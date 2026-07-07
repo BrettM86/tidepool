@@ -119,6 +119,21 @@ type Communities interface {
 	ListByFollowState(ctx context.Context, state FollowState) ([]*Community, error)
 }
 
+// ServiceKeys persists the bridge's own long-lived keys (today: the service
+// actor's AP-side RSA private key). Keys are create-once: there is no update
+// or delete, so a stored key can never be silently rotated out from under
+// signatures already in flight.
+type ServiceKeys interface {
+	// Create inserts a new named key and returns the stored row. An existing
+	// name returns an error satisfying errors.IsAlreadyExists — callers that
+	// lose a bootstrap race must Get the winner's key instead.
+	Create(ctx context.Context, name string, privateKeyPEM []byte) (*ServiceKey, error)
+
+	// Get returns the key for a purpose name. A missing key is an error
+	// satisfying errors.IsNotFound.
+	Get(ctx context.Context, name string) (*ServiceKey, error)
+}
+
 // InboxEvents deduplicates inbound AP activities and records processing
 // outcomes. The queue-consumption side (ListPending and friends) is
 // deliberately deferred to task 06, which owns the processing loop.

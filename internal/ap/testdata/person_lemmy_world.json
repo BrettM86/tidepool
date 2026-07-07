@@ -1,0 +1,29 @@
+{
+  "@context": [
+    "https://join-lemmy.org/context.json",
+    "https://www.w3.org/ns/activitystreams"
+  ],
+  "type": "Person",
+  "id": "https://lemmy.world/u/LeftLeaningFreedomFighters",
+  "preferredUsername": "LeftLeaningFreedomFighters",
+  "inbox": "https://lemmy.world/u/LeftLeaningFreedomFighters/inbox",
+  "outbox": "https://lemmy.world/u/LeftLeaningFreedomFighters/outbox",
+  "publicKey": {
+    "id": "https://lemmy.world/u/LeftLeaningFreedomFighters#main-key",
+    "owner": "https://lemmy.world/u/LeftLeaningFreedomFighters",
+    "publicKeyPem": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAutWsHnK/k+ODe0pktuTD\nIDFCxJny5M1Vno748QTW3yKTvA3L2EGcN8PTvubQ29r8JPt+qVF4XeQZllwq55xD\nsbnU+QHevy/snvXtwsT8luxy9HDfCKXL/JzBMebLSyJMraja7efHxWVnh7uIjacL\n3WNDHLN/pCj9nzArwENMeesolMUVbpmafiEKGLor7lNdLl7jpXBgc5jjYks9HRbC\nJqmeDzrqkBFj/8QFoGjQRjSA/jTVJ0phOXUNzvbT1JNYmJzmtwxy0bQa9+Rf/uKj\n7yXwNSrrBfn1/Ir+0e/2MScfEBc9QybfblAemVyCotIFlXb1ab3RHfwnyHwqPIsA\nPwIDAQAB\n-----END PUBLIC KEY-----\n"
+  },
+  "name": "Surprised Neelix",
+  "icon": {
+    "type": "Image",
+    "url": "https://lemmy.world/pictrs/image/761c9aaf-70a2-4a50-a92c-9ada2025ff51.png"
+  },
+  "image": {
+    "type": "Image",
+    "url": "https://lemmy.world/pictrs/image/8065bb13-9415-4f30-a427-d34e33ffea1b.png"
+  },
+  "endpoints": {
+    "sharedInbox": "https://lemmy.world/inbox"
+  },
+  "published": "2026-06-27T20:59:46.499970Z"
+}

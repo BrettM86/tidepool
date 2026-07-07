@@ -1,0 +1,38 @@
+{
+  "@context": [
+    "https://join-lemmy.org/context.json",
+    "https://www.w3.org/ns/activitystreams"
+  ],
+  "type": "Note",
+  "id": "https://lemmy.zip/comment/27485395",
+  "attributedTo": "https://lemmy.zip/u/tixooo",
+  "to": [
+    "https://www.w3.org/ns/activitystreams#Public"
+  ],
+  "cc": [
+    "https://lemmy.world/c/technology",
+    "https://sh.itjust.works/u/DemandtheOxfordComma"
+  ],
+  "content": "<p>I think it was the theme for all of human history, just the scale is different now.</p>\n",
+  "inReplyTo": "https://sh.itjust.works/comment/26248018",
+  "mediaType": "text/html",
+  "source": {
+    "content": "I think it was the theme for all of human history, just the scale is different now. ",
+    "mediaType": "text/markdown"
+  },
+  "published": "2026-07-07T05:28:23.817032Z",
+  "tag": [
+    {
+      "href": "https://sh.itjust.works/u/DemandtheOxfordComma",
+      "name": "@DemandtheOxfordComma@sh.itjust.works",
+      "type": "Mention"
+    }
+  ],
+  "distinguished": false,
+  "language": {
+    "identifier": "en",
+    "name": "English"
+  },
+  "audience": "https://lemmy.world/c/technology",
+  "attachment": []
+}

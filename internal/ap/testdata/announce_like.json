@@ -1,0 +1,17 @@
+{
+  "actor": "https://lemmy.world/c/technology",
+  "to": [
+    "https://www.w3.org/ns/activitystreams#Public"
+  ],
+  "object": {
+    "actor": "https://lemmy.zip/u/tixooo",
+    "object": "https://lemmy.world/post/49131386",
+    "type": "Like",
+    "id": "https://lemmy.zip/activities/like/3f4e5d6c-7b8a-490e-b1c2-d3e4f5a6b7c8"
+  },
+  "cc": [
+    "https://lemmy.world/c/technology/followers"
+  ],
+  "type": "Announce",
+  "id": "https://lemmy.world/activities/announce/like/2a3b4c5d-6e7f-4809-9a0b-c1d2e3f4a5b6"
+}

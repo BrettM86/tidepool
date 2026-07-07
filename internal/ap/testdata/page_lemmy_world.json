@@ -1,0 +1,41 @@
+{
+  "@context": [
+    "https://join-lemmy.org/context.json",
+    "https://www.w3.org/ns/activitystreams"
+  ],
+  "type": "Page",
+  "id": "https://lemmy.world/post/49131386",
+  "attributedTo": "https://lemmy.world/u/LeftLeaningFreedomFighters",
+  "to": [
+    "https://lemmy.world/c/technology",
+    "https://www.w3.org/ns/activitystreams#Public"
+  ],
+  "name": "Inside the history of DRAM price-fixing lawsuits — how HBM allocations could make a difference after two decades of failed cases",
+  "cc": [],
+  "mediaType": "text/html",
+  "attachment": [
+    {
+      "href": "https://www.tomshardware.com/pc-components/dram/samsung-sk-hynix-and-micron-face-a-third-dram-price-fixing-lawsuit",
+      "mediaType": "text/html; charset=utf-8",
+      "type": "Link"
+    }
+  ],
+  "image": {
+    "type": "Image",
+    "url": "https://lemmy.world/pictrs/image/98840222-90ff-4a7f-83ee-6090488648d4.jpeg"
+  },
+  "sensitive": false,
+  "published": "2026-07-07T03:27:37.028201Z",
+  "language": {
+    "identifier": "en",
+    "name": "English"
+  },
+  "audience": "https://lemmy.world/c/technology",
+  "tag": [
+    {
+      "href": "https://lemmy.world/post/49131386",
+      "name": "#technology",
+      "type": "Hashtag"
+    }
+  ]
+}

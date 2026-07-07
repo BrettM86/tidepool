@@ -54,7 +54,7 @@ func testDB(t *testing.T) *sql.DB {
 	require.NoError(t, testDatabaseErr, "connect and migrate test database")
 
 	_, err := testDatabase.ExecContext(context.Background(),
-		`TRUNCATE ap_objects, bridged_actors, communities, inbox_events RESTART IDENTITY`)
+		`TRUNCATE ap_objects, bridged_actors, communities, inbox_events, service_keys RESTART IDENTITY`)
 	require.NoError(t, err, "truncate test tables")
 
 	return testDatabase

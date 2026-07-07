@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 )
 
 const (
@@ -33,6 +34,12 @@ type Config struct {
 	BridgeServiceDID string
 	// UserAgent is sent on all outbound HTTP requests (signed fetches etc.).
 	UserAgent string
+	// AllowPrivateAddresses disables the SSRF egress guard, letting the AP
+	// client fetch loopback/private/link-local/metadata addresses. It defaults
+	// to false (guard on) and must only be enabled for local development or
+	// tests that hit httptest servers on 127.0.0.1. Set ALLOW_PRIVATE_FETCH=1
+	// to enable.
+	AllowPrivateAddresses bool
 }
 
 // Load reads configuration from the environment. logger must not be nil;
@@ -75,6 +82,14 @@ func Load(logger *slog.Logger) (*Config, error) {
 	// bridge's service DID, otherwise identity bootstrap mints one.
 	cfg.BridgeServiceDID = os.Getenv("BRIDGE_SERVICE_DID")
 
+	// SSRF egress guard is on by default; only local dev/tests should relax
+	// it. Accept it in development but refuse to let production disable the
+	// guard silently.
+	cfg.AllowPrivateAddresses = boolVar("ALLOW_PRIVATE_FETCH")
+	if cfg.AllowPrivateAddresses && !isDevelopment {
+		return nil, fmt.Errorf("config: ALLOW_PRIVATE_FETCH must not be set in production")
+	}
+
 	defaultUserAgent := fmt.Sprintf("tidepool/0.1 (+https://%s)", cfg.BridgeHostname)
 	cfg.UserAgent = os.Getenv("USER_AGENT")
 	if cfg.UserAgent == "" {
@@ -89,6 +104,16 @@ func Load(logger *slog.Logger) (*Config, error) {
 // (migrations-on-start, defaulted config).
 func (c *Config) IsDevelopment() bool {
 	return c.Environment == EnvironmentDevelopment
+}
+
+// boolVar reports whether an environment variable is set to a truthy value
+// ("1", "true", "yes", case-insensitive).
+func boolVar(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 // stringVar returns the value of an environment variable. When unset it

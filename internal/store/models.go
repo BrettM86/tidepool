@@ -132,6 +132,16 @@ type Community struct {
 	CreatedAt         time.Time
 }
 
+// ServiceKey is one of the bridge's own long-lived keys, keyed by purpose
+// name (e.g. "service-actor" for the AP-side RSA signing key, stored as
+// PKCS#8 PEM).
+type ServiceKey struct {
+	ID            int64
+	Name          string
+	PrivateKeyPEM []byte
+	CreatedAt     time.Time
+}
+
 // InboxEvent is a received AP activity, recorded for dedupe and
 // processing bookkeeping.
 type InboxEvent struct {

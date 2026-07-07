@@ -1,0 +1,57 @@
+{
+  "actor": "https://lemmy.world/c/technology",
+  "to": [
+    "https://www.w3.org/ns/activitystreams#Public"
+  ],
+  "object": {
+    "id": "https://lemmy.zip/activities/create/8d4e2f1a-9b3c-4a7d-8e6f-1c2b3a4d5e6f",
+    "actor": "https://lemmy.zip/u/tixooo",
+    "to": [
+      "https://www.w3.org/ns/activitystreams#Public"
+    ],
+    "object": {
+      "type": "Note",
+      "id": "https://lemmy.zip/comment/27485395",
+      "attributedTo": "https://lemmy.zip/u/tixooo",
+      "to": [
+        "https://www.w3.org/ns/activitystreams#Public"
+      ],
+      "cc": [
+        "https://lemmy.world/c/technology",
+        "https://sh.itjust.works/u/DemandtheOxfordComma"
+      ],
+      "content": "<p>I think it was the theme for all of human history, just the scale is different now.</p>\n",
+      "inReplyTo": "https://sh.itjust.works/comment/26248018",
+      "mediaType": "text/html",
+      "source": {
+        "content": "I think it was the theme for all of human history, just the scale is different now. ",
+        "mediaType": "text/markdown"
+      },
+      "published": "2026-07-07T05:28:23.817032Z",
+      "tag": [
+        {
+          "href": "https://sh.itjust.works/u/DemandtheOxfordComma",
+          "name": "@DemandtheOxfordComma@sh.itjust.works",
+          "type": "Mention"
+        }
+      ],
+      "distinguished": false,
+      "language": {
+        "identifier": "en",
+        "name": "English"
+      },
+      "audience": "https://lemmy.world/c/technology",
+      "attachment": []
+    },
+    "cc": [
+      "https://lemmy.world/c/technology"
+    ],
+    "type": "Create",
+    "audience": "https://lemmy.world/c/technology"
+  },
+  "cc": [
+    "https://lemmy.world/c/technology/followers"
+  ],
+  "type": "Announce",
+  "id": "https://lemmy.world/activities/announce/create/7b8c9d0e-1f2a-3b4c-5d6e-7f8a9b0c1d2e"
+}

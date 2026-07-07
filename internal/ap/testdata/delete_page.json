@@ -1,0 +1,13 @@
+{
+  "actor": "https://lemmy.world/u/LeftLeaningFreedomFighters",
+  "to": [
+    "https://www.w3.org/ns/activitystreams#Public"
+  ],
+  "object": "https://lemmy.world/post/49131386",
+  "cc": [
+    "https://lemmy.world/c/technology"
+  ],
+  "type": "Delete",
+  "id": "https://lemmy.world/activities/delete/9c8b7a6d-5e4f-4321-a0b9-c8d7e6f5a4b3",
+  "audience": "https://lemmy.world/c/technology"
+}

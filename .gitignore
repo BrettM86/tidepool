@@ -13,3 +13,6 @@
 
 # Go tooling
 coverage.out
+
+# Local Claude Code session/tooling state
+.claude/

@@ -1,0 +1,131 @@
+{
+  "@context": [
+    "https://join-lemmy.org/context.json",
+    "https://www.w3.org/ns/activitystreams"
+  ],
+  "type": "OrderedCollection",
+  "id": "https://lemmy.world/c/technology/outbox",
+  "totalItems": 50,
+  "orderedItems": [
+    {
+      "actor": "https://lemmy.world/c/technology",
+      "to": [
+        "https://www.w3.org/ns/activitystreams#Public"
+      ],
+      "object": {
+        "id": "https://lemmy.world/activities/create/599f915a-c61e-49fd-b590-28dc86593dc6",
+        "actor": "https://lemmy.world/u/LeftLeaningFreedomFighters",
+        "to": [
+          "https://www.w3.org/ns/activitystreams#Public"
+        ],
+        "object": {
+          "type": "Page",
+          "id": "https://lemmy.world/post/49131386",
+          "attributedTo": "https://lemmy.world/u/LeftLeaningFreedomFighters",
+          "to": [
+            "https://lemmy.world/c/technology",
+            "https://www.w3.org/ns/activitystreams#Public"
+          ],
+          "name": "Inside the history of DRAM price-fixing lawsuits — how HBM allocations could make a difference after two decades of failed cases",
+          "cc": [],
+          "mediaType": "text/html",
+          "attachment": [
+            {
+              "href": "https://www.tomshardware.com/pc-components/dram/samsung-sk-hynix-and-micron-face-a-third-dram-price-fixing-lawsuit",
+              "mediaType": "text/html; charset=utf-8",
+              "type": "Link"
+            }
+          ],
+          "image": {
+            "type": "Image",
+            "url": "https://lemmy.world/pictrs/image/98840222-90ff-4a7f-83ee-6090488648d4.jpeg"
+          },
+          "sensitive": false,
+          "published": "2026-07-07T03:27:37.028201Z",
+          "language": {
+            "identifier": "en",
+            "name": "English"
+          },
+          "audience": "https://lemmy.world/c/technology",
+          "tag": [
+            {
+              "href": "https://lemmy.world/post/49131386",
+              "name": "#technology",
+              "type": "Hashtag"
+            }
+          ]
+        },
+        "cc": [
+          "https://lemmy.world/c/technology"
+        ],
+        "type": "Create",
+        "audience": "https://lemmy.world/c/technology"
+      },
+      "cc": [
+        "https://lemmy.world/c/technology/followers"
+      ],
+      "type": "Announce",
+      "id": "https://lemmy.world/activities/announce/create/6a91b0d9-c1e5-45d6-be8b-ce248306867e"
+    },
+    {
+      "actor": "https://lemmy.world/c/technology",
+      "to": [
+        "https://www.w3.org/ns/activitystreams#Public"
+      ],
+      "object": {
+        "id": "https://lemmy.world/activities/create/6f26283b-505a-42de-afd5-bd3981df830f",
+        "actor": "https://lemmy.world/u/Aweigh",
+        "to": [
+          "https://www.w3.org/ns/activitystreams#Public"
+        ],
+        "object": {
+          "type": "Page",
+          "id": "https://lemmy.world/post/49122698",
+          "attributedTo": "https://lemmy.world/u/Aweigh",
+          "to": [
+            "https://lemmy.world/c/technology",
+            "https://www.w3.org/ns/activitystreams#Public"
+          ],
+          "name": "Microsoft cuts 4,800 jobs and shrinks Xbox in 'significant restructure'",
+          "cc": [],
+          "mediaType": "text/html",
+          "attachment": [
+            {
+              "href": "https://www.bbc.com/news/articles/c36yy27rnpeo",
+              "mediaType": "text/html; charset=utf-8",
+              "type": "Link"
+            }
+          ],
+          "image": {
+            "type": "Image",
+            "url": "https://lemmy.world/pictrs/image/06b96f69-3ae5-4c0b-91aa-631a5ed90080.jpeg"
+          },
+          "sensitive": false,
+          "published": "2026-07-06T22:01:15.771031Z",
+          "language": {
+            "identifier": "en",
+            "name": "English"
+          },
+          "audience": "https://lemmy.world/c/technology",
+          "tag": [
+            {
+              "href": "https://lemmy.world/post/49122698",
+              "name": "#technology",
+              "type": "Hashtag"
+            }
+          ]
+        },
+        "cc": [
+          "https://lemmy.world/c/technology"
+        ],
+        "type": "Create",
+        "audience": "https://lemmy.world/c/technology"
+      },
+      "cc": [
+        "https://lemmy.world/c/technology/followers"
+      ],
+      "type": "Announce",
+      "id": "https://lemmy.world/activities/announce/create/43e8f9ba-b755-492e-900e-035c99d36747"
+    }
+  ]
+}

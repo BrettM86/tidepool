@@ -7,7 +7,7 @@ update this file → schedule next. Stop the loop when every task is `done`.
 | # | Task | Status | Commit | Notes |
 |---|------|--------|--------|-------|
 | 1 | 01-scaffold-storage | done | (see git log) | reviewed by 7 reviewers, 18 fixes applied |
-| 2 | 02-ap-protocol | pending | | |
+| 2 | 02-ap-protocol | done | (see git log) | 5 reviewers incl. security; 14 fixes (critical: actor-id binding; high: SSRF, webfinger host confusion) |
 | 3 | 03-identity-repos | pending | | |
 | 4 | 04-sync-firehose | pending | | |
 | 5 | 05-materializer | pending | | |
@@ -55,3 +55,31 @@ and deferred TODOs here)
   explicit names, mapped via pq.Error.Constraint in uniqueViolation().
 - pr-review-toolkit plugin agents unavailable in this session — the loop
   emulates them with general-purpose agents (works fine; keep doing it).
+
+### From task 02 (internal/ap protocol layer — tasks 05/06 consume this)
+- FetchObject/FetchActor error branches mirror ResolveStrongRef: IsNotFound
+  (404/401/403) → task 05 fetches ancestor chain; IsTombstoned (410 or
+  Tombstone body) → drop subtree (consent). SignatureError → IsValidation.
+- ap.Object is one universal struct. ap.Time has .OK()/.Valid — a present
+  but malformed `published` is non-nil but OK()==false; task 05 MUST call
+  OK() before deriving rkeys/TIDs (zero Time would collide/mis-sort).
+- FetchCollection signals ErrCollectionTruncated when it hits the page cap
+  or a next-loop — task 06 backfill must treat that as "resume needed",
+  NOT complete. Bare-IRI collection items come back with only ID set
+  (Type==""); re-fetch them.
+- SSRF egress guard is ON by default; config.AllowPrivateAddresses /
+  ClientOptions.AllowPrivateAddresses (env ALLOW_PRIVATE_FETCH, dev-only)
+  disables it. ANY test/consumer hitting 127.0.0.1 httptest servers must
+  set AllowPrivateAddresses=true or fetches are blocked at dial time.
+- Task 06 inbox wiring: Verifier.Verify(ctx, req, body) returns the signing
+  actor id, enforces same-authority binding (actor.ID host == keyId host)
+  and requires host+date+(request-target)+digest signed. It does ONE
+  fresh-key refetch on verify failure (key rotation) — task 06 should gate
+  that retry (only when key came from cache) to bound forgery amplification.
+  ServiceActor.DocumentJSON() ready to serve at /actor; inbox convention
+  https://{host}/inbox. service_keys table (migration 005) holds the
+  bridge's RSA key UNENCRYPTED (documented tradeoff; not user key material).
+- Lemmy HTTP-sig facts (activitypub-federation-rust): Digest required on
+  EVERY request incl. GET; keyId is {actorID}#main-key; hs2019 treated as
+  rsa-sha256; 1h date-skew window.
+- .claude/ is gitignored (session/tooling state, incl. scheduled_tasks.lock).

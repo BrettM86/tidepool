@@ -4,6 +4,8 @@
 package config
 
 import (
+	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"os"
@@ -28,9 +30,20 @@ type Config struct {
 	// e.g. "tidepool.example". Used for WebFinger, actor IDs, and handles.
 	BridgeHostname string
 	// PLCDirectoryURL is the did:plc directory used to mint and resolve DIDs.
+	// The dev default is a LOCAL directory (docker compose `plc` profile);
+	// production points at https://plc.directory. Nothing ever falls back to
+	// the live directory implicitly.
 	PLCDirectoryURL string
+	// BridgeKEK is the 32-byte key-encryption key that seals per-actor
+	// signing keys (and the escrow rotation key) at rest, AES-256-GCM.
+	// Set BRIDGE_KEK to 64 hex chars or standard base64 of 32 bytes. The
+	// development default is a fixed, publicly known key — never usable in
+	// production, where BRIDGE_KEK is required.
+	BridgeKEK []byte
 	// BridgeServiceDID optionally pins a pre-provisioned service DID for the
-	// bridge's own actor. Empty means task 03 will mint one on first run.
+	// bridge's own actor. Service-DID bootstrap is deferred: task 06 wires
+	// the service actor; until then an empty value is handled gracefully
+	// (the bridge hostname simply does not resolve to a DID).
 	BridgeServiceDID string
 	// UserAgent is sent on all outbound HTTP requests (signed fetches etc.).
 	UserAgent string
@@ -78,6 +91,19 @@ func Load(logger *slog.Logger) (*Config, error) {
 		return nil, err
 	}
 
+	// The dev-default KEK is fixed and public (sha256 of a known string):
+	// fine for local development, catastrophic in production, hence the
+	// required-in-production rule shared with every other stringVar.
+	kekEncoded, err := stringVar(logger, isDevelopment, "BRIDGE_KEK",
+		"9a80812a2a5e298fe6b36ba6ba99f33ca42a7a5b1cae7ff43a4b338bbbdd6a34")
+	if err != nil {
+		return nil, err
+	}
+	cfg.BridgeKEK, err = decodeKEK(kekEncoded)
+	if err != nil {
+		return nil, err
+	}
+
 	// Optional in every environment: an operator may pre-provision the
 	// bridge's service DID, otherwise identity bootstrap mints one.
 	cfg.BridgeServiceDID = os.Getenv("BRIDGE_SERVICE_DID")
@@ -104,6 +130,26 @@ func Load(logger *slog.Logger) (*Config, error) {
 // (migrations-on-start, defaulted config).
 func (c *Config) IsDevelopment() bool {
 	return c.Environment == EnvironmentDevelopment
+}
+
+// decodeKEK parses the BRIDGE_KEK value: 64 hex chars or standard base64,
+// either way decoding to exactly 32 bytes.
+func decodeKEK(encoded string) ([]byte, error) {
+	encoded = strings.TrimSpace(encoded)
+	if raw, err := hex.DecodeString(encoded); err == nil {
+		if len(raw) != 32 {
+			return nil, fmt.Errorf("config: BRIDGE_KEK must decode to 32 bytes, got %d", len(raw))
+		}
+		return raw, nil
+	}
+	raw, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil, fmt.Errorf("config: BRIDGE_KEK must be 64 hex chars or base64 of 32 bytes: %w", err)
+	}
+	if len(raw) != 32 {
+		return nil, fmt.Errorf("config: BRIDGE_KEK must decode to 32 bytes, got %d", len(raw))
+	}
+	return raw, nil
 }
 
 // boolVar reports whether an environment variable is set to a truthy value

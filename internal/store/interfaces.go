@@ -76,6 +76,11 @@ type BridgedActors interface {
 	// GetByDID returns the actor for a bridged DID.
 	GetByDID(ctx context.Context, did string) (*BridgedActor, error)
 
+	// GetByHandle returns the actor for a bridged handle. Task 03 uses it
+	// for handle-collision suffixing during minting and for
+	// com.atproto.identity.resolveHandle.
+	GetByHandle(ctx context.Context, handle string) (*BridgedActor, error)
+
 	// SetConsentState transitions the actor's consent state. Deleted is
 	// terminal: transitioning away from ConsentStateDeleted returns an
 	// error satisfying errors.IsValidation (re-tombstoning an already

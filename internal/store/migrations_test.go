@@ -11,9 +11,9 @@ import (
 )
 
 // TestMigrations_UpDownUp proves every migration applies cleanly up AND
-// down. It lives in this package (not internal/db) on purpose: `go test
-// ./...` runs packages in parallel, and all tests sharing the postgres
-// schema must stay in one package so they run sequentially.
+// down. Packages sharing the postgres schema are serialized by
+// testutil.DB's advisory lock, so tearing the schema down here cannot race
+// another package's tests.
 func TestMigrations_UpDownUp(t *testing.T) {
 	database := testDB(t) // already migrated up by the harness
 	ctx := context.Background()
@@ -24,7 +24,8 @@ func TestMigrations_UpDownUp(t *testing.T) {
 	err := database.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM information_schema.tables
 		WHERE table_schema = 'public'
-		  AND table_name IN ('ap_objects', 'bridged_actors', 'communities', 'inbox_events', 'service_keys')
+		  AND table_name IN ('ap_objects', 'bridged_actors', 'communities', 'inbox_events', 'service_keys',
+		                     'blocks', 'repo_state', 'firehose_events')
 	`).Scan(&remaining)
 	require.NoError(t, err)
 	assert.Zero(t, remaining, "down migrations must drop every Tidepool table")

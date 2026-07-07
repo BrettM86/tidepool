@@ -19,6 +19,8 @@ import (
 
 	"tidepool/internal/config"
 	"tidepool/internal/db"
+	"tidepool/internal/identity"
+	"tidepool/internal/store"
 )
 
 const (
@@ -74,6 +76,14 @@ func run(logger *slog.Logger) error {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
+
+	// Handle resolution for the bridged handle space (task 03). Bridged
+	// handles are subdomains of BRIDGE_HOSTNAME; wildcard DNS routes them
+	// all here (see README, "Handle resolution & DNS").
+	actors := store.NewBridgedActors(database)
+	resolver := identity.NewStoreResolver(actors, cfg.BridgeHostname, cfg.BridgeServiceDID)
+	router.Get("/xrpc/com.atproto.identity.resolveHandle", identity.ResolveHandleHandler(resolver, logger))
+	router.Get("/.well-known/atproto-did", identity.WellKnownDIDHandler(resolver, logger))
 
 	// Later tasks register here: AP inbox + WebFinger (02/06),
 	// com.atproto.sync.* + subscribeRepos (04), vote aggregates XRPC (07).

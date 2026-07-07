@@ -112,6 +112,18 @@ func (r *postgresBridgedActors) GetByDID(ctx context.Context, did string) (*Brid
 	return actor, nil
 }
 
+func (r *postgresBridgedActors) GetByHandle(ctx context.Context, handle string) (*BridgedActor, error) {
+	query := `SELECT` + bridgedActorColumns + ` FROM bridged_actors WHERE handle = $1`
+	actor, err := scanBridgedActor(r.db.QueryRowContext(ctx, query, handle))
+	if err != nil {
+		if stderrors.Is(err, sql.ErrNoRows) {
+			return nil, errors.NewNotFoundError("bridged_actor", handle)
+		}
+		return nil, fmt.Errorf("get bridged_actor by handle %q: %w", handle, err)
+	}
+	return actor, nil
+}
+
 func (r *postgresBridgedActors) SetConsentState(ctx context.Context, apActorID string, state ConsentState) error {
 	if !state.Valid() {
 		return errors.NewValidationError("consent_state", fmt.Sprintf("unknown state %q", state))

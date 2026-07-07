@@ -1,63 +1,27 @@
 package store
 
 import (
-	"context"
 	"database/sql"
-	"os"
-	"sync"
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/require"
-
-	"tidepool/internal/db"
+	"tidepool/internal/testutil"
 )
 
 // The store tests run against a real postgres database (Coves convention:
 // real infrastructure, no mocks). They skip cleanly when
 // TIDEPOOL_TEST_DATABASE_URL is unset; `make test` starts the postgres-test
-// container and sets it.
-
-var (
-	testDatabaseOnce sync.Once
-	testDatabase     *sql.DB
-	testDatabaseErr  error
-)
+// container and sets it. testutil.DB holds the cross-package advisory lock
+// that serializes the packages sharing this database.
 
 // testDB returns a migrated connection to the test database, truncating all
-// Tidepool tables so each test starts clean.
+// tables this package touches so each test starts clean.
 func testDB(t *testing.T) *sql.DB {
 	t.Helper()
-
-	databaseURL := os.Getenv("TIDEPOOL_TEST_DATABASE_URL")
-	if databaseURL == "" {
-		// In CI a missing database must fail loudly: skipping every
-		// postgres-backed test would let the suite go green while testing
-		// nothing.
-		if os.Getenv("CI") != "" {
-			t.Fatal("CI is set but TIDEPOOL_TEST_DATABASE_URL is not; " +
-				"the postgres-backed store tests must run in CI")
-		}
-		t.Skip("TIDEPOOL_TEST_DATABASE_URL not set; skipping postgres-backed store tests " +
-			"(run `make test` to start the postgres-test container and set it)")
-	}
-
-	testDatabaseOnce.Do(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		testDatabase, testDatabaseErr = db.Open(ctx, databaseURL)
-		if testDatabaseErr != nil {
-			return
-		}
-		testDatabaseErr = db.MigrateUp(ctx, testDatabase)
-	})
-	require.NoError(t, testDatabaseErr, "connect and migrate test database")
-
-	_, err := testDatabase.ExecContext(context.Background(),
-		`TRUNCATE ap_objects, bridged_actors, communities, inbox_events, service_keys RESTART IDENTITY`)
-	require.NoError(t, err, "truncate test tables")
-
-	return testDatabase
+	database := testutil.DB(t)
+	testutil.Truncate(t, database,
+		"ap_objects", "bridged_actors", "communities", "inbox_events", "service_keys")
+	return database
 }
 
 // Shared fixtures for readable tests.

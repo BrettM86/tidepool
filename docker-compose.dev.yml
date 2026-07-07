@@ -51,6 +51,85 @@ services:
     profiles:
       - test
 
+  # PLC directory postgres — backing store for the local did:plc directory.
+  # Port 5444 stays clear of both the Tidepool (5442/5443) and Coves
+  # (5434/5435/5436) stacks.
+  postgres-plc:
+    image: postgres:16
+    container_name: tidepool-dev-postgres-plc
+    ports:
+      - "${POSTGRES_PLC_PORT:-5444}:5432"
+    environment:
+      POSTGRES_DB: plc_dev
+      POSTGRES_USER: plc_user
+      POSTGRES_PASSWORD: plc_password
+    volumes:
+      - postgres-plc-data:/var/lib/postgresql/data
+    networks:
+      - tidepool-dev
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U plc_user -d plc_dev"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    profiles:
+      - plc
+
+  # Local PLC directory (the real did-method-plc server), modeled on the
+  # Coves dev stack. Minting tests run against this — NEVER against the
+  # public https://plc.directory.
+  #
+  # NOTE: this maps host port 3002, the same port the Coves dev PLC
+  # (coves-dev-plc) uses — run one or the other. The identity tests only
+  # need *something* answering at TIDEPOOL_TEST_PLC_URL (default
+  # http://localhost:3002), so an already-running Coves PLC works as-is.
+  #
+  # Usage: docker compose -f docker-compose.dev.yml --profile plc up -d
+  # First start clones and builds did-method-plc (several minutes); the
+  # volume caches it for later runs.
+  plc-directory:
+    image: node:18-alpine
+    container_name: tidepool-dev-plc
+    ports:
+      - "${PLC_PORT:-3002}:3000"
+    working_dir: /app
+    command: >
+      sh -c "
+        if [ ! -d '/app/.git' ]; then
+          echo 'First run: Installing PLC directory...' &&
+          apk add --no-cache git python3 make g++ yarn &&
+          git clone https://github.com/did-method-plc/did-method-plc.git . &&
+          yarn install --frozen-lockfile &&
+          yarn build &&
+          echo 'PLC directory installed successfully!'
+        fi &&
+        cd packages/server &&
+        yarn start
+      "
+    environment:
+      DATABASE_URL: postgresql://plc_user:plc_password@postgres-plc:5432/plc_dev?sslmode=disable
+      DEBUG_MODE: "1"
+      LOG_ENABLED: "true"
+      LOG_LEVEL: debug
+      LOG_DESTINATION: "1"
+      NODE_ENV: development
+      PORT: 3000
+    volumes:
+      - plc-app-data:/app
+    networks:
+      - tidepool-dev
+    depends_on:
+      postgres-plc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/_health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 300s
+    profiles:
+      - plc
+
 networks:
   tidepool-dev:
     driver: bridge
@@ -61,3 +140,7 @@ volumes:
     name: tidepool-dev-postgres-data
   postgres-test-data:
     name: tidepool-test-postgres-data
+  postgres-plc-data:
+    name: tidepool-dev-postgres-plc-data
+  plc-app-data:
+    name: tidepool-dev-plc-app-data

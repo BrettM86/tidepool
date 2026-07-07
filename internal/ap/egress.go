@@ -4,10 +4,29 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
+	"time"
 
 	"tidepool/internal/errors"
 )
+
+// NewGuardedHTTPClient returns an *http.Client whose transport enforces the
+// same SSRF egress guard the AP client uses (resolved-IP validation at dial
+// time). Non-AP outbound HTTP — the identity package's PLC directory client
+// — uses this so every egress path in the bridge shares one guard. As with
+// the AP client, allowPrivate must only be true in development/tests
+// (config.AllowPrivateAddresses, env ALLOW_PRIVATE_FETCH).
+func NewGuardedHTTPClient(allowPrivate bool, timeout time.Duration) *http.Client {
+	if timeout == 0 {
+		timeout = DefaultRequestTimeout
+	}
+	guard := newEgressGuard(allowPrivate)
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: guardedTransport(nil, guard),
+	}
+}
 
 // egressGuard blocks outbound requests to addresses an SSRF attacker would
 // pivot through: loopback, RFC1918 private, link-local, unique-local,

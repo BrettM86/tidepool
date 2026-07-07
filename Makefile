@@ -1,4 +1,4 @@
-.PHONY: help build run test test-db-up test-db-down db-migrate db-migrate-down dev-up dev-down lint fmt fmt-check clean
+.PHONY: help build run test test-db-up test-db-down db-migrate db-migrate-down dev-up dev-down plc-up plc-down lint fmt fmt-check clean
 
 .DEFAULT_GOAL := help
 
@@ -41,10 +41,19 @@ dev-up: ## Start the dev database (port 5442)
 	@$(COMPOSE) up -d --wait postgres
 	@echo "$(GREEN)✓ PostgreSQL (dev) on localhost:5442$(RESET)"
 
-dev-down: ## Stop all dev services (including the test database)
+dev-down: ## Stop all dev services (including the test database and PLC)
 	@echo "$(YELLOW)Stopping Tidepool dev stack...$(RESET)"
-	@$(COMPOSE) --profile test down --remove-orphans
+	@$(COMPOSE) --profile test --profile plc down --remove-orphans
 	@echo "$(GREEN)✓ Stopped$(RESET)"
+
+plc-up: ## Start the local PLC directory (port 3002; first run builds did-method-plc)
+	@echo "$(GREEN)Starting local PLC directory (first run takes several minutes)...$(RESET)"
+	@$(COMPOSE) --profile plc up -d --wait postgres-plc plc-directory
+	@echo "$(GREEN)✓ PLC directory on http://localhost:3002$(RESET)"
+
+plc-down: ## Stop the local PLC directory
+	@$(COMPOSE) --profile plc stop plc-directory postgres-plc
+	@echo "$(GREEN)✓ PLC directory stopped$(RESET)"
 
 ##@ Database Management
 

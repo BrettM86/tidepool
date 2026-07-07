@@ -17,7 +17,7 @@ func clearConfigEnv(t *testing.T) {
 	t.Helper()
 	for _, name := range []string{
 		"ENVIRONMENT", "DATABASE_URL", "LISTEN_ADDR", "BRIDGE_HOSTNAME",
-		"PLC_DIRECTORY_URL", "BRIDGE_SERVICE_DID", "USER_AGENT",
+		"PLC_DIRECTORY_URL", "BRIDGE_SERVICE_DID", "USER_AGENT", "BRIDGE_KEK",
 	} {
 		t.Setenv(name, "")
 	}
@@ -34,9 +34,11 @@ func TestLoad_DevelopmentDefaults(t *testing.T) {
 	assert.Equal(t, "postgres://tidepool:tidepool@localhost:5442/tidepool_dev?sslmode=disable", cfg.DatabaseURL)
 	assert.Equal(t, ":8091", cfg.ListenAddr)
 	assert.Equal(t, "localhost", cfg.BridgeHostname)
-	assert.Equal(t, "http://localhost:3002", cfg.PLCDirectoryURL)
+	assert.Equal(t, "http://localhost:3002", cfg.PLCDirectoryURL,
+		"the dev default PLC directory must be LOCAL, never the live plc.directory")
 	assert.Empty(t, cfg.BridgeServiceDID, "service DID is optional")
 	assert.Equal(t, "tidepool/0.1 (+https://localhost)", cfg.UserAgent)
+	assert.Len(t, cfg.BridgeKEK, 32, "dev-default KEK decodes to 32 bytes")
 }
 
 func TestLoad_ExplicitValuesWin(t *testing.T) {
@@ -75,12 +77,36 @@ func TestLoad_ProductionWithAllValues(t *testing.T) {
 	t.Setenv("LISTEN_ADDR", ":8080")
 	t.Setenv("BRIDGE_HOSTNAME", "tidepool.example")
 	t.Setenv("PLC_DIRECTORY_URL", "https://plc.directory")
+	t.Setenv("BRIDGE_KEK", "sfDrM4bIeCJp01ZBTArLPJXNQlD7pcYFsod2An6UAF0=") // base64 form
 
 	cfg, err := Load(discardLogger())
 	require.NoError(t, err)
 	assert.False(t, cfg.IsDevelopment())
 	assert.Equal(t, "tidepool/0.1 (+https://tidepool.example)", cfg.UserAgent,
 		"user agent default derives from the bridge hostname")
+	assert.Len(t, cfg.BridgeKEK, 32, "base64 KEK decodes to 32 bytes")
+}
+
+func TestLoad_ProductionRequiresKEK(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("ENVIRONMENT", EnvironmentProduction)
+	t.Setenv("DATABASE_URL", "postgres://prod/db")
+	t.Setenv("LISTEN_ADDR", ":8080")
+	t.Setenv("BRIDGE_HOSTNAME", "tidepool.example")
+	t.Setenv("PLC_DIRECTORY_URL", "https://plc.directory")
+
+	_, err := Load(discardLogger())
+	require.Error(t, err, "production must never run on the public dev-default KEK")
+	assert.Contains(t, err.Error(), "BRIDGE_KEK")
+}
+
+func TestLoad_RejectsBadKEK(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("BRIDGE_KEK", "too-short")
+
+	_, err := Load(discardLogger())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "BRIDGE_KEK")
 }
 
 func TestLoad_RejectsUnknownEnvironment(t *testing.T) {

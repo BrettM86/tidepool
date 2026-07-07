@@ -154,6 +154,31 @@ func TestBridgedActors_Get(t *testing.T) {
 	assert.True(t, errors.IsNotFound(err), "expected IsNotFound, got %v", err)
 }
 
+func TestBridgedActors_GetByHandle(t *testing.T) {
+	repo := NewBridgedActors(testDB(t))
+	ctx := context.Background()
+
+	stored, err := repo.UpsertActor(ctx, testActor())
+	require.NoError(t, err)
+
+	byHandle, err := repo.GetByHandle(ctx, stored.Handle)
+	require.NoError(t, err)
+	assert.Equal(t, stored.ID, byHandle.ID)
+
+	_, err = repo.GetByHandle(ctx, "nobody.lemmy-world.tidepool.example")
+	assert.True(t, errors.IsNotFound(err), "expected IsNotFound, got %v", err)
+
+	// Actors without a handle yet (NULL) must not match anything.
+	unhandled := testActor()
+	unhandled.APActorID = "https://lemmy.world/u/bob"
+	unhandled.DID = testSecondDID
+	unhandled.Handle = ""
+	_, err = repo.UpsertActor(ctx, unhandled)
+	require.NoError(t, err)
+	_, err = repo.GetByHandle(ctx, "")
+	assert.True(t, errors.IsNotFound(err), "empty handle must not match NULL-handle rows")
+}
+
 func TestBridgedActors_ConsentStateTransitions(t *testing.T) {
 	repo := NewBridgedActors(testDB(t))
 	ctx := context.Background()

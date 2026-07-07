@@ -9,7 +9,7 @@ update this file → schedule next. Stop the loop when every task is `done`.
 | 1 | 01-scaffold-storage | done | (see git log) | reviewed by 7 reviewers, 18 fixes applied |
 | 2 | 02-ap-protocol | done | (see git log) | 5 reviewers incl. security; 14 fixes (critical: actor-id binding; high: SSRF, webfinger host confusion) |
 | 3 | 03-identity-repos | done | (see git log) | 8 reviewers (5 Claude + codex/gemini/glm); 16 fixes (genesis race, seq ordering, MST-corruption-as-NotFound, KeyUse deletes, TID micro-fill) + 7 new tests |
-| 4 | 04-sync-firehose | pending | | |
+| 4 | 04-sync-firehose | done | (see git log) | 7/8 reviewers (glm watchdog-killed); fixes: ping starvation, prune-mid-replay OutdatedCursor, broadcaster closed-channel, SeqBounds dirty-read, pruner fail-closed; consent-on-firehose deferred to 06 |
 | 5 | 05-materializer | pending | | |
 | 6 | 06-ingestion | pending | | |
 | 7 | 07-vote-aggregates | pending | | |
@@ -165,6 +165,47 @@ and deferred TODOs here)
   go-car (v0, indigo's pinned pseudo-version), go-multihash.
 - Test DB URL needs ?sslmode=disable (the bare URL earlier in this file
   fails with "SSL is not enabled"); Makefile's TEST_DATABASE_URL has it.
+
+### From task 04 (sync surface — tasks 05/06/08 consume this)
+- internal/sync serves the full relay-facing surface: subscribeRepos WS
+  (cursor replay from firehose_events then live tail; per-conn outbox reads
+  the DB log — no in-memory queue; slow consumers evicted by write deadline
+  and resume by reconnecting with their last cursor), getRepo,
+  getLatestCommit, getRecord (proof CAR), listRepos, getRepoStatus,
+  describeServer, /xrpc/_health. Protocol tokens exported: sync.
+  InfoOutdatedCursor / sync.ErrorFutureCursor.
+- repo.Manager owns ALL sync reads (ListEvents, SeqBounds, PruneEvents,
+  GetRecordProof, ListRepos, GetRepoInfo) — internal/sync has zero SQL.
+  Broadcaster wakes on pg_notify (emitted IN the commit tx, repo.
+  FirehoseNotifyChannel) with a poll fallback; wake = "rescan the log",
+  payloads are never trusted. Pings live in a dedicated per-conn goroutine
+  (pingPump) — replay stretches must never starve liveness (was a real bug:
+  healthy consumers evicted every 3×pingInterval during deep backfills).
+- Mid-replay pruning is SIGNALED: on a seq gap the outbox re-checks
+  SeqBounds and emits #info OutdatedCursor if the consumer's position fell
+  off the retained window (benign nextval gaps stay silent). Deactivated
+  (consent=deleted) repos refuse getRepo/getRecord/getLatestCommit
+  (RepoDeactivated) and report active:false in listRepos/getRepoStatus.
+- DEFERRED to task 06 (documented in streamEvents): the firehose itself
+  carries only #commit — consent revocation must eventually emit an
+  #account{active:false} frame (+ scrub delete commits) so subscribers
+  purge; tombstoned actors' historical events stay replayable for the
+  retention window until then. Task 06 must also DECIDE: does nobridge
+  (vs deleted) deactivate the read surface? (bridgy-fed deletes bridged
+  content on nobridge discovery; we currently only stop new
+  materialization.)
+- FIREHOSE_RETENTION (Go duration, default 72h) drives RunPruner (hourly;
+  fails closed on retention<=0). RELAY_HOSTS drives requestCrawl on start
+  (log-only in dev, SSRF-guarded client in prod). created_at on
+  firehose_events is clock_timestamp() (commit-visible time), not tx start.
+- Jetstream verification is MANUAL (compose profile `jetstream`, port 6018
+  + README runbook "Verifying with Jetstream") — the DoD line "Jetstream
+  consumes without errors" is verified by hand, not CI. Task 08's harness
+  should automate it.
+- Not yet done (pre-internet-facing hardening, flagged by security review):
+  no connection cap / per-IP rate limit on the public surface; getRepo
+  buffers full CARs in memory (revisit with block GC / tree cache);
+  PruneEvents is one unbatched DELETE per sweep.
 - Deferred design notes for task 04: repo package should own the sync
   read API (GetRecordProof for sync.getRecord, ListEvents(sinceSeq,
   limit)) rather than task 04 issuing raw SQL against repo tables —

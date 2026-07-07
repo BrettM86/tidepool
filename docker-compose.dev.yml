@@ -130,6 +130,33 @@ services:
     profiles:
       - plc
 
+  # Jetstream pointed at the bridge's own firehose — the task-04 integration
+  # proof (`make jetstream-up`; runbook in README "Verifying with Jetstream").
+  # The bridge runs on the HOST (make run), so Jetstream reaches it via
+  # host.docker.internal (mapped for Linux too via extra_hosts).
+  jetstream:
+    image: ghcr.io/bluesky-social/jetstream:sha-306e463693365e21a5ffd3ec051a5a7920000214
+    container_name: tidepool-dev-jetstream
+    ports:
+      - "6018:6018" # WebSocket endpoint (Coves dev uses 6008; offset avoids clashing)
+      - "6019:6019" # metrics
+    environment:
+      JETSTREAM_WS_URL: ws://host.docker.internal:8091/xrpc/com.atproto.sync.subscribeRepos
+      JETSTREAM_LISTEN_ADDR: ":6018"
+      JETSTREAM_METRICS_LISTEN_ADDR: ":6019"
+      JETSTREAM_DATA_DIR: /data
+      JETSTREAM_EVENT_TTL: 24h
+      # Dev bridges can be quiet for long stretches; don't self-restart.
+      JETSTREAM_LIVENESS_TTL: 24h
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - jetstream-data:/data
+    networks:
+      - tidepool-dev
+    profiles:
+      - jetstream
+
 networks:
   tidepool-dev:
     driver: bridge

@@ -48,6 +48,56 @@ production**:
 | `BRIDGE_SERVICE_DID` | *(optional)* | pre-provisioned service DID for the bridge's own actor |
 | `USER_AGENT` | derived | outbound HTTP user agent |
 | `ALLOW_PRIVATE_FETCH` | off | dev-only: disables the SSRF egress guard (AP fetches **and** PLC directory requests) so localhost targets work |
+| `FIREHOSE_RETENTION` | `72h` | how long `firehose_events` rows are kept for `subscribeRepos` cursor replay (Go duration; a background pruner trims older events hourly) |
+| `RELAY_HOSTS` | *(optional)* | comma-separated relays to send `com.atproto.sync.requestCrawl` to on startup; in development the request is logged, never sent |
+
+## Sync surface (what relays and Jetstream consume)
+
+Tidepool serves the `com.atproto.sync.*` XRPC surface a relay needs to treat
+it as a `subscribeRepos` upstream:
+
+- `GET /xrpc/com.atproto.sync.subscribeRepos` (WebSocket; `?cursor=N` replays
+  from the durable event log, then tails live; slow consumers are evicted
+  and resume by reconnecting with their last cursor; a cursor older than
+  retention gets an `#info OutdatedCursor` frame first)
+- `getRepo` (full CAR), `getLatestCommit`, `getRecord` (proof CAR),
+  `listRepos` (paginated), `getRepoStatus`
+- `com.atproto.server.describeServer`, `/xrpc/_health`
+- `com.atproto.identity.resolveHandle` + `/.well-known/atproto-did` (task 03)
+
+Repos whose actor revoked consent (tombstoned) report `RepoDeactivated` /
+`active: false` and their content endpoints stop serving.
+
+## Verifying with Jetstream
+
+The task-04 integration proof: run a real Jetstream against the bridge and
+watch it re-emit our records as JSON. Not automated in CI (it needs Docker
+networking to the host); the manual runbook is:
+
+Until the materializer (task 05) generates organic writes, the repo test
+suite is the write driver — so point the bridge at the **test** database and
+let the tests produce commits:
+
+```sh
+make test-db-up      # test postgres on :5443
+TEST_DB='postgres://tidepool_test:tidepool_test@localhost:5443/tidepool_test?sslmode=disable'
+
+# serve the test DB (leave running):
+DATABASE_URL="$TEST_DB" make run
+
+make jetstream-up    # Jetstream container → ws://host.docker.internal:8091
+
+# watch Jetstream re-emit our records as JSON:
+websocat 'ws://localhost:6018/subscribe?wantedCollections=social.coves.*'
+
+# in another shell, generate commits (any repo test that writes):
+TIDEPOOL_TEST_DATABASE_URL="$TEST_DB" go test -run TestPutRecord -count=1 ./internal/repo/
+```
+
+Each commit appears on the Jetstream socket as decoded JSON with the repo
+DID, collection, rkey, and record body. `make jetstream-down` stops it.
+(Tests truncate repo tables when they start, so Jetstream cursors don't
+survive a rerun — fine for a smoke check, which is all this is.)
 
 ## Handle resolution & DNS (wildcard requirement)
 

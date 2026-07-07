@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"time"
 )
 
 const (
@@ -47,6 +48,17 @@ type Config struct {
 	BridgeServiceDID string
 	// UserAgent is sent on all outbound HTTP requests (signed fetches etc.).
 	UserAgent string
+	// FirehoseRetention is how long firehose events are kept for
+	// subscribeRepos cursor replay (FIREHOSE_RETENTION, a Go duration,
+	// default 72h). Consumers reconnecting with a cursor older than the
+	// window get an OutdatedCursor #info frame and resume from the oldest
+	// retained event.
+	FirehoseRetention time.Duration
+	// RelayHosts lists relays to send com.atproto.sync.requestCrawl to on
+	// startup (RELAY_HOSTS, comma-separated, optional). In development the
+	// request is logged instead of sent — dev hosts are not publicly
+	// reachable and must never poke real relays.
+	RelayHosts []string
 	// AllowPrivateAddresses disables the SSRF egress guard, letting the AP
 	// client fetch loopback/private/link-local/metadata addresses. It defaults
 	// to false (guard on) and must only be enabled for local development or
@@ -107,6 +119,30 @@ func Load(logger *slog.Logger) (*Config, error) {
 	// Optional in every environment: an operator may pre-provision the
 	// bridge's service DID, otherwise identity bootstrap mints one.
 	cfg.BridgeServiceDID = os.Getenv("BRIDGE_SERVICE_DID")
+
+	// Firehose retention has a real default in every environment — it is a
+	// tuning knob, not a deployment-specific value like hostnames or keys.
+	retentionRaw := os.Getenv("FIREHOSE_RETENTION")
+	if retentionRaw == "" {
+		retentionRaw = "72h"
+		logger.Info("FIREHOSE_RETENTION not set, using default", "value", retentionRaw)
+	}
+	cfg.FirehoseRetention, err = time.ParseDuration(retentionRaw)
+	if err != nil {
+		return nil, fmt.Errorf("config: FIREHOSE_RETENTION must be a Go duration (e.g. 72h): %w", err)
+	}
+	if cfg.FirehoseRetention <= 0 {
+		return nil, fmt.Errorf("config: FIREHOSE_RETENTION must be positive, got %s", cfg.FirehoseRetention)
+	}
+
+	// Optional relay list for requestCrawl on startup.
+	if raw := os.Getenv("RELAY_HOSTS"); raw != "" {
+		for _, host := range strings.Split(raw, ",") {
+			if host = strings.TrimSpace(host); host != "" {
+				cfg.RelayHosts = append(cfg.RelayHosts, host)
+			}
+		}
+	}
 
 	// SSRF egress guard is on by default; only local dev/tests should relax
 	// it. Accept it in development but refuse to let production disable the

@@ -17,10 +17,13 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"tidepool/internal/ap"
 	"tidepool/internal/config"
 	"tidepool/internal/db"
 	"tidepool/internal/identity"
+	"tidepool/internal/repo"
 	"tidepool/internal/store"
+	tidepoolsync "tidepool/internal/sync"
 )
 
 const (
@@ -85,8 +88,54 @@ func run(logger *slog.Logger) error {
 	router.Get("/xrpc/com.atproto.identity.resolveHandle", identity.ResolveHandleHandler(resolver, logger))
 	router.Get("/.well-known/atproto-did", identity.WellKnownDIDHandler(resolver, logger))
 
+	// The sync surface (task 04): com.atproto.sync.* + subscribeRepos,
+	// describeServer, _health — everything a relay or Jetstream needs to
+	// treat Tidepool as a subscribeRepos upstream.
+	custodian, err := identity.NewCustodian(cfg.BridgeKEK)
+	if err != nil {
+		return err
+	}
+	repoManager, err := repo.NewManager(database, identity.NewActorKeys(actors, custodian), logger)
+	if err != nil {
+		return err
+	}
+	broadcaster, err := tidepoolsync.NewBroadcaster(cfg.DatabaseURL, 0, logger)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = broadcaster.Close() }()
+	go broadcaster.Run(ctx)
+	syncServer, err := tidepoolsync.NewServer(tidepoolsync.Options{
+		Repo:        repoManager,
+		Broadcaster: broadcaster,
+		Logger:      logger,
+		Hostname:    cfg.BridgeHostname,
+		ServiceDID:  cfg.BridgeServiceDID,
+	})
+	if err != nil {
+		return err
+	}
+	syncServer.Routes(router)
+
+	// Firehose retention: prune events older than FIREHOSE_RETENTION so the
+	// replay window (and the table) stays bounded.
+	go tidepoolsync.RunPruner(ctx, repoManager, cfg.FirehoseRetention, 0, logger)
+
+	// Ask configured relays to crawl us. Development hosts are not publicly
+	// reachable, so dev only logs what it would have sent (never touches a
+	// live relay from a laptop).
+	if len(cfg.RelayHosts) > 0 {
+		if cfg.IsDevelopment() {
+			logger.Info("development environment: skipping requestCrawl",
+				"relays", cfg.RelayHosts, "hostname", cfg.BridgeHostname)
+		} else {
+			crawlClient := ap.NewGuardedHTTPClient(cfg.AllowPrivateAddresses, 30*time.Second)
+			go tidepoolsync.RequestCrawlAll(ctx, crawlClient, cfg.RelayHosts, cfg.BridgeHostname, logger)
+		}
+	}
+
 	// Later tasks register here: AP inbox + WebFinger (02/06),
-	// com.atproto.sync.* + subscribeRepos (04), vote aggregates XRPC (07).
+	// vote aggregates XRPC (07).
 
 	server := &http.Server{
 		Addr:              cfg.ListenAddr,

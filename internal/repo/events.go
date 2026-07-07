@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strconv"
 
 	indigorepo "github.com/bluesky-social/indigo/atproto/repo"
 
@@ -92,12 +93,24 @@ func appendFirehoseEvent(ctx context.Context, tx *sql.Tx, ev firehoseEvent) (int
 		sinceRev = &ev.sinceRev
 	}
 	var seq int64
+	// created_at uses clock_timestamp(), not the CURRENT_TIMESTAMP default:
+	// the default is transaction-start time, and a commit that waited on the
+	// global advisory lock would be stamped older than it became visible —
+	// skewing the retention pruner's age math against late-visible events.
 	if err := tx.QueryRowContext(ctx, `
-		INSERT INTO firehose_events (did, commit_cid, prev_data_cid, since_rev, rev, ops, car)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		INSERT INTO firehose_events (did, commit_cid, prev_data_cid, since_rev, rev, ops, car, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, clock_timestamp())
 		RETURNING seq`,
 		ev.did, ev.commitCID.String(), prevData, sinceRev, ev.rev, opsJSON, carSlice).Scan(&seq); err != nil {
 		return 0, fmt.Errorf("repo: append firehose event for %s: %w", ev.did, err)
+	}
+	// Wake the subscribeRepos broadcaster (task 04). pg_notify inside the
+	// commit transaction means the notification is delivered exactly when
+	// the event becomes visible — and, because the global commit advisory
+	// lock is still held here, notifications arrive in seq order.
+	if _, err := tx.ExecContext(ctx,
+		`SELECT pg_notify($1, $2)`, FirehoseNotifyChannel, strconv.FormatInt(seq, 10)); err != nil {
+		return 0, fmt.Errorf("repo: notify firehose event %d: %w", seq, err)
 	}
 	return seq, nil
 }

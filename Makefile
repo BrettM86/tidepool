@@ -1,4 +1,4 @@
-.PHONY: help build run test test-db-up test-db-down db-migrate db-migrate-down dev-up dev-down plc-up plc-down lint fmt fmt-check clean
+.PHONY: help build run test test-db-up test-db-down db-migrate db-migrate-down dev-up dev-down plc-up plc-down jetstream-up jetstream-down lint fmt fmt-check clean
 
 .DEFAULT_GOAL := help
 
@@ -41,9 +41,9 @@ dev-up: ## Start the dev database (port 5442)
 	@$(COMPOSE) up -d --wait postgres
 	@echo "$(GREEN)✓ PostgreSQL (dev) on localhost:5442$(RESET)"
 
-dev-down: ## Stop all dev services (including the test database and PLC)
+dev-down: ## Stop all dev services (including the test database, PLC, and Jetstream)
 	@echo "$(YELLOW)Stopping Tidepool dev stack...$(RESET)"
-	@$(COMPOSE) --profile test --profile plc down --remove-orphans
+	@$(COMPOSE) --profile test --profile plc --profile jetstream down --remove-orphans
 	@echo "$(GREEN)✓ Stopped$(RESET)"
 
 plc-up: ## Start the local PLC directory (port 3002; first run builds did-method-plc)
@@ -54,6 +54,15 @@ plc-up: ## Start the local PLC directory (port 3002; first run builds did-method
 plc-down: ## Stop the local PLC directory
 	@$(COMPOSE) --profile plc stop plc-directory postgres-plc
 	@echo "$(GREEN)✓ PLC directory stopped$(RESET)"
+
+jetstream-up: ## Start Jetstream against the local bridge (run `make run` first; ws on :6018)
+	@echo "$(GREEN)Starting Jetstream pointed at the local bridge firehose...$(RESET)"
+	@$(COMPOSE) --profile jetstream up -d jetstream
+	@echo "$(GREEN)✓ Jetstream on ws://localhost:6018/subscribe (metrics :6019)$(RESET)"
+
+jetstream-down: ## Stop the Jetstream container
+	@$(COMPOSE) --profile jetstream stop jetstream
+	@echo "$(GREEN)✓ Jetstream stopped$(RESET)"
 
 ##@ Database Management
 

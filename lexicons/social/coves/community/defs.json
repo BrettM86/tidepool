@@ -1,0 +1,256 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.community.defs",
+  "defs": {
+    "communityView": {
+      "type": "object",
+      "description": "Basic community view with essential information and basic stats",
+      "required": ["did", "name"],
+      "properties": {
+        "did": {
+          "type": "string",
+          "format": "did",
+          "description": "DID of the community"
+        },
+        "handle": {
+          "type": "string",
+          "format": "handle",
+          "description": "Current handle resolved from DID"
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 64,
+          "maxGraphemes": 64,
+          "description": "Short community name"
+        },
+        "displayName": {
+          "type": "string",
+          "maxGraphemes": 128,
+          "maxLength": 1280,
+          "description": "Display name for the community"
+        },
+        "avatar": {
+          "type": "string",
+          "format": "uri",
+          "description": "URL to community avatar image"
+        },
+        "visibility": {
+          "type": "string",
+          "knownValues": ["public", "unlisted", "private"],
+          "description": "Community visibility level"
+        },
+        "subscriberCount": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total number of subscribers"
+        },
+        "memberCount": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of users with formal membership status"
+        },
+        "postCount": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total number of posts in the community"
+        },
+        "viewer": {
+          "type": "object",
+          "description": "Simplified viewer state for list views",
+          "properties": {
+            "subscribed": {
+              "type": "boolean",
+              "description": "Whether the viewer is subscribed"
+            },
+            "member": {
+              "type": "boolean",
+              "description": "Whether the viewer has membership status"
+            }
+          }
+        }
+      }
+    },
+    "communityViewDetailed": {
+      "type": "object",
+      "description": "Detailed community view with stats and viewer state",
+      "required": ["did", "name"],
+      "properties": {
+        "did": {
+          "type": "string",
+          "format": "did",
+          "description": "DID of the community"
+        },
+        "handle": {
+          "type": "string",
+          "format": "handle",
+          "description": "Current handle resolved from DID"
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 64,
+          "maxGraphemes": 64,
+          "description": "Short community name"
+        },
+        "displayName": {
+          "type": "string",
+          "maxGraphemes": 128,
+          "maxLength": 1280,
+          "description": "Display name for the community"
+        },
+        "description": {
+          "type": "string",
+          "maxGraphemes": 1000,
+          "maxLength": 10000,
+          "description": "Community description with rich text support"
+        },
+        "descriptionFacets": {
+          "type": "array",
+          "description": "Rich text annotations for description",
+          "items": {
+            "type": "ref",
+            "ref": "social.coves.richtext.facet"
+          }
+        },
+        "avatar": {
+          "type": "string",
+          "format": "uri",
+          "description": "URL to community avatar image"
+        },
+        "banner": {
+          "type": "string",
+          "format": "uri",
+          "description": "URL to community banner image"
+        },
+        "createdBy": {
+          "type": "string",
+          "format": "did",
+          "description": "DID of the user who created this community"
+        },
+        "createdByProfile": {
+          "type": "ref",
+          "ref": "social.coves.actor.defs#profileView",
+          "description": "Profile of the community creator"
+        },
+        "hostedBy": {
+          "type": "string",
+          "format": "did",
+          "description": "DID of the instance hosting this community"
+        },
+        "visibility": {
+          "type": "string",
+          "knownValues": ["public", "unlisted", "private"],
+          "description": "Community visibility level"
+        },
+        "moderationType": {
+          "type": "string",
+          "knownValues": ["moderator", "sortition"],
+          "description": "Type of moderation system"
+        },
+        "contentWarnings": {
+          "type": "array",
+          "description": "Required content warnings for this community",
+          "items": {
+            "type": "string",
+            "knownValues": ["nsfw", "violence", "spoilers"],
+            "maxLength": 32
+          }
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "datetime"
+        },
+        "stats": {
+          "type": "ref",
+          "ref": "#communityStats",
+          "description": "Aggregated community statistics"
+        },
+        "viewer": {
+          "type": "ref",
+          "ref": "#viewerState",
+          "description": "Viewer's relationship to this community"
+        }
+      }
+    },
+    "communityStats": {
+      "type": "object",
+      "description": "Aggregated statistics for a community",
+      "properties": {
+        "memberCount": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of users with formal membership status"
+        },
+        "subscriberCount": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total number of subscribers"
+        },
+        "postCount": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total number of posts in the community"
+        },
+        "commentCount": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total number of comments across all posts"
+        },
+        "activeUserCount": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of users active in the last 30 days"
+        },
+        "activePostersCount": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of unique posters in the last 30 days"
+        },
+        "moderatorCount": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of active moderators"
+        }
+      }
+    },
+    "viewerState": {
+      "type": "object",
+      "description": "The viewing user's relationship to this community",
+      "properties": {
+        "subscribed": {
+          "type": "boolean",
+          "description": "Whether the viewer is subscribed to this community"
+        },
+        "subscriptionUri": {
+          "type": "string",
+          "format": "at-uri",
+          "description": "AT-URI of the viewer's subscription record if subscribed"
+        },
+        "member": {
+          "type": "boolean",
+          "description": "Whether the viewer has membership status (AppView-computed)"
+        },
+        "reputation": {
+          "type": "integer",
+          "description": "Viewer's reputation in this community"
+        },
+        "moderator": {
+          "type": "boolean",
+          "description": "Whether the viewer is a moderator of this community"
+        },
+        "creator": {
+          "type": "boolean",
+          "description": "Whether the viewer created this community"
+        },
+        "banned": {
+          "type": "boolean",
+          "description": "Whether the viewer is banned from this community"
+        },
+        "banUri": {
+          "type": "string",
+          "format": "at-uri",
+          "description": "AT-URI of the ban record if viewer is banned"
+        }
+      }
+    }
+  }
+}

@@ -307,6 +307,12 @@ func (c *Client) FetchObject(ctx context.Context, iri string) (*Object, error) {
 	return obj, nil
 }
 
+// SameAuthority reports whether two absolute URLs share scheme and host (the
+// authority). Exported so consumers that key storage on a fetched object's
+// self-asserted id (the materializer's ap_objects mapping) can reject a body
+// claiming an id on a different instance than the one it was fetched from.
+func SameAuthority(a, b string) bool { return sameAuthority(a, b) }
+
 // FetchActor fetches an AP actor document and validates that it is one
 // (Group/Person/Application/Service with an id).
 func (c *Client) FetchActor(ctx context.Context, iri string) (*Object, error) {
@@ -415,6 +421,115 @@ func visitItems(page *Object, visit func(*Object) error) error {
 		}
 	}
 	return nil
+}
+
+// FetchMedia fetches a binary resource (avatar, banner, post image) with the
+// same SSRF egress guard, per-host rate limiting, retries, redirect handling,
+// and signing as AP object fetches. maxBytes caps the response body for this
+// call (values <= 0 or above the client cap fall back to the client cap) —
+// the materializer passes its blob-size budget so oversized media fails
+// closed at read time instead of buffering the client-wide maximum.
+//
+// It returns the body and the response Content-Type (as sent by the server,
+// unparsed; empty when the server sent none). Status mapping matches
+// FetchObject: 404/401/403 → IsNotFound, 410 → IsTombstoned, other non-2xx
+// → HTTPError. Content-type policy (images only) is the caller's job — the
+// transport layer cannot know which lexicon slot the bytes are for.
+func (c *Client) FetchMedia(ctx context.Context, iri string, maxBytes int64) (data []byte, contentType string, err error) {
+	if maxBytes <= 0 || maxBytes > c.maxResponseBytes {
+		maxBytes = c.maxResponseBytes
+	}
+	var lastErr error
+	for attempt := 0; attempt < c.maxAttempts; attempt++ {
+		if err := c.backoff(ctx, attempt); err != nil {
+			return nil, "", err
+		}
+		data, contentType, retryable, err := c.fetchMediaOnce(ctx, iri, maxBytes)
+		if err == nil {
+			return data, contentType, nil
+		}
+		if !retryable {
+			return nil, "", err
+		}
+		lastErr = err
+	}
+	return nil, "", lastErr
+}
+
+// fetchMediaOnce performs one media GET, following up to maxRedirects
+// manually (re-signing each hop, like getOnce).
+func (c *Client) fetchMediaOnce(ctx context.Context, iri string, maxBytes int64) (data []byte, contentType string, retryable bool, err error) {
+	target := iri
+	for redirects := 0; ; redirects++ {
+		if err := c.waitForHost(ctx, target); err != nil {
+			return nil, "", false, err
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+		if err != nil {
+			return nil, "", false, fmt.Errorf("ap: build GET %s: %w", target, err)
+		}
+		req.Header.Set("User-Agent", c.userAgent)
+		req.Header.Set("Accept", "image/*, */*;q=0.5")
+		if c.signer != nil {
+			if err := c.signer.SignRequest(req, nil); err != nil {
+				return nil, "", false, err
+			}
+		}
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, "", true, fmt.Errorf("ap: GET %s: %w", target, err)
+		}
+
+		if isRedirect(resp.StatusCode) {
+			location := resp.Header.Get("Location")
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+			_ = resp.Body.Close()
+			if location == "" {
+				return nil, "", false, HTTPError{URL: target, StatusCode: resp.StatusCode}
+			}
+			if redirects >= maxRedirects {
+				return nil, "", false, fmt.Errorf("ap: GET %s: too many redirects", iri)
+			}
+			next, err := url.Parse(location)
+			if err != nil {
+				return nil, "", false, fmt.Errorf("ap: GET %s: bad redirect location %q: %w", target, location, err)
+			}
+			target = req.URL.ResolveReference(next).String()
+			continue
+		}
+
+		body, readErr := func() ([]byte, error) {
+			defer func() { _ = resp.Body.Close() }()
+			body, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+			if err != nil {
+				return nil, fmt.Errorf("read response: %w", err)
+			}
+			if int64(len(body)) > maxBytes {
+				return nil, fmt.Errorf("response exceeds %d byte cap", maxBytes)
+			}
+			return body, nil
+		}()
+		if readErr != nil {
+			return nil, "", false, fmt.Errorf("ap: GET %s: %w", target, readErr)
+		}
+
+		switch {
+		case resp.StatusCode >= 200 && resp.StatusCode < 300:
+			return body, resp.Header.Get("Content-Type"), false, nil
+		case resp.StatusCode == http.StatusGone:
+			return nil, "", false, errors.NewTombstonedError("ap_media", iri)
+		case resp.StatusCode == http.StatusNotFound,
+			resp.StatusCode == http.StatusUnauthorized,
+			resp.StatusCode == http.StatusForbidden:
+			return nil, "", false, errors.NewNotFoundError("ap_media", iri)
+		case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
+			return nil, "", true, HTTPError{URL: iri, StatusCode: resp.StatusCode}
+		default:
+			return nil, "", false, HTTPError{URL: iri, StatusCode: resp.StatusCode}
+		}
+	}
 }
 
 // SendActivity signed-POSTs an activity to a remote inbox (task 06 uses this

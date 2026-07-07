@@ -1,0 +1,82 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.community.getSubscribers",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Get list of users subscribed to a community",
+      "parameters": {
+        "type": "params",
+        "required": ["community"],
+        "properties": {
+          "community": {
+            "type": "string",
+            "format": "at-identifier",
+            "description": "DID or handle of the community"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 50
+          },
+          "cursor": {
+            "type": "string"
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["subscribers"],
+          "properties": {
+            "subscribers": {
+              "type": "array",
+              "items": {
+                "type": "ref",
+                "ref": "#subscriberView"
+              }
+            },
+            "cursor": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "subscriberView": {
+      "type": "object",
+      "required": ["did", "subscribedAt"],
+      "properties": {
+        "did": {
+          "type": "string",
+          "format": "did"
+        },
+        "handle": {
+          "type": "string",
+          "format": "handle"
+        },
+        "displayName": {
+          "type": "string"
+        },
+        "avatar": {
+          "type": "string",
+          "format": "uri"
+        },
+        "subscribedAt": {
+          "type": "string",
+          "format": "datetime"
+        },
+        "isMember": {
+          "type": "boolean",
+          "description": "Whether this subscriber has membership status"
+        },
+        "reputation": {
+          "type": "integer",
+          "description": "User's reputation in this community"
+        }
+      }
+    }
+  }
+}

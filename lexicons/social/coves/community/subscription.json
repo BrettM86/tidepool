@@ -1,0 +1,39 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.community.subscription",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A subscription to a community",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["subject", "createdAt"],
+        "properties": {
+          "subject": {
+            "type": "string",
+            "format": "did",
+            "description": "DID of the community being subscribed to"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When the subscription started"
+          },
+          "endedAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When the subscription ended (null if current)"
+          },
+          "contentVisibility": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 5,
+            "default": 3,
+            "description": "Content visibility level (1=only best content, 5=all content)"
+          }
+        }
+      }
+    }
+  }
+}

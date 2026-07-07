@@ -1,0 +1,58 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.feed.vote.create",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Create or toggle a vote on a post or comment. If a vote in the same direction exists, it will be removed (toggled off). If a vote in the opposite direction exists, it will be replaced.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["subject", "direction"],
+          "properties": {
+            "subject": {
+              "type": "ref",
+              "ref": "com.atproto.repo.strongRef",
+              "description": "Strong reference to the post or comment being voted on"
+            },
+            "direction": {
+              "type": "string",
+              "knownValues": ["up", "down"],
+              "description": "Vote direction: up for upvote, down for downvote"
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["uri", "cid"],
+          "properties": {
+            "uri": {
+              "type": "string",
+              "format": "at-uri",
+              "description": "AT-URI of the created vote (empty string if vote was toggled off)"
+            },
+            "cid": {
+              "type": "string",
+              "format": "cid",
+              "description": "CID of the created vote (empty string if vote was toggled off)"
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "NotAuthorized",
+          "description": "User is not authorized to vote on this content"
+        },
+        {
+          "name": "InvalidSubject",
+          "description": "The subject reference is invalid or malformed"
+        }
+      ]
+    }
+  }
+}

@@ -92,6 +92,7 @@ type APObjectMapping struct {
 	OriginInstance string     // host the object originated from, e.g. lemmy.world
 	Origin         Origin     // which side authored the object; defaults to fediverse
 	DID            string     // repo the record was written into
+	AuthorDID      string     // bridged actor who authored the record; differs from DID for posts (community repo). Optional.
 	Collection     string     // record NSID, e.g. social.coves.community.post
 	RKey           string     // deterministic TID rkey
 	ATURI          string     // at://did/collection/rkey (derived; set by PutMapping)

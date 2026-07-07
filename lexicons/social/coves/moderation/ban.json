@@ -1,0 +1,76 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.moderation.ban",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A ban record for a user in a community",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["community", "subject", "banType", "reason", "createdAt"],
+        "properties": {
+          "community": {
+            "type": "string",
+            "format": "at-identifier",
+            "description": "DID or handle of the community"
+          },
+          "subject": {
+            "type": "string",
+            "format": "did",
+            "description": "DID of the banned user"
+          },
+          "banType": {
+            "type": "string",
+            "knownValues": ["moderator", "tribunal"],
+            "description": "How the ban was imposed"
+          },
+          "reason": {
+            "type": "string",
+            "maxLength": 2000,
+            "description": "Reason for the ban"
+          },
+          "duration": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Ban duration in hours (null for permanent)"
+          },
+          "bannedBy": {
+            "type": "string",
+            "format": "did",
+            "description": "DID of moderator who issued ban (null for tribunal bans)"
+          },
+          "tribunalCase": {
+            "type": "string",
+            "format": "at-uri",
+            "description": "AT-URI of tribunal case that resulted in ban"
+          },
+          "status": {
+            "type": "string",
+            "knownValues": ["active", "expired", "revoked"],
+            "default": "active"
+          },
+          "expiresAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When the ban expires (null for permanent)"
+          },
+          "revokedAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When the ban was revoked"
+          },
+          "revokedBy": {
+            "type": "string",
+            "format": "did",
+            "description": "DID of moderator who revoked the ban"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime"
+          }
+        }
+      }
+    }
+  }
+}

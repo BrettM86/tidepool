@@ -1,0 +1,97 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.richtext.facet",
+  "defs": {
+    "main": {
+      "type": "object",
+      "description": "Annotation of a sub-string within rich text",
+      "required": ["index", "features"],
+      "properties": {
+        "index": {
+          "type": "ref",
+          "ref": "#byteSlice"
+        },
+        "features": {
+          "type": "array",
+          "description": "Features applied to this text range",
+          "items": {
+            "type": "union",
+            "refs": [
+              "#mention",
+              "#link", 
+              "#bold",
+              "#italic",
+              "#strikethrough",
+              "#spoiler"
+            ]
+          }
+        }
+      }
+    },
+    "byteSlice": {
+      "type": "object",
+      "description": "Specifies the sub-string range via byte indices",
+      "required": ["byteStart", "byteEnd"],
+      "properties": {
+        "byteStart": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Inclusive start position in UTF-8 bytes"
+        },
+        "byteEnd": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Exclusive end position in UTF-8 bytes"
+        }
+      }
+    },
+    "mention": {
+      "type": "object",
+      "description": "Facet feature for mention of a user or community. The text is usually a handle with '@' (user) or '!' (community) prefix, but the facet reference is a DID.",
+      "required": ["did"],
+      "properties": {
+        "did": {
+          "type": "string",
+          "format": "did",
+          "description": "DID of the mentioned user or community"
+        }
+      }
+    },
+    "link": {
+      "type": "object",
+      "description": "Facet feature for a URL. The text URL may have been simplified or truncated, but the facet reference should be a complete URL.",
+      "required": ["uri"],
+      "properties": {
+        "uri": {
+          "type": "string",
+          "format": "uri",
+          "description": "Target URI of the link"
+        }
+      }
+    },
+    "bold": {
+      "type": "object",
+      "description": "Bold text formatting"
+    },
+    "italic": {
+      "type": "object",
+      "description": "Italic text formatting"
+    },
+    "strikethrough": {
+      "type": "object",
+      "description": "Strikethrough text formatting"
+    },
+    "spoiler": {
+      "type": "object",
+      "description": "Hidden/spoiler text that requires user interaction to reveal",
+      "properties": {
+        "reason": {
+          "type": "string",
+          "maxLength": 128,
+          "maxGraphemes": 32,
+          "description": "Optional explanation of what's hidden"
+        }
+      }
+    }
+  }
+}

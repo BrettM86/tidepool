@@ -1,0 +1,25 @@
+{
+  "$type": "social.coves.community.profile",
+  "avatar": {
+    "$type": "blob",
+    "ref": {
+      "$link": "bafkreib33oum3wmf36mezw4nv2nf3kolsdorvwtxfsjm7aj3rdekmbrlqy"
+    },
+    "mimeType": "image/png",
+    "size": 67
+  },
+  "banner": {
+    "$type": "blob",
+    "ref": {
+      "$link": "bafkreib33oum3wmf36mezw4nv2nf3kolsdorvwtxfsjm7aj3rdekmbrlqy"
+    },
+    "mimeType": "image/png",
+    "size": 67
+  },
+  "createdAt": "2023-06-11T02:16:17.173Z",
+  "createdBy": "did:web:tidepool.test",
+  "description": "This is a [most excellent](https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExN3N0NmhuODNib3d3Nzg0OHU2bTFqMXAzNW42Y2JsOTVmenNsNG8ycSZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/l46CDHTqbmnGZyxKo/giphy.gif) place for technology news and articles.\n \n---\n \n## Our Rules\n \n---\n \n1. Follow the [lemmy.world rules.](https://mastodon.world/about) \n2. Only tech related news or articles.\n3. Be [excellent to each other!](https://www.youtube.com/watch?v=rph_1DODXDU)\n4. Mod approved content bots can post up to 10 articles per day.\n5. Threads asking for personal tech support may be deleted.\n6. Politics threads may be removed.\n7. No memes allowed as posts, OK to post as comments.\n8. Only approved bots from the list below, this includes using AI responses and summaries. To ask if your bot can be added please contact a mod.\n9. Check for duplicates before posting, duplicates may be removed\n10. Accounts 7 days and younger will have their posts automatically r…\n\n🌉 bridged from !technology@lemmy.world by Tidepool",
+  "displayName": "Technology",
+  "hostedBy": "did:web:tidepool.test",
+  "name": "technology"
+}

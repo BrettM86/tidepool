@@ -22,8 +22,8 @@ func NewAPObjects(db *sql.DB) APObjects {
 }
 
 const apObjectColumns = `
-	id, ap_id, ap_type, origin_instance, origin, did, collection, rkey,
-	at_uri, cid, ap_published_at, indexed_at, deleted_at`
+	id, ap_id, ap_type, origin_instance, origin, did, author_did, collection,
+	rkey, at_uri, cid, ap_published_at, indexed_at, deleted_at`
 
 func (r *postgresAPObjects) PutMapping(ctx context.Context, mapping APObjectMapping) (*APObjectMapping, error) {
 	if err := validateMapping(&mapping); err != nil {
@@ -32,13 +32,14 @@ func (r *postgresAPObjects) PutMapping(ctx context.Context, mapping APObjectMapp
 
 	query := `
 		INSERT INTO ap_objects (
-			ap_id, ap_type, origin_instance, origin, did, collection, rkey,
-			at_uri, cid, ap_published_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			ap_id, ap_type, origin_instance, origin, did, author_did,
+			collection, rkey, at_uri, cid, ap_published_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		ON CONFLICT (ap_id) DO UPDATE SET
 			ap_type = EXCLUDED.ap_type,
 			origin = EXCLUDED.origin,
 			did = EXCLUDED.did,
+			author_did = EXCLUDED.author_did,
 			collection = EXCLUDED.collection,
 			rkey = EXCLUDED.rkey,
 			at_uri = EXCLUDED.at_uri,
@@ -50,7 +51,7 @@ func (r *postgresAPObjects) PutMapping(ctx context.Context, mapping APObjectMapp
 
 	row := r.db.QueryRowContext(ctx, query,
 		mapping.APID, mapping.APType, mapping.OriginInstance, string(mapping.Origin),
-		mapping.DID, mapping.Collection, mapping.RKey,
+		mapping.DID, nullIfEmpty(mapping.AuthorDID), mapping.Collection, mapping.RKey,
 		mapping.ATURI, mapping.CID, mapping.PublishedAt,
 	)
 	stored, err := scanAPObject(row)
@@ -109,6 +110,34 @@ func (r *postgresAPObjects) ResolveStrongRef(ctx context.Context, apID string) (
 	return atURI, cid, nil
 }
 
+func (r *postgresAPObjects) ListByActorDID(ctx context.Context, did string) ([]*APObjectMapping, error) {
+	if did == "" {
+		return nil, errors.NewValidationError("did", "must not be empty")
+	}
+	query := `SELECT` + apObjectColumns + `
+		FROM ap_objects
+		WHERE (did = $1 OR author_did = $1) AND deleted_at IS NULL
+		ORDER BY id`
+	rows, err := r.db.QueryContext(ctx, query, did)
+	if err != nil {
+		return nil, fmt.Errorf("list ap_objects for actor %q: %w", did, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var mappings []*APObjectMapping
+	for rows.Next() {
+		mapping, err := scanAPObject(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan ap_object for actor %q: %w", did, err)
+		}
+		mappings = append(mappings, mapping)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list ap_objects for actor %q: %w", did, err)
+	}
+	return mappings, nil
+}
+
 func (r *postgresAPObjects) SoftDelete(ctx context.Context, apID string) error {
 	// COALESCE keeps the original tombstone time on re-delete, making the
 	// whole operation a single atomic statement: affected == 0 can only
@@ -159,6 +188,11 @@ func validateMapping(mapping *APObjectMapping) error {
 	if err != nil {
 		return errors.NewValidationError("did", err.Error())
 	}
+	if mapping.AuthorDID != "" {
+		if _, err := syntax.ParseDID(mapping.AuthorDID); err != nil {
+			return errors.NewValidationError("author_did", err.Error())
+		}
+	}
 	collection, err := syntax.ParseNSID(mapping.Collection)
 	if err != nil {
 		return errors.NewValidationError("collection", err.Error())
@@ -179,9 +213,10 @@ type rowScanner interface {
 func scanAPObject(row rowScanner) (*APObjectMapping, error) {
 	var mapping APObjectMapping
 	var origin string
+	var authorDID sql.NullString
 	err := row.Scan(
 		&mapping.ID, &mapping.APID, &mapping.APType, &mapping.OriginInstance,
-		&origin, &mapping.DID, &mapping.Collection, &mapping.RKey,
+		&origin, &mapping.DID, &authorDID, &mapping.Collection, &mapping.RKey,
 		&mapping.ATURI, &mapping.CID,
 		&mapping.PublishedAt, &mapping.IndexedAt, &mapping.DeletedAt,
 	)
@@ -189,7 +224,16 @@ func scanAPObject(row rowScanner) (*APObjectMapping, error) {
 		return nil, err
 	}
 	mapping.Origin = Origin(origin)
+	mapping.AuthorDID = authorDID.String
 	return &mapping, nil
+}
+
+// nullIfEmpty maps "" to SQL NULL for optional text columns.
+func nullIfEmpty(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 // uniqueViolation reports whether err is a postgres unique constraint

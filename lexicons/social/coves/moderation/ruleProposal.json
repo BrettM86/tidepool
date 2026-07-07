@@ -1,0 +1,89 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.moderation.ruleProposal",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A proposal to change community rules",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["community", "proposalType", "description", "createdAt"],
+        "properties": {
+          "community": {
+            "type": "string",
+            "format": "at-identifier",
+            "description": "DID or handle of the community"
+          },
+          "proposalType": {
+            "type": "string",
+            "enum": [
+              "addTag",
+              "removeTag",
+              "blockDomain",
+              "unblockDomain",
+              "changePostTypes",
+              "addRule",
+              "removeRule",
+              "updateRule",
+              "removeModerator",
+              "addModerator",
+              "changeModerationSystem",
+              "updateSortitionConfig"
+            ]
+          },
+          "title": {
+            "type": "string",
+            "maxLength": 256,
+            "description": "Short title for the proposal"
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 5000,
+            "description": "Detailed description of the proposed change"
+          },
+          "proposalData": {
+            "type": "unknown",
+            "description": "Type-specific proposal data"
+          },
+          "requiredVotes": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Number of votes needed to pass"
+          },
+          "requiredApprovalPercent": {
+            "type": "integer",
+            "minimum": 50,
+            "maximum": 100,
+            "default": 66,
+            "description": "Percentage of approval votes needed"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["active", "passed", "failed", "cancelled", "implemented"],
+            "default": "active"
+          },
+          "votingStartsAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When voting begins"
+          },
+          "votingEndsAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When voting ends"
+          },
+          "implementedAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When the change was implemented"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime"
+          }
+        }
+      }
+    }
+  }
+}

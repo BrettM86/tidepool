@@ -1,0 +1,24 @@
+{
+  "$type": "social.coves.community.post",
+  "author": "did:plc:tkvgcn4onp7yaeidusiiv4o2",
+  "community": "did:plc:ercpobr77dxb3e5h2gwued43",
+  "createdAt": "2026-07-07T03:27:37.028Z",
+  "embed": {
+    "$type": "social.coves.embed.external",
+    "external": {
+      "thumb": {
+        "$type": "blob",
+        "ref": {
+          "$link": "bafkreihun2gqavrsc5caopdy2qorduba76v5chkzlm2h4w5cjm3d3zeacy"
+        },
+        "mimeType": "image/jpeg",
+        "size": 13
+      },
+      "uri": "https://www.tomshardware.com/pc-components/dram/samsung-sk-hynix-and-micron-face-a-third-dram-price-fixing-lawsuit"
+    }
+  },
+  "langs": [
+    "en"
+  ],
+  "title": "Inside the history of DRAM price-fixing lawsuits — how HBM allocations could make a difference after two decades of failed cases"
+}

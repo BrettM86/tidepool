@@ -1,0 +1,27 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.actor.block",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "Record declaring a block relationship against another user. Blocks are public and one-directional: only the blocker's view is affected.",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["subject"],
+        "properties": {
+          "subject": {
+            "type": "string",
+            "format": "did",
+            "description": "DID of the user being blocked"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When the block was created"
+          }
+        }
+      }
+    }
+  }
+}

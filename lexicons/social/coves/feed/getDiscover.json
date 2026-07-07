@@ -1,0 +1,55 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.feed.getDiscover",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Get the public discover feed showing posts from all communities",
+      "parameters": {
+        "type": "params",
+        "properties": {
+          "sort": {
+            "type": "string",
+            "knownValues": ["hot", "top", "new"],
+            "default": "hot",
+            "description": "Sort order for discover feed"
+          },
+          "timeframe": {
+            "type": "string",
+            "knownValues": ["hour", "day", "week", "month", "year", "all"],
+            "default": "day",
+            "description": "Timeframe for top sorting (only applies when sort=top)"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 50,
+            "default": 15
+          },
+          "cursor": {
+            "type": "string"
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["feed"],
+          "properties": {
+            "feed": {
+              "type": "array",
+              "items": {
+                "type": "ref",
+                "ref": "social.coves.feed.defs#feedViewPost"
+              }
+            },
+            "cursor": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    }
+  }
+}

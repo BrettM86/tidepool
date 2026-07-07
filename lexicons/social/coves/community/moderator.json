@@ -1,0 +1,70 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.community.moderator",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A moderator assignment for a community",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["user", "community", "role", "createdAt", "createdBy"],
+        "properties": {
+          "user": {
+            "type": "string",
+            "format": "did",
+            "description": "DID of the user being assigned as moderator"
+          },
+          "community": {
+            "type": "string",
+            "format": "did",
+            "description": "DID of the community"
+          },
+          "role": {
+            "type": "string",
+            "knownValues": ["moderator", "admin"],
+            "maxLength": 64,
+            "description": "Level of moderation privileges"
+          },
+          "permissions": {
+            "type": "array",
+            "description": "Specific permissions granted",
+            "items": {
+              "type": "string",
+              "knownValues": [
+                "remove_posts",
+                "remove_comments",
+                "ban_users",
+                "manage_rules",
+                "manage_wiki",
+                "manage_moderators",
+                "manage_settings"
+              ],
+              "maxLength": 64
+            }
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When the moderator was assigned"
+          },
+          "createdBy": {
+            "type": "string",
+            "format": "did",
+            "description": "DID of the user who assigned this moderator"
+          },
+          "expiresAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When the moderator assignment expires (optional)"
+          },
+          "note": {
+            "type": "string",
+            "maxLength": 300,
+            "description": "Note about why this person was made a moderator"
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "$type": "social.coves.community.comment",
+  "content": "I think it was the theme for all of human history, just the scale is different now.",
+  "createdAt": "2026-07-07T05:28:23.817Z",
+  "langs": [
+    "en"
+  ],
+  "reply": {
+    "parent": {
+      "cid": "bafyreih3hol7nmp2yqa557gqnnbswqfan5imhkjblcbq6xz6dssm5i24mi",
+      "uri": "at://did:plc:uyiwvebqyu45bgynatiz73hq/social.coves.community.comment/3mpzt3q4jespx"
+    },
+    "root": {
+      "cid": "bafyreia77sa3os74ia7zsxjpn72bl2rt7szeklulzltslb6kylnkp23iu4",
+      "uri": "at://did:plc:ercpobr77dxb3e5h2gwued43/social.coves.community.post/3mpznwj74ndra"
+    }
+  }
+}

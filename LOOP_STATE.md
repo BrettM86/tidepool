@@ -10,7 +10,7 @@ update this file → schedule next. Stop the loop when every task is `done`.
 | 2 | 02-ap-protocol | done | (see git log) | 5 reviewers incl. security; 14 fixes (critical: actor-id binding; high: SSRF, webfinger host confusion) |
 | 3 | 03-identity-repos | done | (see git log) | 8 reviewers (5 Claude + codex/gemini/glm); 16 fixes (genesis race, seq ordering, MST-corruption-as-NotFound, KeyUse deletes, TID micro-fill) + 7 new tests |
 | 4 | 04-sync-firehose | done | (see git log) | 7/8 reviewers (glm watchdog-killed); fixes: ping starvation, prune-mid-replay OutdatedCursor, broadcaster closed-channel, SeqBounds dirty-read, pruner fail-closed; consent-on-firehose deferred to 06 |
-| 5 | 05-materializer | pending | | |
+| 5 | 05-materializer | done | (see git log) | 8 reviewers; fixes: id-authority binding, Note-root panic, create-after-delete, nobridge scrub, embedded-actor trust, byte caps, uri scheme, Group-type check + 9 regression tests |
 | 6 | 06-ingestion | pending | | |
 | 7 | 07-vote-aggregates | pending | | |
 | 8 | 08-e2e-harness | pending | | |
@@ -215,3 +215,53 @@ and deferred TODOs here)
   capability (keeps key plaintext inside identity; enables KMS later) —
   revisit before the interface calcifies. No OnCommit hook yet: task 04's
   broadcaster should LISTEN/NOTIFY or poll seq (CommitResult.Seq exists).
+
+### From task 05 (materializer — task 06 is THE consumer)
+- Entry points task 06 drives: MaterializePost(Page/Article),
+  MaterializeComment(Note), HandleUpdate(obj) [Update; also the Create
+  dispatcher — an Update for an unseen object just materializes it],
+  HandleDelete(apID) [object OR actor], DeleteActor (terminal, sets
+  consent=deleted), SuppressActor (reversible nobridge scrub),
+  Ensure/RefreshActor, Ensure/RefreshCommunity. All return *Result
+  (DID/ATURI/CID/NoOp) or a typed error. IsSkip(err) = log-and-never-retry
+  (consent/tombstone/cycle/unusable input); any other error = retryable.
+- SECURITY CONTRACT task 06 MUST honor: RefreshActor/RefreshCommunity (and
+  HandleUpdate on Person/Group) TRUST an embedded actor doc — call them
+  ONLY after verifying the activity signature (signer == actor). Content
+  paths (Ensure*) always re-fetch by IRI and bind the fetched id to the
+  fetch authority (ap.SameAuthority), so an inline/forged attributedTo
+  can't mint under a victim's id. Fetched-object ids are authority-bound at
+  the materializer boundary (comments.go, actors.go), NOT inside
+  ap.FetchObject (kept generic; ap.SameAuthority is exported for reuse).
+- Consent: nobridge on a previously-bridged actor now SCRUBS existing
+  records (scrubActorRecords) then sets NoBridge (reversible). deleted is
+  terminal. commitRecord refuses to resurrect an object whose own mapping
+  is soft-deleted (unordered create-after-delete). KNOWN GAP for task 06:
+  a Delete arriving BEFORE the object was ever materialized leaves no
+  mapping to tombstone → a later Create still materializes. Task 06's inbox
+  needs dedup/ordering (or a tombstone-of-unseen-ids table) to close it.
+  Also: Undo(Delete)/restore must explicitly clear the soft-delete.
+- Lexicon validation: every record validated against vendored lexicons/
+  (gojsonschema-equivalent indigo validator). StrictValidation=true in
+  dev/tests (fail closed); production logs+writes on failure — task 06
+  should wire a metric on that and consider strict-first rollout. Text
+  fields are capped to BOTH maxGraphemes and maxLength bytes (truncateText).
+- Blob store: migration 008 blobs(did,cid,bytes,mime); repo.PutBlob/GetBlob
+  (content-addressed, CID computed server-side); sync getBlob serves with
+  nosniff + sandbox CSP; image fetches go through the SSRF-guarded ap
+  client with per-slot size/type caps. MAX_BLOB_BYTES config exists but is
+  clamped by ap client's maxResponseBytes (5MiB, no knob) — raising it
+  above 5MiB is currently a no-op (wire it in task 06/07 if needed).
+- DID-MINT AMPLIFICATION (task 06 MUST address when wiring the inbox): a
+  crafted deep comment thread with a distinct fake author per level mints
+  up to maxAncestorDepth(50) DIDs per delivered object. No rate limiting in
+  identity.Minter or materialize yet. Gate inbound minting in task 06.
+- Deferred (LOW, noted for later): transient media-fetch failure on refresh
+  drops existing blobs (no carry-forward); a stale actor behind a 403ing
+  instance drops content instead of serving stale; commitRecord's
+  PutRecord→PutMapping isn't one tx (self-heals on retry; a Delete landing
+  in the crash window logs Warn); DeleteActor scrubs records but not blobs
+  under community DIDs; communityRef uses a Lemmy /c/ heuristic (Mbin /m/
+  later). Test gaps still open: embed.images arm + nsfw label shapes are
+  never lexicon-validated (only external embed is) — add before trusting
+  "all records validate" for image posts.

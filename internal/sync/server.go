@@ -123,6 +123,7 @@ func (s *Server) Routes(r chi.Router) {
 	r.Get("/xrpc/com.atproto.sync.getRepo", s.handleGetRepo)
 	r.Get("/xrpc/com.atproto.sync.getLatestCommit", s.handleGetLatestCommit)
 	r.Get("/xrpc/com.atproto.sync.getRecord", s.handleGetRecord)
+	r.Get("/xrpc/com.atproto.sync.getBlob", s.handleGetBlob)
 	r.Get("/xrpc/com.atproto.sync.listRepos", s.handleListRepos)
 	r.Get("/xrpc/com.atproto.sync.getRepoStatus", s.handleGetRepoStatus)
 	r.Get("/xrpc/com.atproto.server.describeServer", s.handleDescribeServer)
@@ -228,6 +229,43 @@ func (s *Server) handleGetRecord(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Length", strconv.Itoa(len(proof)))
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(proof)
+}
+
+// handleGetBlob serves com.atproto.sync.getBlob: the raw bytes of a stored
+// blob (avatars, banners, post images the materializer fetched). Like the
+// other content endpoints it refuses deactivated repos.
+func (s *Server) handleGetBlob(w http.ResponseWriter, r *http.Request) {
+	info := s.loadActiveRepo(w, r)
+	if info == nil {
+		return
+	}
+	cidStr := r.URL.Query().Get("cid")
+	if cidStr == "" {
+		writeXRPCError(w, http.StatusBadRequest, "InvalidRequest", "missing required parameter: cid")
+		return
+	}
+	data, mimeType, err := s.repo.GetBlob(r.Context(), info.DID, cidStr)
+	switch {
+	case err == nil:
+	case errors.IsNotFound(err):
+		writeXRPCError(w, http.StatusNotFound, "BlobNotFound", "blob not found")
+		return
+	case errors.IsValidation(err):
+		writeXRPCError(w, http.StatusBadRequest, "InvalidRequest", err.Error())
+		return
+	default:
+		s.logger.Error("sync: get blob", "did", info.DID, "cid", cidStr, "error", err)
+		writeXRPCError(w, http.StatusInternalServerError, "InternalServerError", "internal error")
+		return
+	}
+	w.Header().Set("Content-Type", mimeType)
+	// Blob bytes are attacker-influenced media from remote instances: make
+	// sure browsers never sniff them into something executable.
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; sandbox")
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
 }
 
 // handleListRepos serves com.atproto.sync.listRepos with DID-keyed

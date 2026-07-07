@@ -1,0 +1,109 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.community.comment.create",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Create a comment on a post or another comment. Comments support nested threading, rich text, embeds, and self-labeling.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["reply", "content"],
+          "properties": {
+            "reply": {
+              "type": "object",
+              "description": "References for maintaining thread structure. Root always points to the original post, parent points to the immediate parent (post or comment).",
+              "required": ["root", "parent"],
+              "properties": {
+                "root": {
+                  "type": "ref",
+                  "ref": "com.atproto.repo.strongRef",
+                  "description": "Strong reference to the original post that started the thread"
+                },
+                "parent": {
+                  "type": "ref",
+                  "ref": "com.atproto.repo.strongRef",
+                  "description": "Strong reference to the immediate parent (post or comment) being replied to"
+                }
+              }
+            },
+            "content": {
+              "type": "string",
+              "maxGraphemes": 10000,
+              "maxLength": 100000,
+              "description": "Comment text content"
+            },
+            "facets": {
+              "type": "array",
+              "description": "Annotations for rich text (mentions, links, etc.)",
+              "items": {
+                "type": "ref",
+                "ref": "social.coves.richtext.facet"
+              }
+            },
+            "embed": {
+              "type": "union",
+              "description": "Embedded media or quoted posts",
+              "refs": [
+                "social.coves.embed.images",
+                "social.coves.embed.post"
+              ]
+            },
+            "langs": {
+              "type": "array",
+              "description": "Languages used in the comment content (ISO 639-1)",
+              "maxLength": 3,
+              "items": {
+                "type": "string",
+                "format": "language"
+              }
+            },
+            "labels": {
+              "type": "ref",
+              "ref": "com.atproto.label.defs#selfLabels",
+              "description": "Self-applied content labels"
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["uri", "cid"],
+          "properties": {
+            "uri": {
+              "type": "string",
+              "format": "at-uri",
+              "description": "AT-URI of the created comment"
+            },
+            "cid": {
+              "type": "string",
+              "format": "cid",
+              "description": "CID of the created comment record"
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "InvalidReply",
+          "description": "The reply reference is invalid, malformed, or refers to non-existent content"
+        },
+        {
+          "name": "ContentTooLong",
+          "description": "Comment content exceeds maximum length constraints"
+        },
+        {
+          "name": "ContentEmpty",
+          "description": "Comment content is empty or contains only whitespace"
+        },
+        {
+          "name": "NotAuthorized",
+          "description": "User is not authorized to create comments on this content"
+        }
+      ]
+    }
+  }
+}

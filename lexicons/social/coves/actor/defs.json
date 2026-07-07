@@ -1,0 +1,139 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.actor.defs",
+  "defs": {
+    "profileView": {
+      "type": "object",
+      "description": "Basic profile view with essential information",
+      "required": ["did"],
+      "properties": {
+        "did": {
+          "type": "string",
+          "format": "did"
+        },
+        "handle": {
+          "type": "string",
+          "format": "handle",
+          "description": "Current handle resolved from DID"
+        },
+        "displayName": {
+          "type": "string",
+          "maxGraphemes": 64,
+          "maxLength": 640
+        },
+        "avatar": {
+          "type": "string",
+          "format": "uri",
+          "description": "URL to avatar image"
+        }
+      }
+    },
+    "profileViewDetailed": {
+      "type": "object",
+      "description": "Detailed profile view with stats and viewer state",
+      "required": ["did"],
+      "properties": {
+        "did": {
+          "type": "string",
+          "format": "did"
+        },
+        "handle": {
+          "type": "string",
+          "format": "handle",
+          "description": "Current handle resolved from DID"
+        },
+        "displayName": {
+          "type": "string",
+          "maxGraphemes": 64,
+          "maxLength": 640
+        },
+        "bio": {
+          "type": "string",
+          "maxGraphemes": 256,
+          "maxLength": 2560
+        },
+        "bioFacets": {
+          "type": "array",
+          "description": "Rich text annotations for bio",
+          "items": {
+            "type": "ref",
+            "ref": "social.coves.richtext.facet"
+          }
+        },
+        "avatar": {
+          "type": "string",
+          "format": "uri",
+          "description": "URL to avatar image"
+        },
+        "banner": {
+          "type": "string",
+          "format": "uri",
+          "description": "URL to banner image"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "datetime"
+        },
+        "stats": {
+          "type": "ref",
+          "ref": "#profileStats",
+          "description": "Aggregated statistics"
+        },
+        "viewer": {
+          "type": "ref",
+          "ref": "#viewerState",
+          "description": "Viewer's relationship to this profile"
+        }
+      }
+    },
+    "profileStats": {
+      "type": "object",
+      "description": "Aggregated statistics for a user profile",
+      "properties": {
+        "postCount": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total number of posts created"
+        },
+        "commentCount": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total number of comments made"
+        },
+        "communityCount": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of communities subscribed to"
+        },
+        "reputation": {
+          "type": "integer",
+          "description": "Global reputation score"
+        },
+        "membershipCount": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of communities with membership status"
+        }
+      }
+    },
+    "viewerState": {
+      "type": "object",
+      "description": "The viewing user's relationship to this profile",
+      "properties": {
+        "blocked": {
+          "type": "boolean",
+          "description": "Whether the viewer has blocked this user"
+        },
+        "blockedBy": {
+          "type": "boolean",
+          "description": "Whether the viewer is blocked by this user"
+        },
+        "blockUri": {
+          "type": "string",
+          "format": "at-uri",
+          "description": "AT-URI of the block record if viewer blocked this user"
+        }
+      }
+    }
+  }
+}

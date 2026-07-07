@@ -1,0 +1,125 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.community.update",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Update community profile. Requires authentication and moderator/admin permissions.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["community"],
+          "properties": {
+            "community": {
+              "type": "string",
+              "format": "did",
+              "description": "DID of the community to update"
+            },
+            "name": {
+              "type": "string",
+              "maxGraphemes": 64,
+              "maxLength": 640,
+              "description": "Community display name"
+            },
+            "description": {
+              "type": "string",
+              "maxGraphemes": 300,
+              "maxLength": 3000,
+              "description": "Community description"
+            },
+            "avatar": {
+              "type": "blob",
+              "accept": ["image/png", "image/jpeg", "image/webp"],
+              "maxSize": 1000000
+            },
+            "banner": {
+              "type": "blob",
+              "accept": ["image/png", "image/jpeg", "image/webp"],
+              "maxSize": 2000000
+            },
+            "avatarMimeType": {
+              "type": "string",
+              "maxLength": 128,
+              "description": "MIME type of avatar blob (image/png, image/jpeg, image/webp)"
+            },
+            "bannerMimeType": {
+              "type": "string",
+              "maxLength": 128,
+              "description": "MIME type of banner blob (image/png, image/jpeg, image/webp)"
+            },
+            "rules": {
+              "type": "array",
+              "maxLength": 10,
+              "items": {
+                "type": "string",
+                "maxGraphemes": 200,
+                "maxLength": 2000
+              },
+              "description": "Community rules"
+            },
+            "categories": {
+              "type": "array",
+              "maxLength": 3,
+              "items": {
+                "type": "string",
+                "maxLength": 50
+              },
+              "description": "Community categories for discovery"
+            },
+            "language": {
+              "type": "string",
+              "format": "language",
+              "description": "Primary language of the community"
+            },
+            "membershipThreshold": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 10000,
+              "description": "Reputation threshold required for membership"
+            },
+            "visibility": {
+              "type": "string",
+              "knownValues": ["public", "unlisted", "private"],
+              "maxLength": 64,
+              "description": "Community visibility level"
+            },
+            "allowExternalDiscovery": {
+              "type": "boolean",
+              "description": "Whether other Coves instances can index and discover this community"
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["uri", "cid"],
+          "properties": {
+            "uri": {
+              "type": "string",
+              "format": "at-uri",
+              "description": "AT-URI of the updated community profile"
+            },
+            "cid": {
+              "type": "string",
+              "format": "cid",
+              "description": "CID of the updated community profile"
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "NotFound",
+          "description": "Community not found"
+        },
+        {
+          "name": "NotAuthorized",
+          "description": "User is not authorized to update this community"
+        }
+      ]
+    }
+  }
+}

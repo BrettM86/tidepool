@@ -1,0 +1,73 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.community.wiki",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "Community wiki page",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["title", "content", "createdAt"],
+        "properties": {
+          "title": {
+            "type": "string",
+            "maxGraphemes": 128,
+            "maxLength": 512,
+            "description": "Wiki page title"
+          },
+          "slug": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "URL-friendly page identifier"
+          },
+          "content": {
+            "type": "string",
+            "maxLength": 50000,
+            "description": "Markdown-formatted wiki content"
+          },
+          "lastEditedBy": {
+            "type": "string",
+            "format": "did",
+            "description": "DID of the last editor"
+          },
+          "editHistory": {
+            "type": "array",
+            "description": "History of edits (stored separately for efficiency)",
+            "items": {
+              "type": "ref",
+              "ref": "#wikiEdit"
+            }
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "datetime"
+          }
+        }
+      }
+    },
+    "wikiEdit": {
+      "type": "object",
+      "required": ["editor", "timestamp"],
+      "properties": {
+        "editor": {
+          "type": "string",
+          "format": "did"
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "datetime"
+        },
+        "summary": {
+          "type": "string",
+          "maxLength": 256,
+          "description": "Edit summary"
+        }
+      }
+    }
+  }
+}

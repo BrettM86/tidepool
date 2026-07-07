@@ -1,0 +1,18 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.embed.post",
+  "defs": {
+    "main": {
+      "type": "object",
+      "description": "Embedded reference to another post (quoted post)",
+      "required": ["post"],
+      "properties": {
+        "post": {
+          "type": "ref",
+          "ref": "com.atproto.repo.strongRef",
+          "description": "Strong reference to the embedded post (includes URI and CID)"
+        }
+      }
+    }
+  }
+}

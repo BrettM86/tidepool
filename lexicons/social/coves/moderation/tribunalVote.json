@@ -1,0 +1,53 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.moderation.tribunalVote",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A vote in a tribunal decision",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["tribunal", "subject", "decision", "createdAt"],
+        "properties": {
+          "tribunal": {
+            "type": "string",
+            "format": "at-uri",
+            "description": "AT-URI of the tribunal case"
+          },
+          "subject": {
+            "type": "string",
+            "format": "at-uri",
+            "description": "Post/comment/user being judged"
+          },
+          "decision": {
+            "type": "string",
+            "enum": ["remove", "keep", "warn", "ban", "timeout"],
+            "description": "Tribunal decision"
+          },
+          "duration": {
+            "type": "integer",
+            "description": "Ban duration in days (for timeout)"
+          },
+          "reason": {
+            "type": "string",
+            "maxLength": 2000,
+            "description": "Detailed reasoning for the decision"
+          },
+          "precedents": {
+            "type": "array",
+            "description": "References to similar past cases",
+            "items": {
+              "type": "string",
+              "format": "at-uri"
+            }
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime"
+          }
+        }
+      }
+    }
+  }
+}

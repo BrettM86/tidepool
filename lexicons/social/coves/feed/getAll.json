@@ -1,0 +1,68 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.feed.getAll",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Get a global feed of all posts across communities",
+      "parameters": {
+        "type": "params",
+        "properties": {
+          "sort": {
+            "type": "string",
+            "knownValues": ["hot", "top", "new"],
+            "default": "hot",
+            "description": "Sort order for global feed"
+          },
+          "postType": {
+            "type": "string",
+            "knownValues": ["text", "article", "image", "video", "microblog"],
+            "description": "Filter by a single post type (computed from embed structure)"
+          },
+          "postTypes": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "knownValues": ["text", "article", "image", "video", "microblog"]
+            },
+            "description": "Filter by multiple post types (computed from embed structure)"
+          },
+          "timeframe": {
+            "type": "string",
+            "knownValues": ["hour", "day", "week", "month", "year", "all"],
+            "default": "day",
+            "description": "Timeframe for top sorting (only applies when sort=top)"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 50,
+            "default": 15
+          },
+          "cursor": {
+            "type": "string"
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["feed"],
+          "properties": {
+            "feed": {
+              "type": "array",
+              "items": {
+                "type": "ref",
+                "ref": "social.coves.feed.defs#feedViewPost"
+              }
+            },
+            "cursor": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    }
+  }
+}

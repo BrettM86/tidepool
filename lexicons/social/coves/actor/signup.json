@@ -1,0 +1,85 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.actor.signup",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Register a new account on the Coves instance. Creates account on PDS and indexes in AppView.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["handle", "email", "password"],
+          "properties": {
+            "handle": {
+              "type": "string",
+              "format": "handle",
+              "description": "Requested handle for the account (e.g., alice.coves.dev)"
+            },
+            "email": {
+              "type": "string",
+              "description": "Email address for account recovery and notifications"
+            },
+            "password": {
+              "type": "string",
+              "description": "Account password (must meet strength requirements)"
+            },
+            "inviteCode": {
+              "type": "string",
+              "description": "Invite code (required if instance has invite-only registration)"
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["did", "handle", "accessJwt", "refreshJwt"],
+          "properties": {
+            "did": {
+              "type": "string",
+              "format": "did",
+              "description": "The DID of the newly created account"
+            },
+            "handle": {
+              "type": "string",
+              "format": "handle",
+              "description": "The handle of the newly created account"
+            },
+            "accessJwt": {
+              "type": "string",
+              "description": "Access token for authenticated requests"
+            },
+            "refreshJwt": {
+              "type": "string",
+              "description": "Refresh token for obtaining new access tokens"
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "InvalidHandle",
+          "description": "Handle does not meet format requirements"
+        },
+        {
+          "name": "HandleNotAvailable",
+          "description": "The requested handle is already taken"
+        },
+        {
+          "name": "InvalidInviteCode",
+          "description": "The provided invite code is invalid or expired"
+        },
+        {
+          "name": "InvalidEmail",
+          "description": "The email address is invalid"
+        },
+        {
+          "name": "WeakPassword",
+          "description": "Password does not meet strength requirements"
+        }
+      ]
+    }
+  }
+}

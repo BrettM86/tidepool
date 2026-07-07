@@ -1,0 +1,70 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.moderation.banUser",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Ban a user from a community (moderator action)",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["community", "subject", "reason"],
+          "properties": {
+            "community": {
+              "type": "string",
+              "format": "at-identifier",
+              "description": "DID or handle of the community"
+            },
+            "subject": {
+              "type": "string",
+              "format": "did",
+              "description": "DID of the user to ban"
+            },
+            "reason": {
+              "type": "string",
+              "maxLength": 2000,
+              "description": "Reason for the ban"
+            },
+            "duration": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Ban duration in hours (omit for permanent)"
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["ban"],
+          "properties": {
+            "ban": {
+              "type": "ref",
+              "ref": "social.coves.moderation.ban"
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "NotAuthorized",
+          "description": "User is not authorized to ban users in this community"
+        },
+        {
+          "name": "UserNotFound",
+          "description": "Target user does not exist"
+        },
+        {
+          "name": "CommunityNotFound",
+          "description": "Community does not exist"
+        },
+        {
+          "name": "AlreadyBanned",
+          "description": "User is already banned from this community"
+        }
+      ]
+    }
+  }
+}

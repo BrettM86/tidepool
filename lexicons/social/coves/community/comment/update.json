@@ -1,0 +1,97 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.community.comment.update",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Update an existing comment's content, facets, embed, languages, or labels. Threading references (reply.root and reply.parent) are immutable and cannot be changed.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["uri", "content"],
+          "properties": {
+            "uri": {
+              "type": "string",
+              "format": "at-uri",
+              "description": "AT-URI of the comment to update"
+            },
+            "content": {
+              "type": "string",
+              "maxGraphemes": 10000,
+              "maxLength": 100000,
+              "description": "Updated comment text content"
+            },
+            "facets": {
+              "type": "array",
+              "description": "Updated annotations for rich text (mentions, links, etc.)",
+              "items": {
+                "type": "ref",
+                "ref": "social.coves.richtext.facet"
+              }
+            },
+            "embed": {
+              "type": "union",
+              "description": "Updated embedded media or quoted posts",
+              "refs": [
+                "social.coves.embed.images",
+                "social.coves.embed.post"
+              ]
+            },
+            "langs": {
+              "type": "array",
+              "description": "Updated languages used in the comment content (ISO 639-1)",
+              "maxLength": 3,
+              "items": {
+                "type": "string",
+                "format": "language"
+              }
+            },
+            "labels": {
+              "type": "ref",
+              "ref": "com.atproto.label.defs#selfLabels",
+              "description": "Updated self-applied content labels"
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["uri", "cid"],
+          "properties": {
+            "uri": {
+              "type": "string",
+              "format": "at-uri",
+              "description": "AT-URI of the updated comment (unchanged from input)"
+            },
+            "cid": {
+              "type": "string",
+              "format": "cid",
+              "description": "New CID of the updated comment record"
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "CommentNotFound",
+          "description": "Comment with the specified URI does not exist"
+        },
+        {
+          "name": "ContentTooLong",
+          "description": "Updated comment content exceeds maximum length constraints"
+        },
+        {
+          "name": "ContentEmpty",
+          "description": "Updated comment content is empty or contains only whitespace"
+        },
+        {
+          "name": "NotAuthorized",
+          "description": "User is not authorized to update this comment (not the author)"
+        }
+      ]
+    }
+  }
+}

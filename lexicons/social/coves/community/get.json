@@ -1,0 +1,29 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.community.get",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Get detailed information about a community. Authentication optional; viewer state will be included if authenticated.",
+      "parameters": {
+        "type": "params",
+        "required": ["community"],
+        "properties": {
+          "community": {
+            "type": "string",
+            "format": "at-identifier",
+            "description": "DID or handle of the community"
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "social.coves.community.defs#communityViewDetailed",
+          "description": "Detailed community view with stats and viewer state"
+        }
+      }
+    }
+  }
+}

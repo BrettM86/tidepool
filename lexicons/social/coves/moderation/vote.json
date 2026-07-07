@@ -1,0 +1,35 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.moderation.vote",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A vote on a moderation action or rule change",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["subject", "vote", "createdAt"],
+        "properties": {
+          "subject": {
+            "type": "string",
+            "format": "at-uri",
+            "description": "AT-URI of the proposal being voted on"
+          },
+          "vote": {
+            "type": "string",
+            "enum": ["approve", "reject", "abstain"]
+          },
+          "reason": {
+            "type": "string",
+            "maxLength": 1000,
+            "description": "Optional reason for the vote"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime"
+          }
+        }
+      }
+    }
+  }
+}

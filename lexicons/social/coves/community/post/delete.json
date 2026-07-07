@@ -1,0 +1,41 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.community.post.delete",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Delete a post",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["uri"],
+          "properties": {
+            "uri": {
+              "type": "string",
+              "format": "at-uri",
+              "description": "AT-URI of the post to delete"
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "properties": {}
+        }
+      },
+      "errors": [
+        {
+          "name": "PostNotFound",
+          "description": "Post not found"
+        },
+        {
+          "name": "NotAuthorized",
+          "description": "User is not authorized to delete this post"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,286 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.community.post.get",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Get posts by AT-URI. Supports batch fetching for feed hydration. Returns posts in same order as input URIs.",
+      "parameters": {
+        "type": "params",
+        "required": ["uris"],
+        "properties": {
+          "uris": {
+            "type": "array",
+            "description": "List of post AT-URIs to fetch (max 25)",
+            "items": {
+              "type": "string",
+              "format": "at-uri"
+            },
+            "maxLength": 25,
+            "minLength": 1
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["posts"],
+          "properties": {
+            "posts": {
+              "type": "array",
+              "description": "Array of post views. May include notFound/blocked entries for missing posts.",
+              "items": {
+                "type": "union",
+                "refs": ["#postView", "#notFoundPost", "#blockedPost"]
+              }
+            }
+          }
+        }
+      },
+      "errors": [
+        {"name": "InvalidRequest", "description": "Invalid URI format or empty array"}
+      ]
+    },
+    "postView": {
+      "type": "object",
+      "required": ["uri", "cid", "author", "record", "community", "createdAt", "indexedAt"],
+      "properties": {
+        "uri": {
+          "type": "string",
+          "format": "at-uri"
+        },
+        "cid": {
+          "type": "string",
+          "format": "cid"
+        },
+        "author": {
+          "type": "ref",
+          "ref": "#authorView"
+        },
+        "record": {
+          "type": "unknown",
+          "description": "The actual post record (text, image, video, etc.)"
+        },
+        "community": {
+          "type": "ref",
+          "ref": "#communityRef"
+        },
+        "embed": {
+          "type": "union",
+          "description": "Embedded content (images, video, link preview, or quoted post)",
+          "refs": [
+            "social.coves.embed.images#view",
+            "social.coves.embed.video#view",
+            "social.coves.embed.external#view",
+            "social.coves.embed.record#view",
+            "social.coves.embed.recordWithMedia#view"
+          ]
+        },
+        "language": {
+          "type": "string",
+          "format": "language"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "datetime"
+        },
+        "editedAt": {
+          "type": "string",
+          "format": "datetime"
+        },
+        "indexedAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "When this post was indexed by the AppView"
+        },
+        "stats": {
+          "type": "ref",
+          "ref": "#postStats"
+        },
+        "viewer": {
+          "type": "ref",
+          "ref": "#viewerState"
+        }
+      }
+    },
+    "authorView": {
+      "type": "object",
+      "required": ["did", "handle"],
+      "properties": {
+        "did": {
+          "type": "string",
+          "format": "did"
+        },
+        "handle": {
+          "type": "string",
+          "format": "handle"
+        },
+        "displayName": {
+          "type": "string"
+        },
+        "avatar": {
+          "type": "string",
+          "format": "uri"
+        },
+        "reputation": {
+          "type": "integer",
+          "description": "Author's reputation in the community"
+        }
+      }
+    },
+    "communityRef": {
+      "type": "object",
+      "required": ["did", "name"],
+      "properties": {
+        "did": {
+          "type": "string",
+          "format": "did"
+        },
+        "handle": {
+          "type": "string",
+          "format": "handle",
+          "description": "Current handle resolved from DID"
+        },
+        "name": {
+          "type": "string"
+        },
+        "avatar": {
+          "type": "string",
+          "format": "uri"
+        }
+      }
+    },
+    "notFoundPost": {
+      "type": "object",
+      "description": "Post was not found (deleted, never indexed, or invalid URI)",
+      "required": ["uri", "notFound"],
+      "properties": {
+        "uri": {
+          "type": "string",
+          "format": "at-uri"
+        },
+        "notFound": {
+          "type": "boolean",
+          "const": true
+        }
+      }
+    },
+    "blockedPost": {
+      "type": "object",
+      "description": "Post is blocked due to viewer blocking author/community, or community moderation",
+      "required": ["uri", "blocked"],
+      "properties": {
+        "uri": {
+          "type": "string",
+          "format": "at-uri"
+        },
+        "blocked": {
+          "type": "boolean",
+          "const": true
+        },
+        "blockedBy": {
+          "type": "string",
+          "knownValues": ["author", "community", "moderator"],
+          "description": "What caused the block: viewer blocked author, viewer blocked community, or post was removed by moderators"
+        },
+        "author": {
+          "type": "ref",
+          "ref": "#blockedAuthor"
+        },
+        "community": {
+          "type": "ref",
+          "ref": "#blockedCommunity"
+        }
+      }
+    },
+    "blockedAuthor": {
+      "type": "object",
+      "description": "Minimal author info for blocked posts",
+      "required": ["did"],
+      "properties": {
+        "did": {
+          "type": "string",
+          "format": "did"
+        }
+      }
+    },
+    "blockedCommunity": {
+      "type": "object",
+      "description": "Minimal community info for blocked posts",
+      "required": ["did"],
+      "properties": {
+        "did": {
+          "type": "string",
+          "format": "did"
+        },
+        "name": {
+          "type": "string"
+        }
+      }
+    },
+    "postStats": {
+      "type": "object",
+      "required": ["upvotes", "downvotes", "score", "commentCount"],
+      "properties": {
+        "upvotes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "downvotes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "score": {
+          "type": "integer",
+          "description": "Calculated score (upvotes - downvotes)"
+        },
+        "commentCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "shareCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tagCounts": {
+          "type": "object",
+          "description": "Aggregate counts of tags applied by community members",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "viewerState": {
+      "type": "object",
+      "properties": {
+        "vote": {
+          "type": "string",
+          "knownValues": ["up", "down"],
+          "description": "Viewer's vote on this post"
+        },
+        "voteUri": {
+          "type": "string",
+          "format": "at-uri"
+        },
+        "saved": {
+          "type": "boolean"
+        },
+        "savedUri": {
+          "type": "string",
+          "format": "at-uri"
+        },
+        "tags": {
+          "type": "array",
+          "description": "Tags applied by the viewer to this post",
+          "items": {
+            "type": "string",
+            "maxLength": 32
+          }
+        }
+      }
+    }
+  }
+}

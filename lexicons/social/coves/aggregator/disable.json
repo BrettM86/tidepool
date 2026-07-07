@@ -1,0 +1,67 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.aggregator.disable",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Disable an aggregator for a community. Updates the authorization record to set enabled=false. Requires moderator permissions.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["community", "aggregatorDid"],
+          "properties": {
+            "community": {
+              "type": "string",
+              "format": "at-identifier",
+              "description": "DID or handle of the community"
+            },
+            "aggregatorDid": {
+              "type": "string",
+              "format": "did",
+              "description": "DID of the aggregator to disable"
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["uri", "cid"],
+          "properties": {
+            "uri": {
+              "type": "string",
+              "format": "at-uri",
+              "description": "AT-URI of the updated authorization record"
+            },
+            "cid": {
+              "type": "string",
+              "format": "cid",
+              "description": "CID of the updated authorization record"
+            },
+            "disabledAt": {
+              "type": "string",
+              "format": "datetime",
+              "description": "When the aggregator was disabled"
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "NotAuthorized",
+          "description": "Caller is not a moderator of this community"
+        },
+        {
+          "name": "AuthorizationNotFound",
+          "description": "Aggregator is not enabled for this community"
+        },
+        {
+          "name": "AlreadyDisabled",
+          "description": "Aggregator is already disabled"
+        }
+      ]
+    }
+  }
+}

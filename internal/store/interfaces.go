@@ -44,6 +44,12 @@ type APObjects interface {
 	//     dropped, never re-fetched.
 	ResolveStrongRef(ctx context.Context, apID string) (atURI string, cid string, err error)
 
+	// ListByActorDID returns all live (not soft-deleted) mappings whose
+	// record either lives in the actor's repo (did) or was authored by the
+	// actor into another repo (author_did — posts live in community repos).
+	// Task 05's Delete(Actor) scrub enumerates these.
+	ListByActorDID(ctx context.Context, did string) ([]*APObjectMapping, error)
+
 	// SoftDelete marks the mapping for an AP object id as deleted, in one
 	// atomic statement. Deleting an already-deleted mapping is a no-op that
 	// preserves the original tombstone time; a missing mapping is an error

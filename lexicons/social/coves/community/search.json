@@ -1,0 +1,57 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.community.search",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Search for communities by name or description",
+      "parameters": {
+        "type": "params",
+        "required": ["q"],
+        "properties": {
+          "q": {
+            "type": "string",
+            "description": "Search query"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 50
+          },
+          "cursor": {
+            "type": "string"
+          },
+          "category": {
+            "type": "string",
+            "description": "Filter by category"
+          },
+          "language": {
+            "type": "string",
+            "format": "language",
+            "description": "Filter by language"
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["communities"],
+          "properties": {
+            "communities": {
+              "type": "array",
+              "items": {
+                "type": "ref",
+                "ref": "social.coves.community.defs#communityView"
+              }
+            },
+            "cursor": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,97 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.community.getMembers",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Get list of users with membership status in a community",
+      "parameters": {
+        "type": "params",
+        "required": ["community"],
+        "properties": {
+          "community": {
+            "type": "string",
+            "format": "at-identifier",
+            "description": "DID or handle of the community"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 50
+          },
+          "cursor": {
+            "type": "string"
+          },
+          "sort": {
+            "type": "string",
+            "knownValues": ["reputation", "recent", "alphabetical"],
+            "default": "reputation",
+            "maxLength": 64
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["members"],
+          "properties": {
+            "members": {
+              "type": "array",
+              "items": {
+                "type": "ref",
+                "ref": "#memberView"
+              }
+            },
+            "cursor": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "memberView": {
+      "type": "object",
+      "required": ["did", "memberSince", "reputation"],
+      "properties": {
+        "did": {
+          "type": "string",
+          "format": "did"
+        },
+        "handle": {
+          "type": "string",
+          "format": "handle"
+        },
+        "displayName": {
+          "type": "string"
+        },
+        "avatar": {
+          "type": "string",
+          "format": "uri"
+        },
+        "memberSince": {
+          "type": "string",
+          "format": "datetime"
+        },
+        "reputation": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "isModerator": {
+          "type": "boolean"
+        },
+        "postCount": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of posts in this community"
+        },
+        "commentCount": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of comments in this community"
+        }
+      }
+    }
+  }
+}

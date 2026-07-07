@@ -1,0 +1,80 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.community.comment",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A comment on a post or another comment. Comments live in user repositories and support nested threading.",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["reply", "content", "createdAt"],
+        "properties": {
+          "reply": {
+            "type": "ref",
+            "ref": "#replyRef",
+            "description": "Reference to the post and parent being replied to"
+          },
+          "content": {
+            "type": "string",
+            "maxGraphemes": 3000,
+            "maxLength": 30000,
+            "description": "Comment text content"
+          },
+          "facets": {
+            "type": "array",
+            "description": "Annotations for rich text (mentions, links, etc.)",
+            "items": {
+              "type": "ref",
+              "ref": "social.coves.richtext.facet"
+            }
+          },
+          "embed": {
+            "type": "union",
+            "description": "Embedded media or quoted posts",
+            "refs": [
+              "social.coves.embed.images",
+              "social.coves.embed.post"
+            ]
+          },
+          "langs": {
+            "type": "array",
+            "description": "Languages used in the comment content (ISO 639-1)",
+            "maxLength": 3,
+            "items": {
+              "type": "string",
+              "format": "language"
+            }
+          },
+          "labels": {
+            "type": "ref",
+            "ref": "com.atproto.label.defs#selfLabels",
+            "description": "Self-applied content labels"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "Timestamp of comment creation"
+          }
+        }
+      }
+    },
+    "replyRef": {
+      "type": "object",
+      "description": "References for maintaining thread structure. Root always points to the original post, parent points to the immediate parent (post or comment).",
+      "required": ["root", "parent"],
+      "properties": {
+        "root": {
+          "type": "ref",
+          "ref": "com.atproto.repo.strongRef",
+          "description": "Strong reference to the original post that started the thread"
+        },
+        "parent": {
+          "type": "ref",
+          "ref": "com.atproto.repo.strongRef",
+          "description": "Strong reference to the immediate parent (post or comment) being replied to"
+        }
+      }
+    }
+  }
+}

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -54,6 +55,17 @@ type Config struct {
 	// window get an OutdatedCursor #info frame and resume from the oldest
 	// retained event.
 	FirehoseRetention time.Duration
+	// MaxBlobBytes caps how many bytes of remote media (avatars, banners,
+	// post images) the materializer will download and store per blob
+	// (MAX_BLOB_BYTES, default 5 MiB). Individual lexicon slots impose
+	// tighter caps (e.g. avatars max 1 MB); this is the outer transport
+	// budget. Fails closed: oversized media is dropped, never truncated.
+	MaxBlobBytes int64
+	// ProfileRefreshTTL is how stale a bridged actor's materialized profile
+	// may get before the materializer re-fetches and re-materializes it
+	// (PROFILE_REFRESH_TTL, a Go duration, default 24h). AP Update{Person|
+	// Group} activities refresh immediately regardless.
+	ProfileRefreshTTL time.Duration
 	// RelayHosts lists relays to send com.atproto.sync.requestCrawl to on
 	// startup (RELAY_HOSTS, comma-separated, optional). In development the
 	// request is logged instead of sent — dev hosts are not publicly
@@ -133,6 +145,33 @@ func Load(logger *slog.Logger) (*Config, error) {
 	}
 	if cfg.FirehoseRetention <= 0 {
 		return nil, fmt.Errorf("config: FIREHOSE_RETENTION must be positive, got %s", cfg.FirehoseRetention)
+	}
+
+	// Blob budget and profile refresh are tuning knobs like retention:
+	// real defaults in every environment.
+	maxBlobRaw := os.Getenv("MAX_BLOB_BYTES")
+	if maxBlobRaw == "" {
+		cfg.MaxBlobBytes = 5 << 20 // 5 MiB
+		logger.Info("MAX_BLOB_BYTES not set, using default", "value", cfg.MaxBlobBytes)
+	} else {
+		parsed, err := strconv.ParseInt(maxBlobRaw, 10, 64)
+		if err != nil || parsed <= 0 {
+			return nil, fmt.Errorf("config: MAX_BLOB_BYTES must be a positive integer, got %q", maxBlobRaw)
+		}
+		cfg.MaxBlobBytes = parsed
+	}
+
+	profileTTLRaw := os.Getenv("PROFILE_REFRESH_TTL")
+	if profileTTLRaw == "" {
+		profileTTLRaw = "24h"
+		logger.Info("PROFILE_REFRESH_TTL not set, using default", "value", profileTTLRaw)
+	}
+	cfg.ProfileRefreshTTL, err = time.ParseDuration(profileTTLRaw)
+	if err != nil {
+		return nil, fmt.Errorf("config: PROFILE_REFRESH_TTL must be a Go duration (e.g. 24h): %w", err)
+	}
+	if cfg.ProfileRefreshTTL <= 0 {
+		return nil, fmt.Errorf("config: PROFILE_REFRESH_TTL must be positive, got %s", cfg.ProfileRefreshTTL)
 	}
 
 	// Optional relay list for requestCrawl on startup.

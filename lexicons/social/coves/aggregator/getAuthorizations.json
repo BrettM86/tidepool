@@ -1,0 +1,64 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.aggregator.getAuthorizations",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Get list of communities that have authorized a specific aggregator. Used by aggregators to query which communities they can post to. Authentication optional.",
+      "parameters": {
+        "type": "params",
+        "required": ["aggregatorDid"],
+        "properties": {
+          "aggregatorDid": {
+            "type": "string",
+            "format": "did",
+            "description": "DID of the aggregator"
+          },
+          "enabledOnly": {
+            "type": "boolean",
+            "default": true,
+            "description": "Only return enabled authorizations"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 50,
+            "description": "Maximum number of authorizations to return"
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Pagination cursor"
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["authorizations"],
+          "properties": {
+            "authorizations": {
+              "type": "array",
+              "items": {
+                "type": "ref",
+                "ref": "social.coves.aggregator.defs#communityAuthView"
+              },
+              "description": "Array of community authorizations for this aggregator"
+            },
+            "cursor": {
+              "type": "string",
+              "description": "Pagination cursor for next page"
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "AggregatorNotFound",
+          "description": "Aggregator DID does not exist or has no service declaration"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,80 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.community.post.search",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Search for posts",
+      "parameters": {
+        "type": "params",
+        "required": ["q"],
+        "properties": {
+          "q": {
+            "type": "string",
+            "description": "Search query"
+          },
+          "community": {
+            "type": "string",
+            "format": "at-identifier",
+            "description": "Filter by specific community"
+          },
+          "author": {
+            "type": "string",
+            "format": "at-identifier",
+            "description": "Filter by author"
+          },
+          "type": {
+            "type": "string",
+            "knownValues": ["text", "image", "video", "article", "microblog"],
+            "description": "Filter by post type"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Filter by tags"
+          },
+          "sort": {
+            "type": "string",
+            "knownValues": ["relevance", "new", "top"],
+            "default": "relevance"
+          },
+          "timeframe": {
+            "type": "string",
+            "knownValues": ["hour", "day", "week", "month", "year", "all"],
+            "default": "all"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 50
+          },
+          "cursor": {
+            "type": "string"
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["posts"],
+          "properties": {
+            "posts": {
+              "type": "array",
+              "items": {
+                "type": "ref",
+                "ref": "social.coves.feed.defs#feedViewPost"
+              }
+            },
+            "cursor": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    }
+  }
+}

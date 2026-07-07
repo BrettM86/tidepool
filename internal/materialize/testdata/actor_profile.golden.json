@@ -1,0 +1,22 @@
+{
+  "$type": "social.coves.actor.profile",
+  "avatar": {
+    "$type": "blob",
+    "ref": {
+      "$link": "bafkreib33oum3wmf36mezw4nv2nf3kolsdorvwtxfsjm7aj3rdekmbrlqy"
+    },
+    "mimeType": "image/png",
+    "size": 67
+  },
+  "banner": {
+    "$type": "blob",
+    "ref": {
+      "$link": "bafkreib33oum3wmf36mezw4nv2nf3kolsdorvwtxfsjm7aj3rdekmbrlqy"
+    },
+    "mimeType": "image/png",
+    "size": 67
+  },
+  "bio": "🌉 bridged from @LeftLeaningFreedomFighters@lemmy.world by Tidepool",
+  "createdAt": "2026-06-27T20:59:46.499Z",
+  "displayName": "Surprised Neelix"
+}

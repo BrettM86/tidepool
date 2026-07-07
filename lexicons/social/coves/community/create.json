@@ -1,0 +1,133 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.community.create",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Create a new community. Requires authentication.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["name", "description"],
+          "properties": {
+            "name": {
+              "type": "string",
+              "maxGraphemes": 64,
+              "maxLength": 640,
+              "description": "Community display name"
+            },
+            "description": {
+              "type": "string",
+              "maxGraphemes": 300,
+              "maxLength": 3000,
+              "description": "Community description"
+            },
+            "avatar": {
+              "type": "blob",
+              "accept": ["image/png", "image/jpeg", "image/webp"],
+              "maxSize": 1000000
+            },
+            "banner": {
+              "type": "blob",
+              "accept": ["image/png", "image/jpeg", "image/webp"],
+              "maxSize": 2000000
+            },
+            "avatarMimeType": {
+              "type": "string",
+              "maxLength": 128,
+              "description": "MIME type of avatar blob (image/png, image/jpeg, image/webp)"
+            },
+            "bannerMimeType": {
+              "type": "string",
+              "maxLength": 128,
+              "description": "MIME type of banner blob (image/png, image/jpeg, image/webp)"
+            },
+            "rules": {
+              "type": "array",
+              "maxLength": 10,
+              "items": {
+                "type": "string",
+                "maxGraphemes": 200,
+                "maxLength": 2000
+              },
+              "description": "Community rules"
+            },
+            "categories": {
+              "type": "array",
+              "maxLength": 3,
+              "items": {
+                "type": "string",
+                "maxLength": 50
+              },
+              "description": "Community categories for discovery"
+            },
+            "language": {
+              "type": "string",
+              "format": "language",
+              "description": "Primary language of the community"
+            },
+            "membershipThreshold": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 10000,
+              "default": 100,
+              "description": "Reputation threshold required for membership"
+            },
+            "visibility": {
+              "type": "string",
+              "knownValues": ["public", "unlisted", "private"],
+              "default": "public",
+              "maxLength": 64,
+              "description": "Community visibility level"
+            },
+            "allowExternalDiscovery": {
+              "type": "boolean",
+              "default": true,
+              "description": "Whether other Coves instances can index and discover this community"
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["uri", "cid", "did", "handle"],
+          "properties": {
+            "uri": {
+              "type": "string",
+              "format": "at-uri",
+              "description": "AT-URI of the created community profile"
+            },
+            "cid": {
+              "type": "string",
+              "format": "cid",
+              "description": "CID of the created community profile"
+            },
+            "did": {
+              "type": "string",
+              "format": "did",
+              "description": "DID of the created community"
+            },
+            "handle": {
+              "type": "string",
+              "maxLength": 512,
+              "description": "Scoped handle of the created community (~name@instance)"
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "NameTaken",
+          "description": "Community name is already taken"
+        },
+        {
+          "name": "TooManyCommunities",
+          "description": "User has reached the maximum number of communities they can create"
+        }
+      ]
+    }
+  }
+}

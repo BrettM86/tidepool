@@ -1,0 +1,75 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.aggregator.enable",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Enable an aggregator for a community. Creates an authorization record in the community's repository. Requires moderator permissions.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["community", "aggregatorDid"],
+          "properties": {
+            "community": {
+              "type": "string",
+              "format": "at-identifier",
+              "description": "DID or handle of the community"
+            },
+            "aggregatorDid": {
+              "type": "string",
+              "format": "did",
+              "description": "DID of the aggregator to enable"
+            },
+            "config": {
+              "type": "unknown",
+              "description": "Aggregator-specific configuration. Must conform to the aggregator's configSchema."
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["uri", "cid", "authorization"],
+          "properties": {
+            "uri": {
+              "type": "string",
+              "format": "at-uri",
+              "description": "AT-URI of the created authorization record"
+            },
+            "cid": {
+              "type": "string",
+              "format": "cid",
+              "description": "CID of the created authorization record"
+            },
+            "authorization": {
+              "type": "ref",
+              "ref": "social.coves.aggregator.defs#authorizationView",
+              "description": "The created authorization details"
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "NotAuthorized",
+          "description": "Caller is not a moderator of this community"
+        },
+        {
+          "name": "AggregatorNotFound",
+          "description": "Aggregator DID does not exist or has no service declaration"
+        },
+        {
+          "name": "InvalidConfig",
+          "description": "Config does not match aggregator's configSchema"
+        },
+        {
+          "name": "AlreadyEnabled",
+          "description": "Aggregator is already enabled for this community"
+        }
+      ]
+    }
+  }
+}

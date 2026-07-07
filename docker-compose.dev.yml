@@ -1,0 +1,63 @@
+# Tidepool local development stack (Coves-style profiles).
+#
+# Usage:
+#   make dev-up     # start the dev database (port 5442)
+#   make test       # starts postgres-test (port 5443) and runs the suite
+#   make dev-down   # stop everything
+#
+# Ports 5442/5443 are chosen to stay clear of the Coves stack
+# (5434 test, 5435 dev, 5436 plc).
+
+services:
+  # Development database (port 5442)
+  postgres:
+    image: postgres:16
+    container_name: tidepool-dev-postgres
+    ports:
+      - "5442:5432"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-tidepool_dev}
+      POSTGRES_USER: ${POSTGRES_USER:-tidepool}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tidepool}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - tidepool-dev
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tidepool} -d ${POSTGRES_DB:-tidepool_dev}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Test database (port 5443) — used by `make test`
+  postgres-test:
+    image: postgres:16
+    container_name: tidepool-test-postgres
+    ports:
+      - "${POSTGRES_TEST_PORT:-5443}:5432"
+    environment:
+      POSTGRES_DB: ${POSTGRES_TEST_DB:-tidepool_test}
+      POSTGRES_USER: ${POSTGRES_TEST_USER:-tidepool_test}
+      POSTGRES_PASSWORD: ${POSTGRES_TEST_PASSWORD:-tidepool_test}
+    volumes:
+      - postgres-test-data:/var/lib/postgresql/data
+    networks:
+      - tidepool-dev
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_TEST_USER:-tidepool_test} -d ${POSTGRES_TEST_DB:-tidepool_test}"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+    profiles:
+      - test
+
+networks:
+  tidepool-dev:
+    driver: bridge
+    name: tidepool-dev-network
+
+volumes:
+  postgres-data:
+    name: tidepool-dev-postgres-data
+  postgres-test-data:
+    name: tidepool-test-postgres-data

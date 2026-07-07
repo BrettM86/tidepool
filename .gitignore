@@ -1,0 +1,15 @@
+# Build artifacts
+/tidepool
+
+# Environment files with secrets
+.env
+.env.local
+
+# Editor/OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Go tooling
+coverage.out

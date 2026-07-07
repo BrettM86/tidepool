@@ -1,0 +1,121 @@
+// Command tidepool runs the ActivityPub→atproto bridge. main stays thin:
+// config, database, migrations (dev only), a chi router that later tasks
+// register their subsystems on, and graceful shutdown.
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+
+	"tidepool/internal/config"
+	"tidepool/internal/db"
+)
+
+const (
+	readHeaderTimeout = 10 * time.Second
+	writeTimeout      = 30 * time.Second
+	idleTimeout       = 2 * time.Minute
+	shutdownTimeout   = 15 * time.Second
+)
+
+func main() {
+	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	slog.SetDefault(logger)
+
+	if err := run(logger); err != nil {
+		logger.Error("tidepool exited with error", "error", err)
+		os.Exit(1)
+	}
+}
+
+func run(logger *slog.Logger) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	cfg, err := config.Load(logger)
+	if err != nil {
+		return err
+	}
+
+	database, err := db.Open(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = database.Close() }()
+
+	if cfg.IsDevelopment() {
+		logger.Info("development environment: applying migrations on start")
+		if err := db.MigrateUp(ctx, database); err != nil {
+			return err
+		}
+	}
+
+	router := chi.NewRouter()
+	router.Use(middleware.RequestID)
+	router.Use(middleware.Recoverer)
+
+	router.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		if err := database.PingContext(r.Context()); err != nil {
+			logger.Error("health check failed", "error", err)
+			http.Error(w, "database unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	// Later tasks register here: AP inbox + WebFinger (02/06),
+	// com.atproto.sync.* + subscribeRepos (04), vote aggregates XRPC (07).
+
+	server := &http.Server{
+		Addr:              cfg.ListenAddr,
+		Handler:           router,
+		ReadHeaderTimeout: readHeaderTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       idleTimeout,
+	}
+
+	serverErrors := make(chan error, 1)
+	go func() {
+		logger.Info("tidepool listening",
+			"addr", cfg.ListenAddr,
+			"environment", cfg.Environment,
+			"bridge_hostname", cfg.BridgeHostname,
+		)
+		serverErrors <- server.ListenAndServe()
+	}()
+
+	select {
+	case err := <-serverErrors:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("http server: %w", err)
+		}
+		return nil
+	case <-ctx.Done():
+		logger.Info("shutdown signal received, draining connections")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			return fmt.Errorf("graceful shutdown: %w", err)
+		}
+		// ListenAndServe has returned by now (Shutdown guarantees it);
+		// drain its error so a bind failure racing the signal still exits
+		// non-zero instead of being lost in the buffered channel.
+		if err := <-serverErrors; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("http server: %w", err)
+		}
+		logger.Info("shutdown complete")
+		return nil
+	}
+}

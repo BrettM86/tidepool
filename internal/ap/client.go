@@ -589,13 +589,24 @@ func (c *Client) SendActivity(ctx context.Context, inboxURL string, activity any
 // document is fetched from the keyId minus fragment (Lemmy convention:
 // "{actor}#main-key").
 func (c *Client) ResolveKey(ctx context.Context, keyID string) (*rsa.PublicKey, string, error) {
+	key, ownerID, _, err := c.ResolveKeyDetailed(ctx, keyID)
+	return key, ownerID, err
+}
+
+// ResolveKeyDetailed is ResolveKey plus cache provenance: fromCache reports
+// whether the key was served from the positive cache. The Verifier uses it
+// to gate its rotation retry — only a cached key can be stale, so only a
+// cached key that fails verification earns a fresh re-fetch (bounding the
+// outbound-fetch amplification a forged delivery can cause).
+func (c *Client) ResolveKeyDetailed(ctx context.Context, keyID string) (key *rsa.PublicKey, ownerID string, fromCache bool, err error) {
 	c.mu.Lock()
 	cached, ok := c.keyCache[keyID]
 	c.mu.Unlock()
 	if ok && c.now().Before(cached.expiresAt) {
-		return cached.key, cached.ownerID, nil
+		return cached.key, cached.ownerID, true, nil
 	}
-	return c.resolveKeyUncached(ctx, keyID)
+	key, ownerID, err = c.resolveKeyUncached(ctx, keyID)
+	return key, ownerID, false, err
 }
 
 // resolveKeyUncached fetches and validates the actor for keyID, bypassing the

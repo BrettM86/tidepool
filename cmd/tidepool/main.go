@@ -21,6 +21,8 @@ import (
 	"tidepool/internal/config"
 	"tidepool/internal/db"
 	"tidepool/internal/identity"
+	"tidepool/internal/ingest"
+	"tidepool/internal/materialize"
 	"tidepool/internal/repo"
 	"tidepool/internal/store"
 	tidepoolsync "tidepool/internal/sync"
@@ -134,8 +136,142 @@ func run(logger *slog.Logger) error {
 		}
 	}
 
-	// Later tasks register here: AP inbox + WebFinger (02/06),
-	// vote aggregates XRPC (07).
+	// The ingestion pipeline (task 06): AP inbox + signature verification,
+	// the durable work queue, activity dispatch into the materializer, the
+	// community Follow lifecycle, outbox backfill, and consent enforcement.
+	serviceKeys := store.NewServiceKeys(database)
+	serviceActor, err := ap.LoadOrCreateServiceActor(ctx, serviceKeys, cfg.BridgeHostname)
+	if err != nil {
+		return err
+	}
+	apClient := ap.NewClient(ap.ClientOptions{
+		UserAgent:             cfg.UserAgent,
+		Signer:                serviceActor.Signer(),
+		AllowPrivateAddresses: cfg.AllowPrivateAddresses,
+	})
+
+	rotationKey, err := identity.LoadOrCreateRotationKey(ctx, serviceKeys, custodian)
+	if err != nil {
+		return err
+	}
+	minter, err := identity.NewMinter(identity.MinterOptions{
+		PLCDirectoryURL: cfg.PLCDirectoryURL,
+		BridgeHostname:  cfg.BridgeHostname,
+		RotationKey:     rotationKey,
+		Custodian:       custodian,
+		Actors:          actors,
+		HTTPClient:      ap.NewGuardedHTTPClient(cfg.AllowPrivateAddresses, 30*time.Second),
+		UserAgent:       cfg.UserAgent,
+		Logger:          logger,
+	})
+	if err != nil {
+		return err
+	}
+	// Inbound AP activity can trigger DID minting (unseen authors), so the
+	// materializer's minter goes through the rate gate.
+	mintGate, err := ingest.NewMintGate(minter, cfg.MintRatePerMinute, cfg.MintBurst, logger)
+	if err != nil {
+		return err
+	}
+
+	// The bridge's own DID (community.profile createdBy/hostedBy). An
+	// operator may pre-provision one; otherwise the bridge identifies as
+	// did:web on its own hostname.
+	serviceDID := cfg.BridgeServiceDID
+	if serviceDID == "" {
+		serviceDID = "did:web:" + cfg.BridgeHostname
+		logger.Info("BRIDGE_SERVICE_DID not set, deriving from hostname", "did", serviceDID)
+	}
+
+	objects := store.NewAPObjects(database)
+	communities := store.NewCommunities(database)
+	tombstones := store.NewTombstones(database)
+	inboxEvents := store.NewInboxEvents(database)
+
+	materializer, err := materialize.New(materialize.Options{
+		Fetcher:           apClient,
+		Objects:           objects,
+		Actors:            actors,
+		Communities:       communities,
+		Repos:             repoManager,
+		Minter:            mintGate,
+		ServiceDID:        serviceDID,
+		ProfileRefreshTTL: cfg.ProfileRefreshTTL,
+		MaxBlobBytes:      cfg.MaxBlobBytes,
+		StrictValidation:  cfg.IsDevelopment(),
+		Logger:            logger,
+	})
+	if err != nil {
+		return err
+	}
+
+	backfill, err := ingest.NewBackfill(ingest.BackfillOptions{
+		Fetcher:      apClient,
+		Materializer: materializer,
+		Communities:  communities,
+		Tombstones:   tombstones,
+		MaxPosts:     cfg.BackfillMaxPosts,
+		// Async runs derive from the run context so a mid-run backfill stops
+		// pulling remote pages once shutdown starts; the drain below waits for
+		// it, and an interrupted run leaves last_backfill_at unset (resumable).
+		BaseContext: ctx,
+		Logger:      logger,
+	})
+	if err != nil {
+		return err
+	}
+	handler, err := ingest.NewHandler(ingest.HandlerOptions{
+		Materializer:   materializer,
+		Fetcher:        apClient,
+		Objects:        objects,
+		Communities:    communities,
+		Tombstones:     tombstones,
+		Votes:          ingest.NewNoopVotes(logger), // task 07 replaces this
+		Backfill:       backfill,
+		ServiceActorID: serviceActor.ID,
+		Logger:         logger,
+	})
+	if err != nil {
+		return err
+	}
+	queue, err := ingest.NewQueue(ingest.QueueOptions{
+		Events:    inboxEvents,
+		Processor: handler,
+		Workers:   cfg.IngestWorkers,
+		Logger:    logger,
+	})
+	if err != nil {
+		return err
+	}
+	go queue.Run(ctx)
+
+	inbox, err := ingest.NewInbox(ingest.InboxOptions{
+		Verifier: ap.NewVerifier(apClient),
+		Events:   inboxEvents,
+		Queue:    queue,
+		Service:  serviceActor,
+		Logger:   logger,
+	})
+	if err != nil {
+		return err
+	}
+	inbox.Routes(router)
+
+	admin, err := ingest.NewAdmin(ingest.AdminOptions{
+		Token:        cfg.AdminToken,
+		Client:       apClient,
+		Materializer: materializer,
+		Communities:  communities,
+		Service:      serviceActor,
+		Backfill:     backfill,
+		Logger:       logger,
+	})
+	if err != nil {
+		return err
+	}
+	admin.Routes(router)
+
+	// Task 07 registers here: vote aggregates XRPC.
 
 	server := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -167,6 +303,17 @@ func run(logger *slog.Logger) error {
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			return fmt.Errorf("graceful shutdown: %w", err)
+		}
+		// Drain in-flight backfill. ctx is already cancelled, so async runs
+		// are unwinding (they stop pulling remote pages and leave
+		// last_backfill_at unset, which is resumable). Wait bounded so a stuck
+		// run can't hold shutdown open past the deadline.
+		drained := make(chan struct{})
+		go func() { backfill.Wait(); close(drained) }()
+		select {
+		case <-drained:
+		case <-shutdownCtx.Done():
+			logger.Warn("backfill drain timed out; abandoning in-flight run (resumable on restart)")
 		}
 		// ListenAndServe has returned by now (Shutdown guarantees it);
 		// drain its error so a bind failure racing the signal still exits

@@ -105,6 +105,9 @@ type Object struct {
 	Image     *Object `json:"image,omitempty"`
 	Published *Time   `json:"published,omitempty"`
 	Updated   *Time   `json:"updated,omitempty"`
+	// Replies, when advertised, is the object's replies collection (a bare
+	// IRI or an inline collection). Task 06's backfill pages through it.
+	Replies *Object `json:"replies,omitempty"`
 
 	// Lemmy emits a single language object on posts/comments but an ARRAY
 	// of language objects on Group actors; Languages accepts both.

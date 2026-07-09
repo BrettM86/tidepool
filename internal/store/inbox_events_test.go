@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -40,14 +41,23 @@ func TestInboxEvents_MarkProcessed(t *testing.T) {
 	_, err := repo.RecordEvent(ctx, testActivityID, "Announce")
 	require.NoError(t, err)
 
-	require.NoError(t, repo.MarkProcessed(ctx, testActivityID))
+	// The worker must hold the claim to record an outcome: the fencing token
+	// is the ClaimedUntil ClaimNext stamped.
+	claimed, err := repo.ClaimNext(ctx, time.Minute)
+	require.NoError(t, err)
+	require.NotNil(t, claimed.ClaimedUntil)
+	token := *claimed.ClaimedUntil
+
+	applied, err := repo.MarkProcessed(ctx, testActivityID, token)
+	require.NoError(t, err)
+	assert.True(t, applied, "the claim holder's outcome must be applied")
 
 	event, err := repo.GetEvent(ctx, testActivityID)
 	require.NoError(t, err)
 	assert.NotNil(t, event.ProcessedAt)
 	assert.Empty(t, event.Error)
 
-	err = repo.MarkProcessed(ctx, "https://lemmy.world/activities/missing")
+	_, err = repo.MarkProcessed(ctx, "https://lemmy.world/activities/missing", token)
 	assert.True(t, errors.IsNotFound(err), "expected IsNotFound, got %v", err)
 }
 
@@ -58,6 +68,13 @@ func TestInboxEvents_MarkFailedThenRecovers(t *testing.T) {
 	_, err := repo.RecordEvent(ctx, testActivityID, "Create")
 	require.NoError(t, err)
 
+	// Claim so the event is leased (MarkFailed leaves the lease intact, so a
+	// later MarkProcessed by the same worker still holds a valid token).
+	claimed, err := repo.ClaimNext(ctx, time.Minute)
+	require.NoError(t, err)
+	require.NotNil(t, claimed.ClaimedUntil)
+	token := *claimed.ClaimedUntil
+
 	require.NoError(t, repo.MarkFailed(ctx, testActivityID, "parent object fetch timed out"))
 
 	event, err := repo.GetEvent(ctx, testActivityID)
@@ -66,7 +83,9 @@ func TestInboxEvents_MarkFailedThenRecovers(t *testing.T) {
 	assert.Equal(t, "parent object fetch timed out", event.Error)
 
 	// A later successful retry clears the error.
-	require.NoError(t, repo.MarkProcessed(ctx, testActivityID))
+	applied, err := repo.MarkProcessed(ctx, testActivityID, token)
+	require.NoError(t, err)
+	assert.True(t, applied)
 	event, err = repo.GetEvent(ctx, testActivityID)
 	require.NoError(t, err)
 	assert.NotNil(t, event.ProcessedAt)
@@ -82,7 +101,12 @@ func TestInboxEvents_MarkFailedOnProcessedEventIsNoOp(t *testing.T) {
 
 	_, err := repo.RecordEvent(ctx, testActivityID, "Create")
 	require.NoError(t, err)
-	require.NoError(t, repo.MarkProcessed(ctx, testActivityID))
+	claimed, err := repo.ClaimNext(ctx, time.Minute)
+	require.NoError(t, err)
+	require.NotNil(t, claimed.ClaimedUntil)
+	applied, err := repo.MarkProcessed(ctx, testActivityID, *claimed.ClaimedUntil)
+	require.NoError(t, err)
+	require.True(t, applied)
 
 	// A late failure report from a stale worker must not un-process an
 	// event a successful retry already completed: no-op success.

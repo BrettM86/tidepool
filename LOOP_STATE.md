@@ -11,7 +11,7 @@ update this file → schedule next. Stop the loop when every task is `done`.
 | 3 | 03-identity-repos | done | (see git log) | 8 reviewers (5 Claude + codex/gemini/glm); 16 fixes (genesis race, seq ordering, MST-corruption-as-NotFound, KeyUse deletes, TID micro-fill) + 7 new tests |
 | 4 | 04-sync-firehose | done | (see git log) | 7/8 reviewers (glm watchdog-killed); fixes: ping starvation, prune-mid-replay OutdatedCursor, broadcaster closed-channel, SeqBounds dirty-read, pruner fail-closed; consent-on-firehose deferred to 06 |
 | 5 | 05-materializer | done | (see git log) | 8 reviewers; fixes: id-authority binding, Note-root panic, create-after-delete, nobridge scrub, embedded-actor trust, byte caps, uri scheme, Group-type check + 9 regression tests |
-| 6 | 06-ingestion | pending | | |
+| 6 | 06-ingestion | done | (see git log) | 8 reviewers (5 Claude + codex/gemini; glm wandered, no JSON); fixes: announced-Delete/Undo scoped to announcer authority (+actor-delete only self), bare Update{Person/Group} no-mint gate, announce content community-authority check, Undo{Delete} restore compensation, handleAccept pending-only, queue lease fencing token + shutdown-cancel handling + processed/poisoned exclusivity, backfillReplies tombstone check, truncation leaves resumable, activityID rand-fail propagates + 14 regression tests |
 | 7 | 07-vote-aggregates | pending | | |
 | 8 | 08-e2e-harness | pending | | |
 
@@ -265,3 +265,80 @@ and deferred TODOs here)
   later). Test gaps still open: embed.images arm + nsfw label shapes are
   never lexicon-validated (only external embed is) — add before trusting
   "all records validate" for image posts.
+
+### From task 06 (ingestion — tasks 07/08 consume this)
+- internal/ingest is the inbox→queue→dispatch→materializer pipeline. Entry:
+  POST /inbox (+/actor/inbox alias) verify-sig → authority-bind signer →
+  dedupe by activity id → Enqueue. GET /actor, /.well-known/webfinger
+  (service actor only), /.well-known/nodeinfo + /nodeinfo/2.0
+  (software.name "tidepool"). Admin (bearer ADMIN_TOKEN, constant-time):
+  POST/DELETE/GET /admin/communities, POST /admin/communities/backfill.
+- TASK 07 SEAM: implement ingest.VoteAggregator — ApplyVote/RetractVote(ctx,
+  vote *ap.Object, communityIRI string). Wired as NewNoopVotes in main.go;
+  swap it. Announce{Like|Dislike}→ApplyVote, Announce{Undo{Like|Dislike}}→
+  RetractVote; communityIRI is "" for bare (non-announced) votes. RetractVote
+  MUST treat nil/bare-IRI vote.Object/vote.Actor as no-ops (don't error/
+  retry). Aggregate COUNT SEEDING is NOT expressible via per-vote ApplyVote —
+  if task 07 seeds historical counts from Lemmy's API, add a separate
+  SeedAggregates method + Backfill wiring (additive, not breaking).
+- QUEUE (store.InboxEvents.Enqueue/ClaimNext/Release/MarkPoisoned/
+  MarkProcessed): durable pg work queue, per-community serial ordering key,
+  FOR UPDATE SKIP LOCKED + NOT-EXISTS older-sibling gate. Outcome contract
+  (identical on Handler.Process, Processor, queue dispatch): nil/IsSkip →
+  processed; IsValidation → poison; else retry w/ exp backoff (cap 1h);
+  attempt-cap → poison. CRITICAL for task 07: the queue is now FENCED —
+  ClaimNext returns claimed_until as a fencing token; Release/MarkPoisoned/
+  MarkProcessed take that token + return (applied bool). A stale worker's
+  write is a silent no-op (applied=false). This exists SO task 07's vote
+  counter arithmetic isn't double-applied — do NOT bypass repo.Manager-style
+  or write vote state outside the queue's outcome path without the same
+  fencing discipline. HEAD-OF-LINE BLOCKING is intentional: a retrying event
+  blocks its whole ordering key (community) until success or poison.
+- Shutdown: processNext no longer classifies ctx-cancellation as a failure
+  (lease lapses → redeliver); outcome writes use context.WithoutCancel so
+  completed work is recorded during shutdown. Residual: a shutdown-
+  interrupted attempt still consumes its ClaimNext attempt increment (not
+  decremented; harmful poison/error-record behavior is gone).
+- AUTHORIZATION MODEL (task 07/08 must preserve): announced (announcer!="")
+  Delete/Undo require ap.SameAuthority(target, announcer) AND for actor
+  targets require target==announcer (a community may delete only itself, not
+  a co-hosted other actor). Announced CONTENT requires communityIRIFrom(obj)
+  == announcer (no bridging a non-subscribed same-host community). Bare
+  (announcer=="") Update{Person|Group} is REFRESH-ONLY: never mints/bridges
+  an unknown actor (was an SSRF+mint-budget vector); embedded actor doc is
+  trusted only when signer==actor, else forced re-fetch. Bare Delete still
+  uses SameAuthority(target, signer) (host-granularity — instance is the
+  trust unit; documented). Undo{Delete} restores mapping BEFORE re-
+  materialize (commitRecord won't resurrect a soft-deleted mapping) and
+  COMPENSATES (re-soft-delete + re-tombstone) if HandleUpdate skips/invalid.
+- Consent: nobridge scrubs but repo stays ACTIVE (reversible, firehose-
+  visible delete commits); only `deleted` deactivates the sync read surface.
+  Still DEFERRED (task 07/08): firehose #account{active:false} frame on
+  consent revocation (subscribers currently rely on scrub delete-commits);
+  ap_tombstones grows unbounded (no pruner — mirror FIREHOSE_RETENTION);
+  NO per-signer/per-IP rate limit on /inbox (queue-flood DoS via many self-
+  signed identities — coarse admission limit is the hardening item);
+  ClaimNext does an O(N) row scan when a community's queue backs up behind a
+  failing event (per-key serialization cost; revisit at scale). Nudge now
+  cascades on successful claim.
+- Backfill: outbox newest→oldest to BACKFILL_MAX_POSTS (100), replies walk
+  when advertised, tombstone-checked on all three paths now. RESUMABLE-BY-
+  REDO: truncation (ErrCollectionTruncated) or failures>0 leave
+  last_backfill_at UNSET so an un-forced re-trigger re-walks; deterministic
+  rkeys make redo idempotent. main.go drains backfill.Wait() on shutdown
+  (bounded); TriggerAsync runs on the root ctx (observes shutdown).
+- New env: ADMIN_TOKEN (required in prod, dev default dev-admin-token),
+  BACKFILL_MAX_POSTS (100), MINT_RATE_PER_MINUTE (60), MINT_BURST (120),
+  INGEST_WORKERS (4). Migration 009: queue columns on inbox_events
+  (payload, actor_id, ordering_key, attempts, next_attempt_at, claimed_until,
+  failed_at) + ap_tombstones table. store grew Tombstones (Record/Exists/
+  Remove), APObjects.Restore, and the fenced InboxEvents queue API.
+- ap.Client.ResolveKeyDetailed exported + Object.Replies field added. Verify
+  fresh-key refetch is now cache-gated (fires only when the failing key came
+  from cache) — bounds forgery amplification.
+- Deferred TEST gaps (task 08 harness): concurrent-worker queue stress
+  (SKIP-LOCKED ordering only tested sequentially); mint-gate "retry via queue
+  backoff" only asserted at unit level, not end-to-end; webfinger/nodeinfo
+  vs what real Lemmy actually queries (needs live Lemmy). activityID rand-
+  fail path is guarded but unit-untestable (Go 1.24+ crypto/rand failure is
+  a fatal crash, not a returnable error).

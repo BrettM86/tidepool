@@ -161,6 +161,28 @@ func (r *postgresAPObjects) SoftDelete(ctx context.Context, apID string) error {
 	return nil
 }
 
+func (r *postgresAPObjects) Restore(ctx context.Context, apID string) error {
+	// Clearing an already-clear deleted_at is harmless, so affected == 0
+	// can only mean the row does not exist.
+	query := `
+		UPDATE ap_objects
+		SET deleted_at = NULL
+		WHERE ap_id = $1`
+
+	result, err := r.db.ExecContext(ctx, query, apID)
+	if err != nil {
+		return fmt.Errorf("restore ap_object %q: %w", apID, err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("restore ap_object %q: rows affected: %w", apID, err)
+	}
+	if affected == 0 {
+		return errors.NewNotFoundError("ap_object", apID)
+	}
+	return nil
+}
+
 // validateMapping checks the atproto identifiers with indigo's syntax
 // package, defaults Origin to fediverse, and derives ATURI from
 // (DID, Collection, RKey).

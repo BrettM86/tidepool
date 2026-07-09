@@ -18,6 +18,8 @@ func clearConfigEnv(t *testing.T) {
 	for _, name := range []string{
 		"ENVIRONMENT", "DATABASE_URL", "LISTEN_ADDR", "BRIDGE_HOSTNAME",
 		"PLC_DIRECTORY_URL", "BRIDGE_SERVICE_DID", "USER_AGENT", "BRIDGE_KEK",
+		"ADMIN_TOKEN", "BACKFILL_MAX_POSTS", "MINT_RATE_PER_MINUTE",
+		"MINT_BURST", "INGEST_WORKERS",
 	} {
 		t.Setenv(name, "")
 	}
@@ -78,6 +80,7 @@ func TestLoad_ProductionWithAllValues(t *testing.T) {
 	t.Setenv("BRIDGE_HOSTNAME", "tidepool.example")
 	t.Setenv("PLC_DIRECTORY_URL", "https://plc.directory")
 	t.Setenv("BRIDGE_KEK", "sfDrM4bIeCJp01ZBTArLPJXNQlD7pcYFsod2An6UAF0=") // base64 form
+	t.Setenv("ADMIN_TOKEN", "prod-admin-token")
 
 	cfg, err := Load(discardLogger())
 	require.NoError(t, err)
@@ -85,6 +88,25 @@ func TestLoad_ProductionWithAllValues(t *testing.T) {
 	assert.Equal(t, "tidepool/0.1 (+https://tidepool.example)", cfg.UserAgent,
 		"user agent default derives from the bridge hostname")
 	assert.Len(t, cfg.BridgeKEK, 32, "base64 KEK decodes to 32 bytes")
+	assert.Equal(t, "prod-admin-token", cfg.AdminToken)
+	assert.Equal(t, 100, cfg.BackfillMaxPosts, "tuning knobs default in every environment")
+	assert.Equal(t, float64(60), cfg.MintRatePerMinute)
+	assert.Equal(t, 120, cfg.MintBurst)
+	assert.Equal(t, 4, cfg.IngestWorkers)
+}
+
+func TestLoad_ProductionRequiresAdminToken(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("ENVIRONMENT", EnvironmentProduction)
+	t.Setenv("DATABASE_URL", "postgres://prod/db")
+	t.Setenv("LISTEN_ADDR", ":8080")
+	t.Setenv("BRIDGE_HOSTNAME", "tidepool.example")
+	t.Setenv("PLC_DIRECTORY_URL", "https://plc.directory")
+	t.Setenv("BRIDGE_KEK", "sfDrM4bIeCJp01ZBTArLPJXNQlD7pcYFsod2An6UAF0=")
+
+	_, err := Load(discardLogger())
+	require.Error(t, err, "production must never run on the public dev-default admin token")
+	assert.Contains(t, err.Error(), "ADMIN_TOKEN")
 }
 
 func TestLoad_ProductionRequiresKEK(t *testing.T) {

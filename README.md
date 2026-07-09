@@ -50,6 +50,70 @@ production**:
 | `ALLOW_PRIVATE_FETCH` | off | dev-only: disables the SSRF egress guard (AP fetches **and** PLC directory requests) so localhost targets work |
 | `FIREHOSE_RETENTION` | `72h` | how long `firehose_events` rows are kept for `subscribeRepos` cursor replay (Go duration; a background pruner trims older events hourly) |
 | `RELAY_HOSTS` | *(optional)* | comma-separated relays to send `com.atproto.sync.requestCrawl` to on startup; in development the request is logged, never sent |
+| `ADMIN_TOKEN` | `dev-admin-token` | bearer token protecting the `/admin` API |
+| `BACKFILL_MAX_POSTS` | `100` | posts materialized per community backfill run |
+| `MINT_RATE_PER_MINUTE` / `MINT_BURST` | `60` / `120` | rate gate on inbound DID minting (PLC registrations are forever; unseen authors in delivered content trigger mints) |
+| `INGEST_WORKERS` | `4` | inbox queue worker-pool size |
+
+## Subscribing to communities (admin API)
+
+Community subscriptions are operator-driven, over bearer-token-protected
+endpoints (`Authorization: Bearer $ADMIN_TOKEN`):
+
+```sh
+# follow: WebFinger → fetch Group → materialize community → signed Follow
+curl -X POST localhost:8091/admin/communities \
+  -H "Authorization: Bearer dev-admin-token" \
+  -d '{"community":"!technology@lemmy.world"}'
+
+# state is `pending` until the community's Accept arrives at /inbox, which
+# flips it to `accepted` and triggers an outbox backfill automatically.
+
+curl localhost:8091/admin/communities \
+  -H "Authorization: Bearer dev-admin-token"          # list
+curl -X POST localhost:8091/admin/communities/backfill \
+  -H "Authorization: Bearer dev-admin-token" \
+  -d '{"community":"!technology@lemmy.world"}'        # on-demand backfill
+curl -X DELETE localhost:8091/admin/communities \
+  -H "Authorization: Bearer dev-admin-token" \
+  -d '{"community":"!technology@lemmy.world"}'        # Undo{Follow}
+```
+
+The bridge's AP face lives next to the inbox: the service actor document at
+`/actor`, WebFinger for it at `/.well-known/webfinger`, and a minimal
+nodeinfo 2.0 (`software.name: "tidepool"` — what Lemmy instance allowlists
+match against).
+
+## Consent policy (#nobridge / #nobot)
+
+Tidepool mirrors the [Bridgy Fed](https://fed.brid.gy/docs#opt-out) opt-out
+norms, enforced fail-closed in the materializer and wired to live AP
+activity by the ingestion layer:
+
+- An actor whose profile summary or hashtags carry **`#nobridge`** or
+  **`#nobot`** is never bridged: no DID is minted, and every post or comment
+  they author is dropped with the reason logged.
+- If a **previously bridged** actor adds the marker (seen on a profile
+  `Update` or any profile re-fetch), every record they authored is deleted
+  from the bridged repos and new materialization stops. This state is
+  **reversible**: removing the marker upstream restores bridging on the next
+  profile refresh.
+- **`Delete(Actor)`** (account deletion upstream) scrubs all their records
+  and tombstones the bridged repo **terminally**; the sync surface reports
+  the repo `active: false`.
+- Object-level `Delete`s tombstone the mapped record; a `Delete` arriving
+  before its object was ever seen is remembered (`ap_tombstones`), so an
+  out-of-order or re-delivered `Create` cannot resurrect deleted content.
+  `Undo{Delete}` restores by re-fetching the object from its origin.
+- Bridged profiles are visibly labeled: bios/descriptions end with a
+  "bridged from … by Tidepool" provenance line, and community profiles set
+  `hostedBy` to the bridge's service DID.
+
+Deliveries are accepted only over valid draft-cavage HTTP signatures
+(rsa-sha256, 1h date-skew window, digest required); content is accepted only
+from communities the operator subscribed to, and embedded objects are
+re-fetched from their origin instance whenever the delivering signer lacks
+authority over the object's id.
 
 ## Sync surface (what relays and Jetstream consume)
 

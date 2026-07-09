@@ -77,6 +77,24 @@ type Config struct {
 	// tests that hit httptest servers on 127.0.0.1. Set ALLOW_PRIVATE_FETCH=1
 	// to enable.
 	AllowPrivateAddresses bool
+	// AdminToken is the bearer token protecting the /admin API (community
+	// subscribe/unsubscribe/backfill). ADMIN_TOKEN; required in production,
+	// dev default is a fixed, publicly known value.
+	AdminToken string
+	// BackfillMaxPosts caps how many posts one community backfill run
+	// materializes (BACKFILL_MAX_POSTS, default 100).
+	BackfillMaxPosts int
+	// MintRatePerMinute is the sustained rate cap on inbound DID minting
+	// (MINT_RATE_PER_MINUTE, default 60). Inbound AP activity can trigger
+	// minting (post/comment authors), so it must be bounded — PLC
+	// registrations are forever.
+	MintRatePerMinute float64
+	// MintBurst is the mint token bucket's burst size (MINT_BURST, default
+	// 120) — sized to absorb a community backfill's author spike.
+	MintBurst int
+	// IngestWorkers is the inbox queue worker-pool size (INGEST_WORKERS,
+	// default 4).
+	IngestWorkers int
 }
 
 // Load reads configuration from the environment. logger must not be nil;
@@ -191,6 +209,32 @@ func Load(logger *slog.Logger) (*Config, error) {
 		return nil, fmt.Errorf("config: ALLOW_PRIVATE_FETCH must not be set in production")
 	}
 
+	// Admin API auth: like the KEK, the dev default is fixed and public —
+	// required in production.
+	cfg.AdminToken, err = stringVar(logger, isDevelopment, "ADMIN_TOKEN", "dev-admin-token")
+	if err != nil {
+		return nil, err
+	}
+
+	// Ingestion tuning knobs: real defaults in every environment.
+	cfg.BackfillMaxPosts, err = intVar(logger, "BACKFILL_MAX_POSTS", 100)
+	if err != nil {
+		return nil, err
+	}
+	mintRate, err := intVar(logger, "MINT_RATE_PER_MINUTE", 60)
+	if err != nil {
+		return nil, err
+	}
+	cfg.MintRatePerMinute = float64(mintRate)
+	cfg.MintBurst, err = intVar(logger, "MINT_BURST", 120)
+	if err != nil {
+		return nil, err
+	}
+	cfg.IngestWorkers, err = intVar(logger, "INGEST_WORKERS", 4)
+	if err != nil {
+		return nil, err
+	}
+
 	defaultUserAgent := fmt.Sprintf("tidepool/0.1 (+https://%s)", cfg.BridgeHostname)
 	cfg.UserAgent = os.Getenv("USER_AGENT")
 	if cfg.UserAgent == "" {
@@ -225,6 +269,22 @@ func decodeKEK(encoded string) ([]byte, error) {
 		return nil, fmt.Errorf("config: BRIDGE_KEK must decode to 32 bytes, got %d", len(raw))
 	}
 	return raw, nil
+}
+
+// intVar returns a positive-integer environment variable, falling back to a
+// logged default in every environment (tuning knob semantics, like
+// FIREHOSE_RETENTION).
+func intVar(logger *slog.Logger, name string, fallback int) (int, error) {
+	raw := os.Getenv(name)
+	if raw == "" {
+		logger.Info(name+" not set, using default", "value", fallback)
+		return fallback, nil
+	}
+	parsed, err := strconv.Atoi(raw)
+	if err != nil || parsed <= 0 {
+		return 0, fmt.Errorf("config: %s must be a positive integer, got %q", name, raw)
+	}
+	return parsed, nil
 }
 
 // boolVar reports whether an environment variable is set to a truthy value

@@ -55,6 +55,13 @@ type APObjects interface {
 	// preserves the original tombstone time; a missing mapping is an error
 	// satisfying errors.IsNotFound.
 	SoftDelete(ctx context.Context, apID string) error
+
+	// Restore clears a soft delete (Undo{Delete}/restore): the explicit
+	// counterpart task 05 required so an un-deleted object can be
+	// re-materialized (commitRecord refuses to resurrect a mapping whose
+	// deleted_at is set). Restoring a live mapping is a no-op success; a
+	// missing mapping is an error satisfying errors.IsNotFound.
+	Restore(ctx context.Context, apID string) error
 }
 
 // BridgedActors registers fediverse actors bridged into atproto and their
@@ -145,18 +152,59 @@ type ServiceKeys interface {
 	Get(ctx context.Context, name string) (*ServiceKey, error)
 }
 
-// InboxEvents deduplicates inbound AP activities and records processing
-// outcomes. The queue-consumption side (ListPending and friends) is
-// deliberately deferred to task 06, which owns the processing loop.
+// InboxEvents deduplicates inbound AP activities and doubles as the durable
+// postgres work queue the ingestion worker pool consumes (task 06). Rows are
+// never deleted: a processed row IS the dedupe record for re-deliveries.
 type InboxEvents interface {
 	// RecordEvent inserts the activity if it has not been seen before.
 	// It returns isNew=false (and no error) when the activity id was
 	// already recorded — the caller should drop the duplicate delivery.
 	RecordEvent(ctx context.Context, activityID, activityType string) (isNew bool, err error)
 
-	// MarkProcessed stamps the event as successfully processed and clears
-	// any recorded error.
-	MarkProcessed(ctx context.Context, activityID string) error
+	// Enqueue inserts a full queue item (ActivityID, Type, Payload, ActorID,
+	// OrderingKey are honored; the rest is defaulted). Like RecordEvent it
+	// returns isNew=false when the activity id was already recorded, so a
+	// duplicate delivery never re-enqueues work.
+	Enqueue(ctx context.Context, event InboxEvent) (isNew bool, err error)
+
+	// ClaimNext atomically claims the oldest processable event and
+	// increments its attempt counter. An event is processable when it is
+	// unprocessed, not poisoned, past its next_attempt_at, unleased (or the
+	// lease expired), and — the per-community ordering guarantee — no older
+	// unprocessed, unpoisoned event shares its ordering key. An empty queue
+	// returns an error satisfying errors.IsNotFound.
+	//
+	// The returned event's ClaimedUntil is the fencing/claim token for this
+	// claim: MarkProcessed/Release/MarkPoisoned require it so a worker whose
+	// lease expired and was re-claimed by another cannot overwrite the newer
+	// attempt's outcome.
+	ClaimNext(ctx context.Context, lease time.Duration) (*InboxEvent, error)
+
+	// MarkProcessed stamps the event as successfully processed and clears any
+	// recorded error. claimToken must equal the ClaimedUntil returned by the
+	// ClaimNext that produced this attempt. It returns applied=true when the
+	// outcome was written; applied=false (no error) means the claim was stale
+	// — the lease expired and another worker re-claimed the event, or the row
+	// is already in a terminal state — so this outcome was discarded. A
+	// missing event is an error satisfying errors.IsNotFound.
+	MarkProcessed(ctx context.Context, activityID string, claimToken time.Time) (applied bool, err error)
+
+	// Release records a processing failure and schedules the retry: error
+	// message stored, lease cleared, next_attempt_at set. claimToken must
+	// equal the claim's ClaimedUntil. It returns applied=true when the retry
+	// was scheduled; applied=false (no error) means the claim was stale or
+	// the event already completed, so the release was discarded. A missing
+	// event is an error satisfying errors.IsNotFound.
+	Release(ctx context.Context, activityID, message string, nextAttempt time.Time, claimToken time.Time) (applied bool, err error)
+
+	// MarkPoisoned permanently fails the event: failed_at stamped, error
+	// recorded, lease cleared. Poisoned events are skipped by ClaimNext and
+	// stop blocking their ordering key. claimToken must equal the claim's
+	// ClaimedUntil. It returns applied=true when the event was poisoned;
+	// applied=false (no error) means the claim was stale or the event already
+	// completed, so the poison was discarded. A missing event is an error
+	// satisfying errors.IsNotFound.
+	MarkPoisoned(ctx context.Context, activityID, message string, claimToken time.Time) (applied bool, err error)
 
 	// MarkFailed records a processing error on an unprocessed event,
 	// leaving it unprocessed so it can be retried or inspected. The message
@@ -167,4 +215,20 @@ type InboxEvents interface {
 
 	// GetEvent returns the event for an activity id.
 	GetEvent(ctx context.Context, activityID string) (*InboxEvent, error)
+}
+
+// Tombstones remembers AP object ids whose Delete arrived before (or
+// without) a materialization — the create-after-delete gap: a Create
+// delivered after its Delete must not resurrect content the origin removed.
+// Undo{Delete} removes the marker.
+type Tombstones interface {
+	// Record idempotently marks an AP id as deleted upstream.
+	Record(ctx context.Context, apID string) error
+
+	// Exists reports whether the AP id carries a tombstone marker.
+	Exists(ctx context.Context, apID string) (bool, error)
+
+	// Remove clears the marker (Undo{Delete}/restore). Removing a missing
+	// marker is a no-op success.
+	Remove(ctx context.Context, apID string) error
 }

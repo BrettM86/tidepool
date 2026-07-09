@@ -230,6 +230,17 @@ type freshKeyResolver interface {
 	ResolveKeyFresh(ctx context.Context, keyID string) (*rsa.PublicKey, string, error)
 }
 
+// cacheAwareKeyResolver is an optional extension of KeyResolver that reports
+// whether the resolved key was served from a cache. The Verifier uses it to
+// GATE the fresh-key retry: a key that was just fetched from the network
+// cannot be stale, so a signature failing against it is a forgery (or
+// garbage) and a re-fetch gains nothing — it only lets an attacker turn one
+// bogus delivery into two outbound fetches (amplification). The Client
+// implements it via ResolveKeyDetailed.
+type cacheAwareKeyResolver interface {
+	ResolveKeyDetailed(ctx context.Context, keyID string) (key *rsa.PublicKey, ownerID string, fromCache bool, err error)
+}
+
 // KeyResolverFunc adapts a function to the KeyResolver interface.
 type KeyResolverFunc func(ctx context.Context, keyID string) (*rsa.PublicKey, string, error)
 
@@ -341,7 +352,23 @@ func (v *Verifier) Verify(ctx context.Context, req *http.Request, body []byte) (
 		}
 	}
 
-	key, ownerID, err := v.resolver.ResolveKey(ctx, keyID)
+	// Resolve the signing key, learning whether it came from a cache when
+	// the resolver can tell us (the Client can): only a cached key may be
+	// stale, so only a cached key earns the rotation retry below.
+	var (
+		key       *rsa.PublicKey
+		ownerID   string
+		fromCache bool
+	)
+	if aware, ok := v.resolver.(cacheAwareKeyResolver); ok {
+		key, ownerID, fromCache, err = aware.ResolveKeyDetailed(ctx, keyID)
+	} else {
+		// Resolvers that cannot report cache provenance keep the old
+		// behavior (retry allowed) — better a rare extra fetch than
+		// blackholing a rotated key for the cache TTL.
+		fromCache = true
+		key, ownerID, err = v.resolver.ResolveKey(ctx, keyID)
+	}
 	if err != nil {
 		return "", fmt.Errorf("ap: resolve signing key %q: %w", keyID, err)
 	}
@@ -359,12 +386,15 @@ func (v *Verifier) Verify(ctx context.Context, req *http.Request, body []byte) (
 	if rsa.VerifyPKCS1v15(key, crypto.SHA256, hashed[:], signature) == nil {
 		return ownerID, nil
 	}
-	// The (possibly cached) key did not verify. If the resolver can bypass its
-	// cache, try exactly once with a freshly-fetched key: a remote key rotation
-	// leaves a stale key in cache that fails every signature until it expires.
-	// We only re-verify when the fresh key actually differs, so a forged
-	// signature does not gain extra verification attempts.
-	if fresh, ok := v.resolver.(freshKeyResolver); ok {
+	// The (possibly cached) key did not verify. If the key came from a cache
+	// and the resolver can bypass it, try exactly once with a freshly-fetched
+	// key: a remote key rotation leaves a stale key in cache that fails every
+	// signature until it expires. The retry is gated on fromCache — a key
+	// fetched fresh from the network moments ago cannot be stale, and
+	// re-fetching it would just let forged deliveries amplify outbound
+	// traffic. We also only re-verify when the fresh key actually differs, so
+	// a forged signature does not gain extra verification attempts.
+	if fresh, ok := v.resolver.(freshKeyResolver); ok && fromCache {
 		freshKey, freshOwner, ferr := fresh.ResolveKeyFresh(ctx, keyID)
 		if ferr == nil && !freshKey.Equal(key) &&
 			rsa.VerifyPKCS1v15(freshKey, crypto.SHA256, hashed[:], signature) == nil {

@@ -143,12 +143,33 @@ type ServiceKey struct {
 	CreatedAt     time.Time
 }
 
-// InboxEvent is a received AP activity, recorded for dedupe and
-// processing bookkeeping.
+// InboxEvent is a received AP activity: the dedupe record AND the durable
+// work-queue item task 06's worker pool consumes.
 type InboxEvent struct {
-	ID          int64
-	ActivityID  string // AP activity id (URL) — the dedupe key
-	Type        string // AP activity type: Announce, Create, Like, ...
+	ID         int64
+	ActivityID string // AP activity id (URL) — the dedupe key
+	Type       string // AP activity type: Announce, Create, Like, ...
+	// Payload is the raw activity JSON exactly as delivered (the
+	// signature-verified request body). Nil on legacy rows.
+	Payload []byte
+	// ActorID is the AP actor the activity is bound to; the inbox verified
+	// that it shares authority with the HTTP-signature signer.
+	ActorID string
+	// OrderingKey serializes processing: events sharing a key (normally the
+	// community IRI) are handled strictly in arrival order.
+	OrderingKey string
+	// Attempts counts how many times a worker claimed this event.
+	Attempts int
+	// NextAttemptAt is the retry-backoff schedule; claimable when <= now.
+	NextAttemptAt time.Time
+	// ClaimedUntil is the current worker lease; nil/past means unclaimed. It
+	// also serves as the fencing/claim token: ClaimNext stamps a fresh value
+	// on every claim, and MarkProcessed/Release/MarkPoisoned require it so a
+	// worker whose lease expired cannot overwrite a re-claim's outcome.
+	ClaimedUntil *time.Time
+	// FailedAt marks a poisoned event: permanently failed, skipped by the
+	// queue, no longer blocking its ordering key.
+	FailedAt    *time.Time
 	ReceivedAt  time.Time
 	ProcessedAt *time.Time
 	Error       string // last processing error; empty if none

@@ -95,6 +95,11 @@ type Config struct {
 	// IngestWorkers is the inbox queue worker-pool size (INGEST_WORKERS,
 	// default 4).
 	IngestWorkers int
+	// SeedCountsFromAPI enables seeding backfilled posts' vote aggregates
+	// from the origin instance's public API (Lemmy's `counts` field) —
+	// history whose individual Like activities AP never delivers
+	// (SEED_COUNTS_FROM_API, default on; set to 0/false to disable).
+	SeedCountsFromAPI bool
 }
 
 // Load reads configuration from the environment. logger must not be nil;
@@ -234,6 +239,10 @@ func Load(logger *slog.Logger) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	cfg.SeedCountsFromAPI, err = boolVarDefault(logger, "SEED_COUNTS_FROM_API", true)
+	if err != nil {
+		return nil, err
+	}
 
 	defaultUserAgent := fmt.Sprintf("tidepool/0.1 (+https://%s)", cfg.BridgeHostname)
 	cfg.UserAgent = os.Getenv("USER_AGENT")
@@ -295,6 +304,26 @@ func boolVar(name string) bool {
 		return true
 	}
 	return false
+}
+
+// boolVarDefault parses a boolean environment variable with an explicit
+// default when unset (tuning-knob semantics: same default in every
+// environment, logged when applied). Unlike boolVar it rejects
+// unrecognized values instead of silently reading them as false — a
+// default-on flag "disabled" by a typo would be invisible.
+func boolVarDefault(logger *slog.Logger, name string, fallback bool) (bool, error) {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv(name)))
+	if raw == "" {
+		logger.Info(name+" not set, using default", "value", fallback)
+		return fallback, nil
+	}
+	switch raw {
+	case "1", "true", "yes", "on":
+		return true, nil
+	case "0", "false", "no", "off":
+		return false, nil
+	}
+	return false, fmt.Errorf("config: %s must be a boolean (1/0, true/false, yes/no, on/off), got %q", name, raw)
 }
 
 // stringVar returns the value of an environment variable. When unset it

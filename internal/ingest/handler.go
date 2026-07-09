@@ -142,6 +142,14 @@ func (h *Handler) Process(ctx context.Context, event *store.InboxEvent) error {
 		return h.handleReject(ctx, activity, signer)
 	case ap.TypeLike, ap.TypeDislike:
 		// Bare votes (rare; Lemmy normally announces them via the group).
+		// The inbox already bound this top-level activity's actor to the
+		// signer's authority, so for a well-formed vote the check below is
+		// redundant belt-and-braces; it keeps the dispatch layer's bare-vote
+		// rule self-contained (and handleUndo, where the inner vote's actor
+		// is NOT inbox-bound, shares it).
+		if err := h.authorizeBareVote(activity.ID, activity, signer); err != nil {
+			return err
+		}
 		return h.votes.ApplyVote(ctx, activity, "")
 	default:
 		return skip(activity.ID, "unsupported activity type "+activity.Type)

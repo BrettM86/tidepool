@@ -26,6 +26,7 @@ import (
 	"tidepool/internal/repo"
 	"tidepool/internal/store"
 	tidepoolsync "tidepool/internal/sync"
+	"tidepool/internal/votes"
 )
 
 const (
@@ -205,11 +206,31 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
+	// The vote aggregation side channel (task 07): Like/Dislike activities
+	// maintain bridge-side counts (never records), served over
+	// social.coves.bridge.getVoteAggregates.
+	voteAggregator, err := votes.NewAggregator(database, objects, communities, repoManager, logger)
+	if err != nil {
+		return err
+	}
+	// Seeding imports historical scores for backfilled posts from the origin
+	// instance's public API (AP alone cannot provide them).
+	var seeder ingest.CountSeeder
+	if cfg.SeedCountsFromAPI {
+		lemmySeeder, err := votes.NewLemmySeeder(voteAggregator,
+			ap.NewGuardedHTTPClient(cfg.AllowPrivateAddresses, 30*time.Second), cfg.UserAgent, logger)
+		if err != nil {
+			return err
+		}
+		seeder = lemmySeeder
+	}
+
 	backfill, err := ingest.NewBackfill(ingest.BackfillOptions{
 		Fetcher:      apClient,
 		Materializer: materializer,
 		Communities:  communities,
 		Tombstones:   tombstones,
+		Seeder:       seeder,
 		MaxPosts:     cfg.BackfillMaxPosts,
 		// Async runs derive from the run context so a mid-run backfill stops
 		// pulling remote pages once shutdown starts; the drain below waits for
@@ -226,7 +247,7 @@ func run(logger *slog.Logger) error {
 		Objects:        objects,
 		Communities:    communities,
 		Tombstones:     tombstones,
-		Votes:          ingest.NewNoopVotes(logger), // task 07 replaces this
+		Votes:          voteAggregator,
 		Backfill:       backfill,
 		ServiceActorID: serviceActor.ID,
 		Logger:         logger,
@@ -271,7 +292,12 @@ func run(logger *slog.Logger) error {
 	}
 	admin.Routes(router)
 
-	// Task 07 registers here: vote aggregates XRPC.
+	// The vote-aggregate XRPC (the AppView's side-channel read).
+	votesXRPC, err := votes.NewXRPC(votes.XRPCOptions{DB: database, Logger: logger})
+	if err != nil {
+		return err
+	}
+	votesXRPC.Routes(router)
 
 	server := &http.Server{
 		Addr:              cfg.ListenAddr,

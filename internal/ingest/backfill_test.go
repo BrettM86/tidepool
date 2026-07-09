@@ -3,9 +3,11 @@ package ingest
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -97,6 +99,65 @@ func TestBackfillProducesMappedHistory(t *testing.T) {
 	require.NoError(t, err)
 	assert.WithinDuration(t, before, *community.LastBackfillAt, time.Second,
 		"an un-forced re-trigger inside the freshness window must not re-run")
+}
+
+// recordingSeeder captures CountSeeder invocations; a non-nil err makes
+// every call fail.
+type recordingSeeder struct {
+	mu     sync.Mutex
+	seeded []string
+	err    error
+}
+
+func (s *recordingSeeder) SeedPostCounts(_ context.Context, postAPID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.seeded = append(s.seeded, postAPID)
+	return s.err
+}
+
+// TestBackfillSeedsVoteCounts: every materialized post gets exactly one
+// seeding call (replies do not — comments are not seeded in v1), and the
+// seeder is best-effort: a failing one is still invoked per post but never
+// affects the run's outcome. Nil-seeder safety is exercised by every other
+// backfill test (newBackfill leaves Seeder unset).
+func TestBackfillSeedsVoteCounts(t *testing.T) {
+	h := newHarness(t)
+	h.subscribeTechnology()
+	serveOutboxFixtures(t, h)
+	ctx := context.Background()
+
+	seeded := func(seeder *recordingSeeder) *Backfill {
+		b, err := NewBackfill(BackfillOptions{
+			Fetcher:      h.client,
+			Materializer: h.mat,
+			Communities:  h.communities,
+			Tombstones:   h.tombstones,
+			Seeder:       seeder,
+			MaxPosts:     10,
+		})
+		require.NoError(t, err)
+		return b
+	}
+
+	seeder := &recordingSeeder{}
+	community, err := h.communities.GetByAPGroupID(ctx, groupID)
+	require.NoError(t, err)
+	require.NoError(t, seeded(seeder).Run(ctx, community, true))
+	assert.Equal(t, []string{pageID, secondPageID}, seeder.seeded,
+		"each materialized post is seeded once (newest first); replies are not")
+
+	// A failing seeder is invisible to the run: no error, and the clean
+	// completion still stamps last_backfill_at.
+	failing := &recordingSeeder{err: fmt.Errorf("origin API is down")}
+	require.NoError(t, seeded(failing).Run(ctx, community, true),
+		"seeding failures must never fail the backfill")
+	assert.Equal(t, []string{pageID, secondPageID}, failing.seeded,
+		"the failing seeder is still invoked per post")
+	community, err = h.communities.GetByAPGroupID(ctx, groupID)
+	require.NoError(t, err)
+	assert.NotNil(t, community.LastBackfillAt,
+		"a run with seeding failures is still a clean completion")
 }
 
 // TestBackfillHonorsMaxPosts: the post cap stops the walk early.

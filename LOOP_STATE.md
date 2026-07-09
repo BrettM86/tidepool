@@ -12,7 +12,7 @@ update this file → schedule next. Stop the loop when every task is `done`.
 | 4 | 04-sync-firehose | done | (see git log) | 7/8 reviewers (glm watchdog-killed); fixes: ping starvation, prune-mid-replay OutdatedCursor, broadcaster closed-channel, SeqBounds dirty-read, pruner fail-closed; consent-on-firehose deferred to 06 |
 | 5 | 05-materializer | done | (see git log) | 8 reviewers; fixes: id-authority binding, Note-root panic, create-after-delete, nobridge scrub, embedded-actor trust, byte caps, uri scheme, Group-type check + 9 regression tests |
 | 6 | 06-ingestion | done | (see git log) | 8 reviewers (5 Claude + codex/gemini; glm wandered, no JSON); fixes: announced-Delete/Undo scoped to announcer authority (+actor-delete only self), bare Update{Person/Group} no-mint gate, announce content community-authority check, Undo{Delete} restore compensation, handleAccept pending-only, queue lease fencing token + shutdown-cancel handling + processed/poisoned exclusivity, backfillReplies tombstone check, truncation leaves resumable, activityID rand-fail propagates + 14 regression tests |
-| 7 | 07-vote-aggregates | pending | | |
+| 7 | 07-vote-aggregates | done | (see git log) | 6/8 reviewers (Gemini perm-denied, glm watchdog-killed); fixes: announced-vote subject↔community binding (post mapping-DID / comment reply.root), bare Undo{Like} signer binding, RetractVote id-targeted undo, dup-id 0/0 aggregate-row leak, seeder zero-clobber presence check, limiter sweep-throttle + 50k fail-closed cap, at-uri validation + ~20 regression tests |
 | 8 | 08-e2e-harness | pending | | |
 
 Statuses: pending → in-progress → review → done (or blocked: <reason>).
@@ -342,3 +342,52 @@ and deferred TODOs here)
   vs what real Lemmy actually queries (needs live Lemmy). activityID rand-
   fail path is guarded but unit-untestable (Go 1.24+ crypto/rand failure is
   a fatal crash, not a returnable error).
+
+### From task 07 (vote aggregates — task 08 consumes this)
+- internal/votes: Aggregator implements ingest.VoteAggregator.
+  NewAggregator(db, apObjects, communities, records, logger) — `records` is
+  a narrow votes.RecordReader (satisfied by repo.Manager, wired in main.go).
+  XRPC: GET /xrpc/social.coves.bridge.getVoteAggregates (lexicon at
+  lexicons/social/coves/bridge/, README documents it as the AppView
+  integration point). ≤100 uris counted PRE-dedupe; malformed at-uri →
+  InvalidRequest 400 (validated via syntax.ParseATURI); unknown uris
+  omitted; response preserves request order; Cache-Control public/max-age=30;
+  per-IP token bucket on RemoteAddr only (XFF deliberately ignored),
+  FAIL-CLOSED at 50k buckets (unknown IPs get 429 during rotation floods),
+  sweep throttled to 1/min, injectable clock for tests.
+- Vote state machine: append-only vote_events, invariant ≤1 non-undone row
+  per (voter,subject) is APP-enforced only — every mutation MUST take the
+  vote_aggregates row lock FIRST (lockAggregate upsert / SELECT FOR UPDATE),
+  then recompute-in-tx. Dedupe by activity_id (unique, first-writer-wins —
+  forged-id squatting narrowed by authority binding but ids remain
+  unauthenticated). RetractVote targets the undone activity's own id when
+  vote.ID != "" (replay-proof), direction-match fallback for id-less undos.
+  Dup activity id is probed BEFORE creating an aggregate row (no 0/0 rows).
+- AUTHORITY MODEL for votes: announced votes require the announcer to
+  resolve to a followed community AND subject∈that community — posts via
+  mapping.DID == community DID (NOT SameAuthority: Lemmy hosts post objects
+  on the AUTHOR's instance), comments via one GetRecord read of reply.root's
+  DID. Bare Like/Dislike: inbox already binds actor↔signer (403).
+  Bare Undo{vote}: Handler.authorizeBareVote (consent.go, host-granularity
+  SameAuthority like bare Delete). All mismatches drop at debug as nil —
+  queue outcome contract (nil=processed) preserved everywhere; only real DB
+  errors are retryable.
+- Seeding: seeded_upvotes/seeded_downvotes baseline columns (beyond spec —
+  deliberate: served = seeded + live, re-seed idempotent, never clobbers
+  live votes). LemmySeeder.SeedPostCounts posts-only via SSRF-guarded
+  client, presence-checked decode (missing post_view/counts → error, old
+  baseline survives; a wrong-shape 200 can NOT zero-clobber). Wired as
+  optional ingest.CountSeeder in backfill (best-effort, Warn on failure,
+  never affects run outcome). SEED_COUNTS_FROM_API (default on; strict bool
+  parse rejects typos). Known accepted drift: a baseline voter who flips
+  sends Undo for a like we never saw (no-op) — stale until re-seed.
+- DEFERRED (task 08+): vote_events grows unbounded (no pruning of
+  superseded/undone rows — mirror FIREHOSE_RETENTION treatment alongside
+  ap_tombstones); actor-delete/consent revocation does NOT scrub that
+  actor's vote_events rows (inconsistent with scrub posture elsewhere;
+  counts are anonymous on the wire so exposure is low); no concurrency
+  stress test of the aggregate-row locking claim (sequential tests only);
+  subject resolution happens outside the mutation tx (narrow TOCTOU with a
+  racing Delete, documented); no upper sanity cap on seeded counts;
+  comment count seeding skipped (per-comment API calls would triple
+  backfill egress).

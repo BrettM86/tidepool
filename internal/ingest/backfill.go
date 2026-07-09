@@ -33,6 +33,15 @@ type BackfillFetcher interface {
 	FetchCollection(ctx context.Context, iri string, visit func(*ap.Object) error) error
 }
 
+// CountSeeder imports a backfilled post's historical vote counts from its
+// origin's public API (task 07's votes.LemmySeeder; AP alone cannot provide
+// them — outboxes announce historical Likes only sparsely). Optional and
+// best-effort: a nil seeder or a seeding failure never affects the backfill
+// outcome.
+type CountSeeder interface {
+	SeedPostCounts(ctx context.Context, postAPID string) error
+}
+
 // BackfillOptions configures NewBackfill. Fetcher, Materializer,
 // Communities, and Tombstones are required.
 type BackfillOptions struct {
@@ -40,6 +49,9 @@ type BackfillOptions struct {
 	Materializer Materializer
 	Communities  store.Communities
 	Tombstones   store.Tombstones
+	// Seeder, when set, seeds each backfilled post's vote aggregates from
+	// the origin's public API (config SEED_COUNTS_FROM_API).
+	Seeder CountSeeder
 	// MaxPosts caps posts per run (default 100, config.BackfillMaxPosts).
 	MaxPosts int
 	// MinInterval is the freshness window for un-forced triggers
@@ -63,6 +75,7 @@ type Backfill struct {
 	mat         Materializer
 	communities store.Communities
 	tombstones  store.Tombstones
+	seeder      CountSeeder
 	maxPosts    int
 	minInterval time.Duration
 	baseCtx     context.Context
@@ -101,6 +114,7 @@ func NewBackfill(opts BackfillOptions) (*Backfill, error) {
 		mat:         opts.Materializer,
 		communities: opts.Communities,
 		tombstones:  opts.Tombstones,
+		seeder:      opts.Seeder,
 		maxPosts:    opts.MaxPosts,
 		minInterval: opts.MinInterval,
 		baseCtx:     baseCtx,
@@ -271,6 +285,7 @@ func (b *Backfill) materializeOutboxItem(ctx context.Context, item *ap.Object, c
 		if _, err := b.mat.MaterializePost(ctx, obj); err != nil {
 			return false, err
 		}
+		b.seedCounts(ctx, obj.ID)
 		b.backfillReplies(ctx, obj)
 		return true, nil
 	case ap.TypeNote:
@@ -280,6 +295,24 @@ func (b *Backfill) materializeOutboxItem(ctx context.Context, item *ap.Object, c
 		return true, nil
 	default:
 		return false, skip(obj.ID, "unsupported outbox object type "+obj.Type)
+	}
+}
+
+// seedCounts imports a backfilled post's historical vote counts (task 07).
+// Best-effort: failures are logged and never affect the run — a post with a
+// zero score is strictly better than no post. Warn (matching the
+// backfillReplies convention) so a systemic seeding outage is visible at
+// default log levels; a cancellation during shutdown is not an outage.
+func (b *Backfill) seedCounts(ctx context.Context, postAPID string) {
+	if b.seeder == nil {
+		return
+	}
+	if err := b.seeder.SeedPostCounts(ctx, postAPID); err != nil {
+		if ctx.Err() != nil {
+			b.logger.Debug("backfill vote-count seeding canceled", "post", postAPID, "error", err)
+			return
+		}
+		b.logger.Warn("backfill vote-count seeding failed", "post", postAPID, "error", err)
 	}
 }
 

@@ -1,0 +1,66 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.bridge.getVoteAggregates",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Get bridge-side vote aggregates for bridged posts and comments. Votes on bridged (fediverse) content never become atproto records; Tidepool aggregates them and serves the counts over this query — the one sanctioned side channel an AppView polls to display scores. Unknown or unvoted uris are omitted from the response, not an error. Public, cacheable, rate limited by IP. Versioned by nsid: breaking changes ship under a new name.",
+      "parameters": {
+        "type": "params",
+        "required": ["uris"],
+        "properties": {
+          "uris": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "at-uri"
+            },
+            "maxLength": 100,
+            "description": "at-uris of the subject records (posts or comments) to fetch aggregates for. At most 100 per call."
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["aggregates"],
+          "properties": {
+            "aggregates": {
+              "type": "array",
+              "items": {
+                "type": "ref",
+                "ref": "#voteAggregate"
+              }
+            }
+          }
+        }
+      }
+    },
+    "voteAggregate": {
+      "type": "object",
+      "description": "Current vote totals for one bridged subject. Counts reflect each distinct voter's latest state (flips and undos are folded in), plus a baseline seeded from the origin instance's API for pre-bridge history.",
+      "required": ["uri", "upvotes", "downvotes", "updatedAt"],
+      "properties": {
+        "uri": {
+          "type": "string",
+          "format": "at-uri",
+          "description": "The subject record's at-uri"
+        },
+        "upvotes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "downvotes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "When the aggregate last changed"
+        }
+      }
+    }
+  }
+}

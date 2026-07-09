@@ -54,6 +54,7 @@ production**:
 | `BACKFILL_MAX_POSTS` | `100` | posts materialized per community backfill run |
 | `MINT_RATE_PER_MINUTE` / `MINT_BURST` | `60` / `120` | rate gate on inbound DID minting (PLC registrations are forever; unseen authors in delivered content trigger mints) |
 | `INGEST_WORKERS` | `4` | inbox queue worker-pool size |
+| `SEED_COUNTS_FROM_API` | on | seed backfilled posts' vote aggregates from the origin instance's public API (`/api/v3/post` `counts`); set `0` to disable |
 
 ## Subscribing to communities (admin API)
 
@@ -131,6 +132,40 @@ it as a `subscribeRepos` upstream:
 
 Repos whose actor revoked consent (tombstoned) report `RepoDeactivated` /
 `active: false` and their content endpoints stop serving.
+
+## Vote aggregates (the AppView integration point)
+
+Votes never become records (nothing may strongRef a vote): Lemmy
+`Like`/`Dislike`/`Undo` activities maintain bridge-side aggregate counts,
+served over **one sanctioned side-channel XRPC** the Coves AppView polls:
+
+```
+GET /xrpc/social.coves.bridge.getVoteAggregates?uris=at://…&uris=at://…
+```
+
+- `uris`: at-uris of bridged posts/comments — repeated `uris` params (the
+  atproto convention; comma-separated values are also accepted), at most
+  **100** per call (`InvalidRequest` beyond that).
+- Response: `{"aggregates":[{"uri","upvotes","downvotes","updatedAt"}]}` in
+  request order. Unknown or never-voted uris are **omitted**, not an error.
+- Public read, `Cache-Control: public, max-age=30`, rate limited per client
+  IP (token bucket; deployments behind a proxy should rate-limit the real
+  client at the edge — the bridge deliberately ignores `X-Forwarded-For`).
+
+The contract is the lexicon at
+[`lexicons/social/coves/bridge/getVoteAggregates.json`](lexicons/social/coves/bridge/getVoteAggregates.json)
+and is versioned by nsid: breaking changes ship under a new name.
+
+Counts reflect each distinct voter's **latest** state — flips
+(`Like` → `Dislike`) and `Undo`s are folded in, re-delivered activities are
+deduplicated by activity id. Votes on content the bridge never materialized
+are dropped (logged at debug). Known limitation: AP delivers votes only
+going forward, and Lemmy outboxes announce historical Likes sparsely — so
+backfilled posts would start near zero. `SEED_COUNTS_FROM_API` (default on)
+compensates by seeding a baseline from the origin's public API during
+backfill; live votes stack on top, and an undo of a vote that only exists in
+the baseline is a no-op (accepted drift, refreshed on re-seed). Comment
+scores are not seeded in v1 — comments accumulate live votes only.
 
 ## Verifying with Jetstream
 

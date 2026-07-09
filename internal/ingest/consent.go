@@ -112,6 +112,17 @@ func (h *Handler) handleUndo(ctx context.Context, undo *ap.Object, signer, annou
 	}
 	switch inner.Type {
 	case ap.TypeLike, ap.TypeDislike:
+		// The inbox binds only the OUTER Undo's actor to the signature; the
+		// inner vote's actor is unverified. A bare undo may therefore only
+		// retract votes attributed to the signer's own instance — otherwise
+		// any signer could retract other instances' users' votes. Announced
+		// undos ride the announcing community's vouching, exactly like
+		// announced votes (FEP-1b12 group fan-out).
+		if announcer == "" {
+			if err := h.authorizeBareVote(undo.ID, inner, signer); err != nil {
+				return err
+			}
+		}
 		return h.votes.RetractVote(ctx, inner, announcer)
 	case ap.TypeDelete:
 		return h.handleUndoDelete(ctx, undo, inner, signer, announcer)
@@ -173,6 +184,20 @@ func (h *Handler) handleUndoDelete(ctx context.Context, undo, del *ap.Object, si
 				"ap_id", targetID, "reason", err)
 		}
 		return err
+	}
+	return nil
+}
+
+// authorizeBareVote enforces who may cast (or retract) a BARE, un-announced
+// vote: the vote's actor must live on the verified signer's authority — host
+// granularity, the same instance-is-the-trust-unit rule as bare Delete (an
+// instance may speak for its own users, never for another instance's).
+// Mismatches (including an actorless vote) drop as processed skips, never
+// retryable errors — a retry would wedge the ordering key over a vote.
+func (h *Handler) authorizeBareVote(activityID string, vote *ap.Object, signer string) error {
+	if actor := refID(vote.Actor); !ap.SameAuthority(actor, signer) {
+		return skip(activityID, fmt.Sprintf(
+			"bare vote attributed to cross-authority actor %q signed by %s", actor, signer))
 	}
 	return nil
 }

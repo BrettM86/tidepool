@@ -25,7 +25,7 @@ func TestMigrations_UpDownUp(t *testing.T) {
 		SELECT COUNT(*) FROM information_schema.tables
 		WHERE table_schema = 'public'
 		  AND table_name IN ('ap_objects', 'bridged_actors', 'communities', 'inbox_events', 'service_keys',
-		                     'blocks', 'repo_state', 'firehose_events')
+		                     'blocks', 'repo_state', 'firehose_events', 'vote_aggregates', 'vote_events')
 	`).Scan(&remaining)
 	require.NoError(t, err)
 	assert.Zero(t, remaining, "down migrations must drop every Tidepool table")
@@ -56,6 +56,7 @@ func TestMigrations_UniqueConstraintNames(t *testing.T) {
 		"communities_did_key",
 		"inbox_events_activity_id_key",
 		"service_keys_name_key",
+		"vote_events_activity_id_key", // the vote dedupe key (task 07)
 	}
 	for _, name := range expected {
 		var exists bool

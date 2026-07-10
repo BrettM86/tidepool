@@ -2,8 +2,85 @@
 
 Everything known-deferred at the end of the v1 build loop (tasks 01–08),
 collected from `LOOP_STATE.md`'s cross-task notes plus discoveries made
-while building the e2e harness. Organized by area; items marked **(e2e)**
-were discovered or confirmed by the task-08 harness.
+while building the e2e harness, updated as v1.1 tasks land. Organized by
+area; items marked **(e2e)** were discovered or confirmed by the task-08
+harness, **(relay)** by task 09's relay pipeline.
+
+## Relay pipeline (task 09 discoveries)
+
+- **Cross-repo event ordering does NOT survive a relay (relay).** bigsky
+  indexes its inbound firehose with a parallel scheduler keyed by repo DID
+  (indigo `events/schedulers/parallel`, 100 workers): per-repo order is
+  preserved, cross-repo order is not. The bridge's profile-before-post
+  emission discipline (locked decision 3's "author indexed before post")
+  therefore only holds on the bridge's OWN firehose — through a relay, a
+  post in the community repo routinely overtakes its author's first-ever
+  `actor.profile` (the profile costs the relay a PLC resolution + handle
+  verification; the community DID is already cached). **Carry to Coves:**
+  the AppView consumes through relay infrastructure, so its "author must be
+  indexed before the post" validation needs a retry/park-and-reprocess
+  path, or Coves consumes the bridge firehose directly. The e2e suite's
+  listener buffers out-of-order events (`tests/e2e/helpers.go` `pending`)
+  and asserts presence + linkage instead of cross-repo arrival order.
+- **Tombstoned (`active:false`) repo status is not observable through
+  bigsky.** It filters tombstoned/taken-down repos out of `listRepos`,
+  serves no `getRepoStatus`, and learns account state upstream only from
+  `#account` frames — which the bridge does not emit yet (task 11). When
+  the `#account` frame lands, add a relay-side e2e assertion that a
+  consent-revoked repo disappears from the relay's `listRepos`.
+- **A fresh bigsky refuses all non-admin `requestCrawl`**: the new-PDS
+  per-day limit defaults to 0 and is checked BEFORE the trusted-domain
+  list. Any deployment announcing to a self-hosted relay needs the
+  `setPerDayLimit` admin bootstrap (compose does it in `relay-bootstrap`).
+- **Verify env vars against `--help`, not other people's compose files.**
+  Coves' relay stanza sets `BGS_CRAWL_INSECURE_WS`, `BGS_PORT`, and
+  `LOG_LEVEL` — none of which exist in the pinned image
+  (`--crawl-insecure-ws` has no env binding and must be a command arg; the
+  log knob is `BSKYLOG_LOG_LEVEL`). Also local-only traps: bigsky defaults
+  to the public `plc.directory` (`ATP_PLC_HOST`) AND the public `1.1.1.1`
+  DNS resolver (`RESOLVE_ADDRESS`).
+- The pinned bigsky image has **no arm64 manifest** — Apple Silicon runs it
+  under emulation (`platform: linux/amd64`), fine at e2e volume; a future
+  image bump could revisit.
+- indigo's slurper reconnect backoff is effectively sub-second for the
+  first 10 attempts (`sleepForBackoff` multiplies by 2 **nanoseconds**, so
+  only the additive +0–1s jitter — rand milliseconds — matters), then 30s;
+  on the 16th consecutive dial failure (backoff > 15) it marks the PDS
+  `registered=false` and STOPS retrying — a
+  bridge outage longer than ~3 minutes needs a fresh `requestCrawl` (ours
+  re-announces on every startup, which covers the bridge's own restarts but
+  not a long bridge outage while the relay stays up).
+
+## Design revisits (decide before/with the write side)
+
+- **Votes-as-records (2026-07-10 discussion).** The aggregate side channel
+  is a v1 decision worth re-opening when write-back is designed, not a law
+  of nature. Facts to carry into that decision:
+  - A faithful **going-forward** per-voter record stream is buildable
+    today: every live Like/Dislike arrives with the voter's AP identity
+    (that's how `vote_events` dedupes). Flips/undos are already solved
+    state-tracking.
+  - **History is counts-only forever**: Lemmy's per-voter list endpoints
+    (`listPostLikes`/`listCommentLikes`) are origin-instance admin/mod
+    APIs — the bridge is a federated peer, not an admin. Any records
+    design still needs an aggregate baseline for pre-subscribe history.
+  - Naïve design (vote record in the voter's repo) mints a permanent
+    public did:plc per drive-by voter — a global-registry externality,
+    not a compute cost. **Leading alternative:** votes in the
+    *community's* repo with a `voter` field + deterministic rkey
+    (voter+subject hash), mirroring how posts already live in the
+    community repo with an `author` field. Zero new DIDs, votes on the
+    firehose. Requires a new lexicon + Coves AppView consumer — decide
+    WITH Coves.
+  - Write amplification (one commit + firehose event per vote) is only
+    viable after the perf items land: per-DID MST cache, block GC,
+    batched pruning (tasks 11–12). Hardening first is a prerequisite,
+    not a competing priority.
+  - Write-back symmetry favors records: Coves users' votes on bridged
+    posts are already native `social.coves.feed.vote` records; outbound
+    translation is records→Like. Symmetric records would let frontends
+    drop the `getVoteAggregates` XRPC for everything except historical
+    baselines.
 
 ## Federation & interop
 
@@ -45,8 +122,13 @@ were discovered or confirmed by the task-08 harness.
   callers should eventually REUSE an orphaned minted DID via a PLC
   updateHandle op instead of re-minting (task 03 note).
 - Moderation federation, DMs.
-- Relay `requestCrawl` is wired but has never been exercised against a real
-  relay (dev logs instead of sending).
+- ~~Relay `requestCrawl` is wired but has never been exercised against a
+  real relay (dev logs instead of sending).~~ **Closed by task 09**: the
+  e2e stack runs a real BigSky; the bridge announces itself through the
+  production `RequestCrawlAll` path (now with a bounded retry — the relay
+  calls back into `describeServer`, racing process start) under the
+  dev-only `ALLOW_DEV_REQUEST_CRAWL` override, and the suite asserts the
+  bridge is registered + actively subscribed in the relay's PDS registry.
 - `ENVIRONMENT=production` has never been end-to-end tested (the harness
   runs development mode for migrations-on-start, strict validation, http
   scheme, private fetch).
@@ -69,6 +151,10 @@ were discovered or confirmed by the task-08 harness.
 - `SigningKeys` could become a `SignCommit` capability (keeps key plaintext
   inside identity; enables KMS later) — revisit before the interface
   calcifies.
+- `getRepo`'s optional `since` parameter (diff export) is not implemented —
+  a `since` request gets the full CAR, which the spec permits (extra blocks
+  are legal); consumers needing incremental sync use subscribeRepos
+  (`internal/sync/server.go`).
 
 ## Ingestion (task 06 notes)
 
@@ -88,6 +174,12 @@ were discovered or confirmed by the task-08 harness.
 - Mint-gate ("retry via queue backoff") is verified at unit level only —
   the harness never drives minting into the rate limiter (a low
   `MINT_RATE_PER_MINUTE` stack variant would need its own compose profile).
+- The `activityID` rand-failure path is guarded but unit-untestable
+  (Go 1.24+ makes a `crypto/rand` failure a fatal crash, not a returnable
+  error) — permanent test gap unless the reader is injected.
+- `ingest.NewNoopVotes` (`internal/ingest/votes.go`) is dead code: task 07
+  wired the real `votes.NewAggregator` in main.go and nothing (prod or
+  test) references the noop anymore — delete candidate.
 
 ## Votes (task 07 notes)
 
@@ -148,8 +240,10 @@ were discovered or confirmed by the task-08 harness.
   (`PLC_COMMIT` in `e2e/plc/Dockerfile`); bump it deliberately via
   `git ls-remote` when upstream fixes/features are needed.
 - Jetstream **exits** when its upstream drops; `restart: unless-stopped`
-  papers over it. If Jetstream grows reconnect logic upstream, drop the
-  policy.
+  papers over it. Since task 09 its upstream is the relay (which stays up
+  across the bridge-restart scenario — the relay's own slurper reconnects),
+  so the policy only matters if the relay itself dies. If Jetstream grows
+  reconnect logic upstream, drop the policy.
 - Unexpected-collection enforcement runs on **every** commit event any
   listener consumes (await and drain both fail fast on a collection outside
   the four emitted ones), and the vote scenario watches the firehose

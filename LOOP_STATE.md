@@ -16,7 +16,25 @@ update this file → schedule next. Stop the loop when every task is `done`.
 | 8 | 08-e2e-harness (infra: Dockerfile, compose, Lemmy federation, Makefile, CI, lexicon-sync) | done | (see git log) | 7/7 reviewers (4 Claude + codex/gemini/glm, first full external panel since 03); fixes: PRODUCTION https→http redirect-downgrade guard (codex unique catch), webfinger fallback narrowed to transport failures + both-legs errors + 4 tests, minter PDS-endpoint scheme threading, PLC image commit-pin, --wait-timeout + CI logs if:always() + Makefile up-failure cleanup/teardown-status, loopback-only host binds, check-lexicons fail-open holes, sync-lexicons bridge-nesting guard, 2 false compose-header claims rewritten (invented env var, wrong --wait semantics) |
 | 9 | 08-e2e-harness (tests: tests/e2e helpers + 8 scenarios, FOLLOWUPS.md, README) | done | (see git log) | 8/8 reviewers (5 Claude + codex/gemini/glm; gemini zero-issue "excellent", codex sharpest); fixes: drain() dead-listener vacuous-pass (5/8 flagged), centralized vetEvent (unknown-collection Fatalf + lexicon-validate every consumed create/update, suite-wide locked-decision-7 enforcement), scenario-7 backfill-completion poll + gap-post cursor-resume proof + op-agnostic dup keys, readLoop goroutine join, subscribe fail-fast on explicit reject, embed.external e2e coverage, seeder e2e assertion. NEW ASSERTION CAUGHT REAL BUG: Lemmy vote-clear federates Undo with RECONSTRUCTED inner vote (fresh id, type Like even for live dislike; flips are bare opposite votes, no Undo) → id-targeted RetractVote no-oped every production vote-clear; fixed with known-id replay probe + live-vote fallback + 3 unit tests |
 
-ALL TASKS DONE — loop complete. `make e2e` green (8/8 scenarios, ~100s), full unit suite green.
+v1 loop (tasks 01–08) COMPLETE — `make e2e` green (8/8 scenarios, ~100s), full unit suite green.
+
+## v1.1 loop (tasks 09–12) — added 2026-07-10
+
+Goal: work the FOLLOWUPS.md backlog and put a real relay in the e2e
+pipeline. Locked requirement: every state has a full e2e pipeline of
+Lemmy → PDS record → firehose ingestion (where applicable) — task 09
+re-points Jetstream through the relay so every scenario transits it.
+Same protocol: implement (Fable agent) → /second-opinion → fix → verify →
+commit → update this file → next task. Votes-as-records was deliberately
+NOT scheduled — see FOLLOWUPS.md "Design revisits" (decide with the
+write-back design; tasks 11–12 are its prerequisites).
+
+| # | Task | Status | Commit | Notes |
+|---|------|--------|--------|-------|
+| 10 | 09-e2e-relay | done | (see git log) | 7/7 reviewers (4 Claude emulated + codex/gemini/glm); fixes: dev requestCrawl PUBLIC-relay dial guard (codex unique catch — NewPrivateOnlyHTTPClient, inverse SSRF guard), terminal-error classification made pre-flight-only (whole-chain IsValidation was abandoning a relay on attempt 1 for transient DNS), 10s per-attempt timeout (budget arithmetic was 14min worst-case, not 2min), vacuous validation-no-retry test rewritten + 400-is-retried pin, vetEvent per-DID rev-monotonicity (restores per-repo ordering assertion suite-wide), drain() returns+clears pending (closes task-10 vacuous-pass trap), relay poll robustness + pagination cap, doc corrections (RESOLVE_ADDRESS overstatement, spec BGS_CRAWL_INSECURE_WS annotation, FOLLOWUPS 16th-failure off-by-one). KEPT DELIBERATE over 3 reviewers' objection: all wire errors incl. 4xx retried — bigsky answers the describeServer callback race with HTTP 400 (comment + test pin it). Final clean make e2e: 10/10, 96.7s |
+| 11 | 10-e2e-scenarios | pending | | image/consent/Delete(Actor)/unsubscribe/community-update/vote-hammer/suite-end sweep |
+| 12 | 11-hardening | pending | | inbox+sync rate limits, #account frame, delete-before-create, pruners, housekeeping |
+| 13 | 12-perf-scale | pending | | MST cache, getRepo streaming/reachable-set, blocks GC, ClaimNext scan |
 
 Statuses: pending → in-progress → review → done (or blocked: <reason>).
 
@@ -384,6 +402,47 @@ and deferred TODOs here)
   never affects run outcome). SEED_COUNTS_FROM_API (default on; strict bool
   parse rejects typos). Known accepted drift: a baseline voter who flips
   sends Undo for a like we never saw (no-op) — stale until re-seed.
+### From task 09 (relay pipeline — tasks 10/11 MUST know)
+- The e2e pipeline is now Lemmy → tidepool → BigSky relay → Jetstream:
+  EVERY scenario's events transit relay validation (DID resolution against
+  the local PLC, per-commit sig verification). jetstream-direct (compose
+  profile `direct`, host :6038) is a debug tap only. Relay on host :2480
+  (admin key e2e-relay-admin-key); helpers: relayPDSList/relayListRepos/
+  relayGetLatestCommit in tests/e2e/helpers.go.
+- CRITICAL for scenario design: bigsky's parallel indexer (100 workers
+  keyed by repo DID) preserves per-repo order but NOT cross-repo order —
+  author profiles and community posts routinely swap. The e2e listener now
+  BUFFERS consumed-but-unmatched commit events and rescans them on later
+  awaits; await predicates MUST be PURE (side-effecting accounting belongs
+  in drain loops — scenario 8 was rewritten that way). Cross-repo ordering
+  assertions were removed from scenarios 2/3/6; presence + linkage is what
+  survives a relay. Carry to Coves AppView: it cannot rely on
+  profile-before-post through relay infra (FOLLOWUPS "Relay pipeline").
+- New config: ALLOW_DEV_REQUEST_CRAWL (dev-only, refused in production)
+  makes dev actually send requestCrawl; RequestCrawlAll now retries per
+  relay (5s × 24, vars compressible in tests) because bigsky's requestCrawl
+  handler calls BACK into the announcing host's describeServer before
+  subscribing — the first attempt races the bridge's own listener (observed
+  live: attempt 1 fails, attempt 2 lands).
+- bigsky env facts (verified against image --help + source; Coves' compose
+  stanza is wrong): ATP_PLC_HOST (plc), RELAY_ADMIN_KEY, DATA_DIR,
+  RESOLVE_ADDRESS (defaults to PUBLIC 1.1.1.1 — set 127.0.0.11),
+  HANDLE_RESOLVER_HOSTS=tidepool (trial-host resolver GETs
+  /.well-known/atproto-did with the handle as Host header — handles VERIFY,
+  0 failures in a full run), BSKYLOG_LOG_LEVEL; --crawl-insecure-ws has NO
+  env binding (command arg). Fresh relay refuses ALL non-admin requestCrawl
+  (new-PDS-per-day limit 0, checked before trusted domains) → one-shot
+  relay-bootstrap service raises it; tidepool depends_on its completion.
+  Image has no arm64 manifest (platform: linux/amd64, emulated on Apple
+  Silicon). Relay gets its own postgres with TWO dbs (bgs + carstore).
+- Tombstone visibility through the relay is a DEAD END until task 11:
+  bigsky has no getRepoStatus, filters tombstoned repos from listRepos, and
+  only learns account state from #account frames the bridge doesn't emit
+  yet. When task 11 adds the #account frame, add the relay-side assertion
+  (repo disappears from relay listRepos after consent revocation).
+- Timing budgets: eventTimeout 90s→120s (relay hop + first-sight DID work +
+  amd64 emulation), burstTimeout 3m (scenario 8 is drain-based now),
+  crawlTimeout 3m (covers the announce retry window). Suite runs ~114s.
 - DEFERRED (task 08+): vote_events grows unbounded (no pruning of
   superseded/undone rows — mirror FIREHOSE_RETENTION treatment alongside
   ap_tombstones); actor-delete/consent revocation does NOT scrub that

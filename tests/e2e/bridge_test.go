@@ -47,11 +47,23 @@ func TestSubscribe_CommunityProfileOnFirehose(t *testing.T) {
 	}
 }
 
-// Scenario 2: a Lemmy user shares a link → actor.profile first, then
-// community.post in the COMMUNITY's repo with author = the user's DID
-// (PLAN.md locked decision 3), in that order — and the shared url crosses
-// the wire as an embed.external whose uri survives byte-identical (the
-// classic CBOR→JSON breakage point).
+// Scenario 2: a Lemmy user shares a link → actor.profile AND community.post
+// in the COMMUNITY's repo with author = the user's DID (PLAN.md locked
+// decision 3) — and the shared url crosses the wire as an embed.external
+// whose uri survives byte-identical (the classic CBOR→JSON breakage point).
+//
+// Ordering caveat (task 09 discovery): the bridge emits the author's
+// profile strictly before the post on its OWN firehose, but the two records
+// live in different repos (author vs community) and bigsky indexes its
+// inbound stream with a parallel scheduler keyed by repo DID (indigo
+// events/schedulers/parallel, 100 workers) — per-repo order survives the
+// relay, CROSS-repo order does not. In practice the post usually overtakes
+// the profile: the community DID is already known to the relay while the
+// author's first-ever event costs a PLC resolution + handle verification.
+// So this scenario asserts presence + the author linkage, not arrival
+// order — and the Coves AppView, which consumes through relay
+// infrastructure too, cannot rely on profile-before-post either
+// (FOLLOWUPS.md "Relay pipeline").
 func TestPost_ActorProfileThenPost(t *testing.T) {
 	h := newHarness(t)
 	community, sub := setupSubscribedCommunity(t, h, "post")
@@ -70,24 +82,12 @@ func TestPost_ActorProfileThenPost(t *testing.T) {
 	post := user.createLinkPost(t, community.ID, title, "first bridged post", linkURL)
 	t.Logf("created lemmy post %d (%s)", post.ID, post.APID)
 
-	// Both events funnel through one listener; the FIRST match for this
-	// scenario must be the author's profile — the AppView rejects posts
-	// whose author isn't indexed yet, so emission order is load-bearing.
-	first := l.await("actor.profile or community.post for "+username, func(e *jsEvent) bool {
-		switch e.Commit.Collection {
-		case colActorProfile:
-			name, _ := fieldOf(e.Commit.Record, "displayName")
-			return name == username
-		case colPost:
-			got, _ := fieldOf(e.Commit.Record, "title")
-			return e.Did == sub.DID && got == title
-		}
-		return false
+	// Await both events in either order (await buffers non-matches, so a
+	// post that overtook the profile through the relay is not lost).
+	profileEv := l.await("actor.profile for "+username, func(e *jsEvent) bool {
+		name, _ := fieldOf(e.Commit.Record, "displayName")
+		return e.Commit.Collection == colActorProfile && name == username
 	})
-	if first.Commit.Collection != colActorProfile {
-		t.Fatalf("first event was %s — actor.profile must be emitted before the post", first)
-	}
-	profileEv := first
 	if profileEv.Commit.RKey != rkeySelf {
 		t.Errorf("actor.profile rkey = %q, want %q", profileEv.Commit.RKey, rkeySelf)
 	}
@@ -127,8 +127,9 @@ func TestComments_StrongRefsResolve(t *testing.T) {
 	title := "Comment thread " + h.suffix
 	post := user.createPost(t, community.ID, title, "root post")
 
-	// The author's profile precedes their first content (scenario 2 asserts
-	// the ordering; here it pins the author's DID).
+	// The author's profile pins the author's DID. Arrival order vs the post
+	// is relay-dependent (see scenario 2) — await's buffering makes these
+	// sequential awaits order-tolerant.
 	profileEv := l.await("author actor.profile", func(e *jsEvent) bool {
 		name, _ := fieldOf(e.Commit.Record, "displayName")
 		return e.Commit.Collection == colActorProfile && name == username
@@ -355,19 +356,21 @@ func TestBackfill_PreexistingPosts(t *testing.T) {
 	})
 
 	// All three historical posts must materialize (accept triggers the
-	// outbox backfill). Order among the posts is newest-first outbox order —
-	// only presence is asserted — but each post's AUTHOR must have hit the
-	// firehose as an actor.profile before the post itself (the Coves AppView
-	// rejects posts by unindexed authors, so backfill emission order is as
-	// load-bearing as the live path's).
+	// outbox backfill), and every post's AUTHOR must appear on the firehose
+	// as an actor.profile. The bridge emits each profile strictly before
+	// its posts, but profile and post live in different repos and the relay
+	// preserves only per-repo order (scenario 2's caveat) — so authorship
+	// is asserted as presence (each author's profile arrives), not arrival
+	// order.
 	profileDIDs := map[string]bool{}
+	postAuthors := map[string]string{} // author DID → one of their post titles
 	votedURI := ""
 	remaining := len(titles)
 	for remaining > 0 {
 		ev := l.await(fmt.Sprintf("backfilled post or author profile (%d posts to go)", remaining), func(e *jsEvent) bool {
 			switch e.Commit.Collection {
 			case colActorProfile:
-				return true // consume every profile to track author-first ordering
+				return true // consume every profile to track the author set
 			case colPost:
 				title, _ := fieldOf(e.Commit.Record, "title")
 				return e.Did == sub.DID && e.Commit.Operation == opCreate && titles[title]
@@ -379,14 +382,22 @@ func TestBackfill_PreexistingPosts(t *testing.T) {
 			continue
 		}
 		title := recordField(t, ev.Commit.Record, "title")
-		if got := recordField(t, ev.Commit.Record, "author"); !profileDIDs[got] {
-			t.Errorf("backfilled post %q emitted before its author's actor.profile (author %s)", title, got)
-		}
+		postAuthors[recordField(t, ev.Commit.Record, "author")] = title
 		if title == votedTitle {
 			votedURI = ev.atURI()
 		}
 		delete(titles, title)
 		remaining--
+	}
+	// Any author whose profile hasn't been consumed yet must still be in
+	// flight (or already buffered by await): wait for each explicitly.
+	for author, title := range postAuthors {
+		if profileDIDs[author] {
+			continue
+		}
+		l.await(fmt.Sprintf("actor.profile for the author of %q (%s)", title, author), func(e *jsEvent) bool {
+			return e.Commit.Collection == colActorProfile && e.Did == author
+		})
 	}
 
 	// The seeded baseline shows through the side channel: 2 up (author
@@ -561,7 +572,12 @@ func TestBurst_ConcurrentIngestionExactlyOnce(t *testing.T) {
 
 	// Account for EVERY commit on the two communities' repos by
 	// (did, collection/rkey) — an update sneaking in after a create is a
-	// duplicate commit on that record, not a separate event.
+	// duplicate commit on that record, not a separate event. Collection is
+	// drain-based, not await-based: drain sees every live event exactly
+	// once, so the accounting cannot double-count (await predicates must
+	// stay pure now that non-matches are buffered and rescanned), and it is
+	// inherently order-agnostic — which the relay's cross-repo reordering
+	// demands anyway.
 	seen := map[string]int{}
 	keyTitle := map[string]string{}
 	count := func(e *jsEvent) {
@@ -580,15 +596,23 @@ func TestBurst_ConcurrentIngestionExactlyOnce(t *testing.T) {
 
 	// Every post arrives…
 	matched := map[string]bool{}
+	deadline := time.Now().Add(burstTimeout)
 	for len(matched) < len(titles) {
-		ev := l.await(fmt.Sprintf("burst post (%d to go)", len(titles)-len(matched)), func(e *jsEvent) bool {
-			count(e)
-			title, _ := fieldOf(e.Commit.Record, "title")
-			return e.Commit.Operation == opCreate &&
-				(e.Did == subA.DID || e.Did == subB.DID) &&
-				titles[title] && !matched[title]
-		})
-		matched[recordField(t, ev.Commit.Record, "title")] = true
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d/%d burst posts arrived within %s", len(matched), len(titles), burstTimeout)
+		}
+		for _, ev := range l.drain(time.Second) {
+			count(ev)
+			if ev.Kind != kindCommit || ev.Commit == nil || ev.Commit.Operation != opCreate {
+				continue
+			}
+			if ev.Did != subA.DID && ev.Did != subB.DID {
+				continue
+			}
+			if title, ok := fieldOf(ev.Commit.Record, "title"); ok && titles[title] {
+				matched[title] = true
+			}
+		}
 	}
 	// …and exactly once: nothing trailing, no second commit on any rkey.
 	for _, ev := range l.drain(4 * time.Second) {

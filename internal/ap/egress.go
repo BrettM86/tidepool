@@ -28,6 +28,29 @@ func NewGuardedHTTPClient(allowPrivate bool, timeout time.Duration) *http.Client
 	}
 }
 
+// NewPrivateOnlyHTTPClient returns an *http.Client whose transport enforces
+// the INVERSE of the SSRF guard at dial time: every destination must be
+// loopback, RFC1918/ULA private, or link-local — anything public is refused.
+// It backs dev-only paths that talk to local containers (currently the
+// ALLOW_DEV_REQUEST_CRAWL startup crawl against the e2e stack's local relay),
+// enforcing in code the project invariant that development and tests NEVER
+// contact public infrastructure. Production paths must keep the standard
+// guarded client (NewGuardedHTTPClient), where public destinations are the
+// point.
+func NewPrivateOnlyHTTPClient(timeout time.Duration) *http.Client {
+	if timeout == 0 {
+		timeout = DefaultRequestTimeout
+	}
+	guard := &egressGuard{
+		privateOnly:  true,
+		lookupIPAddr: net.DefaultResolver.LookupIPAddr,
+	}
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: guardedTransport(nil, guard),
+	}
+}
+
 // egressGuard blocks outbound requests to addresses an SSRF attacker would
 // pivot through: loopback, RFC1918 private, link-local, unique-local,
 // multicast, unspecified, and the cloud-metadata endpoint. It rejects
@@ -42,6 +65,10 @@ func NewGuardedHTTPClient(allowPrivate bool, timeout time.Duration) *http.Client
 // the httptest-based tests that hit 127.0.0.1 turn it off.
 type egressGuard struct {
 	allowPrivate bool
+	// privateOnly inverts the guard: ONLY loopback/private/link-local
+	// destinations are dialable, everything public is refused. Dev-only
+	// (NewPrivateOnlyHTTPClient); it takes precedence over allowPrivate.
+	privateOnly bool
 	// lookupIPAddr resolves a hostname to candidate IPs. It is a field (not a
 	// direct net.Resolver call) so tests can inject a DNS-rebinding scenario —
 	// a hostname that resolves to a blocked address — without a real DNS server.
@@ -76,8 +103,16 @@ func (g *egressGuard) checkURL(u *url.URL) error {
 }
 
 // checkIP rejects addresses in the blocked ranges unless the guard is
-// disabled for dev/test.
+// disabled for dev/test. In privateOnly mode the check is inverted: only
+// local (loopback/private/link-local) addresses pass.
 func (g *egressGuard) checkIP(ip net.IP) error {
+	if g.privateOnly {
+		if !isLocalIP(ip) {
+			return errors.NewValidationError("url",
+				fmt.Sprintf("address %s is public; this dev-only client permits local egress only", ip))
+		}
+		return nil
+	}
 	if g.allowPrivate {
 		return nil
 	}
@@ -92,6 +127,17 @@ func (g *egressGuard) checkIP(ip net.IP) error {
 // is link-local so isBlockedIP already catches it; naming it makes intent
 // explicit and covers the mapped forms.
 var metadataV4 = net.IPv4(169, 254, 169, 254)
+
+// isLocalIP reports whether ip is a local destination the private-only
+// dev client may dial: loopback, RFC1918 / unique-local private, or
+// link-local unicast. Everything else — including unspecified and
+// multicast — is refused.
+func isLocalIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
+}
 
 func isBlockedIP(ip net.IP) bool {
 	if ip == nil {

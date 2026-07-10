@@ -7,9 +7,10 @@
 #   plc.directory).
 #
 # e2e: on demand — the full docker-compose stack (Lemmy built from source in
-#   debug mode, did:plc directory, Jetstream). Heavy (the Lemmy debug build
-#   is a full Rust compile), so it runs only via workflow_dispatch or the
-#   `run-e2e` PR label.
+#   debug mode, did:plc directory, BigSky relay, Jetstream — every scenario
+#   transits Lemmy → bridge → relay → Jetstream). Heavy (the Lemmy debug
+#   build is a full Rust compile), so it runs only via workflow_dispatch or
+#   the `run-e2e` PR label.
 
 name: ci
 

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -842,4 +843,163 @@ func TestRequestCrawl(t *testing.T) {
 
 	assert.Error(t, RequestCrawl(ctx, client, relay.URL, ""), "empty hostname must be rejected")
 	assert.Error(t, RequestCrawl(ctx, nil, relay.URL, testHostname), "nil client must be rejected")
+}
+
+// testLogger returns a discard logger: the crawl tests assert outcomes via
+// call counts, and retry chatter should never pollute test output.
+func testLogger(t *testing.T) *slog.Logger {
+	t.Helper()
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// compressCrawlRetries shrinks the startup-crawl retry schedule for tests.
+func compressCrawlRetries(t *testing.T, interval time.Duration, attempts int) {
+	t.Helper()
+	prevInterval, prevAttempts := crawlRetryInterval, crawlMaxAttempts
+	crawlRetryInterval, crawlMaxAttempts = interval, attempts
+	t.Cleanup(func() { crawlRetryInterval, crawlMaxAttempts = prevInterval, prevAttempts })
+}
+
+func TestRequestCrawlAll_RetriesTransientFailures(t *testing.T) {
+	compressCrawlRetries(t, 10*time.Millisecond, 10)
+
+	// The relay fails twice before accepting — the startup race in miniature
+	// (relay booting / bridge listener not yet up when the relay probes back).
+	var calls atomic.Int64
+	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) <= 2 {
+			http.Error(w, "still booting", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer relay.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	RequestCrawlAll(ctx, &http.Client{Timeout: time.Second}, []string{relay.URL}, testHostname, testLogger(t))
+	assert.EqualValues(t, 3, calls.Load(), "two failures then the success — no extra attempts after that")
+}
+
+func TestRequestCrawlAll_BudgetExhaustionAndIndependence(t *testing.T) {
+	compressCrawlRetries(t, time.Millisecond, 3)
+
+	var deadCalls atomic.Int64
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		deadCalls.Add(1)
+		http.Error(w, "nope", http.StatusInternalServerError)
+	}))
+	defer dead.Close()
+	var liveCalls atomic.Int64
+	live := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		liveCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer live.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	RequestCrawlAll(ctx, &http.Client{Timeout: time.Second}, []string{dead.URL, live.URL}, testHostname, testLogger(t))
+	assert.EqualValues(t, 3, deadCalls.Load(), "the dead relay gets exactly its budget")
+	assert.EqualValues(t, 1, liveCalls.Load(), "a dead relay must not block or repeat the healthy one")
+}
+
+func TestRequestCrawlAll_ContextCancelStopsRetrying(t *testing.T) {
+	compressCrawlRetries(t, time.Hour, 100) // only cancellation can end the wait
+
+	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "nope", http.StatusInternalServerError)
+	}))
+	defer relay.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		RequestCrawlAll(ctx, &http.Client{Timeout: time.Second}, []string{relay.URL}, testHostname, testLogger(t))
+	}()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("RequestCrawlAll kept waiting after context cancellation")
+	}
+}
+
+func TestRequestCrawlAll_ValidationErrorNotRetried(t *testing.T) {
+	// The hour-long interval is the tripwire: if the pre-flight caller-bug
+	// error were classified as retryable, the goroutine would sleep an hour
+	// before attempt 2 and the deadline below would fire.
+	compressCrawlRetries(t, time.Hour, 5)
+
+	var calls atomic.Int64
+	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer relay.Close()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// Empty hostname is a caller bug (validation error): terminal, no retry.
+		RequestCrawlAll(context.Background(), &http.Client{Timeout: time.Second}, []string{relay.URL}, "", testLogger(t))
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a pre-flight validation error was retried instead of being terminal")
+	}
+	assert.EqualValues(t, 0, calls.Load(), "validation failures must not reach the wire, let alone retry")
+}
+
+// TestRequestCrawlAll_BadRequestIsRetried pins DELIBERATE behavior: HTTP 4xx
+// from a relay is retried like any other wire-level failure. Bigsky answers
+// 400 while the describeServer callback race is unresolved (it probes our
+// listener before subscribing), so treating 400 as terminal would defeat the
+// exact race this retry loop exists for.
+func TestRequestCrawlAll_BadRequestIsRetried(t *testing.T) {
+	compressCrawlRetries(t, time.Millisecond, 10)
+
+	var calls atomic.Int64
+	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) <= 2 {
+			http.Error(w, "host failed to verify", http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer relay.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	RequestCrawlAll(ctx, &http.Client{Timeout: time.Second}, []string{relay.URL}, testHostname, testLogger(t))
+	assert.EqualValues(t, 3, calls.Load(), "two 400s then the success — 4xx must be retried, and success must stop the loop")
+}
+
+// TestRequestCrawlAll_AttemptTimeoutBoundsHangingRelay pins the per-attempt
+// cap (crawlAttemptTimeout): a relay that hangs cannot stretch each attempt
+// to the HTTP client's full timeout, keeping the documented budget honest.
+func TestRequestCrawlAll_AttemptTimeoutBoundsHangingRelay(t *testing.T) {
+	compressCrawlRetries(t, time.Millisecond, 2)
+	prevTimeout := crawlAttemptTimeout
+	crawlAttemptTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { crawlAttemptTimeout = prevTimeout })
+
+	release := make(chan struct{})
+	var calls atomic.Int64
+	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		<-release // hang until the test ends
+	}))
+	defer relay.Close()
+	defer close(release) // LIFO: unblock hung handlers before relay.Close waits on them
+
+	start := time.Now()
+	// The client's own timeout (10s) is far above the attempt cap: only the
+	// per-attempt context can keep this fast.
+	RequestCrawlAll(context.Background(), &http.Client{Timeout: 10 * time.Second}, []string{relay.URL}, testHostname, testLogger(t))
+	elapsed := time.Since(start)
+	assert.EqualValues(t, 2, calls.Load(), "a hanging relay still gets its full attempt budget")
+	assert.Less(t, elapsed, 5*time.Second, "attempts must be bounded by crawlAttemptTimeout, not the client timeout")
 }

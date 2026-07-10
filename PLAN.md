@@ -89,6 +89,15 @@ sanctioned side-channel XRPC. Nothing ever strongRefs a vote.
 | 7 | tasks/07-vote-aggregates.md | Vote ingestion, aggregate store, side-channel XRPC | 800 | 6 |
 | 8 | tasks/08-e2e-harness.md | docker-compose with real Lemmy + PLC + Jetstream, E2E tests, lexicon conformance | 1000 | 4,6 |
 
+### v1.1 sections (added 2026-07-10 — FOLLOWUPS backlog + relay pipeline)
+
+| # | Task file | What | ~LOC | Depends on |
+|---|-----------|------|------|-----------|
+| 9 | tasks/09-e2e-relay.md | BigSky relay in e2e; full pipeline Lemmy → bridge → relay → Jetstream; real requestCrawl | 600 | 8 |
+| 10 | tasks/10-e2e-scenarios.md | Scenario completion: image, consent, Delete(Actor), unsubscribe, community update, vote hammer, suite-end sweep | 800 | 9 |
+| 11 | tasks/11-hardening.md | Pre-internet-facing hardening: rate limits, #account frame, ordering gaps, pruners, housekeeping | 1000 | 10 |
+| 12 | tasks/12-perf-scale.md | MST cache, getRepo streaming/reachable-set, blocks GC, ClaimNext — prerequisite for any votes-as-records revisit | 800 | 11 |
+
 ## Loop protocol
 
 Each iteration (one section per iteration):

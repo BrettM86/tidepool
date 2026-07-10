@@ -75,7 +75,9 @@ type Config struct {
 	// RelayHosts lists relays to send com.atproto.sync.requestCrawl to on
 	// startup (RELAY_HOSTS, comma-separated, optional). In development the
 	// request is logged instead of sent — dev hosts are not publicly
-	// reachable and must never poke real relays.
+	// reachable and must never poke real relays — unless
+	// ALLOW_DEV_REQUEST_CRAWL opts in, which sends but only to local
+	// (loopback/private/link-local) relay addresses.
 	RelayHosts []string
 	// AllowPrivateAddresses disables the SSRF egress guard, letting the AP
 	// client fetch loopback/private/link-local/metadata addresses. It defaults
@@ -83,6 +85,19 @@ type Config struct {
 	// tests that hit httptest servers on 127.0.0.1. Set ALLOW_PRIVATE_FETCH=1
 	// to enable.
 	AllowPrivateAddresses bool
+	// AllowDevRequestCrawl makes ENVIRONMENT=development actually SEND
+	// com.atproto.sync.requestCrawl to RelayHosts on startup instead of only
+	// logging the would-be request. It exists for harnesses that run a REAL
+	// local relay (the e2e stack's BigSky) — dev hosts are otherwise not
+	// publicly reachable and must never poke live relays. The local-only
+	// invariant is enforced at dial time: when this flag is active the
+	// crawl client (ap.NewPrivateOnlyHTTPClient) refuses any destination
+	// that is not loopback/private/link-local, so a public relay in
+	// RELAY_HOSTS cannot be contacted from dev. Refused in production,
+	// where sending is already the behavior and the flag could only
+	// mislead (the ALLOW_PRIVATE_FETCH pattern). Set
+	// ALLOW_DEV_REQUEST_CRAWL=1 to enable.
+	AllowDevRequestCrawl bool
 	// AdminToken is the bearer token protecting the /admin API (community
 	// subscribe/unsubscribe/backfill). ADMIN_TOKEN; required in production,
 	// dev default is a fixed, publicly known value.
@@ -235,6 +250,14 @@ func Load(logger *slog.Logger) (*Config, error) {
 	cfg.AllowPrivateAddresses = boolVar("ALLOW_PRIVATE_FETCH")
 	if cfg.AllowPrivateAddresses && !isDevelopment {
 		return nil, fmt.Errorf("config: ALLOW_PRIVATE_FETCH must not be set in production")
+	}
+
+	// Dev-only requestCrawl override, same posture as ALLOW_PRIVATE_FETCH:
+	// meaningful only where dev would otherwise log instead of send, refused
+	// where it could mask a config mistake.
+	cfg.AllowDevRequestCrawl = boolVar("ALLOW_DEV_REQUEST_CRAWL")
+	if cfg.AllowDevRequestCrawl && !isDevelopment {
+		return nil, fmt.Errorf("config: ALLOW_DEV_REQUEST_CRAWL must not be set in production (production always sends requestCrawl)")
 	}
 
 	// Admin API auth: like the KEK, the dev default is fixed and public —

@@ -1,7 +1,54 @@
 # Tidepool end-to-end stack: a real Lemmy federating with the bridge, a real
-# did:plc directory backing DID minting, and a real Jetstream decoding the
-# bridge's subscribeRepos firehose. `make e2e` builds it, waits for health,
-# runs tests/e2e (tagged `e2e`) from the host, and tears it down.
+# did:plc directory backing DID minting, a real atproto relay (indigo
+# BigSky) crawling the bridge like a hostile consumer — DID resolution
+# against the local PLC, per-commit signature verification, getRepo crawls —
+# and a real Jetstream decoding the RELAY's firehose. `make e2e` builds it,
+# waits for health, runs tests/e2e (tagged `e2e`) from the host, and tears
+# it down. The tested pipeline is:
+#
+#   Lemmy ──AP──▶ tidepool ──subscribeRepos──▶ relay (BigSky) ──▶ jetstream
+#
+# so every scenario's records transit relay validation for free. A direct
+# bridge→Jetstream tap exists behind the `direct` compose profile for
+# debugging only (jetstream-direct below) — it is NOT the tested path.
+#
+# ── BigSky facts this file depends on (verified against the pinned image's
+#    --help output and the indigo source, bgs/ + cmd/bigsky/) ─────────────
+# * PLC host is the `--plc-host` flag / ATP_PLC_HOST env (defaults to the
+#   PUBLIC https://plc.directory — it MUST be pointed at the compose `plc`
+#   service or the relay fails closed resolving our did:plc identities).
+# * `--crawl-insecure-ws` (ws:// to the PDS, and http:// for requestCrawl
+#   hostname validation) has NO env-var binding — it must be a command-line
+#   arg. Coves' BGS_CRAWL_INSECURE_WS env var does not exist in the image
+#   and is silently ignored; same for BGS_PORT and LOG_LEVEL (the real log
+#   knob is BSKYLOG_LOG_LEVEL).
+# * A fresh relay's slurp config has new_pds_per_day_limit = 0, and that
+#   limiter is checked BEFORE the trusted-domain list — a brand-new relay
+#   refuses every non-admin requestCrawl until an admin raises the limit.
+#   The one-shot `relay-bootstrap` service does exactly that (and nothing
+#   else): the crawl itself is still bridge-originated (RequestCrawlAll),
+#   which is the thing under test.
+# * requestCrawl validates the hostname by calling back into the PDS's
+#   /xrpc/com.atproto.server.describeServer before subscribing — hence the
+#   bridge's retrying announcement (internal/sync/crawl.go) and tidepool's
+#   depends_on relay-bootstrap.
+# * Handle verification: HANDLE_RESOLVER_HOSTS switches bigsky to its
+#   TestHandleResolver, which GETs http://<trial-host>/.well-known/atproto-did
+#   with the HANDLE in the Host header — exactly the resolution surface the
+#   bridge already serves. Bridged handles (alice.lemmy.tidepool) do not
+#   exist in compose DNS, so without this the prod resolver would fail —
+#   which is NON-fatal in bigsky (bgs.createExternalUser logs and keeps the
+#   repo with an invalid handle), but with it handles actually verify.
+# * RESOLVE_ADDRESS defaults to the PUBLIC 1.1.1.1:53 resolver; pointed at
+#   Docker's embedded DNS (127.0.0.11) as defense-in-depth on a dead code
+#   path — NOT what makes the stack local-only. Docker's embedded DNS
+#   forwards unknown names to its upstream resolver, so this alone would
+#   not be hermetic; the invariant actually holds because
+#   HANDLE_RESOLVER_HOSTS fully REPLACES the DNS-TXT handle resolver with
+#   the TestHandleResolver (above) and ATP_PLC_HOST keeps did:plc
+#   resolution on the compose plc, leaving no code path that queries DNS.
+# * The image has no arm64 manifest (`platform: linux/amd64`; Apple Silicon
+#   runs it under emulation — fine at e2e volume).
 #
 # ── How Lemmy↔Tidepool federation works over plain HTTP ──────────────────
 # Lemmy only accepts http:// federation URLs in a DEBUG build (a compile-time
@@ -27,11 +74,12 @@
 # trust store is not reliably extensible at runtime, and the proxy adds
 # nothing for a local harness.
 #
-# Host ports (loopback-only — the stack carries an admin token and
+# Host ports (loopback-only — the stack carries admin tokens and
 # ALLOW_PRIVATE_FETCH=1, so it must not be reachable from the local
-# network; offset from the dev stack so both can run):
+# network; offset from the dev stack AND the Coves dev relay so all can run):
 #   127.0.0.1:8092  Tidepool HTTP (admin API, XRPC, healthz)
 #   127.0.0.1:8541  Lemmy HTTP API (8541 nods to lemmy_alpha in upstream's federation compose)
+#   127.0.0.1:2480  Relay (BigSky) XRPC + admin API
 #   127.0.0.1:6028  Jetstream WebSocket (/subscribe)
 #
 # LOCAL-ONLY: nothing here talks to plc.directory, public relays, or public
@@ -73,6 +121,13 @@ services:
       PLC_DIRECTORY_URL: http://plc:3000
       ADMIN_TOKEN: e2e-admin-token
       SEED_COUNTS_FROM_API: "1"
+      # Announce ourselves to the local relay on startup via the REAL
+      # RequestCrawlAll path. ALLOW_DEV_REQUEST_CRAWL exists precisely for
+      # this stack (dev is otherwise log-only, and production refuses the
+      # flag); the announcement retries internally because the relay
+      # validates the hostname by calling back into our describeServer.
+      RELAY_HOSTS: http://relay:2470
+      ALLOW_DEV_REQUEST_CRAWL: "1"
       LOG_LEVEL: debug
     ports:
       - "127.0.0.1:${TIDEPOOL_E2E_PORT:-8092}:80"
@@ -82,6 +137,11 @@ services:
         condition: service_healthy
       plc:
         condition: service_healthy
+      # The relay must be up AND willing to accept new PDS subscriptions
+      # (see relay-bootstrap) before the bridge's startup requestCrawl fires,
+      # or the announcement burns its retry budget against a 0-limit relay.
+      relay-bootstrap:
+        condition: service_completed_successfully
     healthcheck:
       # /healthz pings the database, so healthy == migrated and serving.
       test: ["CMD", "wget", "--spider", "-q", "http://localhost/healthz"]
@@ -125,14 +185,137 @@ services:
       retries: 30
       start_period: 30s
 
-  # ── Jetstream (consumes the bridge's firehose) ──────────────────────────
+  # ── BigSky relay (indigo) ───────────────────────────────────────────────
+  relay-postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: bgs
+      POSTGRES_USER: relay
+      POSTGRES_PASSWORD: relay
+    volumes:
+      # First-boot init: creates the second database (`carstore`) — bigsky
+      # keeps BGS state and carstore shard metadata in separate databases.
+      - ./e2e/relay/init-carstore.sql:/docker-entrypoint-initdb.d/init-carstore.sql:ro
+    networks: [tidepool-e2e]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U relay -d bgs"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  relay:
+    # Pinned bigsky build (same pin Coves uses). All flag/env names below
+    # are verified against this image's --help output — see the header
+    # comment for the ones that look plausible but do NOT exist.
+    image: ghcr.io/bluesky-social/indigo:bigsky-0a2d4173e6e89e49b448f6bb0a6e1ab58d12b385
+    # No arm64 manifest; Apple Silicon hosts run it under emulation.
+    platform: linux/amd64
+    # --crawl-insecure-ws has no env binding (verified): ws:// to the bridge
+    # and http:// hostname validation. The image entrypoint is `dumb-init --`
+    # so the command must restate the binary.
+    command: ["/bigsky", "--crawl-insecure-ws"]
+    environment:
+      DATABASE_URL: postgresql://relay:relay@relay-postgres:5432/bgs?sslmode=disable
+      CARSTORE_DATABASE_URL: postgresql://relay:relay@relay-postgres:5432/carstore?sslmode=disable
+      DATA_DIR: /data
+      # LOCAL-ONLY, twice over: DID resolution against the compose PLC (the
+      # default is the public plc.directory), and DNS against Docker's
+      # embedded resolver (the default is the public 1.1.1.1).
+      ATP_PLC_HOST: http://plc:3000
+      RESOLVE_ADDRESS: 127.0.0.11:53
+      # Bridged handles live under the bridge hostname and resolve via the
+      # bridge's own /.well-known/atproto-did (Host-header keyed) — bigsky's
+      # trial-host resolver speaks exactly that. Without this, handle
+      # verification fails non-fatally (repo kept, handle marked invalid).
+      HANDLE_RESOLVER_HOSTS: tidepool
+      RELAY_ADMIN_KEY: e2e-relay-admin-key
+      # Default is 100 repos per PDS — a long-lived stack under repeated
+      # suite runs mints past that.
+      RELAY_DEFAULT_REPO_LIMIT: "10000"
+      # Disk persister gives real event playback (with TTL) for downstream
+      # cursor replay instead of the DB persister's unbounded table.
+      RELAY_PERSISTER_DIR: /data/persister
+      BSKYLOG_LOG_LEVEL: info
+    ports:
+      - "127.0.0.1:${RELAY_E2E_PORT:-2480}:2470"
+    networks: [tidepool-e2e]
+    depends_on:
+      relay-postgres:
+        condition: service_healthy
+      plc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:2470/xrpc/_health"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  # One-shot bootstrap: raise the new-PDS-per-day limit from its fresh-DB
+  # default of 0 (which refuses ALL non-admin requestCrawl — checked before
+  # the trusted-domain list, so there is no config-only bypass). This is the
+  # sanctioned admin-API bootstrap; the crawl announcement itself still
+  # comes from the bridge (the code path under test). Reuses the bigsky
+  # image (has busybox wget) to avoid pulling another one.
+  relay-bootstrap:
+    image: ghcr.io/bluesky-social/indigo:bigsky-0a2d4173e6e89e49b448f6bb0a6e1ab58d12b385
+    platform: linux/amd64
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - >-
+        wget -q -O- --post-data=''
+        --header='Authorization: Bearer e2e-relay-admin-key'
+        'http://relay:2470/admin/subs/setPerDayLimit?limit=1000'
+    restart: "no"
+    networks: [tidepool-e2e]
+    depends_on:
+      relay:
+        condition: service_healthy
+
+  # ── Jetstream (consumes the RELAY's firehose — the tested pipeline) ─────
   jetstream:
     image: ghcr.io/bluesky-social/jetstream:sha-306e463693365e21a5ffd3ec051a5a7920000214
-    # Jetstream EXITS when its upstream websocket dies ("shutting down on
-    # events kill"), which is exactly what the restart scenario provokes by
-    # bouncing tidepool. Docker revives it; it reconnects with the cursor
-    # persisted in /data (container-local, survives restarts) and resumes
-    # replay from the bridge without gaps or duplicates.
+    # Jetstream EXITS when its upstream websocket dies. Its upstream is now
+    # the relay, which stays up across the restart scenario (the RELAY
+    # reconnects to the bounced bridge with its stored per-PDS cursor), so
+    # the policy only matters if the relay itself dies. Docker revives it;
+    # it reconnects with the cursor persisted in /data (container-local,
+    # survives restarts) and resumes replay without gaps or duplicates.
+    restart: unless-stopped
+    environment:
+      JETSTREAM_WS_URL: ws://relay:2470/xrpc/com.atproto.sync.subscribeRepos
+      JETSTREAM_LISTEN_ADDR: ":6018"
+      JETSTREAM_METRICS_LISTEN_ADDR: ":6019"
+      JETSTREAM_DATA_DIR: /data
+      JETSTREAM_EVENT_TTL: 24h
+      # The stack is quiet between test steps; don't self-restart on idle.
+      JETSTREAM_LIVENESS_TTL: 24h
+      LOG_LEVEL: debug
+    ports:
+      - "127.0.0.1:${JETSTREAM_E2E_PORT:-6028}:6018"
+    networks: [tidepool-e2e]
+    depends_on:
+      relay:
+        condition: service_healthy
+    # No wget/curl in the image, but it is debian-based with bash — a
+    # /dev/tcp probe of the subscribe port is a real readiness gate. Without
+    # a healthcheck, `up --wait` would pass the moment the container is
+    # running, before Jetstream actually accepts subscribers.
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/6018"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  # Debug-only tap: Jetstream wired straight to the bridge, bypassing the
+  # relay. NOT the tested path — bring it up alongside the stack with
+  #   docker compose -f docker-compose.e2e.yml --profile direct up -d jetstream-direct
+  # and point a listener at ws://127.0.0.1:6038 to compare the bridge's raw
+  # emissions against what survives relay validation.
+  jetstream-direct:
+    image: ghcr.io/bluesky-social/jetstream:sha-306e463693365e21a5ffd3ec051a5a7920000214
+    profiles: [direct]
     restart: unless-stopped
     environment:
       JETSTREAM_WS_URL: ws://tidepool:80/xrpc/com.atproto.sync.subscribeRepos
@@ -140,19 +323,14 @@ services:
       JETSTREAM_METRICS_LISTEN_ADDR: ":6019"
       JETSTREAM_DATA_DIR: /data
       JETSTREAM_EVENT_TTL: 24h
-      # The bridge is quiet between test steps; don't self-restart on idle.
       JETSTREAM_LIVENESS_TTL: 24h
       LOG_LEVEL: debug
     ports:
-      - "127.0.0.1:${JETSTREAM_E2E_PORT:-6028}:6018"
+      - "127.0.0.1:${JETSTREAM_DIRECT_E2E_PORT:-6038}:6018"
     networks: [tidepool-e2e]
     depends_on:
       tidepool:
         condition: service_healthy
-    # No wget/curl in the image, but it is debian-based with bash — a
-    # /dev/tcp probe of the subscribe port is a real readiness gate. Without
-    # a healthcheck, `up --wait` would pass the moment the container is
-    # running, before Jetstream actually accepts subscribers.
     healthcheck:
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/6018"]
       interval: 2s

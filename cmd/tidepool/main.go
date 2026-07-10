@@ -126,13 +126,23 @@ func run(logger *slog.Logger) error {
 
 	// Ask configured relays to crawl us. Development hosts are not publicly
 	// reachable, so dev only logs what it would have sent (never touches a
-	// live relay from a laptop).
+	// live relay from a laptop) — unless ALLOW_DEV_REQUEST_CRAWL opts in,
+	// which exists for the e2e harness's LOCAL BigSky relay and is refused
+	// by config in production. Even then dev must not be able to poke public
+	// infrastructure, so the dev-override path uses the private-only client:
+	// it refuses any non-loopback/private/link-local destination at dial
+	// time. Production keeps the standard SSRF-guarded client, where public
+	// relays are the point.
 	if len(cfg.RelayHosts) > 0 {
-		if cfg.IsDevelopment() {
-			logger.Info("development environment: skipping requestCrawl",
+		if cfg.IsDevelopment() && !cfg.AllowDevRequestCrawl {
+			logger.Info("development environment: skipping requestCrawl (set ALLOW_DEV_REQUEST_CRAWL=1 to send to a local relay)",
 				"relays", cfg.RelayHosts, "hostname", cfg.BridgeHostname)
 		} else {
 			crawlClient := ap.NewGuardedHTTPClient(cfg.AllowPrivateAddresses, 30*time.Second)
+			if cfg.IsDevelopment() {
+				// Reached only under ALLOW_DEV_REQUEST_CRAWL: local relays only.
+				crawlClient = ap.NewPrivateOnlyHTTPClient(30 * time.Second)
+			}
 			go tidepoolsync.RequestCrawlAll(ctx, crawlClient, cfg.RelayHosts, cfg.BridgeHostname, logger)
 		}
 	}

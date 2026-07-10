@@ -2,8 +2,10 @@
 
 // Package e2e drives the docker-compose.e2e.yml stack end to end: a real
 // Lemmy (debug build, plain-HTTP federation) federating with Tidepool, a
-// real did:plc directory backing DID minting, and a real Jetstream decoding
-// the bridge's subscribeRepos firehose.
+// real did:plc directory backing DID minting, a real BigSky relay crawling
+// the bridge (DID resolution against the local PLC, per-commit signature
+// verification), and a real Jetstream decoding the RELAY's firehose — every
+// event the suite consumes has therefore survived relay validation.
 //
 // Coves-style: E2E tests test REAL infrastructure, not mocks. Run them with
 // `make e2e` (compose up --build → wait for health → go test -tags e2e →
@@ -50,20 +52,41 @@ func envOr(name, fallback string) string {
 
 func tidepoolURL() string { return envOr("TIDEPOOL_E2E_URL", "http://localhost:8092") }
 func lemmyURL() string    { return envOr("LEMMY_E2E_URL", "http://localhost:8541") }
+func relayURL() string    { return envOr("RELAY_E2E_URL", "http://localhost:2480") }
 func jetstreamURL() string {
 	return envOr("JETSTREAM_E2E_URL", "ws://localhost:6028")
 }
-func adminToken() string { return envOr("TIDEPOOL_E2E_ADMIN_TOKEN", "e2e-admin-token") }
+func adminToken() string     { return envOr("TIDEPOOL_E2E_ADMIN_TOKEN", "e2e-admin-token") }
+func relayAdminKey() string  { return envOr("RELAY_E2E_ADMIN_KEY", "e2e-relay-admin-key") }
+func bridgeHostname() string { return envOr("TIDEPOOL_E2E_HOSTNAME", "tidepool") }
 
 // stackTimeout bounds the initial wait-for-healthy loop. Container startup
 // (Lemmy migrations, PLC boot) can be slow on a cold machine; `make e2e`
 // already waited for compose health, so this is usually instant.
 const stackTimeout = 5 * time.Minute
 
-// eventTimeout bounds one wait for a federation → firehose → Jetstream
-// round trip. LEMMY_TEST_FAST_FEDERATION makes deliveries near-instant, but
-// leave generous slack for slow CI.
-const eventTimeout = 90 * time.Second
+// eventTimeout bounds one wait for a federation → bridge firehose → relay →
+// Jetstream round trip. LEMMY_TEST_FAST_FEDERATION makes Lemmy deliveries
+// near-instant, but the relay hop adds real work per event — first sight of
+// a DID costs the relay a PLC resolution plus handle verification, and on
+// Apple Silicon the (amd64-only) relay image runs emulated — so this budget
+// is deliberately looser than the pre-relay 90s.
+const eventTimeout = 120 * time.Second
+
+// burstTimeout bounds scenario 8's whole 12-post burst arriving (a single
+// shared budget: the collection loop is drain-based rather than one
+// eventTimeout per await).
+const burstTimeout = 3 * time.Minute
+
+// crawlTimeout bounds waiting for the bridge's startup requestCrawl to land
+// in the relay's PDS registry. The announcement retries inside the bridge
+// (internal/sync/crawl.go: 24 attempts × 5s interval, 10s per-attempt cap)
+// because the relay validates the hostname by calling back into the bridge's
+// describeServer — the budget must cover the realistic retry window (attempts
+// fail near-instantly in this stack: connection-refused or bigsky's fast 400)
+// plus the relay's first subscribe. A stack where every attempt hangs to the
+// 10s cap is broken, and failing at this deadline is then the right signal.
+const crawlTimeout = 3 * time.Minute
 
 // ── Firehose vocabulary ────────────────────────────────────────────────────
 
@@ -88,6 +111,12 @@ const (
 	rkeySelf = "self"
 )
 
+// pendingSoftCap is the listener's early-warning threshold for the pending
+// buffer (await's consumed-but-unmatched events): crossing it t.Logf's once
+// as a leak signal, without failing — a busy shared stack can legitimately
+// buffer plenty of foreign traffic.
+const pendingSoftCap = 512
+
 // expectedCollections is the complete set of record collections that may
 // legally appear on the firehose. Anything else — vote records above all
 // (PLAN.md locked decision 7: votes NEVER become records) — is a bug, and
@@ -101,7 +130,7 @@ var expectedCollections = map[string]bool{
 
 // ── Harness ────────────────────────────────────────────────────────────────
 
-// harness bundles the three service endpoints plus a logged-in Lemmy admin.
+// harness bundles the service endpoints plus a logged-in Lemmy admin.
 type harness struct {
 	http  *http.Client
 	admin *lemmyClient // Lemmy admin (setup credentials from lemmy.hjson)
@@ -176,6 +205,9 @@ func waitForStack() error {
 		}},
 		{"lemmy /api/v3/site", func() error {
 			return probeHTTP(client, lemmyURL()+"/api/v3/site")
+		}},
+		{"relay /xrpc/_health", func() error {
+			return probeHTTP(client, relayURL()+"/xrpc/_health")
 		}},
 		{"jetstream /subscribe", func() error {
 			u := jetstreamURL() + "/subscribe?cursor=" + fmt.Sprint(time.Now().UnixMicro())
@@ -623,6 +655,128 @@ func (h *harness) getVoteAggregates(t *testing.T, uris ...string) map[string]vot
 	return byURI
 }
 
+// ── Relay (BigSky) clients ─────────────────────────────────────────────────
+
+// relayPDS is the slice of bigsky's /admin/pds/list response the suite
+// asserts on (an enriched gorm models.PDS; Go field names, no json tags).
+type relayPDS struct {
+	Host                string `json:"Host"`
+	Registered          bool   `json:"Registered"`
+	HasActiveConnection bool   `json:"HasActiveConnection"`
+	RepoCount           int64  `json:"RepoCount"`
+}
+
+// relayPDSList reads the relay's crawled-PDS registry via its admin API.
+// Error-returning (not Fatalf) because its only callers are poll loops: one
+// transient admin-API hiccup must not kill a minutes-long wait — the loop
+// logs the error and Fatalf's at its own deadline.
+func (h *harness) relayPDSList() ([]relayPDS, error) {
+	req, err := http.NewRequest(http.MethodGet, relayURL()+"/admin/pds/list", nil)
+	if err != nil {
+		return nil, fmt.Errorf("relay pds/list: build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+relayAdminKey())
+	resp, err := h.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("relay pds/list: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("relay pds/list: read body: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("relay pds/list: status %d: %s", resp.StatusCode, truncate(raw, 300))
+	}
+	var out []relayPDS
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("relay pds/list: decode: %w (%s)", err, truncate(raw, 300))
+	}
+	return out, nil
+}
+
+// relayListReposPageCap bounds relayListRepos pagination: the e2e relay
+// holds a few dozen repos (≪ one 500-repo page), so hitting the cap — or a
+// cursor that stops advancing — means bigsky's paging is broken, and the
+// walk must error out rather than spin until the 20m test timeout.
+const relayListReposPageCap = 100
+
+// relayListRepos walks the relay's public com.atproto.sync.listRepos and
+// returns did → head. Tombstoned/taken-down repos are filtered out by
+// bigsky itself, so absence after a takedown is the observable signal.
+// Error-returning for the same poll-loop reason as relayPDSList.
+func (h *harness) relayListRepos() (map[string]string, error) {
+	repos := map[string]string{}
+	cursor := ""
+	for page := 0; ; page++ {
+		if page >= relayListReposPageCap {
+			return nil, fmt.Errorf("relay listRepos: still paginating after %d pages (cursor %q) — runaway paging", relayListReposPageCap, cursor)
+		}
+		u := relayURL() + "/xrpc/com.atproto.sync.listRepos?limit=500"
+		if cursor != "" {
+			u += "&cursor=" + url.QueryEscape(cursor)
+		}
+		resp, err := h.http.Get(u)
+		if err != nil {
+			return nil, fmt.Errorf("relay listRepos: %w", err)
+		}
+		raw, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("relay listRepos: read body: %w", err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("relay listRepos: status %d: %s", resp.StatusCode, truncate(raw, 300))
+		}
+		var out struct {
+			Cursor string `json:"cursor"`
+			Repos  []struct {
+				Did  string `json:"did"`
+				Head string `json:"head"`
+			} `json:"repos"`
+		}
+		if err := json.Unmarshal(raw, &out); err != nil {
+			return nil, fmt.Errorf("relay listRepos: decode: %w", err)
+		}
+		for _, r := range out.Repos {
+			repos[r.Did] = r.Head
+		}
+		if out.Cursor == "" {
+			return repos, nil
+		}
+		if out.Cursor == cursor {
+			return nil, fmt.Errorf("relay listRepos: cursor %q did not advance between pages", cursor)
+		}
+		cursor = out.Cursor
+	}
+}
+
+// relayGetLatestCommit reads the relay's view of a repo head. Returns an
+// error (rather than failing) so poll loops can wait out the relay's
+// asynchronous indexing of a commit it just received.
+func (h *harness) relayGetLatestCommit(did string) (cid, rev string, err error) {
+	resp, err := h.http.Get(relayURL() + "/xrpc/com.atproto.sync.getLatestCommit?did=" + url.QueryEscape(did))
+	if err != nil {
+		return "", "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", "", fmt.Errorf("relay getLatestCommit(%s): status %d: %s", did, resp.StatusCode, truncate(raw, 200))
+	}
+	var out struct {
+		CID string `json:"cid"`
+		Rev string `json:"rev"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return "", "", fmt.Errorf("relay getLatestCommit(%s): decode: %w", did, err)
+	}
+	return out.CID, out.Rev, nil
+}
+
 // ── Jetstream WebSocket listener ───────────────────────────────────────────
 
 // jsEvent is Jetstream's JSON event shape (kind "commit" only — the bridge
@@ -663,6 +817,30 @@ type jsListener struct {
 	closed chan struct{} // closed by close(): deliberate shutdown
 	done   chan struct{} // closed by readLoop's defer: goroutine exited
 	once   sync.Once
+
+	// pending holds events consumed by an await that did not match its
+	// predicate, for rescanning by LATER awaits. Load-bearing since the
+	// relay entered the pipeline: bigsky indexes its inbound firehose with a
+	// parallel scheduler keyed by repo DID (indigo events/schedulers/
+	// parallel, 100 workers), so per-repo event order is preserved but
+	// CROSS-repo order is not — an author's actor.profile (author repo) and
+	// their post (community repo) may legally swap on the relay's output.
+	// Sequential awaits would otherwise silently discard the reordered
+	// event and burn a full eventTimeout. Only touched from the test
+	// goroutine (await/drain), never from readLoop.
+	pending []*jsEvent
+
+	// lastRev tracks the newest commit rev THIS listener has consumed per
+	// repo DID (revs are TIDs: strictly increasing per repo). The pending
+	// buffer made the suite order-tolerant, but PLAN.md locked decision 3's
+	// per-repo discipline — and the FOLLOWUPS "Relay pipeline" carve-out —
+	// lean on bigsky preserving PER-repo order even while shuffling repos
+	// against each other; vetEvent asserts that property on every consumed
+	// event so a relay/bridge ordering regression cannot hide behind the
+	// listener's own tolerance. Per-listener (like pending): overlapping
+	// listeners each see a per-repo-ordered stream of their own. Only
+	// touched from the test goroutine.
+	lastRev map[string]string
 
 	mu      sync.Mutex
 	readErr error // readLoop's terminal error, nil on deliberate close
@@ -727,11 +905,12 @@ func (h *harness) newListener(t *testing.T, cursorMicros int64, collections ...s
 		time.Sleep(2 * time.Second)
 	}
 	l := &jsListener{
-		t:      t,
-		conn:   conn,
-		events: make(chan *jsEvent, 1024),
-		closed: make(chan struct{}),
-		done:   make(chan struct{}),
+		t:       t,
+		conn:    conn,
+		events:  make(chan *jsEvent, 1024),
+		closed:  make(chan struct{}),
+		done:    make(chan struct{}),
+		lastRev: map[string]string{},
 	}
 	go l.readLoop()
 	t.Cleanup(l.close)
@@ -797,7 +976,10 @@ func (l *jsListener) close() {
 //     an immediate failure, no matter which scenario's await/drain window it
 //     lands in;
 //   - every create/update record must validate against the vendored Coves
-//     lexicons (deletes carry no record).
+//     lexicons (deletes carry no record);
+//   - commit revs must be strictly increasing per repo DID (see lastRev):
+//     the relay guarantees per-repo order even though cross-repo order is
+//     lost, and this is the one place every consumed event passes through.
 func (l *jsListener) vetEvent(ev *jsEvent) {
 	l.t.Helper()
 	if ev.Kind != kindCommit || ev.Commit == nil {
@@ -806,17 +988,39 @@ func (l *jsListener) vetEvent(ev *jsEvent) {
 	if !expectedCollections[ev.Commit.Collection] {
 		l.t.Fatalf("unexpected collection on firehose: %s — only community/actor profiles, posts, and comments may ever appear (votes never become records)", ev)
 	}
+	if prev, ok := l.lastRev[ev.Did]; ok && ev.Commit.Rev <= prev {
+		l.t.Fatalf("per-repo rev order violated on firehose: %s has rev %q after rev %q — bigsky preserves per-repo commit order, so this is a relay/bridge ordering bug",
+			ev, ev.Commit.Rev, prev)
+	}
+	l.lastRev[ev.Did] = ev.Commit.Rev
 	if op := ev.Commit.Operation; op == opCreate || op == opUpdate {
 		validateLexicon(l.t, ev.Commit)
 	}
 }
 
-// await returns the first commit event matching pred, failing the test
-// after eventTimeout. Non-matching events are vetted (vetEvent), logged,
-// and kept out of the way (each scenario matches on its own
-// community/author to stay independent of concurrent traffic).
+// await returns the first commit event matching pred — scanning events an
+// earlier await consumed-but-buffered FIRST (see pending: the relay does
+// not preserve cross-repo ordering), then the live stream — failing the
+// test after eventTimeout. Non-matching events are vetted (vetEvent),
+// logged, and buffered for later awaits (each scenario matches on its own
+// community/author to stay independent of concurrent traffic). A matched
+// buffered event is removed, so repeat awaits with the same predicate
+// consume distinct events.
+//
+// Because buffered events are re-tested by later awaits' predicates,
+// predicates must be PURE — accounting sweeps belong in drain loops (which
+// return every consumed event exactly once), not in predicate side effects.
 func (l *jsListener) await(desc string, pred func(*jsEvent) bool) *jsEvent {
 	l.t.Helper()
+	for i, ev := range l.pending {
+		if pred(ev) {
+			copy(l.pending[i:], l.pending[i+1:])
+			l.pending[len(l.pending)-1] = nil // let the shifted-out *jsEvent GC
+			l.pending = l.pending[:len(l.pending)-1]
+			l.t.Logf("await %s: matched buffered %s", desc, ev)
+			return ev
+		}
+	}
 	timer := time.NewTimer(eventTimeout)
 	defer timer.Stop()
 	for {
@@ -827,11 +1031,19 @@ func (l *jsListener) await(desc string, pred func(*jsEvent) bool) *jsEvent {
 				return nil
 			}
 			l.vetEvent(ev)
-			if ev.Kind == kindCommit && ev.Commit != nil && pred(ev) {
+			if ev.Kind != kindCommit || ev.Commit == nil {
+				l.t.Logf("await %s: skipping %s", desc, ev)
+				continue
+			}
+			if pred(ev) {
 				l.t.Logf("await %s: matched %s", desc, ev)
 				return ev
 			}
-			l.t.Logf("await %s: skipping %s", desc, ev)
+			l.pending = append(l.pending, ev)
+			if len(l.pending) == pendingSoftCap {
+				l.t.Logf("await %s: pending buffer reached %d unmatched events — a scenario may be leaking unmatched traffic (soft warning, not fatal)", desc, pendingSoftCap)
+			}
+			l.t.Logf("await %s: buffering %s", desc, ev)
 		case <-timer.C:
 			l.t.Fatalf("await %s: no matching jetstream event within %s", desc, eventTimeout)
 			return nil
@@ -839,15 +1051,24 @@ func (l *jsListener) await(desc string, pred func(*jsEvent) bool) *jsEvent {
 	}
 }
 
-// drain collects everything that arrives within d (for negative
-// assertions: "nothing else showed up"). A dead reader would make every
-// negative assertion pass vacuously, so an unexpectedly closed channel is
-// fatal — silence must mean "connected and nothing arrived".
+// drain returns everything the listener has consumed-but-not-matched so
+// far (the pending buffer, cleared here so repeated drains cannot return
+// an event twice) plus everything that arrives LIVE within d — for
+// negative assertions ("nothing else showed up") and order-agnostic
+// accounting sweeps. Including pending is load-bearing, not a convenience:
+// a drain running AFTER an await on the same listener would otherwise
+// silently miss events that await consumed and buffered, turning negative
+// assertions vacuous. It cannot double-count either — pending events were
+// vetted at consumption but never matched/counted by any await. A dead
+// reader would make every negative assertion pass vacuously, so an
+// unexpectedly closed channel is fatal — silence must mean "connected and
+// nothing arrived".
 func (l *jsListener) drain(d time.Duration) []*jsEvent {
 	l.t.Helper()
 	timer := time.NewTimer(d)
 	defer timer.Stop()
-	var out []*jsEvent
+	out := l.pending
+	l.pending = nil
 	for {
 		select {
 		case ev, ok := <-l.events:

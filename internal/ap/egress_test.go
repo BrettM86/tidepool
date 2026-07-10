@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -157,6 +158,63 @@ func TestDialGuard_IPLiteralAddr(t *testing.T) {
 	base := func(_ context.Context, _, _ string) (net.Conn, error) { return stubConn{}, nil }
 	_, err := g.dialContext(base)(context.Background(), "tcp", "169.254.169.254:80")
 	require.Error(t, err, "a blocked IP literal must be refused at dial time")
+}
+
+// TestPrivateOnlyHTTPClient_RefusesPublicDestinations: the dev-only client
+// (ALLOW_DEV_REQUEST_CRAWL's crawl path) is the INVERSE of the SSRF guard —
+// it must refuse anything public at dial time, so a misconfigured
+// RELAY_HOSTS in dev can never contact live infrastructure. 203.0.113.10 is
+// TEST-NET-3: the refusal happens before any dial, so nothing is contacted.
+func TestPrivateOnlyHTTPClient_RefusesPublicDestinations(t *testing.T) {
+	client := NewPrivateOnlyHTTPClient(2 * time.Second)
+	resp, err := client.Get("http://203.0.113.10/")
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	require.Error(t, err, "a public literal-IP destination must be refused at dial time")
+	assert.True(t, errors.IsValidation(err), "refusal must be the guard's validation error, got %v", err)
+	assert.Contains(t, err.Error(), "public")
+}
+
+// TestPrivateOnlyHTTPClient_AllowsLoopback: the same client must still reach
+// local servers — that is its whole purpose (local e2e relays).
+func TestPrivateOnlyHTTPClient_AllowsLoopback(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client := NewPrivateOnlyHTTPClient(2 * time.Second)
+	resp, err := client.Get(server.URL)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusNoContent, resp.StatusCode)
+}
+
+// TestPrivateOnlyDialGuard_ResolvedPublicIP: a hostname that resolves to a
+// public address is refused by the private-only guard at dial time, same
+// resolved-IP mechanics as the SSRF guard but inverted.
+func TestPrivateOnlyDialGuard_ResolvedPublicIP(t *testing.T) {
+	g := &egressGuard{privateOnly: true}
+	g.lookupIPAddr = func(_ context.Context, _ string) ([]net.IPAddr, error) {
+		return []net.IPAddr{{IP: net.IPv4(93, 184, 216, 34)}}, nil
+	}
+	dialed := false
+	base := func(_ context.Context, _, _ string) (net.Conn, error) {
+		dialed = true
+		return stubConn{}, nil
+	}
+	_, err := g.dialContext(base)(context.Background(), "tcp", "relay.example:443")
+	require.Error(t, err, "a hostname resolving to a public address must be refused")
+	assert.False(t, dialed, "the private-only guard must not dial a public resolved address")
+
+	// The same guard dials a loopback resolution.
+	g.lookupIPAddr = func(_ context.Context, _ string) ([]net.IPAddr, error) {
+		return []net.IPAddr{{IP: net.IPv4(127, 0, 0, 1)}}, nil
+	}
+	_, err = g.dialContext(base)(context.Background(), "tcp", "relay.local:443")
+	require.NoError(t, err)
+	assert.True(t, dialed)
 }
 
 // stubConn is a no-op net.Conn so the dial guard tests never touch the network.

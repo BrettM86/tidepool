@@ -117,7 +117,7 @@ e2e: ## Full e2e run: build + start the stack, run the suite, tear down (-v)
 
 e2e-up: ## Start the e2e stack and leave it running (for iterating on tests)
 	@$(E2E_COMPOSE) up -d --build --wait --wait-timeout 600
-	@echo "$(GREEN)✓ e2e stack up: tidepool 127.0.0.1:8092, lemmy 127.0.0.1:8541, jetstream 127.0.0.1:6028$(RESET)"
+	@echo "$(GREEN)✓ e2e stack up: tidepool 127.0.0.1:8092, lemmy 127.0.0.1:8541, relay 127.0.0.1:2480, jetstream 127.0.0.1:6028$(RESET)"
 
 e2e-test: ## Run the e2e suite against an already-running stack (make e2e-up)
 	@go test -tags e2e -count=1 -v -timeout 20m ./tests/e2e/...

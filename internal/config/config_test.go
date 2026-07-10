@@ -20,6 +20,7 @@ func clearConfigEnv(t *testing.T) {
 		"PLC_DIRECTORY_URL", "BRIDGE_SERVICE_DID", "USER_AGENT", "BRIDGE_KEK",
 		"ADMIN_TOKEN", "BACKFILL_MAX_POSTS", "MINT_RATE_PER_MINUTE",
 		"MINT_BURST", "INGEST_WORKERS", "BRIDGE_SCHEME",
+		"ALLOW_PRIVATE_FETCH", "ALLOW_DEV_REQUEST_CRAWL", "RELAY_HOSTS",
 	} {
 		t.Setenv(name, "")
 	}
@@ -154,6 +155,35 @@ func TestLoad_BridgeScheme(t *testing.T) {
 	t.Setenv("BRIDGE_SCHEME", "gopher")
 	_, err = Load(discardLogger())
 	require.Error(t, err, "unknown schemes are rejected")
+}
+
+func TestLoad_AllowDevRequestCrawl(t *testing.T) {
+	clearConfigEnv(t)
+
+	cfg, err := Load(discardLogger())
+	require.NoError(t, err)
+	assert.False(t, cfg.AllowDevRequestCrawl, "off by default: dev logs requestCrawl instead of sending")
+
+	t.Setenv("ALLOW_DEV_REQUEST_CRAWL", "1")
+	cfg, err = Load(discardLogger())
+	require.NoError(t, err)
+	assert.True(t, cfg.AllowDevRequestCrawl, "the e2e harness turns real dev requestCrawl on")
+}
+
+func TestLoad_AllowDevRequestCrawlRefusedInProduction(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("ENVIRONMENT", EnvironmentProduction)
+	t.Setenv("DATABASE_URL", "postgres://prod/db")
+	t.Setenv("LISTEN_ADDR", ":8080")
+	t.Setenv("BRIDGE_HOSTNAME", "tidepool.example")
+	t.Setenv("PLC_DIRECTORY_URL", "https://plc.directory")
+	t.Setenv("BRIDGE_KEK", "sfDrM4bIeCJp01ZBTArLPJXNQlD7pcYFsod2An6UAF0=")
+	t.Setenv("ADMIN_TOKEN", "prod-admin-token")
+	t.Setenv("ALLOW_DEV_REQUEST_CRAWL", "1")
+
+	_, err := Load(discardLogger())
+	require.Error(t, err, "production always sends; the dev override set there is a config mistake")
+	assert.Contains(t, err.Error(), "ALLOW_DEV_REQUEST_CRAWL")
 }
 
 func TestLoad_BridgeSchemeHTTPRefusedInProduction(t *testing.T) {

@@ -36,30 +36,67 @@ your directory is on a different port.
 
 The end-to-end harness runs the whole read path against **real
 infrastructure** — a real Lemmy federating with the bridge, a real did:plc
-directory backing DID minting, and a real Jetstream decoding the firehose —
-in one compose network:
+directory backing DID minting, a real atproto relay (indigo **BigSky**)
+crawling the bridge, and a real Jetstream decoding the **relay's** firehose
+— in one compose network:
 
 ```
                         docker-compose.e2e.yml
- ┌─────────────────────────────────────────────────────────────────────┐
- │  http://lemmy (debug build)          http://tidepool (this repo)    │
- │ ┌───────────────────────┐  Follow ◀─ ┌───────────────────────────┐  │
- │ │ lemmy + lemmy-postgres│  Accept ─▶ │ tidepool + its postgres   │  │
- │ │ + pictrs              │ Announce ─▶│  inbox → queue → material │  │
- │ └───────────────────────┘  (plain    │  izer → virtual PDS       │  │
- │                             HTTP)    └─────┬──────────────┬──────┘  │
- │                                  mint DIDs │   CBOR frames│         │
- │                              ┌─────────────▼──┐  ┌────────▼──────┐  │
- │                              │ plc (did:plc   │  │ jetstream     │  │
- │                              │ + plc-postgres)│  │ (JSON events) │  │
- │                              └────────────────┘  └────────┬──────┘  │
- └───────────────────────────────────────────────────────────┼─────────┘
-   host (127.0.0.1 only): tidepool :8092, lemmy :8541, jetstream :6028 ◀─┘
+ ┌───────────────────────────────────────────────────────────────────────┐
+ │  http://lemmy (debug build)          http://tidepool (this repo)      │
+ │ ┌───────────────────────┐  Follow ◀─ ┌───────────────────────────┐    │
+ │ │ lemmy + lemmy-postgres│  Accept ─▶ │ tidepool + its postgres   │    │
+ │ │ + pictrs              │ Announce ─▶│  inbox → queue → material │    │
+ │ └───────────────────────┘  (plain    │  izer → virtual PDS       │    │
+ │                             HTTP)    └─────┬──────────────┬──────┘    │
+ │                                  mint DIDs │   CBOR frames│ ▲         │
+ │                              ┌─────────────▼──┐           │ │request  │
+ │                              │ plc (did:plc   │◀────┐     │ │Crawl    │
+ │                              │ + plc-postgres)│     │  ┌──▼─┴───────┐ │
+ │                              └────────────────┘ DID │  │ relay      │ │
+ │                                          resolution └──│ (BigSky)   │ │
+ │                                                        │ + postgres │ │
+ │                                                        └──────┬─────┘ │
+ │                                                    CBOR frames│       │
+ │                                                       ┌───────▼─────┐ │
+ │                                                       │ jetstream   │ │
+ │                                                       │ (JSON)      │ │
+ │                                                       └───────┬─────┘ │
+ └───────────────────────────────────────────────────────────────┼───────┘
+      host (127.0.0.1 only): tidepool :8092, lemmy :8541,        │
+                             relay :2480, jetstream :6028 ◀──────┘
                     tests/e2e (go test -tags e2e)
 ```
 
-The host ports bind **loopback-only** (`127.0.0.1:8092/8541/6028`): the
-stack carries an admin token and runs with `ALLOW_PRIVATE_FETCH=1`, so it
+Every event the suite consumes has therefore survived the strictest consumer
+that exists: the relay resolves each repo's DID against the local PLC,
+verifies every commit signature, and crawls repos over the bridge's
+`getRepo`. The bridge announces itself to the relay on startup via the
+**real** `RequestCrawlAll` code path (`RELAY_HOSTS=http://relay:2470` plus
+the dev-only `ALLOW_DEV_REQUEST_CRAWL=1` — production always sends and
+refuses the flag), retrying internally because the relay validates the
+hostname by calling back into the bridge's `describeServer`. A fresh
+relay's new-PDS-per-day limit is 0 (refuses all non-admin `requestCrawl`),
+so a one-shot `relay-bootstrap` service raises the limit over the admin API
+before the bridge starts — the announcement itself is still
+bridge-originated, and the suite asserts it landed (`relay_test.go`).
+Bridged handles verify for real too: `HANDLE_RESOLVER_HOSTS=tidepool`
+points bigsky's trial-host resolver at the bridge's Host-header-keyed
+`/.well-known/atproto-did` (compose-DNS-invisible names like
+`alice.lemmy.tidepool` would otherwise fail handle verification, which
+bigsky treats as non-fatal). For debugging, a direct bridge→Jetstream tap
+exists behind the `direct` compose profile (`jetstream-direct`, host port
+6038) — it is not the tested path.
+
+One ordering consequence worth knowing: bigsky indexes its inbound firehose
+with a parallel scheduler keyed by repo DID, so **per-repo event order
+survives the relay but cross-repo order does not** — an author's
+`actor.profile` (author repo) and their post (community repo) may swap on
+the relay's output, and any AppView consuming through relay infrastructure
+must tolerate that (see FOLLOWUPS.md).
+
+The host ports bind **loopback-only** (`127.0.0.1:8092/8541/2480/6028`):
+the stack carries admin tokens and runs with `ALLOW_PRIVATE_FETCH=1`, so it
 must not be reachable from the local network.
 
 ```sh
@@ -81,23 +118,29 @@ network, with `BRIDGE_SCHEME=http` (dev-only) making the bridge emit
 plain-HTTP AP ids to match. See the header comments in
 `docker-compose.e2e.yml` and `e2e/lemmy/Dockerfile` for the full story.
 
-The suite (`tests/e2e/bridge_test.go`, build tag `e2e`) covers: subscribe →
-`community.profile` on the firehose; a link post → `actor.profile` then
-`community.post` in order, with the shared url crossing the wire as
-`embed.external`; comment threads in the authors' repos with resolving
-strongRefs; edits/deletes as update/delete ops; post **and** comment votes
-reaching `getVoteAggregates` — upvote, flip, retract — while **never**
-appearing as records; pre-subscribe backfill with each author's profile
-emitted before their posts and Lemmy's pre-existing vote counts seeded into
-the aggregates; a mid-test container restart proving deterministic-rkey
+The suite (`tests/e2e/bridge_test.go` + `relay_test.go`, build tag `e2e`)
+covers: subscribe → `community.profile` on the firehose; a link post →
+`actor.profile` and `community.post` (presence + author linkage; arrival
+order across the two repos is relay-dependent, see above), with the shared
+url crossing the wire as `embed.external`; comment threads in the authors'
+repos with resolving strongRefs; edits/deletes as update/delete ops; post
+**and** comment votes reaching `getVoteAggregates` — upvote, flip, retract —
+while **never** appearing as records; pre-subscribe backfill with every
+post's author profile arriving and Lemmy's pre-existing vote counts seeded
+into the aggregates; a mid-test container restart proving deterministic-rkey
 replay idempotency (the forced backfill redo is confirmed complete via the
 admin API's `last_backfill_at` before asserting it emitted nothing) plus
-exactly-once delivery of a post created in the recovery window and Jetstream
-cursor resume; and a concurrent-ingestion burst accounted per
-(did, collection/rkey). Every create/update the tests consume from Jetstream
-is validated against the vendored Coves lexicons on the consumer side of the
-wire, and any collection outside the four the bridge emits fails the suite
-immediately (votes must never become records). Two scripts keep the vendored
+exactly-once delivery of a post created in the recovery window — now proven
+**through the relay**, whose slurper reconnects to the bounced bridge with
+its stored cursor; a concurrent-ingestion burst accounted per
+(did, collection/rkey); and relay-state assertions — the bridge registered
+and actively subscribed in the relay's PDS registry (the bridge-originated
+`requestCrawl`, asserted rather than eyeballed), and bridged repos listed
+and served by the relay's own `listRepos`/`getLatestCommit`. Every
+create/update the tests consume from Jetstream has passed the relay's
+signature verification AND is validated against the vendored Coves lexicons
+on the consumer side of the wire, and any collection outside the four the
+bridge emits fails the suite immediately (votes must never become records). Two scripts keep the vendored
 lexicons honest: `scripts/sync-lexicons.sh` copies them from a Coves
 checkout; `scripts/check-lexicons.sh` verifies the committed manifest (the
 layer that runs in CI) and additionally byte-compares against
@@ -124,7 +167,8 @@ production**:
 | `USER_AGENT` | derived | outbound HTTP user agent |
 | `ALLOW_PRIVATE_FETCH` | off | dev-only: disables the SSRF egress guard (AP fetches **and** PLC directory requests) so localhost targets work |
 | `FIREHOSE_RETENTION` | `72h` | how long `firehose_events` rows are kept for `subscribeRepos` cursor replay (Go duration; a background pruner trims older events hourly) |
-| `RELAY_HOSTS` | *(optional)* | comma-separated relays to send `com.atproto.sync.requestCrawl` to on startup; in development the request is logged, never sent |
+| `RELAY_HOSTS` | *(optional)* | comma-separated relays to send `com.atproto.sync.requestCrawl` to on startup (each retried on a bounded budget — the relay calls back into `describeServer` before subscribing, which can race process start); in development the request is logged, never sent, unless `ALLOW_DEV_REQUEST_CRAWL` opts in |
+| `ALLOW_DEV_REQUEST_CRAWL` | off | dev-only: actually SEND `requestCrawl` to `RELAY_HOSTS` in development (exists for the e2e stack's local BigSky); refused in production, where sending is already the behavior |
 | `ADMIN_TOKEN` | `dev-admin-token` | bearer token protecting the `/admin` API |
 | `BACKFILL_MAX_POSTS` | `100` | posts materialized per community backfill run |
 | `MINT_RATE_PER_MINUTE` / `MINT_BURST` | `60` / `120` | rate gate on inbound DID minting (PLC registrations are forever; unseen authors in delivered content trigger mints) |

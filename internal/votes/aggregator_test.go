@@ -140,6 +140,64 @@ func TestReplayedUndoDoesNotRetractReLike(t *testing.T) {
 	assert.Equal(t, 0, down)
 }
 
+// TestLemmyClearAfterFlipRetractsLiveVote pins the vote-clear wire behavior
+// the e2e suite measured against a real Lemmy 0.19: a flip federates as a
+// bare opposite vote (no Undo), and a clear federates as an Undo whose inner
+// vote is RECONSTRUCTED — a freshly generated activity id, typed Like even
+// though the voter's live vote is the dislike. The retraction must fall back
+// to removing the voter's live vote regardless of the inner id/type.
+// (Before this pin, every Lemmy vote-clear was a silent no-op.)
+func TestLemmyClearAfterFlipRetractsLiveVote(t *testing.T) {
+	database := testDB(t)
+	agg, objects := testAggregator(t, database)
+	bridgeSubject(t, objects, subjectPost, "3jzfcijpj2z2a")
+	ctx := context.Background()
+
+	// Like → flip (bare Dislike) → clear (Undo{Like} with a fresh id).
+	require.NoError(t, agg.ApplyVote(ctx, like(activityID(t, 1), voterAlice, subjectPost), ""))
+	require.NoError(t, agg.ApplyVote(ctx, dislike(activityID(t, 2), voterAlice, subjectPost), ""))
+	require.NoError(t, agg.RetractVote(ctx, like(activityID(t, 3), voterAlice, subjectPost), ""))
+
+	up, down, found := counts(t, database, subjectPost)
+	require.True(t, found)
+	assert.Equal(t, 0, up)
+	assert.Equal(t, 0, down, "the regenerated-id Undo{Like} must retract the live dislike")
+}
+
+// TestIDLessUndoRetractsLiveVote: an inline undo whose inner vote carries no
+// id at all still removes the voter's live vote.
+func TestIDLessUndoRetractsLiveVote(t *testing.T) {
+	database := testDB(t)
+	agg, objects := testAggregator(t, database)
+	bridgeSubject(t, objects, subjectPost, "3jzfcijpj2z2a")
+	ctx := context.Background()
+
+	require.NoError(t, agg.ApplyVote(ctx, like(activityID(t, 1), voterAlice, subjectPost), ""))
+	require.NoError(t, agg.RetractVote(ctx, like("", voterAlice, subjectPost), ""))
+
+	up, down, found := counts(t, database, subjectPost)
+	require.True(t, found)
+	assert.Equal(t, 0, up)
+	assert.Equal(t, 0, down)
+}
+
+// TestUndoByOtherVoterRetractsNothing: the unknown-id fallback is scoped to
+// (voter, subject) — an undo by someone who never voted must not touch
+// another voter's live vote.
+func TestUndoByOtherVoterRetractsNothing(t *testing.T) {
+	database := testDB(t)
+	agg, objects := testAggregator(t, database)
+	bridgeSubject(t, objects, subjectPost, "3jzfcijpj2z2a")
+	ctx := context.Background()
+
+	require.NoError(t, agg.ApplyVote(ctx, like(activityID(t, 1), voterAlice, subjectPost), ""))
+	require.NoError(t, agg.RetractVote(ctx, like(activityID(t, 2), voterBob, subjectPost), ""))
+
+	up, down, _ := counts(t, database, subjectPost)
+	assert.Equal(t, 1, up, "bob's undo must not retract alice's live vote")
+	assert.Equal(t, 0, down)
+}
+
 func TestDuplicateActivityIDOnAnotherSubjectMintsNoAggregate(t *testing.T) {
 	database := testDB(t)
 	agg, objects := testAggregator(t, database)

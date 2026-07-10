@@ -32,6 +32,80 @@ directory — the test suite can never create DIDs on the public
 `plc.directory`. Point `TIDEPOOL_TEST_PLC_URL` elsewhere-on-localhost if
 your directory is on a different port.
 
+## Running the stack (e2e harness)
+
+The end-to-end harness runs the whole read path against **real
+infrastructure** — a real Lemmy federating with the bridge, a real did:plc
+directory backing DID minting, and a real Jetstream decoding the firehose —
+in one compose network:
+
+```
+                        docker-compose.e2e.yml
+ ┌─────────────────────────────────────────────────────────────────────┐
+ │  http://lemmy (debug build)          http://tidepool (this repo)    │
+ │ ┌───────────────────────┐  Follow ◀─ ┌───────────────────────────┐  │
+ │ │ lemmy + lemmy-postgres│  Accept ─▶ │ tidepool + its postgres   │  │
+ │ │ + pictrs              │ Announce ─▶│  inbox → queue → material │  │
+ │ └───────────────────────┘  (plain    │  izer → virtual PDS       │  │
+ │                             HTTP)    └─────┬──────────────┬──────┘  │
+ │                                  mint DIDs │   CBOR frames│         │
+ │                              ┌─────────────▼──┐  ┌────────▼──────┐  │
+ │                              │ plc (did:plc   │  │ jetstream     │  │
+ │                              │ + plc-postgres)│  │ (JSON events) │  │
+ │                              └────────────────┘  └────────┬──────┘  │
+ └───────────────────────────────────────────────────────────┼─────────┘
+   host (127.0.0.1 only): tidepool :8092, lemmy :8541, jetstream :6028 ◀─┘
+                    tests/e2e (go test -tags e2e)
+```
+
+The host ports bind **loopback-only** (`127.0.0.1:8092/8541/6028`): the
+stack carries an admin token and runs with `ALLOW_PRIVATE_FETCH=1`, so it
+must not be reachable from the local network.
+
+```sh
+make e2e        # build + start the stack, run tests/e2e, tear down
+make e2e-up     # start and leave running (iterate with make e2e-test)
+make e2e-test   # run the suite against the running stack
+make e2e-logs   # tail everything
+make e2e-down   # tear down (removes volumes)
+```
+
+The first `make e2e` builds Lemmy **from source in debug mode** (a full Rust
+compile; cached afterwards). That is deliberate: whether Lemmy accepts
+`http://` federation URLs is a compile-time property (`cfg!(debug_assertions)`
+→ the AP crate's `allow_http_urls`), and every published Lemmy image is a
+release build that refuses plain HTTP, explicit ports, and private addresses.
+A debug build — the same thing LemmyNet's own `docker/federation` compose
+uses — federates happily over `http://lemmy` ↔ `http://tidepool` inside the
+network, with `BRIDGE_SCHEME=http` (dev-only) making the bridge emit
+plain-HTTP AP ids to match. See the header comments in
+`docker-compose.e2e.yml` and `e2e/lemmy/Dockerfile` for the full story.
+
+The suite (`tests/e2e/bridge_test.go`, build tag `e2e`) covers: subscribe →
+`community.profile` on the firehose; a link post → `actor.profile` then
+`community.post` in order, with the shared url crossing the wire as
+`embed.external`; comment threads in the authors' repos with resolving
+strongRefs; edits/deletes as update/delete ops; post **and** comment votes
+reaching `getVoteAggregates` — upvote, flip, retract — while **never**
+appearing as records; pre-subscribe backfill with each author's profile
+emitted before their posts and Lemmy's pre-existing vote counts seeded into
+the aggregates; a mid-test container restart proving deterministic-rkey
+replay idempotency (the forced backfill redo is confirmed complete via the
+admin API's `last_backfill_at` before asserting it emitted nothing) plus
+exactly-once delivery of a post created in the recovery window and Jetstream
+cursor resume; and a concurrent-ingestion burst accounted per
+(did, collection/rkey). Every create/update the tests consume from Jetstream
+is validated against the vendored Coves lexicons on the consumer side of the
+wire, and any collection outside the four the bridge emits fails the suite
+immediately (votes must never become records). Two scripts keep the vendored
+lexicons honest: `scripts/sync-lexicons.sh` copies them from a Coves
+checkout; `scripts/check-lexicons.sh` verifies the committed manifest (the
+layer that runs in CI) and additionally byte-compares against
+`~/Code/coves` when that checkout exists (local only).
+
+Everything is local-only: the harness never contacts `plc.directory`, public
+relays, or public Lemmy instances.
+
 ## Configuration
 
 Environment variables with logged dev defaults (see
@@ -43,6 +117,7 @@ production**:
 | `DATABASE_URL` | local dev postgres | bridge state |
 | `LISTEN_ADDR` | `:8091` | HTTP bind address |
 | `BRIDGE_HOSTNAME` | `localhost` | public domain of the bridge; anchors handles and the PDS endpoint in minted DID docs |
+| `BRIDGE_SCHEME` | `https` | scheme of the bridge's own AP URLs (actor id, inbox, activity ids). `http` is dev-only — the e2e harness federates with a debug-mode Lemmy over plain HTTP |
 | `PLC_DIRECTORY_URL` | `http://localhost:3002` (local, `make plc-up`) | did:plc directory; production uses `https://plc.directory` |
 | `BRIDGE_KEK` | fixed public dev key | 32-byte key-encryption key (64 hex chars or base64) sealing per-actor signing keys and the escrow rotation key at rest (AES-256-GCM) |
 | `BRIDGE_SERVICE_DID` | *(optional)* | pre-provisioned service DID for the bridge's own actor |
@@ -169,9 +244,9 @@ scores are not seeded in v1 — comments accumulate live votes only.
 
 ## Verifying with Jetstream
 
-The task-04 integration proof: run a real Jetstream against the bridge and
-watch it re-emit our records as JSON. Not automated in CI (it needs Docker
-networking to the host); the manual runbook is:
+**Automated:** the e2e harness (`make e2e`, above) runs a real Jetstream
+against the bridge and asserts on the decoded events — this manual runbook
+survives for ad-hoc poking at a dev bridge:
 
 Until the materializer (task 05) generates organic writes, the repo test
 suite is the write driver — so point the bridge at the **test** database and

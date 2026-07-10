@@ -179,16 +179,33 @@ func (a *Aggregator) ApplyVote(ctx context.Context, vote *ap.Object, communityIR
 }
 
 // RetractVote undoes a previously applied vote (Undo{Like|Dislike}): the
-// voter's live vote in the undone direction is marked undone and the
-// aggregate recomputed. When the undone activity's own id is known it is
-// targeted directly, so a replayed undo can never retract a NEWER re-vote
-// that merely shares (voter, subject, direction). Everything that cannot be
-// acted on is a logged no-op, never an error: a nil or bare-IRI
-// vote.Object/vote.Actor, an undo for a vote the bridge never saw
-// (out-of-order delivery, or history that only exists as a seeded baseline),
-// an undo whose direction no longer matches the voter's current vote (the
-// like it undoes was already superseded by a flip), and an announced undo
-// whose subject does not belong to the announcing community.
+// voter's live vote on the subject is marked undone and the aggregate
+// recomputed.
+//
+// What Lemmy actually federates (measured by the e2e suite against a real
+// Lemmy 0.19, and NOT what task 07 originally assumed):
+//
+//   - flip (up → down): a bare Dislike, no Undo at all — ApplyVote's
+//     supersede handles it;
+//   - clear (score 0): Announce{Undo{Like}} whose inner vote is
+//     RECONSTRUCTED — a freshly generated activity id, and typed "Like"
+//     even when the voter's live vote is a Dislike.
+//
+// So the inner vote's id and type are hints, not truth. The retraction
+// runs in two steps: first an id-targeted update (correct for
+// implementations that inline the original activity, and what keeps a
+// REPLAYED Undo{Like id=A} after a re-like id=B from retracting B); if that
+// matches nothing and the id was never seen at all (Lemmy's regenerated
+// id, or no id), fall back to retracting the voter's current live vote on
+// the subject regardless of direction — Undo means "remove my vote". The
+// (voter, subject) scoping plus the announced-undo community binding keep
+// forged undos harmless.
+//
+// Everything that cannot be acted on is a logged no-op, never an error: a
+// nil or bare-IRI vote.Object/vote.Actor, an undo for a voter with no live
+// vote (out-of-order delivery, or history that only exists as a seeded
+// baseline), a replayed undo naming an already-superseded activity, and an
+// announced undo whose subject does not belong to the announcing community.
 func (a *Aggregator) RetractVote(ctx context.Context, vote *ap.Object, communityIRI string) error {
 	if vote == nil {
 		return nil
@@ -241,31 +258,63 @@ func (a *Aggregator) RetractVote(ctx context.Context, vote *ap.Object, community
 			return fmt.Errorf("lock vote aggregate for %q: %w", subject, err)
 		}
 
-		// Target the undone activity itself when its id is known (Lemmy
-		// inlines the original Like, so it usually is): a replayed
-		// Undo{Like id=A} after a re-like (id=B) must retract nothing, not B.
-		// The voter/subject/direction predicates stay as defense — a forged
-		// undo naming someone else's activity id retracts nothing. Id-less
-		// inline undos fall back to the voter's current live vote.
-		query := `
-			UPDATE vote_events
-			SET undone = TRUE
-			WHERE subject_ap_id = $1 AND voter_ap_id = $2 AND direction = $3 AND NOT undone`
-		args := []any{subject, voter, direction}
+		// Step 1: target the undone activity by its own id (correct for
+		// implementations that inline the original vote). The voter/subject
+		// predicates stay as defense — a forged undo naming someone else's
+		// activity id retracts nothing. No direction predicate: the id is
+		// the authoritative target and the inner type is unreliable.
+		var retracted int64
 		if vote.ID != "" {
-			query += ` AND activity_id = $4`
-			args = append(args, vote.ID)
+			result, err := tx.ExecContext(ctx, `
+				UPDATE vote_events
+				SET undone = TRUE
+				WHERE subject_ap_id = $1 AND voter_ap_id = $2 AND NOT undone AND activity_id = $3`,
+				subject, voter, vote.ID)
+			if err != nil {
+				return fmt.Errorf("retract vote %q by %q on %q: %w", vote.ID, voter, subject, err)
+			}
+			if retracted, err = result.RowsAffected(); err != nil {
+				return fmt.Errorf("retract vote %q by %q on %q: rows affected: %w", vote.ID, voter, subject, err)
+			}
+			if retracted == 0 {
+				// Zero rows means either a REPLAY (the id is known but its
+				// vote was already undone/superseded — must retract nothing,
+				// above all not a newer re-vote by the same voter) or a
+				// Lemmy-style RECONSTRUCTED inner vote (fresh id the bridge
+				// has never seen). Distinguish by whether the id exists.
+				var known bool
+				if err := tx.QueryRowContext(ctx, `
+					SELECT EXISTS (SELECT 1 FROM vote_events WHERE activity_id = $1)`,
+					vote.ID).Scan(&known); err != nil {
+					return fmt.Errorf("probe undone activity %q: %w", vote.ID, err)
+				}
+				if known {
+					a.logger.Debug("vote retraction dropped: replayed undo of a superseded vote",
+						"subject", subject, "voter", voter, "activity", vote.ID)
+					return nil
+				}
+			}
 		}
-		result, err := tx.ExecContext(ctx, query, args...)
-		if err != nil {
-			return fmt.Errorf("retract vote by %q on %q: %w", voter, subject, err)
-		}
-		retracted, err := result.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("retract vote by %q on %q: rows affected: %w", voter, subject, err)
+
+		// Step 2: unknown or absent id — "remove my vote". Retract the
+		// voter's current live vote on the subject regardless of direction
+		// (the reconstructed inner vote is typed Like even when the live
+		// vote is a Dislike).
+		if retracted == 0 {
+			result, err := tx.ExecContext(ctx, `
+				UPDATE vote_events
+				SET undone = TRUE
+				WHERE subject_ap_id = $1 AND voter_ap_id = $2 AND NOT undone`,
+				subject, voter)
+			if err != nil {
+				return fmt.Errorf("retract vote by %q on %q: %w", voter, subject, err)
+			}
+			if retracted, err = result.RowsAffected(); err != nil {
+				return fmt.Errorf("retract vote by %q on %q: rows affected: %w", voter, subject, err)
+			}
 		}
 		if retracted == 0 {
-			a.logger.Debug("vote retraction dropped: no matching live vote",
+			a.logger.Debug("vote retraction dropped: no live vote to retract",
 				"subject", subject, "voter", voter, "direction", direction)
 			return nil
 		}
@@ -278,9 +327,11 @@ func (a *Aggregator) RetractVote(ctx context.Context, vote *ap.Object, community
 // activities the bridge never saw (Lemmy outboxes announce historical votes
 // only sparsely). Live vote_events stack on top of the baseline; re-seeding
 // (backfill redo) overwrites the baseline idempotently. Known drift: a voter
-// counted in the baseline who later flips sends Undo{Like} for a like the
-// bridge never saw (no-op) plus a fresh Dislike — the retired upvote stays
-// in the baseline. Accepted for v1; the baseline refreshes on re-seed.
+// counted only in the baseline who later flips federates a bare Dislike
+// (Lemmy sends no Undo on flips), so the retired upvote stays in the
+// baseline next to the new live downvote; a clear sends an Undo the
+// fallback cannot act on (no live vote row). Accepted for v1; the baseline
+// refreshes on re-seed.
 // Subjects not present in ap_objects are dropped and logged at debug, like
 // ApplyVote.
 func (a *Aggregator) SeedAggregates(ctx context.Context, subjectAPID string, upvotes, downvotes int) error {

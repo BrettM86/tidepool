@@ -128,6 +128,15 @@ services:
       # validates the hostname by calling back into our describeServer.
       RELAY_HOSTS: http://relay:2470
       ALLOW_DEV_REQUEST_CRAWL: "1"
+      # Short profile-refresh TTL (default 24h) so the consent e2e scenario
+      # can drive the "bridged actor adds #nobridge → scrub" transition:
+      # Lemmy 0.19.x never federates Update{Person} on bio edits (verified:
+      # SendActivityData has no Update-Person variant at this tag), so the
+      # TTL-gated re-fetch on the actor's NEXT activity is the only path by
+      # which the bridge can discover a bio marker change. Harmless for the
+      # other scenarios: a re-fetch that yields an unchanged profile is an
+      # idempotent re-put (no commit, no firehose event).
+      PROFILE_REFRESH_TTL: 2s
       LOG_LEVEL: debug
     ports:
       - "127.0.0.1:${TIDEPOOL_E2E_PORT:-8092}:80"

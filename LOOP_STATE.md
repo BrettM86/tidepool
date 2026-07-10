@@ -32,8 +32,8 @@ write-back design; tasks 11–12 are its prerequisites).
 | # | Task | Status | Commit | Notes |
 |---|------|--------|--------|-------|
 | 10 | 09-e2e-relay | done | (see git log) | 7/7 reviewers (4 Claude emulated + codex/gemini/glm); fixes: dev requestCrawl PUBLIC-relay dial guard (codex unique catch — NewPrivateOnlyHTTPClient, inverse SSRF guard), terminal-error classification made pre-flight-only (whole-chain IsValidation was abandoning a relay on attempt 1 for transient DNS), 10s per-attempt timeout (budget arithmetic was 14min worst-case, not 2min), vacuous validation-no-retry test rewritten + 400-is-retried pin, vetEvent per-DID rev-monotonicity (restores per-repo ordering assertion suite-wide), drain() returns+clears pending (closes task-10 vacuous-pass trap), relay poll robustness + pagination cap, doc corrections (RESOLVE_ADDRESS overstatement, spec BGS_CRAWL_INSECURE_WS annotation, FOLLOWUPS 16th-failure off-by-one). KEPT DELIBERATE over 3 reviewers' objection: all wire errors incl. 4xx retried — bigsky answers the describeServer callback race with HTTP 400 (comment + test pin it). Final clean make e2e: 10/10, 96.7s |
-| 11 | 10-e2e-scenarios | pending | | image/consent/Delete(Actor)/unsubscribe/community-update/vote-hammer/suite-end sweep |
-| 12 | 11-hardening | pending | | inbox+sync rate limits, #account frame, delete-before-create, pruners, housekeeping |
+| 11 | 10-e2e-scenarios | done | (see git log) | 6/7 reviewers (glm watchdog-killed); UNANIMOUS 6/6 finding: tombstone confirm-fetch transient failure → definitive 401 permanently lost legitimate account deletions → fixed with three-way taxonomy (tombstone→202, alive/validation/404→401, transport/5xx→503 defer) + test; codex unique: confirmation fetch followed cross-authority redirects (open-redirect → forged 410) → FetchActorSameAuthority pins every hop; security: unauthenticated durable-write path flagged → encoded into task 11 rate-limit spec; also: zz-sweep replay floor + honest bounds (sentinel-only pass was vacuous), Delete(Actor) over-scrub drain, actor!=object + Announce{Delete} 401 pins, GET / route-level test, cursor 0→1 doc fixes, vote-hammer header de-overclaimed. TASK ITSELF: 7 scenarios + 2 PRODUCTION fixes (apex instance actor — Lemmy silently never delivers Delete{Person} without a Site actor row; tombstone-verified self-delete acceptance). Final clean make e2e: 17/17, 239s |
+| 12 | 11-hardening | in-progress | | inbox+sync rate limits, #account frame, delete-before-create, pruners, housekeeping |
 | 13 | 12-perf-scale | pending | | MST cache, getRepo streaming/reachable-set, blocks GC, ClaimNext scan |
 
 Statuses: pending → in-progress → review → done (or blocked: <reason>).
@@ -453,3 +453,74 @@ and deferred TODOs here)
   racing Delete, documented); no upper sanity cap on seeded counts;
   comment count seeding skipped (per-comment API calls would triple
   backfill egress).
+
+### From task 10 (e2e scenario completion — tasks 11/12 MUST know)
+- The task shipped TWO BRIDGE-CODE changes, not just tests (both were
+  prerequisites for the Delete(Actor) scenario to be real; both are
+  review-worthy):
+  1. **Instance (Site) actor at the origin apex** (`GET /`, ingest
+     inbox.go handleInstanceActor + ap.ServiceActor.InstanceDocumentJSON).
+     Lemmy's federate worker resolves send-to-all-instances targets
+     (Delete{Person}!) to the stored remote SITE row's inbox and silently
+     skips (`no inboxes`) peers without one; Lemmy creates the row by
+     fetching the peer's origin apex on every Person/Community from_json.
+     Wire trap: the Instance protocol enum accepts ONLY `Application` —
+     the OPPOSITE of /actor, where Lemmy's Person enum needs `Service`.
+     Existing peer Lemmys need an actor re-fetch (24h TTL) + worker
+     restart before deletions start flowing (worker caches site=None for
+     its lifetime).
+  2. **Tombstone-verified self-Delete acceptance** (ingest inbox.go
+     tombstonedSelfDelete + ActorFetcher option, 3 regression tests).
+     Lemmy signs the account-deletion Delete{Person} with a key whose
+     actor doc its origin ALREADY serves as 410 Gone — unverifiable
+     unless cached. The inbox accepts a bare self-referential Delete when
+     verification failed on IsTombstoned AND an independent SSRF-guarded
+     fetch of the claimed actor's own IRI confirms Gone (origin word =
+     same host-granularity trust as bare-Delete SameAuthority; forgery ≡
+     truth). Any other tombstoned-signer payload → definitive 401 (5xx
+     would head-of-line block Lemmy's forever-retrying per-instance
+     queue). Review fixes (post-7-model review): the confirmation is
+     three-way — origin says Gone → accept; origin answers definitively
+     otherwise (live actor / not-an-actor / 404) → 401; transport/5xx/
+     timeout → 503 so the sender redelivers (a blip must never
+     permanently drop a deletion) — and the confirmation fetch pins
+     every redirect hop to the actor IRI's own authority
+     (ap.FetchActorSameAuthority), so an open redirect on the origin
+     cannot bounce it to an attacker host serving 410.
+- **Task 11 rate limit MUST cover the tombstonedSelfDelete branch:** it is an unauthenticated POST → confirmation fetch → TWO durable writes (inbox_events + ap_tombstones) reachable with a cheap 410-serving endpoint; consider a dedicated per-IP cap (flagged in tasks/11-hardening.md).
+- **Jetstream cursor full-replay middle band** (measured with a ws probe):
+  cursor ≤ newest stored event → precise µs replay; cursor > server-now →
+  live-tail; cursor BETWEEN newest event and now (any "from now" subscribe
+  on a quiet stream) → replays the ENTIRE store. Every cursorNow()
+  listener gets full-history replays; negative assertions must be bounded
+  by an observed event's time_us (see unsubscribe scenario + cursorNow
+  doc). Carry to Coves AppView: cursor=now is not a dedupe boundary.
+- **Consumer-side lexicon validation of blobs requires
+  atdata.UnmarshalJSON**, not encoding/json — indigo's SchemaBlob.Validate
+  demands a typed atdata.Blob ("expected a blob" on raw maps). The e2e
+  validateLexicon now mirrors the materializer's write-side decode; any
+  JSON Jetstream consumer that validates records with blobs (Coves!) must
+  do the same. Found by the image-post scenario — the first blob ever to
+  cross the suite's validation.
+- Lemmy 0.19.19 wire facts (source-verified + observed): save_user_settings
+  federates NOTHING (no Update{Person} variant exists) — consent marker
+  changes are discoverable only via TTL re-fetch on the actor's next
+  activity (e2e compose sets PROFILE_REFRESH_TTL=2s to drive it; an
+  inactive actor's opt-out is never discovered — task 11 candidate:
+  periodic consent re-scan); delete_account is POST with required
+  delete_content and federates ONE Delete{Person} with nonstandard
+  removeData (no per-object deletes); image-post attachment is
+  {"type":"Image","url",…,"name":alt} with mediaType DROPPED (type field +
+  extension fallback are the only discriminators; alt text doesn't survive
+  the Link fallback); pictrs upload is POST /pictrs/image multipart
+  "images[]", Bearer jwt.
+- GET /admin/communities lists accepted/pending ONLY — an unsubscribed
+  community disappears from it (don't poll it for follow_state=none).
+- e2e suite is now 17 scenarios, ~230s full run, re-runnable against an
+  accumulated stack. TestZZ_SuiteEndSweep (zz_ file = alphabetically last
+  = runs last) replays the whole firehose from cursor 1 unfiltered and
+  re-vets everything incl. per-DID rev monotonicity from history start.
+  TestDeleteActor pins "relay still lists tombstoned repo" — task 11's
+  #account frame must FLIP that assertion.
+- Task-10 stretch (low MINT_RATE_PER_MINUTE compose variant) skipped as
+  specced — needs its own compose profile (FOLLOWUPS, Ingestion).

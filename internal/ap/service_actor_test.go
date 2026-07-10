@@ -2,9 +2,11 @@ package ap
 
 import (
 	"context"
+	"encoding/json"
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -130,6 +132,7 @@ func TestServiceActorDocument(t *testing.T) {
 	assert.Equal(t, TypeService, doc.Type)
 	assert.Equal(t, "https://bridge.example/actor", doc.ID)
 	assert.Equal(t, "https://bridge.example/inbox", doc.Inbox)
+	assert.Equal(t, "https://bridge.example/outbox", doc.Outbox)
 	assert.NotEmpty(t, doc.PreferredUsername, "webfinger reverse resolution needs preferredUsername")
 
 	require.NotNil(t, doc.PublicKey)
@@ -140,9 +143,55 @@ func TestServiceActorDocument(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, actor.Key.PublicKey.Equal(published))
 
-	// The JSON-LD context must include the security vocabulary that defines
-	// publicKey.
+	// The JSON-LD context must include core ActivityStreams and the security
+	// vocabulary that defines publicKey.
+	assert.Contains(t, string(doc.Context), "https://www.w3.org/ns/activitystreams")
 	assert.Contains(t, string(doc.Context), "https://w3id.org/security/v1")
+}
+
+// TestInstanceActorDocument pins the wire shape Lemmy 0.19.19's Instance
+// protocol requires of the apex ("Site") actor — the document that makes
+// Lemmy deliver send-to-all-instances activities (account deletions!) to
+// the bridge. type must be exactly Application (NOT Service — the opposite
+// of the /actor rule), and id/name/inbox/outbox/publicKey/published are
+// required.
+func TestInstanceActorDocument(t *testing.T) {
+	keys := newFakeServiceKeys()
+	actor, err := LoadOrCreateServiceActor(context.Background(), keys, "bridge.example", "")
+	require.NoError(t, err)
+
+	docJSON, err := actor.InstanceDocumentJSON()
+	require.NoError(t, err)
+	var doc map[string]any
+	require.NoError(t, json.Unmarshal(docJSON, &doc))
+
+	assert.Equal(t, "Application", doc["type"],
+		"Lemmy's Instance enum accepts only Application")
+	assert.Equal(t, "https://bridge.example/", doc["id"],
+		"the id must be the origin apex WITH trailing slash — the exact URL Lemmy derives")
+	assert.Equal(t, "https://bridge.example/inbox", doc["inbox"],
+		"this inbox is where Lemmy will deliver Delete{Person}")
+	assert.Equal(t, "https://bridge.example/outbox", doc["outbox"])
+	assert.Contains(t, doc["@context"], "https://www.w3.org/ns/activitystreams",
+		"the JSON-LD context must include core ActivityStreams")
+	for _, field := range []string{"name", "published"} {
+		s, _ := doc[field].(string)
+		assert.NotEmpty(t, s, "Lemmy requires %s on the Instance document", field)
+	}
+	if published, ok := doc["published"].(string); assert.True(t, ok) {
+		_, err := time.Parse(time.RFC3339, published)
+		assert.NoError(t, err, "published must be RFC3339")
+	}
+
+	pk, ok := doc["publicKey"].(map[string]any)
+	require.True(t, ok, "publicKey block is required")
+	assert.Equal(t, "https://bridge.example/#main-key", pk["id"])
+	assert.Equal(t, "https://bridge.example/", pk["owner"])
+	pem, _ := pk["publicKeyPem"].(string)
+	parsed, err := ParsePublicKeyPEM([]byte(pem))
+	require.NoError(t, err)
+	assert.True(t, actor.Key.PublicKey.Equal(parsed),
+		"the instance actor reuses the service RSA key (Lemmy reads only publicKeyPem)")
 }
 
 func TestServiceActorSigner_RoundTrip(t *testing.T) {

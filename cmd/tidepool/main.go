@@ -282,6 +282,7 @@ func run(logger *slog.Logger) error {
 		Events:   inboxEvents,
 		Queue:    queue,
 		Service:  serviceActor,
+		Fetcher:  apClient,
 		Logger:   logger,
 	})
 	if err != nil {

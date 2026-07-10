@@ -27,7 +27,10 @@ harness, **(relay)** by task 09's relay pipeline.
   serves no `getRepoStatus`, and learns account state upstream only from
   `#account` frames — which the bridge does not emit yet (task 11). When
   the `#account` frame lands, add a relay-side e2e assertion that a
-  consent-revoked repo disappears from the relay's `listRepos`.
+  consent-revoked repo disappears from the relay's `listRepos`. Task 10's
+  `TestDeleteActor_ScrubsAndTombstones` PINS the current gap (the relay
+  still lists a tombstoned repo) with a comment pointing here — that
+  assertion must flip when task 11 lands.
 - **A fresh bigsky refuses all non-admin `requestCrawl`**: the new-PDS
   per-day limit defaults to 0 and is checked BEFORE the trusted-domain
   list. Any deployment announcing to a self-hosted relay needs the
@@ -42,6 +45,19 @@ harness, **(relay)** by task 09's relay pipeline.
 - The pinned bigsky image has **no arm64 manifest** — Apple Silicon runs it
   under emulation (`platform: linux/amd64`), fine at e2e volume; a future
   image bump could revisit.
+- **Jetstream cursor semantics have a full-replay middle band (task 10,
+  measured live).** The pinned Jetstream replays precisely (µs-exact,
+  inclusive) for cursors at or before its newest stored event and
+  live-tails for cursors beyond server-now — but a cursor BETWEEN the
+  newest stored event and now (i.e. any "subscribe from now" against a
+  quiet stream) replays the ENTIRE retained store. Every `cursorNow()`
+  e2e listener has therefore been receiving full-history replays without
+  anyone noticing (scoped awaits absorb it); negative assertions must be
+  bounded by an observed event's `time_us`, never by wall-clock cursors
+  (`tests/e2e/helpers.go` cursorNow doc, unsubscribe scenario). Carry to
+  Coves: an AppView consumer that reconnects "from now" after downtime on
+  a quiet Jetstream may get a surprise full replay — idempotent indexing
+  handles it, but don't treat cursor=now as a dedupe boundary.
 - indigo's slurper reconnect backoff is effectively sub-second for the
   first 10 attempts (`sleepForBackoff` multiplies by 2 **nanoseconds**, so
   only the additive +0–1s jitter — rand milliseconds — matters), then 30s;
@@ -97,7 +113,71 @@ harness, **(relay)** by task 09's relay pipeline.
 - **Author auto-upvotes do not federate (e2e).** Lemmy casts a local Like
   by the post author but never announces it, so live-bridged posts read one
   upvote lower than Lemmy's UI until a backfill re-seed. Accepted drift;
-  document for the AppView.
+  document for the AppView (the vote-hammer scenario's expectations bake
+  this in).
+- **Lemmy 0.19.x never federates `Update{Person}` on profile edits (task
+  10, source-verified).** `SaveUserSettings` submits no activity and
+  `SendActivityData` has no Update-Person variant at the pinned tag — bio
+  changes reach remote instances only when they re-fetch the actor.
+  Production consequence: a bridged actor adding `#nobridge` to their bio
+  is discovered only on the next TTL-stale actor re-fetch (default
+  `PROFILE_REFRESH_TTL` 24h) *triggered by their next activity* — an
+  inactive actor's opt-out is never discovered. Consider a periodic consent
+  re-scan of active bridged actors. (The e2e compose sets
+  `PROFILE_REFRESH_TTL=2s` to drive this path; when Lemmy grows
+  Update/Person federation, the consent scenario should also assert the
+  immediate-refresh path.)
+- **Account deletion federates ONE `Delete{Person}` (task 10,
+  source-verified).** `delete_content` rides as a nonstandard `removeData`
+  flag; there are no per-object Delete activities for the user's posts and
+  comments. The bridge's actor-scrub already deletes all authored records
+  regardless of the flag's value.
+- **Lemmy delivers send-to-all-instances activities (account deletions!)
+  ONLY to peers with a stored Site actor row (task 10, observed live +
+  source-verified).** The federate worker resolves `to_all_instances()`
+  targets to the remote instance's Site row inbox and silently skips
+  (`no inboxes`, `was_skipped: true`) when none exists — the bridge
+  received posts and votes happily while every `Delete{Person}` was
+  dropped unsent. Lemmy creates the site row by fetching the peer's ORIGIN
+  APEX (`fetch_instance_actor_for_object`, on every Person/Community
+  `from_json`), so the bridge now serves an instance actor at `GET /`
+  (`ap.ServiceActor.InstanceDocumentJSON`; type must be exactly
+  `Application` — the OPPOSITE of the `/actor` rule, where Lemmy's Person
+  enum rejects Application and needs `Service`). **Operational note for
+  existing deployments:** Lemmy's per-instance worker caches "no site row"
+  for its lifetime and actor re-fetches are 24h-TTL'd — a peer Lemmy that
+  federated with the bridge before this change needs an actor re-fetch AND
+  a worker restart before deletions start flowing.
+- **A federated `Delete{Person}` is signed by an actor its origin already
+  serves as 410 Gone (task 10, observed live).** Unless that user's key
+  happens to sit in the bridge's cache from an earlier direct delivery,
+  the signature can never verify — rejecting it would mean Lemmy account
+  deletions never tombstone bridged repos (a consent failure). The inbox
+  now accepts a bare SELF-referential Delete when verification failed on a
+  tombstone AND an independent SSRF-guarded fetch of the claimed actor's
+  own IRI confirms the origin serves it Gone: the origin's word for its
+  own actor is the same host-granularity trust unit bare-Delete
+  authorization already uses, so a forger can only "forge" a deletion
+  that is already true at the origin. Any OTHER payload with a tombstoned
+  signer is a definitive 401 (a 5xx would head-of-line block Lemmy's
+  per-instance retry queue, which retries forever). See
+  `internal/ingest/inbox.go` `tombstonedSelfDelete` + 3 regression tests.
+- **The tombstone confirmation is Lemmy-scoped by design: a 404-on-deleted
+  origin can never pass it.** `tombstonedSelfDelete` accepts only
+  independently-confirmed tombstone evidence — a 410 Gone or a 200 whose
+  body is a Tombstone object (`internal/ap/client.go`); a plain 404 maps to
+  IsNotFound and the Delete stays a definitive 401. Platforms that serve
+  404 for deleted actors (Mastodon-style behavior in some configurations)
+  would therefore never get their self-Deletes honored via this path. Fine
+  while the bridge federates with Lemmy only (Lemmy serves 410/Tombstone);
+  the PieFed/Mbin follow-up below must revisit this alongside the `/c/`
+  heuristic.
+- **Lemmy's AP `Image` attachment drops `mediaType`** (task 10): an image
+  post's attachment serializes as `{"type":"Image","url":…,"name":<alt>}` —
+  the `type` field (plus the materializer's extension fallback) is the only
+  image discriminator on the wire; `Link` attachments carry `mediaType` but
+  no `name`, so alt text does not survive the metadata-fetch-failure
+  fallback.
 - **PieFed / Mbin untested** (PLAN.md deferred: verify against Lemmy only).
   Known gap: `communityRef` uses a Lemmy `/c/` heuristic — Mbin uses `/m/`.
 - **Lemmy 1.0 / API v4.** Everything (harness helpers, seeder's
@@ -196,10 +276,14 @@ harness, **(relay)** by task 09's relay pipeline.
 - Actor-delete / consent revocation does **not** scrub that actor's
   `vote_events` rows (inconsistent with the scrub posture elsewhere; counts
   are anonymous on the wire, so exposure is low).
-- No true concurrency stress on the aggregate-row locking claim — the e2e
-  burst scenario exercises concurrent queue workers across communities but
-  contains **no votes at all**, so the vote-concurrency path is untested
-  beyond unit level; a many-voters-one-post hammer is still missing.
+- ~~No true concurrency stress on the aggregate-row locking claim — a
+  many-voters-one-post hammer is still missing.~~ **Closed by task 10**:
+  `TestVoteHammer_ConcurrentVotersExactAggregates` fires ten real Lemmy
+  voters in parallel bursts (votes, flips, clears) at one post and asserts
+  exactly-correct final aggregates. Honest caveat: Lemmy's per-instance
+  federation worker delivers sequentially and the bridge's queue serializes
+  per community ordering key, so this proves burst correctness end-to-end
+  rather than true same-row lock contention (which stays unit-level).
 - Subject resolution happens outside the mutation tx (narrow TOCTOU with a
   racing Delete, documented in task 07).
 - No upper sanity cap on seeded counts; comment count seeding skipped
@@ -217,12 +301,14 @@ harness, **(relay)** by task 09's relay pipeline.
 - `commitRecord`'s PutRecord→PutMapping is not one tx (self-heals on retry;
   a Delete landing in the crash window logs Warn).
 - `DeleteActor` scrubs records but not blobs stored under community DIDs.
-- Test gap: `embed.images` arm + nsfw label shapes are never
-  lexicon-validated by unit tests (only the external-embed arm is). The e2e
-  suite lexicon-validates every create/update its listeners consume — the
-  external-embed arm crosses the wire via scenario 2's link post — but no
-  scenario posts an image, so `embed.images` never appears on the wire
-  (needs pictrs-backed image upload in the harness).
+- ~~Test gap: `embed.images` arm + nsfw label shapes never appear on the
+  wire (needs pictrs-backed image upload in the harness).~~ **Closed by
+  task 10**: `TestImagePost_EmbedImagesAndNSFWLabel` uploads through
+  Lemmy's pictrs proxy, posts it NSFW with alt text, and asserts the
+  `embed.images` blob ref + `nsfw` self-label lexicon-validate on the
+  relay-fed wire and the blob serves back byte-consistent via `getBlob`.
+  (Unit-level lexicon fixtures for those arms are still absent — the e2e
+  path is the coverage.)
 - Residual TOCTOU (task 03): a consent flip racing an in-flight commit can
   let that one commit land (consent read is outside the commit tx; fine for
   single-writer v1).
@@ -246,14 +332,37 @@ harness, **(relay)** by task 09's relay pipeline.
   reconnect logic upstream, drop the policy.
 - Unexpected-collection enforcement runs on **every** commit event any
   listener consumes (await and drain both fail fast on a collection outside
-  the four emitted ones), and the vote scenario watches the firehose
-  unfiltered while votes flow. Remaining gap: events emitted while no
-  unfiltered listener is subscribed go unchecked — a stack-wide
-  "nothing else ever appeared" sweep at suite end would close it.
-- Scenario ideas not yet covered: image post (pictrs → blob → embed.images
-  lexicon validation), consent (`#nobridge` in a Lemmy bio → suppression),
-  `Delete(Actor)` tombstone flow, unsubscribe (Undo{Follow}) stopping
-  announces, community profile *update* propagation.
+  the four emitted ones), and the vote scenarios watch the firehose
+  unfiltered while votes flow. ~~Remaining gap: events emitted while no
+  unfiltered listener is subscribed go unchecked.~~ **Closed by task 10**:
+  `TestZZ_SuiteEndSweep` (alphabetically-last file, runs after every
+  scenario) replays the entire firehose from cursor 1 (a zero/negative
+  cursor omits the param and live-tails — `tests/e2e/helpers.go`
+  newListener) on a fresh unfiltered listener and re-vets every retained
+  event — collection whitelist, lexicon validation of every create/update,
+  per-DID rev monotonicity from the beginning of retained history —
+  terminated by a fresh-subscription sentinel, not a bare quiet window,
+  with a replay floor (min commit count + at least one post create and one
+  delete op) so a truncated replay cannot pass on the sentinel alone.
+- **The sweep's replay depth is Jetstream's event TTL** (24h in the pinned
+  image): a stack left up longer than the TTL under-vets — history older
+  than the TTL is gone from Jetstream's store and nothing can re-check it —
+  unless the stack (or at least the Jetstream container + its volume) is
+  recreated per run, as `make e2e` does. The sweep's replay floor catches
+  the degenerate cases (near-empty store, live-tail regression) but cannot
+  recover expired events.
+- ~~Scenario ideas not yet covered: image post, consent, `Delete(Actor)`,
+  unsubscribe, community profile update.~~ **Closed by task 10**
+  (`tests/e2e/media_test.go`, `lifecycle_test.go`, `votes_hammer_test.go`,
+  `zz_sweep_test.go`). The stretch idea from the task — a low
+  `MINT_RATE_PER_MINUTE` stack variant driving the mint gate end-to-end —
+  was skipped as specced (it needs its own compose profile; see the
+  mint-gate item under Ingestion).
+- The e2e compose now sets `PROFILE_REFRESH_TTL=2s` (consent scenario
+  driver — see the Federation note on Update{Person}). Side effect: every
+  materialization re-fetches sub-2s-stale actor profiles; unchanged
+  profiles are idempotent no-op re-puts, so no extra firehose traffic — but
+  a future scenario asserting fetch COUNTS would need to account for it.
 
 ## CI
 

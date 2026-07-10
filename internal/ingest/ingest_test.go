@@ -310,6 +310,7 @@ func newHarness(t *testing.T) *harness {
 		Events:   events,
 		Queue:    h.queue,
 		Service:  h.service,
+		Fetcher:  h.client,
 	})
 	require.NoError(t, err)
 

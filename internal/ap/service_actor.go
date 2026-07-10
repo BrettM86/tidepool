@@ -5,6 +5,7 @@ import (
 	"crypto/rsa"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"tidepool/internal/errors"
 	"tidepool/internal/store"
@@ -38,6 +39,11 @@ type ServiceActor struct {
 	Scheme string
 	// Key is the actor's RSA private key.
 	Key *rsa.PrivateKey
+	// CreatedAt is when the service key was first provisioned — the
+	// `published` timestamp of the actor documents (Lemmy's Instance
+	// protocol REQUIRES published; a zero value falls back to a fixed
+	// epoch so hand-built test actors still render valid documents).
+	CreatedAt time.Time
 }
 
 // BaseURL is the origin the bridge's own AP URLs live under,
@@ -102,10 +108,11 @@ func LoadOrCreateServiceActor(ctx context.Context, keys store.ServiceKeys, hostn
 	}
 
 	return &ServiceActor{
-		ID:       scheme + "://" + hostname + ServiceActorPath,
-		Hostname: hostname,
-		Scheme:   scheme,
-		Key:      key,
+		ID:        scheme + "://" + hostname + ServiceActorPath,
+		Hostname:  hostname,
+		Scheme:    scheme,
+		Key:       key,
+		CreatedAt: stored.CreatedAt,
 	}, nil
 }
 
@@ -163,6 +170,70 @@ func (a *ServiceActor) DocumentJSON() ([]byte, error) {
 	data, err := json.Marshal(doc)
 	if err != nil {
 		return nil, fmt.Errorf("ap: encode service actor document: %w", err)
+	}
+	return data, nil
+}
+
+// InstanceActorID is the bridge's instance-actor id: the bare origin apex
+// WITH a trailing slash — exactly the URL Lemmy derives when it resolves a
+// peer's instance actor (it clears the path of any object id from that
+// origin, yielding "{scheme}://{host}/").
+func (a *ServiceActor) InstanceActorID() string { return a.BaseURL() + "/" }
+
+// instanceActorFallbackPublished keeps hand-built test actors (zero
+// CreatedAt) rendering a valid document — Lemmy requires `published`.
+const instanceActorFallbackPublished = "2026-01-01T00:00:00Z"
+
+// InstanceDocumentJSON renders the bridge's INSTANCE actor — the AP face of
+// the whole deployment, served at the origin apex ("/"). This is a separate
+// identity from the /actor service actor, and it is load-bearing for
+// inbound federation, not decoration:
+//
+// Lemmy resolves every federating peer's instance ("Site") actor by
+// fetching the peer's origin apex (fetch_instance_actor_for_object, called
+// from every Person/Community from_json), and its federation worker
+// delivers "send to all instances" activities — account deletions
+// (Delete{Person}) above all — ONLY to the inbox stored on that site row.
+// A peer with no site row silently never receives them (observed live:
+// the worker logs `no inboxes` and skips). Verified against Lemmy 0.19.19:
+// crates/apub/src/objects/instance.rs, crates/federate/src/worker.rs.
+//
+// Wire shape (crates/apub/src/protocol/objects/instance.rs): `type` must be
+// exactly "Application" — the Instance protocol enum accepts nothing else
+// (the OPPOSITE of the /actor rule, where Lemmy's Person protocol enum
+// rejects Application and needs Service). id, name, inbox, outbox,
+// publicKey{id,owner,publicKeyPem}, and published are all required; Lemmy
+// reads only publicKeyPem from the key block, which safely reuses the
+// service RSA key. The inbox is the same shared /inbox.
+func (a *ServiceActor) InstanceDocumentJSON() ([]byte, error) {
+	publicPEM, err := EncodePublicKeyPEM(&a.Key.PublicKey)
+	if err != nil {
+		return nil, err
+	}
+	published := instanceActorFallbackPublished
+	if !a.CreatedAt.IsZero() {
+		published = a.CreatedAt.UTC().Format(time.RFC3339)
+	}
+	id := a.InstanceActorID()
+	doc := map[string]any{
+		"@context":          json.RawMessage(serviceActorContext),
+		"type":              TypeApplication,
+		"id":                id,
+		"name":              "Tidepool bridge",
+		"preferredUsername": a.Hostname,
+		"summary":           "Bridges threadiverse communities into atproto. " + a.BaseURL(),
+		"inbox":             a.InboxURL(),
+		"outbox":            a.OutboxURL(),
+		"published":         published,
+		"publicKey": map[string]any{
+			"id":           id + "#main-key",
+			"owner":        id,
+			"publicKeyPem": string(publicPEM),
+		},
+	}
+	data, err := json.Marshal(doc)
+	if err != nil {
+		return nil, fmt.Errorf("ap: encode instance actor document: %w", err)
 	}
 	return data, nil
 }

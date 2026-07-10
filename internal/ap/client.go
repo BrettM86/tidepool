@@ -293,7 +293,13 @@ func guardedTransport(base http.RoundTripper, guard *egressGuard) http.RoundTrip
 //     serves Tombstones with 410, Mastodon with 404, others with 200);
 //   - other non-2xx → HTTPError.
 func (c *Client) FetchObject(ctx context.Context, iri string) (*Object, error) {
-	body, err := c.getDeduped(ctx, iri)
+	return c.fetchObject(ctx, iri, fetchModeObject)
+}
+
+// fetchObject is FetchObject parameterized by fetch mode (status mapping and
+// redirect policy — see fetchMode).
+func (c *Client) fetchObject(ctx context.Context, iri string, mode fetchMode) (*Object, error) {
+	body, err := c.getDedupedMode(ctx, iri, mode)
 	if err != nil {
 		return nil, err
 	}
@@ -316,7 +322,25 @@ func SameAuthority(a, b string) bool { return sameAuthority(a, b) }
 // FetchActor fetches an AP actor document and validates that it is one
 // (Group/Person/Application/Service with an id).
 func (c *Client) FetchActor(ctx context.Context, iri string) (*Object, error) {
-	obj, err := c.FetchObject(ctx, iri)
+	return c.fetchActor(ctx, iri, fetchModeObject)
+}
+
+// FetchActorSameAuthority is FetchActor with the redirect authority pinned to
+// the requested IRI: any redirect hop whose target does not share the IRI's
+// scheme+host fails the fetch with errors.IsValidation. The inbox's tombstone
+// confirmation (ingest.tombstonedSelfDelete) uses it because that fetch is an
+// authorization decision about the IRI's own origin — a compromised or
+// open-redirecting origin must not be able to bounce the confirmation to an
+// attacker host that serves 410. Same-authority redirects (a path move within
+// the origin) are still followed; ordinary fetches keep the permissive
+// redirect behavior.
+func (c *Client) FetchActorSameAuthority(ctx context.Context, iri string) (*Object, error) {
+	return c.fetchActor(ctx, iri, fetchModeObjectPinnedAuthority)
+}
+
+// fetchActor is FetchActor parameterized by fetch mode.
+func (c *Client) fetchActor(ctx context.Context, iri string, mode fetchMode) (*Object, error) {
+	obj, err := c.fetchObject(ctx, iri, mode)
 	if err != nil {
 		return nil, err
 	}
@@ -735,7 +759,10 @@ func (c *Client) getDeduped(ctx context.Context, iri string) ([]byte, error) {
 }
 
 func (c *Client) getDedupedMode(ctx context.Context, iri string, mode fetchMode) ([]byte, error) {
-	ch := c.inflight.DoChan(iri, func() (any, error) {
+	// The dedupe key includes the mode: a pinned-authority fetch must never
+	// share the result of a plain fetch for the same IRI (the plain fetch may
+	// have followed a cross-authority redirect the pinned one forbids).
+	ch := c.inflight.DoChan(fmt.Sprintf("%d\x00%s", mode, iri), func() (any, error) {
 		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.requestBudget)
 		defer cancel()
 		return c.get(fetchCtx, iri, mode)
@@ -755,15 +782,19 @@ func (c *Client) getDedupedMode(ctx context.Context, iri string, mode fetchMode)
 	}
 }
 
-// fetchMode selects how non-success statuses map to errors. AP object fetches
-// treat 401/403 as "unavailable" (NotFound); WebFinger must NOT, so a
-// Cloudflare 403 / defederation is distinguishable from a genuinely missing
-// account.
+// fetchMode selects how non-success statuses map to errors and how redirects
+// are policed. AP object fetches treat 401/403 as "unavailable" (NotFound);
+// WebFinger must NOT, so a Cloudflare 403 / defederation is distinguishable
+// from a genuinely missing account.
 type fetchMode int
 
 const (
 	fetchModeObject fetchMode = iota
 	fetchModeWebFinger
+	// fetchModeObjectPinnedAuthority maps statuses like fetchModeObject but
+	// rejects any redirect hop leaving the original IRI's scheme+host (see
+	// FetchActorSameAuthority).
+	fetchModeObjectPinnedAuthority
 )
 
 // get performs a signed GET with retries, redirects, rate limiting, and the
@@ -829,6 +860,14 @@ func (c *Client) getOnce(ctx context.Context, iri string, mode fetchMode) (body 
 			resolved := req.URL.ResolveReference(next)
 			if err := c.checkRedirectScheme(req.URL, resolved); err != nil {
 				return nil, false, fmt.Errorf("ap: GET %s: %w", target, err)
+			}
+			if mode == fetchModeObjectPinnedAuthority && !sameAuthority(iri, resolved.String()) {
+				// The pinned-authority modes exist for fetches whose RESULT is
+				// an authorization statement about iri's own origin; a hop off
+				// that origin is a definitive (non-retryable) refusal, not a
+				// transient failure.
+				return nil, false, errors.NewValidationError("redirect",
+					fmt.Sprintf("redirect from %q to %q leaves the authority of %q", target, resolved.String(), iri))
 			}
 			target = resolved.String()
 			continue

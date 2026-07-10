@@ -12,6 +12,13 @@ Security / admission control:
 - **Per-signer AND per-IP rate limit on `/inbox`** (top item:
   queue-flood DoS via many self-signed identities). Token-bucket,
   fail-closed cap, mirroring the votes XRPC limiter's discipline.
+  MUST specifically cover the `tombstonedSelfDelete` branch (task 10's
+  deleted-actor acceptance): it is an UNAUTHENTICATED POST that costs
+  the bridge an outbound confirmation fetch and — when the claimed
+  origin answers 410, which any cheap attacker-run endpoint can —
+  TWO durable writes (`inbox_events` + `ap_tombstones`). Consider a
+  dedicated per-IP cap on that branch, tighter than the general inbox
+  limit.
 - **Connection cap + per-IP rate limit on the public sync surface**
   (subscribeRepos, getRepo and friends).
 - Seeded-count upper sanity cap (a hostile origin API can't inject

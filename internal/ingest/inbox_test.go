@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -99,6 +100,264 @@ func TestInboxExpiredDate(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.router.ServeHTTP(rec, req)
 	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+}
+
+// selfDelete builds Lemmy's account-deletion shape: a bare Delete whose
+// actor and object are the same person.
+func selfDelete(id, actor string) map[string]any {
+	return map[string]any{
+		"id":     id,
+		"type":   "Delete",
+		"actor":  actor,
+		"object": actor,
+	}
+}
+
+// TestInboxTombstonedSelfDeleteAccepted: Lemmy federates an account
+// deletion as ONE Delete{Person} signed by the deleted user — whose actor
+// document the origin already serves as 410 Gone, so the signature can
+// never verify (no cached key: users whose content only ever arrived via
+// community Announces never signed anything at us). The inbox must accept
+// it on the origin's tombstone evidence: verification failed WITH a
+// tombstone, the payload is a self-Delete, and an independent fetch of the
+// actor's own IRI confirms Gone. (Observed live against Lemmy 0.19.19 in
+// the e2e Delete(Actor) scenario.)
+func TestInboxTombstonedSelfDeleteAccepted(t *testing.T) {
+	h := newHarness(t)
+	const ghost = "https://lemmy.world/u/ghost"
+	// The origin's answer for the deleted actor: 410, nothing fetchable.
+	h.mux.HandleFunc("GET "+urlPath(h.t, ghost), func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusGone)
+	})
+	key, err := ap.GenerateRSAKey()
+	require.NoError(t, err)
+	deleted := &remoteActor{id: ghost, key: key}
+
+	const activityID = "https://lemmy.world/activities/delete/ghost-1"
+	status := h.deliver(deleted, selfDelete(activityID, ghost))
+	require.Equal(t, http.StatusAccepted, status,
+		"a self-Delete from a tombstoned actor must be accepted, not rejected")
+
+	event, err := h.events.GetEvent(context.Background(), activityID)
+	require.NoError(t, err)
+	assert.Equal(t, ghost, event.ActorID)
+
+	h.drain()
+	// Processed as a real delete: the tombstone marker (the
+	// create-after-delete guard) is recorded for the actor id.
+	gone, err := h.tombstones.Exists(context.Background(), ghost)
+	require.NoError(t, err)
+	assert.True(t, gone, "the accepted self-delete must reach handleDelete")
+}
+
+// TestInboxTombstonedSignerRejectedForNonDelete: a tombstoned signing key
+// only ever unlocks the self-Delete path. Anything else is a DEFINITIVE
+// 401 — not a 503, which would make the sender (whose per-instance queue
+// retries head-of-line, forever) block every later delivery behind an
+// activity that can never verify.
+func TestInboxTombstonedSignerRejectedForNonDelete(t *testing.T) {
+	h := newHarness(t)
+	const ghost = "https://lemmy.world/u/ghost2"
+	h.mux.HandleFunc("GET "+urlPath(h.t, ghost), func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusGone)
+	})
+	key, err := ap.GenerateRSAKey()
+	require.NoError(t, err)
+	deleted := &remoteActor{id: ghost, key: key}
+
+	const activityID = "https://lemmy.world/activities/like/ghost-vote"
+	status := h.deliver(deleted, likeActivity(activityID, ghost))
+	assert.Equal(t, http.StatusUnauthorized, status)
+	_, err = h.events.GetEvent(context.Background(), activityID)
+	assert.True(t, errors.IsNotFound(err), "rejected deliveries must not be enqueued")
+}
+
+// TestInboxTombstonedKeyCannotForgeDeleteOfLiveActor: the forgery attempt
+// the independent confirmation exists for — signing a Delete of a LIVE
+// same-host victim with a genuinely-tombstoned actor's keyId. The
+// actor/signer authority binding cannot catch it (same host), so the
+// deciding check is the fetch of the claimed actor's OWN IRI: alive →
+// rejected.
+func TestInboxTombstonedKeyCannotForgeDeleteOfLiveActor(t *testing.T) {
+	h := newHarness(t)
+	const ghost = "https://lemmy.world/u/ghost3"
+	h.mux.HandleFunc("GET "+urlPath(h.t, ghost), func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusGone)
+	})
+	victim := h.newRemoteActor("https://lemmy.world/u/victim9",
+		person("https://lemmy.world/u/victim9", "victim9", nil))
+	key, err := ap.GenerateRSAKey()
+	require.NoError(t, err)
+	forger := &remoteActor{id: ghost, key: key}
+
+	const activityID = "https://lemmy.world/activities/delete/forged-victim9"
+	status := h.deliver(forger, selfDelete(activityID, victim.id))
+	assert.Equal(t, http.StatusUnauthorized, status,
+		"a live actor's self-delete must not be forgeable via a tombstoned keyId")
+	_, err = h.events.GetEvent(context.Background(), activityID)
+	assert.True(t, errors.IsNotFound(err))
+	gone, err := h.tombstones.Exists(context.Background(), victim.id)
+	require.NoError(t, err)
+	assert.False(t, gone, "no tombstone may be recorded for the live victim")
+}
+
+// TestInboxTombstoneConfirmationInconclusiveDeferred: when the independent
+// confirmation fetch fails for a reason that says nothing about the actor
+// (here: the origin answers 5xx), the inbox must answer 503 — retryable — so
+// the sender's queue redelivers. A definitive 401 would make the sender drop
+// the delivery forever, permanently losing a legitimate account deletion
+// during a transient origin blip (there is no rediscovery path for a deleted
+// actor).
+func TestInboxTombstoneConfirmationInconclusiveDeferred(t *testing.T) {
+	h := newHarness(t)
+	const ghost = "https://lemmy.world/u/ghost-flaky"
+	// First GET (key resolution during Verify): 410 → tombstoned verify
+	// error. Second GET (the confirmation fetch): 503 → inconclusive.
+	var mu sync.Mutex
+	hits := 0
+	h.mux.HandleFunc("GET "+urlPath(h.t, ghost), func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		hits++
+		first := hits == 1
+		mu.Unlock()
+		if first {
+			w.WriteHeader(http.StatusGone)
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	key, err := ap.GenerateRSAKey()
+	require.NoError(t, err)
+	deleted := &remoteActor{id: ghost, key: key}
+
+	const activityID = "https://lemmy.world/activities/delete/ghost-flaky-1"
+	status := h.deliver(deleted, selfDelete(activityID, ghost))
+	assert.Equal(t, http.StatusServiceUnavailable, status,
+		"an inconclusive confirmation must defer (503), never definitively reject")
+	_, err = h.events.GetEvent(context.Background(), activityID)
+	assert.True(t, errors.IsNotFound(err), "deferred deliveries must not be enqueued")
+	h.drain()
+	gone, err := h.tombstones.Exists(context.Background(), ghost)
+	require.NoError(t, err)
+	assert.False(t, gone, "no tombstone may be recorded on an inconclusive confirmation")
+}
+
+// TestInboxTombstoneConfirmationFollowsSameAuthorityRedirect pins the
+// redirect semantic of the confirmation fetch: redirect hops that STAY on
+// the actor's own authority are followed (an origin may move its actor
+// paths), and a 410 at the end of such a chain confirms the tombstone.
+func TestInboxTombstoneConfirmationFollowsSameAuthorityRedirect(t *testing.T) {
+	h := newHarness(t)
+	const ghost = "https://lemmy.world/u/ghost-moved"
+	h.mux.HandleFunc("GET "+urlPath(h.t, ghost), func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", "https://lemmy.world/u/ghost-moved-target")
+		w.WriteHeader(http.StatusMovedPermanently)
+	})
+	h.mux.HandleFunc("GET /u/ghost-moved-target", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusGone)
+	})
+	key, err := ap.GenerateRSAKey()
+	require.NoError(t, err)
+	deleted := &remoteActor{id: ghost, key: key}
+
+	const activityID = "https://lemmy.world/activities/delete/ghost-moved-1"
+	status := h.deliver(deleted, selfDelete(activityID, ghost))
+	require.Equal(t, http.StatusAccepted, status,
+		"a same-authority redirect to 410 must confirm the tombstone")
+	h.drain()
+	gone, err := h.tombstones.Exists(context.Background(), ghost)
+	require.NoError(t, err)
+	assert.True(t, gone)
+}
+
+// TestInboxTombstoneConfirmationRejectsCrossAuthorityRedirect: the
+// confirmation fetch is an authorization decision about the actor's OWN
+// origin, so a redirect off that origin (an open-redirect bug, a compromised
+// origin) to an attacker host serving 410 must NOT confirm the tombstone —
+// and because the origin did answer, the outcome is a definitive 401, not a
+// retryable 503.
+func TestInboxTombstoneConfirmationRejectsCrossAuthorityRedirect(t *testing.T) {
+	h := newHarness(t)
+	const ghost = "https://lemmy.world/u/ghost-hijack"
+	h.mux.HandleFunc("GET "+urlPath(h.t, ghost), func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", "https://evil.example/u/attacker-tombstone")
+		w.WriteHeader(http.StatusFound)
+	})
+	// The attacker host happily serves 410 for the "actor".
+	h.mux.HandleFunc("GET /u/attacker-tombstone", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusGone)
+	})
+	key, err := ap.GenerateRSAKey()
+	require.NoError(t, err)
+	forger := &remoteActor{id: ghost, key: key}
+
+	const activityID = "https://lemmy.world/activities/delete/ghost-hijack-1"
+	status := h.deliver(forger, selfDelete(activityID, ghost))
+	assert.Equal(t, http.StatusUnauthorized, status,
+		"a cross-authority redirect to 410 must not satisfy the tombstone confirmation")
+	_, err = h.events.GetEvent(context.Background(), activityID)
+	assert.True(t, errors.IsNotFound(err), "rejected deliveries must not be enqueued")
+	h.drain()
+	gone, err := h.tombstones.Exists(context.Background(), ghost)
+	require.NoError(t, err)
+	assert.False(t, gone, "no tombstone may be recorded via an off-origin redirect")
+}
+
+// TestInboxTombstonedSignerRejectedForNonSelfDelete: a Delete whose object
+// is NOT the actor itself never unlocks the tombstone path — definitive 401
+// before any confirmation fetch is spent.
+func TestInboxTombstonedSignerRejectedForNonSelfDelete(t *testing.T) {
+	h := newHarness(t)
+	const ghost = "https://lemmy.world/u/ghost5"
+	h.mux.HandleFunc("GET "+urlPath(h.t, ghost), func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusGone)
+	})
+	key, err := ap.GenerateRSAKey()
+	require.NoError(t, err)
+	deleted := &remoteActor{id: ghost, key: key}
+
+	const activityID = "https://lemmy.world/activities/delete/ghost5-other"
+	status := h.deliver(deleted, map[string]any{
+		"id":     activityID,
+		"type":   "Delete",
+		"actor":  ghost,
+		"object": "https://lemmy.world/post/12345",
+	})
+	assert.Equal(t, http.StatusUnauthorized, status,
+		"a tombstoned signer's Delete of anything but itself is a definitive 401")
+	_, err = h.events.GetEvent(context.Background(), activityID)
+	assert.True(t, errors.IsNotFound(err), "rejected deliveries must not be enqueued")
+}
+
+// TestInboxTombstonedSignerRejectedForAnnounceDelete: a Delete WRAPPED in an
+// Announce (activity.Type == Announce) is not the bare self-Delete shape and
+// must not unlock the tombstone path.
+func TestInboxTombstonedSignerRejectedForAnnounceDelete(t *testing.T) {
+	h := newHarness(t)
+	const ghost = "https://lemmy.world/u/ghost6"
+	h.mux.HandleFunc("GET "+urlPath(h.t, ghost), func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusGone)
+	})
+	key, err := ap.GenerateRSAKey()
+	require.NoError(t, err)
+	deleted := &remoteActor{id: ghost, key: key}
+
+	const activityID = "https://lemmy.world/activities/announce/ghost6-delete"
+	status := h.deliver(deleted, map[string]any{
+		"id":    activityID,
+		"type":  "Announce",
+		"actor": ghost,
+		"object": map[string]any{
+			"id":     "https://lemmy.world/activities/delete/ghost6-inner",
+			"type":   "Delete",
+			"actor":  ghost,
+			"object": ghost,
+		},
+	})
+	assert.Equal(t, http.StatusUnauthorized, status,
+		"Announce{Delete} from a tombstoned signer is a definitive 401")
+	_, err = h.events.GetEvent(context.Background(), activityID)
+	assert.True(t, errors.IsNotFound(err), "rejected deliveries must not be enqueued")
 }
 
 // TestInboxUnsignedRejected: no Signature header → 401.
@@ -245,4 +504,24 @@ func TestServiceActorEndpoints(t *testing.T) {
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &nodeinfo))
 	assert.Equal(t, "tidepool", nodeinfo.Software.Name)
 	assert.Contains(t, nodeinfo.Protocols, "activitypub")
+}
+
+// TestInstanceActorRoute: through the real router wiring, GET / serves the
+// instance ("Site") actor document — 200, activity+json, parseable — the
+// document Lemmy must resolve before it ever delivers send-to-all-instances
+// activities (account deletions) to the bridge.
+func TestInstanceActorRoute(t *testing.T) {
+	h := newHarness(t)
+	req := httptest.NewRequest(http.MethodGet, "https://"+bridgeHost+"/", nil)
+	rec := httptest.NewRecorder()
+	h.router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "application/activity+json", rec.Header().Get("Content-Type"))
+	doc, err := ap.ParseObject(rec.Body.Bytes())
+	require.NoError(t, err)
+	assert.Equal(t, h.service.InstanceActorID(), doc.ID)
+	assert.Equal(t, ap.TypeApplication, doc.Type)
+	require.NotNil(t, doc.PublicKey)
+	assert.NotEmpty(t, doc.PublicKey.PublicKeyPem)
 }

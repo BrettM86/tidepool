@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
@@ -33,6 +34,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/indigo/atproto/atdata"
 	"github.com/bluesky-social/indigo/atproto/lexicon"
 	"github.com/gorilla/websocket"
 
@@ -87,6 +89,28 @@ const burstTimeout = 3 * time.Minute
 // plus the relay's first subscribe. A stack where every attempt hangs to the
 // 10s cap is broken, and failing at this deadline is then the right signal.
 const crawlTimeout = 3 * time.Minute
+
+// negativeWindow bounds the "and nothing else arrived" drain in the bounded
+// NEGATIVE assertions (consent suppression, unsubscribe). Every such window
+// is anchored by a positive control that already arrived — where the control
+// shares the suppressed event's queue ordering key (same community) the
+// suppressed event's fate was decided BEFORE the control was emitted, so
+// this window is a belt on top of causality, not the proof itself.
+const negativeWindow = 8 * time.Second
+
+// profileStaleWait guarantees a bridged actor's stored profile has gone
+// stale: the e2e compose sets PROFILE_REFRESH_TTL=2s (see
+// docker-compose.e2e.yml — Lemmy 0.19.x never federates Update{Person} on
+// bio edits, so the TTL re-fetch on the actor's next activity is the ONLY
+// path by which the bridge discovers a bio marker change). The wait is
+// TTL + slack over the gap between the profile-sync stamp (materialization
+// time) and our observation of the materialized event on Jetstream.
+const profileStaleWait = 5 * time.Second
+
+// sweepTimeout bounds the suite-end full-firehose replay reaching its
+// sentinel: the whole suite's history replays from local disk in seconds,
+// plus one fresh subscribe round trip for the sentinel itself.
+const sweepTimeout = 3 * time.Minute
 
 // ── Firehose vocabulary ────────────────────────────────────────────────────
 
@@ -276,6 +300,9 @@ func (h *harness) setupLemmySite() error {
 type lemmyClient struct {
 	h   *harness
 	jwt string
+	// password is kept so account-lifecycle scenarios can call endpoints
+	// that re-authenticate (POST /api/v3/user/delete_account requires it).
+	password string
 }
 
 // do issues one JSON API call with the client's bearer token.
@@ -362,6 +389,7 @@ func (h *harness) registerUser(t *testing.T, username string) *lemmyClient {
 		t.Fatalf("register lemmy user %s: no jwt in response (site requires verification?)", username)
 	}
 	c.jwt = out.JWT
+	c.password = password
 	return c
 }
 
@@ -482,6 +510,139 @@ func (c *lemmyClient) likeComment(t *testing.T, commentID, score int) {
 		map[string]any{"comment_id": commentID, "score": score}, nil); err != nil {
 		t.Fatalf("vote %+d on comment %d: %v", score, commentID, err)
 	}
+}
+
+// likePostErr is likePost for goroutines: t.Fatalf must only be called from
+// the test goroutine, so the vote-hammer's concurrent voters collect errors
+// instead.
+func (c *lemmyClient) likePostErr(postID, score int) error {
+	return c.do(http.MethodPost, "/api/v3/post/like",
+		map[string]any{"post_id": postID, "score": score}, nil)
+}
+
+// saveBio sets the user's bio (markdown) via save_user_settings. NOTE
+// (verified against Lemmy 0.19.19 source): this does NOT federate an
+// Update{Person} — SendActivityData has no Update-Person variant at that
+// tag — so remote instances only see a bio change when they next re-fetch
+// the actor (the e2e compose shortens PROFILE_REFRESH_TTL for exactly this).
+func (c *lemmyClient) saveBio(t *testing.T, bio string) {
+	t.Helper()
+	if err := c.do(http.MethodPut, "/api/v3/user/save_user_settings",
+		map[string]any{"bio": bio}, nil); err != nil {
+		t.Fatalf("save bio: %v", err)
+	}
+}
+
+// deleteAccount deletes the Lemmy account (POST in 0.19.x, password
+// re-auth). delete_content=true purges the user's posts/comments on Lemmy;
+// federation-wise both variants arrive at the bridge as ONE Delete{Person}
+// (with a nonstandard removeData flag) sent to all known instances — there
+// is no per-object Delete for the content.
+func (c *lemmyClient) deleteAccount(t *testing.T) {
+	t.Helper()
+	if c.password == "" {
+		t.Fatal("deleteAccount: client has no stored password (only registerUser clients can delete themselves)")
+	}
+	if err := c.do(http.MethodPost, "/api/v3/user/delete_account",
+		map[string]any{"password": c.password, "delete_content": true}, nil); err != nil {
+		t.Fatalf("delete account: %v", err)
+	}
+}
+
+// editCommunity renames/re-describes a community (caller must be a mod —
+// the harness admin created every suite community). Federates as
+// Announce{Update{Group}} to the community's followers.
+func (c *lemmyClient) editCommunity(t *testing.T, communityID int, title, description string) {
+	t.Helper()
+	if err := c.do(http.MethodPut, "/api/v3/community",
+		map[string]any{"community_id": communityID, "title": title, "description": description}, nil); err != nil {
+		t.Fatalf("edit community %d: %v", communityID, err)
+	}
+}
+
+// lemmyInternalOrigin is Lemmy's origin as seen INSIDE the compose network —
+// the form that must appear in post URLs so both Lemmy (opengraph metadata
+// fetch) and the bridge (blob fetch) can resolve it. LOCAL-ONLY by
+// construction.
+func lemmyInternalOrigin() string { return envOr("LEMMY_E2E_INTERNAL_ORIGIN", "http://lemmy") }
+
+// uploadImage pushes image bytes through Lemmy's authenticated pictrs proxy
+// (POST /pictrs/image, multipart field "images[]" — Lemmy streams the body
+// to pict-rs unchanged) and returns the compose-internal image URL in the
+// exact shape Lemmy's own clients embed (…/pictrs/image/<alias>).
+func (c *lemmyClient) uploadImage(t *testing.T, filename string, data []byte) string {
+	t.Helper()
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	part, err := mw.CreateFormFile("images[]", filename)
+	if err != nil {
+		t.Fatalf("upload image: build multipart: %v", err)
+	}
+	if _, err := part.Write(data); err != nil {
+		t.Fatalf("upload image: write multipart: %v", err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatalf("upload image: close multipart: %v", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, lemmyURL()+"/pictrs/image", &buf)
+	if err != nil {
+		t.Fatalf("upload image: build request: %v", err)
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer "+c.jwt)
+	resp, err := c.h.http.Do(req)
+	if err != nil {
+		t.Fatalf("upload image: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("upload image: read body: %v", err)
+	}
+	if resp.StatusCode/100 != 2 {
+		t.Fatalf("upload image: status %d: %s", resp.StatusCode, truncate(raw, 300))
+	}
+	var out struct {
+		Msg   string `json:"msg"`
+		Files []struct {
+			File string `json:"file"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("upload image: decode: %v (%s)", err, truncate(raw, 200))
+	}
+	if out.Msg != "ok" || len(out.Files) == 0 || out.Files[0].File == "" {
+		t.Fatalf("upload image: pictrs refused: %s", truncate(raw, 300))
+	}
+	return lemmyInternalOrigin() + "/pictrs/image/" + out.Files[0].File
+}
+
+// createImagePost creates a post whose url is an (already uploaded) image,
+// optionally NSFW-flagged and alt-texted — the shape the materializer turns
+// into an embed.images (+ nsfw self-label).
+func (c *lemmyClient) createImagePost(t *testing.T, communityID int, title, imageURL, altText string, nsfw bool) lemmyPost {
+	t.Helper()
+	req := map[string]any{
+		"name":         title,
+		"community_id": communityID,
+		"url":          imageURL,
+		"nsfw":         nsfw,
+	}
+	if altText != "" {
+		req["alt_text"] = altText
+	}
+	var out struct {
+		PostView struct {
+			Post struct {
+				ID   int    `json:"id"`
+				APID string `json:"ap_id"`
+			} `json:"post"`
+		} `json:"post_view"`
+	}
+	if err := c.do(http.MethodPost, "/api/v3/post", req, &out); err != nil {
+		t.Fatalf("create image post %q: %v", title, err)
+	}
+	return lemmyPost{ID: out.PostView.Post.ID, APID: out.PostView.Post.APID}
 }
 
 // ── Tidepool admin client ──────────────────────────────────────────────────
@@ -608,6 +769,23 @@ func (h *harness) findCommunity(t *testing.T, handle, groupIRI string) (adminCom
 	return adminCommunity{}, false
 }
 
+// unsubscribeCommunity drives DELETE /admin/communities: the bridge sends a
+// best-effort Undo{Follow} to the group and records follow_state=none, after
+// which Announces from that community are dropped (and Lemmy, having lost
+// its follower, stops announcing at all).
+func (h *harness) unsubscribeCommunity(t *testing.T, community string) adminCommunity {
+	t.Helper()
+	var resp adminCommunity
+	if err := h.adminDo(http.MethodDelete, "/admin/communities",
+		map[string]any{"community": community}, &resp); err != nil {
+		t.Fatalf("unsubscribe %s: %v", community, err)
+	}
+	if resp.FollowState != "none" {
+		t.Fatalf("unsubscribe %s: follow_state = %q, want %q", community, resp.FollowState, "none")
+	}
+	return resp
+}
+
 // triggerBackfill forces a backfill run for a subscribed community.
 func (h *harness) triggerBackfill(t *testing.T, community string) {
 	t.Helper()
@@ -653,6 +831,180 @@ func (h *harness) getVoteAggregates(t *testing.T, uris ...string) map[string]vot
 		byURI[a.URI] = a
 	}
 	return byURI
+}
+
+// ── Bridge sync-surface client ─────────────────────────────────────────────
+//
+// The bridge's OWN com.atproto.sync.* + identity endpoints (tidepool :8092).
+// Repo lifecycle state (active/deactivated) must be asserted here rather
+// than through the relay: bigsky serves no getRepoStatus, FILTERS
+// tombstoned repos out of its listRepos, and learns account state upstream
+// only from #account frames — which the bridge does not emit until task 11
+// (FOLLOWUPS.md "Relay pipeline").
+
+// xrpcResult is the decoded outcome of one bridge XRPC GET: the HTTP status
+// plus either the success body or the standard XRPC error shape.
+type xrpcResult struct {
+	status  int
+	body    []byte
+	errCode string // "error" field of the XRPC error body, "" on 2xx
+}
+
+// bridgeXRPC issues one GET against the bridge and decodes the XRPC error
+// envelope on non-2xx. Error-returning (transport only) so poll loops can
+// wait out restarts; non-2xx statuses are DATA here, not errors — lifecycle
+// scenarios assert on exact refusal codes.
+func (h *harness) bridgeXRPC(path string, query url.Values) (xrpcResult, error) {
+	u := tidepoolURL() + path
+	if enc := query.Encode(); enc != "" {
+		u += "?" + enc
+	}
+	resp, err := h.http.Get(u)
+	if err != nil {
+		return xrpcResult{}, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return xrpcResult{}, err
+	}
+	res := xrpcResult{status: resp.StatusCode, body: raw}
+	if resp.StatusCode/100 != 2 {
+		var xe struct {
+			Error string `json:"error"`
+		}
+		_ = json.Unmarshal(raw, &xe) // non-JSON error bodies leave errCode ""
+		res.errCode = xe.Error
+	}
+	return res, nil
+}
+
+// repoStatus is the bridge's getRepoStatus / listRepos entry shape.
+type repoStatus struct {
+	Did    string `json:"did"`
+	Active bool   `json:"active"`
+	Status string `json:"status"`
+	Rev    string `json:"rev"`
+}
+
+// bridgeGetRepoStatus reads com.atproto.sync.getRepoStatus from the bridge.
+func (h *harness) bridgeGetRepoStatus(did string) (repoStatus, xrpcResult, error) {
+	res, err := h.bridgeXRPC("/xrpc/com.atproto.sync.getRepoStatus", url.Values{"did": {did}})
+	if err != nil || res.status != http.StatusOK {
+		return repoStatus{}, res, err
+	}
+	var out repoStatus
+	if err := json.Unmarshal(res.body, &out); err != nil {
+		return repoStatus{}, res, fmt.Errorf("getRepoStatus(%s): decode: %w (%s)", did, err, truncate(res.body, 200))
+	}
+	return out, res, nil
+}
+
+// bridgeListRepos walks the bridge's own listRepos (which, unlike the
+// relay's, DOES include deactivated repos with active:false).
+func (h *harness) bridgeListRepos(t *testing.T) map[string]repoStatus {
+	t.Helper()
+	repos := map[string]repoStatus{}
+	cursor := ""
+	for page := 0; ; page++ {
+		if page >= relayListReposPageCap {
+			t.Fatalf("bridge listRepos: still paginating after %d pages — runaway paging", relayListReposPageCap)
+		}
+		q := url.Values{"limit": {"500"}}
+		if cursor != "" {
+			q.Set("cursor", cursor)
+		}
+		res, err := h.bridgeXRPC("/xrpc/com.atproto.sync.listRepos", q)
+		if err != nil {
+			t.Fatalf("bridge listRepos: %v", err)
+		}
+		if res.status != http.StatusOK {
+			t.Fatalf("bridge listRepos: status %d: %s", res.status, truncate(res.body, 300))
+		}
+		var out struct {
+			Cursor string       `json:"cursor"`
+			Repos  []repoStatus `json:"repos"`
+		}
+		if err := json.Unmarshal(res.body, &out); err != nil {
+			t.Fatalf("bridge listRepos: decode: %v", err)
+		}
+		for _, r := range out.Repos {
+			repos[r.Did] = r
+		}
+		if out.Cursor == "" || out.Cursor == cursor {
+			return repos
+		}
+		cursor = out.Cursor
+	}
+}
+
+// bridgeResolveHandle resolves a handle via the bridge's
+// com.atproto.identity.resolveHandle. Callers assert on the result: 200 +
+// DID for live actors, 400 HandleNotFound for unknown AND tombstoned ones
+// (a tombstoned actor's identity is frozen — its handle stops resolving).
+func (h *harness) bridgeResolveHandle(t *testing.T, handle string) (did string, res xrpcResult) {
+	t.Helper()
+	res, err := h.bridgeXRPC("/xrpc/com.atproto.identity.resolveHandle", url.Values{"handle": {handle}})
+	if err != nil {
+		t.Fatalf("resolveHandle(%s): %v", handle, err)
+	}
+	if res.status == http.StatusOK {
+		var out struct {
+			Did string `json:"did"`
+		}
+		if err := json.Unmarshal(res.body, &out); err != nil {
+			t.Fatalf("resolveHandle(%s): decode: %v", handle, err)
+		}
+		did = out.Did
+	}
+	return did, res
+}
+
+// bridgedHandle predicts the bridge handle (task-03 shape:
+// name.instance.BRIDGE_HOSTNAME) for a uniqueName-generated Lemmy username
+// ONLY — [a-z0-9_], ≤20 chars. Its sanitizer is a simplification of
+// production normalizeLabel (which additionally collapses dash runs, trims
+// edge dashes, and truncates to 63 chars); the two agree on uniqueName's
+// output but NOT on arbitrary usernames — do not feed it any other input.
+// The suite's uniqueName usernames also make collision suffixes (-2, -3…)
+// impossible within a run.
+func bridgedHandle(username string) string {
+	var b strings.Builder
+	dash := false
+	for _, r := range strings.ToLower(username) {
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-':
+			b.WriteRune(r)
+			dash = false
+		default:
+			if !dash {
+				b.WriteByte('-')
+				dash = true
+			}
+		}
+	}
+	return b.String() + ".lemmy." + bridgeHostname()
+}
+
+// bridgeGetBlob fetches a stored blob from the bridge's
+// com.atproto.sync.getBlob (the AppView's media path for bridged images),
+// returning the bytes and the served Content-Type.
+func (h *harness) bridgeGetBlob(t *testing.T, did, cid string) (data []byte, contentType string) {
+	t.Helper()
+	q := url.Values{"did": {did}, "cid": {cid}}
+	resp, err := h.http.Get(tidepoolURL() + "/xrpc/com.atproto.sync.getBlob?" + q.Encode())
+	if err != nil {
+		t.Fatalf("getBlob(%s, %s): %v", did, cid, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("getBlob(%s, %s): read body: %v", did, cid, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("getBlob(%s, %s): status %d: %s", did, cid, resp.StatusCode, truncate(raw, 200))
+	}
+	return raw, resp.Header.Get("Content-Type")
 }
 
 // ── Relay (BigSky) clients ─────────────────────────────────────────────────
@@ -867,9 +1219,13 @@ func (l *jsListener) readError() error {
 	return l.readErr
 }
 
-// newListener subscribes from cursorMicros (0 = now). Collections filter
-// server-side via wantedCollections; none means all collections (used for
-// negative assertions like "votes never hit the firehose").
+// newListener subscribes from cursorMicros. A zero or negative cursor OMITS
+// the cursor param entirely, which Jetstream treats as live-tail (no replay)
+// — so a subscriber that wants to replay all retained history must pass
+// cursor 1 (the sweep does; its 1 is load-bearing, not a stylistic 0).
+// Collections filter server-side via wantedCollections; none means all
+// collections (used for negative assertions like "votes never hit the
+// firehose").
 //
 // Anti-flake convention (from the Coves harness): capture the cursor BEFORE
 // triggering the action under test, so a subscription opened after the
@@ -919,6 +1275,18 @@ func (h *harness) newListener(t *testing.T, cursorMicros int64, collections ...s
 
 // cursorNow returns a Jetstream cursor a couple of seconds in the past —
 // capture it immediately before the action under test.
+//
+// KNOWN SEMANTICS of the pinned Jetstream (measured live, task 10): a
+// cursor at or before its newest stored event replays precisely from that
+// point (inclusive, µs-exact); a cursor beyond server-now live-tails; but a
+// cursor BETWEEN the newest stored event and now — which "now minus 2s" IS
+// whenever the stream has been quiet for a couple of seconds, i.e. usually —
+// replays the ENTIRE retained store. Listeners built on cursorNow therefore
+// often receive full-history replays. That is safe for every await (they
+// match on per-scenario titles/DIDs/rkeys and buffer the rest) but it means
+// a negative assertion must NEVER be scoped by "this listener only sees new
+// traffic" — scope negatives by content plus a STREAM-derived boundary (an
+// observed event's TimeUs), as the unsubscribe scenario does.
 func cursorNow() int64 {
 	return time.Now().Add(-2 * time.Second).UnixMicro()
 }
@@ -1090,25 +1458,32 @@ func (l *jsListener) drain(d time.Duration) []*jsEvent {
 // lexicons with the same indigo validator (and flags) the materializer uses
 // — but on the CONSUMER side of the wire: what Jetstream decoded is what
 // the AppView would index.
+//
+// The record is decoded with atdata.UnmarshalJSON, NOT plain encoding/json:
+// indigo's validator demands the atproto data model — a blob must arrive as
+// a typed atdata.Blob, which a raw map[string]any can never satisfy (its
+// SchemaBlob.Validate fails with "expected a blob"). This mirrors the
+// materializer's write-side validation (internal/materialize/
+// materializer.go, lexiconData) and is what ANY JSON consumer of Jetstream
+// — the Coves AppView included — must do before validating records that
+// carry blobs. Discovered the hard way by the image-post scenario, the
+// first record with a blob ever to cross the suite's validation.
 func validateLexicon(t *testing.T, commit *jsCommit) {
 	t.Helper()
 	catalog, err := lexicons.Catalog()
 	if err != nil {
 		t.Fatalf("load lexicon catalog: %v", err)
 	}
-	var data any
-	if err := json.Unmarshal(commit.Record, &data); err != nil {
-		t.Fatalf("decode %s record: %v", commit.Collection, err)
-	}
-	rec, ok := data.(map[string]any)
-	if !ok {
-		t.Fatalf("%s record is not an object", commit.Collection)
+	rec, err := atdata.UnmarshalJSON(commit.Record)
+	if err != nil {
+		t.Fatalf("decode %s record as atproto data: %v (%s)",
+			commit.Collection, err, truncate(commit.Record, 300))
 	}
 	recType, _ := rec["$type"].(string)
 	if recType != commit.Collection {
 		t.Fatalf("record $type %q != collection %q", recType, commit.Collection)
 	}
-	if err := lexicon.ValidateRecord(catalog, data, recType, lexicon.ValidateFlags(0)); err != nil {
+	if err := lexicon.ValidateRecord(catalog, rec, recType, lexicon.ValidateFlags(0)); err != nil {
 		t.Errorf("%s record fails lexicon validation: %v\nrecord: %s",
 			recType, err, truncate(commit.Record, 600))
 	}

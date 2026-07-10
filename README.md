@@ -118,7 +118,9 @@ network, with `BRIDGE_SCHEME=http` (dev-only) making the bridge emit
 plain-HTTP AP ids to match. See the header comments in
 `docker-compose.e2e.yml` and `e2e/lemmy/Dockerfile` for the full story.
 
-The suite (`tests/e2e/bridge_test.go` + `relay_test.go`, build tag `e2e`)
+The suite (`tests/e2e/`, build tag `e2e`: `bridge_test.go`,
+`lifecycle_test.go`, `media_test.go`, `relay_test.go`,
+`votes_hammer_test.go`, `zz_sweep_test.go`)
 covers: subscribe → `community.profile` on the firehose; a link post →
 `actor.profile` and `community.post` (presence + author linkage; arrival
 order across the two repos is relay-dependent, see above), with the shared
@@ -136,7 +138,37 @@ its stored cursor; a concurrent-ingestion burst accounted per
 (did, collection/rkey); and relay-state assertions — the bridge registered
 and actively subscribed in the relay's PDS registry (the bridge-originated
 `requestCrawl`, asserted rather than eyeballed), and bridged repos listed
-and served by the relay's own `listRepos`/`getLatestCommit`. Every
+and served by the relay's own `listRepos`/`getLatestCommit`.
+
+The task-10 lifecycle scenarios extend that: an **image post** — a real
+pictrs upload, the blob fetched and stored by the bridge, `embed.images`
+plus the `nsfw` self-label crossing the wire and served back through
+`getBlob`; the full **`#nobridge` consent lifecycle** — a marked user's
+posts never materialize (no DID minted), removing the marker resumes
+bridging on the next post, re-adding it scrubs every record with delete
+commits while the repo stays active (reversible; discovery rides the
+`PROFILE_REFRESH_TTL` re-fetch because Lemmy 0.19 never federates
+`Update{Person}` on bio edits); **`Delete(Actor)`** — account deletion
+scrubs the author's post/comment/profile and terminally tombstones the repo
+(`getRepoStatus`/`listRepos` report `active:false`, the handle stops
+resolving, content endpoints refuse — asserted on the bridge's sync surface
+because the relay cannot observe tombstones until task 11's `#account`
+frame); **unsubscribe** — `DELETE /admin/communities` sends `Undo{Follow}`
+and new posts in that community produce no bridge output while a
+still-subscribed control keeps flowing; a **community profile update**
+federating as an `Announce{Update{Group}}` → `community.profile` update on
+rkey `self`; a **vote-concurrency hammer** — ten real voters in parallel
+bursts (votes, flips, clears) with exactly-correct final aggregates; and a
+**suite-end sweep** that replays the entire firehose from cursor 1 (a zero
+or negative cursor omits the param and live-tails — see the `newListener`
+doc in `tests/e2e/helpers.go`) on a fresh unfiltered listener, re-vetting
+every retained event (collection whitelist, lexicon validation, per-DID rev
+monotonicity), with a replay floor so a truncated replay cannot pass on the
+sentinel alone. Every negative
+assertion ("nothing bridged") is bounded by a positive control in the same
+window — never a bare sleep-and-assert-nothing.
+
+Every
 create/update the tests consume from Jetstream has passed the relay's
 signature verification AND is validated against the vendored Coves lexicons
 on the consumer side of the wire, and any collection outside the four the
@@ -200,9 +232,13 @@ curl -X DELETE localhost:8091/admin/communities \
 ```
 
 The bridge's AP face lives next to the inbox: the service actor document at
-`/actor`, WebFinger for it at `/.well-known/webfinger`, and a minimal
-nodeinfo 2.0 (`software.name: "tidepool"` — what Lemmy instance allowlists
-match against).
+`/actor`, an **instance actor at the origin apex** (`GET /`, type
+`Application` — Lemmy resolves every peer's "Site" actor there and delivers
+its send-to-all-instances activities, account deletions above all, ONLY to
+the inbox that document advertises; without it those activities are
+silently skipped), WebFinger for the service actor at
+`/.well-known/webfinger`, and a minimal nodeinfo 2.0 (`software.name:
+"tidepool"` — what Lemmy instance allowlists match against).
 
 ## Consent policy (#nobridge / #nobot)
 

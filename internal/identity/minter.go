@@ -67,12 +67,15 @@ type Identity struct {
 type Minter struct {
 	plcURL         string
 	bridgeHostname string
-	rotationKey    *atcrypto.PrivateKeyK256
-	custodian      *Custodian
-	actors         store.BridgedActors
-	httpClient     *http.Client
-	userAgent      string
-	logger         *slog.Logger
+	// bridgeScheme is the URL scheme of the advertised PDS endpoint
+	// ("https" everywhere real; "http" only under the local e2e harness).
+	bridgeScheme string
+	rotationKey  *atcrypto.PrivateKeyK256
+	custodian    *Custodian
+	actors       store.BridgedActors
+	httpClient   *http.Client
+	userAgent    string
+	logger       *slog.Logger
 }
 
 // MinterOptions configures NewMinter. All fields except HTTPClient are
@@ -84,6 +87,11 @@ type MinterOptions struct {
 	// BridgeHostname anchors the handle space and the PDS endpoint
 	// (config.BridgeHostname).
 	BridgeHostname string
+	// BridgeScheme is the URL scheme of the PDS endpoint advertised in
+	// minted DID documents (config.BridgeScheme). "https" everywhere real;
+	// "http" exists for the local e2e harness. Empty means "https" — the
+	// same defensive default as ap.ServiceActor.BaseURL.
+	BridgeScheme string
 	// RotationKey is the bridge escrow rotation key
 	// (LoadOrCreateRotationKey).
 	RotationKey *atcrypto.PrivateKeyK256
@@ -113,6 +121,15 @@ func NewMinter(opts MinterOptions) (*Minter, error) {
 	if opts.BridgeHostname == "" {
 		return nil, errors.NewValidationError("bridge_hostname", "must not be empty")
 	}
+	scheme := opts.BridgeScheme
+	switch scheme {
+	case "":
+		scheme = "https"
+	case "http", "https":
+	default:
+		return nil, errors.NewValidationError("bridge_scheme",
+			fmt.Sprintf("must be http or https, got %q", opts.BridgeScheme))
+	}
 	if opts.RotationKey == nil {
 		return nil, errors.NewValidationError("rotation_key", "must not be nil")
 	}
@@ -137,6 +154,7 @@ func NewMinter(opts MinterOptions) (*Minter, error) {
 	return &Minter{
 		plcURL:         strings.TrimRight(opts.PLCDirectoryURL, "/"),
 		bridgeHostname: strings.ToLower(opts.BridgeHostname),
+		bridgeScheme:   scheme,
 		rotationKey:    opts.RotationKey,
 		custodian:      opts.Custodian,
 		actors:         opts.Actors,
@@ -185,7 +203,7 @@ func (m *Minter) MintActor(ctx context.Context, req MintRequest) (*Identity, err
 	}
 
 	op, err := m.signGenesisOp(genesisOperation(
-		rotationPub.DIDKey(), signingPub.DIDKey(), handle, "https://"+m.bridgeHostname))
+		rotationPub.DIDKey(), signingPub.DIDKey(), handle, m.pdsEndpoint()))
 	if err != nil {
 		return nil, err
 	}
@@ -219,6 +237,12 @@ func (m *Minter) MintActor(ctx context.Context, req MintRequest) (*Identity, err
 		DIDKey:              signingPub.DIDKey(),
 		SigningKeyEncrypted: sealed,
 	}, nil
+}
+
+// pdsEndpoint is the PDS service endpoint advertised in every minted DID
+// document: the bridge itself, under the configured scheme.
+func (m *Minter) pdsEndpoint() string {
+	return m.bridgeScheme + "://" + m.bridgeHostname
 }
 
 // availableHandle builds the bridged handle and suffixes it (-2, -3, ...)

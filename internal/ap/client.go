@@ -496,7 +496,11 @@ func (c *Client) fetchMediaOnce(ctx context.Context, iri string, maxBytes int64)
 			if err != nil {
 				return nil, "", false, fmt.Errorf("ap: GET %s: bad redirect location %q: %w", target, location, err)
 			}
-			target = req.URL.ResolveReference(next).String()
+			resolved := req.URL.ResolveReference(next)
+			if err := c.checkRedirectScheme(req.URL, resolved); err != nil {
+				return nil, "", false, fmt.Errorf("ap: GET %s: %w", target, err)
+			}
+			target = resolved.String()
 			continue
 		}
 
@@ -822,7 +826,11 @@ func (c *Client) getOnce(ctx context.Context, iri string, mode fetchMode) (body 
 			if err != nil {
 				return nil, false, fmt.Errorf("ap: GET %s: bad redirect location %q: %w", target, location, err)
 			}
-			target = req.URL.ResolveReference(next).String()
+			resolved := req.URL.ResolveReference(next)
+			if err := c.checkRedirectScheme(req.URL, resolved); err != nil {
+				return nil, false, fmt.Errorf("ap: GET %s: %w", target, err)
+			}
+			target = resolved.String()
 			continue
 		}
 
@@ -887,6 +895,24 @@ func (c *Client) backoff(ctx context.Context, attempt int) error {
 	// Full jitter: uniform in [delay/2, delay].
 	delay = delay/2 + time.Duration(rand.Int64N(int64(delay/2)+1))
 	return c.sleep(ctx, delay)
+}
+
+// checkRedirectScheme rejects a redirect hop that downgrades https to http.
+// In production every fetch starts (and must stay) https; following an
+// http Location from an https response would move the exchange to plaintext
+// (MITM/downgrade vector). The only exception is the dev/e2e relaxation
+// (ALLOW_PRIVATE_FETCH → guard.allowPrivate), where plain-HTTP peers on the
+// compose network are expected. Same-scheme hops and http→https upgrades
+// are always allowed.
+func (c *Client) checkRedirectScheme(from, to *url.URL) error {
+	if c.guard.allowPrivate {
+		return nil
+	}
+	if from.Scheme == "https" && to.Scheme == "http" {
+		return errors.NewValidationError("redirect",
+			fmt.Sprintf("redirect to %q downgrades https to http", to.String()))
+	}
+	return nil
 }
 
 // waitForHost validates the URL against the egress guard (scheme, userinfo,

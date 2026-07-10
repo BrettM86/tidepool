@@ -207,7 +207,7 @@ func TestServiceActorEndpoints(t *testing.T) {
 	actor, err := ap.ParseObject(rec.Body.Bytes())
 	require.NoError(t, err)
 	assert.Equal(t, h.service.ID, actor.ID)
-	assert.Equal(t, ap.TypeApplication, actor.Type)
+	assert.Equal(t, ap.TypeService, actor.Type)
 	require.NotNil(t, actor.PublicKey)
 	assert.Equal(t, h.service.KeyID(), actor.PublicKey.ID)
 	assert.NotEmpty(t, actor.PublicKey.PublicKeyPem)
@@ -231,6 +231,8 @@ func TestServiceActorEndpoints(t *testing.T) {
 	}
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &discovery))
 	require.NotEmpty(t, discovery.Links)
+	assert.Equal(t, "https://"+bridgeHost+"/nodeinfo/2.0", discovery.Links[0].Href,
+		"discovery href must be the BaseURL()-derived nodeinfo route")
 
 	rec = get("/nodeinfo/2.0")
 	require.Equal(t, http.StatusOK, rec.Code)

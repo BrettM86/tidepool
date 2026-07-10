@@ -31,6 +31,12 @@ type Config struct {
 	// BridgeHostname is the public domain the bridge is served from,
 	// e.g. "tidepool.example". Used for WebFinger, actor IDs, and handles.
 	BridgeHostname string
+	// BridgeScheme is the URL scheme the bridge's own AP URLs (service
+	// actor id, inbox, activity ids, nodeinfo) are built with. BRIDGE_SCHEME,
+	// default "https". "http" is only accepted in development — it exists for
+	// the local e2e harness, where a debug-mode Lemmy federates with the
+	// bridge over plain HTTP inside one compose network.
+	BridgeScheme string
 	// PLCDirectoryURL is the did:plc directory used to mint and resolve DIDs.
 	// The dev default is a LOCAL directory (docker compose `plc` profile);
 	// production points at https://plc.directory. Nothing ever falls back to
@@ -136,6 +142,23 @@ func Load(logger *slog.Logger) (*Config, error) {
 	cfg.PLCDirectoryURL, err = stringVar(logger, isDevelopment, "PLC_DIRECTORY_URL", "http://localhost:3002")
 	if err != nil {
 		return nil, err
+	}
+
+	// The bridge's own URL scheme. https everywhere real; http exists so the
+	// e2e harness can federate with a debug-mode Lemmy over plain HTTP, and is
+	// refused outside development (like ALLOW_PRIVATE_FETCH).
+	cfg.BridgeScheme = os.Getenv("BRIDGE_SCHEME")
+	switch cfg.BridgeScheme {
+	case "":
+		cfg.BridgeScheme = "https"
+	case "https":
+	case "http":
+		if !isDevelopment {
+			return nil, fmt.Errorf("config: BRIDGE_SCHEME=http must not be set in production")
+		}
+		logger.Warn("BRIDGE_SCHEME=http: bridge AP URLs are plain HTTP (local federation only)")
+	default:
+		return nil, fmt.Errorf("config: BRIDGE_SCHEME must be http or https, got %q", cfg.BridgeScheme)
 	}
 
 	// The dev-default KEK is fixed and public (sha256 of a known string):

@@ -5,7 +5,7 @@ go 1.25.7
 require (
 	github.com/bluesky-social/indigo v0.0.0-20260202181658-ea3d39eec464
 	github.com/go-chi/chi/v5 v5.3.1
-	github.com/gorilla/websocket v1.5.1
+	github.com/gorilla/websocket v1.5.3
 	github.com/ipfs/go-block-format v0.2.0
 	github.com/ipfs/go-cid v0.4.1
 	github.com/ipfs/go-ipld-format v0.6.0

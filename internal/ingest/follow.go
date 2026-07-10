@@ -380,7 +380,7 @@ func (a *Admin) activityID(kind string) (string, error) {
 	if _, err := rand.Read(buf[:]); err != nil {
 		return "", fmt.Errorf("ingest: mint activity id: %w", err)
 	}
-	return fmt.Sprintf("https://%s/activities/%s/%s", a.service.Hostname, kind, hex.EncodeToString(buf[:])), nil
+	return fmt.Sprintf("%s/activities/%s/%s", a.service.BaseURL(), kind, hex.EncodeToString(buf[:])), nil
 }
 
 // writeJSON writes a JSON response body.

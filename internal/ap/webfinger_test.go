@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -159,6 +160,132 @@ func TestResolveHandle_UnknownAccount(t *testing.T) {
 	_, err := client.ResolveHandle(context.Background(), "ghost@"+host)
 	require.Error(t, err)
 	assert.True(t, errors.IsNotFound(err))
+}
+
+// TestResolveHandle_HTTPFallbackOnTransportFailure: with the guard relaxed
+// (dev/e2e), an https leg that fails at the transport level falls back to
+// http. The server is a PLAIN-http httptest server, so the https attempt
+// dies in the TLS handshake — the handler is only ever reached by the http
+// leg, mirroring the real debug-mode-Lemmy (no TLS listener) case.
+func TestResolveHandle_HTTPFallbackOnTransportFailure(t *testing.T) {
+	var hits atomic.Int32
+	var host string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		require.Equal(t, "/.well-known/webfinger", r.URL.Path)
+		_, _ = fmt.Fprintf(w, `{"subject":"acct:alice@%s","links":[
+			{"rel":"self","type":"application/activity+json","href":"http://%s/u/alice"}
+		]}`, host, host)
+	}))
+	t.Cleanup(server.Close)
+	host = strings.TrimPrefix(server.URL, "http://")
+
+	client := NewClient(ClientOptions{
+		UserAgent:             "tidepool-test/0",
+		MaxAttempts:           1,
+		AllowPrivateAddresses: true,
+	})
+
+	actorURL, err := client.ResolveHandle(context.Background(), "alice@"+host)
+	require.NoError(t, err, "the http fallback must rescue a transport-level https failure")
+	assert.Equal(t, "http://"+host+"/u/alice", actorURL)
+	assert.Equal(t, int32(1), hits.Load(),
+		"exactly one request must reach the handler: the http leg (https dies in the TLS handshake)")
+}
+
+// TestResolveHandle_NoHTTPFallbackOnSemanticError: even with the guard
+// relaxed, an https server that ANSWERED (404 missing account, 403
+// Cloudflare/defederation) must not trigger the http fallback — those
+// semantics are deliberately preserved.
+func TestResolveHandle_NoHTTPFallbackOnSemanticError(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		check  func(t *testing.T, err error)
+	}{
+		{"404 stays not-found", http.StatusNotFound, func(t *testing.T, err error) {
+			assert.True(t, errors.IsNotFound(err), "https 404 must surface as IsNotFound, got %v", err)
+		}},
+		{"403 stays HTTPError", http.StatusForbidden, func(t *testing.T, err error) {
+			assert.False(t, errors.IsNotFound(err))
+			var httpErr HTTPError
+			require.ErrorAs(t, err, &httpErr, "the 403 must stay distinguishable")
+			assert.Equal(t, http.StatusForbidden, httpErr.StatusCode)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			transport := &scriptedTransport{handler: func(req *http.Request) (*http.Response, error) {
+				require.Equal(t, "https", req.URL.Scheme,
+					"a semantic https answer must not trigger an http request")
+				return scriptedResponse(tc.status, ""), nil
+			}}
+			client := NewClient(ClientOptions{
+				UserAgent:             "tidepool-test/0",
+				HTTPClient:            &http.Client{Transport: transport},
+				MaxAttempts:           1,
+				AllowPrivateAddresses: true, // fallback armed; it still must not fire
+			})
+
+			_, err := client.ResolveHandle(context.Background(), "alice@lemmy.test")
+			require.Error(t, err)
+			tc.check(t, err)
+			seen := transport.seen()
+			require.Len(t, seen, 1, "no second (http) request may be issued")
+			assert.True(t, strings.HasPrefix(seen[0], "https://"), "request was %s", seen[0])
+		})
+	}
+}
+
+// TestResolveHandle_NoHTTPFallbackWhenGuardOn: production posture
+// (AllowPrivateAddresses=false) never falls back to http, even for a
+// transport-level https failure. Scripted transport: nothing is dialed.
+func TestResolveHandle_NoHTTPFallbackWhenGuardOn(t *testing.T) {
+	transport := &scriptedTransport{handler: func(req *http.Request) (*http.Response, error) {
+		require.Equal(t, "https", req.URL.Scheme,
+			"a guard-on client must never issue a plaintext webfinger request")
+		return nil, fmt.Errorf("simulated TLS handshake failure")
+	}}
+	client := NewClient(ClientOptions{
+		UserAgent:   "tidepool-test/0",
+		HTTPClient:  &http.Client{Transport: transport},
+		MaxAttempts: 1,
+		// AllowPrivateAddresses deliberately false: guard on.
+	})
+
+	_, err := client.ResolveHandle(context.Background(), "alice@lemmy.test")
+	require.Error(t, err)
+	seen := transport.seen()
+	require.Len(t, seen, 1, "the https failure must be terminal: no http fallback attempt")
+	assert.True(t, strings.HasPrefix(seen[0], "https://"), "request was %s", seen[0])
+}
+
+// TestResolveHandle_FallbackFailureSurfacesBothLegs: when the http fallback
+// itself fails with a non-404, neither leg's error may be discarded — the
+// https transport failure is reported alongside the fallback's HTTPError
+// (which stays errors.As-able).
+func TestResolveHandle_FallbackFailureSurfacesBothLegs(t *testing.T) {
+	transport := &scriptedTransport{handler: func(req *http.Request) (*http.Response, error) {
+		if req.URL.Scheme == "https" {
+			return nil, fmt.Errorf("simulated TLS handshake failure")
+		}
+		return scriptedResponse(http.StatusInternalServerError, ""), nil
+	}}
+	client := NewClient(ClientOptions{
+		UserAgent:             "tidepool-test/0",
+		HTTPClient:            &http.Client{Transport: transport},
+		MaxAttempts:           1,
+		AllowPrivateAddresses: true,
+	})
+
+	_, err := client.ResolveHandle(context.Background(), "alice@lemmy.test")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "http fallback")
+	assert.Contains(t, err.Error(), "simulated TLS handshake failure",
+		"the https leg's transport error must stay visible")
+	var httpErr HTTPError
+	require.ErrorAs(t, err, &httpErr, "the fallback's HTTPError must be wrapped, not discarded")
+	assert.Equal(t, http.StatusInternalServerError, httpErr.StatusCode)
 }
 
 func TestResolveHandle_PrefersActivityJSONLink(t *testing.T) {

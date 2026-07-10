@@ -1,0 +1,97 @@
+# Tidepool CI.
+#
+# unit: always — build, vet, lexicon-manifest check, full unit/integration
+#   suite against a real postgres service (Coves convention: tests hit real
+#   infrastructure; PLC-dependent identity tests self-skip when no local PLC
+#   directory is reachable, and NOTHING ever touches the public
+#   plc.directory).
+#
+# e2e: on demand — the full docker-compose stack (Lemmy built from source in
+#   debug mode, did:plc directory, Jetstream). Heavy (the Lemmy debug build
+#   is a full Rust compile), so it runs only via workflow_dispatch or the
+#   `run-e2e` PR label.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: tidepool_test
+          POSTGRES_USER: tidepool_test
+          POSTGRES_PASSWORD: tidepool_test
+        ports:
+          - 5443:5432
+        options: >-
+          --health-cmd "pg_isready -U tidepool_test -d tidepool_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./... && go vet -tags e2e ./tests/e2e/...
+      - name: Lexicon manifest check
+        # No Coves checkout in CI: the script verifies the committed
+        # manifest and skips the upstream drift comparison gracefully.
+        run: ./scripts/check-lexicons.sh
+      - name: Unit & integration tests
+        env:
+          TIDEPOOL_TEST_DATABASE_URL: postgres://tidepool_test:tidepool_test@localhost:5443/tidepool_test?sslmode=disable
+        run: go test ./...
+
+  e2e:
+    # Heavy and on-demand: manual dispatch, or label a PR `run-e2e`.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       contains(github.event.pull_request.labels.*.name, 'run-e2e'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # COLD-BUILD RISK: every run compiles Lemmy from source (a full debug
+      # Rust build) because BuildKit cache mounts do not persist on GitHub
+      # runners — plausibly 30-60+ min on a 2-core runner, plus serious disk
+      # pressure from the cargo target dir. If this starts timing out,
+      # mitigations (in preference order): publish a prebuilt lemmy-debug
+      # image to GHCR and pull it here, or wire docker/build-push-action's
+      # buildx `gha` cache backend. Tracked in FOLLOWUPS.md ("CI").
+      - name: Reclaim runner disk (drop preinstalled images)
+        run: docker system prune -af || true
+      # Split up/test/down (rather than `make e2e`) so a failure leaves the
+      # stack alive long enough to dump its logs. `make e2e-up` passes
+      # --wait-timeout 600 so a crash-looping service fails the step (with
+      # logs below) instead of wedging until the job-level timeout cancels
+      # the run — a cancellation would skip failure()-gated steps.
+      - name: Start stack (builds Lemmy from source — slow first time)
+        run: make e2e-up
+      - name: Run e2e suite
+        run: make e2e-test
+      - name: Dump stack logs
+        # always(): a wedged `up` that exhausts timeout-minutes gets the job
+        # CANCELLED, and cancellation skips failure()-gated steps. Cheap and
+        # ||-guarded, so unconditional is safe.
+        if: always()
+        run: docker compose -f docker-compose.e2e.yml logs --tail 200 || true
+      - name: Tear down
+        if: always()
+        run: make e2e-down

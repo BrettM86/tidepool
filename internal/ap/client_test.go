@@ -213,6 +213,112 @@ func TestFetchObject_FollowsRedirectsWithFreshSignatures(t *testing.T) {
 	assert.Equal(t, "https://x.example/new", obj.ID)
 }
 
+// scriptedTransport is a RoundTripper answering from a script instead of the
+// network: no dial ever happens, so egress-guard-ON behavior can be tested
+// against fake public hostnames (guard-on clients cannot hit 127.0.0.1
+// httptest servers). Every request URL is recorded.
+type scriptedTransport struct {
+	handler func(req *http.Request) (*http.Response, error)
+
+	mu       sync.Mutex
+	requests []string
+}
+
+func (s *scriptedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	s.mu.Lock()
+	s.requests = append(s.requests, req.URL.String())
+	s.mu.Unlock()
+	return s.handler(req)
+}
+
+// seen returns the URLs of all requests issued so far.
+func (s *scriptedTransport) seen() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.requests...)
+}
+
+// scriptedResponse builds a minimal *http.Response for scriptedTransport.
+func scriptedResponse(status int, body string) *http.Response {
+	return &http.Response{
+		StatusCode: status,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+}
+
+// TestRedirect_DowngradeRejectedWhenGuardOn: with the egress guard ON
+// (production posture) an https fetch that 302s to an http:// URL must fail
+// with the downgrade validation error BEFORE any plaintext request is
+// issued — for both the object path (getOnce) and the media path
+// (fetchMediaOnce).
+func TestRedirect_DowngradeRejectedWhenGuardOn(t *testing.T) {
+	newGuardedClient := func(transport *scriptedTransport) *Client {
+		c := NewClient(ClientOptions{
+			UserAgent:   "tidepool-test/0",
+			HTTPClient:  &http.Client{Transport: transport},
+			MaxAttempts: 1,
+			// AllowPrivateAddresses deliberately false: guard on.
+		})
+		c.sleep = func(ctx context.Context, _ time.Duration) error { return ctx.Err() }
+		return c
+	}
+	newDowngradeTransport := func() *scriptedTransport {
+		return &scriptedTransport{handler: func(req *http.Request) (*http.Response, error) {
+			if req.URL.Scheme != "https" {
+				t.Errorf("plaintext request issued to %s", req.URL)
+				return nil, fmt.Errorf("unexpected plaintext request")
+			}
+			resp := scriptedResponse(http.StatusFound, "")
+			resp.Header.Set("Location", "http://remote.test/object")
+			return resp, nil
+		}}
+	}
+
+	t.Run("object", func(t *testing.T) {
+		transport := newDowngradeTransport()
+		_, _, err := newGuardedClient(transport).getOnce(
+			context.Background(), "https://remote.test/object", fetchModeObject)
+		require.Error(t, err)
+		assert.True(t, errors.IsValidation(err), "downgrade must be a typed validation error, got %v", err)
+		assert.Contains(t, err.Error(), "downgrades https to http")
+		require.Len(t, transport.seen(), 1, "the http hop must never be requested")
+		assert.True(t, strings.HasPrefix(transport.seen()[0], "https://"))
+	})
+
+	t.Run("media", func(t *testing.T) {
+		transport := newDowngradeTransport()
+		_, _, _, err := newGuardedClient(transport).fetchMediaOnce(
+			context.Background(), "https://remote.test/img.png", 1<<20)
+		require.Error(t, err)
+		assert.True(t, errors.IsValidation(err), "downgrade must be a typed validation error, got %v", err)
+		assert.Contains(t, err.Error(), "downgrades https to http")
+		require.Len(t, transport.seen(), 1, "the http hop must never be requested")
+		assert.True(t, strings.HasPrefix(transport.seen()[0], "https://"))
+	})
+}
+
+// TestRedirect_DowngradeFollowedWhenGuardRelaxed: under the dev/e2e
+// relaxation (AllowPrivateAddresses, ALLOW_PRIVATE_FETCH) plain-HTTP peers
+// are expected, so an https→http redirect IS followed.
+func TestRedirect_DowngradeFollowedWhenGuardRelaxed(t *testing.T) {
+	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"type":"Note","id":"https://x.example/downgraded"}`))
+	}))
+	defer httpServer.Close()
+
+	tlsServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, httpServer.URL+"/object", http.StatusFound)
+	}))
+	defer tlsServer.Close()
+
+	client := newTestClient(t, ClientOptions{HTTPClient: tlsServer.Client()})
+	obj, err := client.FetchObject(context.Background(), tlsServer.URL+"/old")
+	require.NoError(t, err)
+	assert.Equal(t, "https://x.example/downgraded", obj.ID,
+		"with the guard relaxed the http redirect target must be fetched")
+}
+
 func TestFetchActor_RejectsNonActors(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write(loadFixture(t, "page_lemmy_world.json"))

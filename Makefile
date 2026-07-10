@@ -1,4 +1,4 @@
-.PHONY: help build run test test-db-up test-db-down db-migrate db-migrate-down dev-up dev-down plc-up plc-down jetstream-up jetstream-down lint fmt fmt-check clean
+.PHONY: help build run test test-db-up test-db-down db-migrate db-migrate-down dev-up dev-down plc-up plc-down jetstream-up jetstream-down lint fmt fmt-check clean e2e e2e-up e2e-test e2e-logs e2e-down check-lexicons
 
 .DEFAULT_GOAL := help
 
@@ -9,6 +9,7 @@ YELLOW := \033[33m
 RED := \033[31m
 
 COMPOSE := docker compose -f docker-compose.dev.yml
+E2E_COMPOSE := docker compose -f docker-compose.e2e.yml
 
 DEV_DATABASE_URL ?= postgres://tidepool:tidepool@localhost:5442/tidepool_dev?sslmode=disable
 TEST_DATABASE_URL ?= postgres://tidepool_test:tidepool_test@localhost:5443/tidepool_test?sslmode=disable
@@ -92,7 +93,46 @@ test: test-db-up ## Run the test suite against real postgres (migrations run in-
 	@TIDEPOOL_TEST_DATABASE_URL="$(TEST_DATABASE_URL)" go test ./...
 	@echo "$(GREEN)✓ Tests complete$(RESET)"
 
+##@ End-to-end (real Lemmy + PLC + Jetstream)
+
+e2e: ## Full e2e run: build + start the stack, run the suite, tear down (-v)
+	@echo "$(GREEN)Starting e2e stack (first run builds Lemmy from source — grab a coffee)...$(RESET)"
+	@up_status=0; $(E2E_COMPOSE) up -d --build --wait --wait-timeout 600 || up_status=$$?; \
+	if [ $$up_status -ne 0 ]; then \
+		echo "$(RED)✗ e2e stack failed to come up (exit $$up_status); recent logs:$(RESET)" >&2; \
+		$(E2E_COMPOSE) logs --tail=100 || true; \
+		echo "$(YELLOW)Tearing down half-started e2e stack...$(RESET)"; \
+		$(E2E_COMPOSE) down -v --remove-orphans || true; \
+		exit $$up_status; \
+	fi; \
+	echo "$(GREEN)Stack healthy; running e2e suite...$(RESET)"; \
+	status=0; go test -tags e2e -count=1 -timeout 20m ./tests/e2e/... || status=$$?; \
+	echo "$(YELLOW)Tearing down e2e stack...$(RESET)"; \
+	down_status=0; $(E2E_COMPOSE) down -v --remove-orphans || down_status=$$?; \
+	if [ $$down_status -ne 0 ]; then \
+		echo "$(RED)✗ WARNING: e2e teardown failed (exit $$down_status) — the stack may still be running; try 'make e2e-down'$(RESET)" >&2; \
+	fi; \
+	if [ $$status -ne 0 ]; then exit $$status; fi; \
+	exit $$down_status
+
+e2e-up: ## Start the e2e stack and leave it running (for iterating on tests)
+	@$(E2E_COMPOSE) up -d --build --wait --wait-timeout 600
+	@echo "$(GREEN)✓ e2e stack up: tidepool 127.0.0.1:8092, lemmy 127.0.0.1:8541, jetstream 127.0.0.1:6028$(RESET)"
+
+e2e-test: ## Run the e2e suite against an already-running stack (make e2e-up)
+	@go test -tags e2e -count=1 -v -timeout 20m ./tests/e2e/...
+
+e2e-logs: ## Tail all e2e stack logs
+	@$(E2E_COMPOSE) logs -f
+
+e2e-down: ## Tear down the e2e stack and its volumes
+	@$(E2E_COMPOSE) down -v --remove-orphans
+	@echo "$(GREEN)✓ e2e stack removed$(RESET)"
+
 ##@ Code Quality
+
+check-lexicons: ## Verify vendored lexicons match the manifest (and ~/Code/coves when present)
+	@./scripts/check-lexicons.sh
 
 fmt: ## Format all Go code
 	@echo "$(GREEN)Formatting Go code...$(RESET)"

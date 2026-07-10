@@ -530,6 +530,8 @@ func (h *harness) subscribeTechnology() *remoteActor {
 	require.Equal(h.t, ap.TypeFollow, follow.Type)
 	require.Equal(h.t, h.service.ID, follow.Actor.ID)
 	require.Equal(h.t, groupID, follow.Object.ID)
+	require.True(h.t, strings.HasPrefix(follow.ID, "https://"+bridgeHost+"/activities/follow/"),
+		"follow activity id %q must live under the bridge's BaseURL", follow.ID)
 
 	// Lemmy answers with Accept{Follow}, signed by the community.
 	status := h.deliver(group, map[string]any{

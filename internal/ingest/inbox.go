@@ -182,7 +182,7 @@ func orderingKeyFor(activity *ap.Object, boundActor string) string {
 	return boundActor
 }
 
-// handleActor serves the bridge's Application actor document (Lemmy fetches
+// handleActor serves the bridge's Service actor document (Lemmy fetches
 // it to validate our Follow signatures).
 func (ib *Inbox) handleActor(w http.ResponseWriter, _ *http.Request) {
 	doc, err := ib.service.DocumentJSON()
@@ -224,7 +224,7 @@ func (ib *Inbox) handleNodeInfoDiscovery(w http.ResponseWriter, _ *http.Request)
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"links": []any{map[string]any{
 			"rel":  "http://nodeinfo.diaspora.software/ns/schema/2.0",
-			"href": "https://" + ib.service.Hostname + "/nodeinfo/2.0",
+			"href": ib.service.BaseURL() + "/nodeinfo/2.0",
 		}},
 	})
 }

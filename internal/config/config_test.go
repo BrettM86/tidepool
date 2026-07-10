@@ -19,7 +19,7 @@ func clearConfigEnv(t *testing.T) {
 		"ENVIRONMENT", "DATABASE_URL", "LISTEN_ADDR", "BRIDGE_HOSTNAME",
 		"PLC_DIRECTORY_URL", "BRIDGE_SERVICE_DID", "USER_AGENT", "BRIDGE_KEK",
 		"ADMIN_TOKEN", "BACKFILL_MAX_POSTS", "MINT_RATE_PER_MINUTE",
-		"MINT_BURST", "INGEST_WORKERS",
+		"MINT_BURST", "INGEST_WORKERS", "BRIDGE_SCHEME",
 	} {
 		t.Setenv(name, "")
 	}
@@ -137,4 +137,39 @@ func TestLoad_RejectsUnknownEnvironment(t *testing.T) {
 
 	_, err := Load(discardLogger())
 	require.Error(t, err)
+}
+
+func TestLoad_BridgeScheme(t *testing.T) {
+	clearConfigEnv(t)
+
+	cfg, err := Load(discardLogger())
+	require.NoError(t, err)
+	assert.Equal(t, "https", cfg.BridgeScheme, "default scheme is https")
+
+	t.Setenv("BRIDGE_SCHEME", "http")
+	cfg, err = Load(discardLogger())
+	require.NoError(t, err)
+	assert.Equal(t, "http", cfg.BridgeScheme, "http is allowed in development")
+
+	t.Setenv("BRIDGE_SCHEME", "gopher")
+	_, err = Load(discardLogger())
+	require.Error(t, err, "unknown schemes are rejected")
+}
+
+func TestLoad_BridgeSchemeHTTPRefusedInProduction(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("ENVIRONMENT", EnvironmentProduction)
+	t.Setenv("DATABASE_URL", "postgres://prod/db")
+	t.Setenv("LISTEN_ADDR", ":8080")
+	t.Setenv("BRIDGE_HOSTNAME", "tidepool.example")
+	t.Setenv("PLC_DIRECTORY_URL", "https://plc.directory")
+	t.Setenv("BRIDGE_KEK", "sfDrM4bIeCJp01ZBTArLPJXNQlD7pcYFsod2An6UAF0=")
+	t.Setenv("ADMIN_TOKEN", "prod-admin-token")
+	t.Setenv("BRIDGE_SCHEME", "http")
+
+	_, err := Load(discardLogger())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "BRIDGE_SCHEME")
+	assert.Contains(t, err.Error(), "production",
+		"the refusal must come from the production branch, not generic scheme validation")
 }

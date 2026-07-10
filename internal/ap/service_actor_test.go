@@ -54,7 +54,7 @@ func TestLoadOrCreateServiceActor_GeneratesThenLoads(t *testing.T) {
 	keys := newFakeServiceKeys()
 	ctx := context.Background()
 
-	first, err := LoadOrCreateServiceActor(ctx, keys, "bridge.example")
+	first, err := LoadOrCreateServiceActor(ctx, keys, "bridge.example", "")
 	require.NoError(t, err)
 	assert.Equal(t, "https://bridge.example/actor", first.ID)
 	assert.Equal(t, "https://bridge.example/actor#main-key", first.KeyID())
@@ -69,7 +69,7 @@ func TestLoadOrCreateServiceActor_GeneratesThenLoads(t *testing.T) {
 	assert.True(t, first.Key.Equal(storedKey))
 
 	// A second bootstrap loads the same key instead of generating a new one.
-	second, err := LoadOrCreateServiceActor(ctx, keys, "bridge.example")
+	second, err := LoadOrCreateServiceActor(ctx, keys, "bridge.example", "")
 	require.NoError(t, err)
 	assert.True(t, first.Key.Equal(second.Key), "restarts must reuse the persisted key")
 }
@@ -92,14 +92,14 @@ func TestLoadOrCreateServiceActor_LosesBootstrapRace(t *testing.T) {
 		keys.mu.Unlock()
 	}
 
-	actor, err := LoadOrCreateServiceActor(ctx, keys, "bridge.example")
+	actor, err := LoadOrCreateServiceActor(ctx, keys, "bridge.example", "")
 	require.NoError(t, err)
 	assert.True(t, winnerKey.Equal(actor.Key),
 		"losing the create race must converge on the winner's key")
 }
 
 func TestLoadOrCreateServiceActor_RequiresHostname(t *testing.T) {
-	_, err := LoadOrCreateServiceActor(context.Background(), newFakeServiceKeys(), "")
+	_, err := LoadOrCreateServiceActor(context.Background(), newFakeServiceKeys(), "", "")
 	require.Error(t, err)
 	assert.True(t, errors.IsValidation(err))
 }
@@ -109,14 +109,14 @@ func TestLoadOrCreateServiceActor_CorruptKey(t *testing.T) {
 	_, err := keys.Create(context.Background(), ServiceKeyName, []byte("not a pem"))
 	require.NoError(t, err)
 
-	_, err = LoadOrCreateServiceActor(context.Background(), keys, "bridge.example")
+	_, err = LoadOrCreateServiceActor(context.Background(), keys, "bridge.example", "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "corrupt")
 }
 
 func TestServiceActorDocument(t *testing.T) {
 	keys := newFakeServiceKeys()
-	actor, err := LoadOrCreateServiceActor(context.Background(), keys, "bridge.example")
+	actor, err := LoadOrCreateServiceActor(context.Background(), keys, "bridge.example", "")
 	require.NoError(t, err)
 
 	docJSON, err := actor.DocumentJSON()
@@ -127,7 +127,7 @@ func TestServiceActorDocument(t *testing.T) {
 	doc, err := ParseObject(docJSON)
 	require.NoError(t, err)
 	assert.True(t, doc.IsActor())
-	assert.Equal(t, TypeApplication, doc.Type)
+	assert.Equal(t, TypeService, doc.Type)
 	assert.Equal(t, "https://bridge.example/actor", doc.ID)
 	assert.Equal(t, "https://bridge.example/inbox", doc.Inbox)
 	assert.NotEmpty(t, doc.PreferredUsername, "webfinger reverse resolution needs preferredUsername")
@@ -147,7 +147,7 @@ func TestServiceActorDocument(t *testing.T) {
 
 func TestServiceActorSigner_RoundTrip(t *testing.T) {
 	keys := newFakeServiceKeys()
-	actor, err := LoadOrCreateServiceActor(context.Background(), keys, "bridge.example")
+	actor, err := LoadOrCreateServiceActor(context.Background(), keys, "bridge.example", "")
 	require.NoError(t, err)
 
 	// Resolve the verification key exactly the way a remote instance would:
@@ -163,4 +163,30 @@ func TestServiceActorSigner_RoundTrip(t *testing.T) {
 	signerActorID, err := verifier.Verify(context.Background(), req, nil)
 	require.NoError(t, err)
 	assert.Equal(t, actor.ID, signerActorID)
+}
+
+func TestLoadOrCreateServiceActor_HTTPScheme(t *testing.T) {
+	actor, err := LoadOrCreateServiceActor(context.Background(), newFakeServiceKeys(), "tidepool", "http")
+	require.NoError(t, err)
+	assert.Equal(t, "http://tidepool/actor", actor.ID)
+	assert.Equal(t, "http://tidepool/inbox", actor.InboxURL())
+	assert.Equal(t, "http://tidepool/outbox", actor.OutboxURL())
+	assert.Equal(t, "http://tidepool", actor.BaseURL())
+
+	doc, err := actor.Document()
+	require.NoError(t, err)
+	assert.Equal(t, "http://tidepool/actor", doc.ID)
+	assert.Equal(t, "http://tidepool/inbox", doc.Inbox)
+}
+
+func TestLoadOrCreateServiceActor_RejectsBadScheme(t *testing.T) {
+	_, err := LoadOrCreateServiceActor(context.Background(), newFakeServiceKeys(), "bridge.example", "gopher")
+	require.Error(t, err)
+	assert.True(t, errors.IsValidation(err))
+}
+
+func TestServiceActor_BaseURLDefaultsToHTTPS(t *testing.T) {
+	actor := &ServiceActor{Hostname: "bridge.example"}
+	assert.Equal(t, "https://bridge.example", actor.BaseURL(),
+		"hand-built literals without a scheme must render https, never a schemeless URL")
 }

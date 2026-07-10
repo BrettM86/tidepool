@@ -22,26 +22,51 @@ const ServiceActorPath = "/actor"
 // core AS2 plus the security vocabulary that defines publicKey.
 const serviceActorContext = `["https://www.w3.org/ns/activitystreams","https://w3id.org/security/v1"]`
 
-// ServiceActor is the bridge's own AP identity: an Application actor whose
+// ServiceActor is the bridge's own AP identity: a Service actor whose
 // RSA key signs every outbound request (fetches and Follows). This is the
 // AP-side interop key — entirely distinct from the atproto secp256k1 repo
 // keys task 03 mints.
 type ServiceActor struct {
-	// ID is the actor's canonical id, https://{hostname}/actor.
+	// ID is the actor's canonical id, {scheme}://{hostname}/actor.
 	ID string
 	// Hostname is the bridge's public hostname (config.BridgeHostname).
 	Hostname string
+	// Scheme is the URL scheme the bridge's own AP URLs are built with
+	// (config.BridgeScheme). "https" everywhere real; "http" exists for the
+	// local e2e harness, where a debug-mode Lemmy federates with the bridge
+	// over plain HTTP inside one compose network. Empty means "https".
+	Scheme string
 	// Key is the actor's RSA private key.
 	Key *rsa.PrivateKey
+}
+
+// BaseURL is the origin the bridge's own AP URLs live under,
+// e.g. "https://bridge.example". Defensive default: an unset Scheme (a
+// hand-built test literal) renders https, never a schemeless URL.
+func (a *ServiceActor) BaseURL() string {
+	scheme := a.Scheme
+	if scheme == "" {
+		scheme = "https"
+	}
+	return scheme + "://" + a.Hostname
 }
 
 // LoadOrCreateServiceActor returns the bridge's service actor, loading its
 // RSA key from the service_keys store or generating and persisting one on
 // first run. Losing a concurrent-bootstrap insert race falls back to the
 // winner's key, so every process converges on the same keypair.
-func LoadOrCreateServiceActor(ctx context.Context, keys store.ServiceKeys, hostname string) (*ServiceActor, error) {
+// scheme is the URL scheme for the actor's own URLs ("https", or "http" for
+// the local e2e harness); empty defaults to https.
+func LoadOrCreateServiceActor(ctx context.Context, keys store.ServiceKeys, hostname, scheme string) (*ServiceActor, error) {
 	if hostname == "" {
 		return nil, errors.NewValidationError("hostname", "must not be empty")
+	}
+	switch scheme {
+	case "":
+		scheme = "https"
+	case "http", "https":
+	default:
+		return nil, errors.NewValidationError("scheme", fmt.Sprintf("must be http or https, got %q", scheme))
 	}
 
 	stored, err := keys.Get(ctx, ServiceKeyName)
@@ -77,8 +102,9 @@ func LoadOrCreateServiceActor(ctx context.Context, keys store.ServiceKeys, hostn
 	}
 
 	return &ServiceActor{
-		ID:       "https://" + hostname + ServiceActorPath,
+		ID:       scheme + "://" + hostname + ServiceActorPath,
 		Hostname: hostname,
+		Scheme:   scheme,
 		Key:      key,
 	}, nil
 }
@@ -89,16 +115,16 @@ func LoadOrCreateServiceActor(ctx context.Context, keys store.ServiceKeys, hostn
 func (a *ServiceActor) KeyID() string { return a.ID + "#main-key" }
 
 // InboxURL is the actor's inbox (served by task 06).
-func (a *ServiceActor) InboxURL() string { return "https://" + a.Hostname + "/inbox" }
+func (a *ServiceActor) InboxURL() string { return a.BaseURL() + "/inbox" }
 
 // OutboxURL is the actor's outbox.
-func (a *ServiceActor) OutboxURL() string { return "https://" + a.Hostname + "/outbox" }
+func (a *ServiceActor) OutboxURL() string { return a.BaseURL() + "/outbox" }
 
 // Signer returns a request signer using the actor's key.
 func (a *ServiceActor) Signer() *Signer { return NewSigner(a.KeyID(), a.Key) }
 
-// Document builds the Application actor document served at
-// https://{hostname}/actor. Lemmy requires the publicKey block (RSA, SPKI
+// Document builds the Service actor document served at
+// {scheme}://{hostname}/actor. Lemmy requires the publicKey block (RSA, SPKI
 // PEM) to accept our signed requests.
 func (a *ServiceActor) Document() (*Object, error) {
 	publicPEM, err := EncodePublicKeyPEM(&a.Key.PublicKey)
@@ -106,12 +132,18 @@ func (a *ServiceActor) Document() (*Object, error) {
 		return nil, err
 	}
 	return &Object{
-		Context:           json.RawMessage(serviceActorContext),
-		ID:                a.ID,
-		Type:              TypeApplication,
+		Context: json.RawMessage(serviceActorContext),
+		ID:      a.ID,
+		// Service, not Application: Lemmy deserializes a Follow's actor as its
+		// Person protocol type, whose kind enum is Person|Service|Organization
+		// (crates/apub .../protocol/.../person.rs, 0.19 and main alike) — an
+		// Application actor fails deserialization and the Follow is dropped.
+		// Service is the standard AS2 type for bots/bridges and every other
+		// platform accepts it.
+		Type:              TypeService,
 		PreferredUsername: a.Hostname,
 		Name:              "Tidepool bridge",
-		Summary:           "Bridges threadiverse communities into atproto. https://" + a.Hostname,
+		Summary:           "Bridges threadiverse communities into atproto. " + a.BaseURL(),
 		Inbox:             a.InboxURL(),
 		Outbox:            a.OutboxURL(),
 		PublicKey: &PublicKey{

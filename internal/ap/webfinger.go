@@ -3,6 +3,7 @@ package ap
 import (
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -62,6 +63,32 @@ func (c *Client) ResolveHandle(ctx context.Context, handle string) (actorURL str
 	webfingerURL := fmt.Sprintf("https://%s/.well-known/webfinger?%s", host, query.Encode())
 
 	body, err := c.getDedupedMode(ctx, webfingerURL, fetchModeWebFinger)
+	if err != nil && c.guard.allowPrivate && isTransportFailure(err) {
+		// Local-federation fallback: when the SSRF guard is relaxed
+		// (ALLOW_PRIVATE_FETCH, dev/e2e only) the peer may be a plain-HTTP
+		// instance on the compose network (debug-mode Lemmy has no TLS
+		// listener at all), so an https attempt that failed at the transport
+		// level (the server never answered HTTP) is retried over http.
+		// Semantic answers are NOT retried: a 404 said the account doesn't
+		// exist, a 401/403 must stay distinguishable (Cloudflare,
+		// defederation), and a 410 is a tombstone. Never reachable in
+		// production: the guard is forced on there, so allowPrivate is
+		// always false.
+		httpURL := fmt.Sprintf("http://%s/.well-known/webfinger?%s", host, query.Encode())
+		httpBody, httpErr := c.getDedupedMode(ctx, httpURL, fetchModeWebFinger)
+		switch {
+		case httpErr == nil:
+			body, err = httpBody, nil
+		case errors.IsNotFound(httpErr):
+			// The http listener answered and said the account doesn't
+			// exist: adopt that as the result.
+			err = httpErr
+		default:
+			// Surface both legs — the https transport failure alone would
+			// hide why the fallback didn't save the lookup.
+			err = fmt.Errorf("ap: webfinger https: %v; http fallback: %w", err, httpErr)
+		}
+	}
 	if err != nil {
 		// Only a genuine 404 means "no such account". A 401/403 (Cloudflare, a
 		// defederating instance) is surfaced as-is so the caller can tell a
@@ -103,6 +130,18 @@ func (c *Client) ResolveHandle(ctx context.Context, handle string) (actorURL str
 		return fallback, nil
 	}
 	return "", errors.NewNotFoundError("webfinger self link", handle)
+}
+
+// isTransportFailure reports whether a fetch error means the server never
+// gave a semantic HTTP answer (dial/TLS/read failure) — as opposed to a
+// mapped status (404 → NotFound, 410 → Tombstoned) or a preserved HTTPError
+// (401/403 in webfinger mode, 5xx, ...). Only transport failures may trigger
+// the dev-only https→http webfinger fallback.
+func isTransportFailure(err error) bool {
+	var httpErr HTTPError
+	return !stderrors.As(err, &httpErr) &&
+		!errors.IsNotFound(err) &&
+		!errors.IsTombstoned(err)
 }
 
 // hrefAuthorityMatches reports whether an href's authority (host:port) equals

@@ -1,0 +1,25 @@
+# Lemmy config for the Tidepool e2e harness (see e2e/lemmy/Dockerfile for
+# why Lemmy is a debug build). Modeled on LemmyNet's own docker/federation
+# hjson files: a plain-HTTP instance addressed by its compose hostname.
+{
+  # The compose service name — this is the authority baked into every AP id
+  # Lemmy emits (http://lemmy/c/testing, http://lemmy/u/alice, ...).
+  # Portless + tls_enabled:false + debug build = plain-HTTP federation.
+  hostname: "lemmy"
+  bind: "0.0.0.0"
+  port: 80
+  tls_enabled: false
+  setup: {
+    # Auto-created on first boot (min 10 chars for the password).
+    admin_username: "admin"
+    admin_password: "lemmylemmy"
+    site_name: "tidepool-e2e"
+  }
+  database: {
+    uri: "postgres://lemmy:lemmy@lemmy-postgres:5432/lemmy"
+  }
+  pictrs: {
+    url: "http://pictrs:8080/"
+    api_key: "e2e-pictrs-key"
+  }
+}

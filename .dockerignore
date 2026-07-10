@@ -1,0 +1,11 @@
+# Keep the build context small and cache-friendly.
+.git
+.claude
+tidepool
+e2e/
+tests/
+tasks/
+*.md
+docker-compose*.yml
+Dockerfile
+.github/

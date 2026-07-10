@@ -112,6 +112,12 @@ func TestGenesisOpEncoding(t *testing.T) {
 
 	op := genesisOperation("did:key:zRotation", "did:key:zSigning",
 		"technology.lemmy-world.tidepool.example", "https://tidepool.example")
+	services, ok := op["services"].(map[string]any)
+	require.True(t, ok)
+	pds, ok := services["atproto_pds"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "https://tidepool.example", pds["endpoint"],
+		"the op must advertise the endpoint exactly as passed (scheme included)")
 	op["sig"] = "fakesig"
 	did1, err := didForOperation(op)
 	require.NoError(t, err)
@@ -345,4 +351,45 @@ func TestNewMinter_RequiresExplicitConfig(t *testing.T) {
 	require.Error(t, err)
 	assert.True(t, errors.IsValidation(err))
 	assert.NotContains(t, err.Error(), "plc.directory")
+}
+
+// TestNewMinter_PDSEndpointScheme pins how BridgeScheme threads into the PDS
+// endpoint advertised in minted DID documents: empty defaults to https (the
+// same defensive default as ap.ServiceActor.BaseURL), http is honored (local
+// e2e harness, BRIDGE_SCHEME=http), anything else is rejected. Needs no PLC
+// or postgres: nothing is dialed.
+func TestNewMinter_PDSEndpointScheme(t *testing.T) {
+	rotationKey, err := atcrypto.GeneratePrivateKeyK256()
+	require.NoError(t, err)
+	base := MinterOptions{
+		PLCDirectoryURL: "https://plc.invalid",
+		BridgeHostname:  "Bridge.Example",
+		RotationKey:     rotationKey,
+		Custodian:       testCustodian(t),
+		Actors:          struct{ store.BridgedActors }{},
+		HTTPClient:      http.DefaultClient,
+	}
+
+	cases := []struct {
+		scheme  string
+		want    string
+		wantErr bool
+	}{
+		{scheme: "", want: "https://bridge.example"},
+		{scheme: "https", want: "https://bridge.example"},
+		{scheme: "http", want: "http://bridge.example"},
+		{scheme: "gopher", wantErr: true},
+	}
+	for _, tc := range cases {
+		opts := base
+		opts.BridgeScheme = tc.scheme
+		m, err := NewMinter(opts)
+		if tc.wantErr {
+			require.Error(t, err, "scheme %q", tc.scheme)
+			assert.True(t, errors.IsValidation(err), "scheme %q must be a validation error", tc.scheme)
+			continue
+		}
+		require.NoError(t, err, "scheme %q", tc.scheme)
+		assert.Equal(t, tc.want, m.pdsEndpoint(), "scheme %q", tc.scheme)
+	}
 }

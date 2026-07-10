@@ -1,0 +1,215 @@
+# Tidepool end-to-end stack: a real Lemmy federating with the bridge, a real
+# did:plc directory backing DID minting, and a real Jetstream decoding the
+# bridge's subscribeRepos firehose. `make e2e` builds it, waits for health,
+# runs tests/e2e (tagged `e2e`) from the host, and tears it down.
+#
+# ── How Lemmy↔Tidepool federation works over plain HTTP ──────────────────
+# Lemmy only accepts http:// federation URLs in a DEBUG build (a compile-time
+# property — see e2e/lemmy/Dockerfile), so the harness builds Lemmy from
+# source in debug mode instead of pulling a release image. Both sides then
+# live portless on :80 under their compose hostnames:
+#
+#   http://lemmy/...     Lemmy's AP ids (hostname "lemmy", tls_enabled false)
+#   http://tidepool/...  the bridge's AP ids (BRIDGE_SCHEME=http, dev-only)
+#
+# Portless matters twice: Lemmy production builds reject explicit ports in
+# ids (moot here, but debug keeps the same shape), and Tidepool's bridged
+# handles are DNS labels under BRIDGE_HOSTNAME, so the hostname must not
+# carry a port. Non-root processes can bind :80 because docker defaults
+# net.ipv4.ip_unprivileged_port_start=0 in containers.
+#
+# No TLS/caddy layer is involved. The release-image alternative (caddy with
+# an internal CA, portless https hostnames via network aliases, and the CA
+# trusted inside every container) was rejected: release builds have NO
+# runtime override for the local-IP/http/port federation checks — they are
+# compile-time debug_assertions in the activitypub-federation crate, which
+# is exactly why the debug build is required. On top of that, Lemmy's TLS
+# trust store is not reliably extensible at runtime, and the proxy adds
+# nothing for a local harness.
+#
+# Host ports (loopback-only — the stack carries an admin token and
+# ALLOW_PRIVATE_FETCH=1, so it must not be reachable from the local
+# network; offset from the dev stack so both can run):
+#   127.0.0.1:8092  Tidepool HTTP (admin API, XRPC, healthz)
+#   127.0.0.1:8541  Lemmy HTTP API (8541 nods to lemmy_alpha in upstream's federation compose)
+#   127.0.0.1:6028  Jetstream WebSocket (/subscribe)
+#
+# LOCAL-ONLY: nothing here talks to plc.directory, public relays, or public
+# Lemmy instances. All egress stays on the compose network (image pulls and
+# build-time package/source downloads aside).
+
+name: tidepool-e2e
+
+services:
+  # ── Tidepool ────────────────────────────────────────────────────────────
+  tidepool-postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: tidepool
+      POSTGRES_USER: tidepool
+      POSTGRES_PASSWORD: tidepool
+    networks: [tidepool-e2e]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tidepool -d tidepool"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  tidepool:
+    build: .
+    environment:
+      # development: migrations-on-start, StrictValidation (lexicon failures
+      # fail closed — exactly what a conformance harness wants), and the two
+      # local-federation relaxations below are dev-gated in config.
+      ENVIRONMENT: development
+      DATABASE_URL: postgres://tidepool:tidepool@tidepool-postgres:5432/tidepool?sslmode=disable
+      LISTEN_ADDR: ":80"
+      BRIDGE_HOSTNAME: tidepool
+      # Plain-HTTP AP ids so a debug-mode Lemmy can fetch/deliver to us.
+      BRIDGE_SCHEME: http
+      # The compose network is private address space; the SSRF guard must let
+      # the bridge fetch lemmy/plc (dev-only, refused in production).
+      ALLOW_PRIVATE_FETCH: "1"
+      PLC_DIRECTORY_URL: http://plc:3000
+      ADMIN_TOKEN: e2e-admin-token
+      SEED_COUNTS_FROM_API: "1"
+      LOG_LEVEL: debug
+    ports:
+      - "127.0.0.1:${TIDEPOOL_E2E_PORT:-8092}:80"
+    networks: [tidepool-e2e]
+    depends_on:
+      tidepool-postgres:
+        condition: service_healthy
+      plc:
+        condition: service_healthy
+    healthcheck:
+      # /healthz pings the database, so healthy == migrated and serving.
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost/healthz"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  # ── did:plc directory ───────────────────────────────────────────────────
+  plc-postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: plc
+      POSTGRES_USER: plc
+      POSTGRES_PASSWORD: plc
+    networks: [tidepool-e2e]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U plc -d plc"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  plc:
+    build: e2e/plc
+    environment:
+      DATABASE_URL: postgresql://plc:plc@plc-postgres:5432/plc?sslmode=disable
+      DEBUG_MODE: "1"
+      LOG_ENABLED: "true"
+      LOG_LEVEL: info
+      LOG_DESTINATION: "1"
+      NODE_ENV: development
+      PORT: 3000
+    networks: [tidepool-e2e]
+    depends_on:
+      plc-postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/_health"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  # ── Jetstream (consumes the bridge's firehose) ──────────────────────────
+  jetstream:
+    image: ghcr.io/bluesky-social/jetstream:sha-306e463693365e21a5ffd3ec051a5a7920000214
+    # Jetstream EXITS when its upstream websocket dies ("shutting down on
+    # events kill"), which is exactly what the restart scenario provokes by
+    # bouncing tidepool. Docker revives it; it reconnects with the cursor
+    # persisted in /data (container-local, survives restarts) and resumes
+    # replay from the bridge without gaps or duplicates.
+    restart: unless-stopped
+    environment:
+      JETSTREAM_WS_URL: ws://tidepool:80/xrpc/com.atproto.sync.subscribeRepos
+      JETSTREAM_LISTEN_ADDR: ":6018"
+      JETSTREAM_METRICS_LISTEN_ADDR: ":6019"
+      JETSTREAM_DATA_DIR: /data
+      JETSTREAM_EVENT_TTL: 24h
+      # The bridge is quiet between test steps; don't self-restart on idle.
+      JETSTREAM_LIVENESS_TTL: 24h
+      LOG_LEVEL: debug
+    ports:
+      - "127.0.0.1:${JETSTREAM_E2E_PORT:-6028}:6018"
+    networks: [tidepool-e2e]
+    depends_on:
+      tidepool:
+        condition: service_healthy
+    # No wget/curl in the image, but it is debian-based with bash — a
+    # /dev/tcp probe of the subscribe port is a real readiness gate. Without
+    # a healthcheck, `up --wait` would pass the moment the container is
+    # running, before Jetstream actually accepts subscribers.
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/6018"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  # ── Lemmy ───────────────────────────────────────────────────────────────
+  lemmy-postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: lemmy
+      POSTGRES_USER: lemmy
+      POSTGRES_PASSWORD: lemmy
+    networks: [tidepool-e2e]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lemmy -d lemmy"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  pictrs:
+    # Lemmy refuses to boot without a pictrs URL configured; 0.5 is the
+    # pairing for lemmy 0.19 (multi-arch, runs fine on arm64).
+    image: asonix/pictrs:0.5
+    environment:
+      PICTRS__SERVER__API_KEY: e2e-pictrs-key
+    networks: [tidepool-e2e]
+
+  lemmy:
+    build: e2e/lemmy
+    environment:
+      RUST_LOG: "warn,lemmy_server=debug,lemmy_apub=debug,lemmy_federate=debug,activitypub_federation=debug"
+      RUST_BACKTRACE: "1"
+      LEMMY_CONFIG_LOCATION: /config/config.hjson
+      # Without this the persistent federation queue delays deliveries by
+      # 30s–5min; Lemmy's own api_tests set it too.
+      LEMMY_TEST_FAST_FEDERATION: "1"
+    volumes:
+      - ./e2e/lemmy/lemmy.hjson:/config/config.hjson:ro
+    ports:
+      - "127.0.0.1:${LEMMY_E2E_PORT:-8541}:80"
+    networks: [tidepool-e2e]
+    depends_on:
+      lemmy-postgres:
+        condition: service_healthy
+      pictrs:
+        condition: service_started
+    healthcheck:
+      # /api/v3/site answers once migrations + setup (admin/site creation) ran.
+      test: ["CMD", "curl", "-sf", "http://localhost/api/v3/site"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+      start_period: 60s
+
+networks:
+  tidepool-e2e:
+    driver: bridge
+    name: tidepool-e2e-network

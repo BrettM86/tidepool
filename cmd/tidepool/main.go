@@ -141,7 +141,7 @@ func run(logger *slog.Logger) error {
 	// the durable work queue, activity dispatch into the materializer, the
 	// community Follow lifecycle, outbox backfill, and consent enforcement.
 	serviceKeys := store.NewServiceKeys(database)
-	serviceActor, err := ap.LoadOrCreateServiceActor(ctx, serviceKeys, cfg.BridgeHostname)
+	serviceActor, err := ap.LoadOrCreateServiceActor(ctx, serviceKeys, cfg.BridgeHostname, cfg.BridgeScheme)
 	if err != nil {
 		return err
 	}
@@ -158,6 +158,7 @@ func run(logger *slog.Logger) error {
 	minter, err := identity.NewMinter(identity.MinterOptions{
 		PLCDirectoryURL: cfg.PLCDirectoryURL,
 		BridgeHostname:  cfg.BridgeHostname,
+		BridgeScheme:    cfg.BridgeScheme,
 		RotationKey:     rotationKey,
 		Custodian:       custodian,
 		Actors:          actors,

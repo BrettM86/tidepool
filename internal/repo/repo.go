@@ -29,6 +29,24 @@ import (
 	"tidepool/internal/errors"
 )
 
+// ErrPreconditionFailed is returned by PutRecordCAS when the record currently
+// at the target path does not match the caller's expected previous CID — an
+// optimistic-concurrency mismatch. It is the signal for the caller's
+// read-modify-write retry: re-read the current record, re-derive the write, and
+// try again. It exists because the vote-stats and carry-forward paths read the
+// record OUTSIDE the commit serialization (per-DID mutex + global advisory
+// lock); the precondition, checked INSIDE it, turns that stale read into a
+// harmless retry instead of a silent lost update or resurrection.
+var ErrPreconditionFailed = stderrors.New("repo: record precondition failed")
+
+// casPrecondition, when non-nil, requires the record currently at the write
+// path to match expectCID before the commit proceeds. expectCID == "" means
+// the record must NOT currently exist (a guarded create). A nil precondition
+// disables the check entirely (the ordinary PutRecord/DeleteRecord path).
+type casPrecondition struct {
+	expectCID string
+}
+
 // KeyUse says what a signing key is being requested for, so key custody
 // can apply consent policy per operation kind: tombstoned (consent-revoked)
 // actors are frozen for new writes but their records must remain deletable.
@@ -177,6 +195,22 @@ func (m *Manager) PutRecord(ctx context.Context, did, collection, rkey string, r
 // PutRecordTx is PutRecord with a side effect executed inside the commit
 // transaction (see TxSideEffect). A nil sideEffect is exactly PutRecord.
 func (m *Manager) PutRecordTx(ctx context.Context, did, collection, rkey string, record map[string]any, sideEffect TxSideEffect) (*CommitResult, error) {
+	return m.putRecord(ctx, did, collection, rkey, record, nil, sideEffect)
+}
+
+// PutRecordCAS is PutRecordTx with an optimistic-concurrency precondition: the
+// record currently at (did, collection, rkey) must have CID expectedPrevCID
+// before the write commits — the empty string requiring the record to NOT
+// currently exist. On mismatch it returns ErrPreconditionFailed WITHOUT
+// committing (the side effect never runs), so a caller whose read happened
+// outside the commit serialization can re-read and retry. The precondition is
+// evaluated under the same per-DID mutex and global advisory lock the commit
+// takes, so it cannot itself race a concurrent commit to the same record.
+func (m *Manager) PutRecordCAS(ctx context.Context, did, collection, rkey string, record map[string]any, expectedPrevCID string, sideEffect TxSideEffect) (*CommitResult, error) {
+	return m.putRecord(ctx, did, collection, rkey, record, &casPrecondition{expectCID: expectedPrevCID}, sideEffect)
+}
+
+func (m *Manager) putRecord(ctx context.Context, did, collection, rkey string, record map[string]any, pre *casPrecondition, sideEffect TxSideEffect) (*CommitResult, error) {
 	if err := validateRecord(record); err != nil {
 		return nil, err
 	}
@@ -188,14 +222,14 @@ func (m *Manager) PutRecordTx(ctx context.Context, did, collection, rkey string,
 	if err != nil {
 		return nil, err
 	}
-	return m.commitWrite(ctx, did, collection, rkey, &c, recordBytes, sideEffect)
+	return m.commitWrite(ctx, did, collection, rkey, &c, recordBytes, pre, sideEffect)
 }
 
 // DeleteRecord removes a record and commits the change. A missing record —
 // or a repo that does not exist yet — is an error satisfying
 // errors.IsNotFound. The result's RecordCID is empty.
 func (m *Manager) DeleteRecord(ctx context.Context, did, collection, rkey string) (*CommitResult, error) {
-	return m.commitWrite(ctx, did, collection, rkey, nil, nil, nil)
+	return m.commitWrite(ctx, did, collection, rkey, nil, nil, nil, nil)
 }
 
 // GetRecord reads the current version of a record. Missing repo or record
@@ -281,7 +315,7 @@ func (m *Manager) readState(ctx context.Context, did string) (*repoState, error)
 // and the global commit advisory lock, applies the mutation to the MST,
 // signs a new commit, and persists blocks, head, and the firehose event in
 // one transaction.
-func (m *Manager) commitWrite(ctx context.Context, did, collection, rkey string, newCID *cid.Cid, recordBytes []byte, sideEffect TxSideEffect) (*CommitResult, error) {
+func (m *Manager) commitWrite(ctx context.Context, did, collection, rkey string, newCID *cid.Cid, recordBytes []byte, pre *casPrecondition, sideEffect TxSideEffect) (*CommitResult, error) {
 	path, parsedDID, err := validatePath(did, collection, rkey)
 	if err != nil {
 		return nil, err
@@ -366,6 +400,25 @@ func (m *Manager) commitWrite(ctx context.Context, did, collection, rkey string,
 	if newCID == nil && op.Prev == nil {
 		return nil, errors.NewNotFoundError("record", fmt.Sprintf("at://%s/%s", did, path))
 	}
+
+	// Optimistic-concurrency precondition (see casPrecondition): the record
+	// that was at this path before this op (op.Prev) must match what the caller
+	// based its read-modify-write on. Checked here, under the commit locks, so a
+	// stale read outside them cannot revert a concurrent edit, drop a
+	// just-committed stamp, or resurrect a deleted record. op.Prev == nil means
+	// no record is present (deleted or never existed); expectCID "" is the
+	// caller asserting exactly that.
+	if pre != nil {
+		var current string
+		if op.Prev != nil {
+			current = op.Prev.String()
+		}
+		if current != pre.expectCID {
+			return nil, fmt.Errorf("repo: precondition for %s/%s: expected prev cid %q, have %q: %w",
+				did, path, pre.expectCID, current, ErrPreconditionFailed)
+		}
+	}
+
 	if newCID != nil && op.Prev != nil && op.Prev.Equals(*newCID) {
 		// Identical re-put: idempotent no-op, keep the existing commit.
 		// op.Prev != nil implies the repo exists, so state is non-nil here.

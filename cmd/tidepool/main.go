@@ -245,6 +245,20 @@ func run(logger *slog.Logger) error {
 	// vote_events rows age out like firehose events do.
 	go prune.Run(ctx, "ap_tombstones", cfg.TombstoneRetention, 0, tombstones.Prune, logger)
 	go prune.Run(ctx, "vote_events(undone)", cfg.VoteEventRetention, 0, voteAggregator.PruneUndoneEvents, logger)
+
+	// Bridged-vote-stats refresher (FOLLOWUPS locked decision 7 final
+	// direction): fold changed vote_aggregates counts onto each subject's
+	// materialized post/comment record as an optional bridgedStats field,
+	// debounced so a hot post's votes coalesce into one record update per
+	// sweep instead of one firehose event per vote. Emits through the
+	// materializer (lexicon validation + mapping-CID bookkeeping) exactly
+	// like every other record write.
+	statsRefresher, err := votes.NewRefresher(database, objects, materializer,
+		cfg.StatsRefreshInterval, cfg.StatsRefreshBatch, logger)
+	if err != nil {
+		return err
+	}
+	go statsRefresher.Run(ctx)
 	// Seeding imports historical scores for backfilled posts from the origin
 	// instance's public API (AP alone cannot provide them).
 	var seeder ingest.CountSeeder

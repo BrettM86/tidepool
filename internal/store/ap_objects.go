@@ -96,6 +96,22 @@ func (r *postgresAPObjects) GetByAPID(ctx context.Context, apID string) (*APObje
 	return mapping, nil
 }
 
+func (r *postgresAPObjects) DeletedInTx(ctx context.Context, tx *sql.Tx, apID string) (bool, error) {
+	if tx == nil {
+		return false, errors.NewValidationError("tx", "must not be nil")
+	}
+	var deletedAt sql.NullTime
+	err := tx.QueryRowContext(ctx,
+		`SELECT deleted_at FROM ap_objects WHERE ap_id = $1`, apID).Scan(&deletedAt)
+	if stderrors.Is(err, sql.ErrNoRows) {
+		return false, errors.NewNotFoundError("ap_object", apID)
+	}
+	if err != nil {
+		return false, fmt.Errorf("read deleted_at for ap_object %q: %w", apID, err)
+	}
+	return deletedAt.Valid, nil
+}
+
 func (r *postgresAPObjects) GetByATURI(ctx context.Context, atURI string) (*APObjectMapping, error) {
 	query := `SELECT` + apObjectColumns + ` FROM ap_objects WHERE at_uri = $1`
 	mapping, err := scanAPObject(r.db.QueryRowContext(ctx, query, atURI))

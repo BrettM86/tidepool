@@ -121,6 +121,17 @@ services:
       PLC_DIRECTORY_URL: http://plc:3000
       ADMIN_TOKEN: e2e-admin-token
       SEED_COUNTS_FROM_API: "1"
+      # Short stats-refresh interval (default 30s) so the vote scenarios
+      # actually exercise the bridged-vote-stats refresher: within ~2s of a
+      # vote landing, the subject's post/comment record gains (or updates) its
+      # bridgedStats field via a real UPDATE commit on the firehose. The
+      # suite's zz-sweep lexicon-validates every create AND update, so the
+      # synced #bridgedStats def must make those pass. Every emitted update is
+      # a post/comment in the four-collection whitelist, so no negative
+      # assertion is tripped (see votes_hammer_test.go: it awaits the vote XRPC
+      # counts and never asserts "no further commits").
+      STATS_REFRESH_INTERVAL: 2s
+      STATS_REFRESH_BATCH: "50"
       # Announce ourselves to the local relay on startup via the REAL
       # RequestCrawlAll path. ALLOW_DEV_REQUEST_CRAWL exists precisely for
       # this stack (dev is otherwise log-only, and production refuses the

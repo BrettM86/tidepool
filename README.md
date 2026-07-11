@@ -208,6 +208,8 @@ production**:
 | `MINT_RATE_PER_MINUTE` / `MINT_BURST` | `60` / `120` | rate gate on inbound DID minting (PLC registrations are forever; unseen authors in delivered content trigger mints) |
 | `INGEST_WORKERS` | `4` | inbox queue worker-pool size |
 | `SEED_COUNTS_FROM_API` | on | seed backfilled posts' vote aggregates from the origin instance's public API (`/api/v3/post` `counts`); set `0` to disable |
+| `STATS_REFRESH_INTERVAL` | `30s` | how often the bridged-vote-stats refresher sweeps `vote_aggregates` and folds changed counts onto each subject's post/comment record (`bridgedStats` field); a debounce, so a hot subject's votes coalesce into one record update per sweep — longer is staler counts + fewer firehose events, shorter is fresher + more commit-lock traffic |
+| `STATS_REFRESH_BATCH` | `200` | max aggregates one refresher sweep processes (emits, or skips permanently, per row); commits are globally serialized, so the batch keeps a sweep from flooding the commit lock (the remainder waits for the next sweep) |
 | `TOMBSTONE_RETENTION` | `720h` | how long `ap_tombstones` markers (the delete-before-create guard) are kept before the hourly pruner reclaims them |
 | `VOTE_EVENT_RETENTION` | `2160h` | how long **undone** (superseded/retracted) `vote_events` rows are kept; live rows are the counts and are never pruned |
 | `BLOCKS_GC_RETENTION` | `72h` | how long superseded (head-unreachable) repo blocks are kept before the GC sweep (every 6h) reclaims them; the window doubles as the sweep's race guard, so keep it far above sweep duration — and comfortably above any app↔DB clock skew plus the sweep's compute→delete gap, since the cutoff comes from the app clock while `created_at` refreshes use the DB clock (see `internal/repo/gc.go`) |
@@ -343,8 +345,17 @@ degenerates from per-IP into a GLOBAL cap.
 ## Vote aggregates (the AppView integration point)
 
 Votes never become records (nothing may strongRef a vote): Lemmy
-`Like`/`Dislike`/`Undo` activities maintain bridge-side aggregate counts,
-served over **one sanctioned side-channel XRPC** the Coves AppView polls:
+`Like`/`Dislike`/`Undo` activities maintain bridge-side aggregate counts.
+Those counts reach the AppView two ways. The primary path (locked decision 7
+final direction) folds them onto the CONTENT record: post and comment records
+carry an optional `bridgedStats {upvotes, downvotes, asOf}` field, written by
+a debounced sweeper (`STATS_REFRESH_INTERVAL`/`STATS_REFRESH_BATCH`) as the
+aggregates change, so the counts ride the firehose the AppView already
+consumes — a debounced update whose true bound is at most one record update
+per subject per sweep, collapsing a burst of votes rather than emitting one
+event per vote.
+The legacy/debug path is **one sanctioned side-channel XRPC** the Coves
+AppView can poll:
 
 ```
 GET /xrpc/social.coves.bridge.getVoteAggregates?uris=at://…&uris=at://…
@@ -372,7 +383,16 @@ backfilled posts would start near zero. `SEED_COUNTS_FROM_API` (default on)
 compensates by seeding a baseline from the origin's public API during
 backfill; live votes stack on top, and an undo of a vote that only exists in
 the baseline is a no-op (accepted drift, refreshed on re-seed). Comment
-scores are not seeded in v1 — comments accumulate live votes only.
+scores are not seeded in v1 — comments accumulate live votes only (a comment
+with live votes still gets a `bridgedStats` field once the refresher folds
+them onto its record).
+
+Both surfaces read the same `vote_aggregates` totals, so `bridgedStats` and
+`getVoteAggregates` never disagree beyond the sweep's debounce lag (the field
+is `asOf`-stamped with the aggregate's `updated_at`, which the AppView can use
+to discard a stale update). Every `bridgedStats` write goes through the same
+lexicon validation and mapping bookkeeping as any other record commit, and a
+Lemmy edit that rebuilds a record carries an existing `bridgedStats` forward.
 
 ## Verifying with Jetstream
 

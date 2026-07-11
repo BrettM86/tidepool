@@ -20,6 +20,15 @@ var (
 	// a missing object may be fetched and materialized, a tombstoned one
 	// must not be. IsNotFound(tombstoned) is false.
 	ErrTombstoned = errors.New("resource tombstoned")
+	// ErrRecordGone marks a bridged-stats emission that cannot proceed
+	// because the TARGET RECORD itself is gone — deleted out from under its
+	// vote aggregate, or its mapping soft-deleted inside the commit
+	// transaction. Deliberately distinct from ErrNotFound: the vote-stats
+	// refresher advances its watermark on a real record-gone but NOT on an
+	// unrelated NotFound surfaced from deeper in a commit (a missing
+	// bridged_actor row or signing key — a key-escrow inconsistency to
+	// retry, never to skip). IsNotFound(recordGone) is false.
+	ErrRecordGone = errors.New("bridged record gone")
 )
 
 // ValidationError reports a rejected field value.
@@ -102,3 +111,6 @@ func IsValidation(err error) bool { return errors.Is(err, ErrInvalidInput) }
 
 // IsTombstoned reports whether err is, wraps, or unwraps to ErrTombstoned.
 func IsTombstoned(err error) bool { return errors.Is(err, ErrTombstoned) }
+
+// IsRecordGone reports whether err is, wraps, or unwraps to ErrRecordGone.
+func IsRecordGone(err error) bool { return errors.Is(err, ErrRecordGone) }

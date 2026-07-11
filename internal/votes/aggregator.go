@@ -336,13 +336,30 @@ func (a *Aggregator) RetractVote(ctx context.Context, vote *ap.Object, community
 // SeedAggregates imports a baseline (upvotes, downvotes) for a bridged
 // subject from its origin's public API — history whose individual Like
 // activities the bridge never saw (Lemmy outboxes announce historical votes
-// only sparsely). Live vote_events stack on top of the baseline; re-seeding
-// (backfill redo) overwrites the baseline idempotently. Known drift: a voter
-// counted only in the baseline who later flips federates a bare Dislike
-// (Lemmy sends no Undo on flips), so the retired upvote stays in the
-// baseline next to the new live downvote; a clear sends an Undo the
-// fallback cannot act on (no live vote row). Accepted for v1; the baseline
-// refreshes on re-seed.
+// only sparsely). Live vote_events stack on top of the baseline.
+//
+// The origin's counts are a TOTAL: they include every vote that ALSO
+// federated live and sits in vote_events as a live row (any vote cast after
+// the community was subscribed). Storing them raw would count those voters
+// twice — once in the baseline, once in the recompute's live term — so the
+// baseline is stored NET of the subject's live counts, per direction,
+// clamped at zero. Served totals therefore equal the origin's counts at
+// seed time, and live events stack on top from there. This also makes a
+// re-seed (backfill redo) the drift healer: a voter counted only in the
+// baseline who later flips federates a bare Dislike (Lemmy sends no Undo on
+// flips), leaving the retired upvote in the baseline next to the new live
+// downvote — until the next re-seed, whose subtraction converges the served
+// totals back to the origin's truth. Two symmetric residual races span the
+// origin API fetch and this transaction, both transient and self-healing on
+// the next re-seed (the pre-fix over-count race was PERMANENT and compounding):
+//   - under-count by one: a vote federates AFTER the fetch but is live here, so
+//     it is net-subtracted from the baseline yet not present in the fetched
+//     total;
+//   - over-count by one (the mirror): a vote already IN the fetched total whose
+//     federated activity arrives AFTER this seed tx — the net-of-live
+//     subtraction cannot yet see it as a live row, so the baseline keeps it AND
+//     the later live event adds it again, until the next re-seed reconciles.
+//
 // Subjects not present in ap_objects are dropped and logged at debug, like
 // ApplyVote.
 func (a *Aggregator) SeedAggregates(ctx context.Context, subjectAPID string, upvotes, downvotes int) error {
@@ -368,19 +385,28 @@ func (a *Aggregator) SeedAggregates(ctx context.Context, subjectAPID string, upv
 	atURI := mapping.ATURI
 
 	return a.inTx(ctx, func(tx *sql.Tx) error {
+		// Upsert-and-lock the aggregate row first — the per-subject
+		// serialization point every mutation goes through — so the live-count
+		// read below cannot interleave with a concurrent ApplyVote/RetractVote
+		// on the same subject.
+		if err := lockAggregate(ctx, tx, subjectAPID, atURI); err != nil {
+			return err
+		}
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO vote_aggregates (
-				subject_ap_id, subject_at_uri,
-				seeded_upvotes, seeded_downvotes, upvotes, downvotes
-			) VALUES ($1, $2, $3, $4, $3, $4)
-			ON CONFLICT (subject_ap_id) DO UPDATE SET
-				subject_at_uri = EXCLUDED.subject_at_uri,
-				seeded_upvotes = EXCLUDED.seeded_upvotes,
-				seeded_downvotes = EXCLUDED.seeded_downvotes`,
-			subjectAPID, atURI, upvotes, downvotes); err != nil {
+			UPDATE vote_aggregates a
+			SET seeded_upvotes = GREATEST(0, $2 - live.up),
+			    seeded_downvotes = GREATEST(0, $3 - live.down)
+			FROM (
+				SELECT
+					COUNT(*) FILTER (WHERE direction = 'up') AS up,
+					COUNT(*) FILTER (WHERE direction = 'down') AS down
+				FROM vote_events
+				WHERE subject_ap_id = $1 AND NOT undone
+			) live
+			WHERE a.subject_ap_id = $1`,
+			subjectAPID, upvotes, downvotes); err != nil {
 			return fmt.Errorf("seed vote aggregate for %q: %w", subjectAPID, err)
 		}
-		// Fold any live events that landed before the seed into the totals.
 		return recomputeAggregate(ctx, tx, subjectAPID)
 	})
 }
@@ -653,12 +679,23 @@ func lockAggregate(ctx context.Context, tx *sql.Tx, subject, atURI string) error
 // baseline plus the live (non-undone) events. Recompute-per-subject over
 // incremental arithmetic: a Lemmy post sees at most a few thousand votes,
 // and recomputing inside the locking transaction cannot drift.
+//
+// updated_at uses clock_timestamp() (the real wall time at statement
+// execution), NOT CURRENT_TIMESTAMP (which is transaction-START time). Under
+// concurrent voters (INGEST_WORKERS > 1) two commits' transaction-start times
+// can order oppositely to their aggregate-row-lock acquisition, so
+// CURRENT_TIMESTAMP could stamp a later-committed vote with an EARLIER
+// updated_at — landing it below the stats refresher's already-advanced
+// watermark, never to be emitted (permanent staleness on a then-quiet
+// subject). clock_timestamp() is taken while THIS transaction holds the
+// per-subject aggregate row lock, so per-subject updated_at is monotonic and
+// every committed vote strictly advances it past any prior watermark.
 func recomputeAggregate(ctx context.Context, tx *sql.Tx, subject string) error {
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE vote_aggregates a
 		SET upvotes = a.seeded_upvotes + live.up,
 		    downvotes = a.seeded_downvotes + live.down,
-		    updated_at = CURRENT_TIMESTAMP
+		    updated_at = clock_timestamp()
 		FROM (
 			SELECT
 				COUNT(*) FILTER (WHERE direction = 'up') AS up,

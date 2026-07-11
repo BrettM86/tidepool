@@ -163,6 +163,18 @@ type Config struct {
 	SyncRatePerSecond  int
 	SyncRateBurst      int
 	SyncMaxSubscribers int
+	// StatsRefreshInterval is how often the bridged-vote-stats refresher
+	// sweeps vote_aggregates and folds changed counts onto the materialized
+	// post/comment records' bridgedStats field (STATS_REFRESH_INTERVAL, a Go
+	// duration, default 30s, must be positive). A debounce, not a deadline: a
+	// hot subject's votes coalesce into at most one record update per sweep.
+	// Longer quiesces emission (staler bridged counts, fewer firehose events);
+	// shorter tightens freshness at more commit-lock traffic.
+	StatsRefreshInterval time.Duration
+	// StatsRefreshBatch bounds how many due aggregates one sweep emits
+	// (STATS_REFRESH_BATCH, default 200, must be positive). Commits are
+	// globally serialized, so the batch keeps one sweep from flooding the lock.
+	StatsRefreshBatch int
 }
 
 // Load reads configuration from the environment. logger must not be nil;
@@ -388,6 +400,17 @@ func Load(logger *slog.Logger) (*Config, error) {
 		return nil, err
 	}
 	cfg.SyncMaxSubscribers, err = intVar(logger, "SYNC_MAX_SUBSCRIBERS", 100)
+	if err != nil {
+		return nil, err
+	}
+
+	// Bridged-vote-stats refresher: tuning knobs with real defaults in every
+	// environment (positive-enforced, like the other interval/size knobs).
+	cfg.StatsRefreshInterval, err = durationVar(logger, "STATS_REFRESH_INTERVAL", 30*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	cfg.StatsRefreshBatch, err = intVar(logger, "STATS_REFRESH_BATCH", 200)
 	if err != nil {
 		return nil, err
 	}

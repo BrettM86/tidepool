@@ -37,6 +37,7 @@ import (
 	comatproto "github.com/bluesky-social/indigo/api/atproto"
 	"github.com/bluesky-social/indigo/atproto/atdata"
 	"github.com/bluesky-social/indigo/atproto/lexicon"
+	"github.com/bluesky-social/indigo/atproto/syntax"
 	indigoevents "github.com/bluesky-social/indigo/events"
 	"github.com/gorilla/websocket"
 
@@ -1413,6 +1414,123 @@ func (l *jsListener) vetEvent(ev *jsEvent) {
 	if op := ev.Commit.Operation; op == opCreate || op == opUpdate {
 		validateLexicon(l.t, ev.Commit)
 	}
+}
+
+// isBridgedStatsUpdate reports whether a commit is the vote-stats refresher's
+// debounced bridgedStats emission: an UPDATE to a post/comment record carrying
+// a bridgedStats object (FOLLOWUPS "Votes-as-records" locked decision 7 final
+// direction — bridged vote counts ride the CONTENT record). With
+// SEED_COUNTS_FROM_API on, EVERY backfilled/seeded subject gets one of these
+// shortly after materialization, plus more as its origin vote counts change —
+// so the content-dedup ("exactly once per rkey") and post-unsubscribe negative
+// windows must not mistake a legitimate stats update for a duplicate emission
+// or a bridging violation.
+//
+// Caveat, deliberate: a genuine CONTENT edit ALSO carries bridgedStats
+// (commitRecord carries the field forward). The scenarios that use this helper
+// perform no content edits on the affected records, so an update-with-stats
+// there is unambiguously a stats emission — the helper is not a general
+// "is this only a stats change" classifier.
+func isBridgedStatsUpdate(ev *jsEvent) bool {
+	if ev.Kind != kindCommit || ev.Commit == nil || ev.Commit.Operation != opUpdate {
+		return false
+	}
+	if ev.Commit.Collection != colPost && ev.Commit.Collection != colComment {
+		return false
+	}
+	if len(ev.Commit.Record) == 0 {
+		return false
+	}
+	var m map[string]any
+	if err := json.Unmarshal(ev.Commit.Record, &m); err != nil {
+		return false
+	}
+	_, ok := m["bridgedStats"].(map[string]any)
+	return ok
+}
+
+// statsDedup tracks the last record seen per (did, collection, rkey) so a
+// scenario can tell a PURE vote-stats emission (safe to exclude from a
+// content-dedup count) from a genuine re-commit. isBridgedStatsUpdate alone can
+// no longer do this: once a record is stamped, EVERY later update carries the
+// field via carry-forward, so a non-idempotent rebuild that duplicated the
+// record would also look like a stats update and slip past the dedup. The
+// distinguisher is equality MODULO bridgedStats — a stats emission changes only
+// that field; a real duplicate changes content too.
+type statsDedup struct {
+	last map[string]json.RawMessage
+}
+
+func newStatsDedup() *statsDedup { return &statsDedup{last: map[string]json.RawMessage{}} }
+
+// isPureStatsEmission reports whether ev is an update that differs from the
+// previously-seen record for its key ONLY in the bridgedStats field, then
+// records ev as the new latest for that key. A create, a first sighting, or an
+// update that also changed content returns false (and is the thing a dedup
+// count must catch).
+func (s *statsDedup) isPureStatsEmission(ev *jsEvent, key string) bool {
+	if ev.Kind != kindCommit || ev.Commit == nil {
+		return false
+	}
+	prev, seen := s.last[key]
+	s.last[key] = ev.Commit.Record
+	if !seen || ev.Commit.Operation != opUpdate {
+		return false
+	}
+	if ev.Commit.Collection != colPost && ev.Commit.Collection != colComment {
+		return false
+	}
+	return recordEqualsModuloBridgedStats(prev, ev.Commit.Record)
+}
+
+// recordEqualsModuloBridgedStats reports whether two firehose records are
+// identical after dropping bridgedStats from both — i.e. the only thing that
+// changed (if anything) is the vote-stats stamp.
+func recordEqualsModuloBridgedStats(a, b json.RawMessage) bool {
+	return canonicalWithoutBridgedStats(a) == canonicalWithoutBridgedStats(b)
+}
+
+func canonicalWithoutBridgedStats(raw json.RawMessage) string {
+	var m map[string]any
+	if len(raw) == 0 || json.Unmarshal(raw, &m) != nil {
+		return string(raw)
+	}
+	delete(m, "bridgedStats")
+	canon, err := json.Marshal(m) // encoding/json sorts map keys → canonical
+	if err != nil {
+		return string(raw)
+	}
+	return string(canon)
+}
+
+// bridgedStatsUpvotes reads bridgedStats.upvotes off a record; ok is false when
+// the field is absent or malformed.
+func bridgedStatsUpvotes(record json.RawMessage) (int, bool) {
+	var m struct {
+		BridgedStats *struct {
+			Upvotes *int   `json:"upvotes"`
+			AsOf    string `json:"asOf"`
+		} `json:"bridgedStats"`
+	}
+	if err := json.Unmarshal(record, &m); err != nil || m.BridgedStats == nil || m.BridgedStats.Upvotes == nil {
+		return 0, false
+	}
+	return *m.BridgedStats.Upvotes, true
+}
+
+// bridgedStatsAsOfParses reports whether bridgedStats.asOf is present and a
+// valid atproto datetime (the field the AppView uses to discard stale updates).
+func bridgedStatsAsOfParses(record json.RawMessage) bool {
+	var m struct {
+		BridgedStats *struct {
+			AsOf string `json:"asOf"`
+		} `json:"bridgedStats"`
+	}
+	if err := json.Unmarshal(record, &m); err != nil || m.BridgedStats == nil || m.BridgedStats.AsOf == "" {
+		return false
+	}
+	_, err := syntax.ParseDatetime(m.BridgedStats.AsOf)
+	return err == nil
 }
 
 // await returns the first commit event matching pred — scanning events an

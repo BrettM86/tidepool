@@ -287,6 +287,21 @@ func TestVotes_SideChannelOnly(t *testing.T) {
 	voter.likeComment(t, comment.ID, 1)
 	awaitAggregates(t, h, commentEv.atURI(), 1, 0)
 
+	// POSITIVE emission assertion (the other half of locked decision 7): the
+	// vote-stats refresher folds the comment's live upvote onto its record as a
+	// bridgedStats UPDATE (STATS_REFRESH_INTERVAL=2s in this stack). Await that
+	// update on the comment's rkey carrying upvotes=1 with a parseable asOf —
+	// end-to-end proof the counts reach the AppView on the firehose, not only
+	// the side-channel XRPC. The comment's final vote state is a stable 1/0 (no
+	// further votes), so this target does not race a later count change.
+	l.await("comment bridgedStats update (upvotes=1)", func(e *jsEvent) bool {
+		if e.Commit.Collection != colComment || e.Commit.Operation != opUpdate || e.atURI() != commentEv.atURI() {
+			return false
+		}
+		up, ok := bridgedStatsUpvotes(e.Commit.Record)
+		return ok && up == 1 && bridgedStatsAsOfParses(e.Commit.Record)
+	})
+
 	// The whole time, nothing vote-shaped may have hit the firehose. The
 	// listener's centralized vetting already fails fast on any unexpected
 	// collection; this explicit unfiltered sweep is the belt to that
@@ -480,15 +495,36 @@ func TestRestart_ReplayIsIdempotent(t *testing.T) {
 
 	// Replay everything from the ORIGINAL cursor. Key the accounting by
 	// (did, collection/rkey) — NOT operation — so a create+update pair for
-	// one record counts as the duplicate it is.
+	// one record counts as the duplicate it is. EXCEPTION: the vote-stats
+	// refresher legitimately emits one bridgedStats UPDATE per seeded/backfilled
+	// post (SEED_COUNTS_FROM_API is on, so the backfill redo re-seeds these
+	// posts and the sweeper folds the counts onto each record) — those are the
+	// debounced feature, not a re-commit. They are excluded via statsDedup,
+	// which recognises a stats emission as an update equal to the prior record
+	// MODULO bridgedStats. A blanket isBridgedStatsUpdate would be too loose
+	// here: once stamped, EVERY update carries the field via carry-forward, so a
+	// non-idempotent rebuild that duplicated a record's CONTENT would also carry
+	// it and slip past — the modulo comparison still catches that (its content
+	// differs), so this assertion keeps its teeth.
 	l2 := h.newListener(t, cursor, colCommunityProfile, colActorProfile, colPost)
 
 	title2 := "Post-restart " + h.suffix
 	author.createPost(t, community.ID, title2, "after the bounce")
 
 	seen := map[string]int{}
+	dedup := newStatsDedup()
 	keyOf := func(ev *jsEvent) string {
 		return fmt.Sprintf("%s %s/%s", ev.Did, ev.Commit.Collection, ev.Commit.RKey)
+	}
+	account := func(ev *jsEvent) {
+		if ev.Kind != kindCommit || ev.Commit == nil {
+			return
+		}
+		key := keyOf(ev)
+		if dedup.isPureStatsEmission(ev, key) {
+			return // the debounced bridgedStats emission, not a re-commit
+		}
+		seen[key]++
 	}
 	gapKey := ""
 	sawNew, sawGap := false, false
@@ -498,8 +534,11 @@ func TestRestart_ReplayIsIdempotent(t *testing.T) {
 			if ev.Kind != kindCommit || ev.Commit == nil {
 				continue
 			}
-			seen[keyOf(ev)]++
-			if ev.Did == sub.DID && ev.Commit.Collection == colPost {
+			pureStats := dedup.isPureStatsEmission(ev, keyOf(ev))
+			if !pureStats {
+				seen[keyOf(ev)]++
+			}
+			if ev.Did == sub.DID && ev.Commit.Collection == colPost && !pureStats {
 				switch got, _ := fieldOf(ev.Commit.Record, "title"); got {
 				case gapTitle:
 					sawGap, gapKey = true, keyOf(ev)
@@ -518,9 +557,7 @@ func TestRestart_ReplayIsIdempotent(t *testing.T) {
 	// The backfill redo finished before l2 dialed; a short trailing drain
 	// still catches any late duplicate emission in flight.
 	for _, ev := range l2.drain(8 * time.Second) {
-		if ev.Kind == kindCommit && ev.Commit != nil {
-			seen[keyOf(ev)]++
-		}
+		account(ev)
 	}
 
 	// The replayed pre-restart post must appear EXACTLY once: zero would

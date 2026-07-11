@@ -113,6 +113,124 @@ harness, **(relay)** by task 09's relay pipeline.
     translation is records→Like. Symmetric records would let frontends
     drop the `getVoteAggregates` XRPC for everything except historical
     baselines.
+  - **FINAL direction (2026-07-10, superseding the community-repo-records
+    lean above): votes never become records — locked decision 7 stands.**
+    Bridged counts ride the CONTENT record instead: an optional
+    `bridgedStats {upvotes, downvotes, asOf}` field on post (and
+    comment) records, written at materialization and refreshed by a
+    debounced sweeper as `vote_aggregates` rows change; Coves folds the
+    counts into its denormalized counters and score. Rationale: every
+    per-vote record would be authored and signed by the bridge anyway,
+    so itemizing votes adds ZERO verifiability over a bridge-asserted
+    aggregate — same authority either way. The field needs no new
+    collection and no voter-identity/DID questions (voter identity now
+    never leaves the bridge, mooting the privacy question), keeps the
+    four-collection e2e whitelist intact, and turns firehose load from
+    one commit per vote into one debounced record update per subject.
+    `getVoteAggregates` demotes to legacy/debug once Coves consumes the
+    field. **Correction (was wrongly called "no Coves trust-model
+    change"): `bridgedStats` IS a new trust surface** — a bridge-asserted
+    vote count Coves folds into its own score — so Coves is gaining a
+    PROVENANCE GATE in a parallel fix (only records from the bridge's DID
+    may carry it; a self-authored `bridgedStats` must be ignored). That
+    gate is the trust-model change this design does require; what it
+    avoids is a NEW COLLECTION and per-voter records.
+  - **Coves-side facts (2026-07-10 investigation) that shaped this:**
+    Coves' post firehose consumer silently DROPS update operations
+    (update handler marked future work) — so a bridged Lemmy post EDIT
+    never re-indexes today (title/content/cid go stale in Coves); the
+    update handler this design needs closes a gap Coves had regardless.
+    Nothing in Coves keys or validates on `posts.cid` for POSTS (votes
+    and viewer-state match by URI), so stats-driven CID churn on a post
+    is safe; unknown record fields parse harmlessly (no lexicon
+    validation on ingest). **Correction (the earlier blanket "CID churn
+    is safe" was wrong for COMMENTS): Coves' comment consumer DOES
+    validate reply strongRef CIDs** — it treats a comment's reply
+    root/parent CIDs as immutable across updates and rejects a changed
+    ref as thread hijacking. A stats stamp on a PARENT post churns that
+    parent's CID, so a later comment edit that re-resolved its reply refs
+    would be rejected permanently. Fixed on the bridge side: a comment
+    rebuild now carries the STORED reply refs forward verbatim (exactly
+    like `bridgedStats`) instead of re-resolving them
+    (`TestCommentEditCarriesReplyRefsForward`); the create path still
+    resolves fresh. `score` is a plain column recomputed imperatively at
+    each vote-consumer write site — making it INCLUSIVE (native +
+    bridged) at every recompute site leaves the hot/top sort expressions,
+    the top-cursor keyset, and `idx_posts_community_score` untouched. The
+    comment consumer already has an update path to ride.
+  - **Baseline/backfill is subsumed by the field**: `bridgedStats` is
+    the unified baseline+live surface (tidepool's `seeded_* + live`
+    recompute feeds it), so external consumers never fold two sources
+    and the re-seed double-count hazard collapses into tidepool's own
+    aggregates. ~~(Flag, still open and independent of this design: the
+    CURRENT seeded+live recompute may already double-count on backfill
+    re-seed — a re-seeded baseline includes federated votes that are
+    also live `vote_events` rows. Verify.)~~ **Verified real and fixed
+    (2026-07-10)**: `SeedAggregates` now stores the baseline NET of the
+    subject's live `vote_events` counts (per direction, clamped at
+    zero, computed under the aggregate row lock), so served totals
+    equal the origin's counts at seed time and every re-seed converges
+    to the origin's truth instead of compounding
+    (`TestReseedDoesNotDoubleCountLiveVotes`). Residual, documented on
+    the method: a vote federating between the origin API fetch and the
+    seed tx under-counts by one until the next re-seed (self-healing;
+    the old code's over-count was permanent and compounding).
+  - **Write-back interaction**: echo suppression is still required —
+    once write-back ships, Lemmy announces the bridge's own
+    written-back Likes back to it, and the aggregator must skip
+    bridge-managed voters or the counts inflate; post-write-back
+    re-seeds must additionally subtract the bridge's own written-back
+    tally (Lemmy's totals will include it). Both are entirely
+    tidepool-side now. Per-voter provenance for write-back comes from
+    native Coves vote records, which is where it always lived.
+  - Declined alternatives, for the record: per-voter repos (a permanent
+    public did:plc per drive-by voter, and every first-time voter's
+    vote queuing behind the MintGate; claiming stays consistent —
+    claimed users' posts already live in community repos, so "claiming
+    doesn't relocate your content" is existing precedent) and
+    community-repo vote records with a `voter` field (a real Coves
+    trust-model change: its vote consumer hard-codes voter = repo DID,
+    `votes.voter_did` has a `^did:` check constraint a raw AP IRI
+    fails, and its create/delete-only consumer would silently ignore a
+    deterministic-rkey flip-as-update — all to buy nothing the
+    bridge-signed aggregate doesn't already provide). Privacy note kept
+    for posterity: Lemmy votes are public enough to bridge (Bridgy
+    Fed's stance, snarfed/bridgy-fed#372; Lemmy federates voter
+    identity to every peer) — but the chosen design publishes no voter
+    identity at all.
+  - **LANDED (emission side): `bridgedStats` rides post/comment records.**
+    Coves' `post.json`/`comment.json` gained an optional `bridgedStats
+    {upvotes, downvotes, asOf}` (`#bridgedStats` def, required all three,
+    ints min 0); synced into tidepool's embedded `lexicons/`. Migration 014
+    adds `vote_aggregates.stats_emitted_at` (nullable per-row watermark). A
+    debounced sweeper (`internal/votes/refresher.go`, `STATS_REFRESH_INTERVAL`
+    30s / `STATS_REFRESH_BATCH` 200) selects rows where `updated_at >
+    stats_emitted_at OR stats_emitted_at IS NULL`, oldest-first, bounded, and
+    for each folds the counts onto the materialized record via
+    `materialize.Materializer.SetBridgedStats` (lexicon-validated,
+    mapping-CID kept in sync, one commit tx). Watermark is set to the
+    `updated_at` READ during the sweep (never now()), so a vote landing
+    mid-sweep re-dirties the row — no lost update. Counts-unchanged emits
+    NOTHING (only `asOf` would churn — not worth a firehose event); a
+    permanent skip (missing/soft-deleted mapping, deleted record →
+    `IsNotFound`, consent-frozen repo → `IsTombstoned`) advances the
+    watermark, a transient error leaves the row dirty for retry.
+    `commitRecord` carries an existing `bridgedStats` forward across a Lemmy
+    EDIT (the rebuild path never emits it), which also keeps an unchanged
+    re-ingest an idempotent no-op. Verified edges: `recomputeAggregate`
+    (hence `SeedAggregates` re-seed AND `ScrubVoter`) sets `updated_at =
+    CURRENT_TIMESTAMP`, so re-seeds and scrubs naturally re-emit corrected
+    counts; seeded-only subjects (no live events) still get a row and still
+    emit. ~~STILL OPEN and untouched here: the seeded+live re-seed
+    double-count flag above (Lemmy's `counts` includes federated votes that
+    are also live `vote_events` rows) — independent of emission.~~ **Closed
+    — see the verified-and-fixed note above (net-of-live seeding).** e2e:
+    `docker-compose.e2e.yml` sets `STATS_REFRESH_INTERVAL=2s`; the refresher
+    now adds one post/comment UPDATE per seeded/voted subject to the
+    firehose, so the restart backfill-redo dedup and the post-unsubscribe
+    negative window exclude `isBridgedStatsUpdate` events deliberately (they
+    are the feature, not a re-commit or a bridging violation), and the
+    zz-sweep lexicon-validates every one.
 
 ## Federation & interop
 
@@ -393,7 +511,11 @@ harness, **(relay)** by task 09's relay pipeline.
 - Baseline-voter drift: a voter counted only in the seeded baseline who
   later flips federates a bare Dislike (no Undo), leaving the baseline
   upvote next to the new live downvote; a clear sends an Undo the live-vote
-  fallback cannot act on (no live row). Counts stale until re-seed.
+  fallback cannot act on (no live row). Counts stale until re-seed — and
+  since the net-of-live seeding fix (2026-07-10), a re-seed genuinely heals
+  the drift (`TestReseedHealsBaselineVoterDrift`); before it, a re-seed
+  re-imported the flipped vote AND kept the live row, making things worse,
+  not better.
 
 ## Materializer (task 05 notes)
 

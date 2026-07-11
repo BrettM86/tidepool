@@ -36,6 +36,14 @@ type APObjects interface {
 	// soft-deleted rows (callers can check IsDeleted to detect tombstones).
 	GetByAPID(ctx context.Context, apID string) (*APObjectMapping, error)
 
+	// DeletedInTx reports whether the mapping for apID is currently
+	// soft-deleted, read ON THE GIVEN TRANSACTION so a commit's side effect
+	// can re-check consent state atomically with its write — the guard that
+	// stops the vote-stats refresher from resurrecting a soft-deleted mapping
+	// (PutMappingTx unconditionally clears deleted_at). A missing mapping is an
+	// error satisfying errors.IsNotFound.
+	DeletedInTx(ctx context.Context, tx *sql.Tx, apID string) (bool, error)
+
 	// GetByATURI returns the mapping for an at-uri, including soft-deleted
 	// rows.
 	GetByATURI(ctx context.Context, atURI string) (*APObjectMapping, error)

@@ -414,7 +414,26 @@ func TestUnsubscribe_StopsBridging(t *testing.T) {
 			continue
 		}
 		if ev.Did == unsSub.DID && ev.TimeUs > preEv.TimeUs {
-			t.Errorf("unsubscribed community repo %s emitted after Undo{Follow}: %s", unsSub.DID, ev)
+			// A trailing bridgedStats UPDATE on an ALREADY-bridged post is the
+			// vote-stats refresher settling seeded counts (SEED_COUNTS_FROM_API
+			// is on), not new content bridged after the Undo{Follow} —
+			// unsubscribe stops NEW content, it does not roll back stats the
+			// aggregates already hold. Tolerated, but ONLY as a pure stats
+			// settle: carry-forward ships the whole record, so a genuine content
+			// change could hide inside a stats-shaped update. Pin the pre-post's
+			// title AND content unchanged so a real edit cannot pass as one.
+			if isBridgedStatsUpdate(ev) {
+				if got, _ := fieldOf(ev.Commit.Record, "title"); got != preTitle {
+					t.Errorf("stats-shaped update on unsubscribed repo %s changed the title to %q (want the pre-post %q): %s",
+						unsSub.DID, got, preTitle, ev)
+				}
+				if got, _ := fieldOf(ev.Commit.Record, "content"); got != "flows while subscribed" {
+					t.Errorf("stats-shaped update on unsubscribed repo %s changed the content to %q (want the pre-post body): %s",
+						unsSub.DID, got, ev)
+				}
+			} else {
+				t.Errorf("unsubscribed community repo %s emitted after Undo{Follow}: %s", unsSub.DID, ev)
+			}
 		}
 		if got, _ := fieldOf(ev.Commit.Record, "title"); got == deadTitle {
 			t.Errorf("post in unsubscribed community reached the firehose: %s", ev)

@@ -325,10 +325,12 @@ func TestSeedAggregates(t *testing.T) {
 	assert.Equal(t, 41, up)
 	assert.Equal(t, 3, down)
 
-	// Re-seeding (backfill redo) replaces the baseline and keeps live votes.
+	// Re-seeding (backfill redo) replaces the baseline. The origin's counts
+	// are a TOTAL that already includes Alice's live vote, so the served
+	// totals must equal them — not add her again.
 	require.NoError(t, agg.SeedAggregates(ctx, subjectPost, 50, 5))
 	up, down, _ = counts(t, database, subjectPost)
-	assert.Equal(t, 51, up)
+	assert.Equal(t, 50, up, "a re-seed must not double-count live votes")
 	assert.Equal(t, 5, down)
 
 	// The served at-uri is the mapping's.
@@ -346,13 +348,110 @@ func TestSeedAggregatesBeforeLiveVotesFoldsThem(t *testing.T) {
 	ctx := context.Background()
 
 	// A live vote lands BEFORE the seed (announce raced the backfill): the
-	// seed must fold it in, not clobber it.
+	// seed must not clobber the live row — and must not count it twice
+	// either. Lemmy counted Alice's vote before announcing it, so the
+	// fetched total (10 up) already includes her.
 	require.NoError(t, agg.ApplyVote(ctx, like(activityID(t, 1), voterAlice, subjectPost), ""))
 	require.NoError(t, agg.SeedAggregates(ctx, subjectPost, 10, 1))
 
 	up, down, _ := counts(t, database, subjectPost)
-	assert.Equal(t, 11, up)
+	assert.Equal(t, 10, up, "the origin total already includes the live vote")
 	assert.Equal(t, 1, down)
+
+	// Alice clears her vote: the live row is undone, and her upvote must
+	// leave the served totals exactly once (it is no longer subtracted from
+	// the baseline once it is not live).
+	require.NoError(t, agg.RetractVote(ctx, like(activityID(t, 1), voterAlice, subjectPost), ""))
+	up, down, _ = counts(t, database, subjectPost)
+	assert.Equal(t, 9, up)
+	assert.Equal(t, 1, down)
+}
+
+// TestReseedDoesNotDoubleCountLiveVotes pins the backfill re-seed contract:
+// votes that federated live between two seeds appear in BOTH the origin's
+// fetched totals and vote_events, and must be served exactly once. Before
+// the net-of-live subtraction, every re-seed re-imported the live voters
+// into the baseline and the recompute added them again — compounding on
+// each subsequent redo.
+func TestReseedDoesNotDoubleCountLiveVotes(t *testing.T) {
+	database := testDB(t)
+	agg, objects := testAggregator(t, database)
+	bridgeSubject(t, objects, subjectPost, "3jzfcijpj2z2a")
+	ctx := context.Background()
+
+	// Initial backfill: the post has 10 up / 0 down of pre-subscribe history.
+	require.NoError(t, agg.SeedAggregates(ctx, subjectPost, 10, 0))
+
+	// Live federation since: two upvotes and a downvote. Lemmy's own counts
+	// are now 12 up / 1 down.
+	require.NoError(t, agg.ApplyVote(ctx, like(activityID(t, 1), voterAlice, subjectPost), ""))
+	require.NoError(t, agg.ApplyVote(ctx, like(activityID(t, 2), voterBob, subjectPost), ""))
+	require.NoError(t, agg.ApplyVote(ctx, dislike(activityID(t, 3), voterCarol, subjectPost), ""))
+	up, down, _ := counts(t, database, subjectPost)
+	require.Equal(t, 12, up)
+	require.Equal(t, 1, down)
+
+	// Backfill redo re-seeds with the origin's current totals. Served counts
+	// must match them exactly, not 14/2.
+	require.NoError(t, agg.SeedAggregates(ctx, subjectPost, 12, 1))
+	up, down, _ = counts(t, database, subjectPost)
+	assert.Equal(t, 12, up, "re-seed must not re-import live voters into the baseline")
+	assert.Equal(t, 1, down)
+
+	// And it must be idempotent: another redo with unchanged origin totals
+	// changes nothing (no compounding).
+	require.NoError(t, agg.SeedAggregates(ctx, subjectPost, 12, 1))
+	up, down, _ = counts(t, database, subjectPost)
+	assert.Equal(t, 12, up)
+	assert.Equal(t, 1, down)
+}
+
+// TestReseedHealsBaselineVoterDrift: a voter counted only in the seeded
+// baseline who flips federates a bare Dislike (Lemmy sends no Undo on
+// flips), leaving the retired upvote in the baseline next to the new live
+// downvote. Accepted drift while it lasts — but a re-seed must converge the
+// served totals back to the origin's truth, which the raw-overwrite seed
+// never did (it re-imported the flipped vote AND kept the live row).
+func TestReseedHealsBaselineVoterDrift(t *testing.T) {
+	database := testDB(t)
+	agg, objects := testAggregator(t, database)
+	bridgeSubject(t, objects, subjectPost, "3jzfcijpj2z2a")
+	ctx := context.Background()
+
+	// Alice's pre-subscribe upvote is part of the 10/0 baseline.
+	require.NoError(t, agg.SeedAggregates(ctx, subjectPost, 10, 0))
+
+	// She flips: a bare Dislike, no Undo. Known drift — her baseline upvote
+	// lingers next to the live downvote (Lemmy's truth is 9/1).
+	require.NoError(t, agg.ApplyVote(ctx, dislike(activityID(t, 1), voterAlice, subjectPost), ""))
+	up, down, _ := counts(t, database, subjectPost)
+	require.Equal(t, 10, up)
+	require.Equal(t, 1, down)
+
+	// Re-seed with the origin's current totals: served counts converge.
+	require.NoError(t, agg.SeedAggregates(ctx, subjectPost, 9, 1))
+	up, down, _ = counts(t, database, subjectPost)
+	assert.Equal(t, 9, up, "re-seed must heal baseline-voter drift")
+	assert.Equal(t, 1, down)
+}
+
+// TestSeedAggregatesClampsBaselineAtZero: an origin reporting totals LOWER
+// than the bridge's live counts (author auto-upvote asymmetry, an origin
+// that lost votes, a hostile API) must clamp the derived baseline at zero
+// per direction — never go negative — and the live counts still serve.
+func TestSeedAggregatesClampsBaselineAtZero(t *testing.T) {
+	database := testDB(t)
+	agg, objects := testAggregator(t, database)
+	bridgeSubject(t, objects, subjectPost, "3jzfcijpj2z2a")
+	ctx := context.Background()
+
+	require.NoError(t, agg.ApplyVote(ctx, like(activityID(t, 1), voterAlice, subjectPost), ""))
+	require.NoError(t, agg.ApplyVote(ctx, like(activityID(t, 2), voterBob, subjectPost), ""))
+	require.NoError(t, agg.SeedAggregates(ctx, subjectPost, 1, 0))
+
+	up, down, _ := counts(t, database, subjectPost)
+	assert.Equal(t, 2, up, "live votes serve even when the origin under-reports")
+	assert.Equal(t, 0, down)
 }
 
 func TestSeedAggregatesUnbridgedSubjectDropped(t *testing.T) {

@@ -247,16 +247,19 @@ func (m *Materializer) commitRecord(ctx context.Context, did, collection, rkey s
 	// layer clears the tombstone explicitly on an Undo(Delete)/restore, and
 	// its ap_tombstones marker covers the delete-before-create ordering
 	// (a Delete for a never-materialized object).
+	//
+	// carryForward marks the update path for a live post/comment mapping: only
+	// there does the rebuild carry fields it cannot reconstruct forward
+	// (bridgedStats, and comments' reply refs), and only there does the commit
+	// need the optimistic-concurrency guard against a racing stats stamp.
+	carryForward := false
 	if existing, err := m.objects.GetByAPID(ctx, obj.ID); err == nil {
 		if existing.IsDeleted() {
 			return nil, skip(obj.ID, "object was deleted upstream; not resurrecting")
 		}
+		carryForward = collection == CollectionPost || collection == CollectionComment
 	} else if !errors.IsNotFound(err) {
 		return nil, fmt.Errorf("materialize: check mapping for %s: %w", obj.ID, err)
-	}
-
-	if err := m.validateRecord(record); err != nil {
-		return nil, err
 	}
 
 	mapping := store.APObjectMapping{
@@ -275,29 +278,108 @@ func (m *Materializer) commitRecord(ctx context.Context, did, collection, rkey s
 	}
 
 	var stored *store.APObjectMapping
-	res, err := m.repos.PutRecordTx(ctx, did, collection, rkey, record,
-		func(ctx context.Context, tx *sql.Tx, res *repo.CommitResult) error {
-			mapping.CID = res.RecordCID
-			var mapErr error
-			stored, mapErr = m.objects.PutMappingTx(ctx, tx, mapping)
-			if mapErr != nil {
-				if errors.IsAlreadyExists(mapErr) {
-					// A different AP id already claimed this at-uri: a
-					// deterministic TID collision (near-impossible after the
-					// hash-filled-micros change; see repo.DeterministicTID).
-					// Loud by design — this is a bug signal, and failing here
-					// now rolls the record write back with it.
-					m.logger.Error("deterministic rkey collision: different ap_id claimed the same at-uri",
-						"ap_id", obj.ID, "did", did, "collection", collection, "rkey", rkey)
-				}
-				return fmt.Errorf("materialize: map %s: %w", obj.ID, mapErr)
+	putMapping := func(ctx context.Context, tx *sql.Tx, res *repo.CommitResult) error {
+		mapping.CID = res.RecordCID
+		var mapErr error
+		stored, mapErr = m.objects.PutMappingTx(ctx, tx, mapping)
+		if mapErr != nil {
+			if errors.IsAlreadyExists(mapErr) {
+				// A different AP id already claimed this at-uri: a
+				// deterministic TID collision (near-impossible after the
+				// hash-filled-micros change; see repo.DeterministicTID).
+				// Loud by design — this is a bug signal, and failing here
+				// now rolls the record write back with it.
+				m.logger.Error("deterministic rkey collision: different ap_id claimed the same at-uri",
+					"ap_id", obj.ID, "did", did, "collection", collection, "rkey", rkey)
 			}
-			return nil
-		})
-	if err != nil {
-		return nil, fmt.Errorf("materialize: put %s/%s/%s for %s: %w", did, collection, rkey, obj.ID, err)
+			return fmt.Errorf("materialize: map %s: %w", obj.ID, mapErr)
+		}
+		return nil
 	}
-	return &Result{DID: did, ATURI: stored.ATURI, CID: res.RecordCID, NoOp: res.NoOp}, nil
+
+	if !carryForward {
+		// Create, or a profile update: no read-modify-write, so no precondition
+		// — an idempotent re-put must still reach the repo's NoOp path.
+		if err := m.validateRecord(record); err != nil {
+			return nil, err
+		}
+		res, err := m.repos.PutRecordTx(ctx, did, collection, rkey, record, putMapping)
+		if err != nil {
+			return nil, fmt.Errorf("materialize: put %s/%s/%s for %s: %w", did, collection, rkey, obj.ID, err)
+		}
+		return &Result{DID: did, ATURI: stored.ATURI, CID: res.RecordCID, NoOp: res.NoOp}, nil
+	}
+
+	// Update path: carry forward the fields the AP rebuild cannot reconstruct,
+	// under a CAS precondition on the stored record's CID. If a concurrent
+	// stats stamp (or another edit) changed the record between the read and the
+	// commit, the commit fails ErrPreconditionFailed and we re-read and retry —
+	// so an edit can neither drop a just-committed stamp nor churn reply refs a
+	// stats stamp already moved.
+	for attempt := 0; ; attempt++ {
+		expectPrevCID, cerr := m.carryForwardFields(ctx, did, collection, rkey, record, obj, attempt)
+		if cerr != nil {
+			return nil, cerr
+		}
+		if err := m.validateRecord(record); err != nil {
+			return nil, err
+		}
+		res, err := m.repos.PutRecordCAS(ctx, did, collection, rkey, record, expectPrevCID, putMapping)
+		if stderrors.Is(err, repo.ErrPreconditionFailed) {
+			if attempt+1 < maxStatsCommitAttempts {
+				continue
+			}
+			return nil, fmt.Errorf("materialize: put %s: record kept changing across %d attempts: %w", obj.ID, maxStatsCommitAttempts, err)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("materialize: put %s/%s/%s for %s: %w", did, collection, rkey, obj.ID, err)
+		}
+		return &Result{DID: did, ATURI: stored.ATURI, CID: res.RecordCID, NoOp: res.NoOp}, nil
+	}
+}
+
+// carryForwardFields folds the fields a Lemmy rebuild cannot reconstruct out of
+// the currently-stored record onto the freshly-built one, and returns the
+// stored record's CID for use as the commit's CAS precondition:
+//
+//   - bridgedStats: the vote-stats refresher writes it; the rebuild never
+//     does. Dropping it would lose the counts until the next sweep and mint a
+//     needless firehose event (breaking idempotent re-ingest).
+//   - reply (comments only): Coves' comment consumer treats reply root/parent
+//     strongRef CIDs as IMMUTABLE across updates, but a stats stamp on the
+//     parent churns its CID — so re-resolving would hand Coves changed refs it
+//     rejects as thread hijacking. Carrying the stored refs verbatim keeps the
+//     thread anchoring stable across edits. The CREATE path still resolves
+//     fresh refs (this runs only for a live existing mapping).
+//
+// A record absent on the FIRST attempt is the crash window between a delete
+// commit and its soft-delete: let the rebuild stand as a guarded create
+// (expectCID ""). Absent on a RETRY means it was deleted concurrently — skip
+// rather than resurrect it.
+func (m *Materializer) carryForwardFields(ctx context.Context, did, collection, rkey string, record map[string]any, obj *ap.Object, attempt int) (expectPrevCID string, err error) {
+	stored, storedCID, rerr := m.repos.GetRecord(ctx, did, collection, rkey)
+	switch {
+	case rerr == nil:
+		if stats, ok := stored[bridgedStatsField]; ok {
+			record[bridgedStatsField] = stats
+		} else {
+			delete(record, bridgedStatsField) // clear any carried by a prior attempt
+		}
+		if collection == CollectionComment {
+			if reply, ok := stored["reply"]; ok {
+				record["reply"] = reply
+			}
+		}
+		return storedCID, nil
+	case errors.IsNotFound(rerr):
+		if attempt > 0 {
+			return "", skip(obj.ID, "record deleted concurrently during rebuild; not resurrecting")
+		}
+		delete(record, bridgedStatsField)
+		return "", nil
+	default:
+		return "", fmt.Errorf("materialize: read record for carry-forward %s: %w", obj.ID, rerr)
+	}
 }
 
 // validateRecord checks the record against the vendored Coves lexicons —
@@ -345,6 +427,20 @@ func jsonRoundTrip(record map[string]any) (map[string]any, error) {
 // (RFC3339, UTC, millisecond precision — Coves parses with time.RFC3339).
 func recordDatetime(t time.Time) string {
 	return t.UTC().Format("2006-01-02T15:04:05.000Z")
+}
+
+// recordDatetimeMicros renders a timestamp at MICROSECOND precision — the
+// resolution vote_aggregates.updated_at (a postgres timestamptz) actually
+// carries. bridgedStats.asOf uses this, not recordDatetime's millisecond
+// dialect: two distinct aggregate versions landing in the same millisecond
+// (concurrent voters under clock_timestamp()) would otherwise serialize to
+// EQUAL asOf strings, letting a newer-or-equal consumer guard and the
+// watermark bookkeeping conflate them. atproto's datetime format permits
+// fractional-second digits, so six is as valid as three; createdAt keeps its
+// existing millisecond dialect (its source `published` time is only that
+// precise, and Coves already parses it).
+func recordDatetimeMicros(t time.Time) string {
+	return t.UTC().Format("2006-01-02T15:04:05.000000Z")
 }
 
 // recordRKey derives the deterministic record key for an AP object,

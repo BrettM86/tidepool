@@ -99,7 +99,8 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	repoManager, err := repo.NewManager(database, identity.NewActorKeys(actors, custodian), logger)
+	repoManager, err := repo.NewManager(database, identity.NewActorKeys(actors, custodian), logger,
+		repo.WithTreeCacheSize(cfg.MSTCacheSize))
 	if err != nil {
 		return err
 	}
@@ -127,6 +128,11 @@ func run(logger *slog.Logger) error {
 	// Firehose retention: prune events older than FIREHOSE_RETENTION so the
 	// replay window (and the table) stays bounded.
 	go tidepoolsync.RunPruner(ctx, repoManager, cfg.FirehoseRetention, 0, logger)
+	// Blocks GC (task 12): reclaim head-unreachable blocks older than
+	// BLOCKS_GC_RETENTION (the invariant lives in internal/repo/gc.go). A
+	// sweep walks every repo's live MST — heavier than the row pruners — so
+	// it runs every 6h instead of the runner's hourly default.
+	go prune.Run(ctx, "blocks(unreachable)", cfg.BlocksGCRetention, 6*time.Hour, repoManager.GCBlocks, logger)
 
 	// Ask configured relays to crawl us. Development hosts are not publicly
 	// reachable, so dev only logs what it would have sent (never touches a

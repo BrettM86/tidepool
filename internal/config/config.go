@@ -131,6 +131,17 @@ type Config struct {
 	// duration, default 2160h = 90 days). Live rows are never pruned; see
 	// votes.PruneUndoneEvents for the replay-dedupe trade-off.
 	VoteEventRetention time.Duration
+	// BlocksGCRetention is how long superseded (head-unreachable) repo
+	// blocks are kept before the GC sweep reclaims them (BLOCKS_GC_RETENTION,
+	// a Go duration, default 72h). The window doubles as the sweep's race
+	// guard against concurrent commits — see internal/repo/gc.go — so it
+	// must stay far above one sweep's duration (seconds); days is right.
+	BlocksGCRetention time.Duration
+	// MSTCacheSize is the per-DID MST tree cache's entry cap (MST_CACHE_SIZE,
+	// default 512, must be positive). Each entry is one repo's fully decoded
+	// live tree, so memory scales with the cached repos' sizes; operators
+	// bridging many very large communities tune this down.
+	MSTCacheSize int
 	// Inbox admission control (task 11): per-client-IP and per-verified-
 	// signer token buckets on POST /inbox, plus the dedicated tighter cap
 	// on the tombstoned-self-delete confirmation branch. All are generous
@@ -328,6 +339,16 @@ func Load(logger *slog.Logger) (*Config, error) {
 		return nil, err
 	}
 	cfg.VoteEventRetention, err = durationVar(logger, "VOTE_EVENT_RETENTION", 2160*time.Hour)
+	if err != nil {
+		return nil, err
+	}
+	cfg.BlocksGCRetention, err = durationVar(logger, "BLOCKS_GC_RETENTION", 72*time.Hour)
+	if err != nil {
+		return nil, err
+	}
+	// 512 mirrors repo.DefaultTreeCacheSize (importing repo here would point
+	// the dependency the wrong way); if one moves, move the other.
+	cfg.MSTCacheSize, err = intVar(logger, "MST_CACHE_SIZE", 512)
 	if err != nil {
 		return nil, err
 	}

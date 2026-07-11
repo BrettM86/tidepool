@@ -42,7 +42,7 @@ var (
 // database fails loudly (skipping every postgres-backed test would let the
 // suite go green while testing nothing). `make test` starts the
 // postgres-test container and sets the variable.
-func DB(t *testing.T) *sql.DB {
+func DB(t testing.TB) *sql.DB {
 	t.Helper()
 
 	databaseURL := os.Getenv("TIDEPOOL_TEST_DATABASE_URL")
@@ -83,7 +83,7 @@ func DB(t *testing.T) *sql.DB {
 
 // Truncate empties the given tables and resets their sequences, so a test
 // starts from a clean slate.
-func Truncate(t *testing.T, conn *sql.DB, tables ...string) {
+func Truncate(t testing.TB, conn *sql.DB, tables ...string) {
 	t.Helper()
 	if len(tables) == 0 {
 		return

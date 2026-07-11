@@ -1,8 +1,10 @@
 package sync
 
 import (
+	"context"
 	"encoding/json"
 	"expvar"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -89,6 +91,11 @@ type Server struct {
 	// shrinks the kernel send buffer so the write deadline is reachable
 	// without megabytes of backlog. Never set in production.
 	onUpgrade func(*websocket.Conn)
+
+	// exportCAR streams a DID's repo as a CAR; always repo.ExportCARTo in
+	// production. Test seam: the getRepo mid-stream-failure tests substitute
+	// exporters that fail before and after the first byte.
+	exportCAR func(ctx context.Context, did string, w io.Writer) error
 }
 
 // Options configures NewServer. Repo and Broadcaster are required; Hostname
@@ -164,6 +171,7 @@ func NewServer(opts Options) (*Server, error) {
 	}
 	s.limiter = ratelimit.New(perSecond, burst)
 	s.refusalLog = ratelimit.NewSampler(time.Second)
+	s.exportCAR = s.repo.ExportCARTo
 	s.maxSubscribers = int64(opts.MaxSubscribers)
 	if s.maxSubscribers <= 0 {
 		s.maxSubscribers = defaultMaxSubscribers
@@ -234,31 +242,74 @@ func (s *Server) loadActiveRepo(w http.ResponseWriter, r *http.Request) *repo.Re
 	return info
 }
 
-// handleGetRepo serves com.atproto.sync.getRepo: the full repo as a CARv1
-// stream. The optional `since` parameter (diff export) is not implemented —
-// consumers that need incremental sync use subscribeRepos; a `since` request
-// gets the full CAR, which the spec permits (extra blocks are legal).
+// handleGetRepo serves com.atproto.sync.getRepo: the repo as a CARv1 stream.
+// The CAR is streamed block-by-block (ExportCARTo) so a large community repo
+// never buffers whole in memory, and it carries only the reachable set from
+// the current head (commit + live MST + record blocks) — correct CAR readers
+// (indigo, bigsky) traverse from the root, so omitting superseded blocks is
+// transparent.
 //
-// NOTE: until block GC exists the export includes historical (unreachable)
-// blocks. CAR consumers traverse from the root commit, so extra blocks are
-// harmless — Jetstream and indigo's LoadRepoFromCAR both tolerate them — and
-// a minimal reachable-set walk over large community repos would cost far
-// more than it saves at bridge scale. Revisit alongside block GC.
+// The optional `since` parameter (diff export) is not implemented — consumers
+// that need incremental sync use subscribeRepos; a `since` request gets the
+// full CAR, which the spec permits.
+//
+// Streaming means the response status cannot change once the first block is
+// written: existence/consent were already checked by loadActiveRepo, and a
+// missing repo (delete race) or unreadable/undecodable head commit fails
+// before the first byte — the countingWriter lets those still send a proper
+// XRPC error (404 RepoNotFound for the vanished repo, 500 otherwise). A
+// failure during the reachable walk happens mid-stream: returning normally
+// would let the server write the terminating chunk and hand the client a
+// transport-complete 200 wrapping a silently truncated CAR (block-boundary
+// truncation is invisible at both the HTTP and CAR-framing layers), so the
+// handler aborts the connection instead and the client sees a transport-level
+// failure. The exception is the client's own disconnect, which is logged
+// quietly and otherwise ignored.
 func (s *Server) handleGetRepo(w http.ResponseWriter, r *http.Request) {
 	info := s.loadActiveRepo(w, r)
 	if info == nil {
 		return
 	}
-	carBytes, err := s.repo.ExportCAR(r.Context(), info.DID)
-	if err != nil {
+	w.Header().Set("Content-Type", "application/vnd.ipld.car")
+	cw := &countingWriter{w: w}
+	err := s.exportCAR(r.Context(), info.DID, cw)
+	switch {
+	case err == nil:
+	case r.Context().Err() != nil:
+		// The client hung up mid-download. Routine on a public sync surface;
+		// keep it out of the Error stream so real export failures stay
+		// visible above the disconnect noise.
+		s.logger.Debug("sync: export CAR abandoned by client", "did", info.DID, "wrote", cw.n, "error", err)
+	case cw.n == 0 && errors.IsNotFound(err):
+		// The repo vanished between loadActiveRepo and the export; nothing
+		// has been written yet, so the same 404 the earlier existence check
+		// produces is still deliverable.
+		writeXRPCError(w, http.StatusNotFound, "RepoNotFound", "repo not found: "+info.DID)
+	case cw.n == 0:
 		s.logger.Error("sync: export CAR", "did", info.DID, "error", err)
 		writeXRPCError(w, http.StatusInternalServerError, "InternalServerError", "internal error")
-		return
+	default:
+		// Bytes are already on the wire: the 200 cannot be revoked, and a
+		// normal return would let the server finish the chunked body around
+		// a truncated CAR. Reset the connection so the truncation is visible
+		// at the transport layer; http.ErrAbortHandler is the stdlib's
+		// sanctioned abort (its stack trace is suppressed).
+		s.logger.Error("sync: export CAR failed mid-stream", "did", info.DID, "wrote", cw.n, "error", err)
+		panic(http.ErrAbortHandler)
 	}
-	w.Header().Set("Content-Type", "application/vnd.ipld.car")
-	w.Header().Set("Content-Length", strconv.Itoa(len(carBytes)))
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(carBytes)
+}
+
+// countingWriter tracks whether any bytes have reached the client, so a
+// streaming handler knows whether it can still send an HTTP error status.
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+	return n, err
 }
 
 // handleGetLatestCommit serves com.atproto.sync.getLatestCommit.

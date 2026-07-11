@@ -210,6 +210,8 @@ production**:
 | `SEED_COUNTS_FROM_API` | on | seed backfilled posts' vote aggregates from the origin instance's public API (`/api/v3/post` `counts`); set `0` to disable |
 | `TOMBSTONE_RETENTION` | `720h` | how long `ap_tombstones` markers (the delete-before-create guard) are kept before the hourly pruner reclaims them |
 | `VOTE_EVENT_RETENTION` | `2160h` | how long **undone** (superseded/retracted) `vote_events` rows are kept; live rows are the counts and are never pruned |
+| `BLOCKS_GC_RETENTION` | `72h` | how long superseded (head-unreachable) repo blocks are kept before the GC sweep (every 6h) reclaims them; the window doubles as the sweep's race guard, so keep it far above sweep duration — and comfortably above any app↔DB clock skew plus the sweep's compute→delete gap, since the cutoff comes from the app clock while `created_at` refreshes use the DB clock (see `internal/repo/gc.go`) |
+| `MST_CACHE_SIZE` | `512` | per-DID MST tree cache entry cap (repos held as decoded in-memory trees on the commit path); memory scales with the cached repos' sizes, tune down when bridging many very large communities |
 | `INBOX_IP_RATE_PER_SECOND` / `INBOX_IP_RATE_BURST` | `50` / `200` | per-client-IP token bucket on `POST /inbox` (refusals are 503 — retryable for federation queues) |
 | `INBOX_SIGNER_RATE_PER_SECOND` / `INBOX_SIGNER_RATE_BURST` | `20` / `100` | per-verified-signer token bucket on `POST /inbox` |
 | `INBOX_TOMBSTONE_CONFIRMS_PER_MINUTE` / `INBOX_TOMBSTONE_CONFIRM_BURST` | `6` / `10` | dedicated per-IP cap on the tombstoned-self-delete confirmation branch (an unauthenticated POST that costs an outbound fetch + durable writes); over-limit deliveries defer (503) so legitimate deletions redeliver |

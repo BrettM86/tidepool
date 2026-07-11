@@ -90,11 +90,31 @@ type Manager struct {
 	// locks is never evicted: it is bounded by the number of bridged
 	// actors, and a stale mutex per DID is 8 bytes of pointer.
 	locks map[string]*sync.Mutex
+
+	// treeCache holds decoded MST trees per DID so the common commit path
+	// skips the O(repo size) full-tree reload (one SELECT per node). Only
+	// the write path touches it, and only under the per-DID lock — see
+	// treecache.go for the coherence model.
+	treeCache *mstTreeCache
+}
+
+// Option customizes a Manager at construction. Options are additive; the
+// zero-option NewManager keeps the previous behavior with a default-sized MST
+// tree cache.
+type Option func(*Manager)
+
+// WithTreeCacheSize sets the maximum number of per-DID MST trees held in
+// memory (LRU eviction beyond it). Passing n <= 0 disables the cache
+// entirely (correct, just unoptimized). Only OMITTING the option uses
+// DefaultTreeCacheSize — there is no in-band "default" value.
+func WithTreeCacheSize(n int) Option {
+	return func(m *Manager) { m.treeCache = newTreeCache(n) }
 }
 
 // NewManager builds the repo manager. db and keys must be non-nil; a nil
-// logger falls back to slog.Default().
-func NewManager(db *sql.DB, keys SigningKeys, logger *slog.Logger) (*Manager, error) {
+// logger falls back to slog.Default(). Without options it uses an MST tree
+// cache of DefaultTreeCacheSize entries.
+func NewManager(db *sql.DB, keys SigningKeys, logger *slog.Logger, opts ...Option) (*Manager, error) {
 	if db == nil {
 		return nil, errors.NewValidationError("db", "must not be nil")
 	}
@@ -104,12 +124,17 @@ func NewManager(db *sql.DB, keys SigningKeys, logger *slog.Logger) (*Manager, er
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Manager{
-		db:     db,
-		keys:   keys,
-		logger: logger,
-		locks:  make(map[string]*sync.Mutex),
-	}, nil
+	m := &Manager{
+		db:        db,
+		keys:      keys,
+		logger:    logger,
+		locks:     make(map[string]*sync.Mutex),
+		treeCache: newTreeCache(DefaultTreeCacheSize),
+	}
+	for _, opt := range opts {
+		opt(m)
+	}
+	return m, nil
 }
 
 // CommitResult reports what a successful PutRecord/DeleteRecord did.
@@ -181,13 +206,16 @@ func (m *Manager) GetRecord(ctx context.Context, did, collection, rkey string) (
 		return nil, "", err
 	}
 
-	// Note this tx runs READ COMMITTED, i.e. per-statement snapshots — it
-	// does NOT freeze one snapshot across the reads below. Consistency
-	// actually rests on blocks being content-addressed and append-only:
-	// once the head pointer is read, every block it references is immutable
-	// and present. Future block GC must preserve that property for any head
-	// a reader may still hold.
-	tx, err := m.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	// This tx runs REPEATABLE READ: one snapshot frozen at the first read
+	// below, so head and every block reachable from it come from a single
+	// consistent point in time. Blocks are content-addressed and append-only,
+	// so once the head is read every block it references is present — and the
+	// snapshot makes that hold even against a concurrent blocks GC: a GC
+	// DELETE that commits after this snapshot is invisible here, and a GC that
+	// committed before it only removed blocks unreachable from a head at or
+	// after this snapshot's head (see GCBlocks). Either way the walk sees a
+	// complete tree.
+	tx, err := m.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true, Isolation: sql.LevelRepeatableRead})
 	if err != nil {
 		return nil, "", fmt.Errorf("repo: begin read tx: %w", err)
 	}
@@ -308,12 +336,23 @@ func (m *Manager) commitWrite(ctx context.Context, did, collection, rkey string,
 		tree = &empty
 	} else {
 		prevRev = state.rev
-		var headData cid.Cid
-		tree, headData, err = loadTree(ctx, tx, did, state.headCID)
-		if err != nil {
-			return nil, err
+		// Fast path: reuse the in-memory tree for this head if it is cached.
+		// take() detaches the entry; it is re-cached only under a
+		// durably-committed head (the successful-commit and NoOp paths below),
+		// so a commit that errors or rolls back leaves no cached tree and the
+		// next commit reloads a correct one from postgres.
+		if cached, root, ok := m.treeCache.take(did, state.headCID); ok {
+			tree = cached
+			headData := root
+			prevData = &headData
+		} else {
+			var headData cid.Cid
+			tree, headData, err = loadTree(ctx, tx, did, state.headCID)
+			if err != nil {
+				return nil, err
+			}
+			prevData = &headData
 		}
-		prevData = &headData
 	}
 
 	// Note: indigo's mst.Tree.Remove returns (nil, nil) for a missing key —
@@ -335,6 +374,14 @@ func (m *Manager) commitWrite(ctx context.Context, did, collection, rkey string,
 			CommitCID: state.headCID,
 			Rev:       prevRev,
 			NoOp:      true,
+		}
+		// Re-cache the (unmodified) tree under the unchanged head: an
+		// identical re-put is an indigo no-op that leaves the tree untouched,
+		// so it still exactly represents state.headCID / *prevData. The
+		// repo_state head is unchanged whatever the side-effect tx does, so
+		// caching here is valid even if the write-free commit below fails.
+		if prevData != nil {
+			m.cacheTree(did, state.headCID, *prevData, tree)
 		}
 		if sideEffect != nil {
 			// The side effect still runs (bookkeeping refresh) and must still
@@ -399,8 +446,16 @@ func (m *Manager) commitWrite(ctx context.Context, did, collection, rkey string,
 	}
 
 	for _, blk := range newBlocks.ordered() {
+		// ON CONFLICT refreshes created_at rather than DO NOTHING: blocks are
+		// content-addressed so the bytes are identical, but the timestamp is
+		// the GC retention floor (see gc.go). A block re-written by this commit
+		// — e.g. an MST node whose CID reappears after churn — must read as
+		// "written now" so the GC floor protects it even if an in-flight sweep
+		// computed it as unreachable from an older head. Refreshing created_at
+		// can only make GC MORE conservative, never delete a live block sooner.
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO blocks (did, cid, bytes) VALUES ($1, $2, $3) ON CONFLICT (did, cid) DO NOTHING`,
+			`INSERT INTO blocks (did, cid, bytes) VALUES ($1, $2, $3)
+			 ON CONFLICT (did, cid) DO UPDATE SET created_at = clock_timestamp()`,
 			did, blk.Cid().String(), blk.RawData()); err != nil {
 			return nil, fmt.Errorf("repo: store block %s: %w", blk.Cid(), err)
 		}
@@ -451,9 +506,26 @@ func (m *Manager) commitWrite(ctx context.Context, did, collection, rkey string,
 		return nil, fmt.Errorf("repo: commit tx for %s: %w", did, err)
 	}
 
+	// The commit is durable: the mutated tree now exactly represents the new
+	// head, so cache it for the next commit (skips a full-tree reload). Cached
+	// only after a successful Commit — never for a rolled-back write.
+	m.cacheTree(did, commitCID.String(), *newRoot, tree)
+
 	m.logger.Debug("repo commit",
 		"did", did, "rev", rev.String(), "commit", commitCID.String(), "path", path, "seq", seq)
 	return res, nil
+}
+
+// cacheTree installs a decoded tree into the per-DID MST cache for reuse by the
+// next commit. head/root MUST be the durably-committed head and its MST root.
+// A partial tree (a block was missing at load, leaving CID stubs) is never
+// cached — a later mutation would need to fault those stubs in from a store
+// that is no longer available.
+func (m *Manager) cacheTree(did, head string, root cid.Cid, tree *mst.Tree) {
+	if tree == nil || tree.IsPartial() {
+		return
+	}
+	m.treeCache.put(did, head, root, tree)
 }
 
 // lockFor returns the per-DID write mutex, creating it on first use.

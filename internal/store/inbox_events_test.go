@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -140,4 +141,64 @@ func TestInboxEvents_GetEventMissing(t *testing.T) {
 
 	_, err := repo.GetEvent(ctx, "https://lemmy.world/activities/missing")
 	assert.True(t, errors.IsNotFound(err), "expected IsNotFound, got %v", err)
+}
+
+// TestInboxEvents_DeepBacklogDoesNotBlockOtherKeys pins the task-12 claim
+// query's semantics AND its reason to exist: a community whose head is
+// backing off hides its (arbitrarily deep) younger backlog without hiding
+// other keys, and once the head becomes claimable it wins again in id order.
+// The old NOT EXISTS scan gave the same answers in O(backlog) per claim; the
+// skip-scan gives them in O(pending keys) — the answers must not move.
+func TestInboxEvents_DeepBacklogDoesNotBlockOtherKeys(t *testing.T) {
+	database := testDB(t)
+	repo := NewInboxEvents(database)
+	ctx := context.Background()
+
+	const backlog = 500
+	const bigKey = "https://lemmy.world/c/big"
+	for i := 0; i < backlog; i++ {
+		_, err := repo.Enqueue(ctx, InboxEvent{
+			ActivityID:  fmt.Sprintf("%s/big/%d", testActivityID, i),
+			Type:        "Announce",
+			OrderingKey: bigKey,
+		})
+		require.NoError(t, err)
+	}
+	_, err := repo.Enqueue(ctx, InboxEvent{
+		ActivityID:  testActivityID + "/small",
+		Type:        "Announce",
+		OrderingKey: "https://lemmy.world/c/small",
+	})
+	require.NoError(t, err)
+
+	// Claim the big community's head and put it into backoff — the classic
+	// failing-event pileup.
+	head, err := repo.ClaimNext(ctx, time.Minute)
+	require.NoError(t, err)
+	assert.Equal(t, bigKey, head.OrderingKey)
+	applied, err := repo.Release(ctx, head.ActivityID, "transient failure",
+		time.Now().Add(time.Hour), *head.ClaimedUntil)
+	require.NoError(t, err)
+	require.True(t, applied)
+
+	// The 499 younger big-community events are invisible; the other key's
+	// event is the only claimable one.
+	small, err := repo.ClaimNext(ctx, time.Minute)
+	require.NoError(t, err)
+	assert.Equal(t, "https://lemmy.world/c/small", small.OrderingKey)
+
+	// Nothing else claimable while big backs off and small is leased.
+	_, err = repo.ClaimNext(ctx, time.Minute)
+	require.Error(t, err)
+	assert.True(t, errors.IsNotFound(err))
+
+	// Head becomes due again → it is claimed before every younger sibling.
+	_, err = database.ExecContext(ctx,
+		`UPDATE inbox_events SET next_attempt_at = CURRENT_TIMESTAMP WHERE activity_id = $1`,
+		head.ActivityID)
+	require.NoError(t, err)
+	again, err := repo.ClaimNext(ctx, time.Minute)
+	require.NoError(t, err)
+	assert.Equal(t, head.ActivityID, again.ActivityID,
+		"the key's head must be re-claimed before any younger sibling")
 }

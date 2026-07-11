@@ -93,10 +93,21 @@ harness, **(relay)** by task 09's relay pipeline.
     community repo with an `author` field. Zero new DIDs, votes on the
     firehose. Requires a new lexicon + Coves AppView consumer — decide
     WITH Coves.
-  - Write amplification (one commit + firehose event per vote) is only
+  - ~~Write amplification (one commit + firehose event per vote) is only
     viable after the perf items land: per-DID MST cache, block GC,
     batched pruning (tasks 11–12). Hardening first is a prerequisite,
-    not a competing priority.
+    not a competing priority.~~ **The perf prerequisites now hold (task
+    12)**: per-DID MST cache (steady-state commit 3.3 ms on a 2k-record
+    repo, 42.6x over the full-reload path), blocks GC (superseded blocks
+    reclaimed after `BLOCKS_GC_RETENTION`), batched firehose pruning
+    (task 11), streaming reachable-set getRepo, and a bounded ClaimNext
+    scan. What is still NOT solved for votes-as-records: commits remain
+    globally serialized (the advisory lock — ~300/s ceiling at the
+    benchmarked commit cost, shared across ALL writes), and every vote
+    would still be a firehose event relays and the AppView must chew
+    through. The decision is now genuinely open on design grounds
+    (lexicon + Coves consumer + DID externality), not blocked on storage
+    perf.
   - Write-back symmetry favors records: Coves users' votes on bridged
     posts are already native `social.coves.feed.vote` records; outbound
     translation is records→Like. Symmetric records would let frontends
@@ -244,20 +255,41 @@ harness, **(relay)** by task 09's relay pipeline.
   not flap) + a concurrent `subscribeRepos` connection cap
   (`SYNC_MAX_SUBSCRIBERS`, reserve-then-check, 429
   `SubscriberLimitExceeded`).
-- `getRepo` buffers full CARs in memory; `ExportCAR` includes unreachable
-  historical blocks (consider reachable-set-only).
+- ~~`getRepo` buffers full CARs in memory; `ExportCAR` includes unreachable
+  historical blocks (consider reachable-set-only).~~ **Closed by task 12**:
+  `repo.ExportCARTo` streams the CAR block-by-block (memory bounded by one
+  fetch batch, `walkBatchSize` = 256 blocks, plus a CID-string seen-set that
+  grows with the reachable set) and exports only the reachable
+  set from the current head (10.9x smaller on the 2k-record benchmark
+  fixture; correct CAR consumers traverse from the root, so omitting
+  superseded blocks is transparent — verified against indigo's
+  `LoadRepoFromCAR`). The sync handler streams; a pre-first-byte failure
+  still returns a clean 500, a mid-stream failure can only truncate
+  (logged).
 - ~~`PruneEvents` is one unbatched DELETE per hourly sweep.~~ **Closed by
   task 11**: batched (1000/statement) from the oldest seq up, so a partial
   sweep still leaves a contiguous retained suffix.
-- MST loads are full-tree (one SELECT per node) → `PutRecord` is O(repo
-  size); needs a per-DID tree cache before big-community scale.
+- ~~MST loads are full-tree (one SELECT per node) → `PutRecord` is O(repo
+  size); needs a per-DID tree cache before big-community scale.~~ **Closed
+  by task 12**: per-DID LRU tree cache (`internal/repo/treecache.go`,
+  `MST_CACHE_SIZE`, default 512 repos) — steady-state commit is an
+  in-memory mutation + diff write (42.6x faster on the 2k-record fixture).
+  Coherence model documented in that file: take() detaches (a failed commit
+  can never leave a mutated tree cached), put() only under a
+  durably-committed head, head validated against the value read under the
+  commit locks (a cross-process commit makes the entry stale, not wrong).
+  A cold first commit still pays one full-tree load.
 - `SigningKeys` could become a `SignCommit` capability (keeps key plaintext
   inside identity; enables KMS later) — revisit before the interface
   calcifies.
 - `getRepo`'s optional `since` parameter (diff export) is not implemented —
-  a `since` request gets the full CAR, which the spec permits (extra blocks
-  are legal); consumers needing incremental sync use subscribeRepos
-  (`internal/sync/server.go`).
+  a `since` request gets the full reachable-set CAR, which the spec permits
+  (extra blocks are legal); consumers needing incremental sync use
+  subscribeRepos (`internal/sync/server.go`). Deliberately left that way in
+  task 12: a real diff export would have to read historical blocks, which
+  the blocks GC invariant (internal/repo/gc.go) explicitly does not
+  guarantee — implementing it means revisiting that invariant, not just
+  adding a query.
 
 ## Ingestion (task 06 notes)
 
@@ -294,8 +326,14 @@ harness, **(relay)** by task 09's relay pipeline.
   `materializeContent` checks it (`TestCreateAfterDeleteTombstone` pins the
   whole ordering, restore included). The README's claim was correct; this
   entry was the false doc.
-- `ClaimNext` does an O(N) row scan when one community's queue backs up
-  behind a failing event (per-key serialization cost; revisit at scale).
+- ~~`ClaimNext` does an O(N) row scan when one community's queue backs up
+  behind a failing event (per-key serialization cost; revisit at scale).~~
+  **Closed by task 12**: the claim query is now a recursive loose index
+  scan over `idx_inbox_events_queue` — one index descent per distinct
+  pending ordering key, O(pending keys × log N) regardless of any key's
+  backlog depth (measured: 162.6 ms → 0.05 ms with a 50k-deep backed-up
+  key). Same semantics, same fencing contract, no schema change;
+  `TestInboxEvents_DeepBacklogDoesNotBlockOtherKeys` pins it.
 - A shutdown-interrupted attempt still consumes its ClaimNext attempt
   increment (cosmetic).
 - ~~`MAX_BLOB_BYTES` above 5 MiB is a silent no-op.~~ **Closed by task
@@ -399,8 +437,20 @@ harness, **(relay)** by task 09's relay pipeline.
   row.~~ **Closed by task 11**: renamed to `key_material` (migration 013;
   the per-row encoding — plaintext PEM vs sealed ciphertext — is documented
   on `store.ServiceKey`).
-- `blocks` is append-only with no GC (load-bearing for GetRecord read
-  consistency; revisit together with the getRepo memory item).
+- ~~`blocks` is append-only with no GC (load-bearing for GetRecord read
+  consistency; revisit together with the getRepo memory item).~~ **Closed
+  by task 12**: `repo.GCBlocks` (shared `internal/prune` runner, 6h sweeps,
+  `BLOCKS_GC_RETENTION` default 72h) deletes blocks that are BOTH
+  unreachable from their repo's current head AND older than the retention
+  cutoff. The full invariant + the audit of every consumer is written at
+  the top of `internal/repo/gc.go` — the load-bearing parts are that
+  readers moved to REPEATABLE READ snapshots, firehose replay reads the
+  self-contained `firehose_events.car` (never `blocks`), and the commit
+  path's `ON CONFLICT ... DO UPDATE SET created_at = clock_timestamp()`
+  refresh makes the retention window the compute→delete race guard. If a
+  real `since` diff export ever gets served from `blocks` history, it must
+  revisit that invariant first (the fallback stays: `since` requests get
+  the full reachable-set CAR, which the spec permits).
 
 ## E2E harness itself (task 08)
 

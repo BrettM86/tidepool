@@ -26,6 +26,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"tidepool/internal/errors"
 	"tidepool/internal/repo"
 	"tidepool/internal/store"
 	"tidepool/internal/testutil"
@@ -744,6 +745,53 @@ func TestHTTPEndpoints_DeactivatedRepo(t *testing.T) {
 	assert.False(t, status.Active)
 	require.NotNil(t, status.Status)
 	assert.Equal(t, "deleted", *status.Status)
+}
+
+// TestGetRepo_MidStreamFailureAbortsConnection pins the streaming failure
+// contract: once bytes are on the wire the 200 cannot be revoked, and letting
+// the server write the terminating chunk would hand the client a
+// transport-complete response wrapping a silently truncated CAR. The handler
+// must abort the connection instead, so the client sees a transport-level
+// read error rather than a clean EOF.
+func TestGetRepo_MidStreamFailureAbortsConnection(t *testing.T) {
+	h := newHarness(t)
+	putRecord(t, h, "s01", "repo exists")
+
+	h.server.exportCAR = func(ctx context.Context, did string, w io.Writer) error {
+		if _, err := w.Write([]byte("carv1 header and first block")); err != nil {
+			return err
+		}
+		// Push the 200 header and first bytes to the client before failing,
+		// so the truncation lands mid-body rather than pre-header.
+		w.(*countingWriter).w.(http.Flusher).Flush()
+		return fmt.Errorf("reachable walk: block row unreadable")
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(h.http.URL + "/xrpc/com.atproto.sync.getRepo?did=" + testDID)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	_, readErr := io.ReadAll(resp.Body)
+	require.Error(t, readErr, "truncated CAR must surface as a transport failure, not a clean EOF")
+}
+
+// TestGetRepo_VanishedRepoIs404 pins the delete race: a repo that disappears
+// between loadActiveRepo and the export has written nothing yet, so the
+// handler must still answer with the same 404 RepoNotFound the earlier
+// existence check uses, not a 500.
+func TestGetRepo_VanishedRepoIs404(t *testing.T) {
+	h := newHarness(t)
+	putRecord(t, h, "s02", "repo exists")
+
+	h.server.exportCAR = func(ctx context.Context, did string, w io.Writer) error {
+		return errors.NewNotFoundError("repo", did)
+	}
+
+	var body map[string]string
+	resp := getJSON(t, h.http.URL+"/xrpc/com.atproto.sync.getRepo?did="+testDID, &body)
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+	assert.Equal(t, "RepoNotFound", body["error"])
 }
 
 // TestGetBlob pins the com.atproto.sync.getBlob surface task 05 added: a

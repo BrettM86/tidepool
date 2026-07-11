@@ -9,6 +9,7 @@ import (
 	blockformat "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
 	ipld "github.com/ipfs/go-ipld-format"
+	"github.com/lib/pq"
 	"github.com/multiformats/go-multihash"
 )
 
@@ -39,6 +40,36 @@ func cidForBlock(data []byte) (cid.Cid, error) {
 type txBlockSource struct {
 	tx  *sql.Tx
 	did string
+}
+
+// GetMany reads a batch of blocks in one query, returning raw bytes keyed by
+// CID string. Missing CIDs are simply absent from the map — callers decide
+// whether a miss is fatal (the reachable-set walk treats it as corruption).
+func (s *txBlockSource) GetMany(ctx context.Context, cids []cid.Cid) (map[string][]byte, error) {
+	strs := make([]string, len(cids))
+	for i, c := range cids {
+		strs[i] = c.String()
+	}
+	rows, err := s.tx.QueryContext(ctx,
+		`SELECT cid, bytes FROM blocks WHERE did = $1 AND cid = ANY($2)`,
+		s.did, pq.Array(strs))
+	if err != nil {
+		return nil, fmt.Errorf("repo: read %d blocks for %s: %w", len(cids), s.did, err)
+	}
+	defer rows.Close()
+	out := make(map[string][]byte, len(cids))
+	for rows.Next() {
+		var cidStr string
+		var raw []byte
+		if err := rows.Scan(&cidStr, &raw); err != nil {
+			return nil, fmt.Errorf("repo: scan block for %s: %w", s.did, err)
+		}
+		out[cidStr] = raw
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("repo: iterate blocks for %s: %w", s.did, err)
+	}
+	return out, nil
 }
 
 func (s *txBlockSource) Get(ctx context.Context, c cid.Cid) (blockformat.Block, error) {

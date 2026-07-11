@@ -247,10 +247,12 @@ func (m *Manager) GetRecordProof(ctx context.Context, did, collection, rkey stri
 		return nil, err
 	}
 
-	// Read consistency: same reasoning as GetRecord — blocks are
-	// content-addressed and append-only, so once the head is read every
-	// block it references is immutable and present.
-	tx, err := m.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	// Read consistency: same reasoning as GetRecord — a REPEATABLE READ
+	// snapshot froze at the first read, so the head and its proof-path blocks
+	// are consistent and immune to a concurrent blocks GC (append-only,
+	// content-addressed blocks; GC only removes blocks unreachable from a head
+	// at or after this snapshot — see GCBlocks).
+	tx, err := m.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true, Isolation: sql.LevelRepeatableRead})
 	if err != nil {
 		return nil, fmt.Errorf("repo: begin read tx: %w", err)
 	}

@@ -6,9 +6,11 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strconv"
 
 	indigorepo "github.com/bluesky-social/indigo/atproto/repo"
+	"github.com/bluesky-social/indigo/atproto/repo/mst"
 	"github.com/bluesky-social/indigo/atproto/syntax"
 
 	blockformat "github.com/ipfs/go-block-format"
@@ -203,66 +205,186 @@ func writeCARSlice(root cid.Cid, blks []blockformat.Block) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// ExportCAR writes the DID's full repo as a CARv1 stream rooted at the
-// current head commit. NOTE (task 04): until block garbage collection
-// exists, this includes every historical block for the DID, not just the
-// reachable set — harmless for CAR readers (they traverse from the root)
-// but larger than a minimal export.
+// ExportCAR writes the DID's full repo as a CARv1 byte slice rooted at the
+// current head commit — the reachable set only (commit + MST nodes + record
+// blocks), the same content ExportCARTo streams. It buffers the whole CAR in
+// memory; the sync surface uses ExportCARTo to stream instead. A missing repo
+// satisfies errors.IsNotFound.
 func (m *Manager) ExportCAR(ctx context.Context, did string) ([]byte, error) {
-	tx, err := m.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	var buf bytes.Buffer
+	if err := m.ExportCARTo(ctx, did, &buf); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// ExportCARTo streams the DID's repo as a CARv1 stream rooted at the current
+// head commit, writing blocks to w as they are fetched so memory stays
+// bounded by one fetch batch (walkBatchSize blocks) plus a CID-string
+// seen-set that grows with the reachable set, rather than the whole CAR
+// (com.atproto.sync.getRepo can serve a large community repo without
+// buffering it). It exports the REACHABLE SET from the
+// current head — the commit block, every MST node on the live tree, and every
+// record block those nodes reference — NOT every historical block ever stored
+// for the DID. Superseded MST nodes and old record versions are omitted:
+// correct CAR consumers (indigo's LoadRepoFromCAR, bigsky) traverse from the
+// root commit and never look at unreachable blocks, so the export is smaller
+// but semantically identical.
+//
+// This reachable-set export is independent of the read-consistency guarantees
+// GetRecord/GetRecordProof and subscribeRepos replay rely on: those read the
+// current head's blocks (append-only, content-addressed) and the self-
+// contained firehose_events.car respectively — neither depends on the
+// unreachable historical blocks omitted here. The read runs in a REPEATABLE
+// READ snapshot so a concurrent blocks GC (which deletes only unreachable
+// blocks) can never pull a block out from under the walk.
+//
+// Failure ordering: the repo-state read, head-CID parse, head-block fetch,
+// and commit decode all happen before the first byte is written, so a missing
+// repo or an unreadable/undecodable head commit returns an error with nothing
+// written to w. The reachable walk itself (batched block fetches, MST node
+// decodes, the missing-block corruption check) runs after bytes are flowing:
+// any failure there truncates the stream mid-write, and the HTTP handler is
+// responsible for making that visible to the client (it cannot be turned into
+// a clean error response once the header is out).
+func (m *Manager) ExportCARTo(ctx context.Context, did string, w io.Writer) error {
+	tx, err := m.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true, Isolation: sql.LevelRepeatableRead})
 	if err != nil {
-		return nil, fmt.Errorf("repo: begin read tx: %w", err)
+		return fmt.Errorf("repo: begin read tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
 	state, err := readRepoState(ctx, tx, did, false)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	head, err := cid.Parse(state.headCID)
 	if err != nil {
-		return nil, fmt.Errorf("repo: parse head cid %q for %s: %w", state.headCID, did, err)
+		return fmt.Errorf("repo: parse head cid %q for %s: %w", state.headCID, did, err)
 	}
-
-	var buf bytes.Buffer
-	if err := car.WriteHeader(&car.CarHeader{Roots: []cid.Cid{head}, Version: 1}, &buf); err != nil {
-		return nil, fmt.Errorf("repo: write CAR header: %w", err)
-	}
-
-	// Head commit block first (readers conventionally expect the root
-	// early), then everything else.
 	src := &txBlockSource{tx: tx, did: did}
 	headBlk, err := src.Get(ctx, head)
 	if err != nil {
-		return nil, fmt.Errorf("repo: read head commit %s for %s: %w", state.headCID, did, err)
+		return fmt.Errorf("repo: read head commit %s for %s: %w", state.headCID, did, err)
 	}
-	if err := carutil.LdWrite(&buf, headBlk.Cid().Bytes(), headBlk.RawData()); err != nil {
-		return nil, fmt.Errorf("repo: write CAR block %s: %w", head, err)
+	var commit indigorepo.Commit
+	if err := commit.UnmarshalCBOR(bytes.NewReader(headBlk.RawData())); err != nil {
+		return fmt.Errorf("repo: decode head commit %s for %s: %w", state.headCID, did, err)
 	}
 
-	rows, err := tx.QueryContext(ctx,
-		`SELECT cid, bytes FROM blocks WHERE did = $1 AND cid <> $2 ORDER BY created_at, cid`,
-		did, state.headCID)
-	if err != nil {
-		return nil, fmt.Errorf("repo: list blocks for %s: %w", did, err)
+	// From here on we write to w; any error truncates the stream.
+	if err := car.WriteHeader(&car.CarHeader{Roots: []cid.Cid{head}, Version: 1}, w); err != nil {
+		return fmt.Errorf("repo: write CAR header: %w", err)
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var cidStr string
-		var raw []byte
-		if err := rows.Scan(&cidStr, &raw); err != nil {
-			return nil, fmt.Errorf("repo: scan block for %s: %w", did, err)
+	// Head commit block first (readers conventionally expect the root early).
+	if err := carutil.LdWrite(w, head.Bytes(), headBlk.RawData()); err != nil {
+		return fmt.Errorf("repo: write CAR block %s: %w", head, err)
+	}
+	// seen dedupes blocks (a record CID can appear under multiple keys, and an
+	// MST subtree could be shared): it holds only CID strings, not bytes, so
+	// memory stays proportional to the number of distinct reachable blocks.
+	seen := map[string]struct{}{head.String(): {}}
+	return walkReachableBlocks(ctx, src, commit.Data, seen, w)
+}
+
+// walkReachableBlocks streams the MST rooted at node — node blocks, then the
+// record blocks their value entries reference, level by level — to w in CARv1
+// LdWrite framing, skipping anything already emitted (seen).
+func walkReachableBlocks(ctx context.Context, src *txBlockSource, node cid.Cid, seen map[string]struct{}, w io.Writer) error {
+	writeBlock := func(c cid.Cid, raw []byte) error {
+		if err := carutil.LdWrite(w, c.Bytes(), raw); err != nil {
+			return fmt.Errorf("repo: write CAR block %s: %w", c, err)
 		}
-		c, err := cid.Parse(cidStr)
+		return nil
+	}
+	return walkReachable(ctx, src, node, seen, writeBlock,
+		func(records []cid.Cid) error {
+			return forEachBlock(ctx, src, records, writeBlock)
+		})
+}
+
+// walkBatchSize is how many blocks one walk fetch pulls from postgres. The
+// reachable-set walk is round-trip bound (a 2k-record repo is ~2.7k blocks),
+// so blocks are fetched in batches of this size — it is also the walk's
+// memory bound: at most walkBatchSize block payloads are resident at once.
+const walkBatchSize = 256
+
+// walkReachable is the reachable-set walk ExportCARTo and GCBlocks share: a
+// breadth-first walk over the MST rooted at node, fetching each level's node
+// blocks in walkBatchSize batches. visitNode receives every node block (with
+// its raw bytes, in batch order); visitRecords receives the record CIDs each
+// level references — bytes deliberately not fetched, because GC only needs
+// the CIDs (the export's visitRecords fetches them itself, batched). Every
+// reachable CID (nodes and records) is added to seen, which both dedupes the
+// walk and, for GC, IS the reachable set.
+func walkReachable(ctx context.Context, src *txBlockSource, node cid.Cid, seen map[string]struct{},
+	visitNode func(cid.Cid, []byte) error, visitRecords func([]cid.Cid) error) error {
+	var level []cid.Cid
+	if _, ok := seen[node.String()]; !ok {
+		seen[node.String()] = struct{}{}
+		level = append(level, node)
+	}
+	for len(level) > 0 {
+		var children, records []cid.Cid
+		err := forEachBlock(ctx, src, level, func(c cid.Cid, raw []byte) error {
+			if err := visitNode(c, raw); err != nil {
+				return err
+			}
+			nd, err := mst.NodeDataFromCBOR(bytes.NewReader(raw))
+			if err != nil {
+				return fmt.Errorf("repo: decode MST node %s: %w", c, err)
+			}
+			n := nd.Node(&c)
+			for i := range n.Entries {
+				e := &n.Entries[i]
+				if e.IsValue() && e.Value != nil {
+					if _, ok := seen[e.Value.String()]; !ok {
+						seen[e.Value.String()] = struct{}{}
+						records = append(records, *e.Value)
+					}
+				}
+				if e.IsChild() && e.ChildCID != nil {
+					if _, ok := seen[e.ChildCID.String()]; !ok {
+						seen[e.ChildCID.String()] = struct{}{}
+						children = append(children, *e.ChildCID)
+					}
+				}
+			}
+			return nil
+		})
 		if err != nil {
-			return nil, fmt.Errorf("repo: parse stored cid %q for %s: %w", cidStr, did, err)
+			return err
 		}
-		if err := carutil.LdWrite(&buf, c.Bytes(), raw); err != nil {
-			return nil, fmt.Errorf("repo: write CAR block %s: %w", c, err)
+		if len(records) > 0 {
+			if err := visitRecords(records); err != nil {
+				return err
+			}
+		}
+		level = children
+	}
+	return nil
+}
+
+// forEachBlock fetches the given CIDs' bytes in walkBatchSize batches (one
+// SELECT ... = ANY per batch) and invokes fn for each in the order given. A
+// CID with no stored block is an error: the walk only asks for blocks the
+// head's tree references, so a miss is corruption, never skippable.
+func forEachBlock(ctx context.Context, src *txBlockSource, cids []cid.Cid, fn func(cid.Cid, []byte) error) error {
+	for start := 0; start < len(cids); start += walkBatchSize {
+		batch := cids[start:min(start+walkBatchSize, len(cids))]
+		blocks, err := src.GetMany(ctx, batch)
+		if err != nil {
+			return err
+		}
+		for _, c := range batch {
+			raw, ok := blocks[c.String()]
+			if !ok {
+				return fmt.Errorf("repo: block %s missing for %s (corrupt repo?)", c, src.did)
+			}
+			if err := fn(c, raw); err != nil {
+				return err
+			}
 		}
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("repo: iterate blocks for %s: %w", did, err)
-	}
-	return buf.Bytes(), nil
+	return nil
 }

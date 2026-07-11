@@ -59,36 +59,75 @@ func (r *postgresInboxEvents) ClaimNext(ctx context.Context, lease time.Duration
 		return nil, errors.NewValidationError("lease", "must be positive")
 	}
 
-	// The candidate subquery picks the oldest processable event:
-	//   - unprocessed, not poisoned, past its retry schedule;
-	//   - unleased, or leased by a worker whose lease expired (crash);
-	//   - with NO older unprocessed, unpoisoned sibling on the same
-	//     ordering key — this is the per-community serialization: while an
-	//     older event is pending (claimed, backing off, or simply queued),
-	//     every younger event on that key is invisible to workers. A
-	//     poisoned sibling stops blocking (poison → skip).
-	// FOR UPDATE SKIP LOCKED lets concurrent workers race without
-	// serializing on row locks; the claiming UPDATE stamps the lease and
-	// counts the attempt atomically.
+	// The candidate is the oldest processable event: unprocessed, not
+	// poisoned, past its retry schedule, unleased (or the lease expired),
+	// and with NO older unprocessed, unpoisoned sibling on the same
+	// ordering key — the per-community serialization: while an older event
+	// is pending (claimed, backing off, or simply queued), every younger
+	// event on that key is invisible to workers. A poisoned sibling stops
+	// blocking (poison → skip).
+	//
+	// "No older pending sibling" is equivalent to "is the min-id pending
+	// row of its ordering key", so instead of scanning pending rows in id
+	// order and probing NOT EXISTS per row — O(backlog) whenever one
+	// community's queue backs up behind a failing head — the recursive CTE
+	// emulates a loose index scan over idx_inbox_events_queue
+	// (ordering_key, id, partial on pending): one index descent per
+	// DISTINCT pending key jumps straight to each key's head, and only
+	// those heads are filtered for claimability. Work is O(pending keys ×
+	// log N) regardless of any one key's backlog depth.
+	//
+	// The heads are materialized with ARRAY(...) — not a plain IN — so the
+	// planner fetches exactly those rows by primary key (a merge/semi join
+	// against an inlined CTE was observed walking the pkey through the
+	// whole backlog again). The outer SELECT re-applies every claimability
+	// condition on the locked row: under READ COMMITTED the row is
+	// re-evaluated after the lock is acquired, so a claim committed between
+	// the CTE's snapshot and the lock is seen and the row skipped. The
+	// head-of-its-key property itself needs no re-check — ids only grow and
+	// processed_at/failed_at are never unset, so a key's pending-min is
+	// stable once observed (one caveat: id assignment order is not
+	// commit-visibility order, so a smaller-id enqueue can become visible
+	// after the claim's snapshot and retroactively lower a key's
+	// pending-min; the previous NOT EXISTS query had the identical
+	// single-snapshot blind spot, so this changes nothing about the claim
+	// semantics). FOR UPDATE SKIP LOCKED lets concurrent workers
+	// race without serializing on row locks; the claiming UPDATE stamps the
+	// lease and counts the attempt atomically.
 	query := `
 		UPDATE inbox_events
 		SET claimed_until = CURRENT_TIMESTAMP + make_interval(secs => $1),
 		    attempts = attempts + 1
 		WHERE id = (
-			SELECT e.id FROM inbox_events e
-			WHERE e.processed_at IS NULL
-			  AND e.failed_at IS NULL
-			  AND e.next_attempt_at <= CURRENT_TIMESTAMP
-			  AND (e.claimed_until IS NULL OR e.claimed_until <= CURRENT_TIMESTAMP)
-			  AND NOT EXISTS (
-				SELECT 1 FROM inbox_events prior
-				WHERE prior.ordering_key = e.ordering_key
-				  AND prior.id < e.id
-				  AND prior.processed_at IS NULL
-				  AND prior.failed_at IS NULL)
-			ORDER BY e.id
+			SELECT c.id FROM inbox_events c
+			WHERE c.id = ANY (ARRAY(
+				WITH RECURSIVE key_heads AS (
+					SELECT h.id, h.ordering_key FROM (
+						SELECT e.id, e.ordering_key
+						FROM inbox_events e
+						WHERE e.processed_at IS NULL AND e.failed_at IS NULL
+						ORDER BY e.ordering_key, e.id
+						LIMIT 1
+					) h
+					UNION ALL
+					SELECT n.id, n.ordering_key FROM key_heads k
+					CROSS JOIN LATERAL (
+						SELECT e.id, e.ordering_key
+						FROM inbox_events e
+						WHERE e.processed_at IS NULL AND e.failed_at IS NULL
+						  AND e.ordering_key > k.ordering_key
+						ORDER BY e.ordering_key, e.id
+						LIMIT 1
+					) n
+				)
+				SELECT id FROM key_heads))
+			  AND c.processed_at IS NULL
+			  AND c.failed_at IS NULL
+			  AND c.next_attempt_at <= CURRENT_TIMESTAMP
+			  AND (c.claimed_until IS NULL OR c.claimed_until <= CURRENT_TIMESTAMP)
+			ORDER BY c.id
 			LIMIT 1
-			FOR UPDATE SKIP LOCKED)
+			FOR UPDATE OF c SKIP LOCKED)
 		RETURNING ` + eventColumns
 
 	event, err := scanInboxEvent(r.db.QueryRowContext(ctx, query, lease.Seconds()))

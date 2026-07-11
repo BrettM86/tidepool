@@ -34,7 +34,11 @@ write-back design; tasks 11–12 are its prerequisites).
 | 10 | 09-e2e-relay | done | (see git log) | 7/7 reviewers (4 Claude emulated + codex/gemini/glm); fixes: dev requestCrawl PUBLIC-relay dial guard (codex unique catch — NewPrivateOnlyHTTPClient, inverse SSRF guard), terminal-error classification made pre-flight-only (whole-chain IsValidation was abandoning a relay on attempt 1 for transient DNS), 10s per-attempt timeout (budget arithmetic was 14min worst-case, not 2min), vacuous validation-no-retry test rewritten + 400-is-retried pin, vetEvent per-DID rev-monotonicity (restores per-repo ordering assertion suite-wide), drain() returns+clears pending (closes task-10 vacuous-pass trap), relay poll robustness + pagination cap, doc corrections (RESOLVE_ADDRESS overstatement, spec BGS_CRAWL_INSECURE_WS annotation, FOLLOWUPS 16th-failure off-by-one). KEPT DELIBERATE over 3 reviewers' objection: all wire errors incl. 4xx retried — bigsky answers the describeServer callback race with HTTP 400 (comment + test pin it). Final clean make e2e: 10/10, 96.7s |
 | 11 | 10-e2e-scenarios | done | (see git log) | 6/7 reviewers (glm watchdog-killed); UNANIMOUS 6/6 finding: tombstone confirm-fetch transient failure → definitive 401 permanently lost legitimate account deletions → fixed with three-way taxonomy (tombstone→202, alive/validation/404→401, transport/5xx→503 defer) + test; codex unique: confirmation fetch followed cross-authority redirects (open-redirect → forged 410) → FetchActorSameAuthority pins every hop; security: unauthenticated durable-write path flagged → encoded into task 11 rate-limit spec; also: zz-sweep replay floor + honest bounds (sentinel-only pass was vacuous), Delete(Actor) over-scrub drain, actor!=object + Announce{Delete} 401 pins, GET / route-level test, cursor 0→1 doc fixes, vote-hammer header de-overclaimed. TASK ITSELF: 7 scenarios + 2 PRODUCTION fixes (apex instance actor — Lemmy silently never delivers Delete{Person} without a Site actor row; tombstone-verified self-delete acceptance). Final clean make e2e: 17/17, 239s |
 | 12 | 11-hardening | done | (see git log) | 6/7 reviewers (glm watchdog-killed on 5k-line diff); NO high-sev confirmed (gemini's "carry-forward type assertion always fails" was a FALSE POSITIVE — GetRecord returns typed atdata.Blob, test green). Fixes: FollowRetrier atomic UPDATE...RETURNING claim (list-then-update raced Accept + burned attempts on transient failure + silent exhaustion), rate-limit refusal observability (expvar counters + sampled Warn — mistuned limit silently dropped all traffic), community-DID blob orphan now retryable (was swallowed → served forever; required delete-before-soft-delete reorder), ScrubVoter DELETE...RETURNING recompute (phantom-count lost update), carry-forward drops on permanent 404/410 vs carries on transient, DeleteActor terminal-state fixpoint (no double #account), migration-011 CHECK tightened + raw-insert test, /admin/metrics scoped expvar, internal/prune fail-closed test, proxy XFF ops note. TASK: inbox+sync admission control, #account{active:false,status:deleted} frame verified purging repo from bigsky, follow auto-retry, 3 pruners, one-tx record+mapping, blob/vote scrubs, service_keys rename. delete-before-create: README was RIGHT, FOLLOWUPS stale (task 06 already closed it). Final clean make e2e: 17/17, 232s |
-| 13 | 12-perf-scale | in-progress | | MST cache, getRepo streaming/reachable-set, blocks GC, ClaimNext scan |
+| 13 | 12-perf-scale | done | (see git log) | 7/8 reviewers (5 Claude emulated + codex/gemini; glm watchdog-killed again); NO high-sev code findings — gemini zero-issue "excellent". Fixes: mid-stream getRepo failure now panics http.ErrAbortHandler so a truncated CAR is a transport-level failure, not a clean 200 (4/7 flagged — the diff's sharpest catch); client-disconnect logging downgraded to Debug; vanished-repo race → 404; FALSE parenthetical in the gc.go invariant header corrected ("every block a commit references is in newBlocks" → only NEWLY-referenced blocks are; believing the original justified deleting rule (a)); DELETE-time created_at re-check + RR isolation + 256-block batch boundary all made test-load-bearing with fail-then-pass proofs (pr-test-analyzer: "you could delete the race-guard clause and the suite stayed green" — no longer); CAR-slice identity test extended to update/delete ops + ordered comparison + no swallowed reader errors; ExportCARTo pre-first-byte doc overclaim fixed; app↔DB clock-skew assumption documented (codex unique). TASK: per-DID MST cache (PutRecord 140.6ms→3.30ms, 42.6x, on a 2k-record repo), streaming reachable-set getRepo (CAR 10.9x smaller, batch-bounded residency), blocks GC (invariant-first design in gc.go), ClaimNext loose index scan (162.6ms→0.050ms on a 50k backlog). Resumed from a killed predecessor agent's partial tree — its walk was correct but 1-SELECT-per-block (698ms/op, would have been a getRepo latency REGRESSION; batching fixed it). Final clean make e2e: 17/17 |
+
+v1.1 loop (tasks 09–12) COMPLETE — `make e2e` green (17/17), full unit
+suite green, all FOLLOWUPS items scheduled into this loop closed or
+explicitly deferred with rationale.
 
 Statuses: pending → in-progress → review → done (or blocked: <reason>).
 
@@ -133,10 +137,10 @@ and deferred TODOs here)
   session lock 0x7469646570 — keep them distinct). This guarantees
   seq order == commit-visibility order, so task 04 may tail with naive
   `WHERE seq > cursor` — any future writer bypassing repo.Manager breaks
-  that. Per-DID mutex + repo_state row lock remain as backstops. blocks
-  keeps superseded blocks (no GC; append-only is load-bearing for
-  GetRecord's read consistency); ExportCAR includes unreachable
-  historical blocks — task 04's getRepo may want reachable-set-only.
+  that. Per-DID mutex + repo_state row lock remain as backstops.
+  [SUPERSEDED by task 12: blocks now has GC (invariant in
+  internal/repo/gc.go), readers hold REPEATABLE READ snapshots instead
+  of relying on append-only, and ExportCAR is reachable-set-only.]
 - identity.Minter.MintActor mints did:plc via MODERN plc_operation genesis
   ops (indigo's plc package only has the deprecated legacy `create` op —
   don't use it): rotationKeys=[bridge escrow key], verificationMethods.
@@ -598,3 +602,49 @@ and deferred TODOs here)
   dialBridgeFirehose/readBridgeAccountFrame in tests/e2e/helpers.go) and
   the repo DISAPPEARING from the relay's listRepos (polled; bigsky
   processes the frame async).
+
+### From task 12 (perf & scale — anything touching repo storage MUST know)
+- **`blocks` is no longer append-only-forever.** The replacement invariant
+  lives at the top of internal/repo/gc.go (delete only if unreachable from
+  the current head in one REPEATABLE READ snapshot AND older than
+  BLOCKS_GC_RETENTION, created_at re-checked inside the DELETE). Every
+  new `blocks` reader must hold a REPEATABLE READ snapshot (GetRecord/
+  GetRecordProof/ExportCARTo do; the commit path's loadTree is covered by
+  the FOR UPDATE head pin) — audit any new reader against gc.go's header.
+  `blocks.created_at` now means "last written" (ON CONFLICT refresh), not
+  "first written"; it is the GC race guard and only ever makes GC more
+  conservative. Retention must comfortably exceed app↔DB clock skew + a
+  sweep's compute→delete gap (72h default dwarfs both).
+- **A future `since` diff export is now HARDER, not just missing**: it
+  would read historical blocks, which the GC invariant explicitly does
+  not guarantee. Documented in FOLLOWUPS; decide GC-interaction first.
+- **Per-DID MST tree cache** (internal/repo/treecache.go): take() detaches
+  the entry and validates against the FOR UPDATE head (ABA impossible —
+  revs strictly increase and are embedded in the commit CID); re-cached
+  only after durable commit (or the provably-unchanged NoOp head). All
+  access under the per-DID mutex inside commitWrite ONLY — never add a
+  read-path consumer. repo.NewManager is now variadic (...Option,
+  WithTreeCacheSize; MST_CACHE_SIZE env, default 512; n <= 0 disables).
+  Cold first commit per DID still pays one full-tree load.
+- **getRepo streams** (repo.ExportCARTo): reachable-set-only, batched
+  ANY() fetches (walkBatchSize 256 — a naive per-block walk measured
+  698ms/op vs 27.7ms batched; don't "simplify" it away). Mid-stream
+  failure panics http.ErrAbortHandler so consumers see a transport error
+  instead of a clean truncated 200; client disconnects log at Debug.
+  walkReachable is SHARED between export and GC — reachability is
+  definitionally "what getRepo serves", they cannot drift.
+- **ClaimNext is a recursive-CTE loose index scan** over
+  idx_inbox_events_queue. The ARRAY(...) head-materialization is
+  LOAD-BEARING (a plain IN regressed the planner to the O(N) scan —
+  EXPLAIN-verified, commented in inbox_events.go). Semantics unchanged:
+  per-key serial ordering, claimed_until fencing, SKIP LOCKED.
+- **Perf ceilings that remain (for the votes-as-records design revisit):**
+  the GLOBAL commit advisory lock serializes ALL repos' commits — per-DID
+  throughput is now ~300 commits/s (3.3ms each) but it is one writer at a
+  time bridge-wide; firehose_events volume is untouched. Those are design
+  decisions, not storage perf — storage prerequisites for
+  votes-as-records now HOLD (FOLLOWUPS updated).
+- Deferred: GC-vs-commit concurrency argued + mechanism-pinned, no
+  goroutine stress test; cold-start loadTree could reuse GetMany batching
+  if it ever matters; sync_test.go grew an exportCAR seam (mirrors
+  onUpgrade) for mid-stream failure injection.

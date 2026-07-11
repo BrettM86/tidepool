@@ -131,12 +131,27 @@ type CommitResult struct {
 	NoOp bool
 }
 
+// TxSideEffect runs INSIDE the commit transaction, after the record write
+// and its firehose event but before COMMIT — the seam that makes "record +
+// its bookkeeping row" atomic (the materializer's ap_objects mapping rides
+// here). An error rolls the whole commit back, record included. The hook
+// also runs on the idempotent NoOp path (res.NoOp == true, Seq == 0), so
+// bookkeeping refreshes even when no new commit is produced. Keep hooks
+// fast: the global commit advisory lock is held while they run.
+type TxSideEffect func(ctx context.Context, tx *sql.Tx, res *CommitResult) error
+
 // PutRecord creates or updates a record and commits the change. The first
 // write to a DID creates its repo (genesis commit). Re-putting an identical
 // record is an idempotent no-op: no new commit or firehose event is
 // emitted, and the result carries NoOp with the existing CID, head, and rev
 // (deterministic rkeys make re-ingestion hit this path on purpose).
 func (m *Manager) PutRecord(ctx context.Context, did, collection, rkey string, record map[string]any) (*CommitResult, error) {
+	return m.PutRecordTx(ctx, did, collection, rkey, record, nil)
+}
+
+// PutRecordTx is PutRecord with a side effect executed inside the commit
+// transaction (see TxSideEffect). A nil sideEffect is exactly PutRecord.
+func (m *Manager) PutRecordTx(ctx context.Context, did, collection, rkey string, record map[string]any, sideEffect TxSideEffect) (*CommitResult, error) {
 	if err := validateRecord(record); err != nil {
 		return nil, err
 	}
@@ -148,14 +163,14 @@ func (m *Manager) PutRecord(ctx context.Context, did, collection, rkey string, r
 	if err != nil {
 		return nil, err
 	}
-	return m.commitWrite(ctx, did, collection, rkey, &c, recordBytes)
+	return m.commitWrite(ctx, did, collection, rkey, &c, recordBytes, sideEffect)
 }
 
 // DeleteRecord removes a record and commits the change. A missing record —
 // or a repo that does not exist yet — is an error satisfying
 // errors.IsNotFound. The result's RecordCID is empty.
 func (m *Manager) DeleteRecord(ctx context.Context, did, collection, rkey string) (*CommitResult, error) {
-	return m.commitWrite(ctx, did, collection, rkey, nil, nil)
+	return m.commitWrite(ctx, did, collection, rkey, nil, nil, nil)
 }
 
 // GetRecord reads the current version of a record. Missing repo or record
@@ -238,7 +253,7 @@ func (m *Manager) readState(ctx context.Context, did string) (*repoState, error)
 // and the global commit advisory lock, applies the mutation to the MST,
 // signs a new commit, and persists blocks, head, and the firehose event in
 // one transaction.
-func (m *Manager) commitWrite(ctx context.Context, did, collection, rkey string, newCID *cid.Cid, recordBytes []byte) (*CommitResult, error) {
+func (m *Manager) commitWrite(ctx context.Context, did, collection, rkey string, newCID *cid.Cid, recordBytes []byte, sideEffect TxSideEffect) (*CommitResult, error) {
 	path, parsedDID, err := validatePath(did, collection, rkey)
 	if err != nil {
 		return nil, err
@@ -315,12 +330,23 @@ func (m *Manager) commitWrite(ctx context.Context, did, collection, rkey string,
 	if newCID != nil && op.Prev != nil && op.Prev.Equals(*newCID) {
 		// Identical re-put: idempotent no-op, keep the existing commit.
 		// op.Prev != nil implies the repo exists, so state is non-nil here.
-		return &CommitResult{
+		res := &CommitResult{
 			RecordCID: newCID.String(),
 			CommitCID: state.headCID,
 			Rev:       prevRev,
 			NoOp:      true,
-		}, nil
+		}
+		if sideEffect != nil {
+			// The side effect still runs (bookkeeping refresh) and must still
+			// be durable, so the — otherwise write-free — transaction commits.
+			if err := sideEffect(ctx, tx, res); err != nil {
+				return nil, err
+			}
+			if err := tx.Commit(); err != nil {
+				return nil, fmt.Errorf("repo: commit no-op side effect for %s: %w", did, err)
+			}
+		}
+		return res, nil
 	}
 
 	// New blocks this commit introduces: MST diff nodes + the record block
@@ -404,12 +430,6 @@ func (m *Manager) commitWrite(ctx context.Context, did, collection, rkey string,
 		return nil, err
 	}
 
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("repo: commit tx for %s: %w", did, err)
-	}
-
-	m.logger.Debug("repo commit",
-		"did", did, "rev", rev.String(), "commit", commitCID.String(), "path", path, "seq", seq)
 	res := &CommitResult{
 		CommitCID: commitCID.String(),
 		Rev:       rev.String(),
@@ -418,6 +438,21 @@ func (m *Manager) commitWrite(ctx context.Context, did, collection, rkey string,
 	if newCID != nil {
 		res.RecordCID = newCID.String()
 	}
+	if sideEffect != nil {
+		// Inside the transaction: a failing side effect rolls the record
+		// write back too — record and bookkeeping land together or not at
+		// all.
+		if err := sideEffect(ctx, tx, res); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("repo: commit tx for %s: %w", did, err)
+	}
+
+	m.logger.Debug("repo commit",
+		"did", did, "rev", rev.String(), "commit", commitCID.String(), "path", path, "seq", seq)
 	return res, nil
 }
 

@@ -150,10 +150,12 @@ commits while the repo stays active (reversible; discovery rides the
 `PROFILE_REFRESH_TTL` re-fetch because Lemmy 0.19 never federates
 `Update{Person}` on bio edits); **`Delete(Actor)`** — account deletion
 scrubs the author's post/comment/profile and terminally tombstones the repo
-(`getRepoStatus`/`listRepos` report `active:false`, the handle stops
-resolving, content endpoints refuse — asserted on the bridge's sync surface
-because the relay cannot observe tombstones until task 11's `#account`
-frame); **unsubscribe** — `DELETE /admin/communities` sends `Undo{Follow}`
+(`getRepoStatus`/`listRepos` report `active:false` status `deleted`, the
+handle stops resolving, content endpoints refuse), the
+`#account{active:false, status:"deleted"}` frame is asserted on the
+bridge's own firehose, and the repo **disappears from the relay's
+`listRepos`** (bigsky consumes the frame, tombstones the account, and
+purges its data); **unsubscribe** — `DELETE /admin/communities` sends `Undo{Follow}`
 and new posts in that community produce no bridge output while a
 still-subscribed control keeps flowing; a **community profile update**
 federating as an `Announce{Update{Group}}` → `community.profile` update on
@@ -206,6 +208,13 @@ production**:
 | `MINT_RATE_PER_MINUTE` / `MINT_BURST` | `60` / `120` | rate gate on inbound DID minting (PLC registrations are forever; unseen authors in delivered content trigger mints) |
 | `INGEST_WORKERS` | `4` | inbox queue worker-pool size |
 | `SEED_COUNTS_FROM_API` | on | seed backfilled posts' vote aggregates from the origin instance's public API (`/api/v3/post` `counts`); set `0` to disable |
+| `TOMBSTONE_RETENTION` | `720h` | how long `ap_tombstones` markers (the delete-before-create guard) are kept before the hourly pruner reclaims them |
+| `VOTE_EVENT_RETENTION` | `2160h` | how long **undone** (superseded/retracted) `vote_events` rows are kept; live rows are the counts and are never pruned |
+| `INBOX_IP_RATE_PER_SECOND` / `INBOX_IP_RATE_BURST` | `50` / `200` | per-client-IP token bucket on `POST /inbox` (refusals are 503 — retryable for federation queues) |
+| `INBOX_SIGNER_RATE_PER_SECOND` / `INBOX_SIGNER_RATE_BURST` | `20` / `100` | per-verified-signer token bucket on `POST /inbox` |
+| `INBOX_TOMBSTONE_CONFIRMS_PER_MINUTE` / `INBOX_TOMBSTONE_CONFIRM_BURST` | `6` / `10` | dedicated per-IP cap on the tombstoned-self-delete confirmation branch (an unauthenticated POST that costs an outbound fetch + durable writes); over-limit deliveries defer (503) so legitimate deletions redeliver |
+| `SYNC_RATE_PER_SECOND` / `SYNC_RATE_BURST` | `25` / `200` | per-client-IP token bucket over the public `com.atproto.sync.*` surface (429; `_health` exempt) |
+| `SYNC_MAX_SUBSCRIBERS` | `100` | concurrent `subscribeRepos` connection cap |
 
 ## Subscribing to communities (admin API)
 
@@ -220,6 +229,10 @@ curl -X POST localhost:8091/admin/communities \
 
 # state is `pending` until the community's Accept arrives at /inbox, which
 # flips it to `accepted` and triggers an outbox backfill automatically.
+# A subscription stuck in `pending` (Lemmy usually skips the Accept for the
+# very FIRST Follow to a new peer — its federation cursor starts at "now")
+# is retried automatically: the bridge re-sends the Follow with a fresh
+# activity id after 2 minutes, up to 5 total sends.
 
 curl localhost:8091/admin/communities \
   -H "Authorization: Bearer dev-admin-token"          # list
@@ -229,6 +242,11 @@ curl -X POST localhost:8091/admin/communities/backfill \
 curl -X DELETE localhost:8091/admin/communities \
   -H "Authorization: Bearer dev-admin-token" \
   -d '{"community":"!technology@lemmy.world"}'        # Undo{Follow}
+
+curl localhost:8091/admin/metrics \
+  -H "Authorization: Bearer dev-admin-token"          # expvar counters
+# (includes tidepool_lexicon_validation_failures — non-zero in production,
+# where validation failures log-and-write, means investigate)
 ```
 
 The bridge's AP face lives next to the inbox: the service actor document at
@@ -251,12 +269,17 @@ activity by the ingestion layer:
   they author is dropped with the reason logged.
 - If a **previously bridged** actor adds the marker (seen on a profile
   `Update` or any profile re-fetch), every record they authored is deleted
-  from the bridged repos and new materialization stops. This state is
-  **reversible**: removing the marker upstream restores bridging on the next
-  profile refresh.
-- **`Delete(Actor)`** (account deletion upstream) scrubs all their records
-  and tombstones the bridged repo **terminally**; the sync surface reports
-  the repo `active: false`.
+  from the bridged repos (with the blobs those records referenced and their
+  `vote_events` rows) and new materialization stops. This state is
+  **reversible**: removing the marker upstream restores bridging — records,
+  media, and future votes — on the next profile refresh; no `#account`
+  frame is emitted and the repo stays active.
+- **`Delete(Actor)`** (account deletion upstream) scrubs all their records,
+  the blobs those records referenced (post images live under COMMUNITY
+  repos), and their `vote_events` rows, then tombstones the bridged repo
+  **terminally**: the sync surface reports `active: false` (status
+  `deleted`) and an `#account{active:false, status:"deleted"}` frame goes
+  out on the firehose so relays purge the repo too.
 - Object-level `Delete`s tombstone the mapped record; a `Delete` arriving
   before its object was ever seen is remembered (`ap_tombstones`), so an
   out-of-order or re-delivered `Create` cannot resurrect deleted content.
@@ -279,14 +302,41 @@ it as a `subscribeRepos` upstream:
 - `GET /xrpc/com.atproto.sync.subscribeRepos` (WebSocket; `?cursor=N` replays
   from the durable event log, then tails live; slow consumers are evicted
   and resume by reconnecting with their last cursor; a cursor older than
-  retention gets an `#info OutdatedCursor` frame first)
+  retention gets an `#info OutdatedCursor` frame first). The stream carries
+  `#commit` frames and — on `Delete(Actor)`/consent revocation —
+  **`#account {active:false, status:"deleted"}`** frames, appended to the
+  same durable log after the scrub delete-commits so relays purge the repo
+  instead of inferring its death (bigsky tombstones the account and drops
+  it from its `listRepos` on that frame). `#nobridge` suppression is
+  reversible and deliberately emits no `#account` frame.
 - `getRepo` (full CAR), `getLatestCommit`, `getRecord` (proof CAR),
   `listRepos` (paginated), `getRepoStatus`
 - `com.atproto.server.describeServer`, `/xrpc/_health`
 - `com.atproto.identity.resolveHandle` + `/.well-known/atproto-did` (task 03)
 
 Repos whose actor revoked consent (tombstoned) report `RepoDeactivated` /
-`active: false` and their content endpoints stop serving.
+`active: false` with status `deleted`, and their content endpoints stop
+serving.
+
+The whole surface sits behind admission control (task 11): a per-client-IP
+token bucket (`SYNC_RATE_PER_SECOND`/`SYNC_RATE_BURST`, 429
+`RateLimitExceeded`; `/xrpc/_health` is exempt so container healthchecks
+never flap) and a concurrent-subscriber cap on `subscribeRepos`
+(`SYNC_MAX_SUBSCRIBERS`, 429 `SubscriberLimitExceeded`). `POST /inbox` has
+its own two-layer limiter — per client IP and per verified signer — plus a
+dedicated, much tighter per-IP cap on the tombstoned-self-delete
+confirmation branch; inbox refusals are **503** (retryable), because
+federation queues drop 4xx permanently but redeliver on server errors.
+
+**Operations note (reverse proxies / load balancers):** every in-process
+per-IP limiter above keys on the connection's `RemoteAddr` and deliberately
+IGNORES `X-Forwarded-For` (it is spoofable without a trusted-proxy allowlist —
+a deliberate non-goal; see FOLLOWUPS.md for a possible future `TRUSTED_PROXY`
+config). Any deployment that terminates TLS or load-balances in front of the
+bridge therefore MUST rate-limit `POST /inbox` and the `com.atproto.sync.*`
+surface at the edge: otherwise every client collapses into the proxy's single
+IP bucket, and in particular the tombstoned-self-delete confirmation cap
+degenerates from per-IP into a GLOBAL cap.
 
 ## Vote aggregates (the AppView integration point)
 

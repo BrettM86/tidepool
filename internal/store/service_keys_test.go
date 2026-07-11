@@ -19,13 +19,13 @@ func TestServiceKeys_CreateAndGet(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotZero(t, created.ID)
 	assert.Equal(t, "service-actor", created.Name)
-	assert.Equal(t, pemBytes, created.PrivateKeyPEM)
+	assert.Equal(t, pemBytes, created.KeyMaterial)
 	assert.False(t, created.CreatedAt.IsZero())
 
 	got, err := repo.Get(ctx, "service-actor")
 	require.NoError(t, err)
 	assert.Equal(t, created.ID, got.ID)
-	assert.Equal(t, pemBytes, got.PrivateKeyPEM)
+	assert.Equal(t, pemBytes, got.KeyMaterial)
 }
 
 func TestServiceKeys_CreateExistingNameConflicts(t *testing.T) {
@@ -45,7 +45,7 @@ func TestServiceKeys_CreateExistingNameConflicts(t *testing.T) {
 
 	got, err := repo.Get(ctx, "service-actor")
 	require.NoError(t, err)
-	assert.Equal(t, original, got.PrivateKeyPEM, "losing create must not clobber the stored key")
+	assert.Equal(t, original, got.KeyMaterial, "losing create must not clobber the stored key")
 }
 
 func TestServiceKeys_GetMissingIsNotFound(t *testing.T) {
@@ -78,5 +78,5 @@ func TestServiceKeys_DistinctNamesCoexist(t *testing.T) {
 
 	got, err := repo.Get(ctx, "some-future-key")
 	require.NoError(t, err)
-	assert.Equal(t, []byte("key-b"), got.PrivateKeyPEM)
+	assert.Equal(t, []byte("key-b"), got.KeyMaterial)
 }

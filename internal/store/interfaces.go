@@ -10,6 +10,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"time"
 )
 
@@ -25,6 +26,11 @@ type APObjects interface {
 	// Collection, RKey, ATURI, CID, and PublishedAt, refreshes IndexedAt,
 	// and clears any soft delete (re-materialization revives the mapping).
 	PutMapping(ctx context.Context, mapping APObjectMapping) (*APObjectMapping, error)
+
+	// PutMappingTx is PutMapping executed on an existing transaction — the
+	// seam repo.TxSideEffect uses so a record commit and its mapping land
+	// atomically (task 11 closed the PutRecord→PutMapping crash window).
+	PutMappingTx(ctx context.Context, tx *sql.Tx, mapping APObjectMapping) (*APObjectMapping, error)
 
 	// GetByAPID returns the mapping for an AP object id, including
 	// soft-deleted rows (callers can check IsDeleted to detect tombstones).
@@ -135,6 +141,20 @@ type Communities interface {
 	// ListByFollowState returns all communities in the given follow state,
 	// ordered by creation time.
 	ListByFollowState(ctx context.Context, state FollowState) ([]*Community, error)
+
+	// ClaimStalePendingFollows atomically claims communities stuck in pending
+	// whose last Follow went out before requestedBefore (rows with a NULL
+	// follow_requested_at — legacy pending rows — are included) and that have
+	// consumed fewer than maxAttempts Follow sends. Claiming is a single
+	// UPDATE ... RETURNING that increments follow_attempts and re-stamps
+	// follow_requested_at on exactly the matched rows, row-locked, so
+	// overlapping sweeps never double-claim and an Accept that flipped a row
+	// to accepted between sweeps is never clobbered back to pending (the
+	// WHERE only matches follow_state='pending'). The returned rows carry the
+	// post-increment follow_attempts and are the ones the retrier must send a
+	// fresh Follow to. The follow retrier's work query (Lemmy first-contact
+	// Accept race).
+	ClaimStalePendingFollows(ctx context.Context, requestedBefore time.Time, maxAttempts int) ([]*Community, error)
 }
 
 // ServiceKeys persists the bridge's own long-lived keys (today: the service
@@ -144,8 +164,9 @@ type Communities interface {
 type ServiceKeys interface {
 	// Create inserts a new named key and returns the stored row. An existing
 	// name returns an error satisfying errors.IsAlreadyExists — callers that
-	// lose a bootstrap race must Get the winner's key instead.
-	Create(ctx context.Context, name string, privateKeyPEM []byte) (*ServiceKey, error)
+	// lose a bootstrap race must Get the winner's key instead. keyMaterial's
+	// encoding is the caller's contract (see ServiceKey.KeyMaterial).
+	Create(ctx context.Context, name string, keyMaterial []byte) (*ServiceKey, error)
 
 	// Get returns the key for a purpose name. A missing key is an error
 	// satisfying errors.IsNotFound.
@@ -231,4 +252,12 @@ type Tombstones interface {
 	// Remove clears the marker (Undo{Delete}/restore). Removing a missing
 	// marker is a no-op success.
 	Remove(ctx context.Context, apID string) error
+
+	// Prune deletes markers recorded before the cutoff, in batches, and
+	// returns how many were deleted. Retention trade-off, accepted: a
+	// pruned marker re-opens the create-after-delete window for THAT id,
+	// but out-of-order re-deliveries happen minutes apart, not months —
+	// TOMBSTONE_RETENTION's default (30 days) is orders of magnitude above
+	// any observed redelivery horizon.
+	Prune(ctx context.Context, cutoff time.Time) (int64, error)
 }

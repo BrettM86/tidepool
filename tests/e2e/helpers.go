@@ -34,8 +34,10 @@ import (
 	"testing"
 	"time"
 
+	comatproto "github.com/bluesky-social/indigo/api/atproto"
 	"github.com/bluesky-social/indigo/atproto/atdata"
 	"github.com/bluesky-social/indigo/atproto/lexicon"
+	indigoevents "github.com/bluesky-social/indigo/events"
 	"github.com/gorilla/websocket"
 
 	"tidepool/lexicons"
@@ -837,10 +839,12 @@ func (h *harness) getVoteAggregates(t *testing.T, uris ...string) map[string]vot
 //
 // The bridge's OWN com.atproto.sync.* + identity endpoints (tidepool :8092).
 // Repo lifecycle state (active/deactivated) must be asserted here rather
-// than through the relay: bigsky serves no getRepoStatus, FILTERS
-// tombstoned repos out of its listRepos, and learns account state upstream
-// only from #account frames — which the bridge does not emit until task 11
-// (FOLLOWUPS.md "Relay pipeline").
+// than through the relay: bigsky serves no getRepoStatus and FILTERS
+// tombstoned repos out of its listRepos. Since task 11 the bridge emits an
+// #account{active:false, status:"deleted"} frame on Delete(Actor), so the
+// relay-side signal IS observable — as the repo DISAPPEARING from the
+// relay's listRepos (asserted in TestDeleteActor) — while fine-grained
+// status still reads from the bridge.
 
 // xrpcResult is the decoded outcome of one bridge XRPC GET: the HTTP status
 // plus either the success body or the standard XRPC error shape.
@@ -898,6 +902,51 @@ func (h *harness) bridgeGetRepoStatus(did string) (repoStatus, xrpcResult, error
 		return repoStatus{}, res, fmt.Errorf("getRepoStatus(%s): decode: %w (%s)", did, err, truncate(res.body, 200))
 	}
 	return out, res, nil
+}
+
+// dialBridgeFirehose opens a raw WebSocket on the BRIDGE's own
+// subscribeRepos (live tail — no cursor), for asserting frames Jetstream's
+// JSON view abstracts away. The caller reads with readBridgeAccountFrame.
+func (h *harness) dialBridgeFirehose(t *testing.T) *websocket.Conn {
+	t.Helper()
+	wsURL := "ws" + strings.TrimPrefix(tidepoolURL(), "http") + "/xrpc/com.atproto.sync.subscribeRepos"
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if resp != nil && resp.Body != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+	if err != nil {
+		t.Fatalf("dial bridge firehose %s: %v", wsURL, err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return conn
+}
+
+// readBridgeAccountFrame consumes the bridge's CBOR event stream until an
+// #account frame for did arrives (skipping #commit and #info frames), or
+// fails the test at the deadline. Uses indigo's frame decoder — the exact
+// bytes a relay consumes.
+func readBridgeAccountFrame(t *testing.T, conn *websocket.Conn, did string, timeout time.Duration) *comatproto.SyncSubscribeRepos_Account {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if err := conn.SetReadDeadline(deadline); err != nil {
+			t.Fatalf("bridge firehose: set read deadline: %v", err)
+		}
+		msgType, payload, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("bridge firehose: no #account frame for %s within %s: %v", did, timeout, err)
+		}
+		if msgType != websocket.BinaryMessage {
+			continue
+		}
+		var evt indigoevents.XRPCStreamEvent
+		if err := evt.Deserialize(bytes.NewReader(payload)); err != nil {
+			t.Fatalf("bridge firehose: undecodable frame: %v", err)
+		}
+		if evt.RepoAccount != nil && evt.RepoAccount.Did == did {
+			return evt.RepoAccount
+		}
+	}
 }
 
 // bridgeListRepos walks the bridge's own listRepos (which, unlike the

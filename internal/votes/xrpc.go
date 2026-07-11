@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -15,6 +14,7 @@ import (
 	"github.com/lib/pq"
 
 	"tidepool/internal/errors"
+	"tidepool/internal/ratelimit"
 )
 
 // NSIDGetVoteAggregates is the sanctioned side-channel query
@@ -53,7 +53,7 @@ type XRPCOptions struct {
 // Public, cacheable, rate limited by client IP.
 type XRPC struct {
 	db      *sql.DB
-	limiter *ipLimiter
+	limiter *ratelimit.Limiter
 	logger  *slog.Logger
 }
 
@@ -76,7 +76,7 @@ func NewXRPC(opts XRPCOptions) (*XRPC, error) {
 	}
 	return &XRPC{
 		db:      opts.DB,
-		limiter: newIPLimiter(perSecond, burst),
+		limiter: ratelimit.New(perSecond, burst),
 		logger:  logger,
 	}, nil
 }
@@ -101,7 +101,7 @@ type aggregateView struct {
 // error — the AppView batches optimistically over content that may predate
 // vote ingestion. Malformed at-uris are InvalidRequest.
 func (x *XRPC) handleGetVoteAggregates(w http.ResponseWriter, r *http.Request) {
-	if !x.limiter.allow(clientIP(r)) {
+	if !x.limiter.Allow(ratelimit.ClientIP(r)) {
 		x.writeXRPCError(w, http.StatusTooManyRequests, "RateLimitExceeded", "rate limit exceeded")
 		return
 	}
@@ -192,18 +192,6 @@ func parseURIs(params []string) ([]string, error) {
 		}
 	}
 	return uris, nil
-}
-
-// clientIP extracts the connection's remote IP. Deliberately not
-// X-Forwarded-For: the bridge cannot know which proxies to trust, and a
-// spoofable header would let one client exhaust every bucket. Deployments
-// behind a load balancer rate-limit the real client at the edge.
-func clientIP(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
 }
 
 func (x *XRPC) writeJSON(w http.ResponseWriter, status int, body any) {

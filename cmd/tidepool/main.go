@@ -23,6 +23,7 @@ import (
 	"tidepool/internal/identity"
 	"tidepool/internal/ingest"
 	"tidepool/internal/materialize"
+	"tidepool/internal/prune"
 	"tidepool/internal/repo"
 	"tidepool/internal/store"
 	tidepoolsync "tidepool/internal/sync"
@@ -109,11 +110,14 @@ func run(logger *slog.Logger) error {
 	defer func() { _ = broadcaster.Close() }()
 	go broadcaster.Run(ctx)
 	syncServer, err := tidepoolsync.NewServer(tidepoolsync.Options{
-		Repo:        repoManager,
-		Broadcaster: broadcaster,
-		Logger:      logger,
-		Hostname:    cfg.BridgeHostname,
-		ServiceDID:  cfg.BridgeServiceDID,
+		Repo:           repoManager,
+		Broadcaster:    broadcaster,
+		Logger:         logger,
+		Hostname:       cfg.BridgeHostname,
+		ServiceDID:     cfg.BridgeServiceDID,
+		RatePerSecond:  float64(cfg.SyncRatePerSecond),
+		RateBurst:      cfg.SyncRateBurst,
+		MaxSubscribers: cfg.SyncMaxSubscribers,
 	})
 	if err != nil {
 		return err
@@ -156,8 +160,11 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 	apClient := ap.NewClient(ap.ClientOptions{
-		UserAgent:             cfg.UserAgent,
-		Signer:                serviceActor.Signer(),
+		UserAgent: cfg.UserAgent,
+		Signer:    serviceActor.Signer(),
+		// MAX_BLOB_BYTES governs media downloads only; the JSON-object cap
+		// keeps its own (smaller) default.
+		MaxMediaBytes:         cfg.MaxBlobBytes,
 		AllowPrivateAddresses: cfg.AllowPrivateAddresses,
 	})
 
@@ -200,6 +207,16 @@ func run(logger *slog.Logger) error {
 	tombstones := store.NewTombstones(database)
 	inboxEvents := store.NewInboxEvents(database)
 
+	// The vote aggregation side channel (task 07): Like/Dislike activities
+	// maintain bridge-side counts (never records), served over
+	// social.coves.bridge.getVoteAggregates. Built before the materializer
+	// because the materializer's actor scrub erases a deleted voter's
+	// vote_events rows through it.
+	voteAggregator, err := votes.NewAggregator(database, objects, communities, repoManager, logger)
+	if err != nil {
+		return err
+	}
+
 	materializer, err := materialize.New(materialize.Options{
 		Fetcher:           apClient,
 		Objects:           objects,
@@ -207,6 +224,7 @@ func run(logger *slog.Logger) error {
 		Communities:       communities,
 		Repos:             repoManager,
 		Minter:            mintGate,
+		Votes:             voteAggregator,
 		ServiceDID:        serviceDID,
 		ProfileRefreshTTL: cfg.ProfileRefreshTTL,
 		MaxBlobBytes:      cfg.MaxBlobBytes,
@@ -217,13 +235,10 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
-	// The vote aggregation side channel (task 07): Like/Dislike activities
-	// maintain bridge-side counts (never records), served over
-	// social.coves.bridge.getVoteAggregates.
-	voteAggregator, err := votes.NewAggregator(database, objects, communities, repoManager, logger)
-	if err != nil {
-		return err
-	}
+	// Task 11 retention pruners: ap_tombstones markers and undone
+	// vote_events rows age out like firehose events do.
+	go prune.Run(ctx, "ap_tombstones", cfg.TombstoneRetention, 0, tombstones.Prune, logger)
+	go prune.Run(ctx, "vote_events(undone)", cfg.VoteEventRetention, 0, voteAggregator.PruneUndoneEvents, logger)
 	// Seeding imports historical scores for backfilled posts from the origin
 	// instance's public API (AP alone cannot provide them).
 	var seeder ingest.CountSeeder
@@ -278,17 +293,36 @@ func run(logger *slog.Logger) error {
 	go queue.Run(ctx)
 
 	inbox, err := ingest.NewInbox(ingest.InboxOptions{
-		Verifier: ap.NewVerifier(apClient),
-		Events:   inboxEvents,
-		Queue:    queue,
-		Service:  serviceActor,
-		Fetcher:  apClient,
-		Logger:   logger,
+		Verifier:                      ap.NewVerifier(apClient),
+		Events:                        inboxEvents,
+		Queue:                         queue,
+		Service:                       serviceActor,
+		Fetcher:                       apClient,
+		Logger:                        logger,
+		IPRatePerSecond:               float64(cfg.InboxIPRatePerSecond),
+		IPRateBurst:                   cfg.InboxIPRateBurst,
+		SignerRatePerSecond:           float64(cfg.InboxSignerRatePerSecond),
+		SignerRateBurst:               cfg.InboxSignerRateBurst,
+		TombstoneConfirmRatePerSecond: float64(cfg.InboxTombstoneConfirmsPerMinute) / 60,
+		TombstoneConfirmBurst:         cfg.InboxTombstoneConfirmBurst,
 	})
 	if err != nil {
 		return err
 	}
 	inbox.Routes(router)
+
+	// Automatic Follow re-send for subscriptions stuck in pending (the
+	// Lemmy first-contact Accept race; task 11).
+	followRetrier, err := ingest.NewFollowRetrier(ingest.FollowRetrierOptions{
+		Client:      apClient,
+		Communities: communities,
+		Service:     serviceActor,
+		Logger:      logger,
+	})
+	if err != nil {
+		return err
+	}
+	go followRetrier.Run(ctx)
 
 	admin, err := ingest.NewAdmin(ingest.AdminOptions{
 		Token:        cfg.AdminToken,

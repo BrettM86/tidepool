@@ -9,21 +9,70 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"expvar"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
 	"tidepool/internal/ap"
 	"tidepool/internal/errors"
+	"tidepool/internal/ratelimit"
 	"tidepool/internal/store"
 )
+
+// InboxRateLimited counts inbox deliveries refused by admission control —
+// the per-IP and per-signer token buckets and the tombstone-confirmation
+// cap. Published to the admin /metrics surface as
+// "tidepool_inbox_ratelimited" (mirrors materialize.ValidationFailures): a
+// misconfigured tight limit that silently drops all traffic is otherwise
+// invisible, since refusals are sampled in the logs. Every refusal
+// increments it.
+var InboxRateLimited = expvar.NewInt("tidepool_inbox_ratelimited")
+
+// refusalLogInterval throttles the (otherwise noisy) refusal Warn logs: a
+// flood must be visible without drowning the log, and the expvar counter
+// carries the true rate.
+const refusalLogInterval = time.Second
 
 // maxInboxBodyBytes caps inbound activity payloads. Lemmy activities are a
 // few KB; anything approaching a megabyte is abuse.
 const maxInboxBodyBytes = 1 << 20
+
+// Inbox admission-control defaults (task 11; config INBOX_* overrides).
+// Two token-bucket layers guard the queue-flood DoS:
+//
+//   - per client IP, checked before anything else — bounds total ingress
+//     per host however many self-signed identities it mints;
+//   - per verified signer, checked after signature verification — bounds
+//     one identity spraying through many addresses.
+//
+// Both are DoS backstops, not fairness controls, so the defaults are
+// generous: a real Lemmy instance delivers sequentially per peer (its
+// federation worker awaits each POST), which tops out far below these
+// rates even on a LAN.
+const (
+	defaultInboxIPRatePerSecond = 50
+	defaultInboxIPRateBurst     = 200
+
+	defaultInboxSignerRatePerSecond = 20
+	defaultInboxSignerRateBurst     = 100
+
+	// The tombstonedSelfDelete branch gets a DEDICATED, much tighter per-IP
+	// cap: it is an UNAUTHENTICATED POST that costs the bridge an outbound
+	// confirmation fetch and — when the claimed origin answers 410, which
+	// any cheap attacker-run endpoint can — two durable writes. Legitimate
+	// origins deliver account deletions rarely (humans deleting accounts),
+	// so ~6/min sustained with a small burst is far above real traffic
+	// while starving an amplification loop. Rate-limited confirmations
+	// DEFER (503) rather than reject: a legitimate deletion behind the
+	// limiter is redelivered by the sender's queue, never dropped.
+	defaultTombstoneConfirmRatePerSecond = 0.1
+	defaultTombstoneConfirmBurst         = 10
+)
 
 // softwareName is what nodeinfo reports; Lemmy admins allowlist by this
 // name.
@@ -58,6 +107,15 @@ type InboxOptions struct {
 	// whose actor document it already serves as 410 Gone).
 	Fetcher ActorFetcher
 	Logger  *slog.Logger
+
+	// Admission-control tuning; zero values take the defaults above
+	// (tests shrink them). See the default constants for the model.
+	IPRatePerSecond               float64
+	IPRateBurst                   int
+	SignerRatePerSecond           float64
+	SignerRateBurst               int
+	TombstoneConfirmRatePerSecond float64
+	TombstoneConfirmBurst         int
 }
 
 // Inbox is the HTTP face of ingestion: POST /inbox (+ the actor inbox
@@ -69,6 +127,11 @@ type Inbox struct {
 	service  *ap.ServiceActor
 	fetcher  ActorFetcher
 	logger   *slog.Logger
+
+	ipLimiter        *ratelimit.Limiter
+	signerLimiter    *ratelimit.Limiter
+	tombstoneLimiter *ratelimit.Limiter
+	refusalLog       *ratelimit.Sampler
 }
 
 // NewInbox validates options and builds the Inbox.
@@ -92,6 +155,15 @@ func NewInbox(opts InboxOptions) (*Inbox, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	limiterOf := func(rate float64, fallbackRate float64, burst, fallbackBurst int) *ratelimit.Limiter {
+		if rate <= 0 {
+			rate = fallbackRate
+		}
+		if burst <= 0 {
+			burst = fallbackBurst
+		}
+		return ratelimit.New(rate, burst)
+	}
 	return &Inbox{
 		verifier: opts.Verifier,
 		events:   opts.Events,
@@ -99,6 +171,13 @@ func NewInbox(opts InboxOptions) (*Inbox, error) {
 		service:  opts.Service,
 		fetcher:  opts.Fetcher,
 		logger:   logger,
+		ipLimiter: limiterOf(opts.IPRatePerSecond, defaultInboxIPRatePerSecond,
+			opts.IPRateBurst, defaultInboxIPRateBurst),
+		signerLimiter: limiterOf(opts.SignerRatePerSecond, defaultInboxSignerRatePerSecond,
+			opts.SignerRateBurst, defaultInboxSignerRateBurst),
+		tombstoneLimiter: limiterOf(opts.TombstoneConfirmRatePerSecond, defaultTombstoneConfirmRatePerSecond,
+			opts.TombstoneConfirmBurst, defaultTombstoneConfirmBurst),
+		refusalLog: ratelimit.NewSampler(refusalLogInterval),
 	}, nil
 }
 
@@ -125,6 +204,21 @@ func (ib *Inbox) Routes(r chi.Router) {
 // worker pool, 202. Everything heavier happens async — remote instances
 // time deliveries and treat slow inboxes as dead.
 func (ib *Inbox) handleInbox(w http.ResponseWriter, r *http.Request) {
+	// Admission layer 1, per client IP, before the body is even read: one
+	// host gets a bounded delivery rate no matter how many identities it
+	// signs with. Refusals are 503, NOT 429: Lemmy's federation crate
+	// treats server errors as retryable but drops 4xx permanently, and a
+	// legitimate burst must be delayed, never lost.
+	clientIP := ratelimit.ClientIP(r)
+	if !ib.ipLimiter.Allow(clientIP) {
+		InboxRateLimited.Add(1)
+		if ib.refusalLog.Allow(time.Now()) {
+			ib.logger.Warn("inbox delivery rate-limited by ip (sampled)", "ip", clientIP)
+		}
+		http.Error(w, "delivery rate limit exceeded; retry later", http.StatusServiceUnavailable)
+		return
+	}
+
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxInboxBodyBytes))
 	if err != nil {
 		http.Error(w, "request body too large or unreadable", http.StatusRequestEntityTooLarge)
@@ -134,7 +228,7 @@ func (ib *Inbox) handleInbox(w http.ResponseWriter, r *http.Request) {
 	actorID, err := ib.verifier.Verify(r.Context(), r, body)
 	var activity *ap.Object
 	if err != nil {
-		selfDelete, tombstonedActor, deferConfirm := ib.tombstonedSelfDelete(r.Context(), body, err)
+		selfDelete, tombstonedActor, deferConfirm := ib.tombstonedSelfDelete(r.Context(), body, err, clientIP)
 		switch {
 		case tombstonedActor != "":
 			// A self-Delete whose actor is verifiably GONE at its own
@@ -173,6 +267,19 @@ func (ib *Inbox) handleInbox(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "signature key unavailable", http.StatusServiceUnavailable)
 			return
 		}
+	}
+
+	// Admission layer 2, per verified signer: one identity spraying from
+	// many addresses is bounded too. Keyed on the SIGNER (the key owner
+	// Verify authenticated — or, on the tombstone path, the confirmed-gone
+	// actor), which is unforgeable, unlike the activity's claimed actor.
+	if !ib.signerLimiter.Allow(actorID) {
+		InboxRateLimited.Add(1)
+		if ib.refusalLog.Allow(time.Now()) {
+			ib.logger.Warn("inbox delivery rate-limited by signer (sampled)", "signer", actorID)
+		}
+		http.Error(w, "delivery rate limit exceeded; retry later", http.StatusServiceUnavailable)
+		return
 	}
 
 	// The tombstoned-self-delete path already parsed the body; every other
@@ -251,6 +358,10 @@ func (ib *Inbox) handleInbox(w http.ResponseWriter, r *http.Request) {
 //   - the payload is a bare self-referential Delete (actor == object) with
 //     an id (the id gates the confirmation fetch: an unenqueueable activity
 //     never earns an outbound request);
+//   - the sender's IP has budget in the dedicated tombstone-confirmation
+//     limiter (task 11) — otherwise the delivery DEFERS (503) without any
+//     outbound fetch, bounding the fetch-and-write amplification this
+//     branch could be farmed for;
 //   - an INDEPENDENT fetch of that actor's own IRI — SSRF-guarded, derived
 //     from the payload, not from any attacker-controllable keyId, and with
 //     every redirect hop pinned to the IRI's own authority
@@ -282,7 +393,7 @@ func (ib *Inbox) handleInbox(w http.ResponseWriter, r *http.Request) {
 //   - anything else (transport error, timeout, 5xx, context cancellation)
 //     → defer: the failure says nothing about the actor, and permanently
 //     dropping a legitimate deletion is unrecoverable.
-func (ib *Inbox) tombstonedSelfDelete(ctx context.Context, body []byte, verifyErr error) (activity *ap.Object, actorID string, deferDelivery bool) {
+func (ib *Inbox) tombstonedSelfDelete(ctx context.Context, body []byte, verifyErr error, clientIP string) (activity *ap.Object, actorID string, deferDelivery bool) {
 	if !errors.IsTombstoned(verifyErr) {
 		return nil, "", false
 	}
@@ -293,6 +404,18 @@ func (ib *Inbox) tombstonedSelfDelete(ctx context.Context, body []byte, verifyEr
 	actorIRI, objectIRI := refID(parsed.Actor), refID(parsed.Object)
 	if actorIRI == "" || actorIRI != objectIRI {
 		return nil, "", false
+	}
+	// The dedicated (much tighter) per-IP cap sits exactly in front of the
+	// costs this branch can be farmed for: the outbound confirmation fetch
+	// and, on a 410 answer, two durable writes. Checked only after the
+	// shape checks above, so an unenqueueable payload never spends a
+	// token, and answered as DEFER (503): a legitimate deletion behind the
+	// limiter is redelivered by the sender's queue, never dropped.
+	if !ib.tombstoneLimiter.Allow(clientIP) {
+		InboxRateLimited.Add(1)
+		ib.logger.Warn("tombstone confirmation rate-limited; deferring self-delete",
+			"ip", clientIP, "actor", actorIRI)
+		return nil, "", true
 	}
 	_, fetchErr := ib.fetcher.FetchActorSameAuthority(ctx, actorIRI)
 	switch {

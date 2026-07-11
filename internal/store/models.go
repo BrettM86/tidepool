@@ -131,16 +131,27 @@ type Community struct {
 	FollowedAt        *time.Time
 	LastBackfillAt    *time.Time
 	CreatedAt         time.Time
+	// FollowRequestedAt is when the most recent Follow activity went out
+	// (stamped on every transition to pending — subscribe and automatic
+	// re-send alike); FollowAttempts counts those sends since the last
+	// unsubscribe. Together they bound the follow retrier (task 11, the
+	// Lemmy first-contact Accept race).
+	FollowRequestedAt *time.Time
+	FollowAttempts    int
 }
 
 // ServiceKey is one of the bridge's own long-lived keys, keyed by purpose
-// name (e.g. "service-actor" for the AP-side RSA signing key, stored as
-// PKCS#8 PEM).
+// name. KeyMaterial's encoding is per-row: plaintext PKCS#8 PEM for
+// "service-actor" (the AP-side RSA signing key — the bridge's own service
+// credential, not user key material), AES-GCM sealed ciphertext for
+// "plc-rotation" (the escrow rotation key, sealed under BRIDGE_KEK by
+// identity.Custodian). The column was renamed from private_key_pem in
+// migration 013 because "PEM" lied for the sealed row.
 type ServiceKey struct {
-	ID            int64
-	Name          string
-	PrivateKeyPEM []byte
-	CreatedAt     time.Time
+	ID          int64
+	Name        string
+	KeyMaterial []byte
+	CreatedAt   time.Time
 }
 
 // InboxEvent is a received AP activity: the dedupe record AND the durable

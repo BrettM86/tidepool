@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/indigo/atproto/atdata"
+	"github.com/ipfs/go-cid"
 
 	"tidepool/internal/ap"
 	"tidepool/internal/errors"
@@ -201,19 +202,28 @@ func (m *Materializer) mintAndUpsert(ctx context.Context, doc *ap.Object, actorT
 // rematerializeProfile writes the actor's profile record (rkey "self"),
 // refreshes the mapping, and stamps profile_synced_at. Idempotent: an
 // unchanged profile is a repo-layer no-op.
+//
+// Media carry-forward (task 11): a refresh whose avatar/banner fetch FAILS
+// while the actor still advertises the image keeps the previously stored
+// blob instead of dropping it — a transient 5xx or timeout at the origin
+// must not strip profiles bare until the next refresh. An actor that
+// REMOVED its image (no icon/image in the doc) still loses the blob, as it
+// should.
 func (m *Materializer) rematerializeProfile(ctx context.Context, stored *store.BridgedActor, doc *ap.Object) (*store.BridgedActor, error) {
-	var record map[string]any
 	collection := CollectionActorProfile
+	if stored.ActorType == store.ActorTypeGroup {
+		collection = CollectionCommunityProfile
+	}
+
+	avatar := m.fetchBlobWithCarryForward(ctx, stored.DID, collection, imageURL(doc.Icon), slotAvatar, "avatar")
+	banner := m.fetchBlobWithCarryForward(ctx, stored.DID, collection, imageURL(doc.Image), slotBanner, "banner")
+
+	var record map[string]any
 	switch stored.ActorType {
 	case store.ActorTypeGroup:
-		collection = CollectionCommunityProfile
-		record = m.buildCommunityProfile(doc, stored.CreatedAt,
-			m.fetchBlob(ctx, stored.DID, imageURL(doc.Icon), slotAvatar),
-			m.fetchBlob(ctx, stored.DID, imageURL(doc.Image), slotBanner))
+		record = m.buildCommunityProfile(doc, stored.CreatedAt, avatar, banner)
 	default:
-		record = m.buildActorProfile(doc, stored.CreatedAt,
-			m.fetchBlob(ctx, stored.DID, imageURL(doc.Icon), slotAvatar),
-			m.fetchBlob(ctx, stored.DID, imageURL(doc.Image), slotBanner))
+		record = m.buildActorProfile(doc, stored.CreatedAt, avatar, banner)
 	}
 	if _, err := m.commitRecord(ctx, stored.DID, collection, ProfileRKey, record, doc, stored.DID); err != nil {
 		return nil, err
@@ -222,6 +232,48 @@ func (m *Materializer) rematerializeProfile(ctx context.Context, stored *store.B
 		return nil, fmt.Errorf("materialize: mark profile synced for %s: %w", stored.APActorID, err)
 	}
 	return stored, nil
+}
+
+// fetchBlobWithCarryForward fetches profile media like fetchBlob, but when a
+// TRANSIENT fetch failure hits AND the actor still advertises an image URL,
+// it falls back to the blob already stored in the existing profile record
+// under field (avatar/banner) — a temporary 5xx/timeout/dial error must not
+// strip the profile bare until the next refresh. A PERMANENT removal
+// (IsNotFound 404 / IsTombstoned 410: the image was deleted at origin while
+// its URL lingers in a stale doc) is NOT carried forward — the blob is
+// dropped, because serving media the origin removed forever is wrong. A
+// first-ever materialization has no existing record, so the fallback is
+// naturally empty there.
+func (m *Materializer) fetchBlobWithCarryForward(ctx context.Context, did, collection, url string, slot blobSlot, field string) *atdata.Blob {
+	if url == "" {
+		return nil
+	}
+	blob, fetchErr := m.fetchBlobClassified(ctx, did, url, slot)
+	if blob != nil {
+		return blob
+	}
+	if errors.IsNotFound(fetchErr) || errors.IsTombstoned(fetchErr) {
+		// Image gone at origin: drop it rather than carrying the stale blob
+		// forward forever.
+		m.logger.Info("media removed at origin; dropping previously stored blob",
+			"did", did, "field", field, "url", url)
+		return nil
+	}
+	existing, _, err := m.repos.GetRecord(ctx, did, collection, ProfileRKey)
+	if err != nil {
+		if !errors.IsNotFound(err) {
+			m.logger.Warn("media carry-forward: read existing profile failed",
+				"did", did, "field", field, "error", err)
+		}
+		return nil
+	}
+	prev, ok := existing[field].(atdata.Blob)
+	if !ok {
+		return nil
+	}
+	m.logger.Info("media fetch failed; carrying forward previously stored blob",
+		"did", did, "field", field, "url", url, "cid", cid.Cid(prev.Ref).String())
+	return &prev
 }
 
 // EnsureCommunity makes sure the AP group behind groupRef is bridged:

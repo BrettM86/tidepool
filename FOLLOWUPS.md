@@ -22,15 +22,20 @@ harness, **(relay)** by task 09's relay pipeline.
   path, or Coves consumes the bridge firehose directly. The e2e suite's
   listener buffers out-of-order events (`tests/e2e/helpers.go` `pending`)
   and asserts presence + linkage instead of cross-repo arrival order.
-- **Tombstoned (`active:false`) repo status is not observable through
-  bigsky.** It filters tombstoned/taken-down repos out of `listRepos`,
-  serves no `getRepoStatus`, and learns account state upstream only from
-  `#account` frames — which the bridge does not emit yet (task 11). When
-  the `#account` frame lands, add a relay-side e2e assertion that a
-  consent-revoked repo disappears from the relay's `listRepos`. Task 10's
-  `TestDeleteActor_ScrubsAndTombstones` PINS the current gap (the relay
-  still lists a tombstoned repo) with a comment pointing here — that
-  assertion must flip when task 11 lands.
+- ~~Tombstoned (`active:false`) repo status is not observable through
+  bigsky (no `#account` frame emitted).~~ **Closed by task 11**: the bridge
+  emits `#account{active:false, status:"deleted"}` through the durable
+  firehose log on `Delete(Actor)` (after the scrub delete-commits, same
+  advisory-lock seq ordering), and `TestDeleteActor_ScrubsAndTombstones`
+  now asserts the frame on the bridge's own firehose AND the repo
+  disappearing from the relay's `listRepos`. Wire fact (source-verified
+  against the pinned bigsky): on `status:"deleted"` bigsky re-resolves the
+  DID doc (PDS-authority check), marks the account `tombstoned` (the
+  `listRepos` filter), and PURGES the repo's carstore data — exactly the
+  downstream purge consent revocation wants. bigsky's `listRepos` filter
+  also excludes `deactivated`/`suspended`/`takendown`, but only `deleted`
+  purges. nobridge (reversible) deliberately emits NO frame — the repo
+  stays active.
 - **A fresh bigsky refuses all non-admin `requestCrawl`**: the new-PDS
   per-day limit defaults to 0 and is checked BEFORE the trusted-domain
   list. Any deployment announcing to a self-hosted relay needs the
@@ -106,10 +111,14 @@ harness, **(relay)** by task 09's relay pipeline.
   Accept answering the very first Follow to a given Lemmy instance is
   usually skipped: the instance row is created by that same Follow, and the
   per-instance worker spawns after the Accept is queued. Re-sending the
-  Follow (fresh activity id → fresh Accept) recovers. The harness retries in
-  `subscribeCommunity`; production operators hit this at most once (usually)
-  per peer instance. Consider an automatic Follow re-send in the follow
-  lifecycle when a subscription stays `pending` past a threshold.
+  Follow (fresh activity id → fresh Accept) recovers. ~~Consider an
+  automatic Follow re-send when a subscription stays `pending` past a
+  threshold.~~ **Closed by task 11**: `ingest.FollowRetrier` re-sends the
+  Follow (fresh activity id) for subscriptions pending past 2m, bounded to
+  5 total sends (`communities.follow_requested_at`/`follow_attempts`,
+  migration 012; unsubscribe resets the budget). The harness's own retry in
+  `subscribeCommunity` stays — the suite must not depend on the 2m
+  threshold.
 - **Author auto-upvotes do not federate (e2e).** Lemmy casts a local Like
   by the post author but never announces it, so live-bridged posts read one
   upvote lower than Lemmy's UI until a backfill re-seed. Accepted drift;
@@ -213,19 +222,33 @@ harness, **(relay)** by task 09's relay pipeline.
   runs development mode for migrations-on-start, strict validation, http
   scheme, private fetch).
 - Strict lexicon validation is dev/test-only; production logs-and-writes.
-  Wire a metric on validation failures and consider a strict-first rollout
-  (task 05 note).
+  ~~Wire a metric on validation failures~~ **(task 11:
+  `tidepool_lexicon_validation_failures` expvar counter, served on the
+  bearer-protected `GET /admin/metrics`)**; the strict-first rollout stays
+  deferred — that counter sitting at zero in production is its
+  precondition.
 
 ## Sync surface (task 04 notes)
 
-- **No `#account{active:false}` frame on consent revocation** — subscribers
-  currently rely on the scrub delete-commits; tombstoned actors' historical
-  events stay replayable until retention expires.
-- No connection cap / per-IP rate limit on the public sync surface
-  (pre-internet-facing hardening).
+- ~~No `#account{active:false}` frame on consent revocation.~~ **Closed by
+  task 11** (see the Relay pipeline entry: durable-log `account` event
+  kind, migration 011, emitted by `DeleteActor`, status `deleted` — which
+  also became the bridge's own `getRepoStatus`/`listRepos` status token,
+  replacing `deactivated`). Tombstoned actors' HISTORICAL events still
+  replay until retention expires — deliberate: replay windows are
+  advertised complete, and the trailing #account frame is the purge signal.
+- ~~No connection cap / per-IP rate limit on the public sync surface.~~
+  **Closed by task 11**: per-client-IP token bucket over every
+  `com.atproto.sync.*` endpoint (`SYNC_RATE_PER_SECOND`/`SYNC_RATE_BURST`,
+  429 `RateLimitExceeded`; `_health` exempt — container healthchecks must
+  not flap) + a concurrent `subscribeRepos` connection cap
+  (`SYNC_MAX_SUBSCRIBERS`, reserve-then-check, 429
+  `SubscriberLimitExceeded`).
 - `getRepo` buffers full CARs in memory; `ExportCAR` includes unreachable
   historical blocks (consider reachable-set-only).
-- `PruneEvents` is one unbatched DELETE per hourly sweep.
+- ~~`PruneEvents` is one unbatched DELETE per hourly sweep.~~ **Closed by
+  task 11**: batched (1000/statement) from the oldest seq up, so a partial
+  sweep still leaves a contiguous retained suffix.
 - MST loads are full-tree (one SELECT per node) → `PutRecord` is O(repo
   size); needs a per-DID tree cache before big-community scale.
 - `SigningKeys` could become a `SignCommit` capability (keeps key plaintext
@@ -238,28 +261,54 @@ harness, **(relay)** by task 09's relay pipeline.
 
 ## Ingestion (task 06 notes)
 
-- **No per-signer/per-IP rate limit on `/inbox`** — queue-flood DoS via
-  many self-signed identities remains the top hardening item.
-- `ap_tombstones` grows unbounded (no pruner — mirror `FIREHOSE_RETENTION`
-  treatment).
-- A `Delete` arriving before its object was ever materialized leaves
-  nothing to tombstone → a later `Create` still materializes (needs dedup /
-  tombstone-of-unseen-ids).
+- ~~No per-signer/per-IP rate limit on `/inbox`.~~ **Closed by task 11**:
+  two token-bucket layers (shared `internal/ratelimit`, the votes-limiter
+  discipline — sweep throttle, 50k fail-closed cap): per client IP before
+  the body is read, per verified signer after verification, plus a
+  DEDICATED much tighter per-IP cap on the `tombstonedSelfDelete`
+  confirmation branch (checked after the shape checks, BEFORE the outbound
+  confirmation fetch — the unauthenticated fetch+2-durable-writes
+  amplification task 10 flagged). All refusals are **503, never 4xx**:
+  Lemmy's federation crate retries server errors but drops 4xx permanently,
+  and rate-limited legitimate deliveries must delay, not vanish. Config
+  `INBOX_IP_RATE_PER_SECOND`/`INBOX_SIGNER_RATE_PER_SECOND`/
+  `INBOX_TOMBSTONE_CONFIRMS_PER_MINUTE` (+ bursts).
+- Every in-process per-IP limiter (inbox, the tombstone-confirmation cap, and
+  the `com.atproto.sync.*` bucket) keys on `RemoteAddr` and IGNORES
+  `X-Forwarded-For` — a deliberate non-goal (XFF is spoofable without a
+  trusted-proxy allowlist). A proxied/LB deployment MUST rate-limit at the
+  edge (see the README operations note), or every client shares the proxy's
+  one bucket and the tombstone-confirmation cap becomes GLOBAL. Clean future
+  fix if a real deployment needs it: an opt-in `TRUSTED_PROXY` config that
+  parses `X-Forwarded-For` only from an allowlisted hop; RemoteAddr-only stays
+  the safe default.
+- ~~`ap_tombstones` grows unbounded.~~ **Closed by task 11**: batched
+  pruner (`TOMBSTONE_RETENTION`, default 30d, shared `internal/prune`
+  runner — fail-closed on non-positive retention). Accepted trade-off: a
+  pruned marker re-opens delete-before-create for that id, but redelivery
+  horizons are hours-to-days.
+- ~~A `Delete` arriving before its object was ever materialized leaves
+  nothing to tombstone → a later `Create` still materializes.~~ **Stale —
+  closed by task 06 itself and verified in task 11**: `handleDelete`
+  records the `ap_tombstones` marker BEFORE `HandleDelete`, and
+  `materializeContent` checks it (`TestCreateAfterDeleteTombstone` pins the
+  whole ordering, restore included). The README's claim was correct; this
+  entry was the false doc.
 - `ClaimNext` does an O(N) row scan when one community's queue backs up
   behind a failing event (per-key serialization cost; revisit at scale).
 - A shutdown-interrupted attempt still consumes its ClaimNext attempt
   increment (cosmetic).
-- `MAX_BLOB_BYTES` above 5 MiB is a silent no-op (clamped by the AP
-  client's fixed `maxResponseBytes`).
+- ~~`MAX_BLOB_BYTES` above 5 MiB is a silent no-op.~~ **Closed by task
+  11**: the AP client grew a dedicated media cap
+  (`ClientOptions.MaxMediaBytes`, wired from `MAX_BLOB_BYTES`) so raising
+  the blob budget does not also raise the JSON-object response cap.
 - Mint-gate ("retry via queue backoff") is verified at unit level only —
   the harness never drives minting into the rate limiter (a low
   `MINT_RATE_PER_MINUTE` stack variant would need its own compose profile).
 - The `activityID` rand-failure path is guarded but unit-untestable
   (Go 1.24+ makes a `crypto/rand` failure a fatal crash, not a returnable
   error) — permanent test gap unless the reader is injected.
-- `ingest.NewNoopVotes` (`internal/ingest/votes.go`) is dead code: task 07
-  wired the real `votes.NewAggregator` in main.go and nothing (prod or
-  test) references the noop anymore — delete candidate.
+- ~~`ingest.NewNoopVotes` is dead code.~~ **Deleted in task 11.**
 
 ## Votes (task 07 notes)
 
@@ -272,10 +321,22 @@ harness, **(relay)** by task 09's relay pipeline.
   vote-clear a silent no-op; caught by the e2e retract-to-zero assertion
   and fixed in `internal/votes/aggregator.go` (id-targeted update first,
   known-id replay guard, then direction-agnostic live-vote fallback).
-- `vote_events` grows unbounded (no pruning of superseded/undone rows).
-- Actor-delete / consent revocation does **not** scrub that actor's
-  `vote_events` rows (inconsistent with the scrub posture elsewhere; counts
-  are anonymous on the wire, so exposure is low).
+- ~~`vote_events` grows unbounded (no pruning of superseded/undone rows).~~
+  **Closed by task 11**: batched pruner over UNDONE rows only
+  (`VOTE_EVENT_RETENTION`, default 90d) — live rows are the counts and are
+  never pruned. Accepted trade-off (documented on `PruneUndoneEvents`): an
+  undone row is also its activity id's dedupe record, so replay protection
+  now has the retention as its horizon.
+- ~~Actor-delete / consent revocation does **not** scrub that actor's
+  `vote_events` rows.~~ **Closed by task 11**: `votes.Aggregator.ScrubVoter`
+  (deletes ALL of the voter's rows, recomputes every affected aggregate
+  under ordered row locks; seeded baselines untouched), called from both
+  `DeleteActor` and the reversible nobridge `SuppressActor` via the
+  materializer's `VoteScrubber` hook. Residual: `ScrubVoter` takes the
+  affected aggregate row locks in a deterministic subject order to avoid
+  deadlock across the multiple subjects one voter touched, but that lock
+  ordering has no concurrency test — deterministic deadlock tests are flaky,
+  so it stays asserted by construction / at unit level only.
 - ~~No true concurrency stress on the aggregate-row locking claim — a
   many-voters-one-post hammer is still missing.~~ **Closed by task 10**:
   `TestVoteHammer_ConcurrentVotersExactAggregates` fires ten real Lemmy
@@ -286,8 +347,11 @@ harness, **(relay)** by task 09's relay pipeline.
   rather than true same-row lock contention (which stays unit-level).
 - Subject resolution happens outside the mutation tx (narrow TOCTOU with a
   racing Delete, documented in task 07).
-- No upper sanity cap on seeded counts; comment count seeding skipped
-  (per-comment API calls would triple backfill egress).
+- ~~No upper sanity cap on seeded counts~~ **(task 11:
+  `votes.MaxSeededCount` = 1,000,000 — a hostile origin's absurd baseline
+  is a validation error the seeder logs; the previous baseline survives)**;
+  comment count seeding stays skipped (per-comment API calls would triple
+  backfill egress).
 - Baseline-voter drift: a voter counted only in the seeded baseline who
   later flips federates a bare Dislike (no Undo), leaving the baseline
   upvote next to the new live downvote; a clear sends an Undo the live-vote
@@ -295,12 +359,28 @@ harness, **(relay)** by task 09's relay pipeline.
 
 ## Materializer (task 05 notes)
 
-- Transient media-fetch failure on profile refresh drops existing blobs
-  (no carry-forward); a stale actor behind a 403-ing instance drops content
-  instead of serving stale.
-- `commitRecord`'s PutRecord→PutMapping is not one tx (self-heals on retry;
-  a Delete landing in the crash window logs Warn).
-- `DeleteActor` scrubs records but not blobs stored under community DIDs.
+- ~~Transient media-fetch failure on profile refresh drops existing blobs
+  (no carry-forward).~~ **Closed by task 11**: a failed avatar/banner fetch
+  while the actor still ADVERTISES the image carries the stored blob
+  forward; a removed image still drops it. The related "stale actor behind
+  a 403-ing instance drops content instead of serving stale" remains open
+  (that is the actor DOCUMENT, not its media).
+- ~~`commitRecord`'s PutRecord→PutMapping is not one tx.~~ **Closed by
+  task 11**: `repo.PutRecordTx` runs a `TxSideEffect` inside the commit
+  transaction (also on the idempotent NoOp path) and the materializer
+  writes the mapping through `store.PutMappingTx` there — record and
+  mapping land together or not at all, deterministic-rkey collisions now
+  roll the record back too.
+- ~~`DeleteActor` scrubs records but not blobs stored under community
+  DIDs.~~ **Closed by task 11**: the scrub reads each record before its
+  delete commit and deletes the blobs it referenced (`atdata.ExtractBlobs`
+  — post thumbnails/images under COMMUNITY DIDs included); `DeleteActor`
+  additionally drops every remaining blob under the actor's own terminally
+  frozen DID. Accepted edge (commented on `repo.DeleteBlob`): blobs are
+  content-addressed per DID (`blobs` PK `(did, cid)`), so two records in one
+  repo embedding byte-identical media share a single blob row, and scrubbing
+  one record can orphan the other's image. Accepted at bridge scale; a blob
+  refcount / junction table is the fix if this ever bites.
 - ~~Test gap: `embed.images` arm + nsfw label shapes never appear on the
   wire (needs pictrs-backed image upload in the harness).~~ **Closed by
   task 10**: `TestImagePost_EmbedImagesAndNSFWLabel` uploads through
@@ -315,8 +395,10 @@ harness, **(relay)** by task 09's relay pipeline.
 
 ## Storage / housekeeping
 
-- `service_keys.private_key_pem` column name lies for the "plc-rotation"
-  row (it holds sealed ciphertext) — rename candidate (task 03 note).
+- ~~`service_keys.private_key_pem` column name lies for the "plc-rotation"
+  row.~~ **Closed by task 11**: renamed to `key_material` (migration 013;
+  the per-row encoding — plaintext PEM vs sealed ciphertext — is documented
+  on `store.ServiceKey`).
 - `blocks` is append-only with no GC (load-bearing for GetRecord read
   consistency; revisit together with the getRepo memory item).
 

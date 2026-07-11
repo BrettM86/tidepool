@@ -102,7 +102,7 @@ func LoadOrCreateServiceActor(ctx context.Context, keys store.ServiceKeys, hostn
 		return nil, fmt.Errorf("ap: load service key: %w", err)
 	}
 
-	key, err := ParsePrivateKeyPEM(stored.PrivateKeyPEM)
+	key, err := ParsePrivateKeyPEM(stored.KeyMaterial)
 	if err != nil {
 		return nil, fmt.Errorf("ap: stored service key is corrupt: %w", err)
 	}

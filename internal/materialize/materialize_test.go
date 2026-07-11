@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/bluesky-social/indigo/atproto/atcrypto"
@@ -113,6 +114,26 @@ type harness struct {
 	communities store.Communities
 	mux         *http.ServeMux
 	fixtures    *httptest.Server
+	scrubbed    *recordingScrubber
+}
+
+// recordingScrubber records ScrubVoter calls (the task-11 vote-scrub hook).
+type recordingScrubber struct {
+	mu  sync.Mutex
+	ids []string
+}
+
+func (r *recordingScrubber) ScrubVoter(_ context.Context, voterAPID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.ids = append(r.ids, voterAPID)
+	return nil
+}
+
+func (r *recordingScrubber) calls() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.ids...)
 }
 
 // newHarness wires the full materialization stack over the real test
@@ -144,6 +165,7 @@ func newHarness(t *testing.T) *harness {
 		MaxAttempts:           1, // fixture errors are deterministic; retries just slow tests
 	})
 
+	scrubbed := &recordingScrubber{}
 	m, err := New(Options{
 		Fetcher:          client,
 		Objects:          objects,
@@ -151,6 +173,7 @@ func newHarness(t *testing.T) *harness {
 		Communities:      communities,
 		Repos:            manager,
 		Minter:           &fakeMinter{custodian: custodian},
+		Votes:            scrubbed,
 		ServiceDID:       testServiceDID,
 		StrictValidation: true, // tests always validate against the vendored lexicons
 	})
@@ -159,7 +182,7 @@ func newHarness(t *testing.T) *harness {
 	h := &harness{
 		t: t, m: m, manager: manager,
 		objects: objects, actors: actors, communities: communities,
-		mux: mux, fixtures: fixtures,
+		mux: mux, fixtures: fixtures, scrubbed: scrubbed,
 	}
 	// Every pictrs-style image path serves fixed bytes by extension.
 	mux.HandleFunc("/pictrs/image/", func(w http.ResponseWriter, r *http.Request) {

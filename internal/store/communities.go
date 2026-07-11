@@ -23,7 +23,8 @@ func NewCommunities(db *sql.DB) Communities {
 
 const communityColumns = `
 	id, ap_group_id, did, preferred_username, instance,
-	follow_state, followed_at, last_backfill_at, created_at`
+	follow_state, followed_at, last_backfill_at, created_at,
+	follow_requested_at, follow_attempts`
 
 func (r *postgresCommunities) UpsertCommunity(ctx context.Context, community Community) (*Community, error) {
 	if err := validateCommunity(&community); err != nil {
@@ -110,12 +111,29 @@ func (r *postgresCommunities) SetFollowState(ctx context.Context, apGroupID stri
 	// followed_at stamps only on the transition INTO accepted — AP happily
 	// redelivers Accept, and a re-accept must not re-stamp the original
 	// time. none clears it; pending leaves it alone.
+	//
+	// The follow-retry bookkeeping (task 11) rides the same statement:
+	// every set-to-pending means "a Follow was just sent" (admin subscribe
+	// and the retrier both send before recording), so it stamps
+	// follow_requested_at and increments follow_attempts; none resets both
+	// (a fresh subscription starts a fresh budget); accepted leaves them
+	// for post-mortems.
 	query := `
 		UPDATE communities
 		SET followed_at = CASE
 		        WHEN $2 = 'accepted' AND follow_state <> 'accepted' THEN CURRENT_TIMESTAMP
 		        WHEN $2 = 'none' THEN NULL
 		        ELSE followed_at
+		    END,
+		    follow_requested_at = CASE
+		        WHEN $2 = 'pending' THEN CURRENT_TIMESTAMP
+		        WHEN $2 = 'none' THEN NULL
+		        ELSE follow_requested_at
+		    END,
+		    follow_attempts = CASE
+		        WHEN $2 = 'pending' THEN follow_attempts + 1
+		        WHEN $2 = 'none' THEN 0
+		        ELSE follow_attempts
 		    END,
 		    follow_state = $2
 		WHERE ap_group_id = $1`
@@ -178,6 +196,54 @@ func (r *postgresCommunities) ListByFollowState(ctx context.Context, state Follo
 	return communities, nil
 }
 
+func (r *postgresCommunities) ClaimStalePendingFollows(ctx context.Context, requestedBefore time.Time, maxAttempts int) ([]*Community, error) {
+	if maxAttempts <= 0 {
+		return nil, errors.NewValidationError("max_attempts", "must be positive")
+	}
+	// One atomic conditional claim: the UPDATE consumes an attempt and
+	// re-stamps follow_requested_at on exactly the rows it matches, and
+	// RETURNING hands back only those (post-increment) rows for the retrier
+	// to send. Because the claim IS the match, a concurrent sweep and an
+	// Accept can never be clobbered:
+	//   - two overlapping sweeps: the second UPDATE re-evaluates its WHERE
+	//     against the first sweep's just-written follow_requested_at (row is
+	//     row-locked until the first commits), which is no longer < the
+	//     cutoff, so it claims nothing — no double-send;
+	//   - an Accept between sweeps flips follow_state to 'accepted', which
+	//     the WHERE excludes, so the claim leaves it untouched (no downgrade
+	//     back to pending).
+	// NULL follow_requested_at (legacy rows from before migration 012) is
+	// treated as stale: a pending row with no recorded send time has, by
+	// definition, waited longer than any threshold.
+	query := `
+		UPDATE communities
+		SET follow_attempts = follow_attempts + 1,
+		    follow_requested_at = CURRENT_TIMESTAMP
+		WHERE follow_state = 'pending'
+		  AND follow_attempts < $2
+		  AND (follow_requested_at IS NULL OR follow_requested_at < $1)
+		RETURNING` + communityColumns
+
+	rows, err := r.db.QueryContext(ctx, query, requestedBefore, maxAttempts)
+	if err != nil {
+		return nil, fmt.Errorf("claim stale pending follows: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var communities []*Community
+	for rows.Next() {
+		community, err := scanCommunity(rows)
+		if err != nil {
+			return nil, fmt.Errorf("claim stale pending follows: scan: %w", err)
+		}
+		communities = append(communities, community)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("claim stale pending follows: rows: %w", err)
+	}
+	return communities, nil
+}
+
 func validateCommunity(community *Community) error {
 	if community.APGroupID == "" {
 		return errors.NewValidationError("ap_group_id", "must not be empty")
@@ -208,6 +274,7 @@ func scanCommunity(row rowScanner) (*Community, error) {
 		&community.PreferredUsername, &community.Instance,
 		&followState, &community.FollowedAt, &community.LastBackfillAt,
 		&community.CreatedAt,
+		&community.FollowRequestedAt, &community.FollowAttempts,
 	)
 	if err != nil {
 		return nil, err

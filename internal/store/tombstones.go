@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 
 	"tidepool/internal/errors"
 )
@@ -52,4 +53,29 @@ func (r *postgresTombstones) Remove(ctx context.Context, apID string) error {
 		return fmt.Errorf("remove tombstone %q: %w", apID, err)
 	}
 	return nil
+}
+
+// tombstonePruneBatchSize bounds one DELETE inside Prune (same reasoning as
+// the firehose pruner: short statements never stall the write path).
+const tombstonePruneBatchSize = 1000
+
+func (r *postgresTombstones) Prune(ctx context.Context, cutoff time.Time) (int64, error) {
+	var total int64
+	for {
+		res, err := r.db.ExecContext(ctx, `
+			DELETE FROM ap_tombstones WHERE ap_id IN (
+				SELECT ap_id FROM ap_tombstones WHERE deleted_at < $1 LIMIT $2
+			)`, cutoff, tombstonePruneBatchSize)
+		if err != nil {
+			return total, fmt.Errorf("prune tombstones before %s: %w", cutoff.Format(time.RFC3339), err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return total, fmt.Errorf("prune tombstones: rows affected: %w", err)
+		}
+		total += n
+		if n < tombstonePruneBatchSize {
+			return total, nil
+		}
+	}
 }

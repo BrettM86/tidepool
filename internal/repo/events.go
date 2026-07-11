@@ -9,11 +9,14 @@ import (
 	"strconv"
 
 	indigorepo "github.com/bluesky-social/indigo/atproto/repo"
+	"github.com/bluesky-social/indigo/atproto/syntax"
 
 	blockformat "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
 	car "github.com/ipld/go-car"
 	carutil "github.com/ipld/go-car/util"
+
+	"tidepool/internal/errors"
 )
 
 // OpAction is the kind of record mutation an Op describes. The values
@@ -112,6 +115,60 @@ func appendFirehoseEvent(ctx context.Context, tx *sql.Tx, ev firehoseEvent) (int
 		`SELECT pg_notify($1, $2)`, FirehoseNotifyChannel, strconv.FormatInt(seq, 10)); err != nil {
 		return 0, fmt.Errorf("repo: notify firehose event %d: %w", seq, err)
 	}
+	return seq, nil
+}
+
+// AppendAccountEvent appends an #account row to the firehose log: the
+// account-state signal (active=false + status) subscribers need to purge a
+// repo instead of inferring its death from scrub delete-commits. It takes
+// the same global commit advisory lock as record commits, so account rows
+// share the "seq order == visibility order" guarantee and can never
+// interleave incorrectly with the scrub commits that precede them. status
+// uses the com.atproto account-status vocabulary (AccountStatusDeleted for
+// the terminal consent flip); it is stored only when active is false.
+func (m *Manager) AppendAccountEvent(ctx context.Context, did string, active bool, status string) (int64, error) {
+	if _, err := syntax.ParseDID(did); err != nil {
+		return 0, errors.NewValidationError("did", err.Error())
+	}
+
+	lock := m.lockFor(did)
+	lock.Lock()
+	defer lock.Unlock()
+
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("repo: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx,
+		`SELECT pg_advisory_xact_lock($1)`, commitAdvisoryLockKey); err != nil {
+		return 0, fmt.Errorf("repo: take commit advisory lock: %w", err)
+	}
+
+	var statusValue any
+	if !active && status != "" {
+		statusValue = status
+	}
+	var seq int64
+	// clock_timestamp() for the same reason as commit events: stamp
+	// visibility time, not transaction start (see appendFirehoseEvent).
+	if err := tx.QueryRowContext(ctx, `
+		INSERT INTO firehose_events (kind, did, account_active, account_status, created_at)
+		VALUES ('account', $1, $2, $3, clock_timestamp())
+		RETURNING seq`,
+		did, active, statusValue).Scan(&seq); err != nil {
+		return 0, fmt.Errorf("repo: append account event for %s: %w", did, err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`SELECT pg_notify($1, $2)`, FirehoseNotifyChannel, strconv.FormatInt(seq, 10)); err != nil {
+		return 0, fmt.Errorf("repo: notify account event %d: %w", seq, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("repo: commit account event for %s: %w", did, err)
+	}
+	m.logger.Info("account event appended to firehose",
+		"did", did, "active", active, "status", status, "seq", seq)
 	return seq, nil
 }
 

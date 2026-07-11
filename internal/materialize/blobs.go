@@ -37,8 +37,20 @@ var (
 // wrong content type) logs a reason and returns nil so the caller omits the
 // image rather than dropping the record.
 func (m *Materializer) fetchBlob(ctx context.Context, did, url string, slot blobSlot) *atdata.Blob {
+	blob, _ := m.fetchBlobClassified(ctx, did, url, slot)
+	return blob
+}
+
+// fetchBlobClassified is fetchBlob that also reports the ORIGIN fetch error,
+// so carry-forward callers can distinguish a permanent removal (IsNotFound
+// for 404/401/403, IsTombstoned for 410 — the image is gone at the source)
+// from a transient failure (timeout/5xx/dial — the image is probably still
+// there). Only the download error is surfaced; unusable-media outcomes
+// (wrong content type, oversize, blob-store failure) return (nil, nil) — the
+// origin gave no removal signal, so the image is simply omitted this pass.
+func (m *Materializer) fetchBlobClassified(ctx context.Context, did, url string, slot blobSlot) (*atdata.Blob, error) {
 	if url == "" {
-		return nil
+		return nil, nil
 	}
 	budget := slot.maxSize
 	if m.maxBlob < budget {
@@ -48,21 +60,21 @@ func (m *Materializer) fetchBlob(ctx context.Context, did, url string, slot blob
 	if err != nil {
 		m.logger.Warn("media fetch failed; omitting image",
 			"slot", slot.name, "url", url, "error", err)
-		return nil
+		return nil, err
 	}
 	mimeType := normalizeImageMime(contentType, data)
 	if !slotAccepts(slot, mimeType) {
 		m.logger.Warn("media has unacceptable content type; omitting image",
 			"slot", slot.name, "url", url, "content_type", mimeType)
-		return nil
+		return nil, nil
 	}
 	blob, err := m.repos.PutBlob(ctx, did, mimeType, data)
 	if err != nil {
 		m.logger.Warn("blob store failed; omitting image",
 			"slot", slot.name, "url", url, "did", did, "error", err)
-		return nil
+		return nil, nil
 	}
-	return blob
+	return blob, nil
 }
 
 // normalizeImageMime parses the server's Content-Type; when it is absent,

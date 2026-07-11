@@ -5,7 +5,9 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"expvar"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -93,7 +95,12 @@ func NewAdmin(opts AdminOptions) (*Admin, error) {
 	}, nil
 }
 
-// Routes mounts the admin API on a chi router.
+// Routes mounts the admin API on a chi router. /admin/metrics serves ONLY
+// tidepool's own expvar counters (keys prefixed "tidepool_": the lexicon
+// validation-failure counter and the per-surface rate-limit refusal
+// counters), bearer-protected like the rest of /admin. It deliberately does
+// NOT use expvar.Handler(), which would also expose Go's global "cmdline"
+// and "memstats" — process internals no operator asked to publish.
 func (a *Admin) Routes(r chi.Router) {
 	r.Route("/admin", func(r chi.Router) {
 		r.Use(requireBearer(a.token, a.logger))
@@ -101,7 +108,28 @@ func (a *Admin) Routes(r chi.Router) {
 		r.Delete("/communities", a.handleUnsubscribe)
 		r.Get("/communities", a.handleList)
 		r.Post("/communities/backfill", a.handleBackfill)
+		r.Method(http.MethodGet, "/metrics", http.HandlerFunc(scopedMetrics))
 	})
+}
+
+// scopedMetrics writes the JSON expvar map filtered to tidepool's own
+// counters — the same wire format as expvar.Handler(), minus Go's global
+// cmdline/memstats.
+func scopedMetrics(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_, _ = io.WriteString(w, "{")
+	first := true
+	expvar.Do(func(kv expvar.KeyValue) {
+		if !strings.HasPrefix(kv.Key, "tidepool") {
+			return
+		}
+		if !first {
+			_, _ = io.WriteString(w, ",")
+		}
+		first = false
+		_, _ = fmt.Fprintf(w, "%q: %s", kv.Key, kv.Value)
+	})
+	_, _ = io.WriteString(w, "}\n")
 }
 
 // communityRequest is the shared request body: a Lemmy-style handle
@@ -333,7 +361,15 @@ func (a *Admin) writeResolveError(w http.ResponseWriter, ref string, err error) 
 // buildFollow constructs the signed Follow activity (delivery signing
 // happens in the client; this is the payload Lemmy validates).
 func (a *Admin) buildFollow(groupIRI string) (*ap.Object, error) {
-	id, err := a.activityID("follow")
+	return buildFollowActivity(a.service, groupIRI)
+}
+
+// buildFollowActivity is the package-level Follow constructor, shared by
+// the admin subscribe path and the follow retrier. Every call mints a
+// FRESH activity id — Lemmy dedupes by id, so a re-sent Follow must never
+// reuse one (the whole point of the retry is provoking a fresh Accept).
+func buildFollowActivity(service *ap.ServiceActor, groupIRI string) (*ap.Object, error) {
+	id, err := mintActivityID(service, "follow")
 	if err != nil {
 		return nil, err
 	}
@@ -341,7 +377,7 @@ func (a *Admin) buildFollow(groupIRI string) (*ap.Object, error) {
 		Context: json.RawMessage(`"https://www.w3.org/ns/activitystreams"`),
 		ID:      id,
 		Type:    ap.TypeFollow,
-		Actor:   &ap.Object{ID: a.service.ID},
+		Actor:   &ap.Object{ID: service.ID},
 		Object:  &ap.Object{ID: groupIRI},
 		To:      ap.Audience{groupIRI},
 	}, nil
@@ -376,11 +412,15 @@ func (a *Admin) buildUndoFollow(groupIRI string) (*ap.Object, error) {
 // Follow/Undo{Follow} would be silently ignored while the admin API still
 // reports success. The buildFollow/buildUndoFollow callers map this to a 5xx.
 func (a *Admin) activityID(kind string) (string, error) {
+	return mintActivityID(a.service, kind)
+}
+
+func mintActivityID(service *ap.ServiceActor, kind string) (string, error) {
 	var buf [16]byte
 	if _, err := rand.Read(buf[:]); err != nil {
 		return "", fmt.Errorf("ingest: mint activity id: %w", err)
 	}
-	return fmt.Sprintf("%s/activities/%s/%s", a.service.BaseURL(), kind, hex.EncodeToString(buf[:])), nil
+	return fmt.Sprintf("%s/activities/%s/%s", service.BaseURL(), kind, hex.EncodeToString(buf[:])), nil
 }
 
 // writeJSON writes a JSON response body.

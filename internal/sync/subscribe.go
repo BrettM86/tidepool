@@ -9,6 +9,8 @@ import (
 
 	"github.com/bluesky-social/indigo/events"
 	"github.com/gorilla/websocket"
+
+	"tidepool/internal/repo"
 )
 
 // upgrader intentionally skips origin checks: subscribeRepos is a public
@@ -58,6 +60,21 @@ func (s *Server) handleSubscribeRepos(w http.ResponseWriter, r *http.Request) {
 		}
 		cursor = &parsed
 	}
+
+	// Connection cap: reserve a slot before upgrading (reserve-then-check,
+	// so concurrent dials cannot all observe "one below the cap" and land
+	// together). Each live connection costs goroutines and a DB cursor;
+	// unbounded subscribers is the cheapest way to sink the bridge.
+	if s.subscribers.Add(1) > s.maxSubscribers {
+		s.subscribers.Add(-1)
+		SyncRateLimited.Add(1)
+		s.logger.Warn("subscribeRepos refused: connection cap reached",
+			"remote", r.RemoteAddr, "max", s.maxSubscribers)
+		writeXRPCError(w, http.StatusTooManyRequests, "SubscriberLimitExceeded",
+			"too many concurrent subscribers")
+		return
+	}
+	defer s.subscribers.Add(-1)
 
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -134,13 +151,14 @@ func (s *Server) readPump(cancel context.CancelFunc, conn *websocket.Conn) {
 
 // streamEvents is the outbox loop described on handleSubscribeRepos.
 //
-// KNOWN GAP (deliberate, tracked for task 06): the stream carries only
-// #commit frames and does not consult consent state, so a tombstoned actor's
-// already-committed events remain replayable for the retention window even
-// though the HTTP read surface refuses the repo. The atproto-native fix is
-// emitting an #account{active:false} frame when consent flips (plus delete
-// commits from the record scrub) so downstream consumers purge — that emit
-// path must land with task 06's consent flows.
+// The stream carries #commit and #account frames. Delete(Actor)/consent
+// revocation appends an #account{active:false, status:"deleted"} event to
+// the durable log (repo.AppendAccountEvent) after the scrub delete-commits,
+// so consumers purge the repo instead of inferring its death. A tombstoned
+// actor's HISTORICAL commit events stay replayable until retention expires —
+// deliberate: replay windows are advertised as complete, and the #account
+// frame (which replays with them, after them in seq order) is the purge
+// signal.
 func (s *Server) streamEvents(ctx context.Context, conn *websocket.Conn, cursor *int64, logger *slog.Logger) {
 	// Subscribe BEFORE reading the seq bounds: an event landing between the
 	// bounds read and the first wait leaves a token in the wake channel, so
@@ -227,7 +245,16 @@ func (s *Server) streamEvents(ctx context.Context, conn *websocket.Conn, cursor 
 			}
 		}
 		for _, ev := range batch {
-			frame, err := commitFrame(ev)
+			var frame *events.XRPCStreamEvent
+			var err error
+			switch ev.Kind {
+			case repo.EventKindAccount:
+				frame = accountFrame(ev)
+			default:
+				// EventKindCommit — and legacy rows written before the kind
+				// column existed, which default to it.
+				frame, err = commitFrame(ev)
+			}
 			if err != nil {
 				// A stored event that cannot be framed is data corruption;
 				// dropping it silently would desync consumers, so terminate.

@@ -142,7 +142,7 @@ func TestLoadOrCreateRotationKey_PersistsAcrossLoads(t *testing.T) {
 	// The stored bytes must be sealed, not the raw key.
 	stored, err := keys.Get(ctx, RotationKeyName)
 	require.NoError(t, err)
-	assert.False(t, bytes.Contains(stored.PrivateKeyPEM, first.Bytes()),
+	assert.False(t, bytes.Contains(stored.KeyMaterial, first.Bytes()),
 		"rotation key must be encrypted at rest")
 }
 

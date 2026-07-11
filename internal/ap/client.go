@@ -110,8 +110,14 @@ type ClientOptions struct {
 	// handled by Client itself; any CheckRedirect on this client is
 	// replaced.
 	HTTPClient *http.Client
-	// MaxResponseBytes caps response bodies.
+	// MaxResponseBytes caps AP object/collection response bodies.
 	MaxResponseBytes int64
+	// MaxMediaBytes caps FetchMedia response bodies (avatars, banners, post
+	// images) independently of MaxResponseBytes, so raising the blob budget
+	// (MAX_BLOB_BYTES) does not also raise the JSON-object cap. Zero falls
+	// back to MaxResponseBytes' effective value — the pre-task-11 behavior,
+	// where the object cap silently clamped media.
+	MaxMediaBytes int64
 	// PerHostRPS / PerHostBurst configure per-host rate limiting.
 	PerHostRPS   float64
 	PerHostBurst int
@@ -139,6 +145,7 @@ type Client struct {
 	userAgent          string
 	signer             *Signer
 	maxResponseBytes   int64
+	maxMediaBytes      int64
 	perHostRPS         rate.Limit
 	perHostBurst       int
 	maxAttempts        int
@@ -206,6 +213,7 @@ func NewClient(opts ClientOptions) *Client {
 		userAgent:          opts.UserAgent,
 		signer:             opts.Signer,
 		maxResponseBytes:   opts.MaxResponseBytes,
+		maxMediaBytes:      opts.MaxMediaBytes,
 		perHostRPS:         rate.Limit(opts.PerHostRPS),
 		perHostBurst:       opts.PerHostBurst,
 		maxAttempts:        opts.MaxAttempts,
@@ -234,6 +242,9 @@ func NewClient(opts ClientOptions) *Client {
 	}
 	if c.maxResponseBytes <= 0 {
 		c.maxResponseBytes = DefaultMaxResponseBytes
+	}
+	if c.maxMediaBytes <= 0 {
+		c.maxMediaBytes = c.maxResponseBytes
 	}
 	if c.perHostRPS <= 0 {
 		c.perHostRPS = DefaultPerHostRPS
@@ -458,10 +469,13 @@ func visitItems(page *Object, visit func(*Object) error) error {
 // unparsed; empty when the server sent none). Status mapping matches
 // FetchObject: 404/401/403 → IsNotFound, 410 → IsTombstoned, other non-2xx
 // → HTTPError. Content-type policy (images only) is the caller's job — the
-// transport layer cannot know which lexicon slot the bytes are for.
+// transport layer cannot know which lexicon slot the bytes are for. The
+// outer clamp is the MEDIA cap (ClientOptions.MaxMediaBytes, wired from
+// MAX_BLOB_BYTES), not the JSON-object cap, so blob budgets above 5 MiB
+// actually take effect.
 func (c *Client) FetchMedia(ctx context.Context, iri string, maxBytes int64) (data []byte, contentType string, err error) {
-	if maxBytes <= 0 || maxBytes > c.maxResponseBytes {
-		maxBytes = c.maxResponseBytes
+	if maxBytes <= 0 || maxBytes > c.maxMediaBytes {
+		maxBytes = c.maxMediaBytes
 	}
 	var lastErr error
 	for attempt := 0; attempt < c.maxAttempts; attempt++ {

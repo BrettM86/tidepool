@@ -61,7 +61,9 @@ func newHarness(t *testing.T) *harness {
 
 // newHarnessWithPoll lets a test pick the broadcaster poll fallback — an
 // effectively-infinite interval makes the LISTEN/NOTIFY path load-bearing.
-func newHarnessWithPoll(t *testing.T, pollInterval time.Duration) *harness {
+// Optional mutators adjust the server Options before construction (the
+// admission-control tests shrink limits with them).
+func newHarnessWithPoll(t *testing.T, pollInterval time.Duration, mutate ...func(*Options)) *harness {
 	t.Helper()
 	database := testutil.DB(t)
 	testutil.Truncate(t, database, "blocks", "repo_state", "firehose_events", "bridged_actors", "blobs")
@@ -80,14 +82,18 @@ func newHarnessWithPoll(t *testing.T, pollInterval time.Duration) *harness {
 		_ = broadcaster.Close()
 	})
 
-	server, err := NewServer(Options{
+	opts := Options{
 		Repo:         manager,
 		Broadcaster:  broadcaster,
 		Hostname:     testHostname,
 		WriteTimeout: 2 * time.Second,
 		PingInterval: time.Second,
 		ReplayBatch:  10,
-	})
+	}
+	for _, m := range mutate {
+		m(&opts)
+	}
+	server, err := NewServer(opts)
 	require.NoError(t, err)
 
 	router := chi.NewRouter()
@@ -737,7 +743,7 @@ func TestHTTPEndpoints_DeactivatedRepo(t *testing.T) {
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.False(t, status.Active)
 	require.NotNil(t, status.Status)
-	assert.Equal(t, "deactivated", *status.Status)
+	assert.Equal(t, "deleted", *status.Status)
 }
 
 // TestGetBlob pins the com.atproto.sync.getBlob surface task 05 added: a

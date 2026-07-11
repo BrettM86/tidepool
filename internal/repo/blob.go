@@ -57,6 +57,45 @@ func (m *Manager) PutBlob(ctx context.Context, did, mimeType string, data []byte
 	}, nil
 }
 
+// DeleteBlob removes one stored blob. Missing rows are a no-op success
+// (scrubs are idempotent). Task 11's Delete(Actor)/nobridge scrub uses this
+// for blobs the deleted actor's records referenced — including post images
+// stored under COMMUNITY DIDs, which record deletion alone never touches.
+// Caveat, accepted: blobs are content-addressed, so if two different records
+// in the same repo embedded byte-identical media, scrubbing one deletes the
+// blob out from under the other (a missing image, not missing content) —
+// tracking cross-record blob references is not worth that edge at bridge
+// scale.
+func (m *Manager) DeleteBlob(ctx context.Context, did, cidStr string) error {
+	if _, err := cid.Parse(cidStr); err != nil {
+		return errors.NewValidationError("cid", err.Error())
+	}
+	if _, err := m.db.ExecContext(ctx,
+		`DELETE FROM blobs WHERE did = $1 AND cid = $2`, did, cidStr); err != nil {
+		return fmt.Errorf("repo: delete blob %s for %s: %w", cidStr, did, err)
+	}
+	return nil
+}
+
+// DeleteBlobsForDID removes every blob stored under a DID — the terminal
+// Delete(Actor) path for the actor's own (now frozen) repo, where getBlob
+// already refuses to serve and nothing can reference the bytes again. It
+// returns how many rows were deleted.
+func (m *Manager) DeleteBlobsForDID(ctx context.Context, did string) (int64, error) {
+	if _, err := syntax.ParseDID(did); err != nil {
+		return 0, errors.NewValidationError("did", err.Error())
+	}
+	res, err := m.db.ExecContext(ctx, `DELETE FROM blobs WHERE did = $1`, did)
+	if err != nil {
+		return 0, fmt.Errorf("repo: delete blobs for %s: %w", did, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("repo: delete blobs for %s: rows affected: %w", did, err)
+	}
+	return n, nil
+}
+
 // GetBlob reads a stored blob by (did, cid). A missing blob is an error
 // satisfying errors.IsNotFound. com.atproto.sync.getBlob serves this.
 func (m *Manager) GetBlob(ctx context.Context, did, cidStr string) (data []byte, mimeType string, err error) {

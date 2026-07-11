@@ -35,13 +35,34 @@ import (
 // this channel to wake subscriber outboxes without polling.
 const FirehoseNotifyChannel = "tidepool_firehose"
 
+// Event kinds (firehose_events.kind). Commit rows carry the #commit frame
+// payload; account rows carry an #account frame (active/status) and no
+// commit columns.
+const (
+	EventKindCommit  = "commit"
+	EventKindAccount = "account"
+)
+
+// Account status tokens for #account frames (the com.atproto.sync.defs
+// account-status vocabulary the bridge emits). Deleted is what Delete(Actor)
+// / consent revocation uses: bigsky marks the repo tombstoned — dropping it
+// from listRepos — and purges its carstore data, which is exactly the
+// downstream purge the consent flip wants.
+const (
+	AccountStatusDeleted = "deleted"
+)
+
 // Event is one row of the durable subscribeRepos backlog, as read back for
-// serving. Field semantics match the #commit frame of
-// com.atproto.sync.subscribeRepos (see migration 006 for the storage notes).
+// serving. For Kind == EventKindCommit the field semantics match the
+// #commit frame of com.atproto.sync.subscribeRepos (see migration 006 for
+// the storage notes); for EventKindAccount only Seq, DID, CreatedAt,
+// AccountActive, and AccountStatus are meaningful.
 type Event struct {
 	// Seq is the firehose cursor (bigserial; gapless in visibility order,
 	// though individual integers may be skipped by rolled-back writes).
 	Seq int64
+	// Kind discriminates commit vs account rows (EventKind*).
+	Kind string
 	// DID is the repo the commit belongs to (the frame's `repo` field).
 	DID string
 	// CommitCID is the signed commit block's CID.
@@ -61,6 +82,10 @@ type Event struct {
 	CAR []byte
 	// CreatedAt is when the commit landed (the frame's `time`).
 	CreatedAt time.Time
+	// AccountActive / AccountStatus carry the #account frame payload for
+	// Kind == EventKindAccount rows.
+	AccountActive bool
+	AccountStatus string
 }
 
 // ListEvents returns up to limit firehose events with seq > sinceSeq, in seq
@@ -72,7 +97,8 @@ func (m *Manager) ListEvents(ctx context.Context, sinceSeq int64, limit int) ([]
 		return nil, errors.NewValidationError("limit", "must be positive")
 	}
 	rows, err := m.db.QueryContext(ctx, `
-		SELECT seq, did, commit_cid, prev_data_cid, since_rev, rev, ops, car, created_at
+		SELECT seq, kind, did, commit_cid, prev_data_cid, since_rev, rev, ops, car, created_at,
+		       account_active, account_status
 		FROM firehose_events
 		WHERE seq > $1
 		ORDER BY seq
@@ -86,12 +112,21 @@ func (m *Manager) ListEvents(ctx context.Context, sinceSeq int64, limit int) ([]
 	for rows.Next() {
 		var ev Event
 		var opsJSON []byte
-		if err := rows.Scan(&ev.Seq, &ev.DID, &ev.CommitCID, &ev.PrevDataCID,
-			&ev.SinceRev, &ev.Rev, &opsJSON, &ev.CAR, &ev.CreatedAt); err != nil {
+		var commitCID, rev, accountStatus sql.NullString
+		var accountActive sql.NullBool
+		if err := rows.Scan(&ev.Seq, &ev.Kind, &ev.DID, &commitCID, &ev.PrevDataCID,
+			&ev.SinceRev, &rev, &opsJSON, &ev.CAR, &ev.CreatedAt,
+			&accountActive, &accountStatus); err != nil {
 			return nil, fmt.Errorf("repo: scan firehose event: %w", err)
 		}
-		if err := json.Unmarshal(opsJSON, &ev.Ops); err != nil {
-			return nil, fmt.Errorf("repo: decode ops for seq %d: %w", ev.Seq, err)
+		ev.CommitCID = commitCID.String
+		ev.Rev = rev.String
+		ev.AccountActive = accountActive.Bool
+		ev.AccountStatus = accountStatus.String
+		if len(opsJSON) > 0 {
+			if err := json.Unmarshal(opsJSON, &ev.Ops); err != nil {
+				return nil, fmt.Errorf("repo: decode ops for seq %d: %w", ev.Seq, err)
+			}
 		}
 		out = append(out, &ev)
 	}
@@ -152,26 +187,52 @@ func (m *Manager) SeqBounds(ctx context.Context) (oldest, newest int64, err erro
 	return lastValue + 1, lastValue, nil
 }
 
+// pruneEventsBatchSize bounds one DELETE statement inside PruneEvents. One
+// unbatched DELETE over a large expired prefix holds row locks (and bloats
+// one WAL transaction) for the whole sweep; batching keeps each statement
+// short so commits — which contend on the same table — never stall behind
+// retention.
+const pruneEventsBatchSize = 1000
+
 // PruneEvents deletes firehose events older than the cutoff. It prunes a
 // strict seq prefix — everything up to the newest expired seq — rather than
 // filtering on created_at row-by-row: commit-transaction start times are not
 // perfectly ordered with seq assignment (CURRENT_TIMESTAMP is the tx start,
 // the advisory lock is taken after BeginTx), and retention must never punch
 // holes in the retained suffix, because subscribeRepos replay treats
-// [oldest, newest] as complete. It returns the number of events deleted.
+// [oldest, newest] as complete. The DELETE runs in batches (each its own
+// implicit transaction) from the oldest seq up, so a partial sweep still
+// leaves a contiguous retained suffix. It returns the number of events
+// deleted.
 func (m *Manager) PruneEvents(ctx context.Context, cutoff time.Time) (int64, error) {
-	res, err := m.db.ExecContext(ctx, `
-		DELETE FROM firehose_events WHERE seq <= (
-			SELECT COALESCE(MAX(seq), 0) FROM firehose_events WHERE created_at < $1
-		)`, cutoff)
-	if err != nil {
-		return 0, fmt.Errorf("repo: prune firehose events before %s: %w", cutoff.Format(time.RFC3339), err)
+	// The boundary is computed once: everything at or below it is expired.
+	var boundary int64
+	if err := m.db.QueryRowContext(ctx, `
+		SELECT COALESCE(MAX(seq), 0) FROM firehose_events WHERE created_at < $1`,
+		cutoff).Scan(&boundary); err != nil {
+		return 0, fmt.Errorf("repo: find prune boundary before %s: %w", cutoff.Format(time.RFC3339), err)
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return 0, fmt.Errorf("repo: prune firehose events: rows affected: %w", err)
+	if boundary == 0 {
+		return 0, nil
 	}
-	return n, nil
+	var total int64
+	for {
+		res, err := m.db.ExecContext(ctx, `
+			DELETE FROM firehose_events WHERE seq IN (
+				SELECT seq FROM firehose_events WHERE seq <= $1 ORDER BY seq LIMIT $2
+			)`, boundary, pruneEventsBatchSize)
+		if err != nil {
+			return total, fmt.Errorf("repo: prune firehose events before %s: %w", cutoff.Format(time.RFC3339), err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return total, fmt.Errorf("repo: prune firehose events: rows affected: %w", err)
+		}
+		total += n
+		if n < pruneEventsBatchSize {
+			return total, nil
+		}
+	}
 }
 
 // GetRecordProof builds the com.atproto.sync.getRecord response: a CARv1
@@ -306,7 +367,10 @@ type RepoInfo struct {
 	Rev     string
 	Active  bool
 	// Status is the lexicon's account-status token when inactive
-	// ("deactivated"); empty when active.
+	// ("deleted" — the bridged actor was tombstoned by Delete(Actor)/
+	// consent revocation, which is terminal); empty when active. The same
+	// token rides the #account frame, so the HTTP surface and the firehose
+	// agree.
 	Status string
 }
 
@@ -369,7 +433,7 @@ func scanRepoInfo(scan func(...any) error) (*RepoInfo, error) {
 	}
 	info.Active = consent != string(store.ConsentStateDeleted)
 	if !info.Active {
-		info.Status = "deactivated"
+		info.Status = AccountStatusDeleted
 	}
 	return &info, nil
 }

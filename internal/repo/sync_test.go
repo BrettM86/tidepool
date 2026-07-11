@@ -246,7 +246,7 @@ func TestListReposAndGetRepoInfo(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	// Tombstone the middle DID's actor: its repo must report deactivated.
+	// Tombstone the middle DID's actor: its repo must report inactive (status "deleted").
 	actors := store.NewBridgedActors(database)
 	_, err := actors.UpsertActor(ctx, store.BridgedActor{
 		APActorID:    "https://lemmy.example/u/tombstoned",
@@ -272,12 +272,12 @@ func TestListReposAndGetRepoInfo(t *testing.T) {
 	assert.NotEmpty(t, page1[0].HeadCID)
 	assert.NotEmpty(t, page1[0].Rev)
 	assert.False(t, page1[1].Active, "tombstoned actor's repo must be inactive")
-	assert.Equal(t, "deactivated", page1[1].Status)
+	assert.Equal(t, "deleted", page1[1].Status)
 
 	info, err := manager.GetRepoInfo(ctx, dids[1])
 	require.NoError(t, err)
 	assert.False(t, info.Active)
-	assert.Equal(t, "deactivated", info.Status)
+	assert.Equal(t, "deleted", info.Status)
 
 	head, rev, err := manager.Head(ctx, dids[0])
 	require.NoError(t, err)

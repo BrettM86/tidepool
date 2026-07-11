@@ -18,22 +18,22 @@ func NewServiceKeys(db *sql.DB) ServiceKeys {
 	return &postgresServiceKeys{db: db}
 }
 
-const serviceKeyColumns = ` id, name, private_key_pem, created_at`
+const serviceKeyColumns = ` id, name, key_material, created_at`
 
-func (r *postgresServiceKeys) Create(ctx context.Context, name string, privateKeyPEM []byte) (*ServiceKey, error) {
+func (r *postgresServiceKeys) Create(ctx context.Context, name string, keyMaterial []byte) (*ServiceKey, error) {
 	if name == "" {
 		return nil, errors.NewValidationError("name", "must not be empty")
 	}
-	if len(privateKeyPEM) == 0 {
-		return nil, errors.NewValidationError("private_key_pem", "must not be empty")
+	if len(keyMaterial) == 0 {
+		return nil, errors.NewValidationError("key_material", "must not be empty")
 	}
 
 	query := `
-		INSERT INTO service_keys (name, private_key_pem)
+		INSERT INTO service_keys (name, key_material)
 		VALUES ($1, $2)
 		RETURNING` + serviceKeyColumns
 
-	key, err := scanServiceKey(r.db.QueryRowContext(ctx, query, name, privateKeyPEM))
+	key, err := scanServiceKey(r.db.QueryRowContext(ctx, query, name, keyMaterial))
 	if err != nil {
 		// Keys are create-once by design: a concurrent bootstrap losing the
 		// insert race must re-Get the winner's key, never overwrite it.
@@ -59,7 +59,7 @@ func (r *postgresServiceKeys) Get(ctx context.Context, name string) (*ServiceKey
 
 func scanServiceKey(row rowScanner) (*ServiceKey, error) {
 	var key ServiceKey
-	if err := row.Scan(&key.ID, &key.Name, &key.PrivateKeyPEM, &key.CreatedAt); err != nil {
+	if err := row.Scan(&key.ID, &key.Name, &key.KeyMaterial, &key.CreatedAt); err != nil {
 		return nil, err
 	}
 	return &key, nil

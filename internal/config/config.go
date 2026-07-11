@@ -121,6 +121,37 @@ type Config struct {
 	// history whose individual Like activities AP never delivers
 	// (SEED_COUNTS_FROM_API, default on; set to 0/false to disable).
 	SeedCountsFromAPI bool
+	// TombstoneRetention is how long ap_tombstones markers (the
+	// delete-before-create guard) are kept before the pruner reclaims them
+	// (TOMBSTONE_RETENTION, a Go duration, default 720h = 30 days — orders
+	// of magnitude above any real redelivery horizon).
+	TombstoneRetention time.Duration
+	// VoteEventRetention is how long undone (superseded/retracted)
+	// vote_events rows are kept before pruning (VOTE_EVENT_RETENTION, a Go
+	// duration, default 2160h = 90 days). Live rows are never pruned; see
+	// votes.PruneUndoneEvents for the replay-dedupe trade-off.
+	VoteEventRetention time.Duration
+	// Inbox admission control (task 11): per-client-IP and per-verified-
+	// signer token buckets on POST /inbox, plus the dedicated tighter cap
+	// on the tombstoned-self-delete confirmation branch. All are generous
+	// DoS backstops; see internal/ingest inbox.go for the model.
+	// INBOX_IP_RATE_PER_SECOND (50) / INBOX_IP_RATE_BURST (200),
+	// INBOX_SIGNER_RATE_PER_SECOND (20) / INBOX_SIGNER_RATE_BURST (100),
+	// INBOX_TOMBSTONE_CONFIRMS_PER_MINUTE (6) /
+	// INBOX_TOMBSTONE_CONFIRM_BURST (10).
+	InboxIPRatePerSecond            int
+	InboxIPRateBurst                int
+	InboxSignerRatePerSecond        int
+	InboxSignerRateBurst            int
+	InboxTombstoneConfirmsPerMinute int
+	InboxTombstoneConfirmBurst      int
+	// Public sync surface admission control: per-client-IP token bucket
+	// over every com.atproto.sync.* endpoint (SYNC_RATE_PER_SECOND, 25 /
+	// SYNC_RATE_BURST, 200) and the concurrent subscribeRepos connection
+	// cap (SYNC_MAX_SUBSCRIBERS, 100).
+	SyncRatePerSecond  int
+	SyncRateBurst      int
+	SyncMaxSubscribers int
 }
 
 // Load reads configuration from the environment. logger must not be nil;
@@ -290,6 +321,56 @@ func Load(logger *slog.Logger) (*Config, error) {
 		return nil, err
 	}
 
+	// Retention knobs for the task-11 pruners: same semantics as
+	// FIREHOSE_RETENTION (real defaults everywhere, must be positive).
+	cfg.TombstoneRetention, err = durationVar(logger, "TOMBSTONE_RETENTION", 720*time.Hour)
+	if err != nil {
+		return nil, err
+	}
+	cfg.VoteEventRetention, err = durationVar(logger, "VOTE_EVENT_RETENTION", 2160*time.Hour)
+	if err != nil {
+		return nil, err
+	}
+
+	// Admission-control knobs (task 11): tuning knobs with real defaults in
+	// every environment, like the other rate limits.
+	cfg.InboxIPRatePerSecond, err = intVar(logger, "INBOX_IP_RATE_PER_SECOND", 50)
+	if err != nil {
+		return nil, err
+	}
+	cfg.InboxIPRateBurst, err = intVar(logger, "INBOX_IP_RATE_BURST", 200)
+	if err != nil {
+		return nil, err
+	}
+	cfg.InboxSignerRatePerSecond, err = intVar(logger, "INBOX_SIGNER_RATE_PER_SECOND", 20)
+	if err != nil {
+		return nil, err
+	}
+	cfg.InboxSignerRateBurst, err = intVar(logger, "INBOX_SIGNER_RATE_BURST", 100)
+	if err != nil {
+		return nil, err
+	}
+	cfg.InboxTombstoneConfirmsPerMinute, err = intVar(logger, "INBOX_TOMBSTONE_CONFIRMS_PER_MINUTE", 6)
+	if err != nil {
+		return nil, err
+	}
+	cfg.InboxTombstoneConfirmBurst, err = intVar(logger, "INBOX_TOMBSTONE_CONFIRM_BURST", 10)
+	if err != nil {
+		return nil, err
+	}
+	cfg.SyncRatePerSecond, err = intVar(logger, "SYNC_RATE_PER_SECOND", 25)
+	if err != nil {
+		return nil, err
+	}
+	cfg.SyncRateBurst, err = intVar(logger, "SYNC_RATE_BURST", 200)
+	if err != nil {
+		return nil, err
+	}
+	cfg.SyncMaxSubscribers, err = intVar(logger, "SYNC_MAX_SUBSCRIBERS", 100)
+	if err != nil {
+		return nil, err
+	}
+
 	defaultUserAgent := fmt.Sprintf("tidepool/0.1 (+https://%s)", cfg.BridgeHostname)
 	cfg.UserAgent = os.Getenv("USER_AGENT")
 	if cfg.UserAgent == "" {
@@ -324,6 +405,25 @@ func decodeKEK(encoded string) ([]byte, error) {
 		return nil, fmt.Errorf("config: BRIDGE_KEK must decode to 32 bytes, got %d", len(raw))
 	}
 	return raw, nil
+}
+
+// durationVar returns a positive Go-duration environment variable, falling
+// back to a logged default in every environment (tuning-knob semantics,
+// like FIREHOSE_RETENTION).
+func durationVar(logger *slog.Logger, name string, fallback time.Duration) (time.Duration, error) {
+	raw := os.Getenv(name)
+	if raw == "" {
+		logger.Info(name+" not set, using default", "value", fallback.String())
+		return fallback, nil
+	}
+	parsed, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("config: %s must be a Go duration (e.g. 720h): %w", name, err)
+	}
+	if parsed <= 0 {
+		return 0, fmt.Errorf("config: %s must be positive, got %s", name, parsed)
+	}
+	return parsed, nil
 }
 
 // intVar returns a positive-integer environment variable, falling back to a

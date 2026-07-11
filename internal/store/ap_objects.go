@@ -26,6 +26,22 @@ const apObjectColumns = `
 	rkey, at_uri, cid, ap_published_at, indexed_at, deleted_at`
 
 func (r *postgresAPObjects) PutMapping(ctx context.Context, mapping APObjectMapping) (*APObjectMapping, error) {
+	return r.putMapping(ctx, r.db, mapping)
+}
+
+func (r *postgresAPObjects) PutMappingTx(ctx context.Context, tx *sql.Tx, mapping APObjectMapping) (*APObjectMapping, error) {
+	if tx == nil {
+		return nil, errors.NewValidationError("tx", "must not be nil")
+	}
+	return r.putMapping(ctx, tx, mapping)
+}
+
+// queryRower is the slice of *sql.DB / *sql.Tx putMapping needs.
+type queryRower interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+func (r *postgresAPObjects) putMapping(ctx context.Context, q queryRower, mapping APObjectMapping) (*APObjectMapping, error) {
 	if err := validateMapping(&mapping); err != nil {
 		return nil, err
 	}
@@ -49,7 +65,7 @@ func (r *postgresAPObjects) PutMapping(ctx context.Context, mapping APObjectMapp
 			deleted_at = NULL
 		RETURNING` + apObjectColumns
 
-	row := r.db.QueryRowContext(ctx, query,
+	row := q.QueryRowContext(ctx, query,
 		mapping.APID, mapping.APType, mapping.OriginInstance, string(mapping.Origin),
 		mapping.DID, nullIfEmpty(mapping.AuthorDID), mapping.Collection, mapping.RKey,
 		mapping.ATURI, mapping.CID, mapping.PublishedAt,

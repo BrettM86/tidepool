@@ -131,8 +131,14 @@ func TestDeleteActorScrubsEverything(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, c1Mapping.IsDeleted())
 
-	// Idempotent: a replayed Delete(Actor) is a no-op success.
+	// Idempotent AND a terminal fixpoint: a replayed Delete(Actor) carrying a
+	// distinct activity id (so inbox dedup did not absorb it) is a no-op
+	// success that must NOT re-scrub or append a SECOND #account frame —
+	// ConsentStateDeleted short-circuits before re-emitting.
+	before := len(h.firehoseEvents())
 	require.NoError(t, h.m.DeleteActor(ctx, authorAP))
+	assert.Len(t, h.firehoseEvents(), before,
+		"a second DeleteActor on an already-deleted actor emits no new firehose event")
 }
 
 // TestDeleteActorViaHandleDelete: HandleDelete recognizes actor ids and

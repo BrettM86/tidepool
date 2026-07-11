@@ -4,11 +4,13 @@ package e2e
 
 // Task 10 lifecycle scenarios: consent (#nobridge), Delete(Actor),
 // unsubscribe, community profile update. All assert through the relay-fed
-// Jetstream like the rest of the suite; repo lifecycle STATE (active /
-// deactivated) is asserted against the bridge's own sync surface because
-// bigsky cannot show it (no getRepoStatus, tombstoned repos filtered from
-// listRepos, account state learned only from #account frames the bridge
-// does not emit until task 11 — FOLLOWUPS.md "Relay pipeline").
+// Jetstream like the rest of the suite; fine-grained repo lifecycle STATE
+// is asserted against the bridge's own sync surface (bigsky serves no
+// getRepoStatus and filters tombstoned repos from listRepos). Since task 11
+// the bridge emits #account{active:false, status:"deleted"} on
+// Delete(Actor), so TestDeleteActor additionally asserts the frame on the
+// bridge's OWN firehose and the repo's DISAPPEARANCE from the relay's
+// listRepos (bigsky tombstones the repo and purges its data on that frame).
 //
 // Negative-assertion discipline: every "nothing bridged" claim is bounded
 // by a positive control. Where the control post shares the suppressed
@@ -173,9 +175,10 @@ func TestConsent_NobridgeLifecycle(t *testing.T) {
 //     410 Gone, so the inbox accepts it on independently-confirmed origin
 //     tombstone evidence (inbox.go tombstonedSelfDelete).
 //
-// NOTE: there is no #account frame yet (task 11), so the RELAY cannot
-// observe the tombstone — bigsky keeps listing the repo. That gap is pinned
-// here (and should flip when task 11 lands).
+// Task 11 added the #account{active:false, status:"deleted"} firehose frame
+// (emitted after the scrub delete-commits): this scenario asserts the frame
+// on the bridge's own subscribeRepos AND its relay-side consequence — bigsky
+// consumes it, marks the repo tombstoned, and stops listing it.
 func TestDeleteActor_ScrubsAndTombstones(t *testing.T) {
 	h := newHarness(t)
 	community, sub := setupSubscribedCommunity(t, h, "del")
@@ -219,6 +222,10 @@ func TestDeleteActor_ScrubsAndTombstones(t *testing.T) {
 		t.Fatalf("pre-delete: handle %s does not resolve to %s (status %d, did %q)", handle, authorDID, res.status, did)
 	}
 
+	// Subscribe to the bridge's OWN firehose (live tail) BEFORE the delete
+	// so the #account frame cannot be missed.
+	fhConn := h.dialBridgeFirehose(t)
+
 	user.deleteAccount(t)
 
 	// Scrub delete-commits for all three records, on their observed rkeys.
@@ -234,6 +241,18 @@ func TestDeleteActor_ScrubsAndTombstones(t *testing.T) {
 		return e.Commit.Collection == colActorProfile && e.Commit.Operation == opDelete &&
 			e.Did == authorDID && e.Commit.RKey == rkeySelf
 	})
+
+	// The #account frame on the bridge's own firehose: active:false,
+	// status "deleted", emitted AFTER the scrub commits (the purge signal a
+	// per-repo-ordered consumer sees last). This is the exact CBOR frame a
+	// relay consumes.
+	account := readBridgeAccountFrame(t, fhConn, authorDID, eventTimeout)
+	if account.Active {
+		t.Errorf("#account frame for %s reports active:true, want false", authorDID)
+	}
+	if account.Status == nil || *account.Status != "deleted" {
+		t.Errorf("#account frame status = %v, want \"deleted\"", account.Status)
+	}
 
 	// Over-scrub guard: the scrub must delete EXACTLY the three records
 	// awaited above. A bounded drain asserts no OTHER delete op appears on
@@ -258,8 +277,8 @@ func TestDeleteActor_ScrubsAndTombstones(t *testing.T) {
 	for {
 		status, res, err := h.bridgeGetRepoStatus(authorDID)
 		if err == nil && res.status == 200 && !status.Active {
-			if status.Status != "deactivated" {
-				t.Errorf("getRepoStatus(%s).status = %q, want deactivated", authorDID, status.Status)
+			if status.Status != "deleted" {
+				t.Errorf("getRepoStatus(%s).status = %q, want deleted", authorDID, status.Status)
 			}
 			break
 		}
@@ -274,8 +293,8 @@ func TestDeleteActor_ScrubsAndTombstones(t *testing.T) {
 	entry, ok := repos[authorDID]
 	if !ok {
 		t.Errorf("bridge listRepos no longer lists tombstoned repo %s (it must, with active:false)", authorDID)
-	} else if entry.Active || entry.Status != "deactivated" {
-		t.Errorf("bridge listRepos entry for %s = %+v, want active:false status:deactivated", authorDID, entry)
+	} else if entry.Active || entry.Status != "deleted" {
+		t.Errorf("bridge listRepos entry for %s = %+v, want active:false status:deleted", authorDID, entry)
 	}
 
 	// The handle stops resolving: tombstoned identity is frozen.
@@ -295,17 +314,25 @@ func TestDeleteActor_ScrubsAndTombstones(t *testing.T) {
 		}
 	}
 
-	// RELAY LIMITATION (task 09 finding, pinned deliberately): bigsky only
-	// learns account state from #account frames, which the bridge does not
-	// emit until task 11 — so the relay STILL lists the tombstoned repo.
-	// When task 11 adds the frame, this assertion must flip to "disappears
-	// from the relay's listRepos" (FOLLOWUPS.md "Relay pipeline").
-	relayRepos, err := h.relayListRepos()
-	if err != nil {
-		t.Fatalf("relay listRepos: %v", err)
-	}
-	if _, ok := relayRepos[authorDID]; !ok {
-		t.Errorf("relay listRepos no longer lists %s — has task 11's #account frame landed? Flip this assertion (see comment)", authorDID)
+	// RELAY-SIDE CONSEQUENCE of the #account frame (flipped from the task-09
+	// pin): bigsky consumes it, re-resolves the DID doc to confirm the
+	// bridge is authoritative, marks the account tombstoned, and drops the
+	// repo from its listRepos (source-verified against the pinned bigsky:
+	// status "deleted" → tombstoned=true + carstore purge; listRepos filters
+	// NOT tombstoned). Polled: the relay processes the frame asynchronously.
+	relayDeadline := time.Now().Add(eventTimeout)
+	for {
+		relayRepos, err := h.relayListRepos()
+		if err != nil {
+			t.Fatalf("relay listRepos: %v", err)
+		}
+		if _, ok := relayRepos[authorDID]; !ok {
+			break
+		}
+		if time.Now().After(relayDeadline) {
+			t.Fatalf("relay still lists tombstoned repo %s after the #account frame — did the relay reject it?", authorDID)
+		}
+		time.Sleep(2 * time.Second)
 	}
 }
 

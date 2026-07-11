@@ -130,7 +130,7 @@ func (c *Custodian) open(ciphertext, aad []byte) ([]byte, error) {
 func LoadOrCreateRotationKey(ctx context.Context, keys store.ServiceKeys, custodian *Custodian) (*atcrypto.PrivateKeyK256, error) {
 	stored, err := keys.Get(ctx, RotationKeyName)
 	if err == nil {
-		return decryptRotationKey(custodian, stored.PrivateKeyPEM)
+		return decryptRotationKey(custodian, stored.KeyMaterial)
 	}
 	if !errors.IsNotFound(err) {
 		return nil, fmt.Errorf("identity: load rotation key: %w", err)
@@ -153,7 +153,7 @@ func LoadOrCreateRotationKey(ctx context.Context, keys store.ServiceKeys, custod
 			if getErr != nil {
 				return nil, fmt.Errorf("identity: reload rotation key after race: %w", getErr)
 			}
-			return decryptRotationKey(custodian, winner.PrivateKeyPEM)
+			return decryptRotationKey(custodian, winner.KeyMaterial)
 		}
 		return nil, fmt.Errorf("identity: persist rotation key: %w", err)
 	}

@@ -18,8 +18,10 @@ package materialize
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	stderrors "errors"
+	"expvar"
 	"fmt"
 	"log/slog"
 	"time"
@@ -35,6 +37,15 @@ import (
 	"tidepool/internal/store"
 	"tidepool/lexicons"
 )
+
+// ValidationFailures counts records that failed lexicon validation
+// (strict and log-and-write modes alike). Exported via the expvar registry
+// as "tidepool_lexicon_validation_failures" — cmd/tidepool serves the
+// registry on the admin surface, so a non-zero counter in production (where
+// failures log-and-write) is observable without log scraping. Task 05
+// deferred a strict-first production rollout; this is the metric that
+// decision waits on.
+var ValidationFailures = expvar.NewInt("tidepool_lexicon_validation_failures")
 
 // Record collections the materializer produces.
 const (
@@ -92,6 +103,13 @@ type ActorMinter interface {
 	MintActor(ctx context.Context, req identity.MintRequest) (*identity.Identity, error)
 }
 
+// VoteScrubber erases an actor's vote_events rows — the vote counterpart of
+// the record scrub (votes.Aggregator implements it). Optional: a nil
+// scrubber skips vote scrubbing (tests that don't exercise votes).
+type VoteScrubber interface {
+	ScrubVoter(ctx context.Context, voterAPID string) error
+}
+
 // Options configures New. Fetcher, Objects, Actors, Communities, Repos,
 // Minter, and ServiceDID are required.
 type Options struct {
@@ -101,6 +119,9 @@ type Options struct {
 	Communities store.Communities
 	Repos       *repo.Manager
 	Minter      ActorMinter
+	// Votes scrubs a deleted actor's vote_events rows alongside the record
+	// scrub (optional; nil skips it).
+	Votes VoteScrubber
 	// ServiceDID is the bridge's own DID: community.profile createdBy and
 	// hostedBy (PLAN.md locked decision 6).
 	ServiceDID string
@@ -128,6 +149,7 @@ type Materializer struct {
 	communities store.Communities
 	repos       *repo.Manager
 	minter      ActorMinter
+	votes       VoteScrubber
 	serviceDID  string
 	profileTTL  time.Duration
 	maxBlob     int64
@@ -135,6 +157,10 @@ type Materializer struct {
 	catalog     *lexicon.BaseCatalog
 	logger      *slog.Logger
 	now         func() time.Time // test seam for profile TTL
+	// deleteBlob deletes one blob by (did, cid); defaults to repos.DeleteBlob.
+	// A test seam so the scrub's retryable-error path can be exercised
+	// without a real storage failure.
+	deleteBlob func(ctx context.Context, did, cid string) error
 }
 
 // New validates options and builds a Materializer. The vendored lexicon
@@ -176,6 +202,7 @@ func New(opts Options) (*Materializer, error) {
 		communities: opts.Communities,
 		repos:       opts.Repos,
 		minter:      opts.Minter,
+		votes:       opts.Votes,
 		serviceDID:  opts.ServiceDID,
 		profileTTL:  opts.ProfileRefreshTTL,
 		maxBlob:     opts.MaxBlobBytes,
@@ -184,6 +211,7 @@ func New(opts Options) (*Materializer, error) {
 		logger:      logger,
 		now:         time.Now,
 	}
+	m.deleteBlob = m.repos.DeleteBlob
 	if m.profileTTL <= 0 {
 		m.profileTTL = defaultProfileRefreshTTL
 	}
@@ -206,17 +234,19 @@ type Result struct {
 }
 
 // commitRecord is the single write path for every materialized record:
-// lexicon-validate, commit into the repo, upsert the ap_objects mapping.
-// authorDID records who authored the record (differs from did for posts).
+// lexicon-validate, then commit the record AND upsert its ap_objects
+// mapping in ONE transaction (repo.PutRecordTx + PutMappingTx — task 11
+// closed the crash window where a record could land on the firehose with
+// no mapping). authorDID records who authored the record (differs from did
+// for posts).
 func (m *Materializer) commitRecord(ctx context.Context, did, collection, rkey string, record map[string]any, obj *ap.Object, authorDID string) (*Result, error) {
 	// Don't resurrect deleted content. AP delivery is unordered, so a Create
 	// or Update can arrive (or be re-delivered) after a Delete already
 	// tombstoned this object's mapping. Re-materializing would un-tombstone it
-	// (PutMapping resets deleted_at) and re-commit the record. Task 06 clears
-	// the tombstone explicitly on an Undo(Delete)/restore.
-	// (Note: this does not cover a Delete that arrived before the object was
-	// ever materialized — no mapping exists to tombstone; that ordering needs
-	// task 06's inbox dedup. Tracked in LOOP_STATE.)
+	// (PutMapping resets deleted_at) and re-commit the record. The ingest
+	// layer clears the tombstone explicitly on an Undo(Delete)/restore, and
+	// its ap_tombstones marker covers the delete-before-create ordering
+	// (a Delete for a never-materialized object).
 	if existing, err := m.objects.GetByAPID(ctx, obj.ID); err == nil {
 		if existing.IsDeleted() {
 			return nil, skip(obj.ID, "object was deleted upstream; not resurrecting")
@@ -228,10 +258,6 @@ func (m *Materializer) commitRecord(ctx context.Context, did, collection, rkey s
 	if err := m.validateRecord(record); err != nil {
 		return nil, err
 	}
-	res, err := m.repos.PutRecord(ctx, did, collection, rkey, record)
-	if err != nil {
-		return nil, fmt.Errorf("materialize: put %s/%s/%s for %s: %w", did, collection, rkey, obj.ID, err)
-	}
 
 	mapping := store.APObjectMapping{
 		APID:           obj.ID,
@@ -242,24 +268,34 @@ func (m *Materializer) commitRecord(ctx context.Context, did, collection, rkey s
 		AuthorDID:      authorDID,
 		Collection:     collection,
 		RKey:           rkey,
-		CID:            res.RecordCID,
 	}
 	if obj.Published.OK() {
 		published := obj.Published.Time
 		mapping.PublishedAt = &published
 	}
-	stored, err := m.objects.PutMapping(ctx, mapping)
+
+	var stored *store.APObjectMapping
+	res, err := m.repos.PutRecordTx(ctx, did, collection, rkey, record,
+		func(ctx context.Context, tx *sql.Tx, res *repo.CommitResult) error {
+			mapping.CID = res.RecordCID
+			var mapErr error
+			stored, mapErr = m.objects.PutMappingTx(ctx, tx, mapping)
+			if mapErr != nil {
+				if errors.IsAlreadyExists(mapErr) {
+					// A different AP id already claimed this at-uri: a
+					// deterministic TID collision (near-impossible after the
+					// hash-filled-micros change; see repo.DeterministicTID).
+					// Loud by design — this is a bug signal, and failing here
+					// now rolls the record write back with it.
+					m.logger.Error("deterministic rkey collision: different ap_id claimed the same at-uri",
+						"ap_id", obj.ID, "did", did, "collection", collection, "rkey", rkey)
+				}
+				return fmt.Errorf("materialize: map %s: %w", obj.ID, mapErr)
+			}
+			return nil
+		})
 	if err != nil {
-		if errors.IsAlreadyExists(err) {
-			// A different AP id already claimed this at-uri: a deterministic
-			// TID collision (near-impossible after the hash-filled-micros
-			// change; see repo.DeterministicTID). Loud by design — this is a
-			// bug signal, and the record we just wrote belongs to the OTHER
-			// object.
-			m.logger.Error("deterministic rkey collision: different ap_id claimed the same at-uri",
-				"ap_id", obj.ID, "did", did, "collection", collection, "rkey", rkey)
-		}
-		return nil, fmt.Errorf("materialize: map %s: %w", obj.ID, err)
+		return nil, fmt.Errorf("materialize: put %s/%s/%s for %s: %w", did, collection, rkey, obj.ID, err)
 	}
 	return &Result{DID: did, ATURI: stored.ATURI, CID: res.RecordCID, NoOp: res.NoOp}, nil
 }
@@ -278,6 +314,11 @@ func (m *Materializer) validateRecord(record map[string]any) error {
 		return fmt.Errorf("materialize: encode record for validation: %w", err)
 	}
 	if err := lexicon.ValidateRecord(m.catalog, data, recordType, lexicon.ValidateFlags(0)); err != nil {
+		// Counted in BOTH modes: the metric is how a production operator
+		// (log-and-write mode) notices validator disagreements without log
+		// scraping, and strict-mode counts keep dev/prod dashboards
+		// comparable.
+		ValidationFailures.Add(1)
 		if m.strict {
 			return errors.NewValidationError("record",
 				fmt.Sprintf("%s fails lexicon validation: %v", recordType, err))

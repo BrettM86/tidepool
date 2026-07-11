@@ -78,6 +78,24 @@ func commitFrame(ev *repo.Event) (*events.XRPCStreamEvent, error) {
 	}, nil
 }
 
+// accountFrame converts a stored account event (repo.EventKindAccount) into
+// the subscribeRepos #account message: the signal relays use to update
+// account state (bigsky tombstones the repo and purges its data on
+// status "deleted") instead of inferring it from scrub delete-commits.
+func accountFrame(ev *repo.Event) *events.XRPCStreamEvent {
+	account := &comatproto.SyncSubscribeRepos_Account{
+		Seq:    ev.Seq,
+		Did:    ev.DID,
+		Active: ev.AccountActive,
+		Time:   ev.CreatedAt.UTC().Format(frameTimeFormat),
+	}
+	if !ev.AccountActive && ev.AccountStatus != "" {
+		status := ev.AccountStatus
+		account.Status = &status
+	}
+	return &events.XRPCStreamEvent{RepoAccount: account}
+}
+
 // infoFrame builds a #info message (e.g. OutdatedCursor).
 func infoFrame(name, message string) *events.XRPCStreamEvent {
 	info := &comatproto.SyncSubscribeRepos_Info{Name: name}

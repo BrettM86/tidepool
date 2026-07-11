@@ -20,7 +20,9 @@ import (
 	stderrors "errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
+	"time"
 
 	"tidepool/internal/ap"
 	"tidepool/internal/errors"
@@ -33,6 +35,15 @@ const (
 	directionUp   = "up"
 	directionDown = "down"
 )
+
+// MaxSeededCount is the upper sanity cap on one seeded baseline value
+// (task 11). Seeds come from a REMOTE instance's public API — a hostile or
+// broken origin must not be able to inject absurd baselines into served
+// scores. The largest scores on the biggest Lemmy instances are low five
+// figures; one million is comfortably above anything real while making a
+// deliberately poisoned 2^31 baseline a validation error the seeder logs
+// and drops (the previous baseline survives).
+const MaxSeededCount = 1_000_000
 
 // RecordReader is the slice of *repo.Manager the aggregator uses to read a
 // bridged comment's stored record: the record's reply.root strongRef names
@@ -341,6 +352,10 @@ func (a *Aggregator) SeedAggregates(ctx context.Context, subjectAPID string, upv
 	if upvotes < 0 || downvotes < 0 {
 		return errors.NewValidationError("counts", "must not be negative")
 	}
+	if upvotes > MaxSeededCount || downvotes > MaxSeededCount {
+		return errors.NewValidationError("counts",
+			fmt.Sprintf("exceed the seeded-count sanity cap of %d (up=%d down=%d)", MaxSeededCount, upvotes, downvotes))
+	}
 
 	mapping, err := a.subjectMapping(ctx, subjectAPID)
 	if err != nil {
@@ -368,6 +383,160 @@ func (a *Aggregator) SeedAggregates(ctx context.Context, subjectAPID string, upv
 		// Fold any live events that landed before the seed into the totals.
 		return recomputeAggregate(ctx, tx, subjectAPID)
 	})
+}
+
+// ScrubVoter erases every vote_events row a voter ever produced — the vote
+// counterpart of the record scrub on Delete(Actor)/consent revocation
+// (task 11; the rows tie an identifiable AP actor id to their voting
+// history, which must not outlive their account). Live votes are removed
+// from served counts too: every affected aggregate is locked (in
+// deterministic subject order, so concurrent per-subject writers cannot
+// deadlock against the scrub) and recomputed in the same transaction.
+// Seeded baselines are untouched — they were never per-voter data. A voter
+// with no rows is a no-op success.
+func (a *Aggregator) ScrubVoter(ctx context.Context, voterAPID string) error {
+	if voterAPID == "" {
+		return errors.NewValidationError("voter_ap_id", "must not be empty")
+	}
+	return a.inTx(ctx, func(tx *sql.Tx) error {
+		// Lock the aggregates the voter is KNOWN to have voted on first,
+		// ordered, exactly like the single-subject paths do (lock → mutate →
+		// recompute).
+		locked := map[string]bool{}
+		rows, err := tx.QueryContext(ctx, `
+			SELECT subject_ap_id
+			FROM vote_aggregates
+			WHERE subject_ap_id IN (
+				SELECT DISTINCT subject_ap_id FROM vote_events WHERE voter_ap_id = $1
+			)
+			ORDER BY subject_ap_id
+			FOR UPDATE`, voterAPID)
+		if err != nil {
+			return fmt.Errorf("lock aggregates for voter %q: %w", voterAPID, err)
+		}
+		for rows.Next() {
+			var subject string
+			if err := rows.Scan(&subject); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("scan scrub subject for %q: %w", voterAPID, err)
+			}
+			locked[subject] = true
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("iterate scrub subjects for %q: %w", voterAPID, err)
+		}
+		_ = rows.Close()
+
+		// DELETE ... RETURNING is the authoritative recompute set: it names
+		// EVERY subject a row was actually removed from. That is a superset of
+		// the pre-DELETE snapshot when a concurrent AddVote committed a vote on
+		// a not-previously-voted subject between the lock above and this DELETE
+		// — a subject that would otherwise be deleted-but-never-recomputed
+		// (phantom count). Recomputing only the snapshot is exactly the
+		// lost-update bug.
+		var deleted int64
+		affected := map[string]bool{}
+		delRows, err := tx.QueryContext(ctx,
+			`DELETE FROM vote_events WHERE voter_ap_id = $1 RETURNING subject_ap_id`, voterAPID)
+		if err != nil {
+			return fmt.Errorf("scrub vote events for %q: %w", voterAPID, err)
+		}
+		for delRows.Next() {
+			var subject string
+			if err := delRows.Scan(&subject); err != nil {
+				_ = delRows.Close()
+				return fmt.Errorf("scan deleted scrub subject for %q: %w", voterAPID, err)
+			}
+			deleted++
+			affected[subject] = true
+		}
+		if err := delRows.Err(); err != nil {
+			_ = delRows.Close()
+			return fmt.Errorf("iterate deleted scrub subjects for %q: %w", voterAPID, err)
+		}
+		_ = delRows.Close()
+
+		// Newly appearing subjects (in the delete set but not the snapshot):
+		// lock them before recompute, in subject order, preserving the
+		// deterministic ORDER BY subject_ap_id lock discipline (task 07) so we
+		// do not introduce a deadlock.
+		var newSubjects []string
+		for subject := range affected {
+			if !locked[subject] {
+				newSubjects = append(newSubjects, subject)
+			}
+		}
+		sort.Strings(newSubjects)
+		for _, subject := range newSubjects {
+			var got string
+			err := tx.QueryRowContext(ctx, `
+				SELECT subject_ap_id FROM vote_aggregates
+				WHERE subject_ap_id = $1 FOR UPDATE`, subject).Scan(&got)
+			if stderrors.Is(err, sql.ErrNoRows) {
+				// No aggregate row for this subject (the concurrent writer's
+				// row was itself removed): nothing to lock or recompute.
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf("lock newly appearing aggregate %q for voter %q: %w", subject, voterAPID, err)
+			}
+			locked[subject] = true
+		}
+
+		// Recompute every locked aggregate (snapshot ∪ newly-appearing rows =
+		// exactly the subjects with an aggregate row that lost one of this
+		// voter's votes), in deterministic subject order.
+		recomputeSet := make([]string, 0, len(locked))
+		for subject := range locked {
+			recomputeSet = append(recomputeSet, subject)
+		}
+		sort.Strings(recomputeSet)
+		for _, subject := range recomputeSet {
+			if err := recomputeAggregate(ctx, tx, subject); err != nil {
+				return err
+			}
+		}
+		if deleted > 0 {
+			a.logger.Info("vote events scrubbed for deleted voter",
+				"voter", voterAPID, "events", deleted, "subjects", len(recomputeSet))
+		}
+		return nil
+	})
+}
+
+// pruneVoteEventsBatchSize bounds one DELETE inside PruneUndoneEvents.
+const pruneVoteEventsBatchSize = 1000
+
+// PruneUndoneEvents deletes undone (superseded or retracted) vote_events
+// rows older than the cutoff, in batches, returning how many were removed.
+// Live rows are NEVER pruned — they are the counts. Retention trade-off,
+// accepted and mirrored from ap_tombstones: an undone row is also the
+// dedupe record for its activity id, so pruning re-opens replay for
+// activities older than the retention window — but real federation queues
+// redeliver over hours-to-days, not months, and VOTE_EVENT_RETENTION's
+// default (90 days) dwarfs that horizon.
+func (a *Aggregator) PruneUndoneEvents(ctx context.Context, cutoff time.Time) (int64, error) {
+	var total int64
+	for {
+		result, err := a.db.ExecContext(ctx, `
+			DELETE FROM vote_events WHERE id IN (
+				SELECT id FROM vote_events
+				WHERE undone AND created_at < $1
+				LIMIT $2
+			)`, cutoff, pruneVoteEventsBatchSize)
+		if err != nil {
+			return total, fmt.Errorf("votes: prune undone events before %s: %w", cutoff.Format(time.RFC3339), err)
+		}
+		n, err := result.RowsAffected()
+		if err != nil {
+			return total, fmt.Errorf("votes: prune undone events: rows affected: %w", err)
+		}
+		total += n
+		if n < pruneVoteEventsBatchSize {
+			return total, nil
+		}
+	}
 }
 
 // subjectMapping resolves a voted-on AP id to its materialized mapping. It

@@ -39,7 +39,7 @@ func (f *fakeServiceKeys) Create(_ context.Context, name string, pem []byte) (*s
 		return nil, errors.NewConflictError("service_key", "name", name)
 	}
 	f.rows[name] = pem
-	return &store.ServiceKey{ID: 1, Name: name, PrivateKeyPEM: pem}, nil
+	return &store.ServiceKey{ID: 1, Name: name, KeyMaterial: pem}, nil
 }
 
 func (f *fakeServiceKeys) Get(_ context.Context, name string) (*store.ServiceKey, error) {
@@ -49,7 +49,7 @@ func (f *fakeServiceKeys) Get(_ context.Context, name string) (*store.ServiceKey
 	if !ok {
 		return nil, errors.NewNotFoundError("service_key", name)
 	}
-	return &store.ServiceKey{ID: 1, Name: name, PrivateKeyPEM: pem}, nil
+	return &store.ServiceKey{ID: 1, Name: name, KeyMaterial: pem}, nil
 }
 
 func TestLoadOrCreateServiceActor_GeneratesThenLoads(t *testing.T) {
@@ -66,7 +66,7 @@ func TestLoadOrCreateServiceActor_GeneratesThenLoads(t *testing.T) {
 	// The key must have been persisted as parseable PKCS#8 PEM.
 	stored, err := keys.Get(ctx, ServiceKeyName)
 	require.NoError(t, err)
-	storedKey, err := ParsePrivateKeyPEM(stored.PrivateKeyPEM)
+	storedKey, err := ParsePrivateKeyPEM(stored.KeyMaterial)
 	require.NoError(t, err)
 	assert.True(t, first.Key.Equal(storedKey))
 

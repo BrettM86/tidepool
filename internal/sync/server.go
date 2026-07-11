@@ -2,9 +2,11 @@ package sync
 
 import (
 	"encoding/json"
+	"expvar"
 	"log/slog"
 	"net/http"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	comatproto "github.com/bluesky-social/indigo/api/atproto"
@@ -12,8 +14,17 @@ import (
 	"github.com/gorilla/websocket"
 
 	"tidepool/internal/errors"
+	"tidepool/internal/ratelimit"
 	"tidepool/internal/repo"
 )
+
+// SyncRateLimited counts public sync-surface requests refused by admission
+// control — the per-client-IP 429s on the read/dial surface and the
+// subscribeRepos connection-cap refusals. Published to the admin /metrics
+// surface as "tidepool_sync_ratelimited" (mirrors
+// materialize.ValidationFailures): a misconfigured tight limit silently
+// dropping all sync traffic is otherwise invisible.
+var SyncRateLimited = expvar.NewInt("tidepool_sync_ratelimited")
 
 // healthVersion is reported by /xrpc/_health, mirroring what the reference
 // PDS exposes (crawlers and Jetstream use it as a liveness probe).
@@ -34,6 +45,20 @@ const (
 	// listRepos limit bounds per com.atproto.sync.listRepos.
 	defaultListReposLimit = 500
 	maxListReposLimit     = 1000
+
+	// Admission-control defaults for the public sync surface (task 11,
+	// pre-internet-facing hardening). Sized as DoS backstops, not fairness
+	// controls: a relay indexing the bridge for the first time bursts
+	// getRepo/getRecord per new DID, so the burst absorbs a whole first
+	// crawl and the sustained rate stays far above anything a legitimate
+	// consumer needs (relays hold ONE WebSocket, not request storms).
+	defaultSyncRatePerSecond = 25
+	defaultSyncRateBurst     = 200
+	// defaultMaxSubscribers caps concurrent subscribeRepos connections. A
+	// bridge has a handful of legitimate firehose consumers (relays,
+	// Jetstream, debug taps); each one costs a goroutine pair and a DB
+	// cursor, so the cap bounds that multiplication.
+	defaultMaxSubscribers = 100
 )
 
 // Server implements the sync XRPC surface over a repo.Manager. Zero-valued
@@ -49,6 +74,15 @@ type Server struct {
 	writeTimeout time.Duration
 	pingInterval time.Duration
 	replayBatch  int
+
+	// limiter is the per-client-IP admission limiter for the whole public
+	// surface (HTTP reads and WebSocket dials alike); subscribers counts
+	// live subscribeRepos connections against maxSubscribers.
+	limiter        *ratelimit.Limiter
+	maxSubscribers int64
+	subscribers    atomic.Int64
+	// refusalLog samples the (otherwise noisy) rate-limit refusal Warn logs.
+	refusalLog *ratelimit.Sampler
 
 	// onUpgrade, when set, runs on every accepted subscribeRepos socket
 	// before streaming starts. Test seam: the slow-consumer eviction test
@@ -72,6 +106,14 @@ type Options struct {
 	WriteTimeout time.Duration
 	PingInterval time.Duration
 	ReplayBatch  int
+
+	// RatePerSecond / RateBurst tune the per-client-IP token bucket guarding
+	// every public sync endpoint (config SYNC_RATE_PER_SECOND /
+	// SYNC_RATE_BURST); zero values take generous defaults. MaxSubscribers
+	// caps concurrent subscribeRepos connections (SYNC_MAX_SUBSCRIBERS).
+	RatePerSecond  float64
+	RateBurst      int
+	MaxSubscribers int
 }
 
 // NewServer validates options and builds the server.
@@ -112,22 +154,56 @@ func NewServer(opts Options) (*Server, error) {
 	if s.replayBatch <= 0 {
 		s.replayBatch = defaultReplayBatch
 	}
+	perSecond := opts.RatePerSecond
+	if perSecond <= 0 {
+		perSecond = defaultSyncRatePerSecond
+	}
+	burst := opts.RateBurst
+	if burst <= 0 {
+		burst = defaultSyncRateBurst
+	}
+	s.limiter = ratelimit.New(perSecond, burst)
+	s.refusalLog = ratelimit.NewSampler(time.Second)
+	s.maxSubscribers = int64(opts.MaxSubscribers)
+	if s.maxSubscribers <= 0 {
+		s.maxSubscribers = defaultMaxSubscribers
+	}
 	return s, nil
 }
 
 // Routes mounts the sync surface on a chi router. resolveHandle and
 // /.well-known/atproto-did stay in cmd/tidepool (task 03 wired them; they
-// belong to the identity package).
+// belong to the identity package). Every endpoint except _health sits
+// behind the per-IP admission limiter (_health is the container healthcheck
+// probe — a rate-limited healthcheck would flap the whole stack, and it
+// does no per-request work worth guarding).
 func (s *Server) Routes(r chi.Router) {
-	r.Get("/xrpc/com.atproto.sync.subscribeRepos", s.handleSubscribeRepos)
-	r.Get("/xrpc/com.atproto.sync.getRepo", s.handleGetRepo)
-	r.Get("/xrpc/com.atproto.sync.getLatestCommit", s.handleGetLatestCommit)
-	r.Get("/xrpc/com.atproto.sync.getRecord", s.handleGetRecord)
-	r.Get("/xrpc/com.atproto.sync.getBlob", s.handleGetBlob)
-	r.Get("/xrpc/com.atproto.sync.listRepos", s.handleListRepos)
-	r.Get("/xrpc/com.atproto.sync.getRepoStatus", s.handleGetRepoStatus)
-	r.Get("/xrpc/com.atproto.server.describeServer", s.handleDescribeServer)
+	r.Get("/xrpc/com.atproto.sync.subscribeRepos", s.limited(s.handleSubscribeRepos))
+	r.Get("/xrpc/com.atproto.sync.getRepo", s.limited(s.handleGetRepo))
+	r.Get("/xrpc/com.atproto.sync.getLatestCommit", s.limited(s.handleGetLatestCommit))
+	r.Get("/xrpc/com.atproto.sync.getRecord", s.limited(s.handleGetRecord))
+	r.Get("/xrpc/com.atproto.sync.getBlob", s.limited(s.handleGetBlob))
+	r.Get("/xrpc/com.atproto.sync.listRepos", s.limited(s.handleListRepos))
+	r.Get("/xrpc/com.atproto.sync.getRepoStatus", s.limited(s.handleGetRepoStatus))
+	r.Get("/xrpc/com.atproto.server.describeServer", s.limited(s.handleDescribeServer))
 	r.Get("/xrpc/_health", s.handleHealth)
+}
+
+// limited wraps a handler with the per-client-IP token bucket. Refusals are
+// 429 RateLimitExceeded (the XRPC convention; sync consumers are pollers and
+// reconnecting WebSocket clients, both of which handle 429 by backing off).
+func (s *Server) limited(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.limiter.Allow(ratelimit.ClientIP(r)) {
+			SyncRateLimited.Add(1)
+			if s.refusalLog.Allow(time.Now()) {
+				s.logger.Warn("sync request rate-limited (sampled)", "remote", r.RemoteAddr, "path", r.URL.Path)
+			}
+			writeXRPCError(w, http.StatusTooManyRequests, "RateLimitExceeded", "rate limit exceeded")
+			return
+		}
+		next(w, r)
+	}
 }
 
 // loadActiveRepo resolves the did query parameter to an active repo,

@@ -33,8 +33,8 @@ write-back design; tasks 11–12 are its prerequisites).
 |---|------|--------|--------|-------|
 | 10 | 09-e2e-relay | done | (see git log) | 7/7 reviewers (4 Claude emulated + codex/gemini/glm); fixes: dev requestCrawl PUBLIC-relay dial guard (codex unique catch — NewPrivateOnlyHTTPClient, inverse SSRF guard), terminal-error classification made pre-flight-only (whole-chain IsValidation was abandoning a relay on attempt 1 for transient DNS), 10s per-attempt timeout (budget arithmetic was 14min worst-case, not 2min), vacuous validation-no-retry test rewritten + 400-is-retried pin, vetEvent per-DID rev-monotonicity (restores per-repo ordering assertion suite-wide), drain() returns+clears pending (closes task-10 vacuous-pass trap), relay poll robustness + pagination cap, doc corrections (RESOLVE_ADDRESS overstatement, spec BGS_CRAWL_INSECURE_WS annotation, FOLLOWUPS 16th-failure off-by-one). KEPT DELIBERATE over 3 reviewers' objection: all wire errors incl. 4xx retried — bigsky answers the describeServer callback race with HTTP 400 (comment + test pin it). Final clean make e2e: 10/10, 96.7s |
 | 11 | 10-e2e-scenarios | done | (see git log) | 6/7 reviewers (glm watchdog-killed); UNANIMOUS 6/6 finding: tombstone confirm-fetch transient failure → definitive 401 permanently lost legitimate account deletions → fixed with three-way taxonomy (tombstone→202, alive/validation/404→401, transport/5xx→503 defer) + test; codex unique: confirmation fetch followed cross-authority redirects (open-redirect → forged 410) → FetchActorSameAuthority pins every hop; security: unauthenticated durable-write path flagged → encoded into task 11 rate-limit spec; also: zz-sweep replay floor + honest bounds (sentinel-only pass was vacuous), Delete(Actor) over-scrub drain, actor!=object + Announce{Delete} 401 pins, GET / route-level test, cursor 0→1 doc fixes, vote-hammer header de-overclaimed. TASK ITSELF: 7 scenarios + 2 PRODUCTION fixes (apex instance actor — Lemmy silently never delivers Delete{Person} without a Site actor row; tombstone-verified self-delete acceptance). Final clean make e2e: 17/17, 239s |
-| 12 | 11-hardening | in-progress | | inbox+sync rate limits, #account frame, delete-before-create, pruners, housekeeping |
-| 13 | 12-perf-scale | pending | | MST cache, getRepo streaming/reachable-set, blocks GC, ClaimNext scan |
+| 12 | 11-hardening | done | (see git log) | 6/7 reviewers (glm watchdog-killed on 5k-line diff); NO high-sev confirmed (gemini's "carry-forward type assertion always fails" was a FALSE POSITIVE — GetRecord returns typed atdata.Blob, test green). Fixes: FollowRetrier atomic UPDATE...RETURNING claim (list-then-update raced Accept + burned attempts on transient failure + silent exhaustion), rate-limit refusal observability (expvar counters + sampled Warn — mistuned limit silently dropped all traffic), community-DID blob orphan now retryable (was swallowed → served forever; required delete-before-soft-delete reorder), ScrubVoter DELETE...RETURNING recompute (phantom-count lost update), carry-forward drops on permanent 404/410 vs carries on transient, DeleteActor terminal-state fixpoint (no double #account), migration-011 CHECK tightened + raw-insert test, /admin/metrics scoped expvar, internal/prune fail-closed test, proxy XFF ops note. TASK: inbox+sync admission control, #account{active:false,status:deleted} frame verified purging repo from bigsky, follow auto-retry, 3 pruners, one-tx record+mapping, blob/vote scrubs, service_keys rename. delete-before-create: README was RIGHT, FOLLOWUPS stale (task 06 already closed it). Final clean make e2e: 17/17, 232s |
+| 13 | 12-perf-scale | in-progress | | MST cache, getRepo streaming/reachable-set, blocks GC, ClaimNext scan |
 
 Statuses: pending → in-progress → review → done (or blocked: <reason>).
 
@@ -524,3 +524,77 @@ and deferred TODOs here)
   #account frame must FLIP that assertion.
 - Task-10 stretch (low MINT_RATE_PER_MINUTE compose variant) skipped as
   specced — needs its own compose profile (FOLLOWUPS, Ingestion).
+
+### From task 11 (hardening — task 12 MUST know)
+- **firehose_events now carries TWO event kinds** (migration 011): `commit`
+  and `account` (nullable commit columns + a shape CHECK per kind).
+  repo.Event grew Kind/AccountActive/AccountStatus; any code iterating
+  events must switch on Kind (sync/subscribe.go does; e2e vetEvent skips
+  non-commit Jetstream kinds already). `repo.AppendAccountEvent` takes the
+  SAME global commit advisory lock as record commits — seq order still ==
+  visibility order; task 12's perf work must preserve that for both kinds.
+- **#account status token is "deleted", and so is the bridge's own
+  getRepoStatus/listRepos status** (was "deactivated"). Wire facts
+  (source-verified, pinned bigsky): on #account it re-resolves the DID doc
+  and REQUIRES the sender to be the DID's authoritative PDS; "deleted" →
+  tombstoned=true (listRepos filters `NOT tombstoned`) + carstore purge;
+  "deactivated"/"suspended"/"takendown" filter from listRepos but do NOT
+  purge. Emitted ONLY by DeleteActor (terminal); nobridge stays frameless
+  (repo active, reversible).
+- **repo.PutRecordTx(… TxSideEffect)** is the new atomic seam: the hook
+  runs inside the commit tx (also on the NoOp re-put, with res.NoOp=true)
+  and an error rolls the RECORD back too. The materializer's ap_objects
+  mapping now rides it (store.APObjects.PutMappingTx). Hooks run under the
+  global advisory lock — keep them tiny; task 12's MST cache must not
+  change hook semantics.
+- **internal/ratelimit** is the shared keyed token-bucket (extracted from
+  votes; sweep throttle + 50k fail-closed cap). Consumers: votes XRPC
+  (429), sync surface (429, _health exempt; subscribeRepos also has a
+  reserve-then-check connection cap), inbox (per-IP pre-body + per-signer
+  post-verify + a dedicated tombstone-confirmation cap INSIDE
+  tombstonedSelfDelete, before the confirmation fetch). INBOX REFUSALS ARE
+  503, NEVER 4xx — Lemmy's federation crate retries 5xx but permanently
+  drops 4xx; the tombstone-cap refusal is a DEFER for the same reason.
+  Defaults are deliberately generous (suite = canary, ran green on
+  defaults); all envs in README's config table.
+- **internal/prune.Run** is the shared retention loop (fail-closed on
+  retention<=0). Pruners: firehose (batched now, 1000/statement, oldest-up
+  so a partial sweep keeps the retained suffix contiguous), ap_tombstones
+  (30d), undone vote_events (90d — an undone row is also its activity id's
+  dedupe record, so replay protection now has that horizon; live rows
+  never pruned).
+- **Blob scrub caveat**: blobs are content-addressed per (did,cid) with no
+  reference tracking — scrubbing a deleted actor's record deletes blob rows
+  other records in the same repo could share (byte-identical media).
+  Accepted + commented on repo.DeleteBlob; a blob-refcount would close it
+  if it ever matters. repo grew DeleteBlob/DeleteBlobsForDID.
+- **votes.Aggregator.ScrubVoter** locks ALL affected aggregates in
+  deterministic subject order (ORDER BY + FOR UPDATE) before deleting —
+  any future multi-subject vote mutation must lock in the same order or
+  risk deadlock against it.
+- **Follow retrier** (ingest.FollowRetrier, migration 012): every
+  set-to-pending stamps follow_requested_at + increments follow_attempts
+  (SetFollowState does it); resend consumes the attempt BEFORE sending so
+  a hanging peer can't get an unbounded budget; none resets. Default:
+  pending >2m → resend, 5 total sends, 1m sweep.
+- **service_keys.private_key_pem → key_material** (migration 013);
+  store.ServiceKey.PrivateKeyPEM → KeyMaterial (identity/ap callers
+  updated).
+- **ap.ClientOptions.MaxMediaBytes**: FetchMedia's outer clamp, wired from
+  MAX_BLOB_BYTES; the JSON-object cap (MaxResponseBytes) stays independent
+  at 5MiB.
+- **Delete-before-create verdict**: README was RIGHT, FOLLOWUPS was stale —
+  task 06's handleDelete records the ap_tombstones marker before
+  HandleDelete and materializeContent checks it;
+  TestCreateAfterDeleteTombstone pins the whole ordering. No code change
+  needed; the false FOLLOWUPS entry is annotated.
+- **Validation-failure metric**: materialize.ValidationFailures (expvar,
+  "tidepool_lexicon_validation_failures", counted in strict AND
+  log-and-write modes), served on bearer-protected GET /admin/metrics.
+  Strict-first production rollout still deferred; this counter is its
+  precondition.
+- e2e: TestDeleteActor's task-09/10 pins FLIPPED — it now asserts the
+  #account frame on the bridge's own firehose (raw CBOR ws helper
+  dialBridgeFirehose/readBridgeAccountFrame in tests/e2e/helpers.go) and
+  the repo DISAPPEARING from the relay's listRepos (polled; bigsky
+  processes the frame async).

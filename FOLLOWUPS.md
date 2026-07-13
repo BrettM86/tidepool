@@ -141,3 +141,14 @@ task documents and git history rather than this list.
   ingest harness (real Postgres + fake Lemmy inbox) and was smoke-tested
   live (startup fail-fast, sweep, POST /admin/communities/reconcile);
   compose plumbing for the file mount is the missing piece.
+- Cold-start visibility gap (observed at the 2026-07-13 production launch):
+  records committed before a relay's first subscription never re-emit as
+  live commit frames, so a Jetstream-fed AppView misses them — the initial
+  community backfill ran ~25 minutes before bsky.network accepted the
+  crawl, and none of those posts indexed in Coves despite the relay
+  serving the repos (crawl imports state, not per-op events). Live records
+  heal organically (any bridgedStats vote sweep or upstream edit re-emits
+  the record as an update commit, which the AppView upserts), but quiet
+  posts stay invisible. Consider an admin "re-emit" endpoint that walks a
+  repo and appends no-op update commits for records older than the relay
+  subscription, for operators onboarding a relay after content exists.

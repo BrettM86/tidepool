@@ -25,4 +25,9 @@
 communities:
   - "!comicstrips@lemmy.world"   # seed set, 2026-07: small, active, cross-checks lemmy.world
   - "!selfhosted@lemmy.world"    # seed set, 2026-07
-  - "!linux@lemmy.ml"            # seed set, 2026-07: second instance, exercises cross-instance federation
+  # seed set, 2026-07: second instance, exercises cross-instance federation.
+  # AP URL form, not "!linux@lemmy.ml": lemmy.ml has BOTH a user and a
+  # community named "linux", and WebFinger acct: resolution picked the
+  # Person (the materializer correctly refused it — want Group). The /c/
+  # URL is unambiguous.
+  - "https://lemmy.ml/c/linux"

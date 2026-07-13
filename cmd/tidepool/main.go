@@ -41,10 +41,49 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	slog.SetDefault(logger)
 
-	if err := run(logger); err != nil {
+	if err := dispatch(logger, os.Args[1:]); err != nil {
 		logger.Error("tidepool exited with error", "error", err)
 		os.Exit(1)
 	}
+}
+
+// dispatch selects the long-running server or an operational one-shot command.
+// Keeping migrations in the same image guarantees the schema bundled with the
+// binary is exactly the schema applied by deployment automation.
+func dispatch(logger *slog.Logger, args []string) error {
+	switch {
+	case len(args) == 0:
+		return run(logger)
+	case len(args) == 1 && args[0] == "migrate":
+		return runMigrations(logger)
+	default:
+		return fmt.Errorf("usage: tidepool [migrate]")
+	}
+}
+
+// runMigrations applies every pending embedded Goose migration and exits. It
+// intentionally reads only DATABASE_URL: migration jobs should not need HTTP,
+// PLC, relay, or key-custody configuration merely to update the schema.
+func runMigrations(logger *slog.Logger) error {
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		return fmt.Errorf("migrate: DATABASE_URL is required")
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	database, err := db.Open(ctx, databaseURL)
+	if err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+	defer func() { _ = database.Close() }()
+
+	if err := db.MigrateUp(ctx, database); err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+	logger.Info("database migrations completed")
+	return nil
 }
 
 func run(logger *slog.Logger) error {

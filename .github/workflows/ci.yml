@@ -47,10 +47,13 @@ jobs:
         run: go build ./...
       - name: Vet
         run: go vet ./... && go vet -tags e2e ./tests/e2e/...
-      - name: Lexicon manifest check
-        # No Coves checkout in CI: the script verifies the committed
-        # manifest and skips the upstream drift comparison gracefully.
-        run: ./scripts/check-lexicons.sh
+      - name: Check out current Coves lexicons
+        # Tidepool vendors Coves' schemas. Comparing only against the local
+        # manifest cannot detect a Coves-only lexicon change, so CI checks the
+        # current canonical Coves tree as well.
+        run: git clone --depth 1 https://tangled.org/bretton.dev/coves /tmp/coves
+      - name: Lexicon manifest and upstream drift check
+        run: ./scripts/check-lexicons.sh /tmp/coves
       - name: Unit & integration tests
         env:
           TIDEPOOL_TEST_DATABASE_URL: postgres://tidepool_test:tidepool_test@localhost:5443/tidepool_test?sslmode=disable

@@ -5,7 +5,7 @@
     "commentView": {
       "type": "object",
       "description": "Base view for a single comment with voting, stats, and viewer state",
-      "required": ["uri", "cid", "post", "createdAt", "indexedAt", "stats"],
+      "required": ["uri", "cid", "author", "record", "post", "createdAt", "indexedAt", "stats"],
       "properties": {
         "uri": {
           "type": "string",
@@ -20,11 +20,11 @@
         "author": {
           "type": "ref",
           "ref": "social.coves.community.post.get#authorView",
-          "description": "Comment author information. Absent for deleted comments (authorship is redacted)"
+          "description": "Comment author information"
         },
         "record": {
           "type": "unknown",
-          "description": "The actual comment record verbatim. Absent for deleted comments"
+          "description": "The actual comment record verbatim"
         },
         "post": {
           "type": "ref",
@@ -63,20 +63,6 @@
           "type": "ref",
           "ref": "#commentViewerState",
           "description": "Viewer-specific state (vote, saved, etc.)"
-        },
-        "isDeleted": {
-          "type": "boolean",
-          "description": "True if this comment was deleted; the view is a placeholder preserving thread structure"
-        },
-        "deletionReason": {
-          "type": "string",
-          "knownValues": ["author", "moderator"],
-          "description": "Who deleted the comment: the author themselves, or a community moderator"
-        },
-        "deletedAt": {
-          "type": "string",
-          "format": "datetime",
-          "description": "When the comment was deleted"
         }
       }
     },

@@ -103,6 +103,22 @@ services:
       timeout: 5s
       retries: 30
 
+  # Production uses the same embedded migration command as this one-shot
+  # service. The bridge waits for a successful exit before starting; a failed
+  # migration therefore fails the stack closed instead of booting mixed code
+  # and schema. Development startup still performs an idempotent migrate as a
+  # convenience, but the harness exercises the deployable command explicitly.
+  tidepool-migrate:
+    build: .
+    command: ["migrate"]
+    environment:
+      DATABASE_URL: postgres://tidepool:tidepool@tidepool-postgres:5432/tidepool?sslmode=disable
+    networks: [tidepool-e2e]
+    depends_on:
+      tidepool-postgres:
+        condition: service_healthy
+    restart: "no"
+
   tidepool:
     build: .
     environment:
@@ -153,8 +169,8 @@ services:
       - "127.0.0.1:${TIDEPOOL_E2E_PORT:-8092}:80"
     networks: [tidepool-e2e]
     depends_on:
-      tidepool-postgres:
-        condition: service_healthy
+      tidepool-migrate:
+        condition: service_completed_successfully
       plc:
         condition: service_healthy
       # The relay must be up AND willing to accept new PDS subscriptions

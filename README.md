@@ -19,6 +19,51 @@ make run         # run the bridge (migrations apply on start in dev)
 make test        # start the test postgres (localhost:5443) and run the suite
 ```
 
+Production does not migrate on server startup. If operating without a registry,
+build the image from the checked-out revision and run its embedded one-shot
+migration command before starting the server:
+
+```sh
+docker build -t tidepool:local .
+docker run --rm \
+  -e DATABASE_URL="$DATABASE_URL" \
+  tidepool:local migrate
+```
+
+In the production deployment Compose file, give the migration and server
+services the same locally-built image, then make the server depend on a
+successful migration job:
+
+```yaml
+x-tidepool-image: &tidepool-image
+  build: .
+  image: tidepool:local
+
+services:
+  tidepool-migrate:
+    <<: *tidepool-image
+    command: ["migrate"]
+    environment:
+      DATABASE_URL: ${TIDEPOOL_DATABASE_URL}
+    restart: "no"
+
+  tidepool:
+    <<: *tidepool-image
+    depends_on:
+      tidepool-migrate:
+        condition: service_completed_successfully
+```
+
+The snippet above is a template to add to the operator's deployment Compose
+file; this repository does not yet ship a standalone production Compose stack.
+Once installed there, the normal deployment command rebuilds the shared local
+image, runs the migration job, and starts Tidepool only if migration succeeded:
+
+```sh
+git pull
+docker compose up -d --build
+```
+
 Requires Go 1.25+, Docker, and (for `make db-migrate` / `make lint`) the
 `goose` and `golangci-lint` CLIs. Store tests need a real postgres: they
 skip with a clear message when `TIDEPOOL_TEST_DATABASE_URL` is unset.
@@ -176,9 +221,9 @@ signature verification AND is validated against the vendored Coves lexicons
 on the consumer side of the wire, and any collection outside the four the
 bridge emits fails the suite immediately (votes must never become records). Two scripts keep the vendored
 lexicons honest: `scripts/sync-lexicons.sh` copies them from a Coves
-checkout; `scripts/check-lexicons.sh` verifies the committed manifest (the
-layer that runs in CI) and additionally byte-compares against
-`~/Code/coves` when that checkout exists (local only).
+checkout; `scripts/check-lexicons.sh` verifies the committed manifest and
+byte-compares against the current Coves checkout. CI clones the canonical Coves
+repository for this comparison; locally it uses `~/Code/coves` by default.
 
 Everything is local-only: the harness never contacts `plc.directory`, public
 relays, or public Lemmy instances.

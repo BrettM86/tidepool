@@ -302,6 +302,16 @@ curl -X DELETE localhost:8091/admin/communities \
 
 curl localhost:8091/admin/metrics \
   -H "Authorization: Bearer dev-admin-token"          # expvar counters
+
+# re-emit a repo's records onto the firehose as delete+create commit pairs
+# (identical values, so at-uris and CIDs are unchanged). For the relay
+# cold-start gap: records committed before a relay first subscribed never
+# re-emit on their own, so a Jetstream-fed AppView cannot index them.
+# {} (or empty body) re-emits every active repo; tombstoned repos are
+# always skipped.
+curl -X POST localhost:8091/admin/reemit \
+  -H "Authorization: Bearer dev-admin-token" \
+  -d '{"did":"did:plc:aaa..."}'
 # (includes tidepool_lexicon_validation_failures — non-zero in production,
 # where validation failures log-and-write, means investigate)
 ```
@@ -399,6 +409,10 @@ it as a `subscribeRepos` upstream:
   `listRepos` (paginated), `getRepoStatus`
 - `com.atproto.server.describeServer`, `/xrpc/_health`
 - `com.atproto.identity.resolveHandle` + `/.well-known/atproto-did` (task 03)
+- `/.well-known/did.json` — the DID document for the bridge's own derived
+  `did:web:<BRIDGE_HOSTNAME>` service identity (the `hostedBy` of every
+  bridged community profile; consumers verifying that claim resolve it
+  here). 404 when a non-did:web `BRIDGE_SERVICE_DID` is provisioned.
 
 Repos whose actor revoked consent (tombstoned) report `RepoDeactivated` /
 `active: false` with status `deleted`, and their content endpoints stop

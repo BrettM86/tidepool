@@ -149,6 +149,9 @@ task documents and git history rather than this list.
   serving the repos (crawl imports state, not per-op events). Live records
   heal organically (any bridgedStats vote sweep or upstream edit re-emits
   the record as an update commit, which the AppView upserts), but quiet
-  posts stay invisible. Consider an admin "re-emit" endpoint that walks a
-  repo and appends no-op update commits for records older than the relay
-  subscription, for operators onboarding a relay after content exists.
+  posts stay invisible. RESOLVED: `POST /admin/reemit` walks a repo (or
+  all repos) and re-emits every record as a delete+create commit pair —
+  honest diffs, unchanged at-uris/CIDs (a same-value "touch" update was
+  rejected as the design: its op list would not match the empty MST diff,
+  which sync-v1.1-validating relays may refuse). Remaining follow-up: the
+  e2e harness has no scenario covering it.

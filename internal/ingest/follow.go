@@ -43,7 +43,10 @@ type AdminOptions struct {
 	Service *ap.ServiceActor
 	// Backfill serves the on-demand backfill endpoint (optional).
 	Backfill Backfiller
-	Logger   *slog.Logger
+	// Repos serves POST /admin/reemit (optional; the endpoint answers 501
+	// when nil). See reemit.go for what re-emission is for.
+	Repos  RepoReemitter
+	Logger *slog.Logger
 }
 
 // Admin is the operator API driving the community subscription lifecycle:
@@ -62,6 +65,7 @@ type Admin struct {
 	communities store.Communities
 	service     *ap.ServiceActor
 	backfill    Backfiller
+	repos       RepoReemitter
 	logger      *slog.Logger
 	// reconciler serves POST /admin/communities/reconcile; nil (the
 	// endpoint answers 501) unless a follow list is configured. Set once
@@ -102,6 +106,7 @@ func NewAdmin(opts AdminOptions) (*Admin, error) {
 		communities: opts.Communities,
 		service:     opts.Service,
 		backfill:    opts.Backfill,
+		repos:       opts.Repos,
 		logger:      logger,
 	}, nil
 }
@@ -120,6 +125,7 @@ func (a *Admin) Routes(r chi.Router) {
 		r.Get("/communities", a.handleList)
 		r.Post("/communities/backfill", a.handleBackfill)
 		r.Post("/communities/reconcile", a.handleReconcile)
+		r.Post("/reemit", a.handleReemit)
 		r.Method(http.MethodGet, "/metrics", http.HandlerFunc(scopedMetrics))
 	})
 }

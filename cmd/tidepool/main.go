@@ -123,17 +123,33 @@ func run(logger *slog.Logger) error {
 		_, _ = w.Write([]byte("ok"))
 	})
 
+	// The bridge's own DID (community.profile createdBy/hostedBy, the bare
+	// hostname's handle, and /.well-known/did.json). An operator may
+	// pre-provision one; otherwise the bridge identifies as did:web on its
+	// own hostname. Derived HERE, before the resolver, so the bare-hostname
+	// handle resolves to it and the did:web document is served — consumers
+	// (the Coves AppView's hostedBy verification) resolve that document and
+	// fail closed when it is missing.
+	serviceDID := cfg.BridgeServiceDID
+	if serviceDID == "" {
+		serviceDID = "did:web:" + cfg.BridgeHostname
+		logger.Info("BRIDGE_SERVICE_DID not set, deriving from hostname", "did", serviceDID)
+	}
+
 	// Handle resolution for the bridged handle space (task 03). Bridged
 	// handles are subdomains of BRIDGE_HOSTNAME; wildcard DNS routes them
 	// all here (see README, "Handle resolution & DNS").
 	actors := store.NewBridgedActors(database)
-	resolver := identity.NewStoreResolver(actors, cfg.BridgeHostname, cfg.BridgeServiceDID)
+	resolver := identity.NewStoreResolver(actors, cfg.BridgeHostname, serviceDID)
 	router.Get("/xrpc/com.atproto.identity.resolveHandle", identity.ResolveHandleHandler(resolver, logger))
 	router.Get("/.well-known/atproto-did", identity.WellKnownDIDHandler(resolver, logger))
 	// Cert-issuance gate for TLS-terminating proxies with on-demand
 	// issuance (production Caddy asks here before requesting a cert for a
 	// bridged-handle subdomain; see docker-compose.prod.yml header).
 	router.Get("/.well-known/tidepool-tls-ask", identity.TLSAskHandler(resolver, logger))
+	// The bridge's own did:web document (404 when a non-did:web
+	// BRIDGE_SERVICE_DID is provisioned).
+	router.Get("/.well-known/did.json", identity.DIDWebHandler(serviceDID, cfg.BridgeHostname))
 
 	// The sync surface (task 04): com.atproto.sync.* + subscribeRepos,
 	// describeServer, _health — everything a relay or Jetstream needs to
@@ -240,15 +256,6 @@ func run(logger *slog.Logger) error {
 	mintGate, err := ingest.NewMintGate(minter, cfg.MintRatePerMinute, cfg.MintBurst, logger)
 	if err != nil {
 		return err
-	}
-
-	// The bridge's own DID (community.profile createdBy/hostedBy). An
-	// operator may pre-provision one; otherwise the bridge identifies as
-	// did:web on its own hostname.
-	serviceDID := cfg.BridgeServiceDID
-	if serviceDID == "" {
-		serviceDID = "did:web:" + cfg.BridgeHostname
-		logger.Info("BRIDGE_SERVICE_DID not set, deriving from hostname", "did", serviceDID)
 	}
 
 	objects := store.NewAPObjects(database)
@@ -394,6 +401,7 @@ func run(logger *slog.Logger) error {
 		Communities:  communities,
 		Service:      serviceActor,
 		Backfill:     backfill,
+		Repos:        repoManager,
 		Logger:       logger,
 	})
 	if err != nil {

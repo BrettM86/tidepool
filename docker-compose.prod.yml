@@ -89,6 +89,12 @@ services:
       PLC_DIRECTORY_URL: https://plc.directory
       BRIDGE_KEK: ${BRIDGE_KEK}
       ADMIN_TOKEN: ${ADMIN_TOKEN}
+      # Gentler than the built-in 60/120: the public plc.directory 429s
+      # mint bursts during community backfill (observed at launch), and a
+      # rejected submission wastes a generated DID. Mints retry durably,
+      # so a smoother rate only defers identity creation, never loses it.
+      MINT_RATE_PER_MINUTE: ${MINT_RATE_PER_MINUTE:-10}
+      MINT_BURST: ${MINT_BURST:-20}
       # bsky.network fans out to the Jetstream instances the Coves AppView
       # consumes (jetstream2.us-east.bsky.network) — this is the path
       # bridged records take into Coves.

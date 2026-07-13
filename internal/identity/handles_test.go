@@ -126,6 +126,46 @@ func TestWellKnownDIDHandler(t *testing.T) {
 	})
 }
 
+func TestTLSAskHandler(t *testing.T) {
+	resolver := &fakeResolver{handles: map[string]string{
+		"alice.lemmy-world.tidepool.example": "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
+	}}
+	handler := TLSAskHandler(resolver, testLogger())
+
+	get := func(target string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		handler(rec, httptest.NewRequest(http.MethodGet, target, nil))
+		return rec
+	}
+
+	t.Run("allows known handle", func(t *testing.T) {
+		assert.Equal(t, http.StatusOK,
+			get("/.well-known/tidepool-tls-ask?domain=alice.lemmy-world.tidepool.example").Code)
+	})
+
+	t.Run("normalizes case and trailing dot", func(t *testing.T) {
+		assert.Equal(t, http.StatusOK,
+			get("/.well-known/tidepool-tls-ask?domain=Alice.Lemmy-World.tidepool.example.").Code)
+	})
+
+	t.Run("refuses unknown domain", func(t *testing.T) {
+		assert.Equal(t, http.StatusNotFound,
+			get("/.well-known/tidepool-tls-ask?domain=random-probe.tidepool.example").Code)
+	})
+
+	t.Run("missing domain is 400", func(t *testing.T) {
+		assert.Equal(t, http.StatusBadRequest, get("/.well-known/tidepool-tls-ask").Code)
+	})
+
+	t.Run("resolver failure is 500, not an allow", func(t *testing.T) {
+		failing := TLSAskHandler(&fakeResolver{err: context.DeadlineExceeded}, testLogger())
+		rec := httptest.NewRecorder()
+		failing(rec, httptest.NewRequest(http.MethodGet,
+			"/.well-known/tidepool-tls-ask?domain=alice.lemmy-world.tidepool.example", nil))
+		assert.Equal(t, http.StatusInternalServerError, rec.Code)
+	})
+}
+
 func TestStoreResolver(t *testing.T) {
 	database := testutil.DB(t)
 	testutil.Truncate(t, database, "bridged_actors")

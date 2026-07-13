@@ -54,15 +54,21 @@ services:
         condition: service_completed_successfully
 ```
 
-The snippet above is a template to add to the operator's deployment Compose
-file; this repository does not yet ship a standalone production Compose stack.
-Once installed there, the normal deployment command rebuilds the shared local
-image, runs the migration job, and starts Tidepool only if migration succeeded:
+This repository ships that stack as
+[docker-compose.prod.yml](docker-compose.prod.yml) (postgres + migrate +
+server; TLS terminates in the operator's reverse proxy — see the file
+header). With `.env` filled in from
+[.env.prod.example](.env.prod.example), the normal deployment command
+rebuilds the shared local image, runs the migration job, and starts
+Tidepool only if migration succeeded:
 
 ```sh
 git pull
-docker compose up -d --build
+docker compose -f docker-compose.prod.yml up -d --build tidepool
 ```
+
+The repo-committed deploy runbook is
+[.claude/commands/deploy.md](.claude/commands/deploy.md).
 
 Requires Go 1.25+, Docker, and (for `make db-migrate` / `make lint`) the
 `goose` and `golangci-lint` CLIs. Store tests need a real postgres: they

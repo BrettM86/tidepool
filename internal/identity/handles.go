@@ -130,6 +130,33 @@ func WellKnownDIDHandler(resolver Resolver, logger *slog.Logger) http.HandlerFun
 	}
 }
 
+// TLSAskHandler gates on-demand TLS certificate issuance for the bridged
+// handle space: GET /.well-known/tidepool-tls-ask?domain=<hostname> answers
+// 200 iff the hostname is a handle the bridge would serve (resolvable, not
+// tombstoned) and 404 otherwise. Reverse proxies terminating TLS with
+// on-demand issuance (Caddy's `on_demand_tls { ask … }`) call this before
+// requesting a certificate — without the gate, wildcard DNS makes every
+// probe of <random>.<BRIDGE_HOSTNAME> burn an ACME issuance attempt.
+func TLSAskHandler(resolver Resolver, logger *slog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		domain := strings.TrimSuffix(strings.ToLower(r.URL.Query().Get("domain")), ".")
+		if domain == "" {
+			http.Error(w, "missing required parameter: domain", http.StatusBadRequest)
+			return
+		}
+		_, err := resolver.ResolveHandle(r.Context(), domain)
+		switch {
+		case err == nil:
+			w.WriteHeader(http.StatusOK)
+		case errors.IsNotFound(err) || errors.IsValidation(err):
+			http.Error(w, "not a bridged handle", http.StatusNotFound)
+		default:
+			logger.Error("tls-ask lookup failed", "domain", domain, "error", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+		}
+	}
+}
+
 func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)

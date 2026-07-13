@@ -1,0 +1,125 @@
+# Tidepool production stack.
+#
+# Runs next to the Coves stack on the same box (/opt/tidepool beside
+# /opt/coves). TLS terminates in the COVES Caddy (coves-prod-caddy), which
+# fronts tdpl.io and every bridged-handle subdomain and reaches the bridge
+# over the shared coves-prod-network — the `tidepool` service joins that
+# network as an external one. The tdpl.io site blocks (including the
+# on-demand-TLS cert gate pointing at /.well-known/tidepool-tls-ask) live in
+# the Coves repo's Caddyfile.
+#
+# Migrations: production does NOT migrate on server start. The migrate
+# one-shot and the server share one locally-built image; the server only
+# starts after a successful migration run (service_completed_successfully),
+# so the deploy command is a single targeted:
+#
+#   docker compose -f docker-compose.prod.yml up -d --build tidepool
+#
+# Follow list: communities.yaml is read through a DIRECTORY bind mount
+# (./:/repo:ro), not a single-file mount — docker pins single-file mounts to
+# the inode present at container start, and `git pull` replaces the file, so
+# a single-file mount would silently serve the pre-pull follow list forever
+# (the same trap the Coves Caddyfile fell into). With the directory mount a
+# plain `git pull` is enough; the reconciler picks the new file up on its
+# next sweep (FOLLOW_LIST_INTERVAL, default 15m) — no container restart.
+#
+# Ops note (README "Sync surface"): the bridge's per-IP rate limiters key on
+# RemoteAddr and see only Caddy's container IP from behind the proxy —
+# per-IP limits degrade to global ones until rate limiting exists at the
+# Caddy edge. Tracked in FOLLOWUPS.md; acceptable at current scale.
+
+x-tidepool-image: &tidepool-image
+  build: .
+  image: tidepool:prod
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: tidepool-prod-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-tidepool}
+      POSTGRES_USER: ${POSTGRES_USER:-tidepool}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./backups:/backups
+    networks:
+      - tidepool-internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tidepool} -d ${POSTGRES_DB:-tidepool}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 16G
+        reservations:
+          memory: 1G
+
+  tidepool-migrate:
+    <<: *tidepool-image
+    container_name: tidepool-prod-migrate
+    command: ["migrate"]
+    restart: "no"
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-tidepool}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-tidepool}?sslmode=disable
+    networks:
+      - tidepool-internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  tidepool:
+    <<: *tidepool-image
+    container_name: tidepool-prod
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8091:80" # host-local ops access (admin API without a round trip through Caddy)
+    environment:
+      ENVIRONMENT: production
+      DATABASE_URL: postgres://${POSTGRES_USER:-tidepool}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-tidepool}?sslmode=disable
+      LISTEN_ADDR: ":80"
+      BRIDGE_HOSTNAME: ${BRIDGE_HOSTNAME:-tdpl.io}
+      PLC_DIRECTORY_URL: https://plc.directory
+      BRIDGE_KEK: ${BRIDGE_KEK}
+      ADMIN_TOKEN: ${ADMIN_TOKEN}
+      # bsky.network fans out to the Jetstream instances the Coves AppView
+      # consumes (jetstream2.us-east.bsky.network) — this is the path
+      # bridged records take into Coves.
+      RELAY_HOSTS: ${RELAY_HOSTS:-https://bsky.network}
+      FOLLOW_LIST_PATH: /repo/communities.yaml
+    volumes:
+      - ./:/repo:ro
+    networks:
+      - tidepool-internal
+      - coves-prod-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      tidepool-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:80/xrpc/_health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+        reservations:
+          memory: 512M
+
+networks:
+  tidepool-internal:
+    driver: bridge
+    name: tidepool-prod-internal
+  coves-prod-network:
+    external: true
+
+volumes:
+  postgres-data:
+    name: tidepool-prod-postgres-data

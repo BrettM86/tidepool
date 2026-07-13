@@ -14,5 +14,11 @@
 # Go tooling
 coverage.out
 
-# Local Claude Code session/tooling state
-.claude/
+# Postgres dump target of docker-compose.prod.yml (server-side only)
+/backups/
+
+# Local Claude Code session/tooling state — but the deploy command is
+# repo-committed (like the Coves one; it uses a <PROD_HOST> placeholder so
+# the SSH target stays out of git history)
+.claude/*
+!.claude/commands/

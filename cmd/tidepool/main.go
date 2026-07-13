@@ -130,6 +130,10 @@ func run(logger *slog.Logger) error {
 	resolver := identity.NewStoreResolver(actors, cfg.BridgeHostname, cfg.BridgeServiceDID)
 	router.Get("/xrpc/com.atproto.identity.resolveHandle", identity.ResolveHandleHandler(resolver, logger))
 	router.Get("/.well-known/atproto-did", identity.WellKnownDIDHandler(resolver, logger))
+	// Cert-issuance gate for TLS-terminating proxies with on-demand
+	// issuance (production Caddy asks here before requesting a cert for a
+	// bridged-handle subdomain; see docker-compose.prod.yml header).
+	router.Get("/.well-known/tidepool-tls-ask", identity.TLSAskHandler(resolver, logger))
 
 	// The sync surface (task 04): com.atproto.sync.* + subscribeRepos,
 	// describeServer, _health — everything a relay or Jetstream needs to

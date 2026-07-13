@@ -264,6 +264,8 @@ production**:
 | `INBOX_TOMBSTONE_CONFIRMS_PER_MINUTE` / `INBOX_TOMBSTONE_CONFIRM_BURST` | `6` / `10` | dedicated per-IP cap on the tombstoned-self-delete confirmation branch (an unauthenticated POST that costs an outbound fetch + durable writes); over-limit deliveries defer (503) so legitimate deletions redeliver |
 | `SYNC_RATE_PER_SECOND` / `SYNC_RATE_BURST` | `25` / `200` | per-client-IP token bucket over the public `com.atproto.sync.*` surface (429; `_health` exempt) |
 | `SYNC_MAX_SUBSCRIBERS` | `100` | concurrent `subscribeRepos` connection cap |
+| `FOLLOW_LIST_PATH` | *(optional)* | declarative follow list (see below); unset = the `/admin` API is the only subscription control |
+| `FOLLOW_LIST_INTERVAL` | `15m` | follow-list reconciler sweep cadence |
 
 ## Subscribing to communities (admin API)
 
@@ -297,6 +299,35 @@ curl localhost:8091/admin/metrics \
 # (includes tidepool_lexicon_validation_failures — non-zero in production,
 # where validation failures log-and-write, means investigate)
 ```
+
+### Declarative follow list (`FOLLOW_LIST_PATH`)
+
+Instead of driving subscriptions one curl at a time, point
+`FOLLOW_LIST_PATH` at a repo-committed YAML naming every community the
+bridge should follow (see [communities.yaml](communities.yaml)):
+
+```yaml
+communities:
+  - "!comicstrips@lemmy.world"   # entries MUST be quoted — bare ! is a YAML tag
+  - "https://lemmy.ml/c/linux"   # AP group URLs work too
+```
+
+A reconciler converges the subscription table to the file on startup and
+every `FOLLOW_LIST_INTERVAL` (`POST /admin/communities/reconcile` forces a
+pass and reports what changed). **The file is authoritative**: entries
+missing from the table are subscribed; subscriptions missing from the file
+are unfollowed (`Undo{Follow}`, records kept — content just stops flowing)
+— including manual `POST /admin/communities` additions. Community consent
+(`#nobridge`) still overrides the file.
+
+Git history is the moderation audit log: additions and removals arrive as
+reviewed PRs (requests via GitHub issue), each entry carrying its rationale
+in a comment. Guard rails, so a bad deploy can't mass-unfollow: a missing
+or malformed file **fails startup**; a file that breaks after startup skips
+sweeps (never "unfollow everything"); an entry that stops matching is
+diffed against the table offline, so a resolver or remote-instance outage
+can't make a desired community look removed. Only an explicit
+`communities: []` unfollows all.
 
 The bridge's AP face lives next to the inbox: the service actor document at
 `/actor`, an **instance actor at the origin apex** (`GET /`, type

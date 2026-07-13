@@ -175,6 +175,24 @@ type Config struct {
 	// (STATS_REFRESH_BATCH, default 200, must be positive). Commits are
 	// globally serialized, so the batch keeps one sweep from flooding the lock.
 	StatsRefreshBatch int
+	// FollowListPath optionally points at the declarative follow list — a
+	// repo-committed YAML file naming every community the bridge should
+	// follow (FOLLOW_LIST_PATH). When set, a reconciler converges the
+	// communities table to the file on startup and every
+	// FollowListInterval: entries missing from the table are subscribed,
+	// subscriptions missing from the file are unfollowed (records are
+	// kept; content just stops flowing). Empty = feature off, the /admin
+	// API is the only subscription control (the BRIDGE_SERVICE_DID
+	// pattern). NOTE: when active, the file is authoritative — manual
+	// /admin subscriptions not in the file are unfollowed at the next
+	// sweep.
+	FollowListPath string
+	// FollowListInterval is the reconciler's sweep cadence
+	// (FOLLOW_LIST_INTERVAL, a Go duration, default 15m, must be
+	// positive). Periodic re-sweeps self-heal subscribes that failed
+	// because the remote was down at startup; pending→accepted retries are
+	// the follow retrier's job, not the reconciler's.
+	FollowListInterval time.Duration
 }
 
 // Load reads configuration from the environment. logger must not be nil;
@@ -411,6 +429,16 @@ func Load(logger *slog.Logger) (*Config, error) {
 		return nil, err
 	}
 	cfg.StatsRefreshBatch, err = intVar(logger, "STATS_REFRESH_BATCH", 200)
+	if err != nil {
+		return nil, err
+	}
+
+	// Declarative follow list: optional in every environment (unset = the
+	// /admin API is the only subscription control). The path's existence and
+	// contents are validated at startup by the caller, not here — config
+	// only carries the knob.
+	cfg.FollowListPath = os.Getenv("FOLLOW_LIST_PATH")
+	cfg.FollowListInterval, err = durationVar(logger, "FOLLOW_LIST_INTERVAL", 15*time.Minute)
 	if err != nil {
 		return nil, err
 	}

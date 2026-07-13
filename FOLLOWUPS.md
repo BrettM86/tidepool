@@ -133,3 +133,11 @@ task documents and git history rather than this list.
 - The e2e suite has not yet completed on GitHub Actions. It cold-builds Lemmy
   from source and may exceed practical runner time/disk limits. Prefer a
   prebuilt pinned Lemmy debug image in GHCR, or persist a buildx GHA cache.
+- The declarative follow list (FOLLOW_LIST_PATH) has no e2e coverage: an
+  end-to-end convergence test would mount a follow-list YAML into the
+  tidepool compose service, restart it, and poll GET /admin/communities
+  until the listed community turns `accepted`, then remove the entry and
+  assert an Undo lands at Lemmy. The reconciler is unit-tested against the
+  ingest harness (real Postgres + fake Lemmy inbox) and was smoke-tested
+  live (startup fail-fast, sweep, POST /admin/communities/reconcile);
+  compose plumbing for the file mount is the missing piece.

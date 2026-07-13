@@ -397,6 +397,29 @@ func run(logger *slog.Logger) error {
 	}
 	admin.Routes(router)
 
+	// Declarative follow list (FOLLOW_LIST_PATH): converge subscriptions to
+	// the repo-committed YAML on startup and every FOLLOW_LIST_INTERVAL. A
+	// missing or malformed file fails startup (fail fast on a bad deploy,
+	// like the migration gate); the reconciler goroutine itself only ever
+	// logs — a file that breaks AFTER startup skips sweeps rather than
+	// unfollowing anything.
+	if cfg.FollowListPath != "" {
+		if _, err := ingest.ParseFollowList(cfg.FollowListPath); err != nil {
+			return err
+		}
+		reconciler, err := ingest.NewFollowReconciler(ingest.FollowReconcilerOptions{
+			Admin:    admin,
+			Path:     cfg.FollowListPath,
+			Interval: cfg.FollowListInterval,
+			Logger:   logger,
+		})
+		if err != nil {
+			return err
+		}
+		admin.SetFollowReconciler(reconciler)
+		go reconciler.Run(ctx)
+	}
+
 	// The vote-aggregate XRPC (the AppView's side-channel read).
 	votesXRPC, err := votes.NewXRPC(votes.XRPCOptions{DB: database, Logger: logger})
 	if err != nil {

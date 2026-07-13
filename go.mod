@@ -3,6 +3,7 @@ module tidepool
 go 1.25.7
 
 require (
+	github.com/JohannesKaufmann/html-to-markdown/v2 v2.5.2
 	github.com/bluesky-social/indigo v0.0.0-20260202181658-ea3d39eec464
 	github.com/go-chi/chi/v5 v5.3.1
 	github.com/gorilla/websocket v1.5.3
@@ -13,14 +14,15 @@ require (
 	github.com/lib/pq v1.12.3
 	github.com/multiformats/go-multihash v0.2.3
 	github.com/pressly/goose/v3 v3.27.2
+	github.com/rivo/uniseg v0.4.7
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/sync v0.21.0
 	golang.org/x/time v0.15.0
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
 	github.com/JohannesKaufmann/dom v0.3.1 // indirect
-	github.com/JohannesKaufmann/html-to-markdown/v2 v2.5.2 // indirect
 	github.com/RussellLuo/slidingwindow v0.0.0-20200528002341-535bb99d338b // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
@@ -71,7 +73,6 @@ require (
 	github.com/prometheus/client_model v0.5.0 // indirect
 	github.com/prometheus/common v0.45.0 // indirect
 	github.com/prometheus/procfs v0.20.1 // indirect
-	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/sethvargo/go-retry v0.3.0 // indirect
 	github.com/spaolacci/murmur3 v1.1.0 // indirect
 	github.com/whyrusleeping/cbor-gen v0.2.1-0.20241030202151-b7a6831be65e // indirect
@@ -90,7 +91,6 @@ require (
 	golang.org/x/sys v0.45.0 // indirect
 	golang.org/x/xerrors v0.0.0-20231012003039-104605ab7028 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
 	gorm.io/gorm v1.25.9 // indirect
 	lukechampine.com/blake3 v1.2.1 // indirect
 )

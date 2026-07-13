@@ -1,0 +1,28 @@
+# Declarative follow list: every Lemmy community this Tidepool instance
+# bridges. Deploys point FOLLOW_LIST_PATH at this file; the reconciler
+# converges subscriptions to it on startup and every FOLLOW_LIST_INTERVAL
+# (default 15m), and POST /admin/communities/reconcile forces a pass.
+#
+# THIS FILE IS AUTHORITATIVE while FOLLOW_LIST_PATH is set:
+#   - adding an entry subscribes it (profile bridged, Follow sent)
+#   - removing an entry unfollows it (Undo{Follow}; already-bridged records
+#     are kept — content just stops flowing)
+#   - manual POST /admin/communities subscriptions NOT listed here are
+#     unfollowed at the next sweep
+# Community-side consent always wins: a community advertising #nobridge is
+# refused no matter what this file says.
+#
+# Inclusion criteria (evaluate requests against these, not vibes):
+#   - active: posts within the last 30 days
+#   - established moderation (named mod team, posted rules)
+#   - not NSFW-primary
+# Request additions or removals via GitHub issue; each entry should carry a
+# comment linking its rationale.
+#
+# Entry format: "!name@host" or the community's AP URL ("https://host/c/name").
+# NOTE: entries MUST be quoted — a bare !name@host is a YAML tag and will
+# fail to parse.
+communities:
+  - "!comicstrips@lemmy.world"   # seed set, 2026-07: small, active, cross-checks lemmy.world
+  - "!selfhosted@lemmy.world"    # seed set, 2026-07
+  - "!linux@lemmy.ml"            # seed set, 2026-07: second instance, exercises cross-instance federation

@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	stderrors "errors"
 	"expvar"
 	"fmt"
 	"io"
@@ -47,10 +48,11 @@ type AdminOptions struct {
 
 // Admin is the operator API driving the community subscription lifecycle:
 //
-//	POST   /admin/communities          {"community":"!tech@lemmy.world"}
-//	DELETE /admin/communities          {"community":"!tech@lemmy.world"}
+//	POST   /admin/communities           {"community":"!tech@lemmy.world"}
+//	DELETE /admin/communities           {"community":"!tech@lemmy.world"}
 //	GET    /admin/communities
-//	POST   /admin/communities/backfill {"community":"!tech@lemmy.world"}
+//	POST   /admin/communities/backfill  {"community":"!tech@lemmy.world"}
+//	POST   /admin/communities/reconcile (follow list configured only)
 //
 // All endpoints require "Authorization: Bearer $ADMIN_TOKEN".
 type Admin struct {
@@ -61,7 +63,16 @@ type Admin struct {
 	service     *ap.ServiceActor
 	backfill    Backfiller
 	logger      *slog.Logger
+	// reconciler serves POST /admin/communities/reconcile; nil (the
+	// endpoint answers 501) unless a follow list is configured. Set once
+	// during startup via SetFollowReconciler, before the server listens.
+	reconciler *FollowReconciler
 }
+
+// SetFollowReconciler wires the optional follow-list reconciler in after
+// construction (the reconciler itself needs the Admin's subscribe cores, so
+// it is necessarily built second).
+func (a *Admin) SetFollowReconciler(r *FollowReconciler) { a.reconciler = r }
 
 // NewAdmin validates options and builds the Admin API.
 func NewAdmin(opts AdminOptions) (*Admin, error) {
@@ -108,6 +119,7 @@ func (a *Admin) Routes(r chi.Router) {
 		r.Delete("/communities", a.handleUnsubscribe)
 		r.Get("/communities", a.handleList)
 		r.Post("/communities/backfill", a.handleBackfill)
+		r.Post("/communities/reconcile", a.handleReconcile)
 		r.Method(http.MethodGet, "/metrics", http.HandlerFunc(scopedMetrics))
 	})
 }
@@ -158,22 +170,68 @@ func communityJSON(c *store.Community) communityResponse {
 	return resp
 }
 
+// adminError carries the admin API's HTTP mapping for a failed
+// subscribe/unsubscribe step, so the HTTP handlers and the follow-list
+// reconciler can share one transport-agnostic core. The core logs each
+// failure at the site that understands it; handlers only translate.
+type adminError struct {
+	status int    // HTTP status the admin API reports
+	public string // operator-facing message (response body)
+	err    error  // underlying cause; nil for pure policy refusals
+}
+
+func (e *adminError) Error() string {
+	if e.err != nil {
+		return e.public + ": " + e.err.Error()
+	}
+	return e.public
+}
+
+func (e *adminError) Unwrap() error { return e.err }
+
+// writeAdminError translates a subscribe/unsubscribe core failure into the
+// HTTP response. Non-adminError errors cannot happen today (the cores wrap
+// everything), but map to 500 rather than panicking on a future oversight.
+func writeAdminError(w http.ResponseWriter, err error) {
+	var ae *adminError
+	if stderrors.As(err, &ae) {
+		http.Error(w, ae.public, ae.status)
+		return
+	}
+	http.Error(w, "internal error", http.StatusInternalServerError)
+}
+
 // handleSubscribe resolves, bridges, and follows a community:
 // WebFinger → fetch Group → materialize community profile → signed Follow
 // from the service actor → follow_state pending (Accept arrives via the
 // inbox and flips it to accepted, which triggers backfill).
 func (a *Admin) handleSubscribe(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
 	var req communityRequest
 	if err := decodeJSONBody(r, &req); err != nil || strings.TrimSpace(req.Community) == "" {
 		http.Error(w, `body must be {"community":"!name@instance"}`, http.StatusBadRequest)
 		return
 	}
 
-	groupIRI, err := a.resolveCommunity(ctx, req.Community)
+	community, err := a.subscribe(r.Context(), req.Community)
 	if err != nil {
-		a.writeResolveError(w, req.Community, err)
+		writeAdminError(w, err)
 		return
+	}
+	if community.FollowState == store.FollowStateAccepted {
+		// Already subscribed; idempotent success.
+		writeJSON(w, http.StatusOK, communityJSON(community))
+		return
+	}
+	writeJSON(w, http.StatusAccepted, communityJSON(community))
+}
+
+// subscribe is the transport-agnostic core of handleSubscribe, shared with
+// the follow-list reconciler. On success the returned community is either
+// already accepted (idempotent no-op) or freshly pending.
+func (a *Admin) subscribe(ctx context.Context, ref string) (*store.Community, error) {
+	groupIRI, err := a.resolveCommunity(ctx, ref)
+	if err != nil {
+		return nil, a.resolveError(ref, err)
 	}
 
 	// Bridge the community first: DID minted, community.profile committed —
@@ -182,52 +240,50 @@ func (a *Admin) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if materialize.IsSkip(err) {
 			a.logger.Warn("subscribe refused", "community", groupIRI, "reason", err.Error())
-			http.Error(w, "community cannot be bridged: "+err.Error(), http.StatusUnprocessableEntity)
-			return
+			return nil, &adminError{status: http.StatusUnprocessableEntity,
+				public: "community cannot be bridged: " + err.Error(), err: err}
 		}
 		a.logger.Error("subscribe: materialize community", "community", groupIRI, "error", err)
-		http.Error(w, "failed to bridge community", http.StatusBadGateway)
-		return
+		return nil, &adminError{status: http.StatusBadGateway,
+			public: "failed to bridge community", err: err}
 	}
 
 	if community.FollowState == store.FollowStateAccepted {
-		// Already subscribed; idempotent success.
-		writeJSON(w, http.StatusOK, communityJSON(community))
-		return
+		return community, nil
 	}
 
 	group, err := a.client.FetchActor(ctx, groupIRI)
 	if err != nil {
 		a.logger.Error("subscribe: fetch group", "community", groupIRI, "error", err)
-		http.Error(w, "failed to fetch community actor", http.StatusBadGateway)
-		return
+		return nil, &adminError{status: http.StatusBadGateway,
+			public: "failed to fetch community actor", err: err}
 	}
 	inbox := group.SharedInboxOrInbox()
 	if inbox == "" {
-		http.Error(w, "community actor advertises no inbox", http.StatusUnprocessableEntity)
-		return
+		return nil, &adminError{status: http.StatusUnprocessableEntity,
+			public: "community actor advertises no inbox"}
 	}
 
 	follow, err := a.buildFollow(groupIRI)
 	if err != nil {
 		a.logger.Error("subscribe: build follow", "community", groupIRI, "error", err)
-		http.Error(w, "failed to build Follow", http.StatusInternalServerError)
-		return
+		return nil, &adminError{status: http.StatusInternalServerError,
+			public: "failed to build Follow", err: err}
 	}
 	if err := a.client.SendActivity(ctx, inbox, follow); err != nil {
 		a.logger.Error("subscribe: deliver follow", "community", groupIRI, "error", err)
-		http.Error(w, "failed to deliver Follow", http.StatusBadGateway)
-		return
+		return nil, &adminError{status: http.StatusBadGateway,
+			public: "failed to deliver Follow", err: err}
 	}
 	if err := a.communities.SetFollowState(ctx, groupIRI, store.FollowStatePending); err != nil {
 		a.logger.Error("subscribe: record pending follow", "community", groupIRI, "error", err)
-		http.Error(w, "failed to record follow state", http.StatusInternalServerError)
-		return
+		return nil, &adminError{status: http.StatusInternalServerError,
+			public: "failed to record follow state", err: err}
 	}
 	a.logger.Info("follow sent; awaiting accept", "community", groupIRI, "did", community.DID)
 
 	community.FollowState = store.FollowStatePending
-	writeJSON(w, http.StatusAccepted, communityJSON(community))
+	return community, nil
 }
 
 // handleUnsubscribe sends Undo{Follow} and clears the follow state. The
@@ -246,15 +302,29 @@ func (a *Admin) handleUnsubscribe(w http.ResponseWriter, r *http.Request) {
 		a.writeResolveError(w, req.Community, err)
 		return
 	}
+	community, err := a.unsubscribeByGroupIRI(ctx, groupIRI)
+	if err != nil {
+		writeAdminError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, communityJSON(community))
+}
+
+// unsubscribeByGroupIRI is the transport-agnostic core of handleUnsubscribe,
+// shared with the follow-list reconciler (which diffs by canonical group IRI
+// and so never needs the resolve step). Undo{Follow} delivery is best-effort;
+// clearing local follow state is the authoritative effect. Materialized
+// records are never deleted — content just stops flowing.
+func (a *Admin) unsubscribeByGroupIRI(ctx context.Context, groupIRI string) (*store.Community, error) {
 	community, err := a.communities.GetByAPGroupID(ctx, groupIRI)
 	if errors.IsNotFound(err) {
-		http.Error(w, "community is not bridged", http.StatusNotFound)
-		return
+		return nil, &adminError{status: http.StatusNotFound,
+			public: "community is not bridged", err: err}
 	}
 	if err != nil {
 		a.logger.Error("unsubscribe: look up community", "community", groupIRI, "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
+		return nil, &adminError{status: http.StatusInternalServerError,
+			public: "internal error", err: err}
 	}
 
 	// Best-effort remote notification.
@@ -279,12 +349,12 @@ func (a *Admin) handleUnsubscribe(w http.ResponseWriter, r *http.Request) {
 
 	if err := a.communities.SetFollowState(ctx, groupIRI, store.FollowStateNone); err != nil {
 		a.logger.Error("unsubscribe: clear follow state", "community", groupIRI, "error", err)
-		http.Error(w, "failed to clear follow state", http.StatusInternalServerError)
-		return
+		return nil, &adminError{status: http.StatusInternalServerError,
+			public: "failed to clear follow state", err: err}
 	}
 	a.logger.Info("community unfollowed", "community", groupIRI)
 	community.FollowState = store.FollowStateNone
-	writeJSON(w, http.StatusOK, communityJSON(community))
+	return community, nil
 }
 
 // handleList reports every community in accepted or pending state.
@@ -336,6 +406,26 @@ func (a *Admin) handleBackfill(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, communityJSON(community))
 }
 
+// handleReconcile runs one synchronous follow-list sweep on demand, so an
+// operator can converge right after editing the file instead of waiting for
+// the next tick. 501 when no follow list is configured (the handleBackfill
+// nil-dependency pattern).
+func (a *Admin) handleReconcile(w http.ResponseWriter, r *http.Request) {
+	if a.reconciler == nil {
+		http.Error(w, "follow list reconciliation is not configured", http.StatusNotImplemented)
+		return
+	}
+	result, err := a.reconciler.Sweep(r.Context())
+	if err != nil {
+		// Parse/list failures abort the pass with no state changes; the
+		// admin API is operator-facing, so the real reason (file path,
+		// entry number) goes straight back.
+		http.Error(w, "reconcile failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
 // resolveCommunity turns the request's community reference into the Group's
 // AP id: URLs pass through, handles go through WebFinger.
 func (a *Admin) resolveCommunity(ctx context.Context, ref string) (string, error) {
@@ -346,16 +436,24 @@ func (a *Admin) resolveCommunity(ctx context.Context, ref string) (string, error
 	return a.client.ResolveHandle(ctx, ref)
 }
 
-func (a *Admin) writeResolveError(w http.ResponseWriter, ref string, err error) {
+// resolveError maps a resolveCommunity failure onto the admin API's HTTP
+// vocabulary (shared by the HTTP handlers and the reconciler-driven
+// subscribe core).
+func (a *Admin) resolveError(ref string, err error) *adminError {
 	switch {
 	case errors.IsValidation(err):
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		return &adminError{status: http.StatusBadRequest, public: err.Error(), err: err}
 	case errors.IsNotFound(err):
-		http.Error(w, "community not found: "+ref, http.StatusNotFound)
+		return &adminError{status: http.StatusNotFound, public: "community not found: " + ref, err: err}
 	default:
 		a.logger.Error("resolve community", "community", ref, "error", err)
-		http.Error(w, "failed to resolve community", http.StatusBadGateway)
+		return &adminError{status: http.StatusBadGateway, public: "failed to resolve community", err: err}
 	}
+}
+
+func (a *Admin) writeResolveError(w http.ResponseWriter, ref string, err error) {
+	e := a.resolveError(ref, err)
+	http.Error(w, e.public, e.status)
 }
 
 // buildFollow constructs the signed Follow activity (delivery signing

@@ -478,6 +478,12 @@ func (m *Materializer) buildCommunityProfile(doc *ap.Object, fallbackCreatedAt t
 		"createdBy": m.serviceDID,
 		"hostedBy":  m.serviceDID,
 		"createdAt": recordDatetime(actorCreatedAt(doc, fallbackCreatedAt)),
+		// Explicit even though the lexicon defaults it: at least one
+		// consumer (the Coves AppView before 2026-07-13) mapped a missing
+		// visibility to the empty string and refused the row. Emitting the
+		// default costs nothing and survives consumers that don't apply
+		// lexicon defaults.
+		"visibility": "public",
 	}
 	if doc.Name != "" {
 		record["displayName"] = truncateText(doc.Name, 128, 1280)

@@ -64,7 +64,7 @@ services:
     command: ["migrate"]
     restart: "no"
     environment:
-      DATABASE_URL: postgres://${POSTGRES_USER:-tidepool}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-tidepool}?sslmode=disable
+      DATABASE_URL: postgres://${POSTGRES_USER:-tidepool}:${POSTGRES_PASSWORD}@tidepool-prod-postgres:5432/${POSTGRES_DB:-tidepool}?sslmode=disable
     networks:
       - tidepool-internal
     depends_on:
@@ -79,7 +79,11 @@ services:
       - "127.0.0.1:8091:80" # host-local ops access (admin API without a round trip through Caddy)
     environment:
       ENVIRONMENT: production
-      DATABASE_URL: postgres://${POSTGRES_USER:-tidepool}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-tidepool}?sslmode=disable
+      # DB host is the container NAME, not the `postgres` service alias:
+      # this service also joins coves-prod-network, where the Coves stack
+      # exposes its own container under the alias `postgres` — the bare
+      # alias can resolve to the WRONG database from here.
+      DATABASE_URL: postgres://${POSTGRES_USER:-tidepool}:${POSTGRES_PASSWORD}@tidepool-prod-postgres:5432/${POSTGRES_DB:-tidepool}?sslmode=disable
       LISTEN_ADDR: ":80"
       BRIDGE_HOSTNAME: ${BRIDGE_HOSTNAME:-tdpl.io}
       PLC_DIRECTORY_URL: https://plc.directory

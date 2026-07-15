@@ -542,3 +542,8 @@ other bridged instance). The bridge then answers both resolution paths:
 Note TLS: a single wildcard certificate only covers one label level, while
 bridged handles sit two levels below `BRIDGE_HOSTNAME` — terminate TLS with
 on-demand certificate issuance (e.g. Caddy) or per-instance wildcard certs.
+
+## License
+
+Tidepool is licensed under the [GNU Affero General Public License v3.0](LICENSE)
+(AGPL-3.0), the same license as [Coves](https://github.com/coves-social).

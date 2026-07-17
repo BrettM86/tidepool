@@ -233,6 +233,9 @@ services:
       JETSTREAM_RELAY_URL: http://relay:2470
       JETSTREAM_ADDR: ":8080"
       JETSTREAM_DATA_DIR: /data
+      # Internal-only debug listener (metrics/pprof/health) — never publish.
+      JETSTREAM_DEBUG_ADDR: ":6060"
+      JETSTREAM_LOG_LEVEL: ${JETSTREAM_LOG_LEVEL:-info}
     volumes:
       - jetstream-data:/data
     networks:

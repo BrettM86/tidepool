@@ -157,6 +157,10 @@ services:
       #   docker compose -f docker-compose.prod.yml build relay
       context: https://github.com/bluesky-social/indigo.git#dfe5578fd537e71dd1ed884dd09b876dd768dfd5
       dockerfile: cmd/relay/Dockerfile
+      args:
+        # indigo's Dockerfile runs `git describe`; git-URL contexts strip
+        # .git unless BuildKit is told to keep it.
+        BUILDKIT_CONTEXT_KEEP_GIT_DIR: 1
     image: tidepool-relay:prod
     container_name: tidepool-prod-relay
     restart: unless-stopped

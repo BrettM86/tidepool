@@ -95,9 +95,13 @@ services:
       # so a smoother rate only defers identity creation, never loses it.
       MINT_RATE_PER_MINUTE: ${MINT_RATE_PER_MINUTE:-10}
       MINT_BURST: ${MINT_BURST:-20}
-      # bsky.network fans out to the Jetstream instances the Coves AppView
-      # consumes (jetstream2.us-east.bsky.network) — this is the path
-      # bridged records take into Coves.
+      # Announced for WIDER-NETWORK visibility only (and quota-limited
+      # there — see the relay service below). The app path into Coves is
+      # the self-hosted relay + jetstream services in this file. The
+      # internal relay is deliberately NOT listed here: production
+      # requestCrawl egress is SSRF-guarded and refuses private addresses;
+      # the internal relay is bootstrapped once via its host-local port
+      # instead (SELF_HOSTED_RELAY.md).
       RELAY_HOSTS: ${RELAY_HOSTS:-https://bsky.network}
       FOLLOW_LIST_PATH: /repo/communities.yaml
     volumes:
@@ -123,6 +127,125 @@ services:
         reservations:
           memory: 512M
 
+  # Self-hosted atproto relay: crawls ONLY our two PDS hosts (tdpl.io +
+  # pds.coves.me) and merges them into one firehose. Exists because
+  # bsky.network caps a new PDS at 100 accounts — every bridged repo past
+  # the quota is status:"throttled" there and its events are silently
+  # dropped, never reaching a Jetstream-fed AppView (diagnosed 2026-07-16:
+  # 91% of tdpl.io repos throttled, bridged threads rendering empty in
+  # Coves). This relay is the app's ingest path; bsky.network remains the
+  # wider-network visibility path (RELAY_HOSTS above is unchanged).
+  #
+  # Host discovery is push-only — a relay never spiders the network. Both
+  # PDS hosts are registered by a one-time requestCrawl against the
+  # host-local port (see SELF_HOSTED_RELAY.md); the host table
+  # persists in relay-data, so this survives restarts. requestCrawl stays
+  # enabled but is reachable only from 127.0.0.1 and the internal network
+  # — network isolation IS the access control (indigo has no flag to
+  # admin-gate it). Do NOT expose 2470 publicly, and do NOT run
+  # `relay pull-hosts` (that imports the global network's host list).
+  #
+  # NOT announced to via Tidepool's RELAY_HOSTS: production requestCrawl
+  # egress uses the SSRF-guarded client (internal/sync/crawl.go), which
+  # correctly refuses private addresses like this container. The one-time
+  # bootstrap replaces the announcement; keep it that way rather than
+  # punching a hole in the egress guard.
+  relay:
+    build:
+      # Pinned upstream checkout, built with indigo's own Dockerfile.
+      # Bump the SHA deliberately; rebuild with:
+      #   docker compose -f docker-compose.prod.yml build relay
+      context: https://github.com/bluesky-social/indigo.git#dfe5578fd537e71dd1ed884dd09b876dd768dfd5
+      dockerfile: cmd/relay/Dockerfile
+    image: tidepool-relay:prod
+    container_name: tidepool-prod-relay
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:2470:2470" # host-local ops: requestCrawl bootstrap, getHostStatus, admin UI
+    environment:
+      ENVIRONMENT: prod
+      RELAY_ADMIN_PASSWORD: ${RELAY_ADMIN_PASSWORD}
+      # sqlite + event persistence both live under /data/relay (relay-data
+      # volume); WORKDIR is / and the defaults are relative paths.
+      DATABASE_URL: sqlite:///data/relay/relay.sqlite
+      RELAY_PERSIST_DIR: /data/relay/persist
+      # The entire point of self-hosting: no account quota. Only our own
+      # hosts can ever be added (see isolation note above), so an
+      # effectively-unlimited default is safe.
+      RELAY_DEFAULT_ACCOUNT_LIMIT: 10000000
+      # Trusted hosts skip the baseline event-rate limiters (the analog of
+      # bsky.network's ~50 ev/s consumption throttle that put the public
+      # path ~1.3h behind). A reemit burst should drain in seconds here.
+      RELAY_TRUSTED_DOMAINS: tdpl.io,pds.coves.me
+      RELAY_REPLAY_WINDOW: 72h
+    volumes:
+      - relay-data:/data/relay
+    networks:
+      - tidepool-internal
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:2470/xrpc/_health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 256M
+
+  # The jetstream image is distroless and runs as the nonroot user baked
+  # into the base (65532). A fresh named volume is created root-owned
+  # (the mount path doesn't exist in the image, so docker can't copy
+  # ownership from it), which would EACCES jetstream's first write. This
+  # one-shot hands the volume to that uid before jetstream starts.
+  jetstream-init:
+    image: alpine:3.22
+    container_name: tidepool-prod-jetstream-init
+    command: ["chown", "-R", "65532:65532", "/data"]
+    restart: "no"
+    volumes:
+      - jetstream-data:/data
+
+  # Jetstream over the self-hosted relay: converts the CBOR firehose into
+  # the filtered JSON /subscribe protocol the Coves consumers speak. Coves
+  # (Phase 2) points its @self consumer set at
+  #   ws://tidepool-prod-jetstream:8080/subscribe
+  # over the shared coves-prod-network. Not publicly exposed.
+  #
+  # First boot performs a bootstrap backfill (listRepos + repo downloads
+  # from the relay) — minutes at our scale; watch `docker logs` before
+  # wiring consumers.
+  jetstream:
+    build:
+      # Pinned to the checkout whose /subscribe (v1) behavior was verified
+      # against the Coves consumers on 2026-07-16.
+      context: https://github.com/bluesky-social/jetstream.git#f6d220f3551efd32bfc1a8757abc93f51a713c12
+    image: tidepool-jetstream:prod
+    container_name: tidepool-prod-jetstream
+    restart: unless-stopped
+    environment:
+      JETSTREAM_RELAY_URL: http://relay:2470
+      JETSTREAM_ADDR: ":8080"
+      JETSTREAM_DATA_DIR: /data
+    volumes:
+      - jetstream-data:/data
+    networks:
+      - tidepool-internal
+      - coves-prod-network
+    depends_on:
+      relay:
+        condition: service_healthy
+      jetstream-init:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 256M
+
 networks:
   tidepool-internal:
     driver: bridge
@@ -133,3 +256,7 @@ networks:
 volumes:
   postgres-data:
     name: tidepool-prod-postgres-data
+  relay-data:
+    name: tidepool-prod-relay-data
+  jetstream-data:
+    name: tidepool-prod-jetstream-data

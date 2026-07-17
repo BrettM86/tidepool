@@ -98,26 +98,39 @@ On the box (`/opt/tidepool`), after `git pull`:
    our scale). Watch `docker logs -f tidepool-prod-jetstream` until it
    settles into live tailing.
 
-6. End-to-end proof (from the box; jetstream is not on a host port —
-   run a throwaway container on the internal network):
+6. End-to-end proof (verified at deploy, 2026-07-17). Jetstream is not
+   on a host port; probe from a throwaway container on the internal
+   network. Two gotchas learned the hard way: websocat's `-E` exits on
+   stdin EOF — over non-interactive SSH that's instantly, making a
+   healthy stream look empty (use `-U`); and a `cursor` older than the
+   stored window replays nothing (pick one inside it).
 
    ```
-   docker run --rm --network tidepool-prod-internal alpine/socat -T 15 - \
-     'TCP:jetstream:8080' <<'EOF' >/dev/null || true
-   EOF
+   # replay recent events (cursor is µs since epoch)
+   cursor=$((($(date +%s) - 900) * 1000000))
+   docker run --rm --network tidepool-prod-internal solsson/websocat \
+     -U "ws://jetstream:8080/subscribe?cursor=$cursor" | head -c 2000
+
+   # relay-side truth: events received from PDSs vs sent to jetstream
+   docker run --rm --network tidepool-prod-internal curlimages/curl -s \
+     http://relay:2471/metrics | grep -E "events_(received|sent)_counter"
+
+   # jetstream-side: subscriber gauge + its own metrics
+   docker run --rm --network tidepool-prod-internal curlimages/curl -s \
+     http://jetstream:6060/metrics | grep jetstream_subscribe
    ```
 
-   Simpler: check its metrics of connected upstream / emitted events, or
-   temporarily `docker exec` from the tidepool container:
+   The clincher: pick a `did` from the replayed events and check
+   `bsky.network/xrpc/com.atproto.sync.getRepoStatus?did=...` — for a
+   throttled account, that event is provably absent from the public
+   path, so seeing it here proves the quota bypass works. (At deploy,
+   a live bridged comment from a throttled account came through within
+   minutes of starting the tap.)
 
-   ```
-   docker exec tidepool-prod wget -qO- 'http://tidepool-prod-jetstream:8080/subscribe?wantedCollections=social.coves.community.comment' --timeout=20 | head -c 2000
-   ```
-
-   Then create/edit a record on a **throttled** account (any bridged
-   vote sweep does this organically) and watch it appear — that event is
-   provably absent from the public path, so seeing it here proves the
-   quota bypass works.
+   Note the relay live-tails the PDSs from "now" — it does NOT replay
+   history that predates its first subscription (the same cold-start
+   property bsky.network has). Pre-existing records reach Coves via
+   `POST /admin/reemit` in Phase 3, not via this pipeline's backlog.
 
 ## Ongoing ops
 

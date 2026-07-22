@@ -407,6 +407,9 @@ it as a `subscribeRepos` upstream:
   reversible and deliberately emits no `#account` frame.
 - `getRepo` (full CAR), `getLatestCommit`, `getRecord` (proof CAR),
   `listRepos` (paginated), `getRepoStatus`
+- `com.atproto.repo.getRecord` — the JSON read surface AppView-side
+  reconcilers expect (e.g. the Coves profile backfill); `repo` accepts a
+  DID or a bridged handle
 - `com.atproto.server.describeServer`, `/xrpc/_health`
 - `com.atproto.identity.resolveHandle` + `/.well-known/atproto-did` (task 03)
 - `/.well-known/did.json` — the DID document for the bridge's own derived

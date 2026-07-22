@@ -678,6 +678,92 @@ func TestHTTPEndpoints(t *testing.T) {
 		assert.Equal(t, "RecordNotFound", body["error"])
 	})
 
+	t.Run("repo.getRecord JSON", func(t *testing.T) {
+		var body struct {
+			URI   string         `json:"uri"`
+			CID   string         `json:"cid"`
+			Value map[string]any `json:"value"`
+		}
+		resp := getJSON(t, base+"/xrpc/com.atproto.repo.getRecord?repo="+testDID+
+			"&collection="+testCollection+"&rkey=h01", &body)
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "at://"+testDID+"/"+testCollection+"/h01", body.URI)
+		assert.Equal(t, first.RecordCID, body.CID)
+		assert.Equal(t, testCollection, body.Value["$type"])
+		assert.Equal(t, "first", body.Value["text"])
+	})
+
+	t.Run("repo.getRecord pinned cid", func(t *testing.T) {
+		var body map[string]any
+		resp := getJSON(t, base+"/xrpc/com.atproto.repo.getRecord?repo="+testDID+
+			"&collection="+testCollection+"&rkey=h01&cid="+first.RecordCID, &body)
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+		// The pin is parsed, not string-compared: the same CID in a
+		// non-canonical multibase encoding must still match.
+		alt, err := cid.MustParse(first.RecordCID).StringOfBase('f') // base16
+		require.NoError(t, err)
+		require.NotEqual(t, first.RecordCID, alt)
+		resp = getJSON(t, base+"/xrpc/com.atproto.repo.getRecord?repo="+testDID+
+			"&collection="+testCollection+"&rkey=h01&cid="+alt, &body)
+		assert.Equal(t, http.StatusOK, resp.StatusCode, "alternate encoding of the current CID must match")
+
+		// Only the current version is retained; any other CID is a miss.
+		var errBody map[string]string
+		resp = getJSON(t, base+"/xrpc/com.atproto.repo.getRecord?repo="+testDID+
+			"&collection="+testCollection+"&rkey=h01&cid="+head.CommitCID, &errBody)
+		assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+		assert.Equal(t, "RecordNotFound", errBody["error"])
+
+		// A malformed pin is the caller's bug, not data absence.
+		errBody = map[string]string{}
+		resp = getJSON(t, base+"/xrpc/com.atproto.repo.getRecord?repo="+testDID+
+			"&collection="+testCollection+"&rkey=h01&cid=notacid", &errBody)
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		assert.Equal(t, "InvalidRequest", errBody["error"])
+	})
+
+	t.Run("repo.getRecord invalid collection", func(t *testing.T) {
+		var body map[string]string
+		resp := getJSON(t, base+"/xrpc/com.atproto.repo.getRecord?repo="+testDID+
+			"&collection=not-an-nsid&rkey=h01", &body)
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		assert.Equal(t, "InvalidRequest", body["error"])
+	})
+
+	t.Run("repo.getRecord missing record", func(t *testing.T) {
+		var body map[string]string
+		resp := getJSON(t, base+"/xrpc/com.atproto.repo.getRecord?repo="+testDID+
+			"&collection="+testCollection+"&rkey=nope", &body)
+		assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+		assert.Equal(t, "RecordNotFound", body["error"])
+	})
+
+	t.Run("repo.getRecord unknown repo", func(t *testing.T) {
+		var body map[string]string
+		resp := getJSON(t, base+"/xrpc/com.atproto.repo.getRecord?repo=did:plc:doesnotexistatall"+
+			"&collection="+testCollection+"&rkey=h01", &body)
+		assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+		assert.Equal(t, "RepoNotFound", body["error"])
+	})
+
+	t.Run("repo.getRecord missing params", func(t *testing.T) {
+		var body map[string]string
+		resp := getJSON(t, base+"/xrpc/com.atproto.repo.getRecord?repo="+testDID, &body)
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		assert.Equal(t, "InvalidRequest", body["error"])
+	})
+
+	t.Run("repo.getRecord handle without resolver", func(t *testing.T) {
+		// This harness configures no HandleResolver, so a non-DID repo
+		// parameter is refused rather than silently treated as a repo miss.
+		var body map[string]string
+		resp := getJSON(t, base+"/xrpc/com.atproto.repo.getRecord?repo=alice.bridge.test"+
+			"&collection="+testCollection+"&rkey=h01", &body)
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		assert.Equal(t, "InvalidRequest", body["error"])
+	})
+
 	t.Run("getRepo full CAR", func(t *testing.T) {
 		client := &http.Client{Timeout: 5 * time.Second}
 		resp, err := client.Get(base + "/xrpc/com.atproto.sync.getRepo?did=" + testDID)
@@ -711,6 +797,80 @@ func TestHTTPEndpoints(t *testing.T) {
 	})
 }
 
+// fakeHandleResolver satisfies HandleResolver for the repo.getRecord handle
+// path without needing bridged_actors rows. Two sentinel handles inject the
+// non-NotFound error classes StoreResolver can produce.
+type fakeHandleResolver struct{ dids map[string]string }
+
+func (f *fakeHandleResolver) ResolveHandle(_ context.Context, handle string) (string, error) {
+	switch handle {
+	case "degenerate.bridge.test":
+		return "", errors.NewValidationError("handle", "must not be empty")
+	case "broken.bridge.test":
+		return "", fmt.Errorf("resolver store down")
+	}
+	if did, ok := f.dids[handle]; ok {
+		return did, nil
+	}
+	return "", errors.NewNotFoundError("handle", handle)
+}
+
+// TestRepoGetRecord_HandleResolution pins the repo-parameter contract: a
+// bridged handle resolves to its DID (with a leading @ tolerated, matching
+// resolveHandle), and an unknown handle is a RepoNotFound — indistinguishable
+// from an unknown DID, so probing the handle space leaks nothing new.
+func TestRepoGetRecord_HandleResolution(t *testing.T) {
+	h := newHarnessWithPoll(t, 500*time.Millisecond, func(o *Options) {
+		o.HandleResolver = &fakeHandleResolver{dids: map[string]string{
+			"alice.bridge.test": testDID,
+		}}
+	})
+	res := putRecord(t, h, "hr1", "resolved")
+	base := h.http.URL
+
+	var body struct {
+		URI string `json:"uri"`
+		CID string `json:"cid"`
+	}
+	resp := getJSON(t, base+"/xrpc/com.atproto.repo.getRecord?repo=alice.bridge.test"+
+		"&collection="+testCollection+"&rkey=hr1", &body)
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "at://"+testDID+"/"+testCollection+"/hr1", body.URI,
+		"uri must carry the resolved DID, not the handle")
+	assert.Equal(t, res.RecordCID, body.CID)
+
+	var prefixed struct {
+		URI string `json:"uri"`
+	}
+	resp = getJSON(t, base+"/xrpc/com.atproto.repo.getRecord?repo=%40alice.bridge.test"+
+		"&collection="+testCollection+"&rkey=hr1", &prefixed)
+	assert.Equal(t, http.StatusOK, resp.StatusCode, "@-prefixed handle must resolve")
+	assert.Equal(t, body.URI, prefixed.URI, "@-prefix must not leak into the response")
+
+	var errBody map[string]string
+	resp = getJSON(t, base+"/xrpc/com.atproto.repo.getRecord?repo=nobody.bridge.test"+
+		"&collection="+testCollection+"&rkey=hr1", &errBody)
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+	assert.Equal(t, "RepoNotFound", errBody["error"])
+
+	// A validation error from the resolver folds into the same RepoNotFound —
+	// the anti-enumeration contract the handler documents. Pinned so a future
+	// "harmonization" with resolveHandle's 400 InvalidRequest mapping cannot
+	// slip through silently.
+	errBody = map[string]string{}
+	resp = getJSON(t, base+"/xrpc/com.atproto.repo.getRecord?repo=degenerate.bridge.test"+
+		"&collection="+testCollection+"&rkey=hr1", &errBody)
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+	assert.Equal(t, "RepoNotFound", errBody["error"])
+
+	// An unexpected resolver failure is an internal error, not a repo miss.
+	errBody = map[string]string{}
+	resp = getJSON(t, base+"/xrpc/com.atproto.repo.getRecord?repo=broken.bridge.test"+
+		"&collection="+testCollection+"&rkey=hr1", &errBody)
+	assert.Equal(t, http.StatusInternalServerError, resp.StatusCode)
+	assert.Equal(t, "InternalServerError", errBody["error"])
+}
+
 // TestHTTPEndpoints_DeactivatedRepo pins the consent surface: content
 // endpoints refuse a tombstoned actor's repo; getRepoStatus reports it.
 func TestHTTPEndpoints_DeactivatedRepo(t *testing.T) {
@@ -732,6 +892,7 @@ func TestHTTPEndpoints_DeactivatedRepo(t *testing.T) {
 		"/xrpc/com.atproto.sync.getRepo?did=" + testDID,
 		"/xrpc/com.atproto.sync.getLatestCommit?did=" + testDID,
 		"/xrpc/com.atproto.sync.getRecord?did=" + testDID + "&collection=" + testCollection + "&rkey=d01",
+		"/xrpc/com.atproto.repo.getRecord?repo=" + testDID + "&collection=" + testCollection + "&rkey=d01",
 	} {
 		var body map[string]string
 		resp := getJSON(t, base+endpoint, &body)

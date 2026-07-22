@@ -233,7 +233,12 @@ func (m *Manager) DeleteRecord(ctx context.Context, did, collection, rkey string
 }
 
 // GetRecord reads the current version of a record. Missing repo or record
-// is an error satisfying errors.IsNotFound.
+// is an error satisfying errors.IsNotFound. The lookup walks the MST
+// root-to-leaf (mstPathToRecord, shared with GetRecordProof) instead of
+// materializing the whole tree: GetRecord backs the public repo.getRecord
+// endpoint, where collection/rkey are attacker-chosen — an eager full-tree
+// load would hand an unauthenticated caller a full-repo read (and a
+// whole-tree allocation) per request.
 func (m *Manager) GetRecord(ctx context.Context, did, collection, rkey string) (record map[string]any, recordCID string, err error) {
 	path, _, err := validatePath(did, collection, rkey)
 	if err != nil {
@@ -259,19 +264,16 @@ func (m *Manager) GetRecord(ctx context.Context, did, collection, rkey string) (
 	if err != nil {
 		return nil, "", err
 	}
-	tree, _, err := loadTree(ctx, tx, did, state.headCID)
+	src := &txBlockSource{tx: tx, did: did}
+	_, commit, err := readHeadCommit(ctx, src, did, state.headCID)
 	if err != nil {
 		return nil, "", err
 	}
-	valCID, err := tree.Get([]byte(path))
+	_, valCID, err := mstPathToRecord(ctx, src, commit.Data, did, path)
 	if err != nil {
-		return nil, "", fmt.Errorf("repo: MST get %s: %w", path, err)
+		return nil, "", err
 	}
-	if valCID == nil {
-		return nil, "", errors.NewNotFoundError("record", fmt.Sprintf("at://%s/%s", did, path))
-	}
-	src := &txBlockSource{tx: tx, did: did}
-	blk, err := src.Get(ctx, *valCID)
+	blk, err := src.Get(ctx, valCID)
 	if err != nil {
 		return nil, "", fmt.Errorf("repo: read record block %s: %w", valCID, err)
 	}
@@ -614,21 +616,32 @@ func readRepoState(ctx context.Context, tx *sql.Tx, did string, forUpdate bool) 
 	return &st, nil
 }
 
-// loadTree loads the full MST behind a head commit from the DID's blocks.
-// It returns the tree and the commit's data (MST root) CID.
-func loadTree(ctx context.Context, tx *sql.Tx, did, headCID string) (*mst.Tree, cid.Cid, error) {
+// readHeadCommit reads and decodes a repo's signed head commit block.
+func readHeadCommit(ctx context.Context, src *txBlockSource, did, headCID string) (blockformat.Block, *indigorepo.Commit, error) {
 	head, err := cid.Parse(headCID)
 	if err != nil {
-		return nil, cid.Undef, fmt.Errorf("repo: parse head cid %q for %s: %w", headCID, did, err)
+		return nil, nil, fmt.Errorf("repo: parse head cid %q for %s: %w", headCID, did, err)
 	}
-	src := &txBlockSource{tx: tx, did: did}
 	blk, err := src.Get(ctx, head)
 	if err != nil {
-		return nil, cid.Undef, fmt.Errorf("repo: read head commit %s for %s: %w", headCID, did, err)
+		return nil, nil, fmt.Errorf("repo: read head commit %s for %s: %w", headCID, did, err)
 	}
 	var commit indigorepo.Commit
 	if err := commit.UnmarshalCBOR(bytes.NewReader(blk.RawData())); err != nil {
-		return nil, cid.Undef, fmt.Errorf("repo: decode head commit %s for %s: %w", headCID, did, err)
+		return nil, nil, fmt.Errorf("repo: decode head commit %s for %s: %w", headCID, did, err)
+	}
+	return blk, &commit, nil
+}
+
+// loadTree loads the full MST behind a head commit from the DID's blocks.
+// It returns the tree and the commit's data (MST root) CID. Write-path only:
+// point lookups use mstPathToRecord instead, which stays proportional to
+// tree depth.
+func loadTree(ctx context.Context, tx *sql.Tx, did, headCID string) (*mst.Tree, cid.Cid, error) {
+	src := &txBlockSource{tx: tx, did: did}
+	_, commit, err := readHeadCommit(ctx, src, did, headCID)
+	if err != nil {
+		return nil, cid.Undef, err
 	}
 	tree, err := mst.LoadTreeFromStore(ctx, src, commit.Data)
 	if err != nil {

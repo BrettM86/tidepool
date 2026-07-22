@@ -17,7 +17,6 @@ import (
 	"fmt"
 	"time"
 
-	indigorepo "github.com/bluesky-social/indigo/atproto/repo"
 	"github.com/bluesky-social/indigo/atproto/repo/mst"
 
 	blockformat "github.com/ipfs/go-block-format"
@@ -262,46 +261,57 @@ func (m *Manager) GetRecordProof(ctx context.Context, did, collection, rkey stri
 	if err != nil {
 		return nil, err
 	}
-	head, err := cid.Parse(state.headCID)
-	if err != nil {
-		return nil, fmt.Errorf("repo: parse head cid %q for %s: %w", state.headCID, did, err)
-	}
 	src := &txBlockSource{tx: tx, did: did}
-	headBlk, err := src.Get(ctx, head)
+	headBlk, commit, err := readHeadCommit(ctx, src, did, state.headCID)
 	if err != nil {
-		return nil, fmt.Errorf("repo: read head commit %s for %s: %w", state.headCID, did, err)
-	}
-	var commit indigorepo.Commit
-	if err := commit.UnmarshalCBOR(bytes.NewReader(headBlk.RawData())); err != nil {
-		return nil, fmt.Errorf("repo: decode head commit %s for %s: %w", state.headCID, did, err)
+		return nil, err
 	}
 
 	blocks := []blockformat.Block{headBlk}
+	pathBlocks, recordCID, err := mstPathToRecord(ctx, src, commit.Data, did, path)
+	if err != nil {
+		return nil, err
+	}
+	blocks = append(blocks, pathBlocks...)
+	recBlk, err := src.Get(ctx, recordCID)
+	if err != nil {
+		return nil, fmt.Errorf("repo: read record block %s for %s: %w", recordCID, did, err)
+	}
+	blocks = append(blocks, recBlk)
+
+	return writeCARSlice(headBlk.Cid(), blocks)
+}
+
+// mstPathToRecord walks the MST from dataRoot toward the leaf holding path's
+// key, returning the node blocks visited (root-to-leaf order) and the
+// record's CID. The walk decodes stored node bytes directly rather than
+// materializing the whole tree, so cost stays proportional to tree depth —
+// load-bearing on the public read surface, where collection/rkey are
+// attacker-chosen. A missing record satisfies errors.IsNotFound.
+func mstPathToRecord(ctx context.Context, src *txBlockSource, dataRoot cid.Cid, did, path string) ([]blockformat.Block, cid.Cid, error) {
 	key := []byte(path)
 	notFound := func() error {
 		return errors.NewNotFoundError("record", fmt.Sprintf("at://%s/%s", did, path))
 	}
 
-	// Walk from the MST root toward the leaf, collecting each node block on
-	// the path. The walk decodes stored node bytes directly (rather than
-	// loading the whole tree) so the proof stays proportional to tree depth.
-	cur := commit.Data
+	var blocks []blockformat.Block
+	cur := dataRoot
 	var recordCID *cid.Cid
 	for depth := 0; ; depth++ {
 		// An MST over a repo path (max ~1KB keys) can never legitimately be
 		// hundreds of levels deep; this bounds the walk against a corrupt
 		// (cyclic) tree.
 		if depth > 128 {
-			return nil, fmt.Errorf("repo: MST walk for %s/%s exceeded max depth (corrupt tree?)", did, path)
+			return nil, cid.Undef, fmt.Errorf("repo: MST walk for %s/%s exceeded max depth (corrupt tree?)", did, path)
 		}
 		blk, err := src.Get(ctx, cur)
 		if err != nil {
-			return nil, fmt.Errorf("repo: read MST node %s for %s: %w", cur, did, err)
+			return nil, cid.Undef, fmt.Errorf("repo: read MST node %s for %s: %w", cur, did, err)
 		}
 		blocks = append(blocks, blk)
 		nd, err := mst.NodeDataFromCBOR(bytes.NewReader(blk.RawData()))
 		if err != nil {
-			return nil, fmt.Errorf("repo: decode MST node %s for %s: %w", cur, did, err)
+			return nil, cid.Undef, fmt.Errorf("repo: decode MST node %s for %s: %w", cur, did, err)
 		}
 		node := nd.Node(&cur)
 
@@ -319,20 +329,14 @@ func (m *Manager) GetRecordProof(ctx context.Context, did, collection, rkey stri
 		}
 		childCID := coveringChild(&node, key)
 		if childCID == nil {
-			return nil, notFound()
+			return nil, cid.Undef, notFound()
 		}
 		cur = *childCID
 	}
 	if recordCID == nil {
-		return nil, notFound()
+		return nil, cid.Undef, notFound()
 	}
-	recBlk, err := src.Get(ctx, *recordCID)
-	if err != nil {
-		return nil, fmt.Errorf("repo: read record block %s for %s: %w", recordCID, did, err)
-	}
-	blocks = append(blocks, recBlk)
-
-	return writeCARSlice(head, blocks)
+	return blocks, *recordCID, nil
 }
 
 // coveringChild returns the CID of the child subtree a key would live under

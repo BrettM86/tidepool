@@ -175,6 +175,7 @@ func run(logger *slog.Logger) error {
 		Logger:         logger,
 		Hostname:       cfg.BridgeHostname,
 		ServiceDID:     cfg.BridgeServiceDID,
+		HandleResolver: resolver,
 		RatePerSecond:  float64(cfg.SyncRatePerSecond),
 		RateBurst:      cfg.SyncRateBurst,
 		MaxSubscribers: cfg.SyncMaxSubscribers,

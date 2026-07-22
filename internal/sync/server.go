@@ -8,12 +8,14 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
 	comatproto "github.com/bluesky-social/indigo/api/atproto"
 	"github.com/go-chi/chi/v5"
 	"github.com/gorilla/websocket"
+	"github.com/ipfs/go-cid"
 
 	"tidepool/internal/errors"
 	"tidepool/internal/ratelimit"
@@ -63,12 +65,25 @@ const (
 	defaultMaxSubscribers = 100
 )
 
+// HandleResolver resolves a bridged handle to its DID. Satisfied by
+// identity.Resolver implementations; unknown handles are errors satisfying
+// errors.IsNotFound, and syntactically degenerate handles may instead
+// satisfy errors.IsValidation — the repo.getRecord handler folds both into
+// repo-not-found (see handleRepoGetRecord).
+type HandleResolver interface {
+	ResolveHandle(ctx context.Context, handle string) (string, error)
+}
+
 // Server implements the sync XRPC surface over a repo.Manager. Zero-valued
 // tunables in Options fall back to production defaults; tests shrink them.
 type Server struct {
 	repo        *repo.Manager
 	broadcaster *Broadcaster
 	logger      *slog.Logger
+	// handles resolves the repo parameter of com.atproto.repo.getRecord when
+	// a consumer passes a handle instead of a DID. Optional: nil restricts
+	// that parameter to DIDs.
+	handles HandleResolver
 
 	hostname   string
 	serviceDID string
@@ -109,6 +124,9 @@ type Options struct {
 	// until service-identity bootstrap (task 06) provisions one; a did:web
 	// derived from Hostname is served in the meantime.
 	ServiceDID string
+	// HandleResolver lets com.atproto.repo.getRecord accept bridged handles
+	// in its repo parameter. Optional; nil means DIDs only.
+	HandleResolver HandleResolver
 
 	WriteTimeout time.Duration
 	PingInterval time.Duration
@@ -146,6 +164,7 @@ func NewServer(opts Options) (*Server, error) {
 		repo:         opts.Repo,
 		broadcaster:  opts.Broadcaster,
 		logger:       logger,
+		handles:      opts.HandleResolver,
 		hostname:     opts.Hostname,
 		serviceDID:   serviceDID,
 		writeTimeout: opts.WriteTimeout,
@@ -193,6 +212,7 @@ func (s *Server) Routes(r chi.Router) {
 	r.Get("/xrpc/com.atproto.sync.getBlob", s.limited(s.handleGetBlob))
 	r.Get("/xrpc/com.atproto.sync.listRepos", s.limited(s.handleListRepos))
 	r.Get("/xrpc/com.atproto.sync.getRepoStatus", s.limited(s.handleGetRepoStatus))
+	r.Get("/xrpc/com.atproto.repo.getRecord", s.limited(s.handleRepoGetRecord))
 	r.Get("/xrpc/com.atproto.server.describeServer", s.limited(s.handleDescribeServer))
 	r.Get("/xrpc/_health", s.handleHealth)
 }
@@ -224,6 +244,13 @@ func (s *Server) loadActiveRepo(w http.ResponseWriter, r *http.Request) *repo.Re
 		writeXRPCError(w, http.StatusBadRequest, "InvalidRequest", "missing required parameter: did")
 		return nil
 	}
+	return s.loadActiveRepoByDID(w, r, did)
+}
+
+// loadActiveRepoByDID is loadActiveRepo for handlers that obtain the DID some
+// other way than the did query parameter (repo.getRecord's repo parameter,
+// possibly via handle resolution).
+func (s *Server) loadActiveRepoByDID(w http.ResponseWriter, r *http.Request, did string) *repo.RepoInfo {
 	info, err := s.repo.GetRepoInfo(r.Context(), did)
 	switch {
 	case err == nil:
@@ -356,6 +383,98 @@ func (s *Server) handleGetRecord(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Length", strconv.Itoa(len(proof)))
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(proof)
+}
+
+// repoGetRecordOutput mirrors com.atproto.repo.getRecord's output schema.
+// indigo's RepoGetRecord_Output wraps Value in a LexiconTypeDecoder, which
+// round-trips through registered lexicon structs; the bridge stores records
+// as plain maps, so a local shape serves them unmodified.
+type repoGetRecordOutput struct {
+	URI   string         `json:"uri"`
+	CID   string         `json:"cid"`
+	Value map[string]any `json:"value"`
+}
+
+// handleRepoGetRecord serves com.atproto.repo.getRecord: the JSON form of a
+// single record. The sync.* CAR endpoints cover relays, but AppView-side
+// reconcilers (the Coves profile backfill) speak the repo.* JSON surface —
+// without this endpoint a missed firehose event cannot be backfilled by
+// consumers that speak only repo.* reads.
+//
+// The repo parameter is an at-identifier: a DID, or a bridged handle when a
+// HandleResolver is configured (a leading @ is tolerated, matching
+// resolveHandle). Handle-resolution failures — unknown and malformed alike
+// — are folded into RepoNotFound so a prober learns nothing the DID path
+// would not also reveal. The optional cid parameter pins a specific
+// version; the bridge retains only the current one, so any other CID is a
+// RecordNotFound — the same answer a reference PDS gives, since its
+// repo.getRecord also serves only the current version.
+func (s *Server) handleRepoGetRecord(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	repoID := strings.TrimPrefix(q.Get("repo"), "@")
+	collection, rkey := q.Get("collection"), q.Get("rkey")
+	if repoID == "" || collection == "" || rkey == "" {
+		writeXRPCError(w, http.StatusBadRequest, "InvalidRequest", "missing required parameter: repo, collection, and rkey")
+		return
+	}
+	did := repoID
+	if !strings.HasPrefix(did, "did:") {
+		if s.handles == nil {
+			writeXRPCError(w, http.StatusBadRequest, "InvalidRequest", "repo must be a DID")
+			return
+		}
+		resolved, err := s.handles.ResolveHandle(r.Context(), repoID)
+		switch {
+		case err == nil:
+			did = resolved
+		case errors.IsNotFound(err), errors.IsValidation(err):
+			writeXRPCError(w, http.StatusNotFound, "RepoNotFound", "repo not found: "+repoID)
+			return
+		default:
+			s.logger.Error("sync: resolve repo handle", "handle", repoID, "error", err)
+			writeXRPCError(w, http.StatusInternalServerError, "InternalServerError", "internal error")
+			return
+		}
+	}
+	info := s.loadActiveRepoByDID(w, r, did)
+	if info == nil {
+		return
+	}
+	record, recordCID, err := s.repo.GetRecord(r.Context(), info.DID, collection, rkey)
+	switch {
+	case err == nil:
+	case errors.IsNotFound(err):
+		writeXRPCError(w, http.StatusNotFound, "RecordNotFound", "record not found")
+		return
+	case errors.IsValidation(err):
+		writeXRPCError(w, http.StatusBadRequest, "InvalidRequest", err.Error())
+		return
+	default:
+		s.logger.Error("sync: get record",
+			"did", info.DID, "collection", collection, "rkey", rkey, "error", err)
+		writeXRPCError(w, http.StatusInternalServerError, "InternalServerError", "internal error")
+		return
+	}
+	if want := q.Get("cid"); want != "" {
+		// Parse rather than string-compare: a valid CID in a non-canonical
+		// multibase encoding must still match, and a malformed pin is the
+		// caller's bug (400), not data absence (404).
+		wantCID, err := cid.Parse(want)
+		if err != nil {
+			writeXRPCError(w, http.StatusBadRequest, "InvalidRequest", "invalid cid parameter")
+			return
+		}
+		if wantCID.String() != recordCID {
+			writeXRPCError(w, http.StatusNotFound, "RecordNotFound",
+				"record not found at cid: only the current version is retained")
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, repoGetRecordOutput{
+		URI:   "at://" + info.DID + "/" + collection + "/" + rkey,
+		CID:   recordCID,
+		Value: record,
+	})
 }
 
 // handleGetBlob serves com.atproto.sync.getBlob: the raw bytes of a stored

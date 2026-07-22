@@ -124,6 +124,8 @@ func TestSyncSurface_PerIPRateLimit(t *testing.T) {
 	// The limiter guards the whole surface, not just listRepos…
 	assert.Equal(t, http.StatusTooManyRequests,
 		status(h.http.URL+fmt.Sprintf("/xrpc/com.atproto.sync.getRepoStatus?did=%s", testDID)))
+	assert.Equal(t, http.StatusTooManyRequests,
+		status(h.http.URL+fmt.Sprintf("/xrpc/com.atproto.repo.getRecord?repo=%s&collection=%s&rkey=x", testDID, testCollection)))
 	// …except the healthcheck probe.
 	assert.Equal(t, http.StatusOK, status(h.http.URL+"/xrpc/_health"))
 }

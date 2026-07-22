@@ -4,12 +4,11 @@ Tidepool is a read-only ActivityPub → atproto bridge for the threadiverse.
 It follows Lemmy/PieFed/Mbin communities (FEP-1b12 group federation),
 materializes their posts, comments, and profiles as `social.coves.*` records
 in a virtual PDS it operates itself, and serves them over
-`com.atproto.sync.*` so the [Coves](https://github.com/coves-social) AppView
+`com.atproto.sync.*` so the [Coves](https://github.com/BrettM86/coves) AppView
 indexes fediverse communities exactly as it indexes native ones. Votes stay
 bridge-side as aggregates behind one sanctioned XRPC.
 
-See **[PLAN.md](PLAN.md)** for the architecture, locked design decisions,
-and the task-by-task build plan (`tasks/`).
+See **[PLAN.md](PLAN.md)** for the architecture and locked design decisions.
 
 ## Quick start
 
@@ -549,4 +548,4 @@ on-demand certificate issuance (e.g. Caddy) or per-instance wildcard certs.
 ## License
 
 Tidepool is licensed under the [GNU Affero General Public License v3.0](LICENSE)
-(AGPL-3.0), the same license as [Coves](https://github.com/coves-social).
+(AGPL-3.0), the same license as [Coves](https://github.com/BrettM86/coves).

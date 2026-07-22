@@ -17,7 +17,13 @@ coverage.out
 # Postgres dump target of docker-compose.prod.yml (server-side only)
 /backups/
 
+# Internal build-process docs (AI build-loop state and task specs) — kept
+# locally, not published
+/LOOP_STATE.md
+/tasks/
+
 # Local Claude Code session/tooling state — but the deploy command is
+
 # repo-committed (like the Coves one; it uses a <PROD_HOST> placeholder so
 # the SSH target stays out of git history)
 .claude/*

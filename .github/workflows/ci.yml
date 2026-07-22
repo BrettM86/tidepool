@@ -51,7 +51,7 @@ jobs:
         # Tidepool vendors Coves' schemas. Comparing only against the local
         # manifest cannot detect a Coves-only lexicon change, so CI checks the
         # current canonical Coves tree as well.
-        run: git clone --depth 1 https://tangled.org/bretton.dev/coves /tmp/coves
+        run: git clone --depth 1 https://github.com/BrettM86/coves /tmp/coves
       - name: Lexicon manifest and upstream drift check
         run: ./scripts/check-lexicons.sh /tmp/coves
       - name: Unit & integration tests

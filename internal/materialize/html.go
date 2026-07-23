@@ -17,9 +17,12 @@ import (
 // using the established JohannesKaufmann/html-to-markdown library (v2)
 // rather than a hand-rolled converter: it handles entity decoding, nested
 // lists, blockquotes, and — security-relevant here — drops <script>/<style>
-// elements entirely during conversion. Coves' lexicons treat content as
-// markdown, so no facet generation is needed; links stay inline as
-// [text](url).
+// elements entirely during conversion. For post and comment bodies the
+// markdown is an intermediate form: those builders pass it through
+// bridgedRichText (richtext.go), which strips the markers and emits canonical
+// plaintext + social.coves.richtext.facet annotations — the model Coves
+// clients actually render. Profile bios and community descriptions
+// (actors.go) currently store the markdown directly, with no facet pass.
 
 // markdownFromObject returns the object's body as markdown: the AP source
 // markdown when present, else the HTML content converted. Empty when the

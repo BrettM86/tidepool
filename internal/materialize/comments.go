@@ -164,11 +164,20 @@ func (m *Materializer) materializeCommentLeaf(ctx context.Context, note *ap.Obje
 		return nil, skip(note.ID, "comment has no content")
 	}
 
+	body, facets := bridgedRichText(content, 3000, 30000)
+	if body == "" {
+		// An HTML-only body can reduce to nothing once tags are stripped; a
+		// comment is nothing but its content, so drop it like a bodiless one.
+		return nil, skip(note.ID, "comment has no content")
+	}
 	record := map[string]any{
 		"$type":     CollectionComment,
 		"reply":     reply,
-		"content":   truncateText(content, 3000, 30000),
+		"content":   body,
 		"createdAt": recordDatetime(note.Published.Time),
+	}
+	if len(facets) > 0 {
+		record["facets"] = facets
 	}
 	if langs := recordLangs(note.Language); len(langs) > 0 {
 		record["langs"] = langs

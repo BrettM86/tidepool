@@ -1,0 +1,131 @@
+{
+  "$type": "social.coves.community.post",
+  "author": "did:plc:tkvgcn4onp7yaeidusiiv4o2",
+  "community": "did:plc:ercpobr77dxb3e5h2gwued43",
+  "content": "The Button is back!\n\nThey said\n\nDo not press\n\nSign up at thebutton.social for bonuses — it's complicated simple.\n\n• one\n• two\n\na | b\n--- | ---\n1 | 2\n\nfmt.Println(\"press\")",
+  "createdAt": "2026-07-07T03:27:37.028Z",
+  "embed": {
+    "$type": "social.coves.embed.external",
+    "external": {
+      "thumb": {
+        "$type": "blob",
+        "ref": {
+          "$link": "bafkreihun2gqavrsc5caopdy2qorduba76v5chkzlm2h4w5cjm3d3zeacy"
+        },
+        "mimeType": "image/jpeg",
+        "size": 13
+      },
+      "uri": "https://www.tomshardware.com/pc-components/dram/samsung-sk-hynix-and-micron-face-a-third-dram-price-fixing-lawsuit"
+    }
+  },
+  "facets": [
+    {
+      "features": [
+        {
+          "$type": "social.coves.richtext.facet#heading",
+          "level": 2
+        }
+      ],
+      "index": {
+        "byteEnd": 19,
+        "byteStart": 0
+      }
+    },
+    {
+      "features": [
+        {
+          "$type": "social.coves.richtext.facet#blockquote",
+          "level": 1
+        }
+      ],
+      "index": {
+        "byteEnd": 30,
+        "byteStart": 21
+      }
+    },
+    {
+      "features": [
+        {
+          "$type": "social.coves.richtext.facet#blockquote",
+          "level": 2
+        }
+      ],
+      "index": {
+        "byteEnd": 44,
+        "byteStart": 32
+      }
+    },
+    {
+      "features": [
+        {
+          "$type": "social.coves.richtext.facet#link",
+          "uri": "https://thebutton.social/"
+        }
+      ],
+      "index": {
+        "byteEnd": 73,
+        "byteStart": 57
+      }
+    },
+    {
+      "features": [
+        {
+          "$type": "social.coves.richtext.facet#bold"
+        }
+      ],
+      "index": {
+        "byteEnd": 85,
+        "byteStart": 78
+      }
+    },
+    {
+      "features": [
+        {
+          "$type": "social.coves.richtext.facet#strikethrough"
+        }
+      ],
+      "index": {
+        "byteEnd": 106,
+        "byteStart": 95
+      }
+    },
+    {
+      "features": [
+        {
+          "$type": "social.coves.richtext.facet#code"
+        }
+      ],
+      "index": {
+        "byteEnd": 113,
+        "byteStart": 107
+      }
+    },
+    {
+      "features": [
+        {
+          "$type": "social.coves.richtext.facet#codeBlock"
+        }
+      ],
+      "index": {
+        "byteEnd": 154,
+        "byteStart": 133
+      }
+    },
+    {
+      "features": [
+        {
+          "$type": "social.coves.richtext.facet#codeBlock",
+          "language": "go"
+        }
+      ],
+      "index": {
+        "byteEnd": 176,
+        "byteStart": 156
+      }
+    }
+  ],
+  "langs": [
+    "en"
+  ],
+  "title": "Inside the history of DRAM price-fixing lawsuits — how HBM allocations could make a difference after two decades of failed cases"
+}

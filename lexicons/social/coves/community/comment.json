@@ -23,7 +23,8 @@
           },
           "facets": {
             "type": "array",
-            "description": "Annotations for rich text (mentions, links, etc.)",
+            "description": "Annotations for rich text (mentions, links, formatting, block structure)",
+            "maxLength": 200,
             "items": {
               "type": "ref",
               "ref": "social.coves.richtext.facet"

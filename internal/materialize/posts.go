@@ -86,7 +86,15 @@ func (m *Materializer) buildPostRecord(ctx context.Context, page *ap.Object, com
 		record["title"] = truncateText(page.Name, 300, 3000)
 	}
 	if content := markdownFromObject(page); content != "" {
-		record["content"] = truncateText(content, 10000, 100000)
+		// bridgedRichText can reduce an HTML-only body to nothing once tags
+		// are stripped; a post is still valid without content (title/embed
+		// carry it), so the field is simply omitted.
+		if body, facets := bridgedRichText(content, 10000, 100000); body != "" {
+			record["content"] = body
+			if len(facets) > 0 {
+				record["facets"] = facets
+			}
+		}
 	}
 	if langs := recordLangs(page.Language); len(langs) > 0 {
 		record["langs"] = langs
@@ -181,11 +189,12 @@ func (m *Materializer) buildPostEmbed(ctx context.Context, page *ap.Object, comm
 	}
 }
 
-// isSafeLinkScheme restricts an embed's external uri to http/https. The
-// lexicon's format:"uri" accepts javascript:/data:/vbscript:, which a
-// downstream client rendering the bridge-authored (remote-actor-controlled)
-// link as clickable would treat as a scripting URI. Fail closed: an unsafe
-// scheme drops the external embed rather than erroring the whole post.
+// isSafeLinkScheme restricts bridge-authored clickable URIs (external
+// embeds, link facets) to http/https. The lexicon's format:"uri" accepts
+// javascript:/data:/vbscript:, which a downstream client rendering the
+// remote-actor-controlled link as clickable would treat as a scripting URI.
+// Fail closed: an unsafe scheme drops the embed or facet rather than
+// erroring the whole record.
 func isSafeLinkScheme(uri string) bool {
 	lower := strings.ToLower(strings.TrimSpace(uri))
 	return strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://")

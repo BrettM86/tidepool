@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"tidepool/internal/ap"
 )
 
 // Golden tests: the task-02 fixtures (real objects captured off lemmy.world
@@ -62,6 +64,33 @@ func TestGoldenPostAndProfiles(t *testing.T) {
 	assertGolden(t, "community_profile", h.recordFor(t, groupID))
 	assertGolden(t, "actor_profile", h.recordFor(t, personID))
 	assertGolden(t, "post", h.recordFor(t, pageID))
+}
+
+// TestGoldenPostRichText pins the full wire form of a markdown-rich post —
+// the exact canonical plaintext and every facet byte offset land in a
+// checked-in file, and TestGoldenRecordsValidateAgainstLexicons then
+// strict-validates the block-feature union members (blockquote, heading,
+// codeBlock) against the vendored Coves lexicons. The captured fixtures are
+// plain text, so without this the golden corpus would pin zero facet output.
+func TestGoldenPostRichText(t *testing.T) {
+	h := newHarness(t)
+	h.serveLemmyWorldFixtures()
+
+	page := loadFixtureObject(t, "page_lemmy_world.json")
+	page.Source = &ap.Source{
+		MediaType: "text/markdown",
+		Content: "## The Button is back!\n\n" +
+			"> They said\n>\n> > Do not press\n\n" +
+			"Sign up at [thebutton.social](https://thebutton.social/) for **bonuses** — it's ~~complicated~~ `simple`.\n\n" +
+			"- one\n- two\n\n" +
+			"| a | b |\n|---|---|\n| 1 | 2 |\n\n" +
+			"```go\nfmt.Println(\"press\")\n```",
+	}
+
+	_, err := h.m.MaterializePost(context.Background(), page)
+	require.NoError(t, err)
+
+	assertGolden(t, "post_richtext", h.recordFor(t, pageID))
 }
 
 // TestGoldenComment pins the comment record for the captured lemmy.zip

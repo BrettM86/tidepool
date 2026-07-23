@@ -24,7 +24,8 @@
             },
             "facets": {
               "type": "array",
-              "description": "Updated annotations for rich text (mentions, links, etc.)",
+              "description": "Updated annotations for rich text (mentions, links, formatting, block structure)",
+              "maxLength": 200,
               "items": {
                 "type": "ref",
                 "ref": "social.coves.richtext.facet"
@@ -90,6 +91,10 @@
         {
           "name": "NotAuthorized",
           "description": "User is not authorized to update this comment (not the author)"
+        },
+        {
+          "name": "InvalidFacets",
+          "description": "Rich text facets are malformed, exceed limits, or reference byte ranges outside the content"
         }
       ]
     }

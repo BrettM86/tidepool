@@ -13,16 +13,21 @@
         },
         "features": {
           "type": "array",
-          "description": "Features applied to this text range",
+          "description": "Features applied to this text range. This union is open: readers MUST render the annotated text as plain text when they do not recognize a feature's $type. Ranges of different block types may nest by containment (e.g. a codeBlock inside a blockquote); only blockquote-in-blockquote containment is disallowed (nested quotes use disjoint ranges with increasing level).",
+          "maxLength": 20,
           "items": {
             "type": "union",
             "refs": [
               "#mention",
-              "#link", 
+              "#link",
               "#bold",
               "#italic",
               "#strikethrough",
-              "#spoiler"
+              "#spoiler",
+              "#blockquote",
+              "#heading",
+              "#code",
+              "#codeBlock"
             ]
           }
         }
@@ -90,6 +95,46 @@
           "maxLength": 128,
           "maxGraphemes": 32,
           "description": "Optional explanation of what's hidden"
+        }
+      }
+    },
+    "blockquote": {
+      "type": "object",
+      "description": "Block-level quotation. The range must span whole lines: from the first byte of the first quoted line through the last content byte of the last quoted line, excluding the trailing newline. Readers encountering a range that does not span whole lines should extend the block to the enclosing line boundaries. Consecutive quoted lines at the same depth should be covered by a single facet; readers should render adjacent same-level quote facets as separate blocks. Nested quotes are expressed as disjoint ranges with increasing level values, not by nesting ranges. Writers must clamp source nesting deeper than 6 to level 6, and strip the source markup markers (e.g. Markdown '>'); the text is canonical and must remain readable without this facet.",
+      "properties": {
+        "level": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 6,
+          "description": "Quote nesting depth. Absent means 1."
+        }
+      }
+    },
+    "heading": {
+      "type": "object",
+      "description": "Section heading. The range must span a single whole line (excluding the trailing newline); readers encountering a range that does not should extend it to the enclosing line boundaries. Writers strip the source markup markers (e.g. Markdown '#'); the text is canonical and must remain readable without this facet.",
+      "required": ["level"],
+      "properties": {
+        "level": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 6,
+          "description": "Heading level, 1 (largest) through 6"
+        }
+      }
+    },
+    "code": {
+      "type": "object",
+      "description": "Inline code span rendered in monospace. Writers strip the source markup markers (e.g. backticks); the annotated text is the literal code."
+    },
+    "codeBlock": {
+      "type": "object",
+      "description": "Block of preformatted code rendered in monospace with whitespace preserved. The range must span whole lines (excluding the trailing newline); readers encountering a range that does not should extend it to the enclosing line boundaries. Writers strip the source fence markers (e.g. Markdown ```); the annotated text is the literal code.",
+      "properties": {
+        "language": {
+          "type": "string",
+          "maxLength": 40,
+          "description": "Optional language hint for syntax highlighting (e.g. 'go', 'python')"
         }
       }
     }

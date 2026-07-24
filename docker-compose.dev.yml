@@ -171,3 +171,5 @@ volumes:
     name: tidepool-dev-postgres-plc-data
   plc-app-data:
     name: tidepool-dev-plc-app-data
+  jetstream-data:
+    name: tidepool-dev-jetstream-data

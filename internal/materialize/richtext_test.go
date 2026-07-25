@@ -640,3 +640,211 @@ func TestMaterializeCommentStoresRichText(t *testing.T) {
 		facetTypePrefix + "bold",
 	}, types)
 }
+
+// --- Lemmy spoiler containers (spoiler.go) ---
+
+// TestRichTextSpoilerContainer: Lemmy's non-CommonMark `::: spoiler` block
+// becomes a spoiler facet whose reason is the title. The fence lines must not
+// survive into the canonical plaintext — before spoiler.go they leaked as
+// literal ":::" lines and the hidden content rendered revealed.
+func TestRichTextSpoilerContainer(t *testing.T) {
+	md := "before\n\n::: spoiler Bonus Panel\nthe **hidden** thing\n:::\n\nafter"
+	content, facets := bridgedRichText(md, 10000, 100000)
+
+	assert.Equal(t, "before\n\nthe hidden thing\n\nafter", content)
+	assert.NotContains(t, content, ":::")
+	assert.NotContains(t, content, "Bonus Panel", "the title belongs in reason, not the text")
+
+	spoiler := requireOneFacet(t, facets, "spoiler")
+	assert.Equal(t, "the hidden thing", facetText(t, content, spoiler))
+	assert.Equal(t, "Bonus Panel", facetFeatures(t, spoiler)[0]["reason"])
+	requireWholeLines(t, content, spoiler)
+
+	// Inline markup inside the container still parses.
+	assert.Equal(t, "hidden", facetText(t, content, requireOneFacet(t, facets, "bold")))
+}
+
+func TestRichTextSpoilerWithoutTitle(t *testing.T) {
+	content, facets := bridgedRichText("::: spoiler\nhidden\n:::", 10000, 100000)
+	assert.Equal(t, "hidden", content)
+	feature := facetFeatures(t, requireOneFacet(t, facets, "spoiler"))[0]
+	_, hasReason := feature["reason"]
+	assert.False(t, hasReason, "a titleless container must omit reason, not send an empty one")
+}
+
+// TestRichTextSpoilerReasonTruncated: unlike a codeBlock language (dropped
+// when over cap), a clipped reason still names what is hidden — so it is
+// truncated to the lexicon's 32 graphemes rather than discarded.
+func TestRichTextSpoilerReasonTruncated(t *testing.T) {
+	title := strings.Repeat("ő", 60)
+	content, facets := bridgedRichText("::: spoiler "+title+"\nhidden\n:::", 10000, 100000)
+	assert.Equal(t, "hidden", content)
+
+	reason, ok := facetFeatures(t, requireOneFacet(t, facets, "spoiler"))[0]["reason"].(string)
+	require.True(t, ok, "an over-cap reason must be truncated, not dropped")
+	assert.LessOrEqual(t, graphemeCount(reason), maxSpoilerReasonGraphemes)
+	assert.LessOrEqual(t, len(reason), maxSpoilerReasonBytes)
+}
+
+// TestRichTextSpoilerUnclosed: markdown-it closes an open container at end of
+// input; so must we, or a missing fence would swallow the facet entirely.
+func TestRichTextSpoilerUnclosed(t *testing.T) {
+	content, facets := bridgedRichText("::: spoiler Ending\nhidden", 10000, 100000)
+	assert.Equal(t, "hidden", content)
+	assert.Equal(t, "hidden", facetText(t, content, requireOneFacet(t, facets, "spoiler")))
+}
+
+// TestRichTextSpoilerSiblingsStayDisjoint mirrors the real Mr Lovenstein post:
+// three sibling containers, each its own range.
+func TestRichTextSpoilerSiblingsStayDisjoint(t *testing.T) {
+	md := "::: spoiler One\nfirst\n:::\n\n::: spoiler Two\nsecond\n:::"
+	content, facets := bridgedRichText(md, 10000, 100000)
+	assert.Equal(t, "first\n\nsecond", content)
+
+	spoilers := findFacets(t, facets, "spoiler")
+	require.Len(t, spoilers, 2)
+	assert.Equal(t, "first", facetText(t, content, spoilers[0]))
+	assert.Equal(t, "One", facetFeatures(t, spoilers[0])[0]["reason"])
+	assert.Equal(t, "second", facetText(t, content, spoilers[1]))
+	assert.Equal(t, "Two", facetFeatures(t, spoilers[1])[0]["reason"])
+
+	_, firstEnd := facetIndex(t, spoilers[0])
+	secondStart, _ := facetIndex(t, spoilers[1])
+	assert.LessOrEqual(t, firstEnd, secondStart, "sibling spoilers must be disjoint")
+}
+
+// TestRichTextNonSpoilerContainerStaysText: only `spoiler` is a Lemmy
+// container. Anything else — and a name that merely starts with "spoiler" —
+// keeps today's degradation to plain text rather than inventing a facet.
+func TestRichTextNonSpoilerContainerStaysText(t *testing.T) {
+	for _, md := range []string{
+		"::: warning Careful\nbody\n:::",
+		":::spoilered Nope\nbody\n:::",
+	} {
+		content, facets := bridgedRichText(md, 10000, 100000)
+		assert.Contains(t, content, "body")
+		assert.Empty(t, findFacets(t, facets, "spoiler"), "input %q must not open a spoiler", md)
+	}
+}
+
+// --- bare-URL linkification (bareURLSpans) ---
+
+// TestRichTextEscapedURLStillLinks is the PieFed case: it escapes punctuation
+// on the way out, writing `https\://…`. Linkify runs over the SOURCE bytes and
+// cannot see through the backslash, while unescapeMarkdown resolves it at
+// render time — so without the plaintext post-pass the stored text reads as a
+// URL and carries no facet at all.
+func TestRichTextEscapedURLStillLinks(t *testing.T) {
+	content, facets := bridgedRichText(`see https\://piefed.social/post/1258520 now`, 10000, 100000)
+	assert.Equal(t, "see https://piefed.social/post/1258520 now", content)
+
+	link := requireOneFacet(t, facets, "link")
+	assert.Equal(t, "https://piefed.social/post/1258520", facetText(t, content, link))
+	assert.Equal(t, "https://piefed.social/post/1258520", facetFeatures(t, link)[0]["uri"])
+}
+
+// TestRichTextAutoLinkNotDoubled: a URL Linkify already caught must not also
+// pick up a post-pass facet — two identical ranges would merge into one facet
+// carrying the same feature twice.
+func TestRichTextAutoLinkNotDoubled(t *testing.T) {
+	content, facets := bridgedRichText("go to https://example.com/p now", 10000, 100000)
+	require.Len(t, findFacets(t, facets, "link"), 1)
+	assert.Equal(t, "https://example.com/p", facetText(t, content, facets[0]))
+}
+
+// TestRichTextURLInCodeNotLinkified: literal text must never become
+// clickable, in either code form.
+func TestRichTextURLInCodeNotLinkified(t *testing.T) {
+	for _, md := range []string{
+		"`https://example.com/p`",
+		"```\nhttps://example.com/p\n```",
+		"    https://example.com/p",
+	} {
+		content, facets := bridgedRichText(md, 10000, 100000)
+		assert.Contains(t, content, "https://example.com/p")
+		assert.Empty(t, findFacets(t, facets, "link"), "code must not linkify: %q", md)
+	}
+}
+
+// TestRichTextURLTextKeepsAuthorDestination: when the link TEXT is itself
+// URL-ish, the author's chosen destination wins — the post-pass must not
+// re-point it at the text.
+func TestRichTextURLTextKeepsAuthorDestination(t *testing.T) {
+	content, facets := bridgedRichText("[https://decoy.example](https://real.example/p)", 10000, 100000)
+	assert.Equal(t, "https://decoy.example", content)
+
+	links := findFacets(t, facets, "link")
+	require.Len(t, links, 1)
+	assert.Equal(t, "https://real.example/p", facetFeatures(t, links[0])[0]["uri"])
+}
+
+// TestRichTextBareURLTailTrimmed applies GFM's extended-autolink tail rules:
+// sentence punctuation is not part of the link, and a closing bracket counts
+// only when the URL opened one.
+func TestRichTextBareURLTailTrimmed(t *testing.T) {
+	for _, tc := range []struct{ md, want string }{
+		{`see https\://example.com/p.`, "https://example.com/p"},
+		{`see https\://example.com/p, then`, "https://example.com/p"},
+		{`(see https\://example.com/p)`, "https://example.com/p"},
+		{`see https\://en.wikipedia.org/wiki/Foo_(bar)`, "https://en.wikipedia.org/wiki/Foo_(bar)"},
+	} {
+		content, facets := bridgedRichText(tc.md, 10000, 100000)
+		link := requireOneFacet(t, facets, "link")
+		assert.Equal(t, tc.want, facetText(t, content, link), "input %q", tc.md)
+		assert.Equal(t, tc.want, facetFeatures(t, link)[0]["uri"], "input %q", tc.md)
+	}
+}
+
+// TestRichTextDeepSpoilerNestingBounded mirrors the deep-quote guard: an
+// adversarial container nest must terminate against maxRenderDepth rather
+// than exhaust the stack, and every surviving facet must stay in bounds.
+func TestRichTextDeepSpoilerNestingBounded(t *testing.T) {
+	md := strings.Repeat("::: spoiler x\n", 5000) + "deep"
+	content, facets := bridgedRichText(md, 10000, 100000)
+	for _, f := range facets {
+		facetText(t, content, f) // asserts bounds
+	}
+}
+
+// TestRichTextManyURLsAroundCode pins the linear overlap walk: interleaved
+// code spans and bare URLs must not go quadratic, and each URL outside code
+// still gets exactly one facet.
+func TestRichTextManyURLsAroundCode(t *testing.T) {
+	md := strings.Repeat("`https://code.example/x` https\\://bare.example/y\n\n", 500)
+	content, facets := bridgedRichText(md, 10000, 100000)
+	for _, f := range facets {
+		facetText(t, content, f) // asserts bounds
+	}
+	for _, link := range findFacets(t, facets, "link") {
+		assert.Equal(t, "https://bare.example/y", facetText(t, content, link),
+			"only the bare URL may linkify")
+	}
+}
+
+// TestMaterializePostStoresSpoilerFacet proves the new feature survives the
+// real wiring, including lexicon validation against the vendored catalog —
+// a #spoiler carrying a `reason` has to be a shape Coves' validator accepts,
+// not just one the converter is willing to emit.
+func TestMaterializePostStoresSpoilerFacet(t *testing.T) {
+	h := newHarness(t)
+	h.serveLemmyWorldFixtures()
+	page := loadFixtureObject(t, "page_lemmy_world.json")
+	page.Source = &ap.Source{
+		Content:   "Mr Lovenstein\n\n::: spoiler Transcript\nCaveman 1: Same\n:::",
+		MediaType: "text/markdown",
+	}
+
+	_, err := h.m.MaterializePost(context.Background(), page)
+	require.NoError(t, err)
+
+	record := h.recordFor(t, pageID)
+	assert.Equal(t, "Mr Lovenstein\n\nCaveman 1: Same", record["content"])
+	facets, ok := record["facets"].([]any)
+	require.True(t, ok, "record must carry facets")
+
+	// Read back through the repo the indices are CBOR int64, not the int the
+	// facetIndex helper expects — so assert on the feature, whose byte range
+	// the converter-level tests already pin.
+	spoiler := requireOneFacet(t, facets, "spoiler")
+	assert.Equal(t, "Transcript", facetFeatures(t, spoiler)[0]["reason"])
+}

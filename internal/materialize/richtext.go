@@ -13,6 +13,7 @@ import (
 	"github.com/yuin/goldmark/ast"
 	"github.com/yuin/goldmark/extension"
 	east "github.com/yuin/goldmark/extension/ast"
+	"github.com/yuin/goldmark/parser"
 	"github.com/yuin/goldmark/text"
 	"github.com/yuin/goldmark/util"
 )
@@ -24,10 +25,12 @@ import (
 // tables, and linkify — Lemmy's own dialect) and emits stripped text plus
 // facets:
 //
-//   - heading/blockquote/codeBlock ranges span whole lines, excluding the
-//     trailing newline; nested quotes become DISJOINT ranges with increasing
-//     level (quote-in-quote containment is forbidden; cross-type containment
-//     is fine), clamped at level 6
+//   - heading/blockquote/codeBlock/spoiler ranges span whole lines, excluding
+//     the trailing newline; nested quotes become DISJOINT ranges with
+//     increasing level (quote-in-quote containment is forbidden; cross-type
+//     containment is fine), clamped at level 6
+//   - Lemmy's non-CommonMark `::: spoiler Title` containers parse via
+//     spoiler.go and become a spoiler facet whose reason is the title
 //   - inline bold/italic/strikethrough/code/link map directly
 //   - lists have no facet by design: markers are normalized into the text
 //     ("• ", "1. ") and degrade as plain lines
@@ -47,6 +50,10 @@ const (
 	maxQuoteLevel        = 6
 	maxHeadingLevel      = 6
 
+	// The lexicon's caps on a spoiler facet's optional `reason`.
+	maxSpoilerReasonGraphemes = 32
+	maxSpoilerReasonBytes     = 128
+
 	// parseSlack is how much markdown beyond the byte cap still gets parsed:
 	// markup renders shorter than its source (markers, link URLs), so a small
 	// slack keeps legitimate near-cap bodies intact while bounding
@@ -65,7 +72,15 @@ const (
 
 var richTextMarkdown = goldmark.New(
 	goldmark.WithExtensions(extension.Strikethrough, extension.Table, extension.Linkify),
+	goldmark.WithParserOptions(parser.WithBlockParsers(
+		util.Prioritized(spoilerBlockParser{}, spoilerParserPriority),
+	)),
 )
+
+// bareURLRe finds an http(s) URL in already-rendered plaintext. The leading
+// word boundary keeps "xhttps://…" from matching; the tail is trimmed by
+// trimURLTail, which the character class deliberately leaves to do its job.
+var bareURLRe = regexp.MustCompile(`(?i)\bhttps?://[^\s<>]+`)
 
 // brTagRe matches every <br> variant (<br>, <br/>, <br clear=all>):
 // federated HTML uses them all, and a missed one concatenates words.
@@ -152,6 +167,18 @@ func codeBlockFeature(language string) map[string]any {
 	return f
 }
 
+// spoilerFeature carries the container's title as the lexicon's optional
+// `reason`. Unlike codeBlockFeature's language, an over-cap reason is
+// TRUNCATED rather than dropped: a clipped label still names what is hidden,
+// where a clipped language tag is meaningless.
+func spoilerFeature(reason string) map[string]any {
+	f := featureOf("spoiler")
+	if r := truncateText(strings.TrimSpace(reason), maxSpoilerReasonGraphemes, maxSpoilerReasonBytes); r != "" {
+		f["reason"] = r
+	}
+	return f
+}
+
 // linkFeature gates every bridge-authored clickable uri behind the http(s)
 // scheme check — the lexicon's format:"uri" would happily carry javascript:
 // into clients. ok=false means keep the text, emit no facet.
@@ -233,7 +260,97 @@ func richTextFromMarkdown(md string) (string, []facetSpan) {
 	c := &richTextConverter{source: source}
 	c.renderBlocks(root, 0)
 	rendered := c.b.String()
-	return rendered, splitContainingQuotes(rendered, c.facets)
+	spans := splitContainingQuotes(rendered, c.facets)
+	return rendered, append(spans, bareURLSpans(rendered, spans)...)
+}
+
+// bareURLSpans linkifies http(s) URLs that goldmark's Linkify extension never
+// saw. Linkify runs over the SOURCE bytes during inline parsing, but backslash
+// escapes are only resolved at RENDER time (unescapeMarkdown) — so a federated
+// app that escapes punctuation on the way out (PieFed writes
+// `https\://example.com`) yields plaintext that reads as a URL and carries no
+// facet at all. Scanning the finished plaintext catches those, and any other
+// linkify miss, at the point where offsets are already final.
+//
+// Ranges already spoken for are skipped: an existing link (Linkify worked, or
+// the author wrote `[url-ish text](other-url)` — whose text must keep pointing
+// at the destination the author chose), and code/codeBlock, where literal text
+// must never become clickable.
+func bareURLSpans(rendered string, existing []facetSpan) []facetSpan {
+	blocked := blockedLinkRanges(existing)
+	var out []facetSpan
+	// Regexp matches arrive in ascending order and blocked is disjoint and
+	// sorted, so one forward cursor decides every overlap — a body that is
+	// thousands of code spans around thousands of URLs stays linear.
+	next := 0
+	for _, m := range bareURLRe.FindAllStringIndex(rendered, -1) {
+		start := m[0]
+		end := start + len(trimURLTail(rendered[start:m[1]]))
+		if start >= end {
+			continue
+		}
+		for next < len(blocked) && blocked[next][1] <= start {
+			next++
+		}
+		if next < len(blocked) && blocked[next][0] < end {
+			continue
+		}
+		if feature, ok := linkFeature(rendered[start:end]); ok {
+			out = append(out, facetSpan{start: start, end: end, feature: feature})
+		}
+	}
+	return out
+}
+
+// blockedLinkRanges collects the ranges bareURLSpans must not touch, merged
+// into disjoint sorted intervals. Link and code ranges genuinely nest
+// (`[`x`](url)`), so merging — not just sorting — is what makes a single
+// forward cursor correct.
+func blockedLinkRanges(spans []facetSpan) [][2]int {
+	var ranges [][2]int
+	for _, s := range spans {
+		switch s.feature["$type"] {
+		case facetTypePrefix + "link", facetTypePrefix + "code", facetTypePrefix + "codeBlock":
+			ranges = append(ranges, [2]int{s.start, s.end})
+		}
+	}
+	if len(ranges) == 0 {
+		return nil
+	}
+	sort.Slice(ranges, func(i, j int) bool { return ranges[i][0] < ranges[j][0] })
+	merged := ranges[:1]
+	for _, r := range ranges[1:] {
+		last := &merged[len(merged)-1]
+		if r[0] <= last[1] {
+			last[1] = max(last[1], r[1])
+		} else {
+			merged = append(merged, r)
+		}
+	}
+	return merged
+}
+
+// trimURLTail applies GFM's extended-autolink tail rules to a candidate match:
+// trailing punctuation belongs to the sentence, not the link, and a closing
+// bracket counts only when the URL itself opened one (Wikipedia-style paths).
+func trimURLTail(u string) string {
+	for u != "" {
+		switch u[len(u)-1] {
+		case '?', '!', '.', ',', ':', ';', '*', '_', '~', '\'', '"':
+		case ')':
+			if strings.Count(u, ")") <= strings.Count(u, "(") {
+				return u
+			}
+		case ']':
+			if strings.Count(u, "]") <= strings.Count(u, "[") {
+				return u
+			}
+		default:
+			return u
+		}
+		u = u[:len(u)-1]
+	}
+	return u
 }
 
 // requestSep asks for a separator before the next written content. Competing
@@ -337,6 +454,8 @@ func (c *richTextConverter) renderBlock(n ast.Node, quoteLevel int) {
 		c.writeText("———")
 	case *ast.HTMLBlock:
 		c.renderHTMLBlock(t)
+	case *spoilerNode:
+		c.renderSpoiler(t, quoteLevel)
 	default:
 		if n.Kind() == east.KindTable {
 			c.renderTable(n)
@@ -413,6 +532,17 @@ func (c *richTextConverter) renderCodeBlock(n ast.Node, language string) {
 	start := c.blockFacetStart()
 	c.writeText(code)
 	c.addFacet(start, c.b.Len(), codeBlockFeature(language))
+}
+
+// renderSpoiler emits the container's contents (fence lines already consumed
+// by the parser) under a spoiler facet carrying the title as `reason`. The
+// title itself stays out of the plaintext: duplicating it there would read as
+// a stray line for any client that ignores the facet, and `reason` is where
+// the lexicon puts it.
+func (c *richTextConverter) renderSpoiler(s *spoilerNode, quoteLevel int) {
+	start := c.blockFacetStart()
+	c.renderBlocks(s, quoteLevel)
+	c.addFacet(start, c.b.Len(), spoilerFeature(s.Reason))
 }
 
 // renderList normalizes list markers into the canonical text — "• " bullets

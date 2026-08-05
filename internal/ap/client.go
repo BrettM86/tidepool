@@ -324,6 +324,19 @@ func (c *Client) fetchObject(ctx context.Context, iri string, mode fetchMode) (*
 	return obj, nil
 }
 
+// FetchObjectSameAuthority is FetchObject with the redirect authority pinned
+// to the requested IRI: any redirect hop whose target does not share the
+// IRI's scheme+host fails the fetch with errors.IsValidation. The admin
+// delete sweep (ingest.SweepDeleted) uses it because there the fetch result
+// IS the authorization — the origin's 410/Tombstone is the only thing
+// licensing the deletion of a bridged record — so an open redirect on the
+// origin must not be able to bounce that decision to an attacker host that
+// serves 410. Same-authority redirects (a path move within the origin) are
+// still followed; ordinary fetches keep the permissive redirect behavior.
+func (c *Client) FetchObjectSameAuthority(ctx context.Context, iri string) (*Object, error) {
+	return c.fetchObject(ctx, iri, fetchModeObjectPinnedAuthority)
+}
+
 // SameAuthority reports whether two absolute URLs share scheme and host (the
 // authority). Exported so consumers that key storage on a fetched object's
 // self-asserted id (the materializer's ap_objects mapping) can reject a body
@@ -807,7 +820,7 @@ const (
 	fetchModeWebFinger
 	// fetchModeObjectPinnedAuthority maps statuses like fetchModeObject but
 	// rejects any redirect hop leaving the original IRI's scheme+host (see
-	// FetchActorSameAuthority).
+	// FetchActorSameAuthority, FetchObjectSameAuthority).
 	fetchModeObjectPinnedAuthority
 )
 

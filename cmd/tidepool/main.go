@@ -405,6 +405,7 @@ func run(logger *slog.Logger) error {
 		Service:      serviceActor,
 		Backfill:     backfill,
 		Repos:        repoManager,
+		Sweeper:      handler,
 		Logger:       logger,
 	})
 	if err != nil {

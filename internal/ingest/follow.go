@@ -28,7 +28,9 @@ type FollowClient interface {
 	SendActivity(ctx context.Context, inboxURL string, activity any) error
 }
 
-// AdminOptions configures NewAdmin. Everything except Logger is required.
+// AdminOptions configures NewAdmin. Token, Client, Materializer,
+// Communities, and Service are required; Backfill, Repos, Sweeper, and
+// Logger are optional (each missing dependency's endpoint answers 501).
 type AdminOptions struct {
 	// Token is the bearer token protecting /admin (config.AdminToken).
 	Token string
@@ -45,17 +47,24 @@ type AdminOptions struct {
 	Backfill Backfiller
 	// Repos serves POST /admin/reemit (optional; the endpoint answers 501
 	// when nil). See reemit.go for what re-emission is for.
-	Repos  RepoReemitter
-	Logger *slog.Logger
+	Repos RepoReemitter
+	// Sweeper serves POST /admin/objects/sweep-deleted (optional; the
+	// endpoint answers 501 when nil). See sweep.go.
+	Sweeper DeleteSweeper
+	Logger  *slog.Logger
 }
 
-// Admin is the operator API driving the community subscription lifecycle:
+// Admin is the operator API driving the community subscription lifecycle,
+// plus the maintenance endpoints for bridged objects, repos, and counters:
 //
 //	POST   /admin/communities           {"community":"!tech@lemmy.world"}
 //	DELETE /admin/communities           {"community":"!tech@lemmy.world"}
 //	GET    /admin/communities
 //	POST   /admin/communities/backfill  {"community":"!tech@lemmy.world"}
 //	POST   /admin/communities/reconcile (follow list configured only)
+//	POST   /admin/reemit                {"did":"did:plc:..."} (or {} for all)
+//	POST   /admin/objects/sweep-deleted {"ap_ids":["https://..."]}
+//	GET    /admin/metrics               (tidepool's own expvar counters)
 //
 // All endpoints require "Authorization: Bearer $ADMIN_TOKEN".
 type Admin struct {
@@ -66,6 +75,7 @@ type Admin struct {
 	service     *ap.ServiceActor
 	backfill    Backfiller
 	repos       RepoReemitter
+	sweeper     DeleteSweeper
 	logger      *slog.Logger
 	// reconciler serves POST /admin/communities/reconcile; nil (the
 	// endpoint answers 501) unless a follow list is configured. Set once
@@ -107,6 +117,7 @@ func NewAdmin(opts AdminOptions) (*Admin, error) {
 		service:     opts.Service,
 		backfill:    opts.Backfill,
 		repos:       opts.Repos,
+		sweeper:     opts.Sweeper,
 		logger:      logger,
 	}, nil
 }
@@ -126,6 +137,7 @@ func (a *Admin) Routes(r chi.Router) {
 		r.Post("/communities/backfill", a.handleBackfill)
 		r.Post("/communities/reconcile", a.handleReconcile)
 		r.Post("/reemit", a.handleReemit)
+		r.Post("/objects/sweep-deleted", a.handleSweepDeleted)
 		r.Method(http.MethodGet, "/metrics", http.HandlerFunc(scopedMetrics))
 	})
 }

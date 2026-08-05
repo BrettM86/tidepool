@@ -323,6 +323,7 @@ func newHarness(t *testing.T) *harness {
 		Communities:  communities,
 		Service:      h.service,
 		Backfill:     h.backfills,
+		Sweeper:      h.handler,
 	})
 	require.NoError(t, err)
 

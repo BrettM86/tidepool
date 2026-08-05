@@ -301,6 +301,8 @@ curl -X DELETE localhost:8091/admin/communities \
 
 curl localhost:8091/admin/metrics \
   -H "Authorization: Bearer dev-admin-token"          # expvar counters
+# (includes tidepool_lexicon_validation_failures — non-zero in production,
+# where validation failures log-and-write, means investigate)
 
 # re-emit a repo's records onto the firehose as delete+create commit pairs
 # (identical values, so at-uris and CIDs are unchanged). For the relay
@@ -311,8 +313,22 @@ curl localhost:8091/admin/metrics \
 curl -X POST localhost:8091/admin/reemit \
   -H "Authorization: Bearer dev-admin-token" \
   -d '{"did":"did:plc:aaa..."}'
-# (includes tidepool_lexicon_validation_failures — non-zero in production,
-# where validation failures log-and-write, means investigate)
+
+# origin-verified cleanup for deletes the bridge missed: each ap_id is
+# re-fetched from its origin (redirects off that origin refuse the fetch)
+# and deleted ONLY if the origin serves a tombstone (HTTP 410 or an AP
+# Tombstone body). Live objects, unknown ids, actor profiles, and 404s are
+# reported, never touched — a 404 also covers the 401/403 a secure-mode
+# instance serves for objects it will not show us, so it means "not
+# visible", not "deleted". Max 200 ap_ids per request (chunk beyond that;
+# 400 otherwise). Idempotent.
+curl -X POST localhost:8091/admin/objects/sweep-deleted \
+  -H "Authorization: Bearer dev-admin-token" \
+  -d '{"ap_ids":["https://lemmy.world/post/123"]}'
+# 200 with {"requested":N,"swept":M,"deleted":…,"failed":…,
+#           "truncated":bool,"result":[{"ap_id":…,"outcome":…}]}.
+# swept < requested ("truncated":true) means the client hung up mid-batch —
+# the remaining ids were never checked; re-run them.
 ```
 
 ### Declarative follow list (`FOLLOW_LIST_PATH`)

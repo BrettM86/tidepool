@@ -489,3 +489,26 @@ func TestOversizedOrWrongTypeMediaDropped(t *testing.T) {
 	assert.NotContains(t, record, "avatar", "oversized avatar must be dropped")
 	assert.NotContains(t, record, "banner", "non-image banner must be dropped")
 }
+
+// TestPublicOnlyAudienceFallsBackToAddressing: an `audience` carrying only
+// the AS2 public collection names no community, in every spelling. The ingest
+// layer's communityIRIFrom already reads it that way, and a materializer that
+// did not would EnsureCommunity("as:Public") — a retryable failure that backs
+// the whole ordering key off into poison over a perfectly ordinary post. The
+// group in `to` answers instead.
+func TestPublicOnlyAudienceFallsBackToAddressing(t *testing.T) {
+	h := newHarness(t)
+	h.serveLemmyWorldFixtures()
+	ctx := context.Background()
+
+	for _, spelling := range []string{"as:Public", "Public", ap.PublicAudience} {
+		pageObj := loadFixtureObject(t, "page_lemmy_world.json")
+		pageObj.Audience = ap.Audience{spelling}
+		pageObj.To = ap.Audience{groupID, ap.PublicAudience}
+
+		res, err := h.m.MaterializePost(ctx, pageObj)
+		require.NoError(t, err, "audience %q must not be mistaken for a community", spelling)
+		assert.Equal(t, testDIDFor("technology", "lemmy.world"), res.DID,
+			"the post lands in the community named by to")
+	}
+}

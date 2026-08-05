@@ -50,16 +50,21 @@ func (m *Materializer) MaterializePost(ctx context.Context, page *ap.Object) (*R
 
 // communityRef finds the community Group IRI a post belongs to: Lemmy sets
 // `audience` (FEP-1b12); older objects carry the group in `to`/`cc` next to
-// the public collection.
+// the public collection. Public-collection IRIs are skipped in EVERY list,
+// audience included — the ingest layer's communityIRIFrom does the same, and
+// a divergence there is not cosmetic: an `audience: ["as:Public"]` post that
+// ingest reads as "names no community" would arrive here as
+// EnsureCommunity("as:Public"), whose failure is retryable and would back the
+// whole ordering key off into poison.
 func communityRef(page *ap.Object) *ap.Object {
 	for _, iri := range page.Audience {
-		if iri != "" && iri != ap.PublicAudience {
+		if iri != "" && !isPublicCollection(iri) {
 			return &ap.Object{ID: iri}
 		}
 	}
 	for _, list := range []ap.Audience{page.To, page.Cc} {
 		for _, iri := range list {
-			if iri == "" || iri == ap.PublicAudience || iri == "as:Public" || iri == "Public" {
+			if iri == "" || isPublicCollection(iri) {
 				continue
 			}
 			// Heuristic for addressing lists that mix users and groups:
@@ -70,6 +75,13 @@ func communityRef(page *ap.Object) *ap.Object {
 		}
 	}
 	return nil
+}
+
+// isPublicCollection reports whether an addressing IRI is the AS2 public
+// collection. All three spellings appear in the wild (Lemmy always writes the
+// full IRI); ap.Object.IsPublic and ingest.isPublicIRI accept the same set.
+func isPublicCollection(iri string) bool {
+	return iri == ap.PublicAudience || iri == "as:Public" || iri == "Public"
 }
 
 // buildPostRecord translates the Page fields per the community.post

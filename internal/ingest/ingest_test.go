@@ -288,8 +288,10 @@ func newHarness(t *testing.T) *harness {
 		Materializer:   h.mat,
 		Fetcher:        h.client,
 		Objects:        objects,
+		Actors:         actors,
 		Communities:    communities,
 		Tombstones:     tombstones,
+		Records:        manager,
 		Votes:          h.votes,
 		Backfill:       h.backfills,
 		ServiceActorID: h.service.ID,
@@ -461,6 +463,28 @@ func (h *harness) serveLemmyWorldContent() {
 	personDoc, err := os.ReadFile(filepath.Join("..", "ap", "testdata", "person_lemmy_world.json"))
 	require.NoError(h.t, err)
 	h.serveJSON("/u/LeftLeaningFreedomFighters", personDoc)
+}
+
+// bridgePost materializes one post under an ap id the caller owns, so the
+// test controls what that id's origin path serves. serveJSON's fixture
+// handlers always answer 200 and cannot be re-registered, but the
+// interesting authorization cases (404, 500, a redirect) are all non-200 —
+// and the announce's embedded Page is same-authority, so bridging it needs
+// no fetch of the post path at all.
+func (h *harness) bridgePost(group *remoteActor, slug string) string {
+	h.t.Helper()
+	postID := "https://lemmy.world/post/" + slug
+	announce := loadFixture(h.t, "announce_create_page_lemmy_world.json")
+	announce["id"] = "https://lemmy.world/activities/announce/create/" + slug
+	create := announce["object"].(map[string]any)
+	create["id"] = "https://lemmy.world/activities/create/" + slug
+	create["object"].(map[string]any)["id"] = postID
+	require.Equal(h.t, http.StatusAccepted, h.deliver(group, announce))
+	h.drain()
+	mapping, err := h.objects.GetByAPID(context.Background(), postID)
+	require.NoError(h.t, err)
+	require.False(h.t, mapping.IsDeleted())
+	return postID
 }
 
 // deliver signs and posts an activity to the bridge inbox, returning the

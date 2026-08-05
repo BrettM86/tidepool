@@ -52,6 +52,11 @@ func (s *stubMaterializer) HandleDelete(context.Context, string) error {
 	return nil
 }
 
+func (s *stubMaterializer) HandleDeleteRecord(context.Context, string) error {
+	s.t.Fatal("votes must never reach HandleDeleteRecord")
+	return nil
+}
+
 func (s *stubMaterializer) RefreshActor(context.Context, *ap.Object) (*store.BridgedActor, error) {
 	s.t.Fatal("votes must never reach RefreshActor")
 	return nil, nil
@@ -74,6 +79,10 @@ type stubFetcher struct{ t *testing.T }
 func (s *stubFetcher) FetchObject(_ context.Context, iri string) (*ap.Object, error) {
 	s.t.Errorf("unexpected fetch of %s while dispatching votes", iri)
 	return nil, errors.NewNotFoundError("object", iri)
+}
+
+func (s *stubFetcher) FetchObjectSameAuthority(ctx context.Context, iri string) (*ap.Object, error) {
+	return s.FetchObject(ctx, iri)
 }
 
 // deliverVote runs one activity through Handler.Process the way the queue
@@ -137,8 +146,10 @@ func TestFakeLemmyVoteE2E(t *testing.T) {
 		Materializer:   &stubMaterializer{t: t},
 		Fetcher:        &stubFetcher{t: t},
 		Objects:        objects,
+		Actors:         store.NewBridgedActors(database),
 		Communities:    communities,
 		Tombstones:     store.NewTombstones(database),
+		Records:        &fakeRecords{records: map[string]map[string]any{}},
 		Votes:          agg,
 		ServiceActorID: e2eServiceID,
 	})
@@ -186,8 +197,10 @@ func TestBareVoteDispatch(t *testing.T) {
 		Materializer:   &stubMaterializer{t: t},
 		Fetcher:        &stubFetcher{t: t},
 		Objects:        objects,
+		Actors:         store.NewBridgedActors(database),
 		Communities:    store.NewCommunities(database),
 		Tombstones:     store.NewTombstones(database),
+		Records:        &fakeRecords{records: map[string]map[string]any{}},
 		Votes:          agg,
 		ServiceActorID: e2eServiceID,
 	})

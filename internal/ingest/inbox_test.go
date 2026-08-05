@@ -145,7 +145,7 @@ func TestInboxTombstonedSelfDeleteAccepted(t *testing.T) {
 	h.drain()
 	// Processed as a real delete: the tombstone marker (the
 	// create-after-delete guard) is recorded for the actor id.
-	gone, err := h.tombstones.Exists(context.Background(), ghost)
+	gone, err := h.tombstones.ExistsFor(context.Background(), ghost, "")
 	require.NoError(t, err)
 	assert.True(t, gone, "the accepted self-delete must reach handleDelete")
 }
@@ -196,7 +196,7 @@ func TestInboxTombstonedKeyCannotForgeDeleteOfLiveActor(t *testing.T) {
 		"a live actor's self-delete must not be forgeable via a tombstoned keyId")
 	_, err = h.events.GetEvent(context.Background(), activityID)
 	assert.True(t, errors.IsNotFound(err))
-	gone, err := h.tombstones.Exists(context.Background(), victim.id)
+	gone, err := h.tombstones.ExistsFor(context.Background(), victim.id, "")
 	require.NoError(t, err)
 	assert.False(t, gone, "no tombstone may be recorded for the live victim")
 }
@@ -237,7 +237,7 @@ func TestInboxTombstoneConfirmationInconclusiveDeferred(t *testing.T) {
 	_, err = h.events.GetEvent(context.Background(), activityID)
 	assert.True(t, errors.IsNotFound(err), "deferred deliveries must not be enqueued")
 	h.drain()
-	gone, err := h.tombstones.Exists(context.Background(), ghost)
+	gone, err := h.tombstones.ExistsFor(context.Background(), ghost, "")
 	require.NoError(t, err)
 	assert.False(t, gone, "no tombstone may be recorded on an inconclusive confirmation")
 }
@@ -265,7 +265,7 @@ func TestInboxTombstoneConfirmationFollowsSameAuthorityRedirect(t *testing.T) {
 	require.Equal(t, http.StatusAccepted, status,
 		"a same-authority redirect to 410 must confirm the tombstone")
 	h.drain()
-	gone, err := h.tombstones.Exists(context.Background(), ghost)
+	gone, err := h.tombstones.ExistsFor(context.Background(), ghost, "")
 	require.NoError(t, err)
 	assert.True(t, gone)
 }
@@ -298,7 +298,7 @@ func TestInboxTombstoneConfirmationRejectsCrossAuthorityRedirect(t *testing.T) {
 	_, err = h.events.GetEvent(context.Background(), activityID)
 	assert.True(t, errors.IsNotFound(err), "rejected deliveries must not be enqueued")
 	h.drain()
-	gone, err := h.tombstones.Exists(context.Background(), ghost)
+	gone, err := h.tombstones.ExistsFor(context.Background(), ghost, "")
 	require.NoError(t, err)
 	assert.False(t, gone, "no tombstone may be recorded via an off-origin redirect")
 }

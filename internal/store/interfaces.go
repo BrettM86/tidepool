@@ -250,16 +250,33 @@ type InboxEvents interface {
 // without) a materialization — the create-after-delete gap: a Create
 // delivered after its Delete must not resurrect content the origin removed.
 // Undo{Delete} removes the marker.
+//
+// Markers are SCOPED to the authority that laid them (migration 015): the
+// announcing community's AP group id, or "" for an origin-authorized marker
+// (a bare same-authority Delete, the admin sweep's verified 410) which is
+// global. Announced deletes are accepted for ids the bridge has no mapping
+// for — that allowance is what closes the delete-before-create race — so an
+// UNSCOPED marker would let any one followed community pre-suppress arbitrary
+// ids belonging to OTHER communities for the whole retention window. Scoping
+// keeps a community's reach inside its own content.
 type Tombstones interface {
-	// Record idempotently marks an AP id as deleted upstream.
-	Record(ctx context.Context, apID string) error
+	// Record idempotently marks an AP id as deleted upstream, scoped to
+	// announcer (the announcing community's AP group id; "" for an
+	// origin-authorized, global marker).
+	Record(ctx context.Context, apID, announcer string) error
 
-	// Exists reports whether the AP id carries a tombstone marker.
-	Exists(ctx context.Context, apID string) (bool, error)
+	// ExistsFor reports whether the AP id carries a marker VISIBLE in
+	// communityIRI's context: a global marker, or one laid by that same
+	// community. A caller with no community context passes "" and sees only
+	// global markers.
+	ExistsFor(ctx context.Context, apID, communityIRI string) (bool, error)
 
-	// Remove clears the marker (Undo{Delete}/restore). Removing a missing
-	// marker is a no-op success.
-	Remove(ctx context.Context, apID string) error
+	// Remove clears markers (Undo{Delete}/restore). A community clears its
+	// OWN marker only — never the global one, which is origin-authorized and
+	// outranks it; "" is that origin authority and clears every marker for the
+	// id (see the implementation for why the read and write sides are
+	// deliberately asymmetric). Removing a missing marker is a no-op success.
+	Remove(ctx context.Context, apID, communityIRI string) error
 
 	// Prune deletes markers recorded before the cutoff, in batches, and
 	// returns how many were deleted. Retention trade-off, accepted: a

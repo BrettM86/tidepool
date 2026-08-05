@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"testing"
 	"time"
 
@@ -22,27 +23,123 @@ func TestTombstonesPrune(t *testing.T) {
 	ctx := context.Background()
 
 	for _, id := range []string{"https://l.test/post/old1", "https://l.test/post/old2", "https://l.test/post/fresh"} {
-		require.NoError(t, tombstones.Record(ctx, id))
+		require.NoError(t, tombstones.Record(ctx, id, ""))
 	}
+	// A second, community-scoped marker on an aged id: pruning is per
+	// (ap_id, announcer), so this fresh row must survive its aged sibling.
+	require.NoError(t, tombstones.Record(ctx, "https://l.test/post/old2", "https://l.test/c/tech"))
 	_, err := database.Exec(
-		`UPDATE ap_tombstones SET deleted_at = NOW() - INTERVAL '40 days' WHERE ap_id LIKE '%old%'`)
+		`UPDATE ap_tombstones SET deleted_at = NOW() - INTERVAL '40 days'
+		 WHERE ap_id LIKE '%old%' AND announcer = ''`)
 	require.NoError(t, err)
 
 	n, err := tombstones.Prune(ctx, time.Now().Add(-30*24*time.Hour))
 	require.NoError(t, err)
 	assert.Equal(t, int64(2), n)
 
-	gone, err := tombstones.Exists(ctx, "https://l.test/post/old1")
+	gone, err := tombstones.ExistsFor(ctx, "https://l.test/post/old1", "")
 	require.NoError(t, err)
 	assert.False(t, gone, "aged marker pruned")
-	kept, err := tombstones.Exists(ctx, "https://l.test/post/fresh")
+	kept, err := tombstones.ExistsFor(ctx, "https://l.test/post/fresh", "")
 	require.NoError(t, err)
 	assert.True(t, kept, "fresh marker survives")
+	sibling, err := tombstones.ExistsFor(ctx, "https://l.test/post/old2", "https://l.test/c/tech")
+	require.NoError(t, err)
+	assert.True(t, sibling, "pruning an aged marker must not take a fresh sibling scope with it")
 
 	// Nothing left to prune: zero, no error.
 	n, err = tombstones.Prune(ctx, time.Now().Add(-30*24*time.Hour))
 	require.NoError(t, err)
 	assert.Zero(t, n)
+}
+
+// TestTombstoneScoping pins the cross-community suppression fix (migration
+// 015): a marker laid by one announcing community is invisible to every other
+// community, only origin-authorized ("") markers are global, and an undo
+// clears no more than its own authority covers.
+func TestTombstoneScoping(t *testing.T) {
+	database := testutil.DB(t)
+	testutil.Truncate(t, database, "ap_tombstones")
+	tombstones := NewTombstones(database)
+	ctx := context.Background()
+
+	const (
+		apID    = "https://l.test/post/contested"
+		commA   = "https://l.test/c/aaa"
+		commB   = "https://l.test/c/bbb"
+		globalD = "https://l.test/post/origin-deleted"
+	)
+
+	// A's announced delete of an id it does not own.
+	require.NoError(t, tombstones.Record(ctx, apID, commA))
+
+	seen, err := tombstones.ExistsFor(ctx, apID, commA)
+	require.NoError(t, err)
+	assert.True(t, seen, "the announcing community sees its own marker")
+	seen, err = tombstones.ExistsFor(ctx, apID, commB)
+	require.NoError(t, err)
+	assert.False(t, seen, "another community must not see A's marker")
+	seen, err = tombstones.ExistsFor(ctx, apID, "")
+	require.NoError(t, err)
+	assert.False(t, seen, "a caller with no community context sees only global markers")
+
+	// B's independent marker for the same id coexists (composite key), and
+	// removing it in B's context leaves A's alone.
+	require.NoError(t, tombstones.Record(ctx, apID, commB))
+	require.NoError(t, tombstones.Remove(ctx, apID, commB))
+	seen, err = tombstones.ExistsFor(ctx, apID, commA)
+	require.NoError(t, err)
+	assert.True(t, seen, "an undo in B's context must not clear A's marker")
+
+	// A community's undo clears its OWN row and nothing else. It must not take
+	// the GLOBAL marker with it: that one carries the ORIGIN's authority, which
+	// outranks any community's, and destroying it (the old `announcer IN ('',
+	// $2)` form) inverted the privilege — one followed community's undo
+	// un-suppressed an id the object's own instance had said was gone.
+	require.NoError(t, tombstones.Record(ctx, apID, ""))
+	require.NoError(t, tombstones.Remove(ctx, apID, commA))
+	assert.Equal(t, []string{""}, announcersFor(t, database, apID),
+		"a scoped remove deletes exactly its own row")
+	seen, err = tombstones.ExistsFor(ctx, apID, commA)
+	require.NoError(t, err)
+	assert.True(t, seen, "the origin-authorized marker survives a community's undo")
+
+	// An origin-authorized marker is global — every community sees it...
+	require.NoError(t, tombstones.Record(ctx, globalD, ""))
+	for _, scope := range []string{"", commA, commB} {
+		seen, err = tombstones.ExistsFor(ctx, globalD, scope)
+		require.NoError(t, err)
+		assert.True(t, seen, "a global marker is visible in every scope")
+	}
+	// ...and a bare (origin-authorized) undo outranks any community's claim:
+	// it clears every marker for the id.
+	require.NoError(t, tombstones.Record(ctx, globalD, commA))
+	require.NoError(t, tombstones.Remove(ctx, globalD, ""))
+	seen, err = tombstones.ExistsFor(ctx, globalD, commA)
+	require.NoError(t, err)
+	assert.False(t, seen, "an origin-authorized undo clears community markers too")
+
+	// Removing what is not there is a no-op success.
+	require.NoError(t, tombstones.Remove(ctx, "https://l.test/post/never", commA))
+}
+
+// announcersFor lists the raw marker rows for an ap id. ExistsFor cannot
+// answer "whose row is it" — a global marker is visible in every scope, so it
+// masks exactly the per-announcer removals the scoping rules are about.
+func announcersFor(t *testing.T, database *sql.DB, apID string) []string {
+	t.Helper()
+	rows, err := database.Query(
+		`SELECT announcer FROM ap_tombstones WHERE ap_id = $1 ORDER BY announcer`, apID)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, rows.Close()) }()
+	announcers := []string{}
+	for rows.Next() {
+		var announcer string
+		require.NoError(t, rows.Scan(&announcer))
+		announcers = append(announcers, announcer)
+	}
+	require.NoError(t, rows.Err())
+	return announcers
 }
 
 func TestCommunitiesFollowRetryBookkeeping(t *testing.T) {

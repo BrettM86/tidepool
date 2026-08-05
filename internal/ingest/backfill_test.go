@@ -190,7 +190,9 @@ func TestBackfillSkipsTombstonedReplies(t *testing.T) {
 	ctx := context.Background()
 
 	const replyID = "https://lemmy.world/comment/3001"
-	require.NoError(t, h.tombstones.Record(ctx, replyID))
+	// Scoped to the community being backfilled: its own marker must hold on
+	// its own walk (the global-marker case is covered below).
+	require.NoError(t, h.tombstones.Record(ctx, replyID, groupID))
 
 	community, err := h.communities.GetByAPGroupID(ctx, groupID)
 	require.NoError(t, err)
@@ -332,7 +334,8 @@ func TestBackfillSkipsTombstonedObjects(t *testing.T) {
 	b := newBackfill(t, h, 10)
 	ctx := context.Background()
 
-	require.NoError(t, h.tombstones.Record(ctx, pageID))
+	// An origin-authorized (global) marker: visible on every community's walk.
+	require.NoError(t, h.tombstones.Record(ctx, pageID, ""))
 	community, err := h.communities.GetByAPGroupID(ctx, groupID)
 	require.NoError(t, err)
 	require.NoError(t, b.Run(ctx, community, true))

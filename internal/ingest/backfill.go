@@ -268,7 +268,10 @@ func (b *Backfill) materializeOutboxItem(ctx context.Context, item *ap.Object, c
 
 	// Same funnel rules as live deliveries: never resurrect deleted
 	// content, trust embedded bodies only on the outbox host's authority.
-	tombstoned, err := b.tombstones.Exists(ctx, obj.ID)
+	// The walk reads markers in the backfilled community's scope — its own,
+	// plus origin-authorized ones; a marker another community laid says
+	// nothing about this community's outbox.
+	tombstoned, err := b.tombstones.ExistsFor(ctx, obj.ID, communityIRI)
 	if err != nil {
 		return false, fmt.Errorf("ingest: tombstone check for %s: %w", obj.ID, err)
 	}
@@ -286,7 +289,7 @@ func (b *Backfill) materializeOutboxItem(ctx context.Context, item *ap.Object, c
 			return false, err
 		}
 		b.seedCounts(ctx, obj.ID)
-		b.backfillReplies(ctx, obj)
+		b.backfillReplies(ctx, obj, communityIRI)
 		return true, nil
 	case ap.TypeNote:
 		if _, err := b.mat.MaterializeComment(ctx, obj); err != nil {
@@ -318,7 +321,9 @@ func (b *Backfill) seedCounts(ctx context.Context, postAPID string) {
 
 // backfillReplies pages a post's advertised replies collection. Failures
 // are logged, never fatal — replies are best-effort garnish on backfill.
-func (b *Backfill) backfillReplies(ctx context.Context, post *ap.Object) {
+// communityIRI is the community being backfilled, carried for the scoped
+// tombstone lookup below.
+func (b *Backfill) backfillReplies(ctx context.Context, post *ap.Object, communityIRI string) {
 	if post.Replies == nil || post.Replies.ID == "" {
 		// Not advertised (or inline-only, which Lemmy never emits).
 		return
@@ -342,7 +347,7 @@ func (b *Backfill) backfillReplies(ctx context.Context, post *ap.Object) {
 		// Same funnel rule as the live path and materializeOutboxItem: a reply
 		// with a recorded Delete must never be resurrected, even if it still
 		// lingers in the origin's replies collection (delivery/collection race).
-		tombstoned, err := b.tombstones.Exists(ctx, resolved.ID)
+		tombstoned, err := b.tombstones.ExistsFor(ctx, resolved.ID, communityIRI)
 		if err != nil {
 			b.logger.Warn("backfill reply tombstone check failed", "post", post.ID, "reply", resolved.ID, "error", err)
 			return nil

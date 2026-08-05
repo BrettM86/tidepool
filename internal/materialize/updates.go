@@ -42,10 +42,12 @@ func (m *Materializer) HandleUpdate(ctx context.Context, obj *ap.Object) (*Resul
 	}
 }
 
-// HandleDelete processes an AP Delete (or Tombstone) for an object or an
-// actor. Actor ids trigger the full Delete(Actor) scrub; object ids delete
-// the single record and soft-delete its mapping. Unknown ids are a logged
-// no-op (nothing was ever bridged). Idempotent throughout.
+// HandleDelete processes an AP Delete (or Tombstone) whose target has NOT
+// been classified yet: a known actor id triggers the full Delete(Actor)
+// scrub, everything else routes to HandleDeleteRecord. The actor lookup is a
+// fresh read, so a caller that already decided the target is content must
+// call HandleDeleteRecord directly rather than come through here — see the
+// TOCTOU that entry point closes.
 func (m *Materializer) HandleDelete(ctx context.Context, apID string) error {
 	if apID == "" {
 		return errors.NewValidationError("ap_id", "must not be empty")
@@ -58,7 +60,24 @@ func (m *Materializer) HandleDelete(ctx context.Context, apID string) error {
 	} else if !errors.IsNotFound(err) {
 		return fmt.Errorf("materialize: look up actor for delete %s: %w", apID, err)
 	}
+	return m.HandleDeleteRecord(ctx, apID)
+}
 
+// HandleDeleteRecord is the CONTENT-only delete: one record removed, its
+// mapping soft-deleted, and never — under any interleaving — the terminal
+// Delete(Actor) scrub. That is the point of it existing separately.
+// Authorization decides actor-vs-content against the state it can see
+// (ingest.authorizeDelete: an announced delete may only ever reach content),
+// and an actor mid-mint has NEITHER a bridged_actors row nor a mapping at
+// that moment but an actor row moments later; re-deriving the branch here
+// from a fresh read would hand that window's actor a terminal scrub off an
+// unrelated community's announced delete. Actor/community PROFILE mappings
+// are refused for the same reason — a profile record belongs to the actor
+// paths. Unknown ids are a logged no-op; idempotent throughout.
+func (m *Materializer) HandleDeleteRecord(ctx context.Context, apID string) error {
+	if apID == "" {
+		return errors.NewValidationError("ap_id", "must not be empty")
+	}
 	mapping, err := m.objects.GetByAPID(ctx, apID)
 	if errors.IsNotFound(err) {
 		// Nothing bridged under this id. Usually a delete for content we
@@ -72,6 +91,11 @@ func (m *Materializer) HandleDelete(ctx context.Context, apID string) error {
 	}
 	if err != nil {
 		return fmt.Errorf("materialize: look up mapping for delete %s: %w", apID, err)
+	}
+	if mapping.Collection == CollectionActorProfile || mapping.Collection == CollectionCommunityProfile {
+		m.logger.Warn("content delete targets an actor profile; refused",
+			"ap_id", apID, "at_uri", mapping.ATURI)
+		return nil
 	}
 	return m.deleteMapping(ctx, mapping)
 }

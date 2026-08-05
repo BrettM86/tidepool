@@ -17,16 +17,26 @@ type Materializer interface {
 	MaterializePost(ctx context.Context, page *ap.Object) (*materialize.Result, error)
 	MaterializeComment(ctx context.Context, note *ap.Object) (*materialize.Result, error)
 	HandleUpdate(ctx context.Context, obj *ap.Object) (*materialize.Result, error)
+	// HandleDelete branches actor vs content off a FRESH bridged_actors read;
+	// HandleDeleteRecord is the content-only entry that never can. Callers
+	// that already classified the target (handleDelete, SweepDeleted) use the
+	// latter — see materialize.HandleDeleteRecord for the TOCTOU it closes.
 	HandleDelete(ctx context.Context, apID string) error
+	HandleDeleteRecord(ctx context.Context, apID string) error
 	RefreshActor(ctx context.Context, actorRef *ap.Object) (*store.BridgedActor, error)
 	RefreshCommunity(ctx context.Context, groupRef *ap.Object) (*store.Community, error)
 	EnsureCommunity(ctx context.Context, groupRef *ap.Object) (*store.Community, error)
 }
 
 // Fetcher is the slice of *ap.Client the dispatcher uses to re-fetch
-// objects it must not trust from a delivery.
+// objects it must not trust from a delivery. The same-authority variant is
+// required wherever a fetch's ANSWER is the authorization decision — the
+// delete sweep's 410 (sweep.go) and the restore's "the origin serves it
+// again" (consent.go) — because a redirect off the object's own origin must
+// not be able to answer those.
 type Fetcher interface {
 	FetchObject(ctx context.Context, iri string) (*ap.Object, error)
+	FetchObjectSameAuthority(ctx context.Context, iri string) (*ap.Object, error)
 }
 
 // Backfiller is notified when a community's Follow is accepted (the
@@ -35,15 +45,25 @@ type Backfiller interface {
 	TriggerAsync(community *store.Community, force bool)
 }
 
+// RecordGetter is the slice of the repo manager the dispatcher reads
+// committed records back through: an announced comment delete is authorized
+// by the comment's stored reply.root (see authorizeDelete), which no mapping
+// column carries.
+type RecordGetter interface {
+	GetRecord(ctx context.Context, did, collection, rkey string) (record map[string]any, recordCID string, err error)
+}
+
 // HandlerOptions configures NewHandler. Materializer, Fetcher, Objects,
-// Communities, Tombstones, Votes, and ServiceActorID are required;
-// Backfill and Logger are optional.
+// Actors, Communities, Tombstones, Records, Votes, and ServiceActorID are
+// required; Backfill and Logger are optional.
 type HandlerOptions struct {
 	Materializer Materializer
 	Fetcher      Fetcher
 	Objects      store.APObjects
+	Actors       store.BridgedActors
 	Communities  store.Communities
 	Tombstones   store.Tombstones
+	Records      RecordGetter
 	Votes        VoteAggregator
 	Backfill     Backfiller
 	// ServiceActorID is the bridge's own AP actor id; Accepts must wrap a
@@ -60,8 +80,10 @@ type Handler struct {
 	mat         Materializer
 	fetcher     Fetcher
 	objects     store.APObjects
+	actors      store.BridgedActors
 	communities store.Communities
 	tombstones  store.Tombstones
+	records     RecordGetter
 	votes       VoteAggregator
 	backfill    Backfiller
 	serviceID   string
@@ -79,11 +101,17 @@ func NewHandler(opts HandlerOptions) (*Handler, error) {
 	if opts.Objects == nil {
 		return nil, errors.NewValidationError("objects", "must not be nil")
 	}
+	if opts.Actors == nil {
+		return nil, errors.NewValidationError("actors", "must not be nil")
+	}
 	if opts.Communities == nil {
 		return nil, errors.NewValidationError("communities", "must not be nil")
 	}
 	if opts.Tombstones == nil {
 		return nil, errors.NewValidationError("tombstones", "must not be nil")
+	}
+	if opts.Records == nil {
+		return nil, errors.NewValidationError("records", "must not be nil")
 	}
 	if opts.Votes == nil {
 		return nil, errors.NewValidationError("votes", "must not be nil")
@@ -99,8 +127,10 @@ func NewHandler(opts HandlerOptions) (*Handler, error) {
 		mat:         opts.Materializer,
 		fetcher:     opts.Fetcher,
 		objects:     opts.Objects,
+		actors:      opts.Actors,
 		communities: opts.Communities,
 		tombstones:  opts.Tombstones,
+		records:     opts.Records,
 		votes:       opts.Votes,
 		backfill:    opts.Backfill,
 		serviceID:   opts.ServiceActorID,
@@ -133,9 +163,9 @@ func (h *Handler) Process(ctx context.Context, event *store.InboxEvent) error {
 	case ap.TypeCreate, ap.TypeUpdate:
 		return h.handleBareCreateUpdate(ctx, activity, signer)
 	case ap.TypeDelete:
-		return h.handleDelete(ctx, activity, signer, "")
+		return h.handleDelete(ctx, activity, signer, nil)
 	case ap.TypeUndo:
-		return h.handleUndo(ctx, activity, signer, "")
+		return h.handleUndo(ctx, activity, signer, nil)
 	case ap.TypeAccept:
 		return h.handleAccept(ctx, activity, signer)
 	case ap.TypeReject:
@@ -200,9 +230,13 @@ func (h *Handler) handleAnnounce(ctx context.Context, announce *ap.Object, signe
 	case ap.TypeLike, ap.TypeDislike:
 		return h.votes.ApplyVote(ctx, inner, signer)
 	case ap.TypeDelete:
-		return h.handleDelete(ctx, inner, signer, signer)
+		// The already-resolved community travels with the activity: the
+		// delete authorization needs its repo DID, and re-reading it there
+		// would turn a "we do not follow it" miss into a retryable error on
+		// an ordering key that would then never drain.
+		return h.handleDelete(ctx, inner, signer, community)
 	case ap.TypeUndo:
-		return h.handleUndo(ctx, inner, signer, signer)
+		return h.handleUndo(ctx, inner, signer, community)
 	default:
 		// Lock, Add, Remove, Block, ... — moderation activities the bridge
 		// does not translate in v1.
@@ -250,7 +284,21 @@ func (h *Handler) materializeContent(ctx context.Context, obj *ap.Object, signer
 	// Create-after-delete: a Delete for this id may have arrived before any
 	// materialization (no mapping to tombstone — task 05's known gap). The
 	// ap_tombstones marker closes it here, in the ingest layer.
-	tombstoned, err := h.tombstones.Exists(ctx, obj.ID)
+	//
+	// Markers are scoped to whoever laid them, so the lookup needs this
+	// delivery's community context — and that context may only come from
+	// somewhere the DELIVERY cannot choose. Announced: the announcer, which
+	// the inbox bound to the HTTP signature, so a community's own marker
+	// suppresses its own re-announce right here, before any outbound fetch.
+	// Bare: nothing trustworthy names a community yet — the only candidate is
+	// the delivered body's audience, and a Create carrying a bare reference
+	// ({"id": X} with no type and no audience) names none at all, which would
+	// read straight past the community-scoped marker that a delete-before-
+	// create left for exactly this id. So the early check is global-only
+	// (still free, and a globally tombstoned id costs no fetch), and the
+	// community-scoped half runs below against the body resolveDelivered
+	// actually vouches for.
+	tombstoned, err := h.tombstones.ExistsFor(ctx, obj.ID, announcer)
 	if err != nil {
 		return fmt.Errorf("ingest: tombstone check for %s: %w", obj.ID, err)
 	}
@@ -269,6 +317,18 @@ func (h *Handler) materializeContent(ctx context.Context, obj *ap.Object, signer
 		communityIRI := communityIRIFrom(obj)
 		if communityIRI == "" {
 			return skip(obj.ID, "bare delivery names no community (no audience group IRI)")
+		}
+		// The community-scoped half of the create-after-delete check, deferred
+		// from above: this audience comes from a body the origin served (or one
+		// the signer vouched for on its own authority), not from a reference the
+		// deliverer wrote, so a marker laid by the community this object claims
+		// to belong to now applies to it.
+		tombstoned, err := h.tombstones.ExistsFor(ctx, obj.ID, communityIRI)
+		if err != nil {
+			return fmt.Errorf("ingest: tombstone check for %s: %w", obj.ID, err)
+		}
+		if tombstoned {
+			return skip(obj.ID, "object was deleted upstream before it was ever materialized")
 		}
 		community, err := h.communities.GetByAPGroupID(ctx, communityIRI)
 		if errors.IsNotFound(err) {
@@ -328,11 +388,31 @@ func (h *Handler) resolveDelivered(ctx context.Context, obj *ap.Object, signer s
 }
 
 // fetchBound fetches an object by IRI and binds the body's self-asserted id
-// to the fetch authority (empty ids inherit the request IRI). Unavailable
-// and tombstoned objects are skips: content that cannot be verified at its
-// origin is dropped, not retried.
+// to the fetch authority (empty ids inherit the request IRI). Redirects stay
+// permissive: here the origin's answer is CONTENT, and the id binding below
+// is what keeps a redirect from forging another instance's object.
 func (h *Handler) fetchBound(ctx context.Context, iri string) (*ap.Object, error) {
-	fetched, err := h.fetcher.FetchObject(ctx, iri)
+	return h.bindFetch(ctx, iri, h.fetcher.FetchObject)
+}
+
+// fetchBoundSameAuthority is fetchBound with the redirect authority pinned to
+// the requested IRI — for the one dispatch fetch whose ANSWER is an
+// authorization decision and not just content: the restore's "the origin
+// serves this object again" (handleUndoDelete), which both licenses
+// re-materializing the record and supplies its body. An open redirect on the
+// origin would otherwise hand both to whoever it points at. The refusal is a
+// validation error, so the event poisons instead of retrying against a
+// redirect the origin is not about to withdraw.
+func (h *Handler) fetchBoundSameAuthority(ctx context.Context, iri string) (*ap.Object, error) {
+	return h.bindFetch(ctx, iri, h.fetcher.FetchObjectSameAuthority)
+}
+
+// bindFetch runs one of the Fetcher's fetches and applies the shared binding
+// rules. Unavailable and tombstoned objects are skips: content that cannot be
+// verified at its origin is dropped, not retried.
+func (h *Handler) bindFetch(ctx context.Context, iri string,
+	fetch func(context.Context, string) (*ap.Object, error)) (*ap.Object, error) {
+	fetched, err := fetch(ctx, iri)
 	switch {
 	case err == nil:
 	case errors.IsTombstoned(err):
@@ -444,23 +524,6 @@ func (h *Handler) isBridged(ctx context.Context, apID string) (bool, error) {
 	} else {
 		return false, fmt.Errorf("ingest: check bridged state for %s: %w", apID, err)
 	}
-}
-
-// targetIsBridgedActor reports whether an AP id is a bridged ACTOR (its
-// mapping is a profile record), as opposed to a content object. A bridged
-// actor always has a profile mapping (EnsureActor commits rkey "self"), so a
-// harmful Delete(Actor) against a bridged victim is always detectable here;
-// an unbridged actor is a materializer no-op regardless.
-func (h *Handler) targetIsBridgedActor(ctx context.Context, apID string) (bool, error) {
-	mapping, err := h.objects.GetByAPID(ctx, apID)
-	if errors.IsNotFound(err) {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("ingest: classify delete target %s: %w", apID, err)
-	}
-	return mapping.Collection == materialize.CollectionActorProfile ||
-		mapping.Collection == materialize.CollectionCommunityProfile, nil
 }
 
 // refID returns the id of a possibly-nil object reference.

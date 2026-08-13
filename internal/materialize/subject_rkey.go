@@ -52,11 +52,16 @@ var subjectRKeyEncoding = base32.StdEncoding.WithPadding(base32.NoPadding)
 // records are reached by ONE derivation, so pre-reading them is two lookups of
 // one computed value rather than a search.
 //
+// PASS THE MAPPING'S AT-URI VERBATIM, NEVER AN AP ID. The subject is the
+// atproto at://did/collection/rkey the record lives at — the identity Coves
+// indexes under. Hashing an origin-platform AP id instead produces a
+// well-formed key for a subject nobody addresses.
+//
 // THE ARGUMENT IS BYTES, NOT A PARSED URI. Whatever the subject string holds
 // is what gets hashed: no normalization, no percent-decoding, no case folding.
 // Those bytes are the identity Coves' AppView indexes under, so a writer that
 // normalized would key its records to a URI the reader never asks for.
-func SubjectRKey(subjectURI string) string {
-	digest := sha256.Sum256([]byte(subjectURI))
+func SubjectRKey(subjectATURI string) string {
+	digest := sha256.Sum256([]byte(subjectATURI))
 	return strings.ToLower(subjectRKeyEncoding.EncodeToString(digest[:]))
 }

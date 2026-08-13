@@ -132,10 +132,13 @@ func (m *Materializer) SuppressActor(ctx context.Context, apActorID string) erro
 }
 
 // scrubActorRecords tombstones every record an actor authored — records in
-// their own repo (comments, profile) and posts written into community repos
-// (author_did) — and deletes the blobs those records referenced (read out
-// of each record BEFORE its delete commit; post images live under the
-// COMMUNITY's DID, which nothing else would ever clean up). Idempotent:
+// their own repo (postv2 posts, comments, profile) and, for the LEGACY post
+// era only, posts written into community repos (author_did) — and deletes the
+// blobs those records referenced (read out of each record BEFORE its delete
+// commit; a legacy post's images live under the COMMUNITY's DID, which nothing
+// else would ever clean up, while a postv2's live under the author's). A
+// postv2's community-side acceptance goes with it via deleteMapping.
+// Idempotent:
 // already-deleted mappings are no-ops, and blob deletes tolerate missing
 // rows. Shared by DeleteActor (terminal) and the nobridge suppression paths
 // (reversible), so the consent decision is separate from the scrub
@@ -149,8 +152,8 @@ func (m *Materializer) scrubActorRecords(ctx context.Context, actorDID string) (
 		// Delete the referenced blobs BEFORE soft-deleting the mapping, and
 		// fail the whole scrub (a retryable error — NOT a skip) if any blob
 		// delete fails. A swallowed failure orphans a blob that getBlob would
-		// serve forever: post images live under the COMMUNITY's DID, which
-		// nothing else cleans up. The ordering keeps the retry able to heal:
+		// serve forever: a legacy post's images live under the COMMUNITY's DID,
+		// which nothing else cleans up. The ordering keeps the retry able to heal:
 		// while the mapping is still live, ListByActorDID re-lists it and the
 		// record is still readable, so the retry re-collects the same blob
 		// refs and re-deletes them (DeleteBlob tolerates already-missing
@@ -235,9 +238,10 @@ func (m *Materializer) DeleteActor(ctx context.Context, apActorID string) error 
 		return nil
 	}
 
-	// Everything they authored: records in their own repo (comments,
-	// profile) plus posts written into community repos (author_did) — and
-	// the blobs those records referenced (scrubActorRecords).
+	// Everything they authored: records in their own repo (postv2 posts,
+	// comments, profile) plus — legacy era only — posts written into community
+	// repos (author_did), and the blobs those records referenced
+	// (scrubActorRecords).
 	n, err := m.scrubActorRecords(ctx, actor.DID)
 	if err != nil {
 		return err

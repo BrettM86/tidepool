@@ -13,22 +13,31 @@ import (
 
 // Announced-vote community binding for the postv2 era (PLAN.md decision 20).
 //
-// subjectBelongsToCommunity binds an announced vote to its community by
-// comparing the subject's REPO DID against the announcing community's DID.
-// That worked only because posts used to live in the community's repo. Since
-// the flip a post is a postv2 in the AUTHOR's repo, so the comparison is
-// false for every legitimate vote, and a comment's reply.root now names the
-// author's repo too — both eras of the check fail OPEN in the safe direction
-// (votes silently dropped), which is why nothing else caught it: counts just
-// stop moving.
+// An announced vote counts only for the community that owns its subject:
+// without that binding, one followed community could Announce Like/Dislike
+// against ANY bridged subject and skew every other community's scores.
 //
-// FIXTURE NOTE FOR THE IMPLEMENTER. These tests assert BEHAVIOR only —
-// applied vs dropped — and never how the community is recovered. The fixtures
-// express the linkage with the shapes that exist today: the postv2 mapping in
-// the author's repo, plus the stored postv2 record carrying `community` (the
-// materializer writes both). If the implementation instead recovers the
-// community from a new ap_objects.community_did column, extend the fixture
-// helpers below to populate it — the assertions must not move.
+// Which community owns a subject is answered by materialize.CommunityDIDOf.
+// Until task 19 the answer was implicit in placement — a post lived in its
+// community's repo, so the mapping's DID WAS the community, and a comment
+// borrowed its thread root's repo DID. After the flip a postv2 lives in the
+// AUTHOR's repo and matches no community DID at all, so ownership is recorded
+// explicitly (ap_objects.community_did) with the record as the fallback.
+//
+// Both directions of that check fail CLOSED: a subject whose community cannot
+// be determined is refused, never admitted. That is the safe direction, and
+// also the quiet one — a binding that stopped recognising legitimate subjects
+// would drop real votes silently, with nothing but flat counts to show for
+// it, which is why these tests assert the POSITIVE cases as hard as the
+// negative one.
+//
+// FIXTURE NOTE. These tests assert BEHAVIOR only — applied vs dropped — and
+// never how the community is recovered. They deliberately populate the
+// mapping's community linkage AND the stored postv2 record's `community`
+// field, which is the shape a pre-016 row has: that keeps the record
+// fallback in CommunityDIDOf exercised rather than only its column fast
+// path, since rows written before the migration are answerable from the
+// record alone.
 const (
 	// postAuthorDID is the repo a postv2 lives in: the AUTHOR's, never the
 	// community's.
@@ -116,8 +125,11 @@ func TestAnnouncedCommentVoteOnPostV2ThreadCounts(t *testing.T) {
 // community announcing at this post is exactly the attack the binding
 // exists for — one malicious followed community skewing another's scores.
 //
-// This one passes TODAY (everything postv2 is dropped) and must still pass
-// after the fix; a fix that simply stopped checking would flip it red.
+// It has always passed — before the flip because every postv2 subject was
+// dropped, since it because the binding names the right owner — so its value
+// is entirely as a regression guard: a binding that recovered the community
+// but forgot to compare it, or that admitted any followed announcer, turns
+// this red while V1 and V2 stay green.
 func TestAnnouncedVoteOnPostV2ByOtherCommunityDropped(t *testing.T) {
 	database := testDB(t)
 	agg, objects, records := testAggregatorWithRecords(t, database)

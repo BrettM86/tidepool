@@ -31,7 +31,10 @@ renamed or repurposed):
 - `handle` — the BARE origin-platform username (the local part, original
   casing, derived from the canonical actor IRI). NOT the bridged
   atproto handle: `instance` sits beside it, and the bridged handle is
-  derivable from the repo DID.
+  derivable from the repo DID. Fallback: when the actor IRI has no usable
+  final path segment, the local part of the BRIDGED handle is used instead,
+  which is lowercased — so original casing is a property of the common case,
+  not a guarantee.
 - `instance` — the origin host.
 - `displayName` — optional; present only when the FETCHED,
   authority-bound actor document asserts a `name`. Never sourced from

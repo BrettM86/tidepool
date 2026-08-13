@@ -36,9 +36,18 @@ type RecordGetter interface {
 //     no UPDATE statement could reach it.
 //
 // An empty return means "cannot be determined": no record, a malformed one, or
-// a collection votes and deletes do not bind to. Callers must treat that as
-// REFUSAL, never as permission — the safe direction is dropping a legitimate
-// announce, not admitting a foreign one.
+// a collection votes and deletes do not bind to. There are exactly TWO
+// sanctioned readings of that, and no third:
+//
+//   - AUTHORIZATION callers (ingest's announced-delete check, votes'
+//     announced-vote binding) must REFUSE — the safe direction is dropping a
+//     legitimate announce, not admitting a foreign one.
+//   - The MATERIALIZATION write path records it as unset, leaving the column
+//     NULL so a later read can still derive the answer from the record.
+//
+// Nothing else may consume an empty value. In particular it must never be
+// compared against a community DID, because "" == "" would make two unbindable
+// subjects each other's community.
 func CommunityDIDOf(ctx context.Context, records RecordGetter, mapping *store.APObjectMapping) (string, error) {
 	switch mapping.Collection {
 	case CollectionPost:
@@ -76,7 +85,14 @@ func CommunityDIDOf(ctx context.Context, records RecordGetter, mapping *store.AP
 // side trusts for it — the repo for a legacy post, the record's own
 // `community` for a postv2 — rather than from the caller's freshly-derived
 // value, which on an update may name an audience the record itself rejected.
-func mappingCommunityDID(collection, did string, record map[string]any, fallback string) string {
+func mappingCommunityDID(collection, did string, record map[string]any, fallback, stored string) string {
+	// A binding already made wins over anything this delivery derived. Which
+	// community owns a piece of content is decided once, when it is first
+	// materialized; every later delivery is just an edit of the content, and
+	// an edit may not move content between communities' moderation authority.
+	if stored != "" {
+		return stored
+	}
 	switch collection {
 	case CollectionPost:
 		return did

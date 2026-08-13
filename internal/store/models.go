@@ -92,13 +92,19 @@ type APObjectMapping struct {
 	OriginInstance string // host the object originated from, e.g. lemmy.world
 	Origin         Origin // which side authored the object; defaults to fediverse
 	DID            string // repo the record was written into
-	AuthorDID      string // bridged actor who authored the record; differs from DID for posts (community repo). Optional.
+	// AuthorDID is the bridged actor who authored the record. It differs from
+	// DID only in the LEGACY post era, whose posts were written into the
+	// community's repo; for a postv2 and for comments the author's repo IS
+	// DID, so the two are equal. Optional.
+	AuthorDID string
 	// CommunityDID is the community whose content this is — the membership
 	// answer announced deletes and announced votes authorize against. Since
 	// the author-owned flip it can no longer be read off DID (a postv2 lives
 	// in the author's repo), so it is recorded at materialization time.
 	// Optional: "" means unset, and readers fall back to deriving it from the
-	// record (migration 016 says which rows that covers and why).
+	// record (migration 016 says which rows that covers and why). Read it
+	// through materialize.CommunityDIDOf, never compared directly — a direct
+	// comparison silently treats every pre-016 row as belonging to nobody.
 	CommunityDID string
 	Collection   string     // record NSID, e.g. social.coves.community.post
 	RKey         string     // deterministic TID rkey

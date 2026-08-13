@@ -44,10 +44,12 @@ const (
 // and drops (the previous baseline survives).
 const MaxSeededCount = 1_000_000
 
-// RecordReader is the slice of *repo.Manager the aggregator uses to read a
-// bridged comment's stored record: the record's reply.root strongRef names
-// the thread's root post in the community repo, which is how an announced
-// comment vote is bound to its announcing community.
+// RecordReader is the slice of *repo.Manager the aggregator hands to
+// materialize.CommunityDIDOf: the reader it uses to derive a subject's
+// community when the mapping's community_did is unset (rows written before
+// migration 016), by reading the postv2's `community` field or walking a
+// comment's reply.root to its thread root. A mapping that carries the column
+// needs no read at all.
 type RecordReader interface {
 	GetRecord(ctx context.Context, did, collection, rkey string) (record map[string]any, recordCID string, err error)
 }

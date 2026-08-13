@@ -1117,19 +1117,23 @@ func (h *harness) bridgeGetRecord(t *testing.T, did, collection, rkey string) (r
 	if err != nil {
 		t.Fatalf("getRecord(%s/%s/%s): %v", did, collection, rkey, err)
 	}
-	switch res.status {
-	case http.StatusOK:
+	if res.status == http.StatusOK {
 		if err := json.Unmarshal(res.body, &rec); err != nil {
 			t.Fatalf("getRecord(%s/%s/%s): decode: %v", did, collection, rkey, err)
 		}
 		return rec, true
-	case http.StatusBadRequest, http.StatusNotFound:
-		return bridgeRecord{}, false
-	default:
-		t.Fatalf("getRecord(%s/%s/%s): unexpected status %d: %s",
-			did, collection, rkey, res.status, truncate(res.body, 200))
+	}
+	// ONLY RecordNotFound means the record is absent. Every other refusal is
+	// a bug in the CALLER — an InvalidRequest from a malformed rkey, a
+	// RepoNotFound from the wrong DID — and each would otherwise read as
+	// "the record is gone", turning the absence assertions above into
+	// false greens that pass no matter what the bridge did.
+	if res.errCode == "RecordNotFound" {
 		return bridgeRecord{}, false
 	}
+	t.Fatalf("getRecord(%s/%s/%s): status %d %s (want 200 or RecordNotFound): %s",
+		did, collection, rkey, res.status, res.errCode, truncate(res.body, 200))
+	return bridgeRecord{}, false
 }
 
 // awaitRecordGone polls the repo surface until a record disappears. The
@@ -1652,17 +1656,6 @@ func (l *jsListener) vetEvent(ev *jsEvent) {
 // perform no content edits on the affected records, so an update-with-stats
 // there is unambiguously a stats emission — the helper is not a general
 // "is this only a stats change" classifier.
-// isContentCollection reports whether a collection carries bridged CONTENT —
-// the records the vote-stats refresher stamps bridgedStats onto. Posts of
-// BOTH eras qualify: the deprecated collection because its records still
-// exist and still get swept, postv2 because it is what every new post is.
-// Acceptance and removal are deliberately excluded: they are the community's
-// attestations ABOUT content, they carry no bridgedStats, and an acceptance
-// repin riding a stats sweep is a different event from the stamp itself.
-func isContentCollection(collection string) bool {
-	return collection == colPost || collection == colPostV2 || collection == colComment
-}
-
 func isBridgedStatsUpdate(ev *jsEvent) bool {
 	if ev.Kind != kindCommit || ev.Commit == nil || ev.Commit.Operation != opUpdate {
 		return false
@@ -1969,6 +1962,17 @@ func (h *harness) restartTidepool(t *testing.T) {
 // era — the deprecated community-repo collection or the author-repo postv2.
 func isPostCollection(collection string) bool {
 	return collection == colPost || collection == colPostV2
+}
+
+// isContentCollection reports whether a collection carries bridged CONTENT —
+// the records the vote-stats refresher stamps bridgedStats onto. Posts of BOTH
+// eras qualify: the deprecated collection because its records still exist and
+// still get swept, postv2 because it is what every new post is. Acceptance and
+// removal are excluded on purpose: they are the community's attestations ABOUT
+// content, they carry no bridgedStats, and an acceptance repin riding a stats
+// sweep is a different event from the stamp that caused it.
+func isContentCollection(collection string) bool {
+	return isPostCollection(collection) || collection == colComment
 }
 
 // isAcceptanceRepinOf reports whether a commit is an update to the acceptance

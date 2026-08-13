@@ -53,9 +53,19 @@ func (m *Materializer) MaterializePost(ctx context.Context, page *ap.Object) (*R
 		return nil, err
 	}
 
-	did, collection := author.DID, CollectionPostV2
+	did, collection, authorDID := author.DID, CollectionPostV2, author.DID
 	if existing, err := m.objects.GetByAPID(ctx, page.ID); err == nil {
 		did, collection, rkey = existing.DID, existing.Collection, existing.RKey
+		// The repo a postv2 lives in IS its authorship claim, so authorship is
+		// fixed at first materialization. attributedTo on an updated Page is
+		// proposed by whoever delivered the update: honouring a changed value
+		// would write the record into an unrelated bridged user's repo — the
+		// strongest authorship statement atproto has — and strand the real
+		// author's copy. The stored mapping is the authority on who authored a
+		// bridged object, exactly as the stored record is on its community.
+		if existing.AuthorDID != "" {
+			authorDID = existing.AuthorDID
+		}
 	} else if !errors.IsNotFound(err) {
 		return nil, fmt.Errorf("materialize: check mapping for %s: %w", page.ID, err)
 	}
@@ -81,7 +91,7 @@ func (m *Materializer) MaterializePost(ctx context.Context, page *ap.Object) (*R
 		}
 		record = m.buildPostV2Record(ctx, page, community.DID, author, authorDoc, did)
 	}
-	res, err := m.commitRecord(ctx, did, collection, rkey, record, page, author.DID, community.DID)
+	res, err := m.commitRecord(ctx, did, collection, rkey, record, page, authorDID, community.DID)
 	if err != nil {
 		return nil, err
 	}

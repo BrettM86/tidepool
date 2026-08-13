@@ -16,12 +16,15 @@ import (
 // Fixture ids for the postv2 creation-semantics tests. Distinct from the
 // shared pageID so each test owns its object graph.
 const (
-	imagePageID   = "https://lemmy.world/post/70001"
-	hijackPageID  = "https://lemmy.world/post/70002"
-	statsPageID   = "https://lemmy.world/post/70003"
-	namePageID    = "https://lemmy.world/post/70004"
-	otherGroupID  = "https://lemmy.world/c/elsewhere"
-	embedImageURL = "https://lemmy.world/media/postv2-embed.png"
+	imagePageID        = "https://lemmy.world/post/70001"
+	hijackPageID       = "https://lemmy.world/post/70002"
+	statsPageID        = "https://lemmy.world/post/70003"
+	namePageID         = "https://lemmy.world/post/70004"
+	hijackAuthorPageID = "https://lemmy.world/post/70005"
+	threadPageID       = "https://lemmy.world/post/70010"
+	otherThreadPageID  = "https://lemmy.world/post/70011"
+	otherGroupID       = "https://lemmy.world/c/elsewhere"
+	embedImageURL      = "https://lemmy.world/media/postv2-embed.png"
 )
 
 // embedImageBytes are UNIQUE to these tests: the shared pngBytes are also what
@@ -50,11 +53,13 @@ func blobHolders(t *testing.T, data []byte) []string {
 }
 
 // TestPostV2EmbedBlobsLandInAuthorRepo (B1): a post's embed media is a blob in
-// the repo that HOLDS the record, and after the flip that repo is the
-// AUTHOR's. Today buildPostEmbed fetches every embed blob under the COMMUNITY
-// DID (posts.go fetchBlob calls) — leaving the community hosting bytes for a
-// record it does not carry, which no consumer can resolve: a blob ref is
-// resolved against the repo the record lives in.
+// the repo that HOLDS the record — the AUTHOR's, since the flip.
+//
+// A blob ref resolves against the repo its record lives in and nowhere else,
+// so the two must not be separated: bytes stored under the community DID for
+// a record the community does not carry are unresolvable for every consumer,
+// while the community pays to host them. The fetch DID therefore has to
+// follow the record's repo rather than the community the post names.
 func TestPostV2EmbedBlobsLandInAuthorRepo(t *testing.T) {
 	h := newHarness(t)
 	h.serveLemmyWorldFixtures()
@@ -213,15 +218,17 @@ func TestPostV2CommunityIsImmutableAcrossUpdates(t *testing.T) {
 
 // TestPostV2EditCarriesBridgedStatsForward (B3): the vote refresher stamps
 // bridgedStats onto the record; a later Lemmy EDIT rebuilds from AP data,
-// which never carries stats. commitRecord's carryForward gate currently keys
-// off CollectionPost/CollectionComment — once posts move to postv2 that gate
-// must include the new collection, or every edit silently drops the counts
-// (and mints a needless firehose event, breaking idempotent re-ingest).
+// which never carries stats. commitRecord's carry-forward must therefore
+// cover postv2 as it covers the collection it replaced, or every edit
+// silently drops the counts — and mints a needless firehose event doing it,
+// breaking idempotent re-ingest.
 //
 // The record is read back through its MAPPING rather than at a hard-coded
-// path, so the bridgedStats assertion is exercised whether or not the flip has
-// landed: pre-flip the collection/DID assertions fail, post-flip-without-the-
-// gate the bridgedStats assertion fails.
+// path, which keeps the two halves independent: the collection/DID assertions
+// pin WHERE the edited post lives, and the bridgedStats assertion is
+// exercised whichever repo and collection that turns out to be — so a
+// carry-forward regression surfaces on its own line rather than hiding behind
+// a placement failure.
 func TestPostV2EditCarriesBridgedStatsForward(t *testing.T) {
 	h := newHarness(t)
 	h.serveLemmyWorldFixtures()
@@ -260,4 +267,126 @@ func TestPostV2EditCarriesBridgedStatsForward(t *testing.T) {
 	assert.EqualValues(t, 40, stats["upvotes"])
 	assert.EqualValues(t, 2, stats["downvotes"])
 	assert.Equal(t, recordDatetimeMicros(statsAsOf), stats["asOf"])
+}
+
+// TestPostV2AuthorIsImmutableAcrossUpdates (F5): the repo a postv2 lives in IS
+// its authorship claim, so an edit may never move it.
+//
+// `attributedTo` on an updated Page is attacker-influenced content: whoever
+// can deliver an Update for a post's AP id proposes it. If a rebuild honoured
+// a changed value, one delivery would write a record into an UNRELATED
+// bridged user's repo — the strongest authorship statement atproto has — and
+// leave the real author's copy behind. The stored mapping is the authority on
+// who authored a bridged object, exactly as the stored record is the authority
+// on its community (B2).
+func TestPostV2AuthorIsImmutableAcrossUpdates(t *testing.T) {
+	h := newHarness(t)
+	h.serveLemmyWorldFixtures()
+	h.serveObject("/u/impostor", person("https://lemmy.world/u/impostor", "impostor", nil))
+	ctx := context.Background()
+
+	original := page(hijackAuthorPageID, personID, groupID, "a post by its real author",
+		"2026-07-08T14:00:00.000000Z")
+	_, err := h.m.MaterializePost(ctx, mustObject(t, original))
+	require.NoError(t, err)
+
+	before, err := h.objects.GetByAPID(ctx, hijackAuthorPageID)
+	require.NoError(t, err)
+
+	authorDID := testDIDFor("LeftLeaningFreedomFighters", "lemmy.world")
+	impostorDID := testDIDFor("impostor", "lemmy.world")
+	require.NotEqual(t, authorDID, impostorDID)
+	require.Equal(t, authorDID, before.DID, "precondition: the post is in its real author's repo")
+
+	// The edit now claims a different author.
+	hijacked := page(hijackAuthorPageID, "https://lemmy.world/u/impostor", groupID,
+		"a post by its real author", "2026-07-08T14:00:00.000000Z")
+	_, err = h.m.HandleUpdate(ctx, mustObject(t, hijacked))
+	require.NoError(t, err,
+		"a retargeted attributedTo must not error — it must simply not retarget the record")
+
+	after, err := h.objects.GetByAPID(ctx, hijackAuthorPageID)
+	require.NoError(t, err)
+	assert.Equal(t, authorDID, after.DID,
+		"the record must stay in the ORIGINAL author's repo: the repo is the authorship claim, "+
+			"and an edit that moved it would write into an unrelated user's repo")
+	assert.Equal(t, authorDID, after.AuthorDID, "the mapping's author must not be reassigned by an edit")
+
+	record, _, err := h.manager.GetRecord(ctx, after.DID, after.Collection, after.RKey)
+	require.NoError(t, err)
+	originalAuthor, ok := record["originalAuthor"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, personID, originalAuthor["apId"],
+		"originalAuthor is provenance about who wrote it upstream; an edit may not rewrite it")
+
+	// And nothing was planted in the impostor's repo.
+	_, _, err = h.manager.GetRecord(ctx, impostorDID, testPostV2Collection, after.RKey)
+	assert.True(t, errors.IsNotFound(err),
+		"no postv2 may appear in the claimed author's repo (err=%v)", err)
+}
+
+// TestCommentCommunityIsImmutableAcrossUpdates (F2): a comment's community is
+// fixed by the thread it was posted in, and an edit may not move it.
+//
+// This is the comment counterpart of B2, and it is a SECURITY property rather
+// than a tidiness one. A comment's community_did is what authorizes announced
+// deletes and binds announced votes: whoever the mapping says owns the comment
+// may moderate it. `inReplyTo` on an updated Note is attacker-influenced, so a
+// rebuild that re-derived the community from it would let a delivery hand
+// community B moderation authority over a comment posted in community A —
+// community A's members' content, moderated by a community they never posted
+// to, with no moderator action on A's side at all.
+func TestCommentCommunityIsImmutableAcrossUpdates(t *testing.T) {
+	h := newHarness(t)
+	h.serveLemmyWorldFixtures()
+	h.serveObject("/c/elsewhere", group(otherGroupID, "elsewhere", nil))
+	ctx := context.Background()
+
+	communityA := testDIDFor("technology", "lemmy.world")
+	communityB := testDIDFor("elsewhere", "lemmy.world")
+	require.NotEqual(t, communityA, communityB)
+
+	// A thread in community A, and an unrelated post in community B.
+	postA := page(threadPageID, personID, groupID, "thread root in A", "2026-07-08T15:00:00.000000Z")
+	h.serveObject("/post/70010", postA)
+	_, err := h.m.MaterializePost(ctx, mustObject(t, postA))
+	require.NoError(t, err)
+
+	postB := page(otherThreadPageID, personID, otherGroupID, "thread root in B", "2026-07-08T15:01:00.000000Z")
+	h.serveObject("/post/70011", postB)
+	_, err = h.m.MaterializePost(ctx, mustObject(t, postB))
+	require.NoError(t, err)
+
+	// A comment in A's thread.
+	const commentID = "https://lemmy.world/comment/70012"
+	comment := note(commentID, personID, threadPageID, "a comment in A", "2026-07-08T15:02:00.000000Z")
+	h.serveObject("/comment/70012", comment)
+	_, err = h.m.MaterializeComment(ctx, mustObject(t, comment))
+	require.NoError(t, err)
+
+	before, err := h.objects.GetByAPID(ctx, commentID)
+	require.NoError(t, err)
+	require.Equal(t, communityA, before.CommunityDID, "precondition: the comment belongs to community A")
+
+	// The edit re-parents the comment into community B's thread.
+	hijacked := note(commentID, personID, otherThreadPageID, "a comment in A (edited)",
+		"2026-07-08T15:02:00.000000Z")
+	_, err = h.m.HandleUpdate(ctx, mustObject(t, hijacked))
+	require.NoError(t, err, "a re-parented comment must not error — it must simply not be re-parented")
+
+	after, err := h.objects.GetByAPID(ctx, commentID)
+	require.NoError(t, err)
+	assert.Equal(t, communityA, after.CommunityDID,
+		"the comment's community must stay A: community_did is what authorizes announced deletes "+
+			"and binds announced votes, so moving it hands B moderation authority over A's content")
+
+	// CommunityDIDOf is the exact function ingest's announced-delete
+	// authorization and votes' announced-vote binding both consult, so
+	// asserting it here is asserting who may moderate this comment.
+	resolved, err := CommunityDIDOf(ctx, h.manager, after)
+	require.NoError(t, err)
+	assert.Equal(t, communityA, resolved,
+		"the community that may moderate this comment must still be A, not the one the edit named")
+	assert.NotEqual(t, communityB, resolved,
+		"community B must NOT have acquired authority over a comment posted in A")
 }

@@ -131,8 +131,8 @@ func TestZZ_SuiteEndSweep(t *testing.T) {
 			total, sweepReplayFloor, counts)
 	}
 	if postCreates == 0 {
-		t.Errorf("sweep saw no %s create — a full suite run always emits posts, so the replayed history is incomplete: %v",
-			colPostV2, counts)
+		t.Errorf("sweep saw no post create in either era (%s or %s) — a full suite run always emits posts, so the replayed history is incomplete: %v",
+			colPostV2, colPost, counts)
 	}
 	if deleteOps == 0 {
 		t.Errorf("sweep saw no delete op in any collection — a full suite run always emits deletes (edits/deletes, scrubs), so the replayed history is incomplete: %v",

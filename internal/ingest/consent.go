@@ -105,8 +105,8 @@ func (h *Handler) handleDelete(ctx context.Context, del *ap.Object, signer strin
 	// purpose: the post is not going anywhere. Laying a marker would suppress
 	// the post's own later Creates and Updates, and deleting the record would
 	// hand one community the power to destroy content in all the others.
-	if announcer != nil && del.HasSummary() {
-		handled, err := h.removePostForModerator(ctx, targetID, del.Summary)
+	if announcer != nil {
+		handled, err := h.moderateAnnouncedDelete(ctx, del, targetID)
 		if err != nil || handled {
 			return err
 		}
@@ -141,18 +141,45 @@ func (h *Handler) handleDelete(ctx context.Context, del *ap.Object, signer strin
 	return nil
 }
 
-// removePostForModerator applies a moderator removal to a postv2, reporting
-// whether it took the activity. It declines — leaving the caller on the
-// ordinary delete path — for everything the postv2 moderation records do not
-// describe: an id the bridge never materialized, a mapping already tombstoned,
-// and above all the PRE-FLIP era, whose posts live in the community's own repo
-// with no acceptance to replace. Writing a removal for a legacy post would
-// announce a visibility mechanism Coves does not consult for that collection,
-// so those keep the v1 behaviour exactly: delete the record, tombstone the
-// mapping.
-func (h *Handler) removePostForModerator(ctx context.Context, targetID, reason string) (bool, error) {
+// moderateAnnouncedDelete decides what an ANNOUNCED Delete of bridged content
+// actually is, and applies it when the answer is a community removal. It
+// reports whether it took the activity; declining leaves the caller on the
+// ordinary delete path.
+//
+// TWO questions, in this order:
+//
+//  1. Does the activity carry a `summary`? Lemmy marks a moderator removal by
+//     putting the key on the Delete (EMPTY when no reason was typed) and an
+//     author's own delete by omitting it. Presence, never emptiness.
+//  2. If it does NOT, is the inner Delete's actor the post's author? The
+//     HTTP signature covers the ANNOUNCING COMMUNITY's key, not the inner
+//     attribution, so that attribution is a claim rather than a proof — but
+//     it is the only signal distinguishing the two shapes, and self-delete
+//     semantics DESTROY the author's record. A community announcing a
+//     summary-less Delete attributed to somebody else is claiming an
+//     authority it does not have: at most it may withdraw the post from
+//     ITSELF. Granting it the author's path would let one followed community
+//     destroy any bridged author's content with a single activity, leaving no
+//     moderation record behind. So anything that is not provably the author
+//     is treated as a removal — the community-scoped action it is entitled to.
+//
+// It declines for everything the postv2 moderation records do not describe: an
+// id the bridge never materialized, a mapping already tombstoned, and above
+// all the PRE-FLIP era, whose posts live in the community's own repo with no
+// acceptance to replace. Writing a removal for a legacy post would announce a
+// visibility mechanism Coves does not consult for that collection, so those
+// keep the v1 behaviour exactly: delete the record, tombstone the mapping.
+func (h *Handler) moderateAnnouncedDelete(ctx context.Context, del *ap.Object, targetID string) (bool, error) {
 	mapping, err := h.objects.GetByAPID(ctx, targetID)
 	if errors.IsNotFound(err) {
+		if del.HasSummary() {
+			// A moderator removal for something never materialized. Nothing to
+			// remove, and the tombstone marker below is all that happens —
+			// worth saying out loud, because it is also what a removal
+			// announced for another community's content looks like.
+			h.logger.Warn("announced moderator removal for an unmapped object; nothing to remove",
+				"ap_id", targetID)
+		}
 		return false, nil
 	}
 	if err != nil {
@@ -161,7 +188,39 @@ func (h *Handler) removePostForModerator(ctx context.Context, targetID, reason s
 	if mapping.IsDeleted() || mapping.Collection != materialize.CollectionPostV2 {
 		return false, nil
 	}
-	return true, h.mat.RemovePost(ctx, mapping, reason)
+	if !del.HasSummary() {
+		authored, aerr := h.deleteIsByAuthor(ctx, del, mapping)
+		if aerr != nil {
+			return false, aerr
+		}
+		if authored {
+			return false, nil // the author's own delete: v1 self-delete semantics
+		}
+		h.logger.Info("summary-less announced delete is not the author's; treating it as a community removal",
+			"ap_id", targetID, "actor", refID(del.Actor))
+		return true, h.mat.RemovePost(ctx, mapping, "")
+	}
+	return true, h.mat.RemovePost(ctx, mapping, del.Summary)
+}
+
+// deleteIsByAuthor reports whether the inner Delete is attributed to the
+// bridged author of the mapped record. Unresolvable in any way — no actor id,
+// no author on the mapping, no bridged_actors row — answers FALSE: the
+// destructive path needs a positive identification, not the absence of a
+// contradiction.
+func (h *Handler) deleteIsByAuthor(ctx context.Context, del *ap.Object, mapping *store.APObjectMapping) (bool, error) {
+	actorID := refID(del.Actor)
+	if actorID == "" || mapping.AuthorDID == "" {
+		return false, nil
+	}
+	author, err := h.actors.GetByDID(ctx, mapping.AuthorDID)
+	if errors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("ingest: resolve author %s of %s: %w", mapping.AuthorDID, mapping.APID, err)
+	}
+	return author.APActorID == actorID, nil
 }
 
 // announcerGroupID is the announcing community's AP group id, or "" for a
@@ -333,13 +392,27 @@ func (h *Handler) handleUndoDelete(ctx context.Context, undo, del *ap.Object, si
 	// Undo of a moderator REMOVAL. That removal deleted no record and
 	// tombstoned no mapping, so everything above was a no-op for it: the
 	// re-materialization put the post back exactly as it already was, and its
-	// acceptance write was refused by the terminality guard because the
-	// removal still stands. Lifting it is a separate transition — delete the
-	// removal, re-accept the CURRENT version, one commit — and it runs AFTER
-	// the re-materialization so the version it pins is the one now in the
-	// repo. RestorePost is a no-op when no removal stands, which is every
-	// ordinary restore.
-	if mapping.Collection == materialize.CollectionPostV2 {
+	// acceptance write was refused by the terminality guard because the removal
+	// still stands. Lifting it is a separate transition — delete the removal,
+	// re-accept the CURRENT version, one commit — and it runs AFTER the
+	// re-materialization so the version it pins is the one now in the repo.
+	// RestorePost is a no-op when no removal stands, which is every ordinary
+	// restore.
+	//
+	// Lifting a REMOVAL is a community decision, so only the community may
+	// make it: an ANNOUNCED undo of a delete that carried a summary — the same
+	// pair of signals that produced the removal in the first place.
+	//
+	// A BARE undo deliberately does not qualify. That path exists so an ORIGIN
+	// can un-delete content it re-serves, and it is permissive by design
+	// (same-authority signer, pinned re-fetch). None of that says anything
+	// about a community's decision to remove the post from itself, and a fresh
+	// acceptance IS a restore — so honouring it would let an author's own
+	// instance overturn moderation by re-serving the post. The bare path still
+	// restores the RECORD and its mapping; the acceptance stays withheld by
+	// the terminality guard in acceptPost, which leaves the post present but
+	// invisible in that community until a moderator restores it.
+	if mapping.Collection == materialize.CollectionPostV2 && announcer != nil && del.HasSummary() {
 		if err := h.mat.RestorePost(ctx, mapping); err != nil {
 			return err
 		}
@@ -417,10 +490,13 @@ func (h *Handler) authorizeBareVote(activityID string, vote *ap.Object, signer s
 //     post in a lemmy.world community carries a jlai.lu ap_id, and its
 //     Delete fans out through the community's Announce (the normal remote-
 //     author federation shape). MEMBERSHIP in the announcing community, not
-//     the target's host, is therefore the test: posts commit into the
-//     community's own repo (mapping.DID answers directly), comments into
-//     their AUTHOR's repo (their thread root answers for them — see
-//     authorizeAnnouncedCommentDelete). A target belonging elsewhere
+//     the target's host, is therefore the test — and it is one question asked
+//     of one function: materialize.CommunityDIDOf, which reads the mapping's
+//     community_did and falls back to deriving it from the record for rows
+//     written before that column existed (see authorizeAnnouncedContentDelete).
+//     Repo placement no longer answers it: since the author-owned flip only a
+//     legacy post sits in the community's own repo, while a postv2 and every
+//     comment sit in their AUTHOR's. A target belonging elsewhere
 //     (another community's content, even co-hosted on the announcer's
 //     instance) drops. A target that is itself a bridged ACTOR — the
 //     terminal DeleteActor scrub — may only be the community ITSELF, never a

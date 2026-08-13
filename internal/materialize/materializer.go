@@ -49,6 +49,10 @@ var ValidationFailures = expvar.NewInt("tidepool_lexicon_validation_failures")
 
 // Record collections the materializer produces.
 const (
+	// CollectionActorProfile and CollectionCommunityProfile are the identity
+	// records, each at the fixed rkey "self" in its own subject's repo. They
+	// are committed before any content that references them, so an AppView
+	// never indexes a post or comment whose author or community is unknown.
 	CollectionActorProfile     = "social.coves.actor.profile"
 	CollectionCommunityProfile = "social.coves.community.profile"
 	// CollectionPost is the DEPRECATED post collection: a post in the
@@ -72,6 +76,10 @@ const (
 	// from it. It shares the acceptance's digest rkey (one derivation per
 	// subject) and replaces the acceptance in one atomic commit.
 	CollectionRemoval = "social.coves.community.removal"
+	// CollectionComment is a reply, in its AUTHOR's repo in both eras — the
+	// flip changed where posts live, never comments. Its community is not a
+	// field on the record but a property of the thread it hangs from
+	// (reply.root), which is why comment mappings carry community_did.
 	CollectionComment = "social.coves.community.comment"
 )
 
@@ -181,6 +189,12 @@ type Materializer struct {
 	// A test seam so the scrub's retryable-error path can be exercised
 	// without a real storage failure.
 	deleteBlob func(ctx context.Context, did, cid string) error
+	// removalCheck reports whether a removal stands for a subject; defaults to
+	// removalStands. A test seam so acceptPost's check-then-act window can be
+	// opened deterministically — the commit-time refusal has to hold even when
+	// this read answers stale, and a timing test could only prove that by
+	// accident.
+	removalCheck func(ctx context.Context, communityDID, rkey string) (bool, error)
 }
 
 // New validates options and builds a Materializer. The vendored lexicon
@@ -232,6 +246,7 @@ func New(opts Options) (*Materializer, error) {
 		now:         time.Now,
 	}
 	m.deleteBlob = m.repos.DeleteBlob
+	m.removalCheck = m.removalStands
 	if m.profileTTL <= 0 {
 		m.profileTTL = defaultProfileRefreshTTL
 	}
@@ -258,7 +273,9 @@ type Result struct {
 // mapping in ONE transaction (repo.PutRecordTx + PutMappingTx — task 11
 // closed the crash window where a record could land on the firehose with
 // no mapping). authorDID records who authored the record (differs from did
-// for posts); communityDID records which community's content it is, for the
+// only for LEGACY posts, which sit in the community's repo; for a postv2 and
+// for comments the author's repo IS did); communityDID records which
+// community's content it is, for the
 // membership binding announced deletes and announced votes authorize against.
 func (m *Materializer) commitRecord(ctx context.Context, did, collection, rkey string, record map[string]any, obj *ap.Object, authorDID, communityDID string) (*Result, error) {
 	// Don't resurrect deleted content. AP delivery is unordered, so a Create
@@ -277,6 +294,13 @@ func (m *Materializer) commitRecord(ctx context.Context, did, collection, rkey s
 	// it replaced: an edit that skipped the carry would drop the vote counts
 	// the refresher stamped and mint a needless firehose event.
 	carryForward := false
+	// storedCommunityDID is the binding a previous materialization already
+	// made. It is preferred over anything derived from THIS delivery: the
+	// community a comment belongs to authorizes announced deletes and binds
+	// announced votes, so re-deriving it from an edited (attacker-influenced)
+	// inReplyTo would hand another community moderation authority over content
+	// posted somewhere else.
+	var storedCommunityDID string
 	if existing, err := m.objects.GetByAPID(ctx, obj.ID); err == nil {
 		if existing.IsDeleted() {
 			return nil, skip(obj.ID, "object was deleted upstream; not resurrecting")
@@ -284,6 +308,7 @@ func (m *Materializer) commitRecord(ctx context.Context, did, collection, rkey s
 		carryForward = collection == CollectionPost ||
 			collection == CollectionPostV2 ||
 			collection == CollectionComment
+		storedCommunityDID = existing.CommunityDID
 	} else if !errors.IsNotFound(err) {
 		return nil, fmt.Errorf("materialize: check mapping for %s: %w", obj.ID, err)
 	}
@@ -311,7 +336,7 @@ func (m *Materializer) commitRecord(ctx context.Context, did, collection, rkey s
 		// audience was retargeted has had the stored (immutable) community
 		// restored by then, and the mapping must agree with the record it
 		// maps or the two would authorize different communities.
-		mapping.CommunityDID = mappingCommunityDID(collection, did, record, communityDID)
+		mapping.CommunityDID = mappingCommunityDID(collection, did, record, communityDID, storedCommunityDID)
 		var mapErr error
 		stored, mapErr = m.objects.PutMappingTx(ctx, tx, mapping)
 		if mapErr != nil {
@@ -410,6 +435,14 @@ func (m *Materializer) carryForwardFields(ctx context.Context, did, collection, 
 		if collection == CollectionPostV2 {
 			if community, ok := stored["community"]; ok {
 				record["community"] = community
+			}
+			// originalAuthor is provenance about who wrote the post UPSTREAM,
+			// and an edit is not a claim about that. attributedTo on an updated
+			// Page is proposed by whoever delivered the update, so rebuilding
+			// provenance from it would let one delivery reattribute a post to
+			// somebody who never wrote it.
+			if author, ok := stored["originalAuthor"]; ok {
+				record["originalAuthor"] = author
 			}
 		}
 		return storedCID, nil

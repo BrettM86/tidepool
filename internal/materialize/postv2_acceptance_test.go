@@ -83,8 +83,9 @@ func TestAcceptanceHealsOnRedelivery(t *testing.T) {
 // delete/scrub walks, ListByActorDID), and let an announced delete for the
 // POST address the acceptance through the same key space.
 //
-// Red today on the shared precondition (no acceptance is written at all);
-// the distinctive assertions bite the moment GREEN lands the write.
+// The acceptance's existence is asserted first as a precondition: the
+// mapping-free assertions below are all negatives, and a run where no
+// acceptance was written at all would satisfy every one of them.
 func TestAcceptanceIsNotOnTheMappingSpine(t *testing.T) {
 	h := newHarness(t)
 	h.serveLemmyWorldFixtures()
@@ -142,8 +143,8 @@ func TestAcceptanceIsNotOnTheMappingSpine(t *testing.T) {
 // commit), every redelivery would mint a community-repo firehose event, and
 // Coves' consumers would re-run admission on a post nothing changed about.
 //
-// Red today on the shared precondition; the churn assertion bites once the
-// write lands.
+// As above, the acceptance is required to exist before the no-churn window
+// opens — "no new event" is trivially true of a repo nothing ever wrote to.
 func TestAcceptanceRedeliveryDoesNotChurnCommunityRepo(t *testing.T) {
 	h := newHarness(t)
 	h.serveLemmyWorldFixtures()
@@ -192,4 +193,99 @@ func eventsForDID(t *testing.T, h *harness, did string) int {
 		}
 	}
 	return n
+}
+
+// TestAcceptanceRefusedWhenRemovalLandsAfterTheGuard (F1) is the G6 race:
+// acceptPost reads the removal BEFORE its commit loop, so a RemovePost that
+// lands in between would leave an acceptance written beside a standing removal
+// — the one state the two records may never be in. Coves reads acceptance and
+// removal from the same digest key; both present is a post that is
+// simultaneously visible and removed, and nothing reconciles it, because each
+// writer believed it observed a consistent world.
+//
+// It is NOT reproduced with goroutines, and deliberately so: a timing test
+// fails in exactly the direction that matters (it passes whenever the race
+// does not happen). What is deterministic is the property the fix must
+// establish — the refusal has to hold at COMMIT time, not at read time. So the
+// pre-loop guard is forced to answer STALE on purpose, and the write must fail
+// anyway. A check-then-act implementation cannot pass this; the ApplyOps batch
+// carrying an inert delete-of-removal at ExpectPrevCID "" does, because the
+// precondition is evaluated under the commit's own locks.
+//
+// The seam (Materializer.removalCheck, defaulted to removalStands in New) is
+// what makes the window openable at all — the Materializer holds *repo.Manager
+// concretely, so nothing else can make one read disagree with the repo's real
+// contents.
+func TestAcceptanceRefusedWhenRemovalLandsAfterTheGuard(t *testing.T) {
+	h := newHarness(t)
+	h.serveLemmyWorldFixtures()
+	ctx := context.Background()
+
+	page := loadFixtureObject(t, "page_lemmy_world.json")
+	rkey, err := recordRKey(page)
+	require.NoError(t, err)
+	_, err = h.m.MaterializePost(ctx, page)
+	require.NoError(t, err)
+
+	communityDID := testDIDFor("technology", "lemmy.world")
+	authorDID := testDIDFor("LeftLeaningFreedomFighters", "lemmy.world")
+	acceptanceRKey := acceptanceFor(t, authorDID, rkey)
+
+	mapping, err := h.objects.GetByAPID(ctx, pageID)
+	require.NoError(t, err)
+	require.NoError(t, h.m.RemovePost(ctx, mapping, "spam wave"))
+
+	// The state the race starts from: removal standing, acceptance gone.
+	_, _, err = h.manager.GetRecord(ctx, communityDID, CollectionAcceptance, acceptanceRKey)
+	require.True(t, errors.IsNotFound(err), "precondition: the removal withdrew the acceptance")
+	_, removalCIDBefore, err := h.manager.GetRecord(ctx, communityDID, CollectionRemoval, acceptanceRKey)
+	require.NoError(t, err, "precondition: the removal stands")
+
+	// Open the window: the pre-loop guard answers as though it read the world
+	// a moment before the RemovePost committed. Counted, so the test can prove
+	// it actually drove the bypass rather than passing because the real guard
+	// caught the write early.
+	var stubbedReads int
+	h.m.removalCheck = func(context.Context, string, string) (bool, error) {
+		stubbedReads++
+		return false, nil
+	}
+
+	// Redelivery of the same post drives acceptPost with the stale answer.
+	_, err = h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"))
+	require.NoError(t, err,
+		"a refused acceptance is not an error: the community's removal simply stands")
+
+	require.Positive(t, stubbedReads,
+		"the stubbed guard was never consulted — this run did not exercise the window at all, "+
+			"so a pass here would prove nothing")
+
+	_, _, err = h.manager.GetRecord(ctx, communityDID, CollectionAcceptance, acceptanceRKey)
+	assert.True(t, errors.IsNotFound(err),
+		"an acceptance was written beside a standing removal: the terminality guard must hold at "+
+			"COMMIT time, not merely at read time, or a RemovePost landing in the check-then-act "+
+			"window leaves the post visible and removed at once (err=%v)", err)
+
+	removalAfter, removalCIDAfter, err := h.manager.GetRecord(ctx, communityDID, CollectionRemoval, acceptanceRKey)
+	require.NoError(t, err, "the removal must survive the refused acceptance")
+	assert.Equal(t, removalCIDBefore, removalCIDAfter,
+		"the inert delete op must claim nothing: the removal record may not be rewritten")
+	assert.Equal(t, "moderator-discretion", removalAfter["code"])
+
+	// CONTROL, and the reason this test can claim to prove anything: with the
+	// SAME bypass in place, removing the removal must let the acceptance
+	// through. Without it, a pass above would be equally consistent with the
+	// stub having simply broken acceptPost — "no acceptance written" is the
+	// expected outcome of both a working commit-time guard and a dead write
+	// path, and only this half tells them apart.
+	_, err = h.manager.DeleteRecord(ctx, communityDID, CollectionRemoval, acceptanceRKey)
+	require.NoError(t, err)
+
+	_, err = h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"))
+	require.NoError(t, err)
+
+	_, _, err = h.manager.GetRecord(ctx, communityDID, CollectionAcceptance, acceptanceRKey)
+	require.NoError(t, err,
+		"with no removal standing the same bypassed path must WRITE the acceptance — otherwise "+
+			"the refusal above proves only that the stub broke the write")
 }

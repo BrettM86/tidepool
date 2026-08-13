@@ -27,6 +27,12 @@ type Materializer interface {
 	// they rewrite the community's acceptance and removal records and leave
 	// the author's post where it is. Deleting content is a different verb, so
 	// these are not reachable through the delete entry points above.
+	//
+	// reason may be EMPTY — Lemmy spells "removed, no reason given" as an
+	// empty summary, and a summary-less delete from a non-author is treated as
+	// a removal with none. Implementations omit the field from the record
+	// rather than writing it blank: a blank reason renders in a moderation log
+	// as an empty explanation instead of as no explanation.
 	RemovePost(ctx context.Context, mapping *store.APObjectMapping, reason string) error
 	RestorePost(ctx context.Context, mapping *store.APObjectMapping) error
 	RefreshActor(ctx context.Context, actorRef *ap.Object) (*store.BridgedActor, error)
@@ -348,11 +354,15 @@ func (h *Handler) materializeContent(ctx context.Context, obj *ap.Object, signer
 		}
 	} else {
 		// Announced content must belong to the announcing community itself: a
-		// followed community may fan out only its own content, never inject
-		// into a DIFFERENT community's repo (even one co-hosted on the same
-		// instance). The materializer derives the target community from the
-		// object's own audience and EnsureCommunity()s it, so without this the
-		// announcer could name any community it likes.
+		// followed community may fan out only its own content, never claim
+		// another community's (even one co-hosted on the same instance). Since
+		// the flip the consequence is not a foreign write into a community repo
+		// — a postv2 goes to its author's repo — but a false BINDING: the
+		// materializer derives the target community from the object's own
+		// audience, EnsureCommunity()s it, records it as the mapping's
+		// community_did and writes that community's acceptance. Without this
+		// guard an announcer could name any community it likes and hand it both
+		// visibility over the post and moderation authority over it.
 		if objCommunity := communityIRIFrom(obj); objCommunity != "" && objCommunity != announcer {
 			return skip(obj.ID, fmt.Sprintf(
 				"announced object names community %s but was announced by %s", objCommunity, announcer))

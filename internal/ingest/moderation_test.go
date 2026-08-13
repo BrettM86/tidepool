@@ -121,10 +121,19 @@ func strongRefCID(v any) string {
 // PRESENT. A nil summary omits the key entirely — the self-delete shape.
 func (h *harness) announceDeleteWithSummary(group *remoteActor, activityID, targetID string, summary *string) {
 	h.t.Helper()
+	h.announceDeleteBy(group, activityID, targetID, modActorID, summary)
+}
+
+// announceDeleteBy is announceDeleteWithSummary with an explicit inner actor.
+// WHO the Delete is attributed to decides which semantics apply: the AUTHOR
+// deleting their own post destroys the record, anyone else may at most remove
+// it from the community.
+func (h *harness) announceDeleteBy(group *remoteActor, activityID, targetID, actor string, summary *string) {
+	h.t.Helper()
 	inner := map[string]any{
 		"id":       activityID + "/delete",
 		"type":     "Delete",
-		"actor":    modActorID,
+		"actor":    actor,
 		"object":   targetID,
 		"audience": group.id,
 		"cc":       []any{group.id},
@@ -282,8 +291,8 @@ func TestModRemovalWithEmptySummary(t *testing.T) {
 	assert.NoError(t, err, "the author's post survives a reasonless removal too")
 }
 
-// TestSelfDeleteRemovesPostAndAcceptance (R3): no summary key means the AUTHOR
-// deleted their own post. The post goes, its acceptance goes with it (an
+// TestSelfDeleteRemovesPostAndAcceptance (R3): no summary key AND the delete
+// attributed to the post's own author means the AUTHOR deleted their own post. The post goes, its acceptance goes with it (an
 // acceptance whose subject is gone is inert), and NO removal is written —
 // author deletion is not moderation, and recording it as such would put a
 // moderation action in the log against someone who was never moderated.
@@ -292,8 +301,8 @@ func TestSelfDeleteRemovesPostAndAcceptance(t *testing.T) {
 	post := setupModeratedPost(t, h)
 	ctx := context.Background()
 
-	h.announceDeleteWithSummary(post.group,
-		"https://lemmy.world/activities/announce/delete/self", pageID, nil)
+	h.announceDeleteBy(post.group,
+		"https://lemmy.world/activities/announce/delete/self", pageID, personID, nil)
 
 	_, _, err := h.manager.GetRecord(ctx, post.authorDID, materialize.CollectionPostV2, post.rkey)
 	assert.True(t, errors.IsNotFound(err),
@@ -522,4 +531,101 @@ func TestLegacyPostModRemovalKeepsV1Semantics(t *testing.T) {
 		assert.NotEqual(t, materialize.CollectionRemoval, entry.Collection,
 			"no removal record may exist for the legacy era (rkey %s)", entry.Rkey)
 	}
+}
+
+// TestNonAuthorDeleteWithoutSummaryKeepsAuthorRecord (F3): a Delete carrying
+// no summary is the SELF-delete shape, and self-delete destroys the author's
+// record. That semantics may only be granted to the author.
+//
+// The inner Delete's actor is not covered by the HTTP signature — the
+// announcing community's key is — so the inner attribution is a claim, not a
+// proof. A community that announces a summary-less Delete attributed to
+// someone other than the author is claiming an authority it does not have: at
+// most it may withdraw the post from ITSELF (its acceptance), never delete a
+// record out of a repo it does not own. Granting it the author's path lets one
+// followed community destroy any bridged author's content with one activity,
+// with no moderation record to show for it.
+//
+// The control — the same shape attributed to the actual author — is
+// TestSelfDeleteRemovesPostAndAcceptance above, which still asserts full v1
+// self-delete semantics.
+func TestNonAuthorDeleteWithoutSummaryKeepsAuthorRecord(t *testing.T) {
+	h := newHarness(t)
+	post := setupModeratedPost(t, h)
+	ctx := context.Background()
+
+	// A moderator, not the author, and NO summary key.
+	h.announceDeleteBy(post.group,
+		"https://lemmy.world/activities/announce/delete/not-the-author",
+		pageID, modActorID, nil)
+
+	_, _, err := h.manager.GetRecord(ctx, post.authorDID, materialize.CollectionPostV2, post.rkey)
+	assert.NoError(t, err,
+		"a summary-less Delete from someone other than the author must NOT delete the author's "+
+			"record: the inner actor is an unverified claim, and self-delete semantics belong to "+
+			"the author alone")
+
+	mapping, err := h.objects.GetByAPID(ctx, pageID)
+	require.NoError(t, err)
+	assert.False(t, mapping.IsDeleted(),
+		"the mapping must stay live: tombstoning it blocks every later edit and vote for a post "+
+			"whose author never asked for it to go")
+}
+
+// TestBareUndoDeleteDoesNotRestoreRemovedPost (F4): a removal is exited only
+// by an explicit moderator restore, and a BARE Undo{Delete} is not one.
+//
+// The bare path exists so an ORIGIN can un-delete content it re-serves, and it
+// is deliberately permissive: same-authority signer, existing mapping, pinned
+// re-fetch. None of that says anything about a COMMUNITY's decision to remove
+// the post from itself. Letting the bare path write a fresh acceptance would
+// let the author's own instance overturn a moderator's removal by re-serving
+// the post — the restore gate has to be the community's, not the origin's.
+//
+// The announced restore (which IS the moderator's decision) is asserted by
+// TestModeration_RemoveRestoreAndSelfDelete at the e2e tier and by R4 here.
+func TestBareUndoDeleteDoesNotRestoreRemovedPost(t *testing.T) {
+	h := newHarness(t)
+	post := setupModeratedPost(t, h)
+	ctx := context.Background()
+
+	reason := "spam wave"
+	h.announceDeleteWithSummary(post.group,
+		"https://lemmy.world/activities/announce/delete/bare-undo", pageID, &reason)
+	removalBefore, removalCIDBefore, err := h.manager.GetRecord(ctx,
+		post.communityDID, materialize.CollectionRemoval, post.digestRKey)
+	require.NoError(t, err, "precondition: the removal landed")
+
+	// A BARE Undo{Delete} — delivered by the post's own origin, no announcer.
+	origin := h.newRemoteActor(personID, map[string]any{
+		"type":              "Person",
+		"id":                personID,
+		"preferredUsername": "LeftLeaningFreedomFighters",
+		"inbox":             personID + "/inbox",
+		"published":         "2024-01-01T00:00:00.000000Z",
+	})
+	require.Equal(t, http.StatusAccepted, h.deliver(origin, map[string]any{
+		"id":    "https://lemmy.world/activities/undo/bare-restore",
+		"type":  "Undo",
+		"actor": personID,
+		"object": map[string]any{
+			"id":     "https://lemmy.world/activities/delete/bare-restore-inner",
+			"type":   "Delete",
+			"actor":  personID,
+			"object": pageID,
+		},
+	}))
+	h.drain()
+
+	_, _, err = h.manager.GetRecord(ctx, post.communityDID, materialize.CollectionAcceptance, post.digestRKey)
+	assert.True(t, errors.IsNotFound(err),
+		"a bare Undo{Delete} must NOT write an acceptance for a post the community removed: a "+
+			"fresh acceptance IS the restore, so this would let the origin overturn moderation "+
+			"by re-serving the post (err=%v)", err)
+
+	removalAfter, removalCIDAfter, err := h.manager.GetRecord(ctx,
+		post.communityDID, materialize.CollectionRemoval, post.digestRKey)
+	require.NoError(t, err, "the removal must still stand")
+	assert.Equal(t, removalCIDBefore, removalCIDAfter, "the removal record must not be rewritten")
+	assert.Equal(t, removalBefore["createdAt"], removalAfter["createdAt"])
 }

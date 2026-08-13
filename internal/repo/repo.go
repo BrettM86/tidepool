@@ -225,11 +225,19 @@ func (m *Manager) putRecord(ctx context.Context, did, collection, rkey string, r
 	return m.commitWrite(ctx, did, collection, rkey, &c, recordBytes, pre, sideEffect)
 }
 
-// RecordOp is one record mutation in a multi-op commit. A nil Record with
-// Action OpActionDelete removes the record; any other action is a put of
-// Record. ExpectPrevCID is an optional per-op CAS precondition (nil = none;
-// a pointer to "" requires the record to not currently exist), mirroring
-// putRecord's internal casPrecondition.
+// RecordOp is one record mutation in a multi-op commit. Action OpActionDelete
+// removes the record; any other action is a put of Record.
+//
+// CREATE AND UPDATE ARE NOT DISTINGUISHED. Both upsert, and the action that
+// reaches the firehose is derived from the MST — whether a value was already
+// at that path — not from what the caller wrote here. A caller wanting a
+// GUARDED create asks for it with ExpectPrevCID pointing at "", which requires
+// the record to be absent at commit time; spelling the Action "create" asserts
+// nothing.
+//
+// ExpectPrevCID is an optional per-op CAS precondition (nil = none; a pointer
+// to "" requires the record to not currently exist), mirroring putRecord's
+// internal casPrecondition.
 type RecordOp struct {
 	Action        OpAction
 	Collection    string
@@ -267,6 +275,7 @@ func (m *Manager) ApplyOps(ctx context.Context, did string, ops []RecordOp) (*Co
 	}
 
 	prepared := make([]preparedOp, 0, len(ops))
+	seen := make(map[string]struct{}, len(ops))
 	var parsedDID syntax.DID
 	use := KeyUseDelete
 	for _, op := range ops {
@@ -274,6 +283,17 @@ func (m *Manager) ApplyOps(ctx context.Context, did string, ops []RecordOp) (*Co
 		if err != nil {
 			return nil, err
 		}
+		// Two ops on ONE record in ONE commit is a caller bug, not a
+		// composition. The MST would keep only the last write, the firehose op
+		// list would disagree with the diff about how many things happened, and
+		// the ops are applied in slice order — so which one survived would be
+		// decided by argument order rather than by anything the caller meant.
+		// Refused at validation, before any of it can reach the tree.
+		if _, dup := seen[path]; dup {
+			return nil, errors.NewValidationError("ops",
+				fmt.Sprintf("path %s appears more than once in one batch", path))
+		}
+		seen[path] = struct{}{}
 		parsedDID = parsed
 		next := preparedOp{path: path, expectPrevCID: op.ExpectPrevCID}
 		if op.Action != OpActionDelete {
@@ -387,6 +407,12 @@ func (m *Manager) ApplyOps(ctx context.Context, did string, ops []RecordOp) (*Co
 		// Every op was inert, so there is nothing to commit and nothing to put
 		// on the firehose: redelivery of an already-applied batch must not
 		// churn the repo. The transaction rolls back having written nothing.
+		//
+		// state is non-nil here, and not by luck: a nil state means the repo
+		// does not exist, which the genesis branch above already returned from
+		// unless the batch contains a put — and a put against an empty tree
+		// always emits (it has no prior value to be identical to). So reaching
+		// this line with every op inert implies the repo existed.
 		res := &CommitResult{CommitCID: state.headCID, Rev: prevRev, NoOp: true}
 		if prevData != nil {
 			// The tree is untouched by inert ops, so it still represents this

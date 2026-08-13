@@ -60,8 +60,10 @@ type APObjects interface {
 
 	// ListByActorDID returns all live (not soft-deleted) mappings whose
 	// record either lives in the actor's repo (did) or was authored by the
-	// actor into another repo (author_did — posts live in community repos).
-	// Task 05's Delete(Actor) scrub enumerates these.
+	// actor into another repo (author_did). The second case is the LEGACY
+	// post era only: those posts were written into the community's repo. A
+	// postv2 and every comment live in the author's own repo, so did answers
+	// for them. Task 05's Delete(Actor) scrub enumerates these.
 	ListByActorDID(ctx context.Context, did string) ([]*APObjectMapping, error)
 
 	// SoftDelete marks the mapping for an AP object id as deleted, in one

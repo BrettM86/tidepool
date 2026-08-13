@@ -140,10 +140,17 @@ exists behind the `direct` compose profile (`jetstream-direct`, host port
 
 One ordering consequence worth knowing: bigsky indexes its inbound firehose
 with a parallel scheduler keyed by repo DID, so **per-repo event order
-survives the relay but cross-repo order does not** — an author's
-`actor.profile` (author repo) and their post (community repo) may swap on
-the relay's output, and any AppView consuming through relay infrastructure
-must tolerate that (see FOLLOWUPS.md).
+survives the relay but cross-repo order does not**. Since the author-owned
+flip a post is a `community.postv2` in the AUTHOR's repo plus a
+`community.acceptance` in the COMMUNITY's — two repos, so those two events
+may arrive in either order, and an AppView can see the acceptance for a post
+it has not indexed yet (or the post before anything makes it visible in the
+community). The same applies to an author's `actor.profile` and their
+content. Any AppView consuming through relay infrastructure must tolerate it
+(see FOLLOWUPS.md). Pre-flip `community.post` records are the exception that
+proves the rule: they sat in the community's repo with no separate
+attestation, so there was no cross-repo pair to reorder — those records still
+exist and are not migrated.
 
 The host ports bind **loopback-only** (`127.0.0.1:8092/8541/2480/6028`):
 the stack carries admin tokens and runs with `ALLOW_PRIVATE_FETCH=1`, so it

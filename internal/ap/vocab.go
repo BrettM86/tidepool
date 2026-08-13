@@ -196,22 +196,37 @@ func (o *Object) UnmarshalJSON(data []byte) error {
 		*o = Object{}
 		return nil
 	}
-	// objectWire shadows `summary` with a POINTER so one pass answers both
+	// objectWire shadows `summary` with RAW BYTES so one pass answers both
 	// questions: the text, and whether the key was on the wire at all. The
 	// outer field sits at depth 0 and the embedded alias's at depth 1, so
 	// encoding/json fills this one and leaves the alias's empty — which is why
 	// the text is copied across below rather than read off the alias.
+	//
+	// Raw bytes rather than a *string because the two must be decided
+	// SEPARATELY. `"summary": null` unmarshals a *string to nil, making an
+	// explicit null indistinguishable from a missing key — and those select
+	// opposite paths: present means a moderator removal (the author's record
+	// survives), absent means a self-delete (it does not). A RawMessage is
+	// empty only when the key was genuinely absent, so presence is decided on
+	// the KEY and the text is read only when there is a JSON string to read.
 	var wire struct {
 		objectAlias
-		Summary *string `json:"summary"`
+		Summary json.RawMessage `json:"summary"`
 	}
 	if err := json.Unmarshal(data, &wire); err != nil {
 		return err
 	}
 	*o = Object(wire.objectAlias)
-	if wire.Summary != nil {
-		o.Summary = *wire.Summary
+	if len(wire.Summary) > 0 {
 		o.summaryPresent = true
+		// Anything that is not a JSON string (null, and any wrong-typed value
+		// a sender emits) leaves the text empty rather than failing the parse:
+		// tolerant parsing, and "present with no text" is a shape the wire
+		// really uses.
+		var text string
+		if err := json.Unmarshal(wire.Summary, &text); err == nil {
+			o.Summary = text
+		}
 	}
 	return nil
 }
@@ -229,6 +244,12 @@ func (o *Object) HasSummary() bool { return o != nil && o.summaryPresent }
 
 // MarshalJSON emits a bare IRI string when only the ID is set (the compact
 // wire form of a reference), otherwise the full object.
+//
+// LOSSY FOR SUMMARY PRESENCE. `summary` is omitempty over a plain string, so
+// a present-but-empty key marshals away and HasSummary answers false on the
+// far side. Never round-trip an inbound activity through Marshal and back
+// where that distinction matters — a moderator removal would re-read as a
+// self-delete. Store the raw bytes and re-parse those instead.
 func (o Object) MarshalJSON() ([]byte, error) {
 	if o.ID != "" && o.isIDOnly() {
 		return json.Marshal(o.ID)

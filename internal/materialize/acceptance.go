@@ -49,7 +49,7 @@ func (m *Materializer) acceptPost(ctx context.Context, communityDID, postURI, po
 	// restore path does not come through here: it deletes the removal and
 	// writes the acceptance in ONE commit (RestorePost), so it never has to
 	// argue with this guard.
-	removed, err := m.removalStands(ctx, communityDID, rkey)
+	removed, err := m.removalCheck(ctx, communityDID, rkey)
 	if err != nil {
 		return err
 	}
@@ -93,13 +93,39 @@ func (m *Materializer) acceptPost(ctx context.Context, communityDID, postURI, po
 			return err
 		}
 
+		// The terminality guard is re-asserted HERE, at commit time, as an
+		// inert op: deleting the removal with a precondition of "must not
+		// exist" claims nothing and changes nothing, but it makes the batch
+		// fail if a removal has appeared since the read above. Without it the
+		// guard is check-then-act, and a RemovePost landing in the window
+		// leaves an acceptance beside a standing removal — a post
+		// simultaneously visible and removed, which nothing reconciles because
+		// each writer believed it saw a consistent world.
+		//
 		// Deliberately NOT commitRecord: that path upserts an ap_objects row,
 		// and an acceptance has no AP object behind it — the bridge mints it as
 		// the community's own attestation. A mapping would invent an ap_id for
 		// it, expose it to every spine consumer, and let an announced delete
 		// aimed at the POST address the acceptance through the same key space.
-		_, err = m.repos.PutRecordCAS(ctx, communityDID, CollectionAcceptance, rkey, record, expectPrevCID, nil)
+		noRemoval := ""
+		_, err = m.repos.ApplyOps(ctx, communityDID, []repo.RecordOp{
+			{Action: repo.OpActionDelete, Collection: CollectionRemoval, RKey: rkey, ExpectPrevCID: &noRemoval},
+			{Action: repo.OpActionUpdate, Collection: CollectionAcceptance, RKey: rkey, Record: record, ExpectPrevCID: &expectPrevCID},
+		})
 		if stderrors.Is(err, repo.ErrPreconditionFailed) {
+			// Either a removal appeared or the acceptance moved. Ask which,
+			// against the repo itself rather than the seam: a removal means the
+			// community has since decided this post is out, and that decision
+			// stands — the acceptance is simply not written.
+			removed, rerr := m.removalStands(ctx, communityDID, rkey)
+			if rerr != nil {
+				return rerr
+			}
+			if removed {
+				m.logger.Debug("post was removed from the community while accepting; not re-accepting",
+					"community_did", communityDID, "post", postURI)
+				return nil
+			}
 			if attempt+1 < maxStatsCommitAttempts {
 				continue
 			}
@@ -159,7 +185,11 @@ func (m *Materializer) RemovePost(ctx context.Context, mapping *store.APObjectMa
 	pinned := mapping.CID
 	if acceptance, _, aerr := m.repos.GetRecord(ctx, communityDID, CollectionAcceptance, rkey); aerr == nil {
 		if ref, ok := extractStrongRef(acceptance, "subject"); ok {
-			pinned, _ = ref["cid"].(string)
+			// Only overwrite on a value we actually got: a blank pin would be
+			// worse than the mapping's approximate one.
+			if cid, ok := ref["cid"].(string); ok && cid != "" {
+				pinned = cid
+			}
 		}
 	} else if !errors.IsNotFound(aerr) {
 		return fmt.Errorf("materialize: read acceptance %s/%s/%s: %w",
@@ -173,7 +203,7 @@ func (m *Materializer) RemovePost(ctx context.Context, mapping *store.APObjectMa
 		// catch-all applies. Inventing a narrower code (spam, rule-violation)
 		// would be the bridge asserting a reason the moderator never gave.
 		"code":      "moderator-discretion",
-		"createdAt": recordDatetime(m.moderationTime(mapping)),
+		"createdAt": recordDatetime(m.moderationStamp(ctx, communityDID, CollectionRemoval, rkey)),
 	}
 	// Omitted rather than written blank: Lemmy spells "no reason given" as an
 	// empty summary, and an empty reason renders in a moderation log as a
@@ -233,7 +263,7 @@ func (m *Materializer) RestorePost(ctx context.Context, mapping *store.APObjectM
 	acceptance := map[string]any{
 		"$type":     CollectionAcceptance,
 		"subject":   strongRef(postURI, currentCID),
-		"createdAt": recordDatetime(m.moderationTime(mapping)),
+		"createdAt": recordDatetime(m.moderationStamp(ctx, communityDID, CollectionAcceptance, rkey)),
 	}
 	if err := m.validateRecord(acceptance); err != nil {
 		return err
@@ -274,18 +304,30 @@ func (m *Materializer) moderationTarget(ctx context.Context, mapping *store.APOb
 	return communityDID, mapping.ATURI, SubjectRKey(mapping.ATURI), nil
 }
 
-// moderationTime is the timestamp a moderation record carries. It is derived
-// from the post, exactly as acceptPost's createdAt is, so a redelivered
-// moderation activity rebuilds byte-identical bytes and reaches the repo
-// layer's no-op path instead of churning the community repo on every retry.
-func (m *Materializer) moderationTime(mapping *store.APObjectMapping) time.Time {
-	if mapping.PublishedAt != nil {
-		return *mapping.PublishedAt
+// moderationStamp is the timestamp a moderation record carries: WHEN THE
+// MODERATOR ACTED, which is now — a removal's createdAt is a claim about the
+// moderator's decision, and deriving it from the post's publish time would
+// date every removal to whenever the post happened to be written.
+//
+// Idempotency comes from carrying the STORED value forward instead: a
+// redelivered moderation activity finds the record it already wrote, reuses
+// its timestamp, and so rebuilds byte-identical bytes that reach the repo
+// layer's no-op path rather than churning the community repo on every retry.
+// Only the FIRST write stamps a clock.
+func (m *Materializer) moderationStamp(ctx context.Context, communityDID, collection, rkey string) time.Time {
+	stored, _, err := m.repos.GetRecord(ctx, communityDID, collection, rkey)
+	if err != nil {
+		return m.now()
 	}
-	// Unreachable for a postv2 (no published time means no deterministic rkey,
-	// so the post never materialized), but a wall-clock fallback keeps the
-	// record writable rather than dropping a moderator's decision.
-	return m.now()
+	when, ok := stored["createdAt"].(string)
+	if !ok || when == "" {
+		return m.now()
+	}
+	parsed, perr := time.Parse(time.RFC3339, when)
+	if perr != nil {
+		return m.now()
+	}
+	return parsed
 }
 
 // deleteAcceptance removes a post's acceptance from its community. Called

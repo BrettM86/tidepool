@@ -22,7 +22,8 @@ package repo
 //     that committed before it only removed blocks unreachable from the
 //     head at GC time — and any block reachable from a LATER head was
 //     (re-)written by an intervening commit, which refreshes created_at
-//     (the ON CONFLICT DO UPDATE in commitWrite), so rule (b) kept it.
+//     (the ON CONFLICT DO UPDATE in finalizeCommit, shared by commitWrite and
+//     ApplyOps), so rule (b) kept it.
 //   - subscribeRepos replay reads firehose_events.car, which is
 //     self-contained (commit + diff + record bytes inline) and never
 //     touches `blocks`. Pruning superseded blocks cannot break replay.

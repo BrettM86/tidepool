@@ -664,9 +664,39 @@ func TestAnnouncedDeleteOfOwnPost(t *testing.T) {
 	}))
 	h.drain()
 
+	// REMOVAL-SCOPED, since the author-owned flip. In v1 the post record lived
+	// in the community's OWN repo, so "the community may delete its own
+	// announced post" was a statement about a record it owned, and deleting it
+	// outright was right. Post-flip the record is the AUTHOR's, in the
+	// author's repo, and the community's authority stops at its own
+	// attestations: it may withdraw the post from itself (acceptance out,
+	// removal in) and nothing more. The authorization being tested is
+	// unchanged — this community may act on this post — only the scope of
+	// what "act" means moved. (The legacy era keeps the v1 outcome verbatim:
+	// TestLegacyPostModRemovalKeepsV1Semantics.)
+	communityDID := testDIDFor("technology", "lemmy.world")
+	authorDID := testDIDFor("LeftLeaningFreedomFighters", "lemmy.world")
+	postURI := "at://" + authorDID + "/" + materialize.CollectionPostV2 + "/" + mapping.RKey
+	digest := testDigestRKey(postURI)
+
+	_, _, err = h.manager.GetRecord(ctx, communityDID, materialize.CollectionAcceptance, digest)
+	assert.True(t, errors.IsNotFound(err),
+		"the community withdrew the post from itself: its acceptance must be gone (err=%v)", err)
+
+	removal, _, err := h.manager.GetRecord(ctx, communityDID, materialize.CollectionRemoval, digest)
+	require.NoError(t, err, "a community acting on a post it hosts records a removal")
+	assert.Equal(t, "moderator-discretion", removal["code"])
+
+	_, _, err = h.manager.GetRecord(ctx, authorDID, materialize.CollectionPostV2, mapping.RKey)
+	assert.NoError(t, err,
+		"the author's record must survive: it lives in the author's repo, and a community's "+
+			"announced delete is not authority over a repo it does not own")
+
 	mapping, err = h.objects.GetByAPID(ctx, pageID)
 	require.NoError(t, err)
-	assert.True(t, mapping.IsDeleted(), "a community may delete its own announced post")
+	assert.False(t, mapping.IsDeleted(),
+		"the post still exists, so its mapping stays live — tombstoning it would block every "+
+			"later edit and vote for a post the author never withdrew")
 }
 
 // TestCrossAuthorityAnnouncedDeleteDropped (Finding 1, negative): a followed

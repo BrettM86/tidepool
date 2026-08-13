@@ -135,3 +135,30 @@ func TestSummaryPresenceDoesNotLeakIntoMarshal(t *testing.T) {
 	assert.Contains(t, actorDoc["summary"], "Bridges threadiverse communities",
 		"the service actor's own summary must survive the shape change unchanged")
 }
+
+// TestSummaryPresentButNull (F6): `"summary": null` is a PRESENT key, and the
+// bridge must classify it as one.
+//
+// The two readings are not symmetric, which is what makes this worth pinning.
+// Read as present, an explicit null is treated as a moderator removal with no
+// reason — the post stays in the author's repo and the community records a
+// removal. Read as absent, it selects the SELF-DELETE path, which destroys the
+// author's record. A JSON null is not a statement that no summary key was
+// sent; it is a sender saying the field is there and empty, and the shadow
+// struct's `*string` nil makes those two indistinguishable unless presence is
+// decided on the key rather than on the value.
+func TestSummaryPresentButNull(t *testing.T) {
+	obj, err := ParseObject([]byte(`{
+		"type": "Delete",
+		"id": "https://lemmy.world/activities/delete/4",
+		"actor": "https://lemmy.world/u/mod",
+		"object": "https://lemmy.world/post/4",
+		"summary": null
+	}`))
+	require.NoError(t, err)
+
+	assert.True(t, obj.HasSummary(),
+		"an explicit null summary is a PRESENT key; classifying it absent picks the "+
+			"self-delete path and destroys the author's record over a sender's null")
+	assert.Equal(t, "", obj.Summary, "a null summary carries no text")
+}

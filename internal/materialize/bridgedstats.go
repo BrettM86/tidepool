@@ -188,10 +188,48 @@ func (m *Materializer) SetBridgedStats(ctx context.Context, mapping *store.APObj
 // "did the stamp commit?" would leave a crash-window pin permanently stale,
 // since the sweep that follows such a crash carries unchanged counts.
 func (m *Materializer) repinAcceptance(ctx context.Context, mapping *store.APObjectMapping, recordCID string) error {
-	if mapping.Collection != CollectionPostV2 || mapping.CommunityDID == "" || mapping.PublishedAt == nil {
+	if mapping.Collection != CollectionPostV2 {
 		return nil
 	}
-	return m.acceptPost(ctx, mapping.CommunityDID, mapping.ATURI, recordCID, *mapping.PublishedAt)
+	// Resolved rather than read straight off the column: a mapping written
+	// before migration 016 carries no community_did, and bailing on that
+	// would leave exactly the oldest posts — the ones most likely to be
+	// stats-swept — pinned to a dead CID forever.
+	communityDID, err := CommunityDIDOf(ctx, m.repos, mapping)
+	if err != nil {
+		return err
+	}
+	if communityDID == "" || mapping.PublishedAt == nil {
+		m.logger.Debug("cannot repin acceptance; leaving it to the next materialization",
+			"ap_id", mapping.APID, "at_uri", mapping.ATURI,
+			"community_did", communityDID, "has_published", mapping.PublishedAt != nil)
+		return nil
+	}
+	if err := m.acceptPost(ctx, communityDID, mapping.ATURI, recordCID, *mapping.PublishedAt); err != nil {
+		return err
+	}
+
+	// ORPHAN GUARD. The stats commit and this repin are separate commits in
+	// separate repos, so a delete can land between them: deleteMapping removes
+	// the acceptance and the post, and this write then re-creates an acceptance
+	// for a record that no longer exists — a community attesting to nothing,
+	// which no later delete will revisit because the mapping is already
+	// tombstoned. Re-read the mapping and compensate if that happened.
+	current, err := m.objects.GetByAPID(ctx, mapping.APID)
+	switch {
+	case err == nil && !current.IsDeleted():
+		return nil
+	case err != nil && !errors.IsNotFound(err):
+		return fmt.Errorf("materialize: re-check mapping after repin %s: %w", mapping.APID, err)
+	}
+	m.logger.Warn("post was deleted while its acceptance was being repinned; withdrawing the acceptance",
+		"ap_id", mapping.APID, "at_uri", mapping.ATURI)
+	rkey := SubjectRKey(mapping.ATURI)
+	if _, derr := m.repos.DeleteRecord(ctx, communityDID, CollectionAcceptance, rkey); derr != nil && !errors.IsNotFound(derr) {
+		return fmt.Errorf("materialize: withdraw orphaned acceptance %s/%s/%s: %w",
+			communityDID, CollectionAcceptance, rkey, derr)
+	}
+	return nil
 }
 
 // bridgedStatsCounts reads the upvotes/downvotes a record's bridgedStats field

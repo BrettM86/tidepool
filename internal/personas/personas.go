@@ -40,6 +40,12 @@ type Options struct {
 	// under, e.g. "https://coves.social". It seeds NEW rows only; serving
 	// derives every URL from the stored actor_id.
 	UserOrigin string
+	// ServiceActor is the bridge's own AP identity. The user origin's
+	// instance ("Site") actor is the SAME bridge speaking under a second
+	// origin, so it republishes this actor's RSA key under an id derived
+	// from UserOrigin; only Key and CreatedAt are read. Optional: without
+	// it the origin apex serves no instance actor (Lemmy tolerates that).
+	ServiceActor *ap.ServiceActor
 }
 
 // Service mints and serves Coves user actors.
@@ -52,6 +58,9 @@ type Service struct {
 	// normalized_origin they are stored under — the same string Host
 	// routing hands the webfinger endpoint, so a lookup needs no reshaping.
 	userHost string
+	// serviceActor is the bridge identity the origin apex republishes. Nil
+	// means the apex publishes nothing.
+	serviceActor *ap.ServiceActor
 }
 
 // New builds a Service. UserOrigin is parsed once here: the host it yields
@@ -67,6 +76,8 @@ func New(opts Options) (*Service, error) {
 		custodian:  opts.Custodian,
 		userOrigin: opts.UserOrigin,
 		userHost:   host,
+
+		serviceActor: opts.ServiceActor,
 	}, nil
 }
 

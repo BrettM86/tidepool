@@ -1,0 +1,186 @@
+package personas
+
+import (
+	"bytes"
+	"net"
+	"net/http"
+	"strings"
+
+	"tidepool/internal/errors"
+)
+
+// HostRouterOptions configures NewHostRouter.
+type HostRouterOptions struct {
+	// ServiceHost is BRIDGE_HOSTNAME: the bridge's own surface, including
+	// every bridged handle's subdomain under it.
+	ServiceHost    string
+	ServiceHandler http.Handler
+	// UserHost is AP_USER_ORIGIN's host: the Coves user origin.
+	UserHost    string
+	UserHandler http.Handler
+	// DevFallthrough sends unknown Hosts to the service handler instead of
+	// refusing them. A laptop is reached by IP, tunnel hostname, or whatever
+	// the tunnel minted this morning; a production deployment is not.
+	DevFallthrough bool
+}
+
+// NewHostRouter splits one listener between the bridge's service surface and
+// the Coves user origin by request Host.
+//
+// Refusing an unknown Host with 421 is the production posture: this process
+// serves an authenticated write surface and an AP inbox, and neither should be
+// reachable under a name an attacker chose. Suffix matching is on a LABEL
+// BOUNDARY in both directions — "nottdpl.io" is not the service host and
+// "tdpl.io.evil.example" is not under it — because a bare substring test here
+// would hand an attacker the whole service surface.
+func NewHostRouter(opts HostRouterOptions) (http.Handler, error) {
+	// A nil handler would nil-panic on the first request of whichever
+	// bucket it was meant to serve, and a missing host cannot classify
+	// anything: both are startup errors, not runtime surprises.
+	if opts.ServiceHost == "" {
+		return nil, errors.NewValidationError("service_host", "must not be empty")
+	}
+	if opts.ServiceHandler == nil {
+		return nil, errors.NewValidationError("service_handler", "must not be nil")
+	}
+	if opts.UserHost == "" {
+		return nil, errors.NewValidationError("user_host", "must not be empty")
+	}
+	if opts.UserHandler == nil {
+		return nil, errors.NewValidationError("user_handler", "must not be nil")
+	}
+
+	return &hostRouter{
+		serviceHost:    normalizeHost(opts.ServiceHost),
+		serviceHandler: opts.ServiceHandler,
+		userHost:       normalizeHost(opts.UserHost),
+		userHandler:    opts.UserHandler,
+		devFallthrough: opts.DevFallthrough,
+	}, nil
+}
+
+type hostRouter struct {
+	serviceHost    string
+	serviceHandler http.Handler
+	userHost       string
+	userHandler    http.Handler
+	devFallthrough bool
+}
+
+func (h *hostRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	host := normalizeHost(r.Host)
+	switch {
+	case host == h.userHost && h.userHost == h.serviceHost:
+		// The default dev configuration points BRIDGE_HOSTNAME and
+		// AP_USER_ORIGIN at the same authority. One Host cannot pick a
+		// bucket, so the split moves to the path: see serveComposed.
+		h.serveComposed(w, r)
+	case host == h.userHost:
+		h.userHandler.ServeHTTP(w, r)
+	case h.isServiceHost(host):
+		h.serviceHandler.ServeHTTP(w, r)
+	case h.devFallthrough:
+		h.serviceHandler.ServeHTTP(w, r)
+	default:
+		http.Error(w, "unrecognized Host", http.StatusMisdirectedRequest)
+	}
+}
+
+// isServiceHost reports whether host belongs to the bridge's own surface:
+// the configured hostname, any subdomain of it (954 bridged handles resolve
+// through those), or an address with no registered name at all — an absent
+// Host, "localhost", or a bare IP literal, which is how container
+// healthchecks and direct-IP probes arrive.
+func (h *hostRouter) isServiceHost(host string) bool {
+	if host == "" || host == h.serviceHost || strings.HasSuffix(host, "."+h.serviceHost) {
+		return true
+	}
+	name := hostnameOnly(host)
+	return name == "localhost" || net.ParseIP(name) != nil
+}
+
+// serveComposed runs the user surface first and replaces its 404 with the
+// service handler's response. The user response is BUFFERED rather than
+// streamed: once a status line has reached the client there is no taking it
+// back, so a fallback would append its body to the 404 instead of replacing
+// it.
+func (h *hostRouter) serveComposed(w http.ResponseWriter, r *http.Request) {
+	buffered := &bufferedResponse{header: http.Header{}}
+	h.userHandler.ServeHTTP(buffered, r)
+	if buffered.status() == http.StatusNotFound {
+		// The user surface does not serve this path; the service surface
+		// gets the real writer, so its headers and status are the ones
+		// that land.
+		h.serviceHandler.ServeHTTP(w, r)
+		return
+	}
+	buffered.flushTo(w)
+}
+
+// bufferedResponse captures a handler's response so the caller can decide
+// whether to send it.
+type bufferedResponse struct {
+	header http.Header
+	code   int
+	body   bytes.Buffer
+}
+
+func (b *bufferedResponse) Header() http.Header { return b.header }
+
+func (b *bufferedResponse) WriteHeader(code int) {
+	if b.code == 0 {
+		b.code = code
+	}
+}
+
+func (b *bufferedResponse) Write(p []byte) (int, error) {
+	b.WriteHeader(http.StatusOK)
+	return b.body.Write(p)
+}
+
+// status is the response's status, defaulting to 200 the way net/http does
+// for a handler that wrote nothing at all.
+func (b *bufferedResponse) status() int {
+	if b.code == 0 {
+		return http.StatusOK
+	}
+	return b.code
+}
+
+func (b *bufferedResponse) flushTo(w http.ResponseWriter) {
+	for key, values := range b.header {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+	w.WriteHeader(b.status())
+	_, _ = w.Write(b.body.Bytes())
+}
+
+// normalizeHost reduces a Host header to the authority it names: lowercase,
+// no trailing dot, and no default port for either scheme.
+//
+// Both default ports are stripped unconditionally, without consulting r.TLS.
+// In production TLS terminates at the proxy and the Go server sees plain HTTP
+// carrying the forwarded Host, so a scheme-keyed rule would classify
+// "coves.social:443" as an unknown authority precisely where it matters. A
+// NON-default port still carries meaning — the dev origin runs on :8091 and
+// coves.social:8443 is a different origin, not a sloppy spelling of one.
+func normalizeHost(host string) string {
+	normalized := strings.ToLower(strings.TrimSpace(host))
+	for _, defaultPort := range []string{":443", ":80"} {
+		if trimmed, found := strings.CutSuffix(normalized, defaultPort); found {
+			normalized = trimmed
+			break
+		}
+	}
+	return strings.TrimSuffix(normalized, ".")
+}
+
+// hostnameOnly strips a port and IPv6 brackets, leaving the name or address.
+func hostnameOnly(host string) string {
+	if name, _, err := net.SplitHostPort(host); err == nil {
+		return name
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+}

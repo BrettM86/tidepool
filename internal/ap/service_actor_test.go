@@ -21,12 +21,17 @@ import (
 type fakeServiceKeys struct {
 	mu   sync.Mutex
 	rows map[string][]byte
+	// created stamps each row like postgres' DEFAULT now() does. The real
+	// column is what the instance actor publishes as `published`, so a fake
+	// that left it zero would let a document render without one and call
+	// that passing.
+	created map[string]time.Time
 	// createHook runs inside Create before the insert (to simulate races).
 	createHook func()
 }
 
 func newFakeServiceKeys() *fakeServiceKeys {
-	return &fakeServiceKeys{rows: map[string][]byte{}}
+	return &fakeServiceKeys{rows: map[string][]byte{}, created: map[string]time.Time{}}
 }
 
 func (f *fakeServiceKeys) Create(_ context.Context, name string, pem []byte) (*store.ServiceKey, error) {
@@ -39,7 +44,8 @@ func (f *fakeServiceKeys) Create(_ context.Context, name string, pem []byte) (*s
 		return nil, errors.NewConflictError("service_key", "name", name)
 	}
 	f.rows[name] = pem
-	return &store.ServiceKey{ID: 1, Name: name, KeyMaterial: pem}, nil
+	f.created[name] = time.Now().UTC()
+	return &store.ServiceKey{ID: 1, Name: name, KeyMaterial: pem, CreatedAt: f.created[name]}, nil
 }
 
 func (f *fakeServiceKeys) Get(_ context.Context, name string) (*store.ServiceKey, error) {
@@ -49,7 +55,7 @@ func (f *fakeServiceKeys) Get(_ context.Context, name string) (*store.ServiceKey
 	if !ok {
 		return nil, errors.NewNotFoundError("service_key", name)
 	}
-	return &store.ServiceKey{ID: 1, Name: name, KeyMaterial: pem}, nil
+	return &store.ServiceKey{ID: 1, Name: name, KeyMaterial: pem, CreatedAt: f.created[name]}, nil
 }
 
 func TestLoadOrCreateServiceActor_GeneratesThenLoads(t *testing.T) {
@@ -192,6 +198,61 @@ func TestInstanceActorDocument(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, actor.Key.PublicKey.Equal(parsed),
 		"the instance actor reuses the service RSA key (Lemmy reads only publicKeyPem)")
+}
+
+// TestInstanceActorDocument_PublishedTracksTheKey pins that `published` is
+// the service key's real provisioning time, not a constant.
+func TestInstanceActorDocument_PublishedTracksTheKey(t *testing.T) {
+	keys := newFakeServiceKeys()
+	actor, err := LoadOrCreateServiceActor(context.Background(), keys, "bridge.example", "")
+	require.NoError(t, err)
+	require.False(t, actor.CreatedAt.IsZero(),
+		"the service key row carries a creation time; the actor must adopt it")
+
+	docJSON, err := actor.InstanceDocumentJSON()
+	require.NoError(t, err)
+	var doc map[string]any
+	require.NoError(t, json.Unmarshal(docJSON, &doc))
+
+	published, ok := doc["published"].(string)
+	require.True(t, ok, "published must be present when the key's age is known")
+	parsed, err := time.Parse(time.RFC3339, published)
+	require.NoError(t, err)
+	assert.WithinDuration(t, actor.CreatedAt, parsed, time.Second,
+		"published must be the key's provisioning time")
+}
+
+// TestInstanceActorDocument_OmitsUnknownPublished retires the hardcoded
+// test-shim fallback: an actor whose CreatedAt is unknown must OMIT
+// published rather than assert a fixed epoch. A document that states a date
+// the bridge does not know is a lie every peer caches; omitting it is
+// honest, and the only actors affected are hand-built test literals —
+// production loads CreatedAt from the service_keys row.
+func TestInstanceActorDocument_OmitsUnknownPublished(t *testing.T) {
+	key, err := GenerateRSAKey()
+	require.NoError(t, err)
+	actor := &ServiceActor{
+		ID:       "https://bridge.example" + ServiceActorPath,
+		Hostname: "bridge.example",
+		Scheme:   "https",
+		Key:      key,
+		// CreatedAt deliberately zero.
+	}
+
+	docJSON, err := actor.InstanceDocumentJSON()
+	require.NoError(t, err, "an unknown provisioning time must not fail the render")
+	assert.NotContains(t, string(docJSON), "2026-01-01",
+		"no hardcoded epoch may appear in a rendered document")
+
+	var doc map[string]any
+	require.NoError(t, json.Unmarshal(docJSON, &doc))
+	assert.NotContains(t, doc, "published",
+		"an unknown published date is omitted, never invented")
+
+	// The rest of the document still renders: omitting one unknown field
+	// must not degrade the identity.
+	assert.Equal(t, "Application", doc["type"])
+	assert.Equal(t, "https://bridge.example/", doc["id"])
 }
 
 func TestServiceActorSigner_RoundTrip(t *testing.T) {

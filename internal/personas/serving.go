@@ -48,6 +48,21 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.handleWebFinger(w, r)
+	case path == "/":
+		if !isGET(w, r) {
+			return
+		}
+		s.handleInstanceActor(w, r)
+	case path == nodeInfoDiscoveryPath:
+		if !isGET(w, r) {
+			return
+		}
+		s.handleNodeInfoDiscovery(w, r)
+	case path == nodeInfoSchemaPath:
+		if !isGET(w, r) {
+			return
+		}
+		s.handleNodeInfo(w, r)
 	case strings.HasPrefix(path, actorPathPrefix):
 		rest := strings.TrimPrefix(path, actorPathPrefix)
 		if !isGET(w, r) {
@@ -168,7 +183,7 @@ func (s *Service) handleWebFinger(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	host := requestHost(r)
+	host := normalizeHost(r.Host)
 	actor, err := s.lookupResource(r.Context(), resource, host)
 	if err != nil {
 		writeStoreError(w, err)
@@ -206,7 +221,7 @@ func (s *Service) lookupResource(ctx context.Context, resource, host string) (*s
 		if err != nil {
 			return nil, err
 		}
-		if canonicalHost(acctHost) != host {
+		if normalizeHost(acctHost) != host {
 			return nil, errors.NewNotFoundError("ap_actor", resource)
 		}
 		return s.actors.GetByOriginLocalPart(ctx, host, strings.ToLower(local))
@@ -216,7 +231,7 @@ func (s *Service) lookupResource(ctx context.Context, resource, host string) (*s
 	if err != nil {
 		return nil, errors.NewValidationError("resource", err.Error())
 	}
-	if canonicalHost(parsed.Host) != host {
+	if normalizeHost(parsed.Host) != host {
 		return nil, errors.NewNotFoundError("ap_actor", resource)
 	}
 	did, ok := strings.CutPrefix(parsed.Path, actorPathPrefix)
@@ -233,26 +248,6 @@ func (s *Service) lookupResource(ctx context.Context, resource, host string) (*s
 		return nil, errors.NewNotFoundError("ap_actor", resource)
 	}
 	return actor, nil
-}
-
-// requestHost is the routed authority in the form ap_actors.normalized_origin
-// stores it. The scheme's DEFAULT port is noise and is stripped; any other
-// port is part of the authority and stays — dev runs the origin on
-// localhost:8091, and coves.social:8443 is a different origin from
-// coves.social, not a sloppy spelling of it.
-func requestHost(r *http.Request) string {
-	host := strings.ToLower(strings.TrimSpace(r.Host))
-	defaultPort := ":80"
-	if r.TLS != nil {
-		defaultPort = ":443"
-	}
-	return canonicalHost(strings.TrimSuffix(host, defaultPort))
-}
-
-// canonicalHost lowercases a host and drops the trailing dot of a
-// fully-qualified name, which names the same host.
-func canonicalHost(host string) string {
-	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
 }
 
 // actorOrigin recovers the scheme+host an actor was minted under from its

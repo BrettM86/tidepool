@@ -28,13 +28,28 @@ type RepoReemitter interface {
 // comments), or the content lands with dangling references. Cross-repo
 // order is relay-dependent regardless (see README), so this is best-effort
 // within one repo, not a delivery guarantee.
+//
+// The tiers are what references what: profiles are referenced by everything,
+// posts are referenced by the comments that reply to them, and acceptance and
+// removal records strongRef a post, so they come last. BOTH post eras share
+// tier 1 — a postv2 is a post, and the deprecated collection is the same tier
+// because the records already written under it still index the same way. That
+// pairing is the whole point: matching only the old name put an author's
+// comments ahead of the roots they reply to the moment the flip landed, which
+// is precisely the dangling reference this ordering exists to prevent.
 func reemitCollectionRank(collection string) int {
 	switch collection {
 	case "social.coves.community.profile", "social.coves.actor.profile":
 		return 0
-	case "social.coves.community.post":
+	case "social.coves.community.post", "social.coves.community.postv2":
 		return 1
+	case "social.coves.community.acceptance", "social.coves.community.removal":
+		// After ALL content: each pins a post by strongRef, and a community's
+		// attestation about a post is meaningless to an indexer that has not
+		// seen the post yet.
+		return 3
 	default:
+		// Comments and anything not listed. Content, so after posts.
 		return 2
 	}
 }

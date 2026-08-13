@@ -416,6 +416,46 @@ func TestRemovalSurvivesRedeliveredCreate(t *testing.T) {
 	assert.Equal(t, removalBefore["createdAt"], removalAfter["createdAt"])
 }
 
+// TestSweepDeletedPostV2RemovesAcceptanceWithoutRemoval (N2): the
+// origin-verified delete sweep is CLEANUP, not moderation. When the origin
+// stops serving a post, the bridge stops carrying it — the postv2 goes, and
+// its acceptance must go with it or the community is left attesting to a
+// record that no longer exists. No removal record is written: nobody
+// moderated anything, and a removal would put a moderation action in the
+// community's log against an author whose instance simply deleted the post.
+//
+// Note the sweep's safety rule stands unchanged: a 404 is NOT a delete (an
+// instance hiding an object it will not serve us is indistinguishable from a
+// missing one), so only the origin's explicit Tombstone triggers this.
+func TestSweepDeletedPostV2RemovesAcceptanceWithoutRemoval(t *testing.T) {
+	h := newHarness(t)
+	post := setupModeratedPost(t, h)
+	ctx := context.Background()
+
+	// The origin now serves Lemmy's deleted-object shape.
+	h.serveObject(urlPath(t, pageID), map[string]any{"id": pageID, "type": "Tombstone"})
+	out := h.sweep(pageID)
+	require.Equal(t, OutcomeDeleted, out.Result[0].Outcome)
+	require.Equal(t, 1, out.Deleted)
+
+	_, _, err := h.manager.GetRecord(ctx, post.authorDID, materialize.CollectionPostV2, post.rkey)
+	assert.True(t, errors.IsNotFound(err),
+		"the swept postv2 must be deleted from the author's repo (err=%v)", err)
+	_, _, err = h.manager.GetRecord(ctx, post.communityDID, materialize.CollectionAcceptance, post.digestRKey)
+	assert.True(t, errors.IsNotFound(err),
+		"the acceptance must not outlive the post it attests to (err=%v)", err)
+	_, _, err = h.manager.GetRecord(ctx, post.communityDID, materialize.CollectionRemoval, post.digestRKey)
+	assert.True(t, errors.IsNotFound(err),
+		"an origin-verified sweep is cleanup, not moderation: no removal record (err=%v)", err)
+
+	mapping, err := h.objects.GetByAPID(ctx, pageID)
+	require.NoError(t, err)
+	assert.True(t, mapping.IsDeleted(), "the mapping must be soft-deleted")
+	tombstoned, err := h.tombstones.ExistsFor(ctx, pageID, "")
+	require.NoError(t, err)
+	assert.True(t, tombstoned, "the create-after-delete marker must be recorded")
+}
+
 // TestLegacyPostModRemovalKeepsV1Semantics (R6) is the mixed-era control.
 // Moderation records are postv2-only in this task: a pre-flip post has no
 // acceptance to delete, and writing a removal for it would announce a

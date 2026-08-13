@@ -226,10 +226,22 @@ func handleFromAlsoKnownAs(alsoKnownAs []string) (string, error) {
 		}
 		return candidate, nil
 	}
-	// RULED PERMANENT: the document is a complete answer, and it says this DID
-	// claims no handle. Nothing about retrying changes what the document says,
-	// so it is dead-lettered exhausted rather than redriven — the recovery
-	// path is manual, by design.
+	if len(alsoKnownAs) == 0 {
+		// TRANSIENT, deliberately. An empty alsoKnownAs is a complete answer
+		// today, but it is an answer about a mutable external world: a user
+		// who publishes their handle minutes after their first comment must
+		// still get that comment federated. Under this consumer's semantics a
+		// permanent failure is dead-lettered with its redrive budget already
+		// spent and never retried, so "permanent" here would mean "lost until
+		// a human intervenes", while transient costs ten cheap retries and
+		// reaches the same terminal state if the handle never appears.
+		return "", fmt.Errorf("DID document publishes no alsoKnownAs yet")
+	}
+	// PERMANENT. The DID has published identity claims and not one of them is
+	// an atproto handle — https:// profile links and mailto: addresses are
+	// perfectly valid alsoKnownAs entries and are simply not handles. Retrying
+	// re-reads the same list; the recovery path is the user publishing a
+	// handle, which arrives as a new event rather than a redrive of this one.
 	return "", fmt.Errorf("%w: DID document claims no atproto handle", ErrPermanentEvent)
 }
 

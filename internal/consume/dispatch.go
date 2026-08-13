@@ -302,14 +302,58 @@ func (d *Dispatcher) handleCommit(ctx context.Context, event *JetstreamEvent) er
 // handlePostV2 hands a native post to the task 16 acceptance engine. Admission,
 // the acceptance write and the outbound enqueue must ride ONE commit, which
 // only the engine can do — so this consumer hands over the whole commit and
-// owns none of it, not even the outbound_objects row.
+// owns none of it, not even the outbound_objects row. Keeping no post state
+// here is also what makes the lexicon's community-immutability rule
+// enforceable in ONE place: there is no second copy of the answer to disagree
+// with the engine's.
 func (d *Dispatcher) handlePostV2(ctx context.Context, did string, commit *CommitEvent) error {
 	if d.engine == nil {
 		d.logger.Debug("no acceptance engine wired; skipping postv2",
 			slog.String("did", did), slog.String("rkey", commit.RKey))
 		return nil
 	}
+
+	// A DELETE passes through ungated. It carries no record, so there is no
+	// community field to check — and gating on one it cannot see would drop
+	// every author delete and strand the acceptance records those deletes
+	// exist to take down. The engine already knows which posts it accepted
+	// and can no-op the rest.
+	if commit.Operation != operationDelete {
+		communityDID := stringField(commit.Record, "community")
+		if communityDID == "" {
+			// The lexicon REQUIRES community. A post without one is malformed
+			// and belongs in the DLQ, where a lexicon rollout mistake stays
+			// visible instead of becoming a silent drop.
+			return fmt.Errorf("%w: postv2 %s names no community", ErrPermanentEvent, commit.RKey)
+		}
+		bridged, err := d.isBridgedCommunity(ctx, communityDID)
+		if err != nil {
+			return err
+		}
+		if !bridged {
+			// Most Coves posts are exactly this. Admitting one would write an
+			// acceptance record into a community repo that has no business
+			// existing.
+			d.logger.Debug("skipping postv2 for a non-bridged community",
+				slog.String("did", did), slog.String("community", communityDID))
+			return nil
+		}
+	}
+
 	return d.engine.AdmitPost(ctx, did, commit)
+}
+
+// isBridgedCommunity reports whether Tidepool federates the community. The
+// communities table is the authority: a row is what makes a community bridged.
+func (d *Dispatcher) isBridgedCommunity(ctx context.Context, communityDID string) (bool, error) {
+	_, err := d.communities.GetByDID(ctx, communityDID)
+	if errors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("look up community %s: %w", communityDID, err)
+	}
+	return true, nil
 }
 
 // handleAccount applies a #account status change (decision 19). Status is what

@@ -3,6 +3,7 @@ package consume
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -35,9 +36,14 @@ type fakeIdentity struct {
 	plcBody   map[string]string
 	// wellKnownStatus forces a status for one handle's endpoint.
 	wellKnownStatus map[string]int
+	// txt is the DID each handle publishes over DNS, and txtRaw overrides the
+	// raw record set. Absent from both = NXDOMAIN.
+	txt    map[string]string
+	txtRaw map[string][]string
 
 	plcHits       int
 	wellKnownHits int
+	txtHits       int
 }
 
 const wellKnownATProtoDIDPath = "/.well-known/atproto-did"
@@ -51,6 +57,8 @@ func newFakeIdentity(t *testing.T) *fakeIdentity {
 		plcStatus:       map[string]int{},
 		plcBody:         map[string]string{},
 		wellKnownStatus: map[string]int{},
+		txt:             map[string]string{},
+		txtRaw:          map[string][]string{},
 	}
 
 	mux := http.NewServeMux()
@@ -164,6 +172,46 @@ func (f *fakeIdentity) wellKnownFails(handle string, status int) {
 	f.wellKnownStatus[strings.ToLower(handle)] = status
 }
 
+// txtClaims publishes a handle's DID over DNS, the way a self-hosted handle
+// does. This is the FIRST direction the resolver tries.
+func (f *fakeIdentity) txtClaims(handle, did string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.txt[strings.ToLower(handle)] = did
+}
+
+// txtRecords sets a handle's raw TXT record set — for the case where DNS
+// answers but says nothing about atproto.
+func (f *fakeIdentity) txtRecords(handle string, records ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.txtRaw[strings.ToLower(handle)] = records
+}
+
+// lookupTXT is the LookupTXTFunc the resolver is wired with. It is injected
+// rather than hitting the system resolver, which is what keeps these tests
+// from issuing real DNS queries for the handles in their fixtures.
+func (f *fakeIdentity) lookupTXT(_ context.Context, name string) ([]string, error) {
+	handle := strings.ToLower(strings.TrimPrefix(name, atprotoTXTPrefix))
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.txtHits++
+	if records, ok := f.txtRaw[handle]; ok {
+		return records, nil
+	}
+	if did, ok := f.txt[handle]; ok {
+		return []string{"did=" + did}, nil
+	}
+	return nil, &net.DNSError{Err: "no such host", Name: name, IsNotFound: true}
+}
+
+func (f *fakeIdentity) TXTHits() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.txtHits
+}
+
 func (f *fakeIdentity) PLCHits() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -188,6 +236,7 @@ func (f *fakeIdentity) resolver(t *testing.T) *HandleResolver {
 			Transport: identityRewriteTransport{target: f.server.Listener.Addr().String()},
 		},
 		UserAgent: "tidepool-test/0.1",
+		LookupTXT: f.lookupTXT,
 	})
 	require.NoError(t, err, "build handle resolver")
 	require.NotNil(t, resolver)

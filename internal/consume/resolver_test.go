@@ -140,7 +140,7 @@ func TestHandleResolver_TransientFailuresStayRedrivable(t *testing.T) {
 	}
 }
 
-func TestHandleResolver_MissingHandleIsPermanent(t *testing.T) {
+func TestHandleResolver_MissingHandleIsTransient(t *testing.T) {
 	fake := newFakeIdentity(t)
 	// A valid DID document with no alsoKnownAs at all.
 	fake.plcServes(resolveDID, `{"@context":["https://www.w3.org/ns/did/v1"],
@@ -150,13 +150,19 @@ func TestHandleResolver_MissingHandleIsPermanent(t *testing.T) {
 
 	require.Error(t, err, "a DID with no handle cannot be given a frozen local part")
 	assert.Empty(t, handle)
-	assert.ErrorIs(t, err, ErrPermanentEvent,
-		"RULED PERMANENT: the document states the DID has no handle, which is an answer "+
-			"rather than a failure. See the cycle F report — permanent events are "+
-			"excluded from redrive by design, so the recovery path is manual")
+	assert.NotErrorIs(t, err, ErrPermanentEvent,
+		"RE-RULED TRANSIENT. The document is a complete answer TODAY, but it is an "+
+			"answer about a mutable external world: a user who publishes their handle "+
+			"minutes after their first comment must get that comment federated. Under "+
+			"our shipped semantics a permanent failure is dead-lettered with its "+
+			"budget already spent and the redriver never touches it again, so "+
+			"'permanent' here would mean 'lost until a human intervenes' — while "+
+			"transient costs ten cheap retries and reaches the same terminal state "+
+			"if the handle never appears")
 
 	assert.Zero(t, fake.WellKnownHits(),
 		"and nothing is fetched from the network on a claim that does not exist")
+	assert.Zero(t, fake.TXTHits(), "nor from DNS")
 }
 
 func TestHandleResolver_NonATProtoAlsoKnownAsIsPermanent(t *testing.T) {
@@ -213,4 +219,87 @@ func TestNewHandleResolver_RequiresGuardedEgress(t *testing.T) {
 	})
 	require.Error(t, err, "the directory URL must be an absolute http(s) URL")
 	assert.True(t, errors.IsValidation(err), "want validation error, got %v", err)
+}
+
+// ---------------------------------------------------------------------------
+// FF2 — the DNS half of handle verification
+// ---------------------------------------------------------------------------
+//
+// The atproto convention offers two ways for a handle to claim a DID back:
+// a _atproto.{handle} TXT record, and the HTTPS well-known. DNS is tried
+// first, which is both the spec's order and the safer one — see the
+// contradiction test below.
+
+func TestHandleResolver_DNSAloneVerifiesAndSkipsTheWellKnown(t *testing.T) {
+	fake := newFakeIdentity(t)
+	// The document claims the handle; the handle claims the DID back over DNS
+	// ONLY — it serves no well-known at all, like most self-hosted handles.
+	fake.claimOneWay(resolveDID, resolveHandle)
+	fake.txtClaims(resolveHandle, resolveDID)
+
+	handle, err := fake.resolver(t).ResolveDIDHandle(context.Background(), resolveDID)
+	require.NoError(t, err,
+		"a TXT-verified handle must resolve: DNS-only handles are the majority on the "+
+			"network, and refusing them would silently drop those users' comments")
+	assert.Equal(t, resolveHandle, handle)
+
+	assert.Equal(t, 1, fake.TXTHits())
+	assert.Zero(t, fake.WellKnownHits(),
+		"DNS answered, so the well-known is never fetched — one round-trip, not two, "+
+			"on the path in front of every first-time commenter")
+}
+
+func TestHandleResolver_ContradictingTXTIsPermanentAndTheWellKnownCannotOverrideIt(t *testing.T) {
+	fake := newFakeIdentity(t)
+	// Mallory's document claims alice's handle.
+	fake.claimOneWay(resolveOtherDID, resolveHandle)
+	// DNS — which alice controls — says the handle is alice's.
+	fake.txtClaims(resolveHandle, resolveDID)
+	// The well-known says otherwise. An attacker who can serve HTTP for the
+	// handle's host, but cannot change its DNS, would win if a contradicting
+	// TXT fell through to the well-known.
+	fake.wellKnownReturns(resolveHandle, resolveOtherDID)
+
+	handle, err := fake.resolver(t).ResolveDIDHandle(context.Background(), resolveOtherDID)
+
+	require.Error(t, err)
+	assert.Empty(t, handle)
+	assert.ErrorIs(t, err, ErrPermanentEvent,
+		"DNS answered and the answer names a different DID: that is a refusal, not a "+
+			"missing record")
+	assert.Zero(t, fake.WellKnownHits(),
+		"and the well-known must NOT be consulted after a contradicting TXT — falling "+
+			"through would let whoever controls the handle's web server overrule the "+
+			"DNS its real owner published")
+}
+
+func TestHandleResolver_MissingTXTFallsThroughToTheWellKnown(t *testing.T) {
+	fake := newFakeIdentity(t)
+	fake.claim(resolveDID, resolveHandle) // well-known only; no TXT registered
+
+	handle, err := fake.resolver(t).ResolveDIDHandle(context.Background(), resolveDID)
+	require.NoError(t, err)
+	assert.Equal(t, resolveHandle, handle)
+
+	assert.Equal(t, 1, fake.TXTHits(), "DNS is asked first")
+	assert.Equal(t, 1, fake.WellKnownHits(),
+		"NXDOMAIN is 'this handle does not use DNS', not 'this handle disowns the DID', "+
+			"so the well-known is the answer")
+}
+
+func TestHandleResolver_TXTWithoutAnATProtoRecordFallsThrough(t *testing.T) {
+	fake := newFakeIdentity(t)
+	fake.claim(resolveDID, resolveHandle)
+	// DNS answers, but says nothing about atproto. Almost every domain has
+	// TXT records; only the did= one is a claim.
+	fake.txtRecords(resolveHandle, "v=spf1 -all", "google-site-verification=abc123")
+
+	handle, err := fake.resolver(t).ResolveDIDHandle(context.Background(), resolveDID)
+	require.NoError(t, err)
+	assert.Equal(t, resolveHandle, handle)
+
+	assert.Equal(t, 1, fake.TXTHits())
+	assert.Equal(t, 1, fake.WellKnownHits(),
+		"an unrelated TXT record set is not an atproto answer, so verification "+
+			"continues rather than failing")
 }

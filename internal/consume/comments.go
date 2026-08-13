@@ -13,33 +13,49 @@ import (
 // The native-comment path: a social.coves.community.comment record in a Coves
 // user's own repo that belongs to a thread the bridge federates.
 //
-// Cycle F implements CREATE. Update, delete, the Lemmy depth cap and parents
-// that are themselves comments are cycle H; they extend this file rather than
-// replacing it, because the four steps below are the same for all of them.
+// The DELETE case is what outbound_objects exists for. A Jetstream delete
+// commit carries the repo DID, the collection and the rkey and NOTHING else:
+// no record body, no CID, no reply refs. Every fact the Delete activity needs
+// — the AP id, the community it is addressed to, the parent it hangs under —
+// has to be read back out of state written at create time.
+
+// maxCommentDepth is Lemmy's comment nesting limit (0.19.20). A comment AT the
+// cap still federates; one below it never can, so it is made visible in the
+// DLQ rather than dropped at debug.
+const maxCommentDepth = 50
 
 // handleComment applies one comment commit.
+func (d *Dispatcher) handleComment(ctx context.Context, did string, commit *CommitEvent) error {
+	switch commit.Operation {
+	case operationCreate, operationUpdate:
+		return d.applyCommentWrite(ctx, did, commit)
+	case operationDelete:
+		return d.applyCommentDelete(ctx, did, commit)
+	default:
+		d.logger.Debug("unknown comment operation",
+			slog.String("operation", commit.Operation), slog.String("did", did))
+		return nil
+	}
+}
+
+// applyCommentWrite handles a create or an update — the two operations that
+// push content OUTWARD.
 //
 // The ORDER of the steps is the design, and each one is a gate on the next:
 //
 //  1. the opt-out gate, so a user who said no never gets an AP identity
-//     created for them;
+//     created for them and never has new content sent on their behalf;
 //  2. the thread resolution, so a comment in a NATIVE community — which this
 //     bridge has no business federating — is skipped before anything is
 //     written or minted;
-//  3. the lazy mint, THROUGH handle verification, because the local part it
+//  3. the depth cap, before any state or identity exists for a comment Lemmy
+//     will never accept;
+//  4. the lazy mint, THROUGH handle verification, because the local part it
 //     derives is frozen at creation;
-//  4. the outbound state, then the intent — state first, because the intent is
-//     built from it and a delete one day has nothing else to be built from.
-func (d *Dispatcher) handleComment(ctx context.Context, did string, commit *CommitEvent) error {
-	if commit.Operation != operationCreate {
-		// Update and delete are cycle H. Returning nil rather than an error
-		// keeps the cursor moving; the rev gate has already claimed this
-		// revision, which is what a later handler needs to stay ordered.
-		d.logger.Debug("comment operation not handled yet",
-			slog.String("operation", commit.Operation), slog.String("did", did))
-		return nil
-	}
-
+//  5. the outbound state, then the intent — state first, because the intent's
+//     activity id comes from the seq the write bumps, and a delete one day has
+//     nothing else to be built from.
+func (d *Dispatcher) applyCommentWrite(ctx context.Context, did string, commit *CommitEvent) error {
 	federating, err := d.mayFederate(ctx, did)
 	if err != nil {
 		return err
@@ -48,63 +64,111 @@ func (d *Dispatcher) handleComment(ctx context.Context, did string, commit *Comm
 		// The residual split-thread case, explicitly chosen (decision 11): the
 		// comment stays on the atproto side and the Lemmy side never sees it.
 		d.logger.Debug("skipping comment from an opted-out author",
-			slog.String("did", did), slog.String("rkey", commit.RKey))
+			slog.String("did", did), slog.String("rkey", commit.RKey),
+			slog.String("operation", commit.Operation))
 		return nil
 	}
 
-	thread, err := d.resolveThread(ctx, commit)
+	atURI := commitRecordURI(did, commit)
+	thread, err := d.commentThread(ctx, atURI, commit)
 	if err != nil {
 		return err
 	}
 	if thread == nil {
-		// Most native comments live in native communities. Dead-lettering
-		// every one of them would bury the queue in events that are working
-		// exactly as intended.
-		d.logger.Debug("skipping comment with no federated parent",
-			slog.String("did", did), slog.String("rkey", commit.RKey))
+		// Most native comments live in native communities, and most updates
+		// with no prior state are edits to a comment that never federated.
+		// Dead-lettering either would bury the queue in events working exactly
+		// as intended.
+		d.logger.Debug("skipping comment with no federated thread",
+			slog.String("did", did), slog.String("rkey", commit.RKey),
+			slog.String("operation", commit.Operation))
 		return nil
+	}
+
+	if thread.Depth > maxCommentDepth {
+		// Named "depth" on purpose: the connector stores err.Error() as the
+		// dead letter's last_error, and that string is all an operator
+		// triaging the queue has to go on.
+		return fmt.Errorf("%w: comment %s is at depth %d, beyond Lemmy's cap of %d",
+			ErrPermanentEvent, atURI, thread.Depth, maxCommentDepth)
 	}
 
 	if err := d.ensureActor(ctx, did); err != nil {
 		return err
 	}
 
-	atURI := commitRecordURI(did, commit)
 	snapshot, err := commentSnapshot(atURI, commit, thread)
 	if err != nil {
 		return err
 	}
-
 	stored, err := d.objects.Upsert(ctx, store.OutboundObject{
 		ATURI:      atURI,
 		APObjectID: d.apObjectID(did, commit),
 		LastCID:    commit.CID,
 		LastRev:    commit.Rev,
-		// The community comes from the PARENT's mapping, never from anything
-		// the comment asserts about itself: a record can claim any community
-		// it likes, but its parent's mapping is what the bridge already
-		// federated.
+		// The community and the depth come from the THREAD, never from
+		// anything the record asserts about itself — and on an update they
+		// come from the state the create left, because an edit never moves a
+		// comment between communities or up the thread.
 		CommunityDID:       thread.CommunityDID,
 		CommunityAPID:      thread.CommunityAPID,
 		TranslatedSnapshot: snapshot,
-		Depth:              thread.Depth + 1,
+		Depth:              thread.Depth,
 	})
 	if err != nil {
 		return fmt.Errorf("write outbound state for %s: %w", atURI, err)
 	}
 
+	return d.enqueueComment(ctx, did, commit.Operation, stored, thread.ParentATURI, thread.ParentAPID)
+}
+
+// applyCommentDelete withdraws a comment, using ONLY state.
+//
+// The opt-out gate is deliberately absent. A delete only ever REMOVES content,
+// so it is always safe to send, and it is the only way a user who has opted
+// out can retract what is already on the fediverse — blocking it would leave
+// the peer's copy standing forever, the exact opposite of what asking to stop
+// federating means.
+func (d *Dispatcher) applyCommentDelete(ctx context.Context, did string, commit *CommitEvent) error {
+	atURI := commitRecordURI(did, commit)
+
+	// Tombstone returns the state the Delete is built from in the same
+	// statement that stamps it, and is idempotent: a redelivered delete
+	// preserves the original tombstone time AND seq, so it reuses the activity
+	// id the first one sent and the peer recognises it as the same activity.
+	dead, err := d.objects.Tombstone(ctx, atURI)
+	if errors.IsNotFound(err) {
+		// A comment this bridge never federated. There is nothing to withdraw,
+		// and most native comment deletes are exactly this.
+		d.logger.Debug("skipping delete for a comment with no outbound state",
+			slog.String("did", did), slog.String("rkey", commit.RKey))
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("tombstone outbound state for %s: %w", atURI, err)
+	}
+
+	parent := parentFromSnapshot(dead.TranslatedSnapshot)
+	return d.enqueueComment(ctx, did, operationDelete, dead, parent.ATURI, parent.APID)
+}
+
+// enqueueComment hands one intent to task 15. The activity id comes from the
+// seq the write just produced, so every applied operation gets its own stable
+// id and a redelivery reuses it.
+func (d *Dispatcher) enqueueComment(ctx context.Context, did, operation string, stored *store.OutboundObject, parentATURI, parentAPID string) error {
 	intent := CommentIntent{
-		Op:            operationCreate,
-		ATURI:         atURI,
-		ID:            ActivityID(d.userOrigin, atURI, operationCreate, stored.LastActivitySeq),
-		CommunityAPID: thread.CommunityAPID,
-		ParentAPID:    thread.ParentAPID,
-		Snapshot:      snapshot,
+		Op:            operation,
+		ATURI:         stored.ATURI,
+		ID:            ActivityID(d.userOrigin, stored.ATURI, operation, stored.LastActivitySeq),
+		CommunityAPID: stored.CommunityAPID,
+		ParentAPID:    parentAPID,
+		Snapshot:      stored.TranslatedSnapshot,
 	}
 	// parentATURI carries the causal dependency (decision 15): delivery must
-	// not present a reply to a peer before the thing it replies to.
-	if err := d.enqueuer.EnqueueActivity(ctx, did, did, thread.ParentATURI, intent); err != nil {
-		return fmt.Errorf("enqueue comment intent for %s: %w", atURI, err)
+	// not present a reply to a peer before the thing it replies to. On a
+	// delete it comes from state, because the frame carries no reply refs.
+	if err := d.enqueuer.EnqueueActivity(ctx, did, did, parentATURI, intent); err != nil {
+		return fmt.Errorf("enqueue comment intent for %s: %w", stored.ATURI, err)
 	}
 	return nil
 }
@@ -116,59 +180,110 @@ type resolvedThread struct {
 	ParentAPID    string
 	CommunityDID  string
 	CommunityAPID string
-	// Depth is the PARENT's reply depth; the comment sits one below it.
+	// Depth is THIS comment's depth: the parent's recorded depth plus one.
 	Depth int
 }
 
-// resolveThread resolves the comment's parent through ap_objects and the
-// parent's community through communities. A nil thread with a nil error means
-// "not federated here" — a skip, not a failure.
-func (d *Dispatcher) resolveThread(ctx context.Context, commit *CommitEvent) (*resolvedThread, error) {
+// commentThread resolves the thread context for a create or an update.
+//
+// An UPDATE reads it back from the state its create wrote rather than
+// re-resolving: the record could name a different parent, and an edit is not
+// allowed to move a comment between communities or up the thread. It also
+// means an edit to a comment that never federated (the author was opted out at
+// the time, or it predates the bridge) resolves to nothing and is skipped.
+func (d *Dispatcher) commentThread(ctx context.Context, atURI string, commit *CommitEvent) (*resolvedThread, error) {
+	if commit.Operation == operationUpdate {
+		stored, err := d.objects.GetByATURI(ctx, atURI)
+		if errors.IsNotFound(err) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read outbound state for %s: %w", atURI, err)
+		}
+		parent := parentFromSnapshot(stored.TranslatedSnapshot)
+		return &resolvedThread{
+			ParentATURI:   parent.ATURI,
+			ParentAPID:    parent.APID,
+			CommunityDID:  stored.CommunityDID,
+			CommunityAPID: stored.CommunityAPID,
+			Depth:         stored.Depth,
+		}, nil
+	}
+	return d.resolveParent(ctx, commit)
+}
+
+// resolveParent finds the thing a new comment replies to. A parent can live in
+// EITHER of two places, and both are legitimate:
+//
+//   - ap_objects: content materialized from the fediverse (a Lemmy post or
+//     comment), or bridge-origin content mapped at write time;
+//   - outbound_objects: a NATIVE postv2 the acceptance engine admitted, or an
+//     earlier native comment. Nothing maps those into ap_objects — they were
+//     never materialized from the fediverse — so their outbound row is the
+//     only evidence they federate at all.
+//
+// A nil thread with a nil error means "not federated here": a skip, not a
+// failure.
+func (d *Dispatcher) resolveParent(ctx context.Context, commit *CommitEvent) (*resolvedThread, error) {
 	parentATURI := replyRef(commit.Record, "parent")
 	if parentATURI == "" {
-		// A comment with no reply.parent is a top-level comment shape this
-		// task does not federate; root-only replies fall back to the root.
+		// A root-only reply hangs directly under the thread root.
 		parentATURI = replyRef(commit.Record, "root")
 	}
 	if parentATURI == "" {
 		return nil, nil
 	}
 
-	parent, err := d.objectMappings.GetByATURI(ctx, parentATURI)
-	if errors.IsNotFound(err) {
-		return nil, nil
-	}
-	if err != nil {
+	mapping, err := d.objectMappings.GetByATURI(ctx, parentATURI)
+	if err != nil && !errors.IsNotFound(err) {
 		return nil, fmt.Errorf("resolve comment parent %s: %w", parentATURI, err)
 	}
-	if parent.CommunityDID == "" {
-		return nil, nil
+	if err == nil && mapping.CommunityDID != "" {
+		community, err := d.communities.GetByDID(ctx, mapping.CommunityDID)
+		if errors.IsNotFound(err) {
+			// The parent is mapped but its community is not one this bridge
+			// federates, so there is nowhere to deliver to.
+			return nil, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("resolve community %s: %w", mapping.CommunityDID, err)
+		}
+		return &resolvedThread{
+			ParentATURI:   parentATURI,
+			ParentAPID:    mapping.APID,
+			CommunityDID:  mapping.CommunityDID,
+			CommunityAPID: community.APGroupID,
+			Depth:         d.parentDepth(ctx, parentATURI) + 1,
+		}, nil
 	}
 
-	community, err := d.communities.GetByDID(ctx, parent.CommunityDID)
+	state, err := d.objects.GetByATURI(ctx, parentATURI)
 	if errors.IsNotFound(err) {
-		// The parent is mapped but its community is not one this bridge
-		// federates, so there is nowhere to deliver to.
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("resolve community %s: %w", parent.CommunityDID, err)
-	}
-
-	thread := &resolvedThread{
-		ParentATURI:   parentATURI,
-		ParentAPID:    parent.APID,
-		CommunityDID:  parent.CommunityDID,
-		CommunityAPID: community.APGroupID,
-	}
-	// A parent that is itself a federated comment carries its own depth; a
-	// parent that is a post has none, and its replies are depth 1.
-	if parentState, err := d.objects.GetByATURI(ctx, parentATURI); err == nil {
-		thread.Depth = parentState.Depth
-	} else if !errors.IsNotFound(err) {
 		return nil, fmt.Errorf("read parent outbound state %s: %w", parentATURI, err)
 	}
-	return thread, nil
+	return &resolvedThread{
+		ParentATURI:   parentATURI,
+		ParentAPID:    state.APObjectID,
+		CommunityDID:  state.CommunityDID,
+		CommunityAPID: state.CommunityAPID,
+		Depth:         state.Depth + 1,
+	}, nil
+}
+
+// parentDepth reads a mapped parent's recorded depth, which exists only if the
+// bridge federated it outward too. A parent with no outbound row is a post or
+// a Lemmy object at the top of what this bridge tracks, so its replies are
+// depth 1. Reading the parent's recorded depth is what keeps the cap O(1)
+// instead of walking the thread on every comment.
+func (d *Dispatcher) parentDepth(ctx context.Context, parentATURI string) int {
+	state, err := d.objects.GetByATURI(ctx, parentATURI)
+	if err != nil {
+		return 0
+	}
+	return state.Depth
 }
 
 // ensureActor makes sure the author has an AP identity, resolving their handle
@@ -210,9 +325,11 @@ func (d *Dispatcher) apObjectID(did string, commit *CommitEvent) string {
 }
 
 // commentSnapshot is the durable state a Delete or a restore is rebuilt from.
-// It keeps the RECORD as it arrived plus the context that was resolved around
-// it, because the delete commit that arrives one day carries neither.
-// Rendering it into ActivityPub vocabulary is task 15's; this is the input.
+// It keeps the RECORD as it arrived plus the context resolved around it,
+// because the delete commit that arrives one day carries neither — including
+// the PARENT, whose at-uri and AP id the Delete needs for causal ordering and
+// addressing. Rendering all of it into ActivityPub vocabulary is task 15's;
+// this is the input.
 func commentSnapshot(atURI string, commit *CommitEvent, thread *resolvedThread) ([]byte, error) {
 	snapshot, err := json.Marshal(map[string]any{
 		"atUri":         atURI,
@@ -220,6 +337,7 @@ func commentSnapshot(atURI string, commit *CommitEvent, thread *resolvedThread) 
 		"rev":           commit.Rev,
 		"collection":    commit.Collection,
 		"record":        commit.Record,
+		"parentAtUri":   thread.ParentATURI,
 		"parentApId":    thread.ParentAPID,
 		"communityApId": thread.CommunityAPID,
 	})
@@ -229,6 +347,22 @@ func commentSnapshot(atURI string, commit *CommitEvent, thread *resolvedThread) 
 		return nil, fmt.Errorf("%w: snapshot %s: %w", ErrPermanentEvent, atURI, err)
 	}
 	return snapshot, nil
+}
+
+// snapshotParent is the parent reference carried in a stored snapshot.
+type snapshotParent struct {
+	ATURI string `json:"parentAtUri"`
+	APID  string `json:"parentApId"`
+}
+
+// parentFromSnapshot reads the parent back out of stored state. An unreadable
+// or older snapshot yields empty strings rather than an error: the delete
+// still has to go out, and delivery without the causal hint is better than a
+// retraction that never leaves.
+func parentFromSnapshot(snapshot []byte) snapshotParent {
+	var parent snapshotParent
+	_ = json.Unmarshal(snapshot, &parent)
+	return parent
 }
 
 // replyRef reads reply.{name}.uri out of a decoded comment record.
@@ -245,5 +379,8 @@ func replyRef(record map[string]any, name string) string {
 	return uri
 }
 
-// operationCreate is the commit operation that carries a new record.
-const operationCreate = "create"
+// The commit operations this consumer distinguishes.
+const (
+	operationCreate = "create"
+	operationUpdate = "update"
+)

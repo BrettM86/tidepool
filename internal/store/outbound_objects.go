@@ -21,7 +21,7 @@ func NewOutboundObjects(db *sql.DB) OutboundObjects {
 const outboundObjectColumns = `
 	at_uri, ap_object_id, last_cid, last_rev,
 	community_did, community_ap_id, translated_snapshot,
-	last_activity_seq, depth, created_at, updated_at, tombstoned_at`
+	last_activity_seq, depth, created_at, updated_at, tombstoned_at, accepted_at`
 
 // execer is the subset of *sql.DB and *sql.Tx these repositories need, so one
 // statement runs either standalone or inside a caller's transaction.
@@ -161,18 +161,21 @@ func (r *postgresOutboundObjects) SetAccepted(ctx context.Context, atURI string)
 
 func scanOutboundObject(row rowScanner) (*OutboundObject, error) {
 	var object OutboundObject
-	var tombstonedAt sql.NullTime
+	var tombstonedAt, acceptedAt sql.NullTime
 	err := row.Scan(
 		&object.ATURI, &object.APObjectID, &object.LastCID, &object.LastRev,
 		&object.CommunityDID, &object.CommunityAPID, &object.TranslatedSnapshot,
 		&object.LastActivitySeq, &object.Depth,
-		&object.CreatedAt, &object.UpdatedAt, &tombstonedAt,
+		&object.CreatedAt, &object.UpdatedAt, &tombstonedAt, &acceptedAt,
 	)
 	if err != nil {
 		return nil, err
 	}
 	if tombstonedAt.Valid {
 		object.TombstonedAt = &tombstonedAt.Time
+	}
+	if acceptedAt.Valid {
+		object.AcceptedAt = &acceptedAt.Time
 	}
 	return &object, nil
 }

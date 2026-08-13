@@ -246,11 +246,19 @@ type OutboundObject struct {
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
 	TombstonedAt *time.Time
+	// AcceptedAt is the causal-gating marker (task 15, migration 020): stamped
+	// on delivery success. NULL means "not yet accepted by its community", which
+	// gates a bridge-origin child from delivering before its parent.
+	AcceptedAt *time.Time
 }
 
 // IsTombstoned reports whether the record was deleted upstream. Tombstoned
 // rows are KEPT: they are what a late replay is rejected against.
 func (o *OutboundObject) IsTombstoned() bool { return o.TombstonedAt != nil }
+
+// IsAccepted reports whether the object has been accepted by its community (its
+// AP delivery succeeded). A bridge-origin parent gates its children until it is.
+func (o *OutboundObject) IsAccepted() bool { return o.AcceptedAt != nil }
 
 // OutboundVote is the durable outbound state for one native vote (decision
 // 16). A vote DELETE commit names only the vote record, so direction and the

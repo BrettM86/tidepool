@@ -91,6 +91,12 @@ func (e *CollectionTruncatedError) Unwrap() error { return ErrCollectionTruncate
 type HTTPError struct {
 	URL        string
 	StatusCode int
+	// Body is a bounded excerpt of the response body, populated on delivery
+	// POSTs so the caller can classify peer-specific signals (task 15's worker
+	// keys Lemmy's duplicate-activity response — a 400 whose body names an
+	// already-received activity — as DELIVERED, not poisoned). Empty when the
+	// body was not captured.
+	Body string
 }
 
 func (e HTTPError) Error() string {
@@ -600,13 +606,47 @@ func (c *Client) SendActivity(ctx context.Context, inboxURL string, activity any
 // SendActivityAs signed-POSTs an activity to a remote inbox using the GIVEN
 // per-actor signer, not the client's configured Signer (which stays reserved
 // for the service actor's Follow/Undo). Task 15's delivery worker signs each
-// activity as the persona that authored the record. Retry/status handling
-// mirrors SendActivity.
+// activity as the persona that authored the record.
+//
+// Unlike SendActivity, this is a SINGLE POST with no internal retry loop: the
+// task-15 Worker owns retry, backoff and the poison/attempt-cap policy, and it
+// needs to see each response to classify it (Lemmy's duplicate-activity 400 is
+// a SUCCESS, a 404 triggers inbox re-resolution). A non-2xx response is
+// returned as an HTTPError carrying the status AND a bounded body excerpt, so
+// the worker can read Lemmy's "already received" body; a transport failure is
+// any other error.
 func (c *Client) SendActivityAs(ctx context.Context, signer *Signer, inboxURL string, activity any) error {
 	if signer == nil {
 		return errors.NewValidationError("signer", "SendActivityAs requires a per-actor Signer")
 	}
-	return c.sendActivityWith(ctx, signer, inboxURL, activity)
+	payload, err := json.Marshal(activity)
+	if err != nil {
+		return fmt.Errorf("ap: encode activity: %w", err)
+	}
+	if err := c.waitForHost(ctx, inboxURL); err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, inboxURL, bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("ap: build POST %s: %w", inboxURL, err)
+	}
+	req.Header.Set("User-Agent", c.userAgent)
+	req.Header.Set("Content-Type", ContentTypeActivityJSON)
+	if err := signer.SignRequest(req, payload); err != nil {
+		return err
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("ap: POST %s: %w", inboxURL, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil
+	}
+	return HTTPError{URL: inboxURL, StatusCode: resp.StatusCode, Body: string(body)}
 }
 
 // sendActivityWith is the shared POST loop: it marshals the activity once,

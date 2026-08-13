@@ -109,6 +109,22 @@ func (r *postgresOutboundVotes) GetByActorSubject(ctx context.Context, actorDID,
 	return vote, nil
 }
 
+// GetByActivityID looks a vote up by its current activity id — the delivery
+// callback's lookup: a Like/Dislike is delivered under CurrentActivityID and an
+// Undo embeds that same id, so both success callbacks resolve the vote row from
+// the one id. A miss is a NotFound.
+func (r *postgresOutboundVotes) GetByActivityID(ctx context.Context, activityID string) (*OutboundVote, error) {
+	query := `SELECT` + outboundVoteColumns + ` FROM outbound_votes WHERE current_activity_id = $1`
+	vote, err := scanOutboundVote(r.db.QueryRowContext(ctx, query, activityID))
+	if err != nil {
+		if stderrors.Is(err, sql.ErrNoRows) {
+			return nil, errors.NewNotFoundError("outbound_vote", activityID)
+		}
+		return nil, fmt.Errorf("get outbound_vote by activity id %q: %w", activityID, err)
+	}
+	return vote, nil
+}
+
 func (r *postgresOutboundVotes) SetDeliveredState(ctx context.Context, voteATURI string, state DeliveredState) error {
 	// Validated in Go rather than left to the CHECK constraint: an unknown
 	// state is a caller bug, and the caller needs it back as a validation

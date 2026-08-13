@@ -264,6 +264,20 @@ func (r *postgresOutboundDeliveries) Get(ctx context.Context, activityID, target
 	return delivery, nil
 }
 
+func (r *postgresOutboundDeliveries) HasPoisonedPredecessor(ctx context.Context, orderingKey, targetInbox string, seq int64) (bool, error) {
+	var exists bool
+	err := r.db.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM outbound_deliveries
+			WHERE ordering_key = $1 AND target_inbox = $2
+			  AND state = 'poisoned' AND seq < $3)`,
+		orderingKey, targetInbox, seq).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check poisoned predecessor on %q: %w", orderingKey, err)
+	}
+	return exists, nil
+}
+
 func scanOutboundDelivery(row rowScanner) (*OutboundDelivery, error) {
 	var delivery OutboundDelivery
 	var state string

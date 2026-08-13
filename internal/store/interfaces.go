@@ -373,6 +373,13 @@ type OutboundVotes interface {
 	// A miss is an error satisfying errors.IsNotFound.
 	GetByActorSubject(ctx context.Context, actorDID, subjectATURI string) (*OutboundVote, error)
 
+	// GetByActivityID returns the vote whose CurrentActivityID equals
+	// activityID — the DELIVERY callback's lookup (task 15). A Like/Dislike is
+	// delivered under CurrentActivityID; an Undo embeds that same id as its
+	// inner object, so both delivery-success callbacks resolve the vote row
+	// from the one activity id. A miss is an error satisfying errors.IsNotFound.
+	GetByActivityID(ctx context.Context, activityID string) (*OutboundVote, error)
+
 	// SetDeliveredState transitions the delivery state. An unknown state is
 	// an error satisfying errors.IsValidation; a missing vote is an error
 	// satisfying errors.IsNotFound.
@@ -532,4 +539,12 @@ type OutboundDeliveries interface {
 	// Get returns the delivery for an (activity, inbox) pair. A miss is an
 	// error satisfying errors.IsNotFound.
 	Get(ctx context.Context, activityID, targetInbox string) (*OutboundDelivery, error)
+
+	// HasPoisonedPredecessor reports whether an earlier delivery on the same
+	// ordering key and target inbox (a lower seq) is poisoned — the causal
+	// signal task 15's worker reads to distinguish a child whose bridge-origin
+	// parent WILL NEVER land (parent_poisoned) from one merely waiting
+	// (parent_unaccepted). Per-community serialization makes a lower-seq
+	// delivery on the same line a causal ancestor.
+	HasPoisonedPredecessor(ctx context.Context, orderingKey, targetInbox string, seq int64) (bool, error)
 }

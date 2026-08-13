@@ -48,7 +48,52 @@ type InboxResolver interface {
 
 // ActivitySender POSTs a signed activity to a remote inbox as a specific
 // persona. *ap.Client satisfies it via SendActivityAs (the per-actor signing
-// path, distinct from the service actor's configured-Signer SendActivity).
+// path, distinct from the service actor's configured-Signer SendActivity). A
+// non-2xx response is returned as an *ap.HTTPError carrying the status and a
+// bounded body excerpt, so the worker can classify Lemmy's duplicate-activity
+// response (400 + "already received") as DELIVERED; a transport failure is any
+// other error.
 type ActivitySender interface {
 	SendActivityAs(ctx context.Context, signer *ap.Signer, inbox string, activity any) error
 }
+
+// FreshInboxResolver is the OPTIONAL cache-bypassing extension an InboxResolver
+// may implement. On a 401/404/410 the worker re-resolves the community's inbox
+// ONCE bypassing the TTL cache — an endpoint rotation must not become a poison.
+// A resolver that does not implement it is simply asked again through the
+// normal (cached) path.
+type FreshInboxResolver interface {
+	ResolveInboxFresh(ctx context.Context, communityAPID string) (inbox string, err error)
+}
+
+// DeliveryScope is the (actor, community, inbox host) a delivery falls under,
+// which the kill switches are keyed on.
+type DeliveryScope struct {
+	ActorDID      string
+	CommunityAPID string
+	InboxHost     string
+}
+
+// Switches is the outbound kill-switch surface (decision 19), consulted at
+// claim time. A delivery a switch blocks is PARKED — it stays pending and
+// resumes when the switch clears — never poisoned or cancelled. The four levels
+// (global, per-host, per-community, per-actor) all funnel through
+// OutboundAllowed. DryRun is the separate "translate and log but POST nothing"
+// mode.
+type Switches interface {
+	// OutboundAllowed reports whether a delivery in this scope may be sent.
+	OutboundAllowed(scope DeliveryScope) bool
+	// DryRun reports whether to translate + log without POSTing (the delivery
+	// stays pending, nothing is marked delivered).
+	DryRun() bool
+}
+
+// AllowAll is the default Switches: everything enabled, no dry-run. main wires a
+// config-backed implementation; a nil Switches on the Worker means AllowAll.
+type AllowAll struct{}
+
+// OutboundAllowed always allows.
+func (AllowAll) OutboundAllowed(DeliveryScope) bool { return true }
+
+// DryRun is always false.
+func (AllowAll) DryRun() bool { return false }

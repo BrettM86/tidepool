@@ -238,6 +238,13 @@ func (s *Service) ActorSigner(ctx context.Context, did string) (*ap.Signer, erro
 	return s.actorSigner(ctx, did)
 }
 
+// SignerFor satisfies outbound.SignerProvider so main can inject *Service as the
+// delivery worker's signer source (cycle J). It is ActorSigner under the name
+// the worker's interface uses.
+func (s *Service) SignerFor(ctx context.Context, did string) (*ap.Signer, error) {
+	return s.actorSigner(ctx, did)
+}
+
 // actorSigner unseals a minted actor's RSA key and returns a Signer whose
 // keyID is "{actor_id}#main-key" — the same id the actor document publishes,
 // so a verifier that fetches the document finds the key it needs there.

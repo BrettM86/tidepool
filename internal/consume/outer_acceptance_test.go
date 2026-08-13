@@ -37,12 +37,17 @@ const (
 	// The commenter. This DID has NO row anywhere: no ap_actors, no
 	// bridged_actors, no communities, no repo_state. Its actor must be minted
 	// by the act of commenting.
-	acceptCommenterDID  = "did:plc:7iza6de2dwap2sbkpav7c6c6"
-	acceptCommentRKey   = "3lzcmnt3333bb"
-	acceptCommentCID    = "bafyreievgu2ty7qbiaaom5zhmkznsnajuzideek3lo7e65dwqlrvrxnmo4"
-	acceptCommentRev    = "3lzcmntrev001"
-	acceptCommentATURI  = "at://" + acceptCommenterDID + "/social.coves.community.comment/" + acceptCommentRKey
-	acceptCommentTimeUS = int64(1_775_000_000_000_000)
+	acceptCommenterDID = "did:plc:7iza6de2dwap2sbkpav7c6c6"
+	// The commenter's handle, which the bridge has to discover and VERIFY on
+	// its own: the commit carries no handle, and the local part it derives is
+	// frozen at creation.
+	acceptCommenterHandle    = "alice.coves.social"
+	acceptCommenterLocalPart = "alice"
+	acceptCommentRKey        = "3lzcmnt3333bb"
+	acceptCommentCID         = "bafyreievgu2ty7qbiaaom5zhmkznsnajuzideek3lo7e65dwqlrvrxnmo4"
+	acceptCommentRev         = "3lzcmntrev001"
+	acceptCommentATURI       = "at://" + acceptCommenterDID + "/social.coves.community.comment/" + acceptCommentRKey
+	acceptCommentTimeUS      = int64(1_775_000_000_000_000)
 )
 
 // acceptKEK seals minted actors' AP RSA keys (32 bytes, AES-256).
@@ -89,24 +94,42 @@ func TestConsumerFederatesAnUnseenNativeComment(t *testing.T) {
 	state := NewPostgresStateStore(conn, CursorSchemaVersion)
 	objects := store.NewOutboundObjects(conn)
 
+	// The atproto identity world: a PLC directory serving the commenter's DID
+	// document, and the handle's own well-known claiming the DID back. Both on
+	// httptest — no test ever reaches the network.
+	identity := newFakeIdentity(t)
+	identity.claim(acceptCommenterDID, acceptCommenterHandle)
+	resolver := identity.resolver(t)
+
 	// -------------------------------------------------------------------
 	// Run 1: first sighting.
 	// -------------------------------------------------------------------
 	firstEnqueuer := &recordingEnqueuer{}
-	runConnector(t, conn, minter, state, firstEnqueuer, acceptCommentTimeUS,
+	runConnector(t, conn, minter, resolver, state, firstEnqueuer, acceptCommentTimeUS,
 		commentCreateFrame(acceptCommentTimeUS, acceptCommentRev))
 
-	// 1. Lazy mint. The local part's derivation is deliberately NOT asserted
-	//    here: a commit event carries no handle, and where the handle comes
-	//    from is an open design question (see the task report). What the
-	//    bridge MUST NOT do is federate a comment from an identity that
-	//    doesn't exist.
+	// 1. Lazy mint, through resolution. The commit carries no handle, so the
+	//    bridge had to fetch the DID document, read the handle it claims, and
+	//    confirm the handle claims the DID back — before minting, because the
+	//    local part is frozen at creation.
 	var mintedActors int
 	require.NoError(t, conn.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM ap_actors WHERE did = $1`, acceptCommenterDID).Scan(&mintedActors))
 	require.Equal(t, 1, mintedActors,
 		"the commenter's first federating interaction must lazily mint exactly one AP actor "+
 			"for %s (task 13's get-or-create)", acceptCommenterDID)
+
+	var mintedLocalPart string
+	require.NoError(t, conn.QueryRowContext(ctx,
+		`SELECT local_part FROM ap_actors WHERE did = $1`, acceptCommenterDID).Scan(&mintedLocalPart))
+	require.Equal(t, acceptCommenterLocalPart, mintedLocalPart,
+		"the frozen local part derives from the VERIFIED handle %q — this is the whole "+
+			"reason the consumer resolves before minting", acceptCommenterHandle)
+
+	require.Positive(t, identity.PLCHits(), "the DID document was fetched")
+	require.Positive(t, identity.WellKnownHits(),
+		"and the handle was asked to claim the DID back: one-way trust would let any "+
+			"DID freeze somebody else's name")
 
 	// 2. Durable outbound state, keyed by the comment's at-uri.
 	stored, err := objects.GetByATURI(ctx, acceptCommentATURI)
@@ -176,7 +199,7 @@ func TestConsumerFederatesAnUnseenNativeComment(t *testing.T) {
 	require.NoError(t, err)
 
 	replayEnqueuer := &recordingEnqueuer{}
-	runConnector(t, conn, minter, state, replayEnqueuer, acceptCommentTimeUS,
+	runConnector(t, conn, minter, resolver, state, replayEnqueuer, acceptCommentTimeUS,
 		commentCreateFrame(acceptCommentTimeUS, acceptCommentRev))
 
 	assert.Empty(t, replayEnqueuer.Calls(),
@@ -228,6 +251,7 @@ func runConnector(
 	t *testing.T,
 	database *sql.DB,
 	minter ActorMinter,
+	resolver DIDResolver,
 	state *PostgresStateStore,
 	enqueuer OutboundEnqueuer,
 	lastEventTimeUS int64,
@@ -240,6 +264,7 @@ func runConnector(
 	dispatcher, err := NewDispatcher(Options{
 		DB:         database,
 		Actors:     minter,
+		Resolver:   resolver,
 		Enqueuer:   enqueuer,
 		UserOrigin: acceptUserOrigin,
 	})

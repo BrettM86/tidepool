@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 
@@ -38,19 +39,51 @@ func dispatchTestDB(t *testing.T) *sql.DB {
 // (cycle F) while still pinning WHETHER a mint was attempted, which is the
 // ordering question the opt-out gate is about.
 type recordingMinter struct {
+	// db makes the double behave like the real service in the one way that
+	// matters here: it actually CREATES the ap_actors row, so a second event
+	// for the same DID finds an existing actor. Without that, "resolve only
+	// before the FIRST mint" could not be observed through this seam.
+	db *sql.DB
+
 	mu    sync.Mutex
 	calls []struct{ DID, Handle string }
 	err   error
 }
 
-func (m *recordingMinter) CreateActorForDID(_ context.Context, did, handle string) (*store.APActor, error) {
+func (m *recordingMinter) CreateActorForDID(ctx context.Context, did, handle string) (*store.APActor, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.calls = append(m.calls, struct{ DID, Handle string }{did, handle})
 	if m.err != nil {
 		return nil, m.err
 	}
-	return &store.APActor{DID: did, Kind: store.ActorTypePerson, LocalPart: "minted"}, nil
+	localPart := "minted"
+	if handle != "" {
+		localPart, _, _ = strings.Cut(handle, ".")
+	}
+	if m.db != nil {
+		// Get-or-create, like the real service.
+		_, err := m.db.ExecContext(ctx, `
+			INSERT INTO ap_actors (did, kind, actor_id, normalized_origin, local_part,
+			                       rsa_key_sealed, rsa_key_version, public_key_pem)
+			VALUES ($1, 'person', $2, 'coves.social', $3, '\x00'::bytea, 1, 'pem')
+			ON CONFLICT (did) DO NOTHING`,
+			did, acceptUserOrigin+"/ap/actor/"+did, localPart)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &store.APActor{DID: did, Kind: store.ActorTypePerson, LocalPart: localPart}, nil
+}
+
+func (m *recordingMinter) Handles() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	handles := []string{}
+	for _, call := range m.calls {
+		handles = append(handles, call.Handle)
+	}
+	return handles
 }
 
 func (m *recordingMinter) DIDs() []string {
@@ -126,16 +159,18 @@ type dispatchFixture struct {
 	enqueuer   *recordingEnqueuer
 	engine     *recordingEngine
 	deleter    *recordingDeleter
+	resolver   *recordingResolver
 }
 
 func newDispatchFixture(t *testing.T, database *sql.DB, mutate ...func(*Options)) *dispatchFixture {
 	t.Helper()
 	fixture := &dispatchFixture{
 		db:       database,
-		minter:   &recordingMinter{},
+		minter:   &recordingMinter{db: database},
 		enqueuer: &recordingEnqueuer{},
 		engine:   &recordingEngine{},
 		deleter:  &recordingDeleter{},
+		resolver: &recordingResolver{handle: dispatchNativeHandle},
 	}
 	opts := Options{
 		DB:            database,
@@ -143,6 +178,7 @@ func newDispatchFixture(t *testing.T, database *sql.DB, mutate ...func(*Options)
 		Enqueuer:      fixture.enqueuer,
 		Engine:        fixture.engine,
 		RemoteDeleter: fixture.deleter,
+		Resolver:      fixture.resolver,
 		UserOrigin:    acceptUserOrigin,
 	}
 	for _, m := range mutate {
@@ -177,8 +213,11 @@ func parseFrame(t *testing.T, frame []byte) *JetstreamEvent {
 
 const (
 	dispatchNativeDID = "did:plc:7iza6de2dwap2sbkpav7c6c6"
-	dispatchRev       = "3lzrev0000001"
-	dispatchRevHigher = "3lzrev0000002"
+	// dispatchNativeHandle is what the resolver verifies for that DID; the
+	// local part derives from its first label.
+	dispatchNativeHandle = "nativeuser.coves.social"
+	dispatchRev          = "3lzrev0000001"
+	dispatchRevHigher    = "3lzrev0000002"
 )
 
 // federationFrame is the opt-out record (literal:self).

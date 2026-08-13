@@ -133,38 +133,6 @@ func (d *Dispatcher) mayFederate(ctx context.Context, did string) (bool, error) 
 	return pref.Enabled, nil
 }
 
-// handleComment applies a native comment commit.
-//
-// What this cycle owns is the ORDER: the opt-out gate runs BEFORE the lazy
-// mint, so a user who opted out before ever federating anything never gets an
-// AP identity created for them. Resolving the thread through ap_objects,
-// writing outbound_objects state and enqueueing the intent are the comment
-// handler proper (cycle H); they run after these two steps, not instead of
-// them.
-func (d *Dispatcher) handleComment(ctx context.Context, did string, commit *CommitEvent) error {
-	federating, err := d.mayFederate(ctx, did)
-	if err != nil {
-		return err
-	}
-	if !federating {
-		// The residual split-thread case, explicitly chosen (decision 11): the
-		// comment stays on the atproto side and the Lemmy side never sees it.
-		d.logger.Debug("skipping comment from an opted-out author",
-			slog.String("did", did), slog.String("rkey", commit.RKey))
-		return nil
-	}
-
-	// The lazy mint: this interaction is what earns the identity. The handle
-	// is not in the commit — Jetstream commits carry none — and it is NOT
-	// synthesized here, because the local part is frozen at creation and a
-	// placeholder would freeze the wrong name forever. It arrives with the DID
-	// resolution the profile/identity handler brings.
-	if _, err := d.actors.CreateActorForDID(ctx, did, ""); err != nil {
-		return fmt.Errorf("mint actor for commenter %s: %w", did, err)
-	}
-	return nil
-}
-
 // operationDelete is the commit operation that carries no record body.
 const operationDelete = "delete"
 

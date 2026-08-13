@@ -117,6 +117,10 @@ type Options struct {
 	// RemoteDeleter is the task 17 destructive seam. Optional (see
 	// RemoteContentDeleter).
 	RemoteDeleter RemoteContentDeleter
+	// Resolver verifies a DID's handle before the FIRST mint. Required: the
+	// local part is frozen at creation, so minting without a verified handle
+	// would freeze a guess.
+	Resolver DIDResolver
 	// UserOrigin is AP_USER_ORIGIN: the origin every deterministic activity
 	// id is minted under.
 	UserOrigin string
@@ -133,12 +137,19 @@ type Dispatcher struct {
 	enqueuer      OutboundEnqueuer
 	engine        AcceptanceEngine
 	remoteDeleter RemoteContentDeleter
+	resolver      DIDResolver
 	prefs         store.FederationPrefs
 	apActors      store.APActors
-	hosted        *hostedRepos
-	gate          *RevGate
-	userOrigin    string
-	logger        *slog.Logger
+	// objects is the outbound state; objectMappings and communities are the
+	// bridge's own record of what it already federated, which is where a
+	// comment's thread and target community are resolved FROM.
+	objectMappings store.APObjects
+	objects        store.OutboundObjects
+	communities    store.Communities
+	hosted         *hostedRepos
+	gate           *RevGate
+	userOrigin     string
+	logger         *slog.Logger
 }
 
 var _ EventHandler = (*Dispatcher)(nil)
@@ -156,6 +167,10 @@ func NewDispatcher(opts Options) (*Dispatcher, error) {
 		return nil, errors.NewValidationError("Actors", "must not be nil")
 	case opts.Enqueuer == nil:
 		return nil, errors.NewValidationError("Enqueuer", "must not be nil")
+	case opts.Resolver == nil:
+		// Minting without a verified handle would freeze a guessed local part
+		// forever, so there is no safe default to fall back to.
+		return nil, errors.NewValidationError("Resolver", "must not be nil")
 	case opts.UserOrigin == "":
 		// Every outbound activity id is minted under this origin, and the id
 		// is a wire contract: deriving one under "" would publish ids no peer
@@ -168,17 +183,21 @@ func NewDispatcher(opts Options) (*Dispatcher, error) {
 		logger = slog.Default()
 	}
 	return &Dispatcher{
-		db:            opts.DB,
-		actors:        opts.Actors,
-		enqueuer:      opts.Enqueuer,
-		engine:        opts.Engine,
-		remoteDeleter: opts.RemoteDeleter,
-		prefs:         store.NewFederationPrefs(opts.DB),
-		apActors:      store.NewAPActors(opts.DB),
-		hosted:        newHostedRepos(opts.DB),
-		gate:          NewRevGate(opts.DB),
-		userOrigin:    opts.UserOrigin,
-		logger:        logger,
+		db:             opts.DB,
+		actors:         opts.Actors,
+		enqueuer:       opts.Enqueuer,
+		engine:         opts.Engine,
+		remoteDeleter:  opts.RemoteDeleter,
+		resolver:       opts.Resolver,
+		prefs:          store.NewFederationPrefs(opts.DB),
+		apActors:       store.NewAPActors(opts.DB),
+		objectMappings: store.NewAPObjects(opts.DB),
+		objects:        store.NewOutboundObjects(opts.DB),
+		communities:    store.NewCommunities(opts.DB),
+		hosted:         newHostedRepos(opts.DB),
+		gate:           NewRevGate(opts.DB),
+		userOrigin:     opts.UserOrigin,
+		logger:         logger,
 	}, nil
 }
 
@@ -225,6 +244,8 @@ func (d *Dispatcher) commitHandlerFor(collection string) commitHandler {
 		return d.handlePostV2
 	case CollectionComment:
 		return d.handleComment
+	case CollectionProfile:
+		return d.handleProfile
 	}
 	return nil
 }
@@ -328,20 +349,6 @@ func (d *Dispatcher) handleAccount(ctx context.Context, event *JetstreamEvent) e
 
 // accountStatusDeleted is the ONLY #account status that means deletion.
 const accountStatusDeleted = "deleted"
-
-// handleIdentity applies a #identity handle change. The local part is frozen
-// at actor creation, so a rename may refresh the profile CACHE and nothing
-// else — re-deriving the local part would strand every federated mention of
-// the old name. The cache refresh needs the DID re-resolved (identity events
-// can be stale) and lands with the profile handler.
-func (d *Dispatcher) handleIdentity(_ context.Context, event *JetstreamEvent) error {
-	if event.Identity == nil {
-		return fmt.Errorf("%w: identity event for %s carries no identity", ErrPermanentEvent, event.DID)
-	}
-	d.logger.Debug("identity event observed; the local part is never re-derived",
-		slog.String("did", event.Identity.DID), slog.String("handle", event.Identity.Handle))
-	return nil
-}
 
 // activityIDVersionTag prefixes every activity-id preimage. It exists so the
 // derivation can CHANGE without colliding with ids already published: bump the

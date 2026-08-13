@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"syscall"
@@ -23,6 +24,7 @@ import (
 	"tidepool/internal/identity"
 	"tidepool/internal/ingest"
 	"tidepool/internal/materialize"
+	"tidepool/internal/personas"
 	"tidepool/internal/prune"
 	"tidepool/internal/repo"
 	"tidepool/internal/store"
@@ -443,9 +445,46 @@ func run(logger *slog.Logger) error {
 	}
 	votesXRPC.Routes(router)
 
+	// The Coves user origin (task 13): AP Person actors for Coves users,
+	// served on AP_USER_ORIGIN's Host. It shares this listener with the
+	// bridge's own surface, and the Host router below decides which one a
+	// request belongs to. The inbox is handed the EXISTING ingest handler —
+	// the user origin publishes a shared inbox but never a second verify
+	// pipeline.
+	personasService, err := personas.New(personas.Options{
+		DB:           database,
+		Custodian:    custodian,
+		UserOrigin:   cfg.APUserOrigin,
+		ServiceActor: serviceActor,
+		InboxHandler: inbox.InboxHandler(),
+	})
+	if err != nil {
+		return fmt.Errorf("user origin: %w", err)
+	}
+
+	// Host routing wraps everything: the chi router keeps answering for the
+	// bridge hostname and its bridged-handle subdomains, the user origin
+	// answers for its own Host, and an unrecognized Host is refused with 421
+	// unless AP_HOST_FALLTHROUGH_DEV is on. Both hosts naming one authority
+	// (the dev default) composes by path instead.
+	userHost, err := url.Parse(cfg.APUserOrigin)
+	if err != nil || userHost.Host == "" {
+		return fmt.Errorf("user origin: AP_USER_ORIGIN %q is not an absolute origin URL", cfg.APUserOrigin)
+	}
+	hostRouter, err := personas.NewHostRouter(personas.HostRouterOptions{
+		ServiceHost:    cfg.BridgeHostname,
+		ServiceHandler: router,
+		UserHost:       userHost.Host,
+		UserHandler:    personasService,
+		DevFallthrough: cfg.APHostFallthroughDev,
+	})
+	if err != nil {
+		return fmt.Errorf("host router: %w", err)
+	}
+
 	server := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           router,
+		Handler:           hostRouter,
 		ReadHeaderTimeout: readHeaderTimeout,
 		WriteTimeout:      writeTimeout,
 		IdleTimeout:       idleTimeout,

@@ -63,6 +63,13 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.handleNodeInfo(w, r)
+	case path == inboxPath:
+		// The method check comes FIRST, so a GET learns only that an inbox
+		// is write-only — never whether one is wired up here.
+		if !requireMethod(w, r, http.MethodPost) {
+			return
+		}
+		s.handleInbox(w, r)
 	case strings.HasPrefix(path, actorPathPrefix):
 		rest := strings.TrimPrefix(path, actorPathPrefix)
 		if !isGET(w, r) {
@@ -83,12 +90,32 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func isGET(w http.ResponseWriter, r *http.Request) bool {
-	if r.Method != http.MethodGet {
-		w.Header().Set("Allow", http.MethodGet)
+	return requireMethod(w, r, http.MethodGet)
+}
+
+func requireMethod(w http.ResponseWriter, r *http.Request, method string) bool {
+	if r.Method != method {
+		w.Header().Set("Allow", method)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return false
 	}
 	return true
+}
+
+// handleInbox hands the delivery to the ingest inbox VERBATIM — same request,
+// same body, same headers. The user origin publishes a shared inbox but must
+// not grow a second verify pipeline: signature verification, actor binding,
+// dedupe, admission control, and the refusal taxonomy Lemmy reads to decide
+// retry-vs-drop all stay in one implementation, and the inbox's own response
+// is what the remote sees.
+func (s *Service) handleInbox(w http.ResponseWriter, r *http.Request) {
+	if s.inboxHandler == nil {
+		// Advertising an inbox this origin cannot serve; 404 is the honest
+		// answer.
+		http.NotFound(w, r)
+		return
+	}
+	s.inboxHandler.ServeHTTP(w, r)
 }
 
 // handleActorDocument serves the Person document. A DISABLED actor still

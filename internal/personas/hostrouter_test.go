@@ -263,6 +263,56 @@ func TestHostRouter_CollidingHosts(t *testing.T) {
 	})
 }
 
+// TestHostRouter_DevDefaultAuthorities is the wiring contract for the
+// DEFAULT development configuration, where the two hosts are configured
+// differently but name the same listener: BRIDGE_HOSTNAME is "localhost"
+// while AP_USER_ORIGIN is "http://localhost:8091", so every local request
+// arrives as Host "localhost:8091".
+//
+// That Host matches the user origin exactly AND satisfies the service
+// bucket's loopback rule, so composition must key on "both buckets accept
+// this authority", not on the two configured strings being equal. Keyed on
+// string equality instead, the user surface swallows the whole listener and
+// /healthz — the thing a developer hits first — disappears.
+func TestHostRouter_DevDefaultAuthorities(t *testing.T) {
+	const devServiceHost = "localhost" // BRIDGE_HOSTNAME dev default
+	const devUserHost = "localhost:8091"
+
+	newRouter := func(t *testing.T) (http.Handler, *marker, *marker) {
+		t.Helper()
+		service := newMarker("service")
+		user := newMarker("user", "/xrpc/_health", "/healthz")
+		router, err := NewHostRouter(HostRouterOptions{
+			ServiceHost:    devServiceHost,
+			ServiceHandler: service,
+			UserHost:       devUserHost,
+			UserHandler:    user,
+			DevFallthrough: true,
+		})
+		require.NoError(t, err)
+		return router, service, user
+	}
+
+	t.Run("the user surface answers its own routes", func(t *testing.T) {
+		router, _, user := newRouter(t)
+		rec := routeHost(t, router, "http", devUserHost, "/.well-known/webfinger")
+		assert.Equal(t, http.StatusOK, rec.Code, "body=%s", rec.Body.String())
+		assert.Equal(t, "user", rec.Header().Get("X-Handler"))
+		assert.Equal(t, 1, user.calls)
+	})
+
+	for _, path := range []string{"/healthz", "/xrpc/_health"} {
+		t.Run("the service surface still answers "+path, func(t *testing.T) {
+			router, service, _ := newRouter(t)
+			rec := routeHost(t, router, "http", devUserHost, path)
+			require.Equal(t, http.StatusOK, rec.Code,
+				"a dev listener must keep serving %s; body=%s", path, rec.Body.String())
+			assert.Equal(t, "service", rec.Header().Get("X-Handler"))
+			assert.Equal(t, 1, service.calls)
+		})
+	}
+}
+
 // TestNewHostRouter_RequiresHandlers: a nil handler would nil-panic on the
 // first request of whichever bucket it was meant to serve.
 func TestNewHostRouter_RequiresHandlers(t *testing.T) {

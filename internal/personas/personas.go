@@ -10,6 +10,7 @@ import (
 	"database/sql"
 	stderrors "errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
@@ -46,6 +47,12 @@ type Options struct {
 	// from UserOrigin; only Key and CreatedAt are read. Optional: without
 	// it the origin apex serves no instance actor (Lemmy tolerates that).
 	ServiceActor *ap.ServiceActor
+	// InboxHandler receives POST /ap/inbox. The user origin does NOT run a
+	// second verify pipeline: deliveries go verbatim to the ingest inbox
+	// that already does signature verification, authority binding, dedupe,
+	// and queueing (ingest.Inbox.InboxHandler). Nil means the origin
+	// advertises an inbox it cannot serve, so the route 404s.
+	InboxHandler http.Handler
 }
 
 // Service mints and serves Coves user actors.
@@ -61,6 +68,9 @@ type Service struct {
 	// serviceActor is the bridge identity the origin apex republishes. Nil
 	// means the apex publishes nothing.
 	serviceActor *ap.ServiceActor
+	// inboxHandler is the ingest inbox this origin's shared inbox dispatches
+	// to. Nil means the route 404s.
+	inboxHandler http.Handler
 }
 
 // New builds a Service. UserOrigin is parsed once here: the host it yields
@@ -78,6 +88,7 @@ func New(opts Options) (*Service, error) {
 		userHost:   host,
 
 		serviceActor: opts.ServiceActor,
+		inboxHandler: opts.InboxHandler,
 	}, nil
 }
 

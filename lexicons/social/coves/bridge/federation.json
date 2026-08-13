@@ -1,0 +1,25 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.bridge.federation",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A Coves user's ActivityPub federation preference, read by the Tidepool bridge. This record is an OPT-OUT: federation is on by default and its ABSENCE means enabled, so the record only ever exists to turn federation down. enabled=false is a soft disable — the user's AP actor stops resolving via WebFinger and stops delivering, while the actor document and its already-federated references stay intact. Adding deleteRemote=true escalates to the destructive tier, asking peers to delete the user's federated content. Re-enabling is either deleting this record or writing enabled=true; both restore the default-on state under the SAME actor identity, because the local part is frozen at creation and never re-derived.",
+      "key": "literal:self",
+      "record": {
+        "type": "object",
+        "required": ["enabled"],
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether the user's content federates to the fediverse. Stated explicitly: a record with no enabled field is ambiguous about its own intent."
+          },
+          "deleteRemote": {
+            "type": "boolean",
+            "description": "When disabling, also ask remote instances to delete the user's already-federated content. Destructive and irreversible on the remote side — peers that honor it cannot restore what they dropped. Meaningful only alongside enabled=false; omitted or false leaves remote copies in place."
+          }
+        }
+      }
+    }
+  }
+}

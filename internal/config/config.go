@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -98,6 +99,20 @@ type Config struct {
 	// mislead (the ALLOW_PRIVATE_FETCH pattern). Set
 	// ALLOW_DEV_REQUEST_CRAWL=1 to enable.
 	AllowDevRequestCrawl bool
+	// APUserOrigin is the origin Coves users' ActivityPub actors live under
+	// (AP_USER_ORIGIN, e.g. "https://coves.social"); dev defaults to
+	// http://localhost:8091. It seeds NEW actor rows only — serving derives
+	// every URL from the stored actor_id — and its host must not be
+	// BRIDGE_HOSTNAME or a subdomain of it, which would shadow the bridged
+	// handle namespace.
+	APUserOrigin string
+	// APHostFallthroughDev routes unknown Hosts to the service surface
+	// instead of refusing them (AP_HOST_FALLTHROUGH_DEV). Unlike the other
+	// dev flags this one defaults to TRUE in development — a laptop is
+	// reached by IP or tunnel hostname — and setting it in production is
+	// refused: an authenticated write surface must not answer under a Host
+	// an attacker chose.
+	APHostFallthroughDev bool
 	// AdminToken is the bearer token protecting the /admin API (community
 	// subscribe/unsubscribe/backfill). ADMIN_TOKEN; required in production,
 	// dev default is a fixed, publicly known value.
@@ -332,6 +347,33 @@ func Load(logger *slog.Logger) (*Config, error) {
 		return nil, fmt.Errorf("config: ALLOW_DEV_REQUEST_CRAWL must not be set in production (production always sends requestCrawl)")
 	}
 
+	// The Coves user origin. Required in production: it is baked into every
+	// actor_id this deployment mints, so a wrong or missing value is not a
+	// runtime inconvenience but a set of federated identities pointing at
+	// the wrong place, forever.
+	cfg.APUserOrigin, err = stringVar(logger, isDevelopment, "AP_USER_ORIGIN", "http://localhost:8091")
+	if err != nil {
+		return nil, err
+	}
+	if err := validateUserOrigin(cfg.APUserOrigin, cfg.BridgeHostname); err != nil {
+		return nil, err
+	}
+
+	// Unlike every other dev flag this one defaults ON in development: a
+	// laptop is reached by IP, tunnel hostname, or whatever the tunnel
+	// minted this morning, and a default-off flag would 421 every local
+	// request. Production defaults it off and REFUSES it set — an
+	// authenticated write surface must not answer under a Host an attacker
+	// chose.
+	cfg.APHostFallthroughDev, err = boolVarDefault(logger, "AP_HOST_FALLTHROUGH_DEV", isDevelopment)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.APHostFallthroughDev && !isDevelopment {
+		return nil, fmt.Errorf("config: AP_HOST_FALLTHROUGH_DEV must not be set in production " +
+			"(unknown Hosts are refused there)")
+	}
+
 	// Admin API auth: like the KEK, the dev default is fixed and public —
 	// required in production.
 	cfg.AdminToken, err = stringVar(logger, isDevelopment, "ADMIN_TOKEN", "dev-admin-token")
@@ -542,6 +584,32 @@ func boolVarDefault(logger *slog.Logger, name string, fallback bool) (bool, erro
 		return false, nil
 	}
 	return false, fmt.Errorf("config: %s must be a boolean (1/0, true/false, yes/no, on/off), got %q", name, raw)
+}
+
+// validateUserOrigin refuses a user origin that would shadow the bridge's own
+// handle namespace. Bridged handles are subdomains of BRIDGE_HOSTNAME resolved
+// off r.Host, so a user origin AT that name or UNDER it would swallow them —
+// and the Host router could not tell the two surfaces apart in the first
+// place. The comparison is on host:port, because a different port is a
+// different authority: the dev defaults are exactly that shape
+// (BRIDGE_HOSTNAME localhost, user origin on :8091). Matching is on a label
+// boundary, so "nottidepool.example" is not under "tidepool.example".
+func validateUserOrigin(origin, bridgeHostname string) error {
+	parsed, err := url.Parse(origin)
+	if err != nil {
+		return fmt.Errorf("config: AP_USER_ORIGIN must be an absolute origin URL, got %q: %w", origin, err)
+	}
+	if parsed.Scheme == "" || parsed.Host == "" {
+		return fmt.Errorf("config: AP_USER_ORIGIN must be an absolute origin URL "+
+			"(scheme and host), got %q", origin)
+	}
+	host := strings.ToLower(parsed.Host)
+	bridge := strings.ToLower(strings.TrimSpace(bridgeHostname))
+	if host == bridge || strings.HasSuffix(host, "."+bridge) {
+		return fmt.Errorf("config: AP_USER_ORIGIN host %q must not be BRIDGE_HOSTNAME %q "+
+			"or a subdomain of it: the bridged handle namespace lives there", host, bridge)
+	}
+	return nil
 }
 
 // stringVar returns the value of an environment variable. When unset it

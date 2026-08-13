@@ -199,6 +199,15 @@ func (ib *Inbox) Routes(r chi.Router) {
 	r.Get("/nodeinfo/2.0", ib.handleNodeInfo)
 }
 
+// InboxHandler is the delivery handler mounted at /inbox, exported so a
+// SECOND origin can serve the same pipeline without duplicating it. The Coves
+// user origin's POST /ap/inbox dispatches straight here: signature
+// verification, actor binding, dedupe, admission control, and the refusal
+// taxonomy are one implementation, and a second copy would drift.
+func (ib *Inbox) InboxHandler() http.Handler {
+	return http.HandlerFunc(ib.handleInbox)
+}
+
 // handleInbox receives one AP delivery: verify the HTTP signature, bind the
 // activity's actor to the signer, dedupe by activity id, enqueue for the
 // worker pool, 202. Everything heavier happens async — remote instances

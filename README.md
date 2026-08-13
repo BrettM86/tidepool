@@ -261,6 +261,8 @@ production**:
 | `RELAY_HOSTS` | *(optional)* | comma-separated relays to send `com.atproto.sync.requestCrawl` to on startup (each retried on a bounded budget — the relay calls back into `describeServer` before subscribing, which can race process start); in development the request is logged, never sent, unless `ALLOW_DEV_REQUEST_CRAWL` opts in |
 | `ALLOW_DEV_REQUEST_CRAWL` | off | dev-only: actually SEND `requestCrawl` to `RELAY_HOSTS` in development (exists for the e2e stack's local BigSky); refused in production, where sending is already the behavior |
 | `ADMIN_TOKEN` | `dev-admin-token` | bearer token protecting the `/admin` API |
+| `AP_USER_ORIGIN` | `http://localhost:8091` | origin the Coves users' ActivityPub actors live under (e.g. `https://coves.social`). Baked into every `actor_id` minted under it, so serving derives URLs from the stored row and never from this value; its host must not be `BRIDGE_HOSTNAME` or a subdomain of it, which would shadow the bridged handle namespace (refused at startup) |
+| `AP_HOST_FALLTHROUGH_DEV` | **on** in development | route unknown `Host`s to the bridge surface instead of refusing them with 421. The one dev flag that defaults ON — a laptop is reached by IP or tunnel hostname — and the only posture in production is off: setting it there is refused |
 | `BACKFILL_MAX_POSTS` | `100` | posts materialized per community backfill run |
 | `MINT_RATE_PER_MINUTE` / `MINT_BURST` | `60` / `120` | rate gate on inbound DID minting (PLC registrations are forever; unseen authors in delivered content trigger mints) |
 | `INGEST_WORKERS` | `4` | inbox queue worker-pool size |
@@ -495,6 +497,19 @@ The contract is the lexicon at
 [`lexicons/social/coves/bridge/getVoteAggregates.json`](lexicons/social/coves/bridge/getVoteAggregates.json)
 and is versioned by nsid: breaking changes ship under a new name.
 
+Its sibling under the same Tidepool-owned namespace is
+[`lexicons/social/coves/bridge/federation.json`](lexicons/social/coves/bridge/federation.json)
+(`key: literal:self`, one record per repo), the user-facing federation
+preference. It is an **opt-OUT**: federation is on by default, so the record's
+ABSENCE means enabled and it only ever exists to turn federation down.
+`enabled: false` is a soft disable — the actor stops resolving via WebFinger
+and stops delivering, while its actor document and already-federated
+references stay intact. Adding `deleteRemote: true` escalates to the
+destructive tier (ask peers to delete the user's federated content —
+irreversible on their side). Deleting the record, or writing
+`enabled: true`, restores the default under the SAME actor identity: the local
+part is frozen at creation and never re-derived.
+
 Counts reflect each distinct voter's **latest** state — flips
 (`Like` → `Dislike`) and `Undo`s are folded in, re-delivered activities are
 deduplicated by activity id. Votes on content the bridge never materialized
@@ -514,6 +529,37 @@ is `asOf`-stamped with the aggregate's `updated_at`, which the AppView can use
 to discard a stale update). Every `bridgedStats` write goes through the same
 lexicon validation and mapping bookkeeping as any other record commit, and a
 Lemmy edit that rebuilds a record carries an existing `bridgedStats` forward.
+
+## Coves user origin (the `coves.social` AP surface)
+
+Coves users get ActivityPub identities of their own, served on
+`AP_USER_ORIGIN` — a **second origin on the same listener**, distinct from the
+bridge's `BRIDGE_HOSTNAME` surface. A `Host` router splits the two: the bridge
+hostname and its bridged-handle subdomains (plus `localhost`, bare IPs, and an
+absent `Host` — container healthchecks) reach the bridge; the user origin's own
+`Host` reaches the user surface; anything else is refused with **421 Misdirected
+Request** unless `AP_HOST_FALLTHROUGH_DEV` is on. When both names resolve to one
+authority (the dev default, `localhost:8091`), the split falls back to the path:
+the user surface answers first and its 404s fall through to the bridge.
+
+What the user origin serves:
+
+| Route | Purpose |
+|---|---|
+| `GET /.well-known/webfinger?resource=acct:alice@…` | discovery for a minted local part, scoped to the routed `Host` |
+| `GET /ap/actor/{did}` | the user's `Person` document (`publicKey`, `inbox`, `endpoints.sharedInbox`, `outbox`, `published`) |
+| `GET /ap/actor/{did}/outbox` | empty `OrderedCollection` — Lemmy requires the field, and a missing outbox rejects the whole actor |
+| `POST /ap/inbox` | shared inbox; dispatched **verbatim** to the existing ingest pipeline (one verification, dedupe, and refusal taxonomy — never a second copy) |
+| `GET /` | the origin's instance (`Application`) actor, republishing the bridge's key — Lemmy delivers `Delete{Person}` and other send-to-all-instances activities only to the inbox on that row |
+| `GET /.well-known/nodeinfo`, `GET /nodeinfo/2.0` | software identification (`software.name: tidepool`) |
+
+An actor is minted lazily on a user's first federating interaction. Its local
+part is derived once and then **frozen**: a native handle
+(`alice.coves.social`) yields `alice`, anything else keeps its full handle
+(`bretton.dev` stays `bretton.dev`), collisions take `-2`, `-3`, … , and a
+later handle change refreshes only the cached display name, summary, and
+avatar. The RSA private key is sealed with `BRIDGE_KEK` (AES-256-GCM, bound to
+the DID) and never stored in the clear; only the public PEM is published.
 
 ## Verifying with Jetstream
 

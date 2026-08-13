@@ -70,10 +70,15 @@ type hostRouter struct {
 func (h *hostRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	host := normalizeHost(r.Host)
 	switch {
-	case host == h.userHost && h.userHost == h.serviceHost:
-		// The default dev configuration points BRIDGE_HOSTNAME and
-		// AP_USER_ORIGIN at the same authority. One Host cannot pick a
-		// bucket, so the split moves to the path: see serveComposed.
+	case host == h.userHost && h.isServiceHost(host):
+		// BOTH buckets accept this authority, so one Host cannot pick one
+		// and the split moves to the path: see serveComposed. The test is
+		// "both buckets accept it", not "the two configured strings are
+		// equal" — the DEFAULT dev configuration sets BRIDGE_HOSTNAME to
+		// "localhost" and AP_USER_ORIGIN to "http://localhost:8091", two
+		// different strings naming one listener. Keyed on string equality,
+		// the user surface would swallow the whole listener and /healthz —
+		// the first thing a developer hits — would disappear.
 		h.serveComposed(w, r)
 	case host == h.userHost:
 		h.userHandler.ServeHTTP(w, r)

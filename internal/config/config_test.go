@@ -22,6 +22,7 @@ func clearConfigEnv(t *testing.T) {
 		"MINT_BURST", "INGEST_WORKERS", "BRIDGE_SCHEME",
 		"ALLOW_PRIVATE_FETCH", "ALLOW_DEV_REQUEST_CRAWL", "RELAY_HOSTS",
 		"AP_USER_ORIGIN", "AP_HOST_FALLTHROUGH_DEV",
+		"CONSUMER_ENABLED", "JETSTREAM_URL",
 	} {
 		t.Setenv(name, "")
 	}
@@ -433,4 +434,93 @@ func TestLoad_APUserOriginShadowCheckIsCanonical(t *testing.T) {
 			assert.Contains(t, err.Error(), "AP_USER_ORIGIN")
 		})
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Task 14 cycle K1: the Jetstream consumer's configuration.
+//
+// The consumer is default-OFF and stays that way until task 18 wires the e2e
+// path, because it writes durable outbound state and hands work to delivery:
+// a deployment that has not been wired end to end should not quietly start
+// accumulating it.
+// ---------------------------------------------------------------------------
+
+func TestLoad_ConsumerIsDisabledByDefault(t *testing.T) {
+	clearConfigEnv(t)
+
+	cfg, err := Load(discardLogger())
+	require.NoError(t, err)
+
+	assert.False(t, cfg.ConsumerEnabled,
+		"the consumer is off unless a deployment says otherwise")
+	assert.Empty(t, cfg.JetstreamURL,
+		"and an unset JETSTREAM_URL is fine while it is off")
+}
+
+func TestLoad_EnabledConsumerRequiresAJetstreamURL(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("CONSUMER_ENABLED", "true")
+
+	_, err := Load(discardLogger())
+	require.Error(t, err,
+		"a consumer with nowhere to dial would come up looking healthy and consume "+
+			"NOTHING — silence is indistinguishable from a quiet stream, which is "+
+			"exactly the failure the cursor and lag metrics exist to expose")
+	assert.Contains(t, err.Error(), "JETSTREAM_URL",
+		"the message must name the variable an operator has to set")
+}
+
+func TestLoad_EnabledConsumerAcceptsAWebSocketURL(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("CONSUMER_ENABLED", "1")
+	t.Setenv("JETSTREAM_URL", "ws://localhost:6008/subscribe")
+
+	cfg, err := Load(discardLogger())
+	require.NoError(t, err)
+
+	assert.True(t, cfg.ConsumerEnabled)
+	assert.Equal(t, "ws://localhost:6008/subscribe", cfg.JetstreamURL)
+}
+
+func TestLoad_JetstreamURLMustBeAWebSocketURL(t *testing.T) {
+	for _, raw := range []string{
+		"https://jetstream.example/subscribe", // the scheme a copy-paste produces
+		"jetstream.example",                   // no scheme at all
+		"://nonsense",
+	} {
+		t.Run(raw, func(t *testing.T) {
+			clearConfigEnv(t)
+			t.Setenv("CONSUMER_ENABLED", "true")
+			t.Setenv("JETSTREAM_URL", raw)
+
+			_, err := Load(discardLogger())
+			require.Error(t, err,
+				"a bad URL must fail at BOOT: caught at dial time instead, it becomes a "+
+					"reconnect loop that looks like an upstream outage")
+			assert.Contains(t, err.Error(), "JETSTREAM_URL")
+		})
+	}
+}
+
+func TestLoad_JetstreamURLIsCarriedEvenWhileDisabled(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("JETSTREAM_URL", "wss://jetstream.example/subscribe")
+
+	cfg, err := Load(discardLogger())
+	require.NoError(t, err,
+		"a URL configured ahead of the flag is not an error — that is how a deployment "+
+			"is staged before being switched on")
+	assert.False(t, cfg.ConsumerEnabled)
+	assert.Equal(t, "wss://jetstream.example/subscribe", cfg.JetstreamURL)
+}
+
+func TestLoad_ConsumerEnabledRejectsATypo(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("CONSUMER_ENABLED", "yess")
+
+	_, err := Load(discardLogger())
+	require.Error(t, err,
+		"boolVarDefault semantics: an unrecognised value is refused rather than read as "+
+			"false, because a flag disabled by a typo is invisible")
+	assert.Contains(t, err.Error(), "CONSUMER_ENABLED")
 }

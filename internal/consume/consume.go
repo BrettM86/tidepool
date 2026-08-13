@@ -14,6 +14,9 @@ package consume
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/url"
+	"strings"
 )
 
 // ErrPermanentEvent marks a handler failure as permanent: the event can never
@@ -44,6 +47,46 @@ const (
 	CollectionComment    = "social.coves.community.comment"
 	CollectionVote       = "social.coves.feed.vote"
 )
+
+// WantedCollections is the wantedCollections filter this consumer subscribes
+// with. It is a function rather than a package var so no caller can append to
+// the shared slice and silently widen every future subscription.
+func WantedCollections() []string {
+	return []string{
+		CollectionFederation,
+		CollectionProfile,
+		CollectionPostV2,
+		CollectionComment,
+		CollectionVote,
+	}
+}
+
+// SubscribeURL builds the WebSocket subscribe URL: the configured base with a
+// /subscribe path (appended unless already present) and ONE wantedCollections
+// parameter per collection.
+//
+// The filter is not optional in practice: a subscribe URL without
+// wantedCollections asks Jetstream for the entire firehose, which this
+// consumer would then discard record by record — the collection filter is the
+// difference between a few Coves repos' events and the whole network's.
+func SubscribeURL(baseURL string, collections []string) (string, error) {
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		return "", fmt.Errorf("invalid Jetstream URL %q: %w", baseURL, err)
+	}
+	if !strings.HasSuffix(parsed.Path, subscribePath) {
+		parsed.Path = strings.TrimSuffix(parsed.Path, "/") + subscribePath
+	}
+	query := parsed.Query()
+	for _, collection := range collections {
+		query.Add("wantedCollections", collection)
+	}
+	parsed.RawQuery = query.Encode()
+	return parsed.String(), nil
+}
+
+// subscribePath is Jetstream's subscribe endpoint.
+const subscribePath = "/subscribe"
 
 // JetstreamEvent is one frame off the Jetstream WebSocket.
 type JetstreamEvent struct {

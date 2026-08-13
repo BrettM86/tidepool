@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"tidepool/internal/errors"
+	"tidepool/internal/materialize"
 	"tidepool/internal/store"
 )
 
@@ -64,6 +65,11 @@ type VoteIntent struct {
 	Direction string
 	// ID is the deterministic activity id.
 	ID string
+	// InnerActivityID is the id of the Like/Dislike an Undo withdraws. An
+	// Undo has to embed the activity it undoes, and by the time the delete
+	// arrives the vote record is gone — so this is read back from
+	// outbound_votes.current_activity_id, not recomputed.
+	InnerActivityID string
 	// CommunityAPID is the target community's AP Group id.
 	CommunityAPID string
 }
@@ -103,6 +109,18 @@ type RemoteContentDeleter interface {
 	DeleteRemoteContent(ctx context.Context, did string) error
 }
 
+// AccountTerminator is the task 17 TERMINAL seam: a repo whose account status
+// is "deleted" (decision 19) means the user is gone, and their federated
+// identity has to be withdrawn with Delete{Person}.
+//
+// It is a seam rather than an inline write because acting on a stale event is
+// unrecoverable: the terminal tier re-verifies against PLC/the PDS before
+// sending anything. Optional — a nil terminator means the tier is not wired
+// yet, which is announced rather than silently treated as a pause.
+type AccountTerminator interface {
+	TerminateAccount(ctx context.Context, did string) error
+}
+
 // Options configures a Dispatcher.
 type Options struct {
 	// DB is the bridge database.
@@ -117,6 +135,13 @@ type Options struct {
 	// RemoteDeleter is the task 17 destructive seam. Optional (see
 	// RemoteContentDeleter).
 	RemoteDeleter RemoteContentDeleter
+	// Terminator is the task 17 terminal seam for status=deleted accounts.
+	// Optional (see AccountTerminator).
+	Terminator AccountTerminator
+	// Records reads committed records so a subject's community can be derived
+	// for mappings written before migration 016 filled community_did.
+	// *repo.Manager satisfies it. Optional — see subjectCommunityDID.
+	Records materialize.RecordGetter
 	// Resolver verifies a DID's handle before the FIRST mint. Required: the
 	// local part is frozen at creation, so minting without a verified handle
 	// would freeze a guess.
@@ -137,6 +162,7 @@ type Dispatcher struct {
 	enqueuer      OutboundEnqueuer
 	engine        AcceptanceEngine
 	remoteDeleter RemoteContentDeleter
+	terminator    AccountTerminator
 	resolver      DIDResolver
 	prefs         store.FederationPrefs
 	apActors      store.APActors
@@ -145,7 +171,9 @@ type Dispatcher struct {
 	// comment's thread and target community are resolved FROM.
 	objectMappings store.APObjects
 	objects        store.OutboundObjects
+	votes          store.OutboundVotes
 	communities    store.Communities
+	records        materialize.RecordGetter
 	hosted         *hostedRepos
 	gate           *RevGate
 	userOrigin     string
@@ -188,12 +216,15 @@ func NewDispatcher(opts Options) (*Dispatcher, error) {
 		enqueuer:       opts.Enqueuer,
 		engine:         opts.Engine,
 		remoteDeleter:  opts.RemoteDeleter,
+		terminator:     opts.Terminator,
 		resolver:       opts.Resolver,
 		prefs:          store.NewFederationPrefs(opts.DB),
 		apActors:       store.NewAPActors(opts.DB),
 		objectMappings: store.NewAPObjects(opts.DB),
 		objects:        store.NewOutboundObjects(opts.DB),
+		votes:          store.NewOutboundVotes(opts.DB),
 		communities:    store.NewCommunities(opts.DB),
+		records:        opts.Records,
 		hosted:         newHostedRepos(opts.DB),
 		gate:           NewRevGate(opts.DB),
 		userOrigin:     opts.UserOrigin,
@@ -246,6 +277,8 @@ func (d *Dispatcher) commitHandlerFor(collection string) commitHandler {
 		return d.handleComment
 	case CollectionProfile:
 		return d.handleProfile
+	case CollectionVote:
+		return d.handleVote
 	}
 	return nil
 }
@@ -371,22 +404,44 @@ func (d *Dispatcher) handleAccount(ctx context.Context, event *JetstreamEvent) e
 		did = event.DID
 	}
 
+	// The actor check comes first for EVERY status. Nothing was ever federated
+	// under a DID with no AP identity, so there is no delivery to pause and
+	// nothing for the terminal tier to withdraw — and minting an actor in
+	// order to pause or delete it would create the very identity the event is
+	// about losing.
+	if _, err := d.apActors.GetByDID(ctx, did); err != nil {
+		if errors.IsNotFound(err) {
+			d.logger.Debug("account status for a DID with no actor",
+				slog.String("did", did), slog.String("status", account.Status))
+			return nil
+		}
+		return fmt.Errorf("look up actor for %s: %w", did, err)
+	}
+
 	if account.Status == accountStatusDeleted {
-		// The terminal tier re-verifies against PLC/PDS before sending
-		// Delete{Person}, because a deletion acted on from a stale event is
-		// unrecoverable. It is a separate seam and is not wired here.
-		d.logger.Warn("account reported deleted; the terminal tier owns this event",
-			slog.String("did", did))
+		// The ONE status that means gone. It goes to the tier that re-verifies
+		// against PLC and the PDS before sending Delete{Person}, because
+		// acting on a stale deletion event is unrecoverable.
+		if d.terminator == nil {
+			// Announced, and deliberately NOT degraded into a pause: a
+			// deletion half-handled as a pause looks handled in the database
+			// and is not.
+			d.logger.Warn("account reported deleted but no terminal tier is wired",
+				slog.String("did", did))
+			return nil
+		}
+		if err := d.terminator.TerminateAccount(ctx, did); err != nil {
+			return fmt.Errorf("terminate account %s: %w", did, err)
+		}
 		return nil
 	}
 
+	// Everything else is transient — deactivated, suspended, takendown,
+	// throttled are all states a user comes back from. Delivery stops; the
+	// identity, and every federated reference to it, survives.
 	err := d.apActors.SetPaused(ctx, did, !account.Active)
 	if errors.IsNotFound(err) {
-		// No actor for this DID: there is no delivery to pause, and minting
-		// one to pause it would create the identity the event is about losing.
-		d.logger.Debug("account status for a DID with no actor",
-			slog.String("did", did), slog.String("status", account.Status))
-		return nil
+		return nil // the actor vanished between the check and the write
 	}
 	return err
 }

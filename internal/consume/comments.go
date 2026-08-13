@@ -212,18 +212,9 @@ func (d *Dispatcher) commentThread(ctx context.Context, atURI string, commit *Co
 	return d.resolveParent(ctx, commit)
 }
 
-// resolveParent finds the thing a new comment replies to. A parent can live in
-// EITHER of two places, and both are legitimate:
-//
-//   - ap_objects: content materialized from the fediverse (a Lemmy post or
-//     comment), or bridge-origin content mapped at write time;
-//   - outbound_objects: a NATIVE postv2 the acceptance engine admitted, or an
-//     earlier native comment. Nothing maps those into ap_objects — they were
-//     never materialized from the fediverse — so their outbound row is the
-//     only evidence they federate at all.
-//
-// A nil thread with a nil error means "not federated here": a skip, not a
-// failure.
+// resolveParent finds the thing a new comment replies to, and places the
+// comment one level below it. Reading the parent's RECORDED depth is what
+// keeps the cap O(1) instead of walking the thread on every comment.
 func (d *Dispatcher) resolveParent(ctx context.Context, commit *CommitEvent) (*resolvedThread, error) {
 	parentATURI := replyRef(commit.Record, "parent")
 	if parentATURI == "" {
@@ -234,56 +225,17 @@ func (d *Dispatcher) resolveParent(ctx context.Context, commit *CommitEvent) (*r
 		return nil, nil
 	}
 
-	mapping, err := d.objectMappings.GetByATURI(ctx, parentATURI)
-	if err != nil && !errors.IsNotFound(err) {
-		return nil, fmt.Errorf("resolve comment parent %s: %w", parentATURI, err)
-	}
-	if err == nil && mapping.CommunityDID != "" {
-		community, err := d.communities.GetByDID(ctx, mapping.CommunityDID)
-		if errors.IsNotFound(err) {
-			// The parent is mapped but its community is not one this bridge
-			// federates, so there is nowhere to deliver to.
-			return nil, nil
-		}
-		if err != nil {
-			return nil, fmt.Errorf("resolve community %s: %w", mapping.CommunityDID, err)
-		}
-		return &resolvedThread{
-			ParentATURI:   parentATURI,
-			ParentAPID:    mapping.APID,
-			CommunityDID:  mapping.CommunityDID,
-			CommunityAPID: community.APGroupID,
-			Depth:         d.parentDepth(ctx, parentATURI) + 1,
-		}, nil
-	}
-
-	state, err := d.objects.GetByATURI(ctx, parentATURI)
-	if errors.IsNotFound(err) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("read parent outbound state %s: %w", parentATURI, err)
+	parent, err := d.resolveSubject(ctx, parentATURI)
+	if err != nil || parent == nil {
+		return nil, err
 	}
 	return &resolvedThread{
-		ParentATURI:   parentATURI,
-		ParentAPID:    state.APObjectID,
-		CommunityDID:  state.CommunityDID,
-		CommunityAPID: state.CommunityAPID,
-		Depth:         state.Depth + 1,
+		ParentATURI:   parent.ATURI,
+		ParentAPID:    parent.APID,
+		CommunityDID:  parent.CommunityDID,
+		CommunityAPID: parent.CommunityAPID,
+		Depth:         parent.Depth + 1,
 	}, nil
-}
-
-// parentDepth reads a mapped parent's recorded depth, which exists only if the
-// bridge federated it outward too. A parent with no outbound row is a post or
-// a Lemmy object at the top of what this bridge tracks, so its replies are
-// depth 1. Reading the parent's recorded depth is what keeps the cap O(1)
-// instead of walking the thread on every comment.
-func (d *Dispatcher) parentDepth(ctx context.Context, parentATURI string) int {
-	state, err := d.objects.GetByATURI(ctx, parentATURI)
-	if err != nil {
-		return 0
-	}
-	return state.Depth
 }
 
 // ensureActor makes sure the author has an AP identity, resolving their handle

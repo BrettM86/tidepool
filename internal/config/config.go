@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -114,6 +115,17 @@ type Config struct {
 	// refused: an authenticated write surface must not answer under a Host
 	// an attacker chose.
 	APHostFallthroughDev bool
+
+	// ConsumerEnabled turns on the Jetstream consumer (task 14). Default OFF:
+	// the consumer writes durable outbound state and hands work to delivery,
+	// so a deployment that has not been wired end to end should not start
+	// silently accumulating it.
+	ConsumerEnabled bool
+	// JetstreamURL is the self-hosted Jetstream the consumer subscribes to
+	// (ws:// or wss://). REQUIRED when ConsumerEnabled — a consumer with
+	// nowhere to dial would come up "healthy" and consume nothing, which is
+	// the failure mode cursors and lag metrics exist to make impossible.
+	JetstreamURL string
 	// AdminToken is the bearer token protecting the /admin API (community
 	// subscribe/unsubscribe/backfill). ADMIN_TOKEN; required in production,
 	// dev default is a fixed, publicly known value.
@@ -404,6 +416,36 @@ func Load(logger *slog.Logger) (*Config, error) {
 	cfg.SeedCountsFromAPI, err = boolVarDefault(logger, "SEED_COUNTS_FROM_API", true)
 	if err != nil {
 		return nil, err
+	}
+
+	// The Jetstream consumer (task 14), default OFF until task 18 wires the
+	// e2e path: it writes durable outbound state and hands work to delivery,
+	// so a deployment that has not been wired end to end should not quietly
+	// start accumulating it.
+	cfg.ConsumerEnabled, err = boolVarDefault(logger, "CONSUMER_ENABLED", false)
+	if err != nil {
+		return nil, err
+	}
+	cfg.JetstreamURL = strings.TrimSpace(os.Getenv("JETSTREAM_URL"))
+	// Validated whenever it is SET, not only when the consumer is on: staging
+	// a URL ahead of the flag is how a deployment is prepared, and a typo
+	// caught then is a boot failure with a clear message instead of a
+	// reconnect loop on the day someone flips the switch.
+	if cfg.JetstreamURL != "" {
+		parsed, err := url.Parse(cfg.JetstreamURL)
+		if err != nil {
+			return nil, fmt.Errorf("config: JETSTREAM_URL is not a valid URL: %w", err)
+		}
+		if parsed.Scheme != "ws" && parsed.Scheme != "wss" || parsed.Host == "" {
+			return nil, fmt.Errorf("config: JETSTREAM_URL must be an absolute ws:// or wss:// URL, got %q", cfg.JetstreamURL)
+		}
+	}
+	if cfg.ConsumerEnabled && cfg.JetstreamURL == "" {
+		// A consumer with nowhere to dial comes up looking healthy and
+		// consumes NOTHING, and silence is indistinguishable from a quiet
+		// stream — the exact failure the cursor and lag metrics exist to
+		// expose. Refuse at boot instead.
+		return nil, fmt.Errorf("config: JETSTREAM_URL is required when CONSUMER_ENABLED is set")
 	}
 
 	// Retention knobs for the task-11 pruners: same semantics as

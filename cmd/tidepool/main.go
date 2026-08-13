@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -20,6 +21,7 @@ import (
 
 	"tidepool/internal/ap"
 	"tidepool/internal/config"
+	"tidepool/internal/consume"
 	"tidepool/internal/db"
 	"tidepool/internal/identity"
 	"tidepool/internal/ingest"
@@ -462,6 +464,18 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("user origin: %w", err)
 	}
 
+	// The Jetstream consumer (task 14): the atproto half of the world this
+	// bridge does not host. Default OFF until task 18 wires the e2e path —
+	// it writes durable outbound state, so a deployment that has not been
+	// wired end to end must not start accumulating it.
+	var consumerDone <-chan struct{}
+	if cfg.ConsumerEnabled {
+		consumerDone, err = startConsumer(ctx, cfg, database, repoManager, personasService, logger)
+		if err != nil {
+			return err
+		}
+	}
+
 	// Host routing wraps everything: the chi router keeps answering for the
 	// bridge hostname and its bridged-handle subdomains, the user origin
 	// answers for its own Host, and an unrecognized Host is refused with 421
@@ -530,6 +544,17 @@ func run(logger *slog.Logger) error {
 		case <-shutdownCtx.Done():
 			logger.Warn("backfill drain timed out; abandoning in-flight run (resumable on restart)")
 		}
+		// Wait for the consumer's read loop to exit. Its shutdown path flushes
+		// the cursor on a fresh context, so cutting the process short here
+		// would lose the progress since the last periodic flush and replay it
+		// on the next boot.
+		if consumerDone != nil {
+			select {
+			case <-consumerDone:
+			case <-shutdownCtx.Done():
+				logger.Warn("jetstream consumer did not stop in time; its cursor may replay on restart")
+			}
+		}
 		// ListenAndServe has returned by now (Shutdown guarantees it);
 		// drain its error so a bind failure racing the signal still exits
 		// non-zero instead of being lost in the buffered channel.
@@ -539,4 +564,94 @@ func run(logger *slog.Logger) error {
 		logger.Info("shutdown complete")
 		return nil
 	}
+}
+
+// startConsumer wires the Jetstream consumer (task 14) and starts its read
+// loop. The returned channel closes when the connector's loop has exited, so
+// shutdown can wait for the final cursor flush instead of racing it.
+//
+// The seams that are not wired yet are nil ON PURPOSE, and each is a no-op the
+// consumer announces rather than a silent gap:
+//
+//   - Enqueuer is the logging no-op until task 15's delivery queue lands. The
+//     consumer still runs behind it, so the cursor, the rev gate and the
+//     outbound state that delivery will be built FROM are all exercised.
+//   - Engine (task 16) nil means postv2 events are skipped at debug.
+//   - RemoteDeleter (task 17) nil means a deleteRemote opt-out is recorded and
+//     logged rather than acted on.
+//   - Terminator (task 17) nil means a deleted account is logged rather than
+//     withdrawn — never quietly downgraded to a delivery pause.
+func startConsumer(
+	ctx context.Context,
+	cfg *config.Config,
+	database *sql.DB,
+	repoManager *repo.Manager,
+	minter consume.ActorMinter,
+	logger *slog.Logger,
+) (<-chan struct{}, error) {
+	// The most SSRF-exposed egress in the bridge: the well-known host comes
+	// from a DID document a stranger controls, so it shares the AP client's
+	// guard rather than using a bare http.Client.
+	resolver, err := consume.NewHandleResolver(consume.ResolverOptions{
+		PLCDirectoryURL: cfg.PLCDirectoryURL,
+		HTTPClient:      ap.NewGuardedHTTPClient(cfg.AllowPrivateAddresses, 30*time.Second),
+		UserAgent:       cfg.UserAgent,
+		// DNS is the first half of handle verification and covers every
+		// self-hosted handle that publishes no well-known.
+		LookupTXT: consume.DefaultLookupTXT,
+		Logger:    logger,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("consumer: handle resolver: %w", err)
+	}
+
+	dispatcher, err := consume.NewDispatcher(consume.Options{
+		DB:       database,
+		Actors:   minter,
+		Resolver: resolver,
+		Enqueuer: consume.NewNoopEnqueuer(logger),
+		// Reads committed records so a subject's community resolves for
+		// mappings written before migration 016 filled community_did.
+		Records:    repoManager,
+		UserOrigin: cfg.APUserOrigin,
+		Logger:     logger,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("consumer: dispatcher: %w", err)
+	}
+
+	// The collection filter is load-bearing: without wantedCollections this
+	// would subscribe to the entire network's firehose and discard it record
+	// by record.
+	subscribeURL, err := consume.SubscribeURL(cfg.JetstreamURL, consume.WantedCollections())
+	if err != nil {
+		return nil, fmt.Errorf("consumer: %w", err)
+	}
+
+	state := consume.NewPostgresStateStore(database, consume.CursorSchemaVersion)
+	connector := consume.NewConnector(consume.ConsumerNative, subscribeURL, dispatcher,
+		consume.WithCursorStore(state),
+		consume.WithDeadLetterWriter(state),
+		consume.WithConnectorLogger(logger))
+
+	// The redriver makes transient failures self-healing: an event captured
+	// during a postgres blip is replayed once the blip clears, without anyone
+	// being paged.
+	go consume.NewDeadLetterRedriver(state,
+		map[string]consume.EventHandler{consume.ConsumerNative: dispatcher}).Run(ctx)
+
+	// Cursor age and dead-letter depth are what make a STALLED consumer
+	// visible: the process stays up and the health check stays green while
+	// events quietly stop arriving.
+	consume.PublishMetrics(context.Background(), connector, state)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := connector.Start(ctx); err != nil {
+			logger.Error("jetstream consumer stopped", "error", err)
+		}
+	}()
+	logger.Info("jetstream consumer started", "url", subscribeURL)
+	return done, nil
 }

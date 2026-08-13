@@ -9,39 +9,37 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["name", "description"],
+          "required": [
+            "name",
+            "description"
+          ],
           "properties": {
             "name": {
               "type": "string",
-              "maxGraphemes": 64,
-              "maxLength": 640,
-              "description": "Community display name"
+              "maxLength": 63,
+              "description": "Short community name used as the local part of the handle (e.g., 'gaming'). Must be a valid DNS label: ASCII letters, digits, and hyphens only."
+            },
+            "displayName": {
+              "type": "string",
+              "maxGraphemes": 128,
+              "maxLength": 1280,
+              "description": "Display name for the community"
             },
             "description": {
               "type": "string",
-              "maxGraphemes": 300,
-              "maxLength": 3000,
+              "maxGraphemes": 1000,
+              "maxLength": 10000,
               "description": "Community description"
-            },
-            "avatar": {
-              "type": "blob",
-              "accept": ["image/png", "image/jpeg", "image/webp"],
-              "maxSize": 1000000
-            },
-            "banner": {
-              "type": "blob",
-              "accept": ["image/png", "image/jpeg", "image/webp"],
-              "maxSize": 2000000
             },
             "avatarMimeType": {
               "type": "string",
               "maxLength": 128,
-              "description": "MIME type of avatar blob (image/png, image/jpeg, image/webp)"
+              "description": "MIME type of the avatar image (image/png, image/jpeg, image/webp)"
             },
             "bannerMimeType": {
               "type": "string",
               "maxLength": 128,
-              "description": "MIME type of banner blob (image/png, image/jpeg, image/webp)"
+              "description": "MIME type of the banner image (image/png, image/jpeg, image/webp)"
             },
             "rules": {
               "type": "array",
@@ -76,7 +74,11 @@
             },
             "visibility": {
               "type": "string",
-              "knownValues": ["public", "unlisted", "private"],
+              "knownValues": [
+                "public",
+                "unlisted",
+                "private"
+              ],
               "default": "public",
               "maxLength": 64,
               "description": "Community visibility level"
@@ -85,6 +87,16 @@
               "type": "boolean",
               "default": true,
               "description": "Whether other Coves instances can index and discover this community"
+            },
+            "avatarBlob": {
+              "type": "string",
+              "maxLength": 1400000,
+              "description": "Base64-encoded avatar image data (png, jpeg, or webp)"
+            },
+            "bannerBlob": {
+              "type": "string",
+              "maxLength": 2800000,
+              "description": "Base64-encoded banner image data (png, jpeg, or webp)"
             }
           }
         }
@@ -93,7 +105,12 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["uri", "cid", "did", "handle"],
+          "required": [
+            "uri",
+            "cid",
+            "did",
+            "handle"
+          ],
           "properties": {
             "uri": {
               "type": "string",

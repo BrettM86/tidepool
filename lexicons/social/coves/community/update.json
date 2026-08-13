@@ -9,84 +9,83 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["community"],
+          "required": [
+            "communityDid"
+          ],
           "properties": {
-            "community": {
+            "communityDid": {
               "type": "string",
               "format": "did",
               "description": "DID of the community to update"
             },
-            "name": {
+            "displayName": {
               "type": "string",
-              "maxGraphemes": 64,
-              "maxLength": 640,
-              "description": "Community display name"
+              "maxGraphemes": 128,
+              "maxLength": 1280,
+              "description": "Display name for the community"
             },
             "description": {
               "type": "string",
-              "maxGraphemes": 300,
-              "maxLength": 3000,
+              "maxGraphemes": 1000,
+              "maxLength": 10000,
               "description": "Community description"
-            },
-            "avatar": {
-              "type": "blob",
-              "accept": ["image/png", "image/jpeg", "image/webp"],
-              "maxSize": 1000000
-            },
-            "banner": {
-              "type": "blob",
-              "accept": ["image/png", "image/jpeg", "image/webp"],
-              "maxSize": 2000000
             },
             "avatarMimeType": {
               "type": "string",
               "maxLength": 128,
-              "description": "MIME type of avatar blob (image/png, image/jpeg, image/webp)"
+              "description": "MIME type of the avatar image (image/png, image/jpeg, image/webp)"
             },
             "bannerMimeType": {
               "type": "string",
               "maxLength": 128,
-              "description": "MIME type of banner blob (image/png, image/jpeg, image/webp)"
+              "description": "MIME type of the banner image (image/png, image/jpeg, image/webp)"
             },
-            "rules": {
+            "moderationType": {
+              "type": "string",
+              "knownValues": [
+                "moderator",
+                "sortition"
+              ],
+              "maxLength": 64,
+              "description": "Type of moderation system"
+            },
+            "contentWarnings": {
               "type": "array",
               "maxLength": 10,
+              "description": "Required content warnings for this community",
               "items": {
                 "type": "string",
-                "maxGraphemes": 200,
-                "maxLength": 2000
-              },
-              "description": "Community rules"
-            },
-            "categories": {
-              "type": "array",
-              "maxLength": 3,
-              "items": {
-                "type": "string",
-                "maxLength": 50
-              },
-              "description": "Community categories for discovery"
-            },
-            "language": {
-              "type": "string",
-              "format": "language",
-              "description": "Primary language of the community"
-            },
-            "membershipThreshold": {
-              "type": "integer",
-              "minimum": 0,
-              "maximum": 10000,
-              "description": "Reputation threshold required for membership"
+                "knownValues": [
+                  "nsfw",
+                  "violence",
+                  "spoilers"
+                ],
+                "maxLength": 32
+              }
             },
             "visibility": {
               "type": "string",
-              "knownValues": ["public", "unlisted", "private"],
+              "knownValues": [
+                "public",
+                "unlisted",
+                "private"
+              ],
               "maxLength": 64,
               "description": "Community visibility level"
             },
             "allowExternalDiscovery": {
               "type": "boolean",
               "description": "Whether other Coves instances can index and discover this community"
+            },
+            "avatarBlob": {
+              "type": "string",
+              "maxLength": 1400000,
+              "description": "Base64-encoded avatar image data (png, jpeg, or webp)"
+            },
+            "bannerBlob": {
+              "type": "string",
+              "maxLength": 2800000,
+              "description": "Base64-encoded banner image data (png, jpeg, or webp)"
             }
           }
         }
@@ -95,7 +94,10 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["uri", "cid"],
+          "required": [
+            "uri",
+            "cid"
+          ],
           "properties": {
             "uri": {
               "type": "string",

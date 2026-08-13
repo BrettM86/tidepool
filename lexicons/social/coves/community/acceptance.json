@@ -1,0 +1,27 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.community.acceptance",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A community's attestation that it accepts a post. Written only by the community's key holder, automatically once admission checks pass - machine attestation, not human approval. The community is implicit in the repository this record lives in. The record key is deterministic: the unpadded lowercase base32 encoding of the SHA-256 digest of the canonical subject AT-URI (fixed 52 characters, always rkey-safe), so a post has exactly one acceptance rkey per community, concurrent writers converge idempotently instead of allocating duplicates, and re-acceptance after an author edit is an update of this same record in place. Repo placement attributes authorship as vouched for by a verifying relay or a direct DID-resolved PDS fetch; firehose events themselves carry no commit-signature proof. If the author deletes the subject post, the community host deletes this acceptance on observing the tombstone; consumers treat an acceptance whose subject is gone as inert.",
+      "key": "any",
+      "record": {
+        "type": "object",
+        "required": ["subject", "createdAt"],
+        "properties": {
+          "subject": {
+            "type": "ref",
+            "ref": "com.atproto.repo.strongRef",
+            "description": "Strong reference to the accepted post, pinning the exact accepted version. If the author edits the post the CID no longer matches and the post is pending re-acceptance; clients and AppViews MUST NOT auto-render the new CID under the old acceptance."
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "Timestamp when the post was accepted"
+          }
+        }
+      }
+    }
+  }
+}

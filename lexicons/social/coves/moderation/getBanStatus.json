@@ -4,7 +4,7 @@
   "defs": {
     "main": {
       "type": "query",
-      "description": "Check if a user is banned from a community",
+      "description": "Check if a user is banned from a community. Requires authentication; callers must be the subject themselves or a moderator of the community.",
       "parameters": {
         "type": "params",
         "required": ["community", "subject"],
@@ -33,8 +33,8 @@
             },
             "ban": {
               "type": "ref",
-              "ref": "social.coves.moderation.ban",
-              "description": "Ban record if user is banned"
+              "ref": "social.coves.moderation.defs#banView",
+              "description": "Ban view if user is banned"
             }
           }
         }

@@ -4,7 +4,7 @@
   "defs": {
     "main": {
       "type": "record",
-      "description": "Authorization for an aggregator to post to a community with specific configuration. Published in the community's repository by moderators. Similar to social.coves.actor.subscription.",
+      "description": "Authorization for an aggregator to post to a community with specific configuration. Published in the community's repository by moderators. The record key MUST be the authorized aggregator's DID, guaranteeing at most one authorization per (community, aggregator) pair. Similar to social.coves.actor.subscription.",
       "key": "any",
       "record": {
         "type": "object",

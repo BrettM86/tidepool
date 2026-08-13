@@ -7,7 +7,9 @@
       "description": "Get list of users with membership status in a community",
       "parameters": {
         "type": "params",
-        "required": ["community"],
+        "required": [
+          "community"
+        ],
         "properties": {
           "community": {
             "type": "string",
@@ -21,11 +23,16 @@
             "default": 50
           },
           "cursor": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 500
           },
           "sort": {
             "type": "string",
-            "knownValues": ["reputation", "recent", "alphabetical"],
+            "knownValues": [
+              "reputation",
+              "recent",
+              "alphabetical"
+            ],
             "default": "reputation",
             "maxLength": 64
           }
@@ -35,7 +42,9 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["members"],
+          "required": [
+            "members"
+          ],
           "properties": {
             "members": {
               "type": "array",
@@ -45,7 +54,8 @@
               }
             },
             "cursor": {
-              "type": "string"
+              "type": "string",
+              "maxLength": 500
             }
           }
         }
@@ -53,7 +63,10 @@
     },
     "memberView": {
       "type": "object",
-      "required": ["did", "memberSince", "reputation"],
+      "required": [
+        "did",
+        "memberSince"
+      ],
       "properties": {
         "did": {
           "type": "string",
@@ -64,7 +77,9 @@
           "format": "handle"
         },
         "displayName": {
-          "type": "string"
+          "type": "string",
+          "maxGraphemes": 128,
+          "maxLength": 1280
         },
         "avatar": {
           "type": "string",

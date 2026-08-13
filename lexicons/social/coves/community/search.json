@@ -7,11 +7,14 @@
       "description": "Search for communities by name or description",
       "parameters": {
         "type": "params",
-        "required": ["q"],
+        "required": [
+          "q"
+        ],
         "properties": {
           "q": {
             "type": "string",
-            "description": "Search query"
+            "description": "Search query",
+            "maxLength": 500
           },
           "limit": {
             "type": "integer",
@@ -20,11 +23,13 @@
             "default": 50
           },
           "cursor": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 500
           },
           "category": {
             "type": "string",
-            "description": "Filter by category"
+            "description": "Filter by category",
+            "maxLength": 50
           },
           "language": {
             "type": "string",
@@ -37,7 +42,9 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["communities"],
+          "required": [
+            "communities"
+          ],
           "properties": {
             "communities": {
               "type": "array",
@@ -47,7 +54,8 @@
               }
             },
             "cursor": {
-              "type": "string"
+              "type": "string",
+              "maxLength": 500
             }
           }
         }

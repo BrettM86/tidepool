@@ -5,7 +5,9 @@
     "main": {
       "type": "object",
       "description": "External link embed with optional aggregated sources for megathreads",
-      "required": ["external"],
+      "required": [
+        "external"
+      ],
       "properties": {
         "external": {
           "type": "ref",
@@ -16,7 +18,9 @@
     "external": {
       "type": "object",
       "description": "Primary external link metadata",
-      "required": ["uri"],
+      "required": [
+        "uri"
+      ],
       "properties": {
         "uri": {
           "type": "string",
@@ -25,19 +29,23 @@
         },
         "title": {
           "type": "string",
-          "maxLength": 500,
+          "maxLength": 5000,
           "maxGraphemes": 500,
           "description": "Title of the linked content"
         },
         "description": {
           "type": "string",
-          "maxLength": 1000,
+          "maxLength": 10000,
           "maxGraphemes": 1000,
           "description": "Description or excerpt of the linked content"
         },
         "thumb": {
           "type": "blob",
-          "accept": ["image/png", "image/jpeg", "image/webp"],
+          "accept": [
+            "image/png",
+            "image/jpeg",
+            "image/webp"
+          ],
           "maxSize": 6000000,
           "description": "Thumbnail image for the post (applies to primary link)"
         },
@@ -48,8 +56,14 @@
         },
         "embedType": {
           "type": "string",
-          "knownValues": ["article", "image", "video", "website"],
-          "description": "Type hint for content rendering and filtering"
+          "knownValues": [
+            "article",
+            "image",
+            "video",
+            "website"
+          ],
+          "description": "Type hint for content rendering and filtering",
+          "maxLength": 64
         },
         "provider": {
           "type": "string",
@@ -84,7 +98,9 @@
     "source": {
       "type": "object",
       "description": "A source link aggregated into a megathread",
-      "required": ["uri"],
+      "required": [
+        "uri"
+      ],
       "properties": {
         "uri": {
           "type": "string",
@@ -93,7 +109,7 @@
         },
         "title": {
           "type": "string",
-          "maxLength": 500,
+          "maxLength": 5000,
           "maxGraphemes": 500,
           "description": "Title of the source article"
         },
@@ -106,6 +122,94 @@
           "type": "ref",
           "ref": "com.atproto.repo.strongRef",
           "description": "Reference to the Coves post that originally shared this link. Used for feed deprioritization of rolled-up posts"
+        }
+      }
+    },
+    "view": {
+      "type": "object",
+      "description": "View of an external link embed as served by the AppView",
+      "required": [
+        "external"
+      ],
+      "properties": {
+        "external": {
+          "type": "ref",
+          "ref": "#viewExternal"
+        }
+      }
+    },
+    "viewExternal": {
+      "type": "object",
+      "description": "External link metadata as served by the AppView; thumb is a fetchable URL instead of a blob reference",
+      "required": [
+        "uri"
+      ],
+      "properties": {
+        "uri": {
+          "type": "string",
+          "format": "uri",
+          "description": "URI of the primary external content"
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 5000,
+          "maxGraphemes": 500,
+          "description": "Title of the linked content"
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 10000,
+          "maxGraphemes": 1000,
+          "description": "Description or excerpt of the linked content"
+        },
+        "thumb": {
+          "type": "string",
+          "format": "uri",
+          "description": "URL of the thumbnail image, served via the AppView's image proxy"
+        },
+        "domain": {
+          "type": "string",
+          "maxLength": 253,
+          "description": "Domain of the linked content (e.g., nytimes.com)"
+        },
+        "embedType": {
+          "type": "string",
+          "knownValues": [
+            "article",
+            "image",
+            "video",
+            "website"
+          ],
+          "description": "Type hint for content rendering and filtering",
+          "maxLength": 64
+        },
+        "provider": {
+          "type": "string",
+          "maxLength": 100,
+          "description": "Service provider name (e.g., imgur, streamable)"
+        },
+        "images": {
+          "type": "array",
+          "maxLength": 8,
+          "description": "Preview images for image gallery providers",
+          "items": {
+            "type": "ref",
+            "ref": "social.coves.embed.images#viewImage"
+          }
+        },
+        "totalCount": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total number of items if more than displayed (for galleries)"
+        },
+        "sources": {
+          "type": "array",
+          "description": "Aggregated source links for megathreads. Each source references an original article and optionally the Coves post that shared it",
+          "maxLength": 50,
+          "items": {
+            "type": "ref",
+            "ref": "#source"
+          }
         }
       }
     }

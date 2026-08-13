@@ -5,12 +5,32 @@
     "main": {
       "type": "object",
       "description": "Embedded reference to another post (quoted post)",
-      "required": ["post"],
+      "required": [
+        "post"
+      ],
       "properties": {
         "post": {
           "type": "ref",
           "ref": "com.atproto.repo.strongRef",
           "description": "Strong reference to the embedded post (includes URI and CID)"
+        }
+      }
+    },
+    "view": {
+      "type": "object",
+      "description": "View of a quoted-post embed as served by the AppView, optionally enriched with resolved post data",
+      "required": [
+        "post"
+      ],
+      "properties": {
+        "post": {
+          "type": "ref",
+          "ref": "com.atproto.repo.strongRef",
+          "description": "Strong reference to the embedded post (includes URI and CID)"
+        },
+        "resolved": {
+          "type": "unknown",
+          "description": "Resolved data for the referenced post (e.g., a hydrated Bluesky post), or an unavailable marker with a user-facing message"
         }
       }
     }

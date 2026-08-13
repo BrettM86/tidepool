@@ -7,7 +7,9 @@
       "description": "List bans for a community (moderator only)",
       "parameters": {
         "type": "params",
-        "required": ["community"],
+        "required": [
+          "community"
+        ],
         "properties": {
           "community": {
             "type": "string",
@@ -16,9 +18,15 @@
           },
           "status": {
             "type": "string",
-            "knownValues": ["active", "expired", "revoked", "all"],
+            "knownValues": [
+              "active",
+              "expired",
+              "revoked",
+              "all"
+            ],
             "default": "active",
-            "description": "Filter by ban status"
+            "description": "Filter by ban status",
+            "maxLength": 64
           },
           "limit": {
             "type": "integer",
@@ -29,7 +37,8 @@
           },
           "cursor": {
             "type": "string",
-            "description": "Pagination cursor"
+            "description": "Pagination cursor",
+            "maxLength": 500
           }
         }
       },
@@ -37,18 +46,21 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["bans"],
+          "required": [
+            "bans"
+          ],
           "properties": {
             "bans": {
               "type": "array",
               "items": {
                 "type": "ref",
-                "ref": "social.coves.moderation.ban"
+                "ref": "social.coves.moderation.defs#banView"
               }
             },
             "cursor": {
               "type": "string",
-              "description": "Pagination cursor for next page"
+              "description": "Pagination cursor for next page",
+              "maxLength": 500
             }
           }
         }

@@ -16,23 +16,35 @@
           },
           "cursor": {
             "type": "string",
-            "description": "Pagination cursor"
+            "description": "Pagination cursor",
+            "maxLength": 500
           },
           "visibility": {
             "type": "string",
-            "knownValues": ["public", "unlisted", "private"],
-            "description": "Filter communities by visibility level"
+            "knownValues": [
+              "public",
+              "unlisted",
+              "private"
+            ],
+            "description": "Filter communities by visibility level",
+            "maxLength": 64
           },
           "sort": {
             "type": "string",
-            "knownValues": ["popular", "active", "new", "alphabetical"],
+            "knownValues": [
+              "popular",
+              "active",
+              "new",
+              "alphabetical"
+            ],
             "default": "popular",
             "maxLength": 64,
             "description": "Sorting method"
           },
           "category": {
             "type": "string",
-            "description": "Filter by category"
+            "description": "Filter by category",
+            "maxLength": 50
           },
           "language": {
             "type": "string",
@@ -49,7 +61,9 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["communities"],
+          "required": [
+            "communities"
+          ],
           "properties": {
             "communities": {
               "type": "array",
@@ -59,7 +73,8 @@
               }
             },
             "cursor": {
-              "type": "string"
+              "type": "string",
+              "maxLength": 500
             }
           }
         }

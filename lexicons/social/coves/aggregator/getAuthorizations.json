@@ -7,7 +7,9 @@
       "description": "Get list of communities that have authorized a specific aggregator. Used by aggregators to query which communities they can post to. Authentication optional.",
       "parameters": {
         "type": "params",
-        "required": ["aggregatorDid"],
+        "required": [
+          "aggregatorDid"
+        ],
         "properties": {
           "aggregatorDid": {
             "type": "string",
@@ -28,7 +30,8 @@
           },
           "cursor": {
             "type": "string",
-            "description": "Pagination cursor"
+            "description": "Pagination cursor",
+            "maxLength": 500
           }
         }
       },
@@ -36,7 +39,9 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["authorizations"],
+          "required": [
+            "authorizations"
+          ],
           "properties": {
             "authorizations": {
               "type": "array",
@@ -48,7 +53,8 @@
             },
             "cursor": {
               "type": "string",
-              "description": "Pagination cursor for next page"
+              "description": "Pagination cursor for next page",
+              "maxLength": 500
             }
           }
         }

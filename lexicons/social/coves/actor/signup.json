@@ -9,7 +9,11 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["handle", "email", "password"],
+          "required": [
+            "handle",
+            "email",
+            "password"
+          ],
           "properties": {
             "handle": {
               "type": "string",
@@ -18,15 +22,18 @@
             },
             "email": {
               "type": "string",
-              "description": "Email address for account recovery and notifications"
+              "description": "Email address for account recovery and notifications",
+              "maxLength": 320
             },
             "password": {
               "type": "string",
-              "description": "Account password (must meet strength requirements)"
+              "description": "Account password (must meet strength requirements)",
+              "maxLength": 512
             },
             "inviteCode": {
               "type": "string",
-              "description": "Invite code (required if instance has invite-only registration)"
+              "description": "Invite code (required if instance has invite-only registration)",
+              "maxLength": 128
             }
           }
         }
@@ -35,7 +42,12 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["did", "handle", "accessJwt", "refreshJwt"],
+          "required": [
+            "did",
+            "handle",
+            "accessJwt",
+            "refreshJwt"
+          ],
           "properties": {
             "did": {
               "type": "string",
@@ -49,11 +61,13 @@
             },
             "accessJwt": {
               "type": "string",
-              "description": "Access token for authenticated requests"
+              "description": "Access token for authenticated requests",
+              "maxLength": 8192
             },
             "refreshJwt": {
               "type": "string",
-              "description": "Refresh token for obtaining new access tokens"
+              "description": "Refresh token for obtaining new access tokens",
+              "maxLength": 8192
             }
           }
         }

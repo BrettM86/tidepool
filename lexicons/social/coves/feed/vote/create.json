@@ -9,7 +9,10 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["subject", "direction"],
+          "required": [
+            "subject",
+            "direction"
+          ],
           "properties": {
             "subject": {
               "type": "ref",
@@ -18,8 +21,12 @@
             },
             "direction": {
               "type": "string",
-              "knownValues": ["up", "down"],
-              "description": "Vote direction: up for upvote, down for downvote"
+              "knownValues": [
+                "up",
+                "down"
+              ],
+              "description": "Vote direction: up for upvote, down for downvote",
+              "maxLength": 64
             }
           }
         }
@@ -28,17 +35,16 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["uri", "cid"],
           "properties": {
             "uri": {
               "type": "string",
               "format": "at-uri",
-              "description": "AT-URI of the created vote (empty string if vote was toggled off)"
+              "description": "AT-URI of the created vote. Absent if the vote was toggled off."
             },
             "cid": {
               "type": "string",
               "format": "cid",
-              "description": "CID of the created vote (empty string if vote was toggled off)"
+              "description": "CID of the created vote. Absent if the vote was toggled off."
             }
           }
         }

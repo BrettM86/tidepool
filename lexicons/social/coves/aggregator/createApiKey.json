@@ -17,15 +17,22 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["key", "keyPrefix", "did", "createdAt"],
+          "required": [
+            "key",
+            "keyPrefix",
+            "did",
+            "createdAt"
+          ],
           "properties": {
             "key": {
               "type": "string",
-              "description": "The plain-text API key. This is shown ONCE and cannot be retrieved again. Format: ckapi_<64-hex-chars> (32 bytes hex-encoded)"
+              "description": "The plain-text API key. This is shown ONCE and cannot be retrieved again. Format: ckapi_<64-hex-chars> (32 bytes hex-encoded)",
+              "maxLength": 256
             },
             "keyPrefix": {
               "type": "string",
-              "description": "First 12 characters of the key (e.g., 'ckapi_ab12cd') for identification in logs and UI"
+              "description": "First 12 characters of the key (e.g., 'ckapi_ab12cd') for identification in logs and UI",
+              "maxLength": 64
             },
             "did": {
               "type": "string",

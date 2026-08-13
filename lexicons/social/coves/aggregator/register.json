@@ -9,7 +9,10 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["did", "domain"],
+          "required": [
+            "did",
+            "domain"
+          ],
           "properties": {
             "did": {
               "type": "string",
@@ -18,8 +21,8 @@
             },
             "domain": {
               "type": "string",
-              "format": "uri",
-              "description": "Domain where the aggregator is hosted (e.g., 'rss-bot.example.com'). Must serve .well-known/atproto-did file containing the DID."
+              "maxLength": 253,
+              "description": "Hostname where the aggregator is hosted, without scheme (e.g., 'rss-bot.example.com'). Must serve a .well-known/atproto-did file containing the DID."
             }
           }
         }
@@ -28,7 +31,10 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["did", "handle"],
+          "required": [
+            "did",
+            "handle"
+          ],
           "properties": {
             "did": {
               "type": "string",
@@ -37,11 +43,13 @@
             },
             "handle": {
               "type": "string",
-              "description": "Handle extracted from DID document"
+              "description": "Handle extracted from DID document",
+              "maxLength": 512
             },
             "message": {
               "type": "string",
-              "description": "Success message with next steps"
+              "description": "Success message with next steps",
+              "maxLength": 1000
             }
           }
         }

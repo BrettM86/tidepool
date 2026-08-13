@@ -1,0 +1,58 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.community.post.getStatus",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Get one community's admission decision about one post. Intentionally UNAUTHENTICATED: the caller with the strongest need is an author on another server whose post is pending on this host, and they have no account here to authenticate with. It is also the only way a rejection is reachable at all - a submission refused before it was ever accepted writes no community record, so there is no repository record and no firehose event carrying it, and without this endpoint an author whose post vanished could never learn that it was refused or why. The accepted cost is that anyone who can name a post AT-URI learns its status in a community. Both parameters are required: a post carries independent decisions from several communities, so there is no single status of a post.",
+      "parameters": {
+        "type": "params",
+        "required": ["post", "community"],
+        "properties": {
+          "post": {
+            "type": "string",
+            "format": "at-uri",
+            "description": "AT-URI of the post, in the author's repository"
+          },
+          "community": {
+            "type": "string",
+            "format": "did",
+            "description": "DID of the community whose decision is being asked about"
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["status"],
+          "properties": {
+            "status": {
+              "type": "string",
+              "knownValues": ["pending", "accepted", "pending_reacceptance", "rejected", "removed"],
+              "description": "The community's decision state. Reported verbatim rather than collapsed: an author who edited an accepted post needs pending_reacceptance to be distinguishable from a post that was never accepted, because the two have completely different next steps."
+            },
+            "decisionCode": {
+              "type": "string",
+              "description": "Why the post was refused. Present only for rejected and removed. The vocabulary is open and spans both the codes a community publishes in a removal record and the admission-time codes that never reach a repository."
+            },
+            "decisionAt": {
+              "type": "string",
+              "format": "datetime",
+              "description": "When the refusal above was decided"
+            },
+            "acceptanceUri": {
+              "type": "string",
+              "format": "at-uri",
+              "description": "AT-URI of the live community acceptance record, so the caller can read the signed attestation rather than trusting this AppView's summary of it. Present only while an acceptance stands."
+            }
+          }
+        }
+      },
+      "errors": [
+        {"name": "InvalidRequest", "description": "A missing or malformed post or community parameter"},
+        {"name": "NotFound", "description": "This community has no decision about this post"}
+      ]
+    }
+  }
+}

@@ -8,12 +8,17 @@
       "key": "tid",
       "record": {
         "type": "object",
-        "required": ["community", "subject", "banType", "reason", "createdAt"],
+        "required": [
+          "community",
+          "subject",
+          "banType",
+          "createdAt"
+        ],
         "properties": {
           "community": {
             "type": "string",
-            "format": "at-identifier",
-            "description": "DID or handle of the community"
+            "format": "did",
+            "description": "DID of the community"
           },
           "subject": {
             "type": "string",
@@ -22,38 +27,47 @@
           },
           "banType": {
             "type": "string",
-            "knownValues": ["moderator", "tribunal"],
-            "description": "How the ban was imposed"
+            "knownValues": [
+              "moderator",
+              "tribunal"
+            ],
+            "description": "How the ban was imposed",
+            "maxLength": 64
           },
           "reason": {
             "type": "string",
-            "maxLength": 2000,
+            "maxGraphemes": 2000,
+            "maxLength": 20000,
             "description": "Reason for the ban"
           },
           "duration": {
             "type": "integer",
             "minimum": 1,
-            "description": "Ban duration in hours (null for permanent)"
+            "description": "Ban duration in hours (omit for permanent)"
           },
           "bannedBy": {
             "type": "string",
             "format": "did",
-            "description": "DID of moderator who issued ban (null for tribunal bans)"
+            "description": "DID of moderator who issued ban (omitted for tribunal bans)"
           },
           "tribunalCase": {
-            "type": "string",
-            "format": "at-uri",
-            "description": "AT-URI of tribunal case that resulted in ban"
+            "type": "ref",
+            "ref": "com.atproto.repo.strongRef",
+            "description": "Strong reference to the tribunal case that resulted in this ban"
           },
           "status": {
             "type": "string",
-            "knownValues": ["active", "expired", "revoked"],
-            "default": "active"
+            "knownValues": [
+              "active",
+              "expired",
+              "revoked"
+            ],
+            "maxLength": 64
           },
           "expiresAt": {
             "type": "string",
             "format": "datetime",
-            "description": "When the ban expires (null for permanent)"
+            "description": "When the ban expires (omit for permanent)"
           },
           "revokedAt": {
             "type": "string",

@@ -1,0 +1,46 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.community.removal",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A community's record that a post has been removed from it. Written in the same com.atproto.repo.applyWrites commit that deletes the social.coves.community.acceptance, so the firehose never carries a half-completed moderation action. Removal is URI-scoped and terminal: it applies to the post URI across later author edits, not only to the version it pins. A post rejected at submission time was never accepted and writes no record. Removed is exited only by an explicit moderator restore: an atomic commit deleting the removal record and writing a fresh acceptance. The record key is deterministic: the unpadded lowercase base32 encoding of the SHA-256 digest of the canonical subject AT-URI (fixed 52 characters, always rkey-safe), so each post has exactly one removal rkey per community and re-removal updates the same record.",
+      "key": "any",
+      "record": {
+        "type": "object",
+        "required": ["subject", "code", "createdAt"],
+        "properties": {
+          "subject": {
+            "type": "ref",
+            "ref": "com.atproto.repo.strongRef",
+            "description": "Strong reference to the removed post. The pinned CID is audit metadata recording the version present at removal time; the removal itself applies to the post URI."
+          },
+          "code": {
+            "type": "string",
+            "knownValues": [
+              "rule-violation",
+              "spam",
+              "off-topic",
+              "illegal-content",
+              "author-banned",
+              "moderator-discretion"
+            ],
+            "description": "Machine-readable reason for the removal. knownValues is an open set: federated peers may send codes this AppView has not seen yet and their records must still validate, so this MUST NOT become an enum.",
+            "maxLength": 64
+          },
+          "reason": {
+            "type": "string",
+            "maxGraphemes": 1000,
+            "maxLength": 10000,
+            "description": "Human-readable explanation of the removal, shown to the author and in the moderation log"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "Timestamp when the post was removed"
+          }
+        }
+      }
+    }
+  }
+}

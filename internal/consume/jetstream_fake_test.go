@@ -24,8 +24,8 @@ import (
 // tests pin the WIRE shape Jetstream actually emits rather than agreeing with
 // our own types about it.
 type fakeJetstream struct {
-	server *httptest.Server
-	script [][]byte
+	server   *httptest.Server
+	sessions []jsSession
 
 	mu      sync.Mutex
 	dials   int
@@ -33,12 +33,34 @@ type fakeJetstream struct {
 	queries []string
 }
 
-// newFakeJetstream starts a fake Jetstream serving the given frames at
-// /subscribe. It is closed when the test finishes.
+// jsSession is what ONE dial gets: a batch of frames and whether the server
+// then hangs up. Hanging up is how the reconnect tests produce a dropped
+// connection without racing on timing.
+type jsSession struct {
+	frames [][]byte
+	// closeAfter hangs up once the frames are written, instead of holding the
+	// connection open. The nth dial gets sessions[n-1]; once the sessions run
+	// out the LAST one repeats, so a script that ends with a holding session
+	// settles instead of reconnecting forever.
+	closeAfter bool
+}
+
+// newFakeJetstream starts a fake Jetstream serving one session — the given
+// frames, then holding open — at /subscribe. Closed when the test finishes.
 func newFakeJetstream(t *testing.T, script ...[]byte) *fakeJetstream {
 	t.Helper()
+	return newSessionJetstream(t, jsSession{frames: script})
+}
 
-	fake := &fakeJetstream{script: script}
+// newSessionJetstream starts a fake Jetstream that serves a DIFFERENT script
+// per dial, so a test can script a disconnect between two events.
+func newSessionJetstream(t *testing.T, sessions ...jsSession) *fakeJetstream {
+	t.Helper()
+	if len(sessions) == 0 {
+		sessions = []jsSession{{}}
+	}
+
+	fake := &fakeJetstream{sessions: sessions}
 	upgrader := websocket.Upgrader{
 		CheckOrigin: func(*http.Request) bool { return true },
 	}
@@ -47,9 +69,15 @@ func newFakeJetstream(t *testing.T, script ...[]byte) *fakeJetstream {
 	mux.HandleFunc("/subscribe", func(w http.ResponseWriter, r *http.Request) {
 		fake.mu.Lock()
 		fake.dials++
+		dial := fake.dials
 		fake.cursors = append(fake.cursors, r.URL.Query().Get("cursor"))
 		fake.queries = append(fake.queries, r.URL.RawQuery)
 		fake.mu.Unlock()
+
+		session := fake.sessions[len(fake.sessions)-1]
+		if dial <= len(fake.sessions) {
+			session = fake.sessions[dial-1]
+		}
 
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
@@ -58,10 +86,13 @@ func newFakeJetstream(t *testing.T, script ...[]byte) *fakeJetstream {
 		}
 		defer func() { _ = conn.Close() }()
 
-		for _, frame := range fake.script {
+		for _, frame := range session.frames {
 			if err := conn.WriteMessage(websocket.TextMessage, frame); err != nil {
 				return // client went away mid-script; nothing to report
 			}
+		}
+		if session.closeAfter {
+			return // hang up: the connector must re-dial from its cursor
 		}
 		// Hold open. ReadMessage also services the connector's pings, and
 		// returns as soon as the client closes.

@@ -92,19 +92,28 @@ type Object struct {
 	Target *Object `json:"target,omitempty"`
 
 	// Content.
-	Name      string  `json:"name,omitempty"`
-	Content   string  `json:"content,omitempty"`
-	Summary   string  `json:"summary,omitempty"`
-	MediaType string  `json:"mediaType,omitempty"`
-	Source    *Source `json:"source,omitempty"`
-	URL       Links   `json:"url,omitempty"`
-	InReplyTo *Object `json:"inReplyTo,omitempty"`
-	Tag       Tags    `json:"tag,omitempty"`
-	Attach    Tags    `json:"attachment,omitempty"`
-	Icon      *Object `json:"icon,omitempty"`
-	Image     *Object `json:"image,omitempty"`
-	Published *Time   `json:"published,omitempty"`
-	Updated   *Time   `json:"updated,omitempty"`
+	Name    string `json:"name,omitempty"`
+	Content string `json:"content,omitempty"`
+	// Summary is the summary TEXT. Ask HasSummary whether the key was there
+	// at all: "" and absent are the same string but not the same activity
+	// (PLAN.md decision 18 — a Delete carrying a summary is a moderator
+	// removal, one without it is the author deleting their own content, and
+	// a moderator who typed no reason sends `"summary": ""`).
+	Summary string `json:"summary,omitempty"`
+	// summaryPresent records whether the wire object carried the key. It is
+	// unexported so encoding/json cannot see it: presence is an observation
+	// about received bytes, never a field the bridge emits.
+	summaryPresent bool
+	MediaType      string  `json:"mediaType,omitempty"`
+	Source         *Source `json:"source,omitempty"`
+	URL            Links   `json:"url,omitempty"`
+	InReplyTo      *Object `json:"inReplyTo,omitempty"`
+	Tag            Tags    `json:"tag,omitempty"`
+	Attach         Tags    `json:"attachment,omitempty"`
+	Icon           *Object `json:"icon,omitempty"`
+	Image          *Object `json:"image,omitempty"`
+	Published      *Time   `json:"published,omitempty"`
+	Updated        *Time   `json:"updated,omitempty"`
 	// Replies, when advertised, is the object's replies collection (a bare
 	// IRI or an inline collection). Task 06's backfill pages through it.
 	Replies *Object `json:"replies,omitempty"`
@@ -187,13 +196,36 @@ func (o *Object) UnmarshalJSON(data []byte) error {
 		*o = Object{}
 		return nil
 	}
-	var alias objectAlias
-	if err := json.Unmarshal(data, &alias); err != nil {
+	// objectWire shadows `summary` with a POINTER so one pass answers both
+	// questions: the text, and whether the key was on the wire at all. The
+	// outer field sits at depth 0 and the embedded alias's at depth 1, so
+	// encoding/json fills this one and leaves the alias's empty — which is why
+	// the text is copied across below rather than read off the alias.
+	var wire struct {
+		objectAlias
+		Summary *string `json:"summary"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
 		return err
 	}
-	*o = Object(alias)
+	*o = Object(wire.objectAlias)
+	if wire.Summary != nil {
+		o.Summary = *wire.Summary
+		o.summaryPresent = true
+	}
 	return nil
 }
+
+// HasSummary reports whether the wire object carried a `summary` key at all,
+// which is a different question from whether Summary is non-empty. Lemmy marks
+// a moderator removal by putting the key on the Delete and an author's own
+// delete by omitting it (PLAN.md decision 18), and a moderator who gave no
+// reason sends the key with an empty string — so collapsing "" into "absent"
+// reads every reasonless mod removal as a self-delete.
+//
+// Nil-safe, like Time.OK: callers ask the question of whatever they hold
+// without first proving it is there.
+func (o *Object) HasSummary() bool { return o != nil && o.summaryPresent }
 
 // MarshalJSON emits a bare IRI string when only the ID is set (the compact
 // wire form of a reference), otherwise the full object.

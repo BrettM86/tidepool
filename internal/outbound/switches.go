@@ -1,5 +1,7 @@
 package outbound
 
+import "strings"
+
 // ConfigSwitches is the config-backed Switches: the operator kill switches
 // (decision 19) resolved from static configuration. It is the adapter main
 // builds from config values and hands the Worker.
@@ -27,8 +29,14 @@ func (s ConfigSwitches) OutboundAllowed(scope DeliveryScope) bool {
 	if s.Disabled {
 		return false
 	}
-	if _, blocked := s.DisabledHosts[scope.InboxHost]; blocked {
-		return false
+	// Case-insensitive on host: the scope host is lowercased (hostOf), but a
+	// switch value constructed directly may be mixed-case, and a kill switch
+	// must fail closed rather than silently miss on case.
+	host := strings.ToLower(scope.InboxHost)
+	for disabled := range s.DisabledHosts {
+		if strings.ToLower(disabled) == host {
+			return false
+		}
 	}
 	if _, blocked := s.DisabledCommunities[scope.CommunityAPID]; blocked {
 		return false

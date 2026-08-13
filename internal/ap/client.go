@@ -649,10 +649,13 @@ func (c *Client) SendActivityAs(ctx context.Context, signer *Signer, inboxURL st
 	return HTTPError{URL: inboxURL, StatusCode: resp.StatusCode, Body: string(body)}
 }
 
-// sendActivityWith is the shared POST loop: it marshals the activity once,
+// sendActivityWith is the RETRYING POST loop: it marshals the activity once,
 // then retries the signed POST under the client's backoff / egress guard,
-// signing each attempt with the given signer. SendActivity supplies the
-// service actor's configured signer; SendActivityAs supplies a per-actor one.
+// signing each attempt with the given signer. Its only caller is SendActivity
+// (the service actor's Follow/Undo), which supplies the configured signer.
+// SendActivityAs deliberately does NOT use this loop — it is a standalone
+// single-shot POST, because the task-15 delivery worker owns retry and needs to
+// see each response to classify it.
 func (c *Client) sendActivityWith(ctx context.Context, signer *Signer, inboxURL string, activity any) error {
 	payload, err := json.Marshal(activity)
 	if err != nil {

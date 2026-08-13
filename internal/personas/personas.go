@@ -230,17 +230,12 @@ func suffixedLocalPart(base string, attempt int) string {
 	return base + "-" + strconv.Itoa(attempt)
 }
 
-// ActorSigner is the exported per-actor signer accessor (task 15 seam): the
+// SignerFor is THE exported per-actor signer accessor (task 15 seam): the
 // outbound delivery worker signs each activity as the persona that authored the
-// record, not as the service actor. It is actorSigner promoted to the package
-// surface; internal callers keep using the unexported form.
-func (s *Service) ActorSigner(ctx context.Context, did string) (*ap.Signer, error) {
-	return s.actorSigner(ctx, did)
-}
-
-// SignerFor satisfies outbound.SignerProvider so main can inject *Service as the
-// delivery worker's signer source (cycle J). It is ActorSigner under the name
-// the worker's interface uses.
+// record, not as the service actor. It promotes the unexported actorSigner to
+// the package surface under the name outbound.SignerProvider requires, so main
+// injects *Service directly as the worker's signer source (cycle J). Internal
+// callers keep using actorSigner.
 func (s *Service) SignerFor(ctx context.Context, did string) (*ap.Signer, error) {
 	return s.actorSigner(ctx, did)
 }

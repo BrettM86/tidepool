@@ -580,12 +580,17 @@ func run(logger *slog.Logger) error {
 // loop. The returned channel closes when the connector's loop has exited, so
 // shutdown can wait for the final cursor flush instead of racing it.
 //
-// The seams that are not wired yet are nil ON PURPOSE, and each is a no-op the
-// consumer announces rather than a silent gap:
+// Outbound delivery (task 15) is fully wired here:
 //
-//   - Enqueuer is the logging no-op until task 15's delivery queue lands. The
-//     consumer still runs behind it, so the cursor, the rev gate and the
-//     outbound state that delivery will be built FROM are all exercised.
+//   - Enqueuer: the real persisting enqueuer is wired whenever CONSUMER_ENABLED
+//     (this function only runs then), so intents past the rev gate always
+//     persist to outbound_activities/deliveries. OUTBOUND_WORKERS>0 additionally
+//     starts the delivery workers that POST them; the noop enqueuer is used only
+//     when the consumer is disabled (this function does not run at all).
+//
+// The task-16/17 seams are still nil ON PURPOSE, each a no-op the consumer
+// announces rather than a silent gap:
+//
 //   - Engine (task 16) nil means postv2 events are skipped at debug.
 //   - RemoteDeleter (task 17) nil means a deleteRemote opt-out is recorded and
 //     logged rather than acted on.
@@ -617,28 +622,28 @@ func startConsumer(
 		return nil, fmt.Errorf("consumer: handle resolver: %w", err)
 	}
 
-	// The outbound delivery pipe (task 15). The noop enqueuer is the default —
-	// the consumer still writes durable outbound state, but nothing federates
-	// — and it is swapped for the real enqueuer ONLY when OUTBOUND_WORKERS>0.
-	// This is the gate that keeps a not-yet-wired deployment (and the e2e,
-	// which runs with workers=0) from sending anything.
+	// The outbound delivery pipe (task 15). Because this function runs ONLY when
+	// the consumer is enabled, the REAL persisting enqueuer is always wired: it
+	// writes outbound_activities/deliveries inside the consumer's gate tx, so an
+	// intent past the gate is never dropped. OUTBOUND_WORKERS gates only whether
+	// the delivery WORKER goroutines run — with workers=0, state accumulates but
+	// nothing is POSTed. (The noop enqueuer is reserved for the consumer-disabled
+	// path, where nothing runs at all.)
 	inboxes := outbound.NewInboxResolver(apClient, outboundInboxTTL)
-	var enqueuer consume.OutboundEnqueuer = consume.NewNoopEnqueuer(logger)
+	enqueuer, err := outbound.NewEnqueuer(outbound.EnqueuerOptions{
+		DB:         database,
+		Translator: outbound.NewTranslator(cfg.APUserOrigin),
+		Inboxes:    inboxes,
+		Actors:     store.NewAPActors(database),
+		UserOrigin: cfg.APUserOrigin,
+		Logger:     logger,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("consumer: outbound enqueuer: %w", err)
+	}
+
 	var worker *outbound.Worker
 	if cfg.OutboundWorkers > 0 {
-		realEnqueuer, err := outbound.NewEnqueuer(outbound.EnqueuerOptions{
-			DB:         database,
-			Translator: outbound.NewTranslator(cfg.APUserOrigin),
-			Inboxes:    inboxes,
-			Actors:     store.NewAPActors(database),
-			UserOrigin: cfg.APUserOrigin,
-			Logger:     logger,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("consumer: outbound enqueuer: %w", err)
-		}
-		enqueuer = realEnqueuer
-
 		worker, err = outbound.NewWorker(outbound.WorkerOptions{
 			DB:      database,
 			Actors:  store.NewAPActors(database),

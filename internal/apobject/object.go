@@ -95,6 +95,11 @@ func BuildPage(actorID, communityAPID, objectURL string, record map[string]any) 
 // its blobs live in the author's PDS and need a blob→PDS-URL seam to render as
 // attachment [{type:Image, url}] — a task follow-up. A post with no external
 // embed carries no attachment.
+//
+// The href is scheme-checked: a javascript:/data:/vbscript:/file: uri rendered
+// as a clickable Link would be a stored-XSS-shaped hazard on every peer that
+// renders it, so an unsafe scheme drops the attachment (fail closed) rather than
+// federating it.
 func linkAttachment(record map[string]any) []any {
 	embed, ok := record["embed"].(map[string]any)
 	if !ok {
@@ -108,10 +113,19 @@ func linkAttachment(record map[string]any) []any {
 		return nil
 	}
 	href, _ := external["uri"].(string)
-	if href == "" {
+	if href == "" || !isSafeLinkScheme(href) {
 		return nil
 	}
 	return []any{map[string]any{"type": "Link", "href": href}}
+}
+
+// isSafeLinkScheme restricts a bridge-authored clickable URI to http/https. The
+// lexicon's format:"uri" accepts javascript:/data:/vbscript:/file:, which a
+// downstream client rendering the remote-controlled link as clickable would
+// treat as a scripting or local-file URI.
+func isSafeLinkScheme(uri string) bool {
+	lower := strings.ToLower(strings.TrimSpace(uri))
+	return strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://")
 }
 
 // hasNSFWLabel reports whether the record self-labels nsfw

@@ -105,8 +105,9 @@ type PostIntent struct {
 // ActivityID reports the deterministic activity id.
 func (i PostIntent) ActivityID() string { return i.ID }
 
-// OutboundEnqueuer is the task 15 seam. main.go wires a logging noop until
-// task 15 swaps in the real delivery queue.
+// OutboundEnqueuer is the task 15 seam. main wires the real persisting enqueuer
+// (outbound.Enqueuer, which writes outbound_activities/deliveries on the gate
+// tx) whenever CONSUMER_ENABLED; the noop is the consumer-disabled default.
 type OutboundEnqueuer interface {
 	// EnqueueActivity hands one intent to delivery ON THE CALLER'S TX — the
 	// enqueue must commit with the rev-gate advance the consumer is holding, or

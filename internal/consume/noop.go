@@ -7,10 +7,10 @@ import (
 )
 
 // noopEnqueuer logs the outbound intents it is handed and delivers nothing.
-// It is what main wires until task 15 lands, following the v1 precedent
-// (ingest.NewNoopVotes): the consumer runs, writes its state, and makes the
-// work it WOULD deliver visible, rather than being disabled entirely and
-// leaving the whole path unexercised until delivery exists.
+// It is the consumer-DISABLED default: it drops intents by design so a path that
+// is not running end to end makes the work it WOULD deliver visible in the log
+// rather than accumulating it. It is NOT a pre-task-15 placeholder — whenever
+// CONSUMER_ENABLED, main wires the real persisting outbound.Enqueuer instead.
 type noopEnqueuer struct {
 	logger *slog.Logger
 }

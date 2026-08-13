@@ -25,9 +25,9 @@ CREATE TABLE outbound_activities (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- The causal-gating lookup: a delivery whose activity has a parent_at_uri is
--- ineligible until the parent's own outbound_objects row is accepted_at (a
--- BRIDGE-origin parent) — task 15's worker reads the parent chain by actor.
+-- Supports CancelForActor's actor_did filter (the consent-withdrawal /
+-- kill-switch sweep that parks a disabled or paused actor's pending outbound
+-- work): it scans activities by actor to cancel their deliveries.
 CREATE INDEX idx_outbound_activities_actor ON outbound_activities (actor_did);
 
 -- outbound_deliveries is one delivery attempt per (activity, target inbox). It

@@ -209,14 +209,15 @@ func getDelivery(t *testing.T, conn *sql.DB, activityID string) *store.OutboundD
 func newWorker(t *testing.T, conn *sql.DB, sender ActivitySender, opts func(*WorkerOptions)) *Worker {
 	t.Helper()
 	o := WorkerOptions{
-		DB:          conn,
-		Actors:      store.NewAPActors(conn),
-		Signers:     newFakeSigners(t),
-		Inboxes:     staticInbox{inbox: wInbox},
-		Sender:      sender,
-		Lease:       time.Minute,
-		MaxAttempts: 3,
-		BackoffBase: time.Millisecond,
+		DB:               conn,
+		Actors:           store.NewAPActors(conn),
+		Signers:          newFakeSigners(t),
+		Inboxes:          staticInbox{inbox: wInbox},
+		Sender:           sender,
+		Lease:            time.Minute,
+		MaxAttempts:      3,
+		BackoffBase:      time.Millisecond,
+		CausalWaitBudget: time.Hour, // long by default: recent deliveries never time out
 	}
 	if opts != nil {
 		opts(&o)

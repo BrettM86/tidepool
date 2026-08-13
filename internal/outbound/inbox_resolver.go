@@ -10,10 +10,17 @@ import (
 )
 
 // ActorFetcher fetches an AP actor document by IRI. *ap.Client satisfies it via
-// FetchActor (SSRF-guarded, same-authority binding); the resolver depends only
-// on this narrow surface.
+// FetchActor; the resolver depends only on this narrow surface.
 type ActorFetcher interface {
 	FetchActor(ctx context.Context, iri string) (*ap.Object, error)
+}
+
+// sameAuthorityFetcher is the optional hardened fetch: it pins the redirect
+// authority to the requested IRI, so an open redirect on the community's origin
+// cannot bounce the Group-doc fetch to an attacker host. *ap.Client satisfies it
+// (FetchActorSameAuthority); a plain ActorFetcher falls back to FetchActor.
+type sameAuthorityFetcher interface {
+	FetchActorSameAuthority(ctx context.Context, iri string) (*ap.Object, error)
 }
 
 // cachedInboxResolver resolves a community's target inbox from its Group actor
@@ -60,19 +67,30 @@ func (r *cachedInboxResolver) ResolveInboxFresh(ctx context.Context, communityAP
 	return r.fetchAndCache(ctx, communityAPID)
 }
 
-// fetchAndCache fetches the Group document and reads its delivery inbox. The
-// fetch runs through the ap client's SSRF + same-authority guards (ActorFetcher
-// is *ap.Client.FetchActor), so a Group doc advertising a cross-authority or
-// private-range inbox is refused at fetch time; the worker's POST re-applies the
-// egress guard on the resolved inbox.
+// fetchAndCache fetches the Group document (with the redirect authority pinned
+// when the fetcher supports it) and reads its delivery inbox. It REFUSES a
+// resolved inbox whose host is not same-authority with the community: a Group
+// doc a stranger controls must not be able to redirect a signed activity to an
+// arbitrary origin. The worker's POST re-applies the SSRF egress guard on top.
 func (r *cachedInboxResolver) fetchAndCache(ctx context.Context, communityAPID string) (string, error) {
-	doc, err := r.fetcher.FetchActor(ctx, communityAPID)
+	var (
+		doc *ap.Object
+		err error
+	)
+	if hardened, ok := r.fetcher.(sameAuthorityFetcher); ok {
+		doc, err = hardened.FetchActorSameAuthority(ctx, communityAPID)
+	} else {
+		doc, err = r.fetcher.FetchActor(ctx, communityAPID)
+	}
 	if err != nil {
 		return "", fmt.Errorf("resolve inbox for %s: %w", communityAPID, err)
 	}
 	inbox := doc.SharedInboxOrInbox()
 	if inbox == "" {
 		return "", fmt.Errorf("community %s advertises no inbox", communityAPID)
+	}
+	if !ap.SameAuthority(communityAPID, inbox) {
+		return "", fmt.Errorf("community %s advertises a cross-authority inbox %q; refusing", communityAPID, inbox)
 	}
 	r.mu.Lock()
 	r.cache[communityAPID] = inboxEntry{inbox: inbox, expires: time.Now().Add(r.ttl)}

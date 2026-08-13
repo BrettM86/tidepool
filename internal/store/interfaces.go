@@ -540,13 +540,20 @@ type OutboundDeliveries interface {
 	// error satisfying errors.IsNotFound.
 	Get(ctx context.Context, activityID, targetInbox string) (*OutboundDelivery, error)
 
-	// HasPoisonedPredecessor reports whether an earlier delivery on the same
-	// ordering key and target inbox (a lower seq) is poisoned — the causal
-	// signal task 15's worker reads to distinguish a child whose bridge-origin
-	// parent WILL NEVER land (parent_poisoned) from one merely waiting
-	// (parent_unaccepted). Per-community serialization makes a lower-seq
-	// delivery on the same line a causal ancestor.
-	HasPoisonedPredecessor(ctx context.Context, orderingKey, targetInbox string, seq int64) (bool, error)
+	// ParentDeliveryPoisoned reports whether the delivery of the child's ACTUAL
+	// parent (the activity that federated parentATURI as its object, to the same
+	// inbox) is poisoned — the causal signal task 15's worker reads to poison a
+	// child whose bridge-origin parent will NEVER land (parent_poisoned), as
+	// distinct from one merely waiting for a pending parent (parent_unaccepted).
+	// Keyed on the parent's object id, NOT on seq-ancestry, so an unrelated
+	// poisoned row on the same serial line does not poison the child.
+	ParentDeliveryPoisoned(ctx context.Context, parentATURI, targetInbox string) (bool, error)
+
+	// CancelClaimed cancels a SINGLE claimed delivery under its fencing token
+	// (the consent-block outcome for one create/update), leaving the actor's
+	// other pending work — its Delete/Undo retractions above all — untouched.
+	// Same (exists, applied) fencing contract as MarkDelivered.
+	CancelClaimed(ctx context.Context, activityID, targetInbox string, claimToken time.Time) (exists, applied bool, err error)
 
 	// CountsByState returns the number of deliveries in each state — the
 	// operator queue-inspect (GET /admin/outbound).

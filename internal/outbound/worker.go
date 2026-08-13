@@ -57,6 +57,13 @@ type WorkerOptions struct {
 	// BackoffBase is the first retry-backoff step (doubles per attempt). Zero
 	// uses DefaultBackoffBase; tests compress it.
 	BackoffBase time.Duration
+	// CausalWaitBudget is the WALL-CLOCK deadline a reply waits for its
+	// bridge-origin parent to be accepted before poisoning parent_unaccepted.
+	// It is measured from the delivery's creation, NOT its attempt count — a
+	// causal wait must not consume the delivery-failure retry budget (a parent
+	// legitimately takes minutes to be admitted). Zero uses
+	// DefaultCausalWaitBudget.
+	CausalWaitBudget time.Duration
 	// Lease overrides DefaultLease.
 	Lease time.Duration
 	// Logger receives per-delivery outcomes. Nil uses slog.Default().
@@ -71,6 +78,9 @@ const (
 	// DefaultBackoffBase is the first retry step; it doubles per attempt,
 	// capped at one hour.
 	DefaultBackoffBase = 30 * time.Second
+	// DefaultCausalWaitBudget is the wall-clock window a reply waits for its
+	// bridge-origin parent to be accepted before poisoning parent_unaccepted.
+	DefaultCausalWaitBudget = 6 * time.Hour
 )
 
 // Worker claims one delivery at a time and carries it to a terminal state. It
@@ -78,21 +88,22 @@ const (
 // (Lemmy dedupes on our stable activity id, and its duplicate-activity response
 // is classified DELIVERED, not poisoned).
 type Worker struct {
-	db          *sql.DB
-	activities  store.OutboundActivities
-	deliveries  store.OutboundDeliveries
-	objects     store.OutboundObjects
-	actors      store.APActors
-	prefs       store.FederationPrefs
-	votes       store.OutboundVotes
-	signers     SignerProvider
-	inboxes     InboxResolver
-	sender      ActivitySender
-	switches    Switches
-	maxAttempts int
-	backoffBase time.Duration
-	lease       time.Duration
-	logger      *slog.Logger
+	db               *sql.DB
+	activities       store.OutboundActivities
+	deliveries       store.OutboundDeliveries
+	objects          store.OutboundObjects
+	actors           store.APActors
+	prefs            store.FederationPrefs
+	votes            store.OutboundVotes
+	signers          SignerProvider
+	inboxes          InboxResolver
+	sender           ActivitySender
+	switches         Switches
+	maxAttempts      int
+	backoffBase      time.Duration
+	causalWaitBudget time.Duration
+	lease            time.Duration
+	logger           *slog.Logger
 }
 
 // NewWorker wires a Worker.
@@ -137,22 +148,27 @@ func NewWorker(opts WorkerOptions) (*Worker, error) {
 	if backoffBase <= 0 {
 		backoffBase = DefaultBackoffBase
 	}
+	causalWaitBudget := opts.CausalWaitBudget
+	if causalWaitBudget <= 0 {
+		causalWaitBudget = DefaultCausalWaitBudget
+	}
 	return &Worker{
-		db:          opts.DB,
-		activities:  activities,
-		deliveries:  deliveries,
-		objects:     objects,
-		actors:      opts.Actors,
-		prefs:       prefs,
-		votes:       votes,
-		signers:     opts.Signers,
-		inboxes:     opts.Inboxes,
-		sender:      opts.Sender,
-		switches:    switches,
-		maxAttempts: maxAttempts,
-		backoffBase: backoffBase,
-		lease:       lease,
-		logger:      logger,
+		db:               opts.DB,
+		activities:       activities,
+		deliveries:       deliveries,
+		objects:          objects,
+		actors:           opts.Actors,
+		prefs:            prefs,
+		votes:            votes,
+		signers:          opts.Signers,
+		inboxes:          opts.Inboxes,
+		sender:           opts.Sender,
+		switches:         switches,
+		maxAttempts:      maxAttempts,
+		backoffBase:      backoffBase,
+		causalWaitBudget: causalWaitBudget,
+		lease:            lease,
+		logger:           logger,
 	}, nil
 }
 
@@ -228,29 +244,43 @@ func (w *Worker) handle(ctx context.Context, delivery *store.OutboundDelivery) e
 	case causalEligible:
 		// fall through to consent + delivery
 	case causalWait:
-		return w.park(ctx, delivery, "parent_pending", "waiting for bridge-origin parent to be accepted")
+		// Held, NOT failed: keep it immediately re-eligible so it delivers the
+		// instant its parent is accepted, and do not advance the poison budget
+		// (the causal wait is wall-clock-bounded in causalStatus).
+		return w.parkCausal(ctx, delivery, "parent_pending", "waiting for bridge-origin parent to be accepted")
 	case causalPoisonUnaccepted:
-		return w.poison(ctx, delivery, "parent_unaccepted", "bounded wait exhausted; parent never accepted", 0)
+		return w.poison(ctx, delivery, "parent_unaccepted", "causal wait budget exhausted; parent never accepted", 0)
 	case causalPoisonParent:
 		return w.poison(ctx, delivery, "parent_poisoned", "parent delivery poisoned; descendant cannot land", 0)
 	}
 
 	// Consent recheck (retraction asymmetry): a Delete/Undo always goes out —
 	// it is how an opted-out user takes down what is already federated. Outward
-	// kinds are cancelled when the actor is disabled, paused, or opted out.
+	// kinds are cancelled when the actor is disabled, paused, or opted out —
+	// but ONLY this one claimed delivery, never the actor's pending retractions.
 	if !isRetraction(activity.Kind) {
 		blocked, err := w.consentBlocked(ctx, activity.ActorDID)
 		if err != nil {
 			return err
 		}
 		if blocked {
-			cancelled, err := w.deliveries.CancelForActor(ctx, activity.ActorDID)
+			_, applied, err := w.deliveries.CancelClaimed(ctx, delivery.ActivityID, delivery.TargetInbox, *delivery.ClaimedUntil)
 			if err != nil {
-				return fmt.Errorf("cancel deliveries for %s: %w", activity.ActorDID, err)
+				return fmt.Errorf("cancel delivery %s: %w", delivery.ActivityID, err)
 			}
-			metricCancelled.Add(cancelled)
+			if applied {
+				metricCancelled.Add(1)
+			}
 			return nil
 		}
+	}
+
+	// Defense in depth: never sign a POST to an inbox that is not same-authority
+	// with the target community. The resolver already refuses a cross-authority
+	// inbox at enqueue time; this catches a tampered or legacy stored target.
+	if !ap.SameAuthority(delivery.OrderingKey, delivery.TargetInbox) {
+		return w.poison(ctx, delivery, "cross_authority",
+			"target inbox is not same-authority with the community; refusing to deliver", 0)
 	}
 
 	return w.deliver(ctx, delivery, activity)
@@ -283,13 +313,17 @@ func (w *Worker) classify(ctx context.Context, delivery *store.OutboundDelivery,
 			// Lemmy's received_activity dedupe (400 + "already received") is a
 			// SUCCESS by our stable id: a redelivery after a crash is expected.
 			return w.deliverSuccess(ctx, delivery, activity, he.StatusCode)
-		case he.StatusCode == http.StatusUnauthorized ||
-			he.StatusCode == http.StatusNotFound ||
+		case he.StatusCode == http.StatusNotFound ||
 			he.StatusCode == http.StatusGone:
+			// 404/410 is an endpoint-GONE signal: re-resolve the inbox once
+			// before poisoning (a rotation must not become a poison).
 			return w.rotateInbox(ctx, delivery, activity, signer, he)
-		case he.StatusCode == http.StatusRequestTimeout ||
+		case he.StatusCode == http.StatusUnauthorized ||
+			he.StatusCode == http.StatusRequestTimeout ||
 			he.StatusCode == http.StatusTooManyRequests ||
 			he.StatusCode >= 500:
+			// 401 is an AUTH problem (our signature, their secure mode), not an
+			// endpoint rotation: retry it, don't burn the single re-resolve.
 			return w.releaseOrPoison(ctx, delivery, classForStatus(he.StatusCode), he.Body, he.StatusCode)
 		default:
 			// Other 4xx: a genuine rejection. Retried on a small budget, then
@@ -330,9 +364,18 @@ func (w *Worker) rotateInbox(ctx context.Context, delivery *store.OutboundDelive
 	return w.poison(ctx, delivery, "inbox_gone", "inbox still unreachable after re-resolution", status)
 }
 
-// deliverSuccess marks the delivery delivered under its fencing token and fires
-// the object-acceptance and vote-delivery callbacks.
+// deliverSuccess opens the causal gate and marks the delivery delivered, in
+// that order so the two are effectively atomic: a parent must NEVER be observed
+// delivered while its accepted_at is unset (that strands every child forever).
+// The accepted_at stamp is written FIRST; only if it commits is the delivered
+// mark applied. If the stamp genuinely fails, we return before marking and the
+// retry re-runs both (Lemmy dedupes the re-POST). The only reachable states are
+// (¬accepted,¬delivered), (accepted,¬delivered), (accepted,delivered) — never
+// the forbidden (¬accepted,delivered).
 func (w *Worker) deliverSuccess(ctx context.Context, delivery *store.OutboundDelivery, activity *store.OutboundActivity, status int) error {
+	if err := w.stampAccepted(ctx, activity); err != nil {
+		return fmt.Errorf("stamp accepted for %s: %w", delivery.ActivityID, err)
+	}
 	_, applied, err := w.deliveries.MarkDelivered(ctx, delivery.ActivityID, delivery.TargetInbox, status, *delivery.ClaimedUntil)
 	if err != nil {
 		return fmt.Errorf("mark delivered %s: %w", delivery.ActivityID, err)
@@ -341,25 +384,29 @@ func (w *Worker) deliverSuccess(ctx context.Context, delivery *store.OutboundDel
 		return nil // a stale claim: another worker already recorded the outcome
 	}
 	metricDelivered.Add(1)
-	w.stampAccepted(ctx, activity)
 	return w.voteCallback(ctx, activity)
 }
 
 // stampAccepted opens the causal gate for this object's children: on a
 // successful Create/Update, the object it federated is now accepted by its
-// community. Best-effort — a delivery for an object with no outbound_objects row
-// (a comment we never persisted, a vote) simply has nothing to stamp.
-func (w *Worker) stampAccepted(ctx context.Context, activity *store.OutboundActivity) {
+// community. A NotFound (no outbound_objects row — a comment we never persisted,
+// a vote) is not a failure and returns nil; a real store error is propagated so
+// deliverSuccess withholds the delivered mark until the stamp can commit.
+func (w *Worker) stampAccepted(ctx context.Context, activity *store.OutboundActivity) error {
 	if activity.Kind != "Create" && activity.Kind != "Update" {
-		return
+		return nil
 	}
 	atURI := objectATURIFromPayload(activity.Payload)
 	if atURI == "" {
-		return
+		return nil
 	}
-	if err := w.objects.SetAccepted(ctx, atURI); err != nil && !errors.IsNotFound(err) {
-		w.logger.Warn("stamp accepted failed", "at_uri", atURI, "error", err)
+	if err := w.objects.SetAccepted(ctx, atURI); err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		return err
 	}
+	return nil
 }
 
 // voteCallback applies decision-16 delivery callbacks: a Like/Dislike success
@@ -420,13 +467,34 @@ func (w *Worker) poison(ctx context.Context, delivery *store.OutboundDelivery, c
 	return nil
 }
 
-// park releases the delivery pending with a short backoff and no move toward
-// the poison cap: a kill switch, dry-run, or causal wait is a "not now", never
-// a failure.
+// parkDelay is how long a kill-switched or dry-run delivery waits before it can
+// be re-claimed: long enough that a parked row does not spin the worker in a hot
+// loop, short enough that clearing the switch resumes delivery promptly.
+const parkDelay = 5 * time.Second
+
+// park holds a kill-switched or dry-run delivery: it stays pending, scheduled a
+// REAL delay into the future so it is not instantly re-claimable, and never
+// poisons. Release does not touch the attempt counter, so a park is not a
+// failure and does not itself advance the poison budget.
 func (w *Worker) park(ctx context.Context, delivery *store.OutboundDelivery, class, reason string) error {
-	_, _, err := w.deliveries.Release(ctx, delivery.ActivityID, delivery.TargetInbox, class, reason, 0, time.Now(), *delivery.ClaimedUntil)
+	next := time.Now().Add(parkDelay)
+	_, _, err := w.deliveries.Release(ctx, delivery.ActivityID, delivery.TargetInbox, class, reason, 0, next, *delivery.ClaimedUntil)
 	if err != nil {
 		return fmt.Errorf("park delivery %s: %w", delivery.ActivityID, err)
+	}
+	metricParked.Add(1)
+	return nil
+}
+
+// parkCausal holds a causally-ineligible delivery WITHOUT a future delay: a held
+// child must become claimable the instant its bridge-origin parent is accepted
+// (in practice the parent, a lower-seq delivery on the same serial line, is
+// delivered first, so this rarely re-fires). Like park it never poisons and does
+// not advance the poison budget; the causal wait is bounded by wall clock.
+func (w *Worker) parkCausal(ctx context.Context, delivery *store.OutboundDelivery, class, reason string) error {
+	_, _, err := w.deliveries.Release(ctx, delivery.ActivityID, delivery.TargetInbox, class, reason, 0, time.Now(), *delivery.ClaimedUntil)
+	if err != nil {
+		return fmt.Errorf("park (causal) delivery %s: %w", delivery.ActivityID, err)
 	}
 	metricParked.Add(1)
 	return nil
@@ -460,18 +528,24 @@ func (w *Worker) causalStatus(ctx context.Context, delivery *store.OutboundDeliv
 	if parent.IsAccepted() {
 		return causalEligible
 	}
-	// Bridge-origin parent, not yet accepted. A poisoned ancestor on the same
-	// serial line means it will NEVER land → poison the descendant distinctly.
-	poisoned, err := w.deliveries.HasPoisonedPredecessor(ctx, delivery.OrderingKey, delivery.TargetInbox, delivery.Seq)
+	// Bridge-origin parent, not yet accepted. Poison ONLY if the child's ACTUAL
+	// parent delivery is poisoned (it will never land) — keyed on parent_at_uri,
+	// not seq-ancestry, so an unrelated poisoned row on the same line does not
+	// poison this child.
+	poisoned, err := w.deliveries.ParentDeliveryPoisoned(ctx, activity.ParentATURI, delivery.TargetInbox)
 	if err != nil {
-		w.logger.Error("poisoned-predecessor check failed", "error", err)
+		w.logger.Error("parent-delivery poisoned check failed", "error", err)
 		return causalWait
 	}
 	if poisoned {
 		return causalPoisonParent
 	}
-	if delivery.Attempts >= w.maxAttempts {
-		return causalPoisonUnaccepted // bounded wait exhausted
+	// Otherwise the parent is merely pending: WAIT, bounded by WALL CLOCK from
+	// the delivery's creation — never by the attempt count, so a parent that
+	// legitimately takes minutes is not poisoned just because the child was
+	// claimed a few times.
+	if time.Since(delivery.CreatedAt) >= w.causalWaitBudget {
+		return causalPoisonUnaccepted
 	}
 	return causalWait
 }
@@ -527,6 +601,8 @@ func isDuplicate(he ap.HTTPError) bool {
 // classForStatus labels a retryable HTTP status for the retry taxonomy.
 func classForStatus(status int) string {
 	switch {
+	case status == http.StatusUnauthorized:
+		return "unauthorized"
 	case status == http.StatusRequestTimeout:
 		return "timeout"
 	case status == http.StatusTooManyRequests:

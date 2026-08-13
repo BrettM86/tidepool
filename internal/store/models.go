@@ -178,8 +178,12 @@ const (
 	DeliveredStatePending DeliveredState = "pending"
 	// DeliveredStateDelivered means a peer accepted the Like/Dislike.
 	DeliveredStateDelivered DeliveredState = "delivered"
-	// DeliveredStateUndone means the Undo was delivered; the row is kept as
-	// the record of what was withdrawn.
+	// DeliveredStateUndone is RESERVED and currently UNWRITTEN: task 15's worker
+	// DELETES the outbound_votes row on a successful Undo (clear-on-Undo) rather
+	// than transitioning it to "undone", so no code path ever sets this today.
+	// It is kept in the enum and the CHECK constraint (the migration is applied)
+	// against a future "keep the withdrawn-vote record" policy; Valid() still
+	// accepts it so a hand-set or legacy row round-trips.
 	DeliveredStateUndone DeliveredState = "undone"
 )
 

@@ -482,7 +482,11 @@ func Load(logger *slog.Logger) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	cfg.OutboundDisabledHosts = parseSet(os.Getenv("OUTBOUND_DISABLED_HOSTS"))
+	// Hosts are lowercased (the worker's scope host comes from hostOf, which
+	// lowercases): a kill switch must fail CLOSED, so a mixed-case entry has to
+	// still block the normalized host. Communities and actors are exact ids and
+	// keep their case.
+	cfg.OutboundDisabledHosts = parseHostSet(os.Getenv("OUTBOUND_DISABLED_HOSTS"))
 	cfg.OutboundDisabledCommunities = parseSet(os.Getenv("OUTBOUND_DISABLED_COMMUNITIES"))
 	cfg.OutboundDisabledActors = parseSet(os.Getenv("OUTBOUND_DISABLED_ACTORS"))
 
@@ -661,6 +665,18 @@ func parseSet(raw string) map[string]struct{} {
 	set := make(map[string]struct{})
 	for _, item := range strings.Split(raw, ",") {
 		if item = strings.TrimSpace(item); item != "" {
+			set[item] = struct{}{}
+		}
+	}
+	return set
+}
+
+// parseHostSet is parseSet with each entry lowercased — for the host kill
+// switch, whose scope host arrives already lowercased.
+func parseHostSet(raw string) map[string]struct{} {
+	set := make(map[string]struct{})
+	for _, item := range strings.Split(raw, ",") {
+		if item = strings.ToLower(strings.TrimSpace(item)); item != "" {
 			set[item] = struct{}{}
 		}
 	}

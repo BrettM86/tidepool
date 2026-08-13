@@ -179,18 +179,27 @@ type outboundMutateRequest struct {
 	Activity  string `json:"activity"`
 	Community string `json:"community"`
 	Actor     string `json:"actor"`
+	All       bool   `json:"all"`
 }
 
-// handleOutboundRedrive resets poisoned deliveries back to pending, optionally
-// scoped to one activity or community.
+// handleOutboundRedrive resets poisoned deliveries back to pending, scoped to
+// one activity or community. An unscoped redrive (no filter) would re-attempt
+// EVERY poisoned delivery at once, so it is refused unless the caller opts in
+// explicitly with {"all":true} — a malformed body is a 400, never a silent
+// fleet-wide redrive.
 func (a *Admin) handleOutboundRedrive(w http.ResponseWriter, r *http.Request) {
 	if a.deliveries == nil {
 		http.Error(w, "outbound delivery is not configured", http.StatusNotImplemented)
 		return
 	}
 	var req outboundMutateRequest
-	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `body must be JSON: {"activity":"..."} | {"community":"..."} | {"all":true}`, http.StatusBadRequest)
+		return
+	}
+	if req.Activity == "" && req.Community == "" && !req.All {
+		http.Error(w, `refusing an unscoped redrive: set {"activity":"..."}, {"community":"..."}, or {"all":true}`, http.StatusBadRequest)
+		return
 	}
 	redriven, err := a.deliveries.RedrivePoisoned(r.Context(), req.Activity, req.Community)
 	if err != nil {

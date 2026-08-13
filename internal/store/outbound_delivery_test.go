@@ -238,6 +238,37 @@ func TestOutboundDeliveries_ClaimNextStampsFencingAndBumpsAttempts(t *testing.T)
 	assert.True(t, errors.IsNotFound(err), "want NotFound (empty queue), got %v", err)
 }
 
+func TestOutboundDeliveries_ExpiredLeaseIsReclaimable(t *testing.T) {
+	database := deliveryTestDB(t)
+	activities := NewOutboundActivities(database)
+	repo := NewOutboundDeliveries(database)
+	ctx := context.Background()
+
+	seedActivity(t, activities, testActivity())
+	_, err := repo.Enqueue(ctx, testDelivery())
+	require.NoError(t, err)
+
+	claimed, err := repo.ClaimNext(ctx, time.Minute)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+
+	// A worker that claimed this delivery then crashed: its lease lapses. The
+	// whole point of a lease is that the delivery becomes re-claimable — a stuck
+	// worker must never strand a delivery forever.
+	_, err = database.ExecContext(ctx,
+		`UPDATE outbound_deliveries SET claimed_until = now() - interval '1 minute' WHERE activity_id = $1`,
+		delActivityID)
+	require.NoError(t, err)
+
+	reclaimed, err := repo.ClaimNext(ctx, time.Minute)
+	require.NoError(t, err, "a delivery whose lease has EXPIRED must be re-claimable")
+	require.NotNil(t, reclaimed)
+	assert.Equal(t, delActivityID, reclaimed.ActivityID)
+	require.NotNil(t, reclaimed.ClaimedUntil)
+	assert.True(t, reclaimed.ClaimedUntil.After(time.Now()),
+		"the re-claim stamps a fresh future lease")
+}
+
 func TestOutboundDeliveries_PerOrderingKeySerialization(t *testing.T) {
 	database := deliveryTestDB(t)
 	activities := NewOutboundActivities(database)

@@ -100,60 +100,6 @@ func TestCausalGating_FediverseParentIsAlwaysEligible(t *testing.T) {
 	assert.Equal(t, store.DeliveryStateDelivered, getDelivery(t, conn, id).State)
 }
 
-func TestCausalGating_BoundedWaitPoisonsParentUnaccepted(t *testing.T) {
-	conn := workerTestDB(t)
-	seedWorkerActor(t, conn, true, false)
-	seedBridgeParent(t, conn, false) // never accepted
-	id := seedDelivery(t, conn, "Create", gParentATURI, createPayload("x"))
-	// The bounded wait is exhausted (attempts at the cap): a comment on a
-	// never-accepted post must not wait forever.
-	setAttempts(t, conn, id, 3) // MaxAttempts is 3
-
-	w := newWorker(t, conn, &fakeSender{}, nil)
-	_, err := w.DeliverNext(context.Background())
-	require.NoError(t, err)
-
-	d := getDelivery(t, conn, id)
-	assert.Equal(t, store.DeliveryStatePoisoned, d.State,
-		"after the bounded wait, an unaccepted parent poisons the child")
-	assert.Contains(t, d.LastErrorClass, "parent_unaccepted",
-		"the poison reason is queryable: parent_unaccepted (distinct from a delivery failure)")
-}
-
-func TestCausalGating_PoisonedParentPoisonsChild(t *testing.T) {
-	conn := workerTestDB(t)
-	seedWorkerActor(t, conn, true, false)
-	seedBridgeParent(t, conn, false)
-
-	// The parent's own delivery is POISONED. A descendant must not wait forever
-	// for a parent that will never land — it poisons with a DISTINCT reason.
-	parentActivityID := "https://coves.social/ap/activity/" + repeatHex64("parent")
-	_, err := store.NewOutboundActivities(conn).Insert(context.Background(), store.OutboundActivity{
-		ActivityID: parentActivityID,
-		ActorDID:   wActorDID,
-		Kind:       "Create",
-		Payload:    createPayload(parentActivityID),
-	})
-	require.NoError(t, err)
-	_, err = store.NewOutboundDeliveries(conn).Enqueue(context.Background(), store.OutboundDelivery{
-		ActivityID:  parentActivityID,
-		TargetInbox: wInbox,
-		OrderingKey: wCommunityAPID,
-	})
-	require.NoError(t, err)
-	_, err = conn.ExecContext(context.Background(),
-		`UPDATE outbound_deliveries SET state='poisoned' WHERE activity_id=$1`, parentActivityID)
-	require.NoError(t, err)
-
-	id := seedDelivery(t, conn, "Create", gParentATURI, createPayload("child"))
-
-	w := newWorker(t, conn, &fakeSender{}, nil)
-	_, err = w.DeliverNext(context.Background())
-	require.NoError(t, err)
-
-	d := getDelivery(t, conn, id)
-	assert.Equal(t, store.DeliveryStatePoisoned, d.State,
-		"a poisoned parent poisons its descendants")
-	assert.Contains(t, d.LastErrorClass, "parent_poisoned",
-		"the reason is parent_poisoned — distinct and queryable from parent_unaccepted")
-}
+// Bounded-wait and poisoned-parent gating moved to causal_hardening_test.go —
+// they are now TIME-bounded (not attempt-bounded, H4b) and keyed on the child's
+// ACTUAL parent (not any lower-seq poison on the line, H6).

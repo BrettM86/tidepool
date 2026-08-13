@@ -29,7 +29,7 @@ import (
 // SignerProvider yields the per-actor AP Signer a delivery is signed with. The
 // worker signs each delivery as the PERSONA that authored the record, not as
 // the service actor — Lemmy attributes the activity to the signing key's owner.
-// personas.Service satisfies this (its actorSigner, exported for task 15).
+// *personas.Service satisfies this via its SignerFor method.
 type SignerProvider interface {
 	// SignerFor returns the Signer whose keyId is "{actorID}#main-key" for the
 	// persona minted under did. A DID with no minted actor is an error

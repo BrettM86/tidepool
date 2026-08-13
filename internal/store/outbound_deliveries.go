@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	stderrors "errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"tidepool/internal/errors"
@@ -76,12 +77,22 @@ func (r *postgresOutboundDeliveries) ClaimNext(ctx context.Context, lease time.D
 	// The heads are found by a recursive CTE emulating a loose index scan over
 	// idx_outbound_deliveries_queue (ordering_key, seq WHERE state='pending'):
 	// one index descent per DISTINCT pending key jumps to each key's head, so
-	// the claim is O(pending keys × log N) regardless of any one community's
-	// backlog depth — never O(backlog) as a per-row NOT EXISTS would be. They
-	// are materialized with ARRAY(...) — not a plain IN or a correlated EXISTS —
-	// so the planner fetches exactly those rows by seq. The outer SELECT
-	// re-applies every claimability predicate on the locked row (a claim
-	// committed between the CTE snapshot and the lock is then seen and skipped).
+	// the claim finds the DISTINCT pending keys' heads without a per-row NOT
+	// EXISTS. The heads are materialized with ARRAY(...) — not a plain IN or a
+	// correlated EXISTS — so the head set is computed ONCE (the loose scan)
+	// rather than re-derived per row. The outer SELECT then locks and re-applies
+	// every claimability predicate on just that head set (a claim committed
+	// between the CTE snapshot and the lock is then seen and skipped).
+	//
+	// NOTE on the outer re-fetch: seq is a BIGSERIAL ordering column, NOT the
+	// primary key (the PK is (activity_id, target_inbox)) and has no standalone
+	// index — so `c.seq = ANY(ARRAY(...))` is a re-check over the small head set,
+	// NOT the indexed point-fetch inbox_events gets (there `id` IS the PK). For a
+	// deep pending backlog the planner can only reach the head rows through the
+	// partial (ordering_key, seq) index, so the re-check is not the strict
+	// O(keys × log N) a seq index would give. A dedicated UNIQUE index on seq
+	// (its own migration, so goose actually applies it) would restore the
+	// point-fetch and is worth adding if this path ever profiles hot.
 	// FOR UPDATE ... SKIP LOCKED lets concurrent workers race without
 	// serializing on row locks; the UPDATE stamps the lease and counts the
 	// attempt atomically.
@@ -264,18 +275,48 @@ func (r *postgresOutboundDeliveries) Get(ctx context.Context, activityID, target
 	return delivery, nil
 }
 
-func (r *postgresOutboundDeliveries) HasPoisonedPredecessor(ctx context.Context, orderingKey, targetInbox string, seq int64) (bool, error) {
+func (r *postgresOutboundDeliveries) ParentDeliveryPoisoned(ctx context.Context, parentATURI, targetInbox string) (bool, error) {
+	// The parent's delivery is the one whose activity federated parentATURI as
+	// its object: the activity payload's object.id is the served object URL,
+	// which ends in "/ap/object/<did>/<collection>/<rkey>" — exactly the
+	// at-uri's three parts. Match on that suffix so we need no origin here (and
+	// DIDs/NSIDs/TIDs carry no LIKE metacharacters).
+	suffix := strings.TrimPrefix(parentATURI, "at://")
 	var exists bool
 	err := r.db.QueryRowContext(ctx, `
 		SELECT EXISTS (
-			SELECT 1 FROM outbound_deliveries
-			WHERE ordering_key = $1 AND target_inbox = $2
-			  AND state = 'poisoned' AND seq < $3)`,
-		orderingKey, targetInbox, seq).Scan(&exists)
+			SELECT 1
+			FROM outbound_deliveries d
+			JOIN outbound_activities a ON a.activity_id = d.activity_id
+			WHERE d.state = 'poisoned'
+			  AND d.target_inbox = $2
+			  AND a.payload -> 'object' ->> 'id' LIKE '%/ap/object/' || $1)`,
+		suffix, targetInbox).Scan(&exists)
 	if err != nil {
-		return false, fmt.Errorf("check poisoned predecessor on %q: %w", orderingKey, err)
+		return false, fmt.Errorf("check parent delivery poisoned for %q: %w", parentATURI, err)
 	}
 	return exists, nil
+}
+
+func (r *postgresOutboundDeliveries) CancelClaimed(ctx context.Context, activityID, targetInbox string, claimToken time.Time) (bool, bool, error) {
+	// Fenced single-row cancel: only the current claim holder cancels, and only
+	// while pending, so a stale worker cannot clobber a re-claim and — unlike
+	// CancelForActor — an actor's OTHER pending deliveries (its retractions) are
+	// left standing.
+	query := `
+		WITH updated AS (
+			UPDATE outbound_deliveries
+			SET state = 'cancelled', claimed_until = NULL, updated_at = now()
+			WHERE activity_id = $1 AND target_inbox = $2
+			  AND state = 'pending'
+			  AND claimed_until = $3
+			RETURNING 1
+		)
+		SELECT
+			EXISTS (SELECT 1 FROM outbound_deliveries WHERE activity_id = $1 AND target_inbox = $2),
+			EXISTS (SELECT 1 FROM updated)`
+
+	return r.markResult(ctx, "cancel claimed", query, activityID, targetInbox, claimToken.UTC())
 }
 
 func (r *postgresOutboundDeliveries) CountsByState(ctx context.Context) (map[DeliveryState]int, error) {

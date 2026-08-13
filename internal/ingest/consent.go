@@ -92,6 +92,26 @@ func (h *Handler) handleDelete(ctx context.Context, del *ap.Object, signer strin
 		return err
 	}
 
+	// MODERATOR REMOVAL, not a delete. Lemmy spells the two with the same
+	// activity and distinguishes them by `summary`: a moderator's removal
+	// carries the key (EMPTY when they gave no reason), an author deleting
+	// their own post omits it entirely. Reading one as the other either
+	// destroys an author's post over a moderator's hidden action or fabricates
+	// a moderation record against someone who moderated nobody, so the
+	// question asked is key PRESENCE (HasSummary), never whether the text is
+	// empty.
+	//
+	// It diverts before the tombstone marker and the delete dispatch below on
+	// purpose: the post is not going anywhere. Laying a marker would suppress
+	// the post's own later Creates and Updates, and deleting the record would
+	// hand one community the power to destroy content in all the others.
+	if announcer != nil && del.HasSummary() {
+		handled, err := h.removePostForModerator(ctx, targetID, del.Summary)
+		if err != nil || handled {
+			return err
+		}
+	}
+
 	// Record the tombstone marker BEFORE deleting: if this is a Delete for
 	// an object we never materialized, the marker is the only thing
 	// stopping a later (re-delivered, out-of-order) Create from
@@ -119,6 +139,29 @@ func (h *Handler) handleDelete(ctx context.Context, del *ap.Object, signer strin
 		return err
 	}
 	return nil
+}
+
+// removePostForModerator applies a moderator removal to a postv2, reporting
+// whether it took the activity. It declines — leaving the caller on the
+// ordinary delete path — for everything the postv2 moderation records do not
+// describe: an id the bridge never materialized, a mapping already tombstoned,
+// and above all the PRE-FLIP era, whose posts live in the community's own repo
+// with no acceptance to replace. Writing a removal for a legacy post would
+// announce a visibility mechanism Coves does not consult for that collection,
+// so those keep the v1 behaviour exactly: delete the record, tombstone the
+// mapping.
+func (h *Handler) removePostForModerator(ctx context.Context, targetID, reason string) (bool, error) {
+	mapping, err := h.objects.GetByAPID(ctx, targetID)
+	if errors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("ingest: look up mapping for removal of %s: %w", targetID, err)
+	}
+	if mapping.IsDeleted() || mapping.Collection != materialize.CollectionPostV2 {
+		return false, nil
+	}
+	return true, h.mat.RemovePost(ctx, mapping, reason)
 }
 
 // announcerGroupID is the announcing community's AP group id, or "" for a
@@ -286,6 +329,20 @@ func (h *Handler) handleUndoDelete(ctx context.Context, undo, del *ap.Object, si
 		h.logger.Info("restore re-materialization failed; rolled back to deleted state",
 			"ap_id", targetID, "reason", err)
 		return err
+	}
+	// Undo of a moderator REMOVAL. That removal deleted no record and
+	// tombstoned no mapping, so everything above was a no-op for it: the
+	// re-materialization put the post back exactly as it already was, and its
+	// acceptance write was refused by the terminality guard because the
+	// removal still stands. Lifting it is a separate transition — delete the
+	// removal, re-accept the CURRENT version, one commit — and it runs AFTER
+	// the re-materialization so the version it pins is the one now in the
+	// repo. RestorePost is a no-op when no removal stands, which is every
+	// ordinary restore.
+	if mapping.Collection == materialize.CollectionPostV2 {
+		if err := h.mat.RestorePost(ctx, mapping); err != nil {
+			return err
+		}
 	}
 	return nil
 }

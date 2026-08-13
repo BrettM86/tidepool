@@ -101,7 +101,7 @@ func TestDeleteActor_AccountEventVoteAndBlobScrub(t *testing.T) {
 		}
 	}
 	assert.Equal(t, 1, accountEvents, "exactly one account event for one Delete(Actor)")
-	assert.Equal(t, 2, deleteOps, "scrub deletes: the post and the actor profile")
+	assert.Equal(t, 3, deleteOps, "scrub deletes: the acceptance, the post and the actor profile")
 }
 
 // TestSuppressActor_ScrubsVotesToo: the reversible nobridge scrub erases

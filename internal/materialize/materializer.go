@@ -68,7 +68,11 @@ const (
 	// at-uri (SubjectRKey), and it is what makes a postv2 visible in the
 	// community at all.
 	CollectionAcceptance = "social.coves.community.acceptance"
-	CollectionComment    = "social.coves.community.comment"
+	// CollectionRemoval is the community's record that a post was removed
+	// from it. It shares the acceptance's digest rkey (one derivation per
+	// subject) and replaces the acceptance in one atomic commit.
+	CollectionRemoval = "social.coves.community.removal"
+	CollectionComment = "social.coves.community.comment"
 )
 
 // ProfileRKey is the fixed record key of actor and community profiles.

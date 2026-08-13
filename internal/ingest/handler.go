@@ -23,6 +23,12 @@ type Materializer interface {
 	// latter — see materialize.HandleDeleteRecord for the TOCTOU it closes.
 	HandleDelete(ctx context.Context, apID string) error
 	HandleDeleteRecord(ctx context.Context, apID string) error
+	// RemovePost/RestorePost are the community-scoped moderation transitions:
+	// they rewrite the community's acceptance and removal records and leave
+	// the author's post where it is. Deleting content is a different verb, so
+	// these are not reachable through the delete entry points above.
+	RemovePost(ctx context.Context, mapping *store.APObjectMapping, reason string) error
+	RestorePost(ctx context.Context, mapping *store.APObjectMapping) error
 	RefreshActor(ctx context.Context, actorRef *ap.Object) (*store.BridgedActor, error)
 	RefreshCommunity(ctx context.Context, groupRef *ap.Object) (*store.Community, error)
 	EnsureCommunity(ctx context.Context, groupRef *ap.Object) (*store.Community, error)

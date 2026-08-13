@@ -72,6 +72,16 @@ func (s *stubMaterializer) EnsureCommunity(context.Context, *ap.Object) (*store.
 	return nil, nil
 }
 
+func (s *stubMaterializer) RemovePost(context.Context, *store.APObjectMapping, string) error {
+	s.t.Fatal("votes must never reach RemovePost")
+	return nil
+}
+
+func (s *stubMaterializer) RestorePost(context.Context, *store.APObjectMapping) error {
+	s.t.Fatal("votes must never reach RestorePost")
+	return nil
+}
+
 // stubFetcher fails loudly on any fetch: inline vote activities must be
 // dispatched without touching the network.
 type stubFetcher struct{ t *testing.T }

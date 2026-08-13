@@ -276,6 +276,19 @@ func (m *Materializer) deleteMapping(ctx context.Context, mapping *store.APObjec
 	if mapping.IsDeleted() {
 		return nil
 	}
+	// A postv2's acceptance is the community's attestation ABOUT this record,
+	// so it goes with it — and it goes FIRST. A crash after the acceptance is
+	// deleted leaves a post that is merely invisible in the community; the
+	// reverse order leaves the community attesting to a record that no longer
+	// exists, which is the state a consumer cannot make sense of. Every scrub
+	// path (consent revocation, Delete{Actor}, the delete sweep) inherits this
+	// by coming through here. No REMOVAL is written: an author deleting their
+	// own post, or a scrub, is not a moderation action.
+	if mapping.Collection == CollectionPostV2 {
+		if err := m.deleteAcceptance(ctx, mapping); err != nil {
+			return err
+		}
+	}
 	if _, err := m.repos.DeleteRecord(ctx, mapping.DID, mapping.Collection, mapping.RKey); err != nil && !errors.IsNotFound(err) {
 		return fmt.Errorf("materialize: delete record %s: %w", mapping.ATURI, err)
 	}

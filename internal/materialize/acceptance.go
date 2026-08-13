@@ -8,6 +8,7 @@ import (
 
 	"tidepool/internal/errors"
 	"tidepool/internal/repo"
+	"tidepool/internal/store"
 )
 
 // acceptPost writes the community's acceptance of one post: the attestation
@@ -39,6 +40,24 @@ import (
 // once, and re-pinning the version it accepts is not a new acceptance.
 func (m *Materializer) acceptPost(ctx context.Context, communityDID, postURI, postCID string, publishedAt time.Time) error {
 	rkey := SubjectRKey(postURI)
+
+	// TERMINALITY. A removal is exited only by an explicit restore, and a
+	// fresh acceptance IS a restore — so writing one here would un-remove the
+	// post. This path is reached by every redelivery and every backfill pass,
+	// neither of which is anybody's decision to reinstate content, so a
+	// standing removal wins and the acceptance is simply not written. The
+	// restore path does not come through here: it deletes the removal and
+	// writes the acceptance in ONE commit (RestorePost), so it never has to
+	// argue with this guard.
+	removed, err := m.removalStands(ctx, communityDID, rkey)
+	if err != nil {
+		return err
+	}
+	if removed {
+		m.logger.Debug("post is removed from the community; not re-accepting",
+			"community_did", communityDID, "post", postURI)
+		return nil
+	}
 
 	// Read-modify-write under a CAS precondition, bounded like the stats
 	// stamp: the read happens outside the commit serialization, so a racing
@@ -93,4 +112,198 @@ func (m *Materializer) acceptPost(ctx context.Context, communityDID, postURI, po
 		}
 		return nil
 	}
+}
+
+// removalStands reports whether the community currently holds a removal for
+// the subject at rkey. Acceptance and removal share the digest key, so this is
+// a lookup rather than a search.
+func (m *Materializer) removalStands(ctx context.Context, communityDID, rkey string) (bool, error) {
+	_, _, err := m.repos.GetRecord(ctx, communityDID, CollectionRemoval, rkey)
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.IsNotFound(err):
+		return false, nil
+	default:
+		return false, fmt.Errorf("materialize: read removal %s/%s/%s: %w",
+			communityDID, CollectionRemoval, rkey, err)
+	}
+}
+
+// RemovePost records a community's moderator removal of a post: the acceptance
+// is deleted and a removal written IN ONE COMMIT, at the same digest rkey.
+//
+// Atomicity is the requirement, not an optimization. Two commits would put a
+// window on the firehose where the acceptance is gone and the removal is not
+// yet there, and a consumer reading that window sees a post that is neither
+// accepted nor removed — a state nobody decided on.
+//
+// The AUTHOR'S POST IS NOT TOUCHED, and neither is its mapping. A community
+// removing a post says where the post may appear, not whether it exists;
+// deleting the author's record would let one community destroy content for
+// every other, and tombstoning the mapping would block the post's later edits
+// and votes from ever materializing again.
+func (m *Materializer) RemovePost(ctx context.Context, mapping *store.APObjectMapping, reason string) error {
+	communityDID, postURI, rkey, err := m.moderationTarget(ctx, mapping)
+	if err != nil {
+		return err
+	}
+
+	// The removal pins the version that was accepted when it was removed —
+	// audit metadata, per the lexicon, since removal itself applies to the URI
+	// across later edits. Read BEFORE the delete, or the pin is gone with it.
+	// A missing acceptance (a crash-window heal, or a removal arriving before
+	// the acceptance ever landed) falls back to the mapping's CID: the removal
+	// is terminal on the URI either way, so an approximate pin is better than
+	// refusing to record the moderator's decision.
+	pinned := mapping.CID
+	if acceptance, _, aerr := m.repos.GetRecord(ctx, communityDID, CollectionAcceptance, rkey); aerr == nil {
+		if ref, ok := extractStrongRef(acceptance, "subject"); ok {
+			pinned, _ = ref["cid"].(string)
+		}
+	} else if !errors.IsNotFound(aerr) {
+		return fmt.Errorf("materialize: read acceptance %s/%s/%s: %w",
+			communityDID, CollectionAcceptance, rkey, aerr)
+	}
+
+	removal := map[string]any{
+		"$type":   CollectionRemoval,
+		"subject": strongRef(postURI, pinned),
+		// Lemmy sends no machine-readable code, so the open knownValues set's
+		// catch-all applies. Inventing a narrower code (spam, rule-violation)
+		// would be the bridge asserting a reason the moderator never gave.
+		"code":      "moderator-discretion",
+		"createdAt": recordDatetime(m.moderationTime(mapping)),
+	}
+	// Omitted rather than written blank: Lemmy spells "no reason given" as an
+	// empty summary, and an empty reason renders in a moderation log as a
+	// blank explanation instead of as none.
+	if reason != "" {
+		removal["reason"] = reason
+	}
+	if err := m.validateRecord(removal); err != nil {
+		return err
+	}
+
+	if _, err := m.repos.ApplyOps(ctx, communityDID, []repo.RecordOp{
+		{Action: repo.OpActionDelete, Collection: CollectionAcceptance, RKey: rkey},
+		{Action: repo.OpActionUpdate, Collection: CollectionRemoval, RKey: rkey, Record: removal},
+	}); err != nil {
+		return fmt.Errorf("materialize: remove %s from %s: %w", postURI, communityDID, err)
+	}
+	m.logger.Info("post removed from community by moderator",
+		"community_did", communityDID, "post", postURI, "ap_id", mapping.APID)
+	return nil
+}
+
+// RestorePost undoes a moderator removal: the removal is deleted and a fresh
+// acceptance written IN ONE COMMIT, for the same reason the removal was
+// atomic. It is a no-op when no removal stands, so a restore that arrives
+// twice — or one for a post that was never removed — costs a read.
+//
+// The fresh acceptance pins the post's CURRENT version, not the one that was
+// removed: the author may have edited it while it was out of the community,
+// and re-accepting a version that is no longer there would leave the post
+// pending re-acceptance the moment it came back.
+func (m *Materializer) RestorePost(ctx context.Context, mapping *store.APObjectMapping) error {
+	communityDID, postURI, rkey, err := m.moderationTarget(ctx, mapping)
+	if err != nil {
+		return err
+	}
+	removed, err := m.removalStands(ctx, communityDID, rkey)
+	if err != nil {
+		return err
+	}
+	if !removed {
+		return nil
+	}
+
+	_, currentCID, err := m.repos.GetRecord(ctx, mapping.DID, mapping.Collection, mapping.RKey)
+	if err != nil {
+		// No post to re-accept. The removal stays: it is terminal on the URI,
+		// and an acceptance pinning nothing would be worse than none.
+		if errors.IsNotFound(err) {
+			m.logger.Warn("restore target has no record to re-accept; leaving the removal in place",
+				"ap_id", mapping.APID, "at_uri", mapping.ATURI)
+			return nil
+		}
+		return fmt.Errorf("materialize: read %s for restore: %w", mapping.ATURI, err)
+	}
+
+	acceptance := map[string]any{
+		"$type":     CollectionAcceptance,
+		"subject":   strongRef(postURI, currentCID),
+		"createdAt": recordDatetime(m.moderationTime(mapping)),
+	}
+	if err := m.validateRecord(acceptance); err != nil {
+		return err
+	}
+
+	if _, err := m.repos.ApplyOps(ctx, communityDID, []repo.RecordOp{
+		{Action: repo.OpActionDelete, Collection: CollectionRemoval, RKey: rkey},
+		{Action: repo.OpActionUpdate, Collection: CollectionAcceptance, RKey: rkey, Record: acceptance},
+	}); err != nil {
+		return fmt.Errorf("materialize: restore %s into %s: %w", postURI, communityDID, err)
+	}
+	m.logger.Info("post restored to community by moderator",
+		"community_did", communityDID, "post", postURI, "ap_id", mapping.APID)
+	return nil
+}
+
+// moderationTarget resolves the community, subject uri and digest rkey a
+// moderation transition acts on, refusing anything that is not a postv2.
+// Moderation records are postv2-only: a pre-flip post has no acceptance to
+// replace, and writing a removal for one would announce a visibility
+// mechanism Coves does not consult for that collection.
+func (m *Materializer) moderationTarget(ctx context.Context, mapping *store.APObjectMapping) (communityDID, postURI, rkey string, err error) {
+	if mapping == nil {
+		return "", "", "", errors.NewValidationError("mapping", "must not be nil")
+	}
+	if mapping.Collection != CollectionPostV2 {
+		return "", "", "", errors.NewValidationError("mapping",
+			"moderation records are only written for "+CollectionPostV2+", got "+mapping.Collection)
+	}
+	communityDID, err = CommunityDIDOf(ctx, m.repos, mapping)
+	if err != nil {
+		return "", "", "", err
+	}
+	if communityDID == "" {
+		return "", "", "", errors.NewValidationError("mapping",
+			"cannot moderate "+mapping.ATURI+": it binds to no community")
+	}
+	return communityDID, mapping.ATURI, SubjectRKey(mapping.ATURI), nil
+}
+
+// moderationTime is the timestamp a moderation record carries. It is derived
+// from the post, exactly as acceptPost's createdAt is, so a redelivered
+// moderation activity rebuilds byte-identical bytes and reaches the repo
+// layer's no-op path instead of churning the community repo on every retry.
+func (m *Materializer) moderationTime(mapping *store.APObjectMapping) time.Time {
+	if mapping.PublishedAt != nil {
+		return *mapping.PublishedAt
+	}
+	// Unreachable for a postv2 (no published time means no deterministic rkey,
+	// so the post never materialized), but a wall-clock fallback keeps the
+	// record writable rather than dropping a moderator's decision.
+	return m.now()
+}
+
+// deleteAcceptance removes a post's acceptance from its community. Called
+// before the post record itself goes: a crash in between then leaves a post
+// that is merely invisible, where the reverse order would leave the community
+// attesting to a record that no longer exists.
+func (m *Materializer) deleteAcceptance(ctx context.Context, mapping *store.APObjectMapping) error {
+	communityDID, err := CommunityDIDOf(ctx, m.repos, mapping)
+	if err != nil {
+		return err
+	}
+	if communityDID == "" {
+		return nil
+	}
+	rkey := SubjectRKey(mapping.ATURI)
+	if _, err := m.repos.DeleteRecord(ctx, communityDID, CollectionAcceptance, rkey); err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("materialize: delete acceptance %s/%s/%s: %w",
+			communityDID, CollectionAcceptance, rkey, err)
+	}
+	return nil
 }

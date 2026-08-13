@@ -126,6 +126,25 @@ type Config struct {
 	// nowhere to dial would come up "healthy" and consume nothing, which is
 	// the failure mode cursors and lag metrics exist to make impossible.
 	JetstreamURL string
+	// OutboundWorkers is how many delivery workers to run (OUTBOUND_WORKERS,
+	// default 0 = OFF). Delivery starts ONLY when this is >0 AND
+	// ConsumerEnabled: until a deployment is wired end to end, the consumer
+	// still records outbound state but the noop enqueuer federates nothing.
+	OutboundWorkers int
+	// OutboundDryRun makes workers translate + log but POST nothing, leaving
+	// deliveries pending (OUTBOUND_DRY_RUN, default false).
+	OutboundDryRun bool
+	// OutboundDisabled is the global kill switch: every delivery is PARKED
+	// (stays pending, resumes when cleared), nothing federates
+	// (OUTBOUND_DISABLED, default false).
+	OutboundDisabled bool
+	// OutboundDisabledHosts / Communities / Actors are the scoped kill
+	// switches: any delivery whose inbox host, community AP id, or actor DID is
+	// in the set is parked (comma-separated OUTBOUND_DISABLED_HOSTS /
+	// OUTBOUND_DISABLED_COMMUNITIES / OUTBOUND_DISABLED_ACTORS). Empty = allow.
+	OutboundDisabledHosts       map[string]struct{}
+	OutboundDisabledCommunities map[string]struct{}
+	OutboundDisabledActors      map[string]struct{}
 	// AdminToken is the bearer token protecting the /admin API (community
 	// subscribe/unsubscribe/backfill). ADMIN_TOKEN; required in production,
 	// dev default is a fixed, publicly known value.
@@ -448,6 +467,25 @@ func Load(logger *slog.Logger) (*Config, error) {
 		return nil, fmt.Errorf("config: JETSTREAM_URL is required when CONSUMER_ENABLED is set")
 	}
 
+	// Outbound delivery (task 15), default OFF: workers start only when
+	// OUTBOUND_WORKERS>0 AND the consumer is on, so a not-yet-wired deployment
+	// keeps the noop enqueuer and federates nothing.
+	cfg.OutboundWorkers, err = intVarNonNegative(logger, "OUTBOUND_WORKERS", 0)
+	if err != nil {
+		return nil, err
+	}
+	cfg.OutboundDryRun, err = boolVarDefault(logger, "OUTBOUND_DRY_RUN", false)
+	if err != nil {
+		return nil, err
+	}
+	cfg.OutboundDisabled, err = boolVarDefault(logger, "OUTBOUND_DISABLED", false)
+	if err != nil {
+		return nil, err
+	}
+	cfg.OutboundDisabledHosts = parseSet(os.Getenv("OUTBOUND_DISABLED_HOSTS"))
+	cfg.OutboundDisabledCommunities = parseSet(os.Getenv("OUTBOUND_DISABLED_COMMUNITIES"))
+	cfg.OutboundDisabledActors = parseSet(os.Getenv("OUTBOUND_DISABLED_ACTORS"))
+
 	// Retention knobs for the task-11 pruners: same semantics as
 	// FIREHOSE_RETENTION (real defaults everywhere, must be positive).
 	cfg.TombstoneRetention, err = durationVar(logger, "TOMBSTONE_RETENTION", 720*time.Hour)
@@ -598,6 +636,35 @@ func intVar(logger *slog.Logger, name string, fallback int) (int, error) {
 		return 0, fmt.Errorf("config: %s must be a positive integer, got %q", name, raw)
 	}
 	return parsed, nil
+}
+
+// intVarNonNegative is intVar for a knob whose OFF value is 0: it accepts 0 (and
+// any positive int), unlike intVar which treats 0 as invalid. Used for
+// OUTBOUND_WORKERS, where 0 means "no delivery workers".
+func intVarNonNegative(logger *slog.Logger, name string, fallback int) (int, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		logger.Info(name+" not set, using default", "value", fallback)
+		return fallback, nil
+	}
+	parsed, err := strconv.Atoi(raw)
+	if err != nil || parsed < 0 {
+		return 0, fmt.Errorf("config: %s must be a non-negative integer, got %q", name, raw)
+	}
+	return parsed, nil
+}
+
+// parseSet splits a comma-separated environment value into a set, dropping
+// blanks. An empty or unset value yields an empty (but non-nil) set, which every
+// membership test reads as "nothing disabled".
+func parseSet(raw string) map[string]struct{} {
+	set := make(map[string]struct{})
+	for _, item := range strings.Split(raw, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			set[item] = struct{}{}
+		}
+	}
+	return set
 }
 
 // boolVar reports whether an environment variable is set to a truthy value

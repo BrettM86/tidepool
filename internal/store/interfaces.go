@@ -547,4 +547,15 @@ type OutboundDeliveries interface {
 	// (parent_unaccepted). Per-community serialization makes a lower-seq
 	// delivery on the same line a causal ancestor.
 	HasPoisonedPredecessor(ctx context.Context, orderingKey, targetInbox string, seq int64) (bool, error)
+
+	// CountsByState returns the number of deliveries in each state — the
+	// operator queue-inspect (GET /admin/outbound).
+	CountsByState(ctx context.Context) (map[DeliveryState]int, error)
+
+	// RedrivePoisoned resets poisoned deliveries back to pending for
+	// redelivery, clearing the lease and rescheduling now. activityID and
+	// orderingKey are optional filters (empty = no filter on that column); the
+	// attempt counter is reset so a redriven delivery gets a fresh budget.
+	// Returns how many rows were redriven.
+	RedrivePoisoned(ctx context.Context, activityID, orderingKey string) (int64, error)
 }

@@ -244,9 +244,11 @@ func (w *Worker) handle(ctx context.Context, delivery *store.OutboundDelivery) e
 			return err
 		}
 		if blocked {
-			if _, err := w.deliveries.CancelForActor(ctx, activity.ActorDID); err != nil {
+			cancelled, err := w.deliveries.CancelForActor(ctx, activity.ActorDID)
+			if err != nil {
 				return fmt.Errorf("cancel deliveries for %s: %w", activity.ActorDID, err)
 			}
+			metricCancelled.Add(cancelled)
 			return nil
 		}
 	}
@@ -338,6 +340,7 @@ func (w *Worker) deliverSuccess(ctx context.Context, delivery *store.OutboundDel
 	if !applied {
 		return nil // a stale claim: another worker already recorded the outcome
 	}
+	metricDelivered.Add(1)
 	w.stampAccepted(ctx, activity)
 	return w.voteCallback(ctx, activity)
 }
@@ -413,6 +416,7 @@ func (w *Worker) poison(ctx context.Context, delivery *store.OutboundDelivery, c
 	if err != nil {
 		return fmt.Errorf("poison delivery %s: %w", delivery.ActivityID, err)
 	}
+	metricPoisoned.Add(1)
 	return nil
 }
 
@@ -424,6 +428,7 @@ func (w *Worker) park(ctx context.Context, delivery *store.OutboundDelivery, cla
 	if err != nil {
 		return fmt.Errorf("park delivery %s: %w", delivery.ActivityID, err)
 	}
+	metricParked.Add(1)
 	return nil
 }
 

@@ -51,7 +51,12 @@ type AdminOptions struct {
 	// Sweeper serves POST /admin/objects/sweep-deleted (optional; the
 	// endpoint answers 501 when nil). See sweep.go.
 	Sweeper DeleteSweeper
-	Logger  *slog.Logger
+	// Deliveries serves the task-15 outbound queue endpoints (optional; those
+	// endpoints answer 501 when nil): GET /admin/outbound inspects the queue,
+	// POST /admin/outbound/redrive resets poisoned rows, POST
+	// /admin/outbound/cancel parks an actor's or community's pending work.
+	Deliveries store.OutboundDeliveries
+	Logger     *slog.Logger
 }
 
 // Admin is the operator API driving the community subscription lifecycle,
@@ -76,6 +81,7 @@ type Admin struct {
 	backfill    Backfiller
 	repos       RepoReemitter
 	sweeper     DeleteSweeper
+	deliveries  store.OutboundDeliveries
 	logger      *slog.Logger
 	// reconciler serves POST /admin/communities/reconcile; nil (the
 	// endpoint answers 501) unless a follow list is configured. Set once
@@ -118,6 +124,7 @@ func NewAdmin(opts AdminOptions) (*Admin, error) {
 		backfill:    opts.Backfill,
 		repos:       opts.Repos,
 		sweeper:     opts.Sweeper,
+		deliveries:  opts.Deliveries,
 		logger:      logger,
 	}, nil
 }
@@ -138,8 +145,93 @@ func (a *Admin) Routes(r chi.Router) {
 		r.Post("/communities/reconcile", a.handleReconcile)
 		r.Post("/reemit", a.handleReemit)
 		r.Post("/objects/sweep-deleted", a.handleSweepDeleted)
+		r.Get("/outbound", a.handleOutboundInspect)
+		r.Post("/outbound/redrive", a.handleOutboundRedrive)
+		r.Post("/outbound/cancel", a.handleOutboundCancel)
 		r.Method(http.MethodGet, "/metrics", http.HandlerFunc(scopedMetrics))
 	})
+}
+
+// handleOutboundInspect reports the delivery queue depth by state — the
+// operator's window on pending/poisoned/cancelled backlog (task 15).
+func (a *Admin) handleOutboundInspect(w http.ResponseWriter, r *http.Request) {
+	if a.deliveries == nil {
+		http.Error(w, "outbound delivery is not configured", http.StatusNotImplemented)
+		return
+	}
+	counts, err := a.deliveries.CountsByState(r.Context())
+	if err != nil {
+		a.logger.Error("outbound inspect failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	byState := map[string]int{}
+	for state, n := range counts {
+		byState[string(state)] = n
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(map[string]any{"by_state": byState})
+}
+
+// outboundMutateRequest is the shared body for redrive/cancel: any subset of
+// the optional filters.
+type outboundMutateRequest struct {
+	Activity  string `json:"activity"`
+	Community string `json:"community"`
+	Actor     string `json:"actor"`
+}
+
+// handleOutboundRedrive resets poisoned deliveries back to pending, optionally
+// scoped to one activity or community.
+func (a *Admin) handleOutboundRedrive(w http.ResponseWriter, r *http.Request) {
+	if a.deliveries == nil {
+		http.Error(w, "outbound delivery is not configured", http.StatusNotImplemented)
+		return
+	}
+	var req outboundMutateRequest
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+	redriven, err := a.deliveries.RedrivePoisoned(r.Context(), req.Activity, req.Community)
+	if err != nil {
+		a.logger.Error("outbound redrive failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(map[string]any{"redriven": redriven})
+}
+
+// handleOutboundCancel parks an actor's or a community's PENDING deliveries as
+// cancelled (consent withdrawal / community removal). Exactly one of actor or
+// community must be given.
+func (a *Admin) handleOutboundCancel(w http.ResponseWriter, r *http.Request) {
+	if a.deliveries == nil {
+		http.Error(w, "outbound delivery is not configured", http.StatusNotImplemented)
+		return
+	}
+	var req outboundMutateRequest
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+	if (req.Actor == "") == (req.Community == "") {
+		http.Error(w, `body must set exactly one of {"actor":"did:..."} or {"community":"https://..."}`, http.StatusBadRequest)
+		return
+	}
+	var cancelled int64
+	var err error
+	if req.Actor != "" {
+		cancelled, err = a.deliveries.CancelForActor(r.Context(), req.Actor)
+	} else {
+		cancelled, err = a.deliveries.CancelForCommunity(r.Context(), req.Community)
+	}
+	if err != nil {
+		a.logger.Error("outbound cancel failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(map[string]any{"cancelled": cancelled})
 }
 
 // scopedMetrics writes the JSON expvar map filtered to tidepool's own

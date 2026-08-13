@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -26,6 +27,7 @@ import (
 	"tidepool/internal/identity"
 	"tidepool/internal/ingest"
 	"tidepool/internal/materialize"
+	"tidepool/internal/outbound"
 	"tidepool/internal/personas"
 	"tidepool/internal/prune"
 	"tidepool/internal/repo"
@@ -39,6 +41,13 @@ const (
 	writeTimeout      = 30 * time.Second
 	idleTimeout       = 2 * time.Minute
 	shutdownTimeout   = 15 * time.Second
+
+	// outboundInboxTTL memoizes a community's resolved delivery inbox; a
+	// rotation is caught by the worker's cache-bypassing re-resolve on a 4xx.
+	outboundInboxTTL = time.Hour
+	// outboundWorkerIdle is how long a delivery worker sleeps when the queue is
+	// empty before polling ClaimNext again.
+	outboundWorkerIdle = time.Second
 )
 
 func main() {
@@ -410,6 +419,7 @@ func run(logger *slog.Logger) error {
 		Backfill:     backfill,
 		Repos:        repoManager,
 		Sweeper:      handler,
+		Deliveries:   store.NewOutboundDeliveries(database),
 		Logger:       logger,
 	})
 	if err != nil {
@@ -470,7 +480,7 @@ func run(logger *slog.Logger) error {
 	// wired end to end must not start accumulating it.
 	var consumerDone <-chan struct{}
 	if cfg.ConsumerEnabled {
-		consumerDone, err = startConsumer(ctx, cfg, database, repoManager, personasService, logger)
+		consumerDone, err = startConsumer(ctx, cfg, database, repoManager, personasService, apClient, personasService, logger)
 		if err != nil {
 			return err
 		}
@@ -587,6 +597,8 @@ func startConsumer(
 	database *sql.DB,
 	repoManager *repo.Manager,
 	minter consume.ActorMinter,
+	apClient *ap.Client,
+	signers outbound.SignerProvider,
 	logger *slog.Logger,
 ) (<-chan struct{}, error) {
 	// The most SSRF-exposed egress in the bridge: the well-known host comes
@@ -605,11 +617,54 @@ func startConsumer(
 		return nil, fmt.Errorf("consumer: handle resolver: %w", err)
 	}
 
+	// The outbound delivery pipe (task 15). The noop enqueuer is the default —
+	// the consumer still writes durable outbound state, but nothing federates
+	// — and it is swapped for the real enqueuer ONLY when OUTBOUND_WORKERS>0.
+	// This is the gate that keeps a not-yet-wired deployment (and the e2e,
+	// which runs with workers=0) from sending anything.
+	inboxes := outbound.NewInboxResolver(apClient, outboundInboxTTL)
+	var enqueuer consume.OutboundEnqueuer = consume.NewNoopEnqueuer(logger)
+	var worker *outbound.Worker
+	if cfg.OutboundWorkers > 0 {
+		realEnqueuer, err := outbound.NewEnqueuer(outbound.EnqueuerOptions{
+			DB:         database,
+			Translator: outbound.NewTranslator(cfg.APUserOrigin),
+			Inboxes:    inboxes,
+			Actors:     store.NewAPActors(database),
+			UserOrigin: cfg.APUserOrigin,
+			Logger:     logger,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("consumer: outbound enqueuer: %w", err)
+		}
+		enqueuer = realEnqueuer
+
+		worker, err = outbound.NewWorker(outbound.WorkerOptions{
+			DB:      database,
+			Actors:  store.NewAPActors(database),
+			Prefs:   store.NewFederationPrefs(database),
+			Signers: signers,
+			Inboxes: inboxes,
+			Sender:  apClient,
+			Switches: outbound.ConfigSwitches{
+				Disabled:            cfg.OutboundDisabled,
+				Dry:                 cfg.OutboundDryRun,
+				DisabledHosts:       cfg.OutboundDisabledHosts,
+				DisabledCommunities: cfg.OutboundDisabledCommunities,
+				DisabledActors:      cfg.OutboundDisabledActors,
+			},
+			Logger: logger,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("consumer: outbound worker: %w", err)
+		}
+	}
+
 	dispatcher, err := consume.NewDispatcher(consume.Options{
 		DB:       database,
 		Actors:   minter,
 		Resolver: resolver,
-		Enqueuer: consume.NewNoopEnqueuer(logger),
+		Enqueuer: enqueuer,
 		// Reads committed records so a subject's community resolves for
 		// mappings written before migration 016 filled community_did.
 		Records:    repoManager,
@@ -645,12 +700,35 @@ func startConsumer(
 	// events quietly stop arriving.
 	consume.PublishMetrics(context.Background(), connector, state)
 
-	done := make(chan struct{})
+	// The connector loop and every delivery worker share one WaitGroup, so the
+	// returned done channel closes only after ALL of them have drained on ctx
+	// cancellation — shutdown joins delivery the same way it joins the consumer.
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
-		defer close(done)
+		defer wg.Done()
 		if err := connector.Start(ctx); err != nil {
 			logger.Error("jetstream consumer stopped", "error", err)
 		}
+	}()
+	if worker != nil {
+		for i := 0; i < cfg.OutboundWorkers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := worker.Run(ctx, outboundWorkerIdle); err != nil && !errors.Is(err, context.Canceled) {
+					logger.Error("outbound worker stopped", "error", err)
+				}
+			}()
+		}
+		logger.Info("outbound delivery workers started",
+			"count", cfg.OutboundWorkers, "dry_run", cfg.OutboundDryRun, "global_disabled", cfg.OutboundDisabled)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
 	}()
 	logger.Info("jetstream consumer started", "url", subscribeURL)
 	return done, nil

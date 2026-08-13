@@ -278,6 +278,52 @@ func (r *postgresOutboundDeliveries) HasPoisonedPredecessor(ctx context.Context,
 	return exists, nil
 }
 
+func (r *postgresOutboundDeliveries) CountsByState(ctx context.Context) (map[DeliveryState]int, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT state, COUNT(*) FROM outbound_deliveries GROUP BY state`)
+	if err != nil {
+		return nil, fmt.Errorf("count outbound_deliveries by state: %w", err)
+	}
+	defer rows.Close()
+
+	counts := make(map[DeliveryState]int)
+	for rows.Next() {
+		var state string
+		var n int
+		if err := rows.Scan(&state, &n); err != nil {
+			return nil, fmt.Errorf("scan delivery state count: %w", err)
+		}
+		counts[DeliveryState(state)] = n
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate delivery state counts: %w", err)
+	}
+	return counts, nil
+}
+
+func (r *postgresOutboundDeliveries) RedrivePoisoned(ctx context.Context, activityID, orderingKey string) (int64, error) {
+	// Empty filters pass through the NULLIF/COALESCE guard: a blank $2/$3 means
+	// "any row", so the sweep can target one activity, one community, or all
+	// poisoned deliveries. Reset attempts + next_attempt_at so a redriven
+	// delivery gets a fresh budget and is immediately claimable.
+	result, err := r.db.ExecContext(ctx, `
+		UPDATE outbound_deliveries
+		SET state = 'pending', attempts = 0, claimed_until = NULL, next_attempt_at = now(),
+		    updated_at = now()
+		WHERE state = 'poisoned'
+		  AND ($1 = '' OR activity_id = $1)
+		  AND ($2 = '' OR ordering_key = $2)`,
+		activityID, orderingKey)
+	if err != nil {
+		return 0, fmt.Errorf("redrive poisoned deliveries: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("redrive poisoned deliveries: rows affected: %w", err)
+	}
+	return affected, nil
+}
+
 func scanOutboundDelivery(row rowScanner) (*OutboundDelivery, error) {
 	var delivery OutboundDelivery
 	var state string

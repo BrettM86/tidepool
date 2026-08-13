@@ -23,6 +23,9 @@ func clearConfigEnv(t *testing.T) {
 		"ALLOW_PRIVATE_FETCH", "ALLOW_DEV_REQUEST_CRAWL", "RELAY_HOSTS",
 		"AP_USER_ORIGIN", "AP_HOST_FALLTHROUGH_DEV",
 		"CONSUMER_ENABLED", "JETSTREAM_URL",
+		"OUTBOUND_WORKERS", "OUTBOUND_DRY_RUN", "OUTBOUND_DISABLED",
+		"OUTBOUND_DISABLED_HOSTS", "OUTBOUND_DISABLED_COMMUNITIES",
+		"OUTBOUND_DISABLED_ACTORS",
 	} {
 		t.Setenv(name, "")
 	}
@@ -523,4 +526,70 @@ func TestLoad_ConsumerEnabledRejectsATypo(t *testing.T) {
 		"boolVarDefault semantics: an unrecognised value is refused rather than read as "+
 			"false, because a flag disabled by a typo is invisible")
 	assert.Contains(t, err.Error(), "CONSUMER_ENABLED")
+}
+
+func TestLoad_OutboundDefaultsOff(t *testing.T) {
+	clearConfigEnv(t)
+
+	cfg, err := Load(discardLogger())
+	require.NoError(t, err)
+
+	assert.Equal(t, 0, cfg.OutboundWorkers,
+		"OUTBOUND_WORKERS defaults to 0: delivery is OFF until a deployment is wired end to end")
+	assert.False(t, cfg.OutboundDryRun, "OUTBOUND_DRY_RUN defaults to false")
+	assert.False(t, cfg.OutboundDisabled, "OUTBOUND_DISABLED defaults to false")
+	assert.Empty(t, cfg.OutboundDisabledHosts, "no hosts disabled by default")
+	assert.Empty(t, cfg.OutboundDisabledCommunities)
+	assert.Empty(t, cfg.OutboundDisabledActors)
+}
+
+func TestLoad_OutboundWorkersParses(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("OUTBOUND_WORKERS", "4")
+
+	cfg, err := Load(discardLogger())
+	require.NoError(t, err)
+	assert.Equal(t, 4, cfg.OutboundWorkers)
+}
+
+func TestLoad_OutboundWorkersRejectsNegative(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("OUTBOUND_WORKERS", "-1")
+
+	_, err := Load(discardLogger())
+	require.Error(t, err, "a negative worker count is a config error, not silently 0")
+	assert.Contains(t, err.Error(), "OUTBOUND_WORKERS")
+}
+
+func TestLoad_OutboundDryRunParses(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("OUTBOUND_DRY_RUN", "true")
+
+	cfg, err := Load(discardLogger())
+	require.NoError(t, err)
+	assert.True(t, cfg.OutboundDryRun)
+}
+
+func TestLoad_OutboundDisableListsParse(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("OUTBOUND_DISABLED", "1")
+	t.Setenv("OUTBOUND_DISABLED_HOSTS", "lemmy.world, sh.itjust.works")
+	t.Setenv("OUTBOUND_DISABLED_COMMUNITIES", "https://lemmy.world/c/tech")
+	t.Setenv("OUTBOUND_DISABLED_ACTORS", "did:plc:aaa,did:plc:bbb , ")
+
+	cfg, err := Load(discardLogger())
+	require.NoError(t, err)
+
+	assert.True(t, cfg.OutboundDisabled, "the global kill switch parses")
+
+	assert.Contains(t, cfg.OutboundDisabledHosts, "lemmy.world")
+	assert.Contains(t, cfg.OutboundDisabledHosts, "sh.itjust.works",
+		"comma-separated hosts are trimmed and split into a set")
+	assert.Len(t, cfg.OutboundDisabledHosts, 2)
+
+	assert.Contains(t, cfg.OutboundDisabledCommunities, "https://lemmy.world/c/tech")
+
+	assert.Contains(t, cfg.OutboundDisabledActors, "did:plc:aaa")
+	assert.Contains(t, cfg.OutboundDisabledActors, "did:plc:bbb")
+	assert.Len(t, cfg.OutboundDisabledActors, 2, "blank entries are dropped, not stored as empty keys")
 }

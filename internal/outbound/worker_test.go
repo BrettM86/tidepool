@@ -107,10 +107,10 @@ func (f fakeSigners) SignerFor(context.Context, string) (*ap.Signer, error) {
 
 // fakeSwitches records the scopes it was consulted with.
 type fakeSwitches struct {
-	mu      sync.Mutex
-	allow   bool
-	dryRun  bool
-	scopes  []DeliveryScope
+	mu     sync.Mutex
+	allow  bool
+	dryRun bool
+	scopes []DeliveryScope
 }
 
 func (s *fakeSwitches) OutboundAllowed(scope DeliveryScope) bool {
@@ -358,11 +358,11 @@ func TestWorker_ConsentAsymmetry(t *testing.T) {
 			explanation: "a federation opt-out cancels an outward create",
 		},
 		{
-			name:        "disabled actor STILL delivers a delete",
-			disable:     func(t *testing.T, conn *sql.DB) { seedWorkerActor(t, conn, false, false) },
-			kind:        "Delete",
-			wantState:   store.DeliveryStateDelivered,
-			wantPosted:  true,
+			name:       "disabled actor STILL delivers a delete",
+			disable:    func(t *testing.T, conn *sql.DB) { seedWorkerActor(t, conn, false, false) },
+			kind:       "Delete",
+			wantState:  store.DeliveryStateDelivered,
+			wantPosted: true,
 			explanation: "retraction asymmetry: a Delete goes out even for a disabled actor — it is the " +
 				"only way an opted-out user takes down what is already federated",
 		},

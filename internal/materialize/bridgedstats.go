@@ -93,7 +93,22 @@ func (m *Materializer) SetBridgedStats(ctx context.Context, mapping *store.APObj
 		// Counts unchanged? Re-emitting would only move asOf, minting a new CID
 		// and a firehose event for nothing. Skip the commit entirely (the caller
 		// still advances its watermark).
+		//
+		// The ACCEPTANCE is still reconciled first, against prevCID — the CID
+		// this read just proved the record has, never mapping.CID, which is a
+		// row read before the commit that produced it and can name a version
+		// that no longer exists. The repin has to be driven by the pin, not by
+		// whether this stamp committed: a crash between a stats commit and its
+		// repin leaves an acceptance pinning a dead CID, and every later sweep
+		// carries the same counts and lands here. Returning early would make
+		// this the one branch that can SEE the stale pin and the only one that
+		// never fixes it, so the post stays out of its community until somebody
+		// edits it upstream. An already-correct pin costs one record read and
+		// commits nothing.
 		if up, down, ok := bridgedStatsCounts(record); ok && up == upvotes && down == downvotes {
+			if err := m.repinAcceptance(ctx, mapping, prevCID); err != nil {
+				return nil, err
+			}
 			return &Result{DID: mapping.DID, ATURI: mapping.ATURI, CID: mapping.CID, NoOp: true}, nil
 		}
 
@@ -165,6 +180,13 @@ func (m *Materializer) SetBridgedStats(ctx context.Context, mapping *store.APObj
 // property as the create path: redelivery re-runs it. It is skipped, rather
 // than guessed at, when the mapping cannot say where or when to write; the
 // next materialization of the post heals it.
+//
+// It runs on EVERY stats pass, the no-op ones included, because it reconciles
+// a pin rather than announcing a commit: recordCID is whatever the caller has
+// just proved the record holds, and an acceptance already naming it re-puts
+// byte-identically and reaches the repo layer's no-op path. Gating this on
+// "did the stamp commit?" would leave a crash-window pin permanently stale,
+// since the sweep that follows such a crash carries unchanged counts.
 func (m *Materializer) repinAcceptance(ctx context.Context, mapping *store.APObjectMapping, recordCID string) error {
 	if mapping.Collection != CollectionPostV2 || mapping.CommunityDID == "" || mapping.PublishedAt == nil {
 		return nil

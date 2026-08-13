@@ -17,8 +17,10 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/bluesky-social/indigo/atproto/atdata"
@@ -254,6 +256,10 @@ func (e *Engine) AdmitPost(ctx context.Context, did string, commit *consume.Comm
 			Status:       StatusRejected,
 			DecisionCode: code,
 			EvaluatedCID: commit.CID,
+			// The record body + context this decision was made against, so a later
+			// force re-admit can re-run admission from stored state (a rejection
+			// writes no outbound_objects, and the author's PDS is not local).
+			EvaluatedSnapshot: evaluatedSnapshot(commit),
 		})
 	}
 
@@ -405,13 +411,14 @@ func (e *Engine) accept(ctx context.Context, did, communityDID, postURI string, 
 			return err
 		}
 		return e.admissions.RecordTx(sctx, tx, Admission{
-			AuthorDID:      did,
-			CommunityDID:   communityDID,
-			PostURI:        postURI,
-			Status:         StatusAccepted,
-			EvaluatedCID:   commit.CID,
-			AcceptanceRKey: rkey,
-			AcceptedCID:    commit.CID,
+			AuthorDID:         did,
+			CommunityDID:      communityDID,
+			PostURI:           postURI,
+			Status:            StatusAccepted,
+			EvaluatedCID:      commit.CID,
+			AcceptanceRKey:    rkey,
+			AcceptedCID:       commit.CID,
+			EvaluatedSnapshot: evaluatedSnapshot(commit),
 		})
 	}
 
@@ -450,12 +457,13 @@ func (e *Engine) removeAccepted(ctx context.Context, did, communityDID, postURI 
 			return err
 		}
 		return e.admissions.RecordTx(sctx, tx, Admission{
-			AuthorDID:    did,
-			CommunityDID: communityDID,
-			PostURI:      postURI,
-			Status:       StatusRemoved,
-			DecisionCode: code,
-			EvaluatedCID: commit.CID,
+			AuthorDID:         did,
+			CommunityDID:      communityDID,
+			PostURI:           postURI,
+			Status:            StatusRemoved,
+			DecisionCode:      code,
+			EvaluatedCID:      commit.CID,
+			EvaluatedSnapshot: evaluatedSnapshot(commit),
 		})
 	}
 
@@ -585,4 +593,152 @@ func publishedAtOf(record map[string]any) time.Time {
 		}
 	}
 	return time.Time{}
+}
+
+// ReadmitResult reports the outcome of a force re-admit (A2). Enqueued is true
+// when the re-admission newly wrote/repinned the acceptance and enqueued a
+// Create/Update{Page}; false when the post STILL fails admission (the result
+// then carries the current rejection Status and DecisionCode).
+type ReadmitResult struct {
+	PostURI      string
+	Status       string
+	DecisionCode string
+	Enqueued     bool
+}
+
+// ErrUnrecoverableReadmit is returned by Readmit when the post's admissions row
+// carries no stored record snapshot ('{}' — a legacy row, or a decision made
+// before migration 022). Admission cannot be re-run from nothing, and the postv2
+// lives in the author's native PDS Tidepool does not host, so this surfaces as a
+// distinct error (HTTP 422) rather than a silent no-op. A task-18
+// com.atproto.repo.getRecord fetch would recover it.
+var ErrUnrecoverableReadmit = stderrors.New("accept: no stored record snapshot to re-run admission from")
+
+// Readmit force re-runs admission for ONE post (the mod-override seam task 17
+// reuses for restore). It re-runs the SAME decide() path against the record
+// snapshot stored on the post's admissions row (evaluated_snapshot, migration
+// 022) — task 16 re-admits from STORED STATE, because the postv2 lives in the
+// author's native PDS that Tidepool does not host, so there is no local record to
+// re-read. Passes now → the acceptance is written/repinned and a Create/Update
+// {Page} enqueued (Enqueued=true); still fails → the current rejection/removal is
+// reported and nothing is enqueued.
+func (e *Engine) Readmit(ctx context.Context, postATURI string) (*ReadmitResult, error) {
+	adm, err := e.admissions.GetByPostURI(ctx, postATURI)
+	if err != nil {
+		return nil, err // NotFound flows through; the handler maps it to 404.
+	}
+
+	commit, did, ok := rebuildCommit(postATURI, adm.EvaluatedSnapshot)
+	if !ok {
+		return nil, ErrUnrecoverableReadmit
+	}
+	communityDID, _ := commit.Record["community"].(string)
+	if communityDID == "" {
+		communityDID = adm.CommunityDID
+	}
+
+	// Re-run the exact admission pipeline AdmitPost uses — no duplicated policy.
+	prior, priorBound, err := e.priorBinding(ctx, postATURI)
+	if err != nil {
+		return nil, err
+	}
+	code, discard, err := e.decide(ctx, did, commit, communityDID, prior, priorBound)
+	if err != nil {
+		return nil, err
+	}
+	if discard {
+		// The stored community no longer matches the event's — nothing is written;
+		// reported as still-failing with the immutability cause.
+		return &ReadmitResult{PostURI: postATURI, Status: adm.Status, DecisionCode: DecisionCommunityImmutable}, nil
+	}
+	if code != "" {
+		priorAccepted := priorBound && !prior.IsTombstoned()
+		if priorAccepted {
+			// Was accepted, now fails: this is a removal, exactly as AdmitPost would.
+			if err := e.removeAccepted(ctx, did, communityDID, postATURI, commit, prior, code); err != nil {
+				return nil, err
+			}
+			return &ReadmitResult{PostURI: postATURI, Status: StatusRemoved, DecisionCode: code}, nil
+		}
+		// Still rejected: refresh the ledger with the current cause (idempotent),
+		// enqueue nothing.
+		if err := e.admissions.Record(ctx, Admission{
+			AuthorDID:         did,
+			CommunityDID:      communityDID,
+			PostURI:           postATURI,
+			Status:            StatusRejected,
+			DecisionCode:      code,
+			EvaluatedCID:      commit.CID,
+			EvaluatedSnapshot: evaluatedSnapshot(commit),
+		}); err != nil {
+			return nil, err
+		}
+		return &ReadmitResult{PostURI: postATURI, Status: StatusRejected, DecisionCode: code}, nil
+	}
+
+	// Passes now: write/repin the acceptance and enqueue the Page (reusing accept()).
+	if err := e.accept(ctx, did, communityDID, postATURI, commit); err != nil {
+		return nil, err
+	}
+	return &ReadmitResult{PostURI: postATURI, Status: StatusAccepted, Enqueued: true}, nil
+}
+
+// evaluatedSnapshot serializes the postv2 record and the context a Readmit needs
+// to rebuild the CommitEvent it re-runs admission against. It is stored on EVERY
+// decision (accept, reject, remove). A marshal failure yields nil, which the
+// store coalesces to '{}' — an unrecoverable readmit, never a wrong one.
+func evaluatedSnapshot(commit *consume.CommitEvent) []byte {
+	b, err := json.Marshal(map[string]any{
+		"record":     commit.Record,
+		"cid":        commit.CID,
+		"rev":        commit.Rev,
+		"operation":  commit.Operation,
+		"collection": commit.Collection,
+	})
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+// rebuildCommit reconstructs the CommitEvent (and its author DID) a Readmit
+// re-runs admission against, from the post at-uri and the stored evaluated
+// snapshot. ok=false means the snapshot did not survive (legacy '{}' or a
+// malformed at-uri): the caller surfaces that as ErrUnrecoverableReadmit.
+func rebuildCommit(postURI string, snapshot []byte) (commit *consume.CommitEvent, authorDID string, ok bool) {
+	trimmed := strings.TrimPrefix(postURI, "at://")
+	parts := strings.SplitN(trimmed, "/", 3)
+	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
+		return nil, "", false
+	}
+	did, collection, rkey := parts[0], parts[1], parts[2]
+
+	if len(snapshot) == 0 {
+		return nil, "", false
+	}
+	var snap struct {
+		Record    map[string]any `json:"record"`
+		CID       string         `json:"cid"`
+		Rev       string         `json:"rev"`
+		Operation string         `json:"operation"`
+	}
+	if err := json.Unmarshal(snapshot, &snap); err != nil {
+		return nil, "", false
+	}
+	if len(snap.Record) == 0 {
+		// '{}' — a decision recorded before the snapshot column existed.
+		return nil, "", false
+	}
+	op := snap.Operation
+	if op == "" {
+		op = "create"
+	}
+	return &consume.CommitEvent{
+		Rev:        snap.Rev,
+		Operation:  op,
+		Collection: collection,
+		RKey:       rkey,
+		CID:        snap.CID,
+		Record:     snap.Record,
+	}, did, true
 }

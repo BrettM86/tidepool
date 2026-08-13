@@ -33,6 +33,12 @@ type Admission struct {
 	AcceptanceRKey string
 	AcceptedCID    string
 	Redrivable     bool
+	// EvaluatedSnapshot is the postv2 record (plus resolved context) this
+	// decision was made against, stored on EVERY decision so /admin/admissions/
+	// readmit can re-run admission from stored state (migration 022). Empty
+	// ('{}') means the body did not survive — readmit is unrecoverable without a
+	// getRecord fetch from the author's PDS (task 18).
+	EvaluatedSnapshot []byte
 }
 
 // Admissions persists the decision ledger.
@@ -69,11 +75,17 @@ func (a *Admissions) record(ctx context.Context, ex execer, adm Admission) error
 	if adm.Status == "" {
 		return errors.NewValidationError("admission.status", "must be set")
 	}
+	// A JSONB NOT NULL column rejects a NULL, so an unset snapshot coalesces to
+	// the empty object the DEFAULT would have used.
+	snapshot := adm.EvaluatedSnapshot
+	if len(snapshot) == 0 {
+		snapshot = []byte("{}")
+	}
 	_, err := ex.ExecContext(ctx, `
 		INSERT INTO admissions
 		    (community_did, post_uri, author_did, status, decision_code, evaluated_cid,
-		     acceptance_rkey, accepted_cid, redrivable)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		     acceptance_rkey, accepted_cid, redrivable, evaluated_snapshot)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		ON CONFLICT (community_did, post_uri) DO UPDATE SET
 		    author_did = EXCLUDED.author_did,
 		    status = EXCLUDED.status,
@@ -82,9 +94,10 @@ func (a *Admissions) record(ctx context.Context, ex execer, adm Admission) error
 		    acceptance_rkey = EXCLUDED.acceptance_rkey,
 		    accepted_cid = EXCLUDED.accepted_cid,
 		    redrivable = EXCLUDED.redrivable,
+		    evaluated_snapshot = EXCLUDED.evaluated_snapshot,
 		    updated_at = now()`,
 		adm.CommunityDID, adm.PostURI, adm.AuthorDID, adm.Status, adm.DecisionCode, adm.EvaluatedCID,
-		adm.AcceptanceRKey, adm.AcceptedCID, adm.Redrivable)
+		adm.AcceptanceRKey, adm.AcceptedCID, adm.Redrivable, snapshot)
 	if err != nil {
 		return fmt.Errorf("accept: record admission %s/%s: %w", adm.CommunityDID, adm.PostURI, err)
 	}
@@ -97,11 +110,11 @@ func (a *Admissions) Get(ctx context.Context, communityDID, postURI string) (*Ad
 	var adm Admission
 	err := a.db.QueryRowContext(ctx, `
 		SELECT community_did, post_uri, author_did, status, decision_code, evaluated_cid,
-		       acceptance_rkey, accepted_cid, redrivable
+		       acceptance_rkey, accepted_cid, redrivable, evaluated_snapshot
 		  FROM admissions WHERE community_did = $1 AND post_uri = $2`,
 		communityDID, postURI).Scan(
 		&adm.CommunityDID, &adm.PostURI, &adm.AuthorDID, &adm.Status, &adm.DecisionCode, &adm.EvaluatedCID,
-		&adm.AcceptanceRKey, &adm.AcceptedCID, &adm.Redrivable)
+		&adm.AcceptanceRKey, &adm.AcceptedCID, &adm.Redrivable, &adm.EvaluatedSnapshot)
 	if stderrors.Is(err, sql.ErrNoRows) {
 		return nil, errors.NewNotFoundError("admission", communityDID+"/"+postURI)
 	}
@@ -109,6 +122,61 @@ func (a *Admissions) Get(ctx context.Context, communityDID, postURI string) (*Ad
 		return nil, fmt.Errorf("accept: get admission %s/%s: %w", communityDID, postURI, err)
 	}
 	return &adm, nil
+}
+
+// GetByPostURI returns the admission for a post at-uri alone — the readmit and
+// admin-list path, which knows the post but not necessarily its community. The
+// post_uri is globally unique (it embeds the author repo), so at most one row
+// matches. A miss satisfies errors.IsNotFound.
+func (a *Admissions) GetByPostURI(ctx context.Context, postURI string) (*Admission, error) {
+	var adm Admission
+	err := a.db.QueryRowContext(ctx, `
+		SELECT community_did, post_uri, author_did, status, decision_code, evaluated_cid,
+		       acceptance_rkey, accepted_cid, redrivable, evaluated_snapshot
+		  FROM admissions WHERE post_uri = $1`, postURI).Scan(
+		&adm.CommunityDID, &adm.PostURI, &adm.AuthorDID, &adm.Status, &adm.DecisionCode, &adm.EvaluatedCID,
+		&adm.AcceptanceRKey, &adm.AcceptedCID, &adm.Redrivable, &adm.EvaluatedSnapshot)
+	if stderrors.Is(err, sql.ErrNoRows) {
+		return nil, errors.NewNotFoundError("admission", postURI)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("accept: get admission %s: %w", postURI, err)
+	}
+	return &adm, nil
+}
+
+// AdmissionFilter narrows a List. Empty fields are wildcards.
+type AdmissionFilter struct {
+	Status    string
+	Community string
+}
+
+// List returns admissions matching the filter, newest first — the admin
+// surface's read of pending/rejected/removed decisions with their reasons. The
+// snapshot is deliberately NOT returned (it can be large and the listing is a
+// triage view); readmit reads it through GetByPostURI.
+func (a *Admissions) List(ctx context.Context, filter AdmissionFilter) ([]Admission, error) {
+	rows, err := a.db.QueryContext(ctx, `
+		SELECT community_did, post_uri, author_did, status, decision_code, evaluated_cid,
+		       acceptance_rkey, accepted_cid, redrivable
+		  FROM admissions
+		 WHERE ($1 = '' OR status = $1)
+		   AND ($2 = '' OR community_did = $2)
+		 ORDER BY updated_at DESC`, filter.Status, filter.Community)
+	if err != nil {
+		return nil, fmt.Errorf("accept: list admissions: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []Admission
+	for rows.Next() {
+		var adm Admission
+		if err := rows.Scan(&adm.CommunityDID, &adm.PostURI, &adm.AuthorDID, &adm.Status,
+			&adm.DecisionCode, &adm.EvaluatedCID, &adm.AcceptanceRKey, &adm.AcceptedCID, &adm.Redrivable); err != nil {
+			return nil, fmt.Errorf("accept: scan admission: %w", err)
+		}
+		out = append(out, adm)
+	}
+	return out, rows.Err()
 }
 
 // CountAccepted reports how many posts one author currently has ACCEPTED in one

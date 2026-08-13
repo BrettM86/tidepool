@@ -481,10 +481,25 @@ func run(logger *slog.Logger) error {
 	// wired end to end must not start accumulating it.
 	var consumerDone <-chan struct{}
 	if cfg.ConsumerEnabled {
-		consumerDone, err = startConsumer(ctx, cfg, database, repoManager, personasService, apClient, personasService, logger)
+		var acceptEngine *accept.Engine
+		consumerDone, acceptEngine, err = startConsumer(ctx, cfg, database, repoManager, personasService, apClient, personasService, logger)
 		if err != nil {
 			return err
 		}
+		// The acceptance-engine admin surface (task 16): list admissions with
+		// their reasons + force re-admit. It shares the /admin bearer and mounts
+		// only WITH the consumer, because a force re-admit needs the engine. A
+		// deployment with the consumer off has no admissions to inspect.
+		acceptAdmin, err := accept.NewAdmin(accept.AdminOptions{
+			Token:      cfg.AdminToken,
+			Admissions: accept.NewAdmissions(database),
+			Engine:     acceptEngine,
+			Logger:     logger,
+		})
+		if err != nil {
+			return err
+		}
+		acceptAdmin.Routes(router)
 	}
 
 	// Host routing wraps everything: the chi router keeps answering for the
@@ -606,7 +621,7 @@ func startConsumer(
 	apClient *ap.Client,
 	signers outbound.SignerProvider,
 	logger *slog.Logger,
-) (<-chan struct{}, error) {
+) (<-chan struct{}, *accept.Engine, error) {
 	// The most SSRF-exposed egress in the bridge: the well-known host comes
 	// from a DID document a stranger controls, so it shares the AP client's
 	// guard rather than using a bare http.Client.
@@ -620,7 +635,7 @@ func startConsumer(
 		Logger:    logger,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("consumer: handle resolver: %w", err)
+		return nil, nil, fmt.Errorf("consumer: handle resolver: %w", err)
 	}
 
 	// The outbound delivery pipe (task 15). Because this function runs ONLY when
@@ -640,7 +655,7 @@ func startConsumer(
 		Logger:     logger,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("consumer: outbound enqueuer: %w", err)
+		return nil, nil, fmt.Errorf("consumer: outbound enqueuer: %w", err)
 	}
 
 	var worker *outbound.Worker
@@ -662,7 +677,7 @@ func startConsumer(
 			Logger: logger,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("consumer: outbound worker: %w", err)
+			return nil, nil, fmt.Errorf("consumer: outbound worker: %w", err)
 		}
 	}
 
@@ -685,7 +700,7 @@ func startConsumer(
 		Logger:                   logger,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("consumer: acceptance engine: %w", err)
+		return nil, nil, fmt.Errorf("consumer: acceptance engine: %w", err)
 	}
 
 	dispatcher, err := consume.NewDispatcher(consume.Options{
@@ -701,7 +716,7 @@ func startConsumer(
 		Logger:     logger,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("consumer: dispatcher: %w", err)
+		return nil, nil, fmt.Errorf("consumer: dispatcher: %w", err)
 	}
 
 	// The collection filter is load-bearing: without wantedCollections this
@@ -709,7 +724,7 @@ func startConsumer(
 	// by record.
 	subscribeURL, err := consume.SubscribeURL(cfg.JetstreamURL, consume.WantedCollections())
 	if err != nil {
-		return nil, fmt.Errorf("consumer: %w", err)
+		return nil, nil, fmt.Errorf("consumer: %w", err)
 	}
 
 	state := consume.NewPostgresStateStore(database, consume.CursorSchemaVersion)
@@ -760,5 +775,5 @@ func startConsumer(
 		close(done)
 	}()
 	logger.Info("jetstream consumer started", "url", subscribeURL)
-	return done, nil
+	return done, engine, nil
 }

@@ -336,3 +336,101 @@ func TestLoad_ProductionDefaultsFallthroughOff(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, cfg.APHostFallthroughDev, "production never falls through")
 }
+
+// TestLoad_APUserOriginMustBeBareOrigin: the value is concatenated into
+// every minted actor_id, keyId, and webfinger href. Anything past
+// scheme://host — a trailing slash, a path, a query, a fragment, userinfo —
+// is silently baked into identities that are FROZEN once minted, so it has
+// to be refused at startup rather than discovered in a peer's parser.
+func TestLoad_APUserOriginMustBeBareOrigin(t *testing.T) {
+	for _, origin := range []string{
+		"https://coves.social/",
+		"https://coves.social/ap",
+		"https://coves.social/ap/",
+		"https://coves.social?x=1",
+		"https://coves.social/#frag",
+		"https://coves.social#frag",
+		"https://user@coves.social",
+		"https://user:pass@coves.social",
+	} {
+		t.Run(origin, func(t *testing.T) {
+			clearConfigEnv(t)
+			t.Setenv("BRIDGE_HOSTNAME", "tidepool.example")
+			t.Setenv("AP_USER_ORIGIN", origin)
+
+			_, err := Load(discardLogger())
+			require.Error(t, err, "%q is not a bare origin", origin)
+			assert.Contains(t, err.Error(), "AP_USER_ORIGIN")
+		})
+	}
+}
+
+// TestLoad_APUserOriginCanonicalized: two spellings of one authority must
+// not mint two namespaces. The stored value is what actor_ids are built
+// from, so canonicalization happens ONCE, here.
+func TestLoad_APUserOriginCanonicalized(t *testing.T) {
+	for _, tc := range []struct{ raw, want string }{
+		{"https://coves.social:443", "https://coves.social"},
+		{"http://coves.social:80", "http://coves.social"},
+		{"HTTPS://Coves.Social", "https://coves.social"},
+		{"https://coves.social.", "https://coves.social"},
+		{"https://coves.social", "https://coves.social"},
+		// A non-default port is part of the authority and must survive.
+		{"http://localhost:8091", "http://localhost:8091"},
+	} {
+		t.Run(tc.raw, func(t *testing.T) {
+			clearConfigEnv(t)
+			t.Setenv("BRIDGE_HOSTNAME", "tidepool.example")
+			t.Setenv("AP_USER_ORIGIN", tc.raw)
+
+			cfg, err := Load(discardLogger())
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, cfg.APUserOrigin,
+				"the canonical origin is what every minted actor_id carries")
+		})
+	}
+}
+
+// TestLoad_APUserOriginRequiresHTTPSInProduction: an http origin in
+// production would publish actor ids that peers fetch in plaintext, and
+// signature verification would carry over an unauthenticated channel.
+func TestLoad_APUserOriginRequiresHTTPSInProduction(t *testing.T) {
+	setProductionEnv(t)
+	t.Setenv("AP_USER_ORIGIN", "http://coves.social")
+
+	_, err := Load(discardLogger())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "AP_USER_ORIGIN")
+
+	// Development still federates with a plain-HTTP Lemmy in the compose
+	// network, so http stays legal there.
+	clearConfigEnv(t)
+	t.Setenv("BRIDGE_HOSTNAME", "tidepool.example")
+	t.Setenv("AP_USER_ORIGIN", "http://coves.social")
+	cfg, err := Load(discardLogger())
+	require.NoError(t, err)
+	assert.Equal(t, "http://coves.social", cfg.APUserOrigin)
+}
+
+// TestLoad_APUserOriginShadowCheckIsCanonical: the shadow check must run on
+// the canonical host, or a second spelling of BRIDGE_HOSTNAME walks straight
+// past it and takes over the bridged-handle namespace.
+func TestLoad_APUserOriginShadowCheckIsCanonical(t *testing.T) {
+	for _, origin := range []string{
+		"https://tdpl.io:443",
+		"https://tdpl.io.",
+		"https://TDPL.IO",
+		"https://users.tdpl.io:443",
+		"https://users.TDPL.io.",
+	} {
+		t.Run(origin, func(t *testing.T) {
+			clearConfigEnv(t)
+			t.Setenv("BRIDGE_HOSTNAME", "tdpl.io")
+			t.Setenv("AP_USER_ORIGIN", origin)
+
+			_, err := Load(discardLogger())
+			require.Error(t, err, "%q is BRIDGE_HOSTNAME wearing a different spelling", origin)
+			assert.Contains(t, err.Error(), "AP_USER_ORIGIN")
+		})
+	}
+}

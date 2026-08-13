@@ -8,11 +8,12 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
-	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"tidepool/internal/personas"
 )
 
 const (
@@ -351,11 +352,12 @@ func Load(logger *slog.Logger) (*Config, error) {
 	// actor_id this deployment mints, so a wrong or missing value is not a
 	// runtime inconvenience but a set of federated identities pointing at
 	// the wrong place, forever.
-	cfg.APUserOrigin, err = stringVar(logger, isDevelopment, "AP_USER_ORIGIN", "http://localhost:8091")
+	rawUserOrigin, err := stringVar(logger, isDevelopment, "AP_USER_ORIGIN", "http://localhost:8091")
 	if err != nil {
 		return nil, err
 	}
-	if err := validateUserOrigin(cfg.APUserOrigin, cfg.BridgeHostname); err != nil {
+	cfg.APUserOrigin, err = validateUserOrigin(rawUserOrigin, cfg.BridgeHostname, isDevelopment)
+	if err != nil {
 		return nil, err
 	}
 
@@ -586,30 +588,39 @@ func boolVarDefault(logger *slog.Logger, name string, fallback bool) (bool, erro
 	return false, fmt.Errorf("config: %s must be a boolean (1/0, true/false, yes/no, on/off), got %q", name, raw)
 }
 
-// validateUserOrigin refuses a user origin that would shadow the bridge's own
-// handle namespace. Bridged handles are subdomains of BRIDGE_HOSTNAME resolved
-// off r.Host, so a user origin AT that name or UNDER it would swallow them —
-// and the Host router could not tell the two surfaces apart in the first
-// place. The comparison is on host:port, because a different port is a
-// different authority: the dev defaults are exactly that shape
-// (BRIDGE_HOSTNAME localhost, user origin on :8091). Matching is on a label
-// boundary, so "nottidepool.example" is not under "tidepool.example".
-func validateUserOrigin(origin, bridgeHostname string) error {
-	parsed, err := url.Parse(origin)
+// validateUserOrigin canonicalizes the user origin and refuses one that would
+// shadow the bridge's own handle namespace, returning the CANONICAL origin —
+// the value every minted actor_id is built from, so the canonicalization has
+// to happen once, here, rather than at each use site.
+//
+// Bridged handles are subdomains of BRIDGE_HOSTNAME resolved off r.Host, so a
+// user origin AT that name or UNDER it would swallow them — and the Host
+// router could not tell the two surfaces apart in the first place. The
+// comparison runs on canonical forms in both directions, or a second spelling
+// of BRIDGE_HOSTNAME ("https://TDPL.IO:443") walks straight past the check.
+// Matching is on a label boundary, so "nottidepool.example" is not under
+// "tidepool.example", and a different port is a different authority (the dev
+// defaults are exactly that shape: BRIDGE_HOSTNAME localhost, origin on
+// :8091).
+func validateUserOrigin(origin, bridgeHostname string, isDevelopment bool) (string, error) {
+	canonical, host, err := personas.CanonicalizeOrigin(origin)
 	if err != nil {
-		return fmt.Errorf("config: AP_USER_ORIGIN must be an absolute origin URL, got %q: %w", origin, err)
+		return "", fmt.Errorf("config: AP_USER_ORIGIN: %w", err)
 	}
-	if parsed.Scheme == "" || parsed.Host == "" {
-		return fmt.Errorf("config: AP_USER_ORIGIN must be an absolute origin URL "+
-			"(scheme and host), got %q", origin)
+	// http publishes actor ids peers fetch in plaintext, carrying signature
+	// verification over an unauthenticated channel. It exists for the same
+	// reason BRIDGE_SCHEME=http does — the local e2e harness — and is
+	// refused outside development for the same reason.
+	if !isDevelopment && !strings.HasPrefix(canonical, "https://") {
+		return "", fmt.Errorf("config: AP_USER_ORIGIN must be https in production, got %q", canonical)
 	}
-	host := strings.ToLower(parsed.Host)
-	bridge := strings.ToLower(strings.TrimSpace(bridgeHostname))
+
+	bridge := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(bridgeHostname)), ".")
 	if host == bridge || strings.HasSuffix(host, "."+bridge) {
-		return fmt.Errorf("config: AP_USER_ORIGIN host %q must not be BRIDGE_HOSTNAME %q "+
+		return "", fmt.Errorf("config: AP_USER_ORIGIN host %q must not be BRIDGE_HOSTNAME %q "+
 			"or a subdomain of it: the bridged handle namespace lives there", host, bridge)
 	}
-	return nil
+	return canonical, nil
 }
 
 // stringVar returns the value of an environment variable. When unset it

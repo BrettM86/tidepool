@@ -2,12 +2,20 @@ package personas
 
 import (
 	"bytes"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"tidepool/internal/errors"
+	"tidepool/internal/ratelimit"
 )
+
+// misdirectedLogInterval throttles the 421 refusal log: a scanner sweeping
+// Hosts would otherwise write one line per probe, and the interesting signal
+// is "this is happening at all", not each instance.
+const misdirectedLogInterval = time.Second
 
 // HostRouterOptions configures NewHostRouter.
 type HostRouterOptions struct {
@@ -22,6 +30,9 @@ type HostRouterOptions struct {
 	// refusing them. A laptop is reached by IP, tunnel hostname, or whatever
 	// the tunnel minted this morning; a production deployment is not.
 	DevFallthrough bool
+	// Logger receives a sampled warning for refused Hosts. Nil uses
+	// slog.Default().
+	Logger *slog.Logger
 }
 
 // NewHostRouter splits one listener between the bridge's service surface and
@@ -50,12 +61,18 @@ func NewHostRouter(opts HostRouterOptions) (http.Handler, error) {
 		return nil, errors.NewValidationError("user_handler", "must not be nil")
 	}
 
+	logger := opts.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 	return &hostRouter{
 		serviceHost:    normalizeHost(opts.ServiceHost),
 		serviceHandler: opts.ServiceHandler,
 		userHost:       normalizeHost(opts.UserHost),
 		userHandler:    opts.UserHandler,
 		devFallthrough: opts.DevFallthrough,
+		logger:         logger,
+		refusalLog:     ratelimit.NewSampler(misdirectedLogInterval),
 	}, nil
 }
 
@@ -65,6 +82,8 @@ type hostRouter struct {
 	userHost       string
 	userHandler    http.Handler
 	devFallthrough bool
+	logger         *slog.Logger
+	refusalLog     *ratelimit.Sampler
 }
 
 func (h *hostRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -87,21 +106,35 @@ func (h *hostRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case h.devFallthrough:
 		h.serviceHandler.ServeHTTP(w, r)
 	default:
+		if h.refusalLog.Allow(time.Now()) {
+			h.logger.Warn("refused request for an unrecognized Host (sampled)",
+				"host", host, "path", r.URL.Path)
+		}
 		http.Error(w, "unrecognized Host", http.StatusMisdirectedRequest)
 	}
 }
 
 // isServiceHost reports whether host belongs to the bridge's own surface:
 // the configured hostname, any subdomain of it (954 bridged handles resolve
-// through those), or an address with no registered name at all — an absent
-// Host, "localhost", or a bare IP literal, which is how container
-// healthchecks and direct-IP probes arrive.
+// through those), or a LOOPBACK address — an absent Host, "localhost", or
+// 127.0.0.1/::1, which is how container healthchecks and local probes arrive.
+//
+// A PUBLIC IP literal is deliberately not in the bucket. It names no
+// configured surface, and admitting it would hand an attacker a way to reach
+// the service surface directly by address, bypassing whatever the proxy
+// enforces per-name. Dev fallthrough still admits it — a dev box IS reached
+// by its address — which is the whole reason that flag is refused in
+// production.
 func (h *hostRouter) isServiceHost(host string) bool {
 	if host == "" || host == h.serviceHost || strings.HasSuffix(host, "."+h.serviceHost) {
 		return true
 	}
 	name := hostnameOnly(host)
-	return name == "localhost" || net.ParseIP(name) != nil
+	if name == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(name)
+	return ip != nil && ip.IsLoopback()
 }
 
 // serveComposed runs the user surface first and replaces its 404 with the
@@ -109,6 +142,14 @@ func (h *hostRouter) isServiceHost(host string) bool {
 // streamed: once a status line has reached the client there is no taking it
 // back, so a fallback would append its body to the 404 instead of replacing
 // it.
+//
+// INVARIANT: the user surface must not read the request body on any path it
+// 404s. The replay hands the SAME *http.Request to the service handler, and a
+// consumed body cannot be rewound — the service handler would see an empty
+// one. personas.Service satisfies this (only POST /ap/inbox reads a body, and
+// it never 404s after reading); a future handler that reads before deciding
+// would break the fallback silently, in the direction of an inbox that
+// accepts empty deliveries.
 func (h *hostRouter) serveComposed(w http.ResponseWriter, r *http.Request) {
 	buffered := &bufferedResponse{header: http.Header{}}
 	h.userHandler.ServeHTTP(buffered, r)
@@ -123,7 +164,11 @@ func (h *hostRouter) serveComposed(w http.ResponseWriter, r *http.Request) {
 }
 
 // bufferedResponse captures a handler's response so the caller can decide
-// whether to send it.
+// whether to send it. It implements http.ResponseWriter and nothing else:
+// no Flusher, no Hijacker, no ReaderFrom. Composition only happens when both
+// configured hosts name one authority — the dev default — and nothing on the
+// user surface streams, flushes, or upgrades. A future streaming route on a
+// composed listener would need this to forward those interfaces.
 type bufferedResponse struct {
 	header http.Header
 	code   int

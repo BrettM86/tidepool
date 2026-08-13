@@ -46,11 +46,18 @@ const (
 	rotationKeyAAD       = "tidepool:plc-rotation-key:v1"
 )
 
-// Custodian seals and opens per-actor secp256k1 private keys with the
-// bridge KEK (AES-256-GCM). Key claiming/migration is out of scope for v1,
-// but the storage design allows it later: each actor's key is independent,
-// bound to its DID via AAD, and exportable by decrypting and handing the
-// key material to the user during a future claim flow.
+// Custodian seals and opens the bridge's two per-actor key domains with the
+// bridge KEK (AES-256-GCM): the atproto secp256k1 escrow keys of bridged
+// fediverse actors (EncryptActorKey/DecryptActorKey) and the ActivityPub RSA
+// keys of Coves users' own actors (EncryptActorRSAKey/DecryptActorRSAKey, in
+// actor_rsa.go). One KEK, two AAD prefixes: a ciphertext from one domain
+// must never open in the other, so the constants above are distinct by
+// construction and a cross test pins it.
+//
+// Key claiming/migration is out of scope for v1, but the storage design
+// allows it later: each actor's key is independent, bound to its DID via AAD,
+// and exportable by decrypting and handing the key material to the user
+// during a future claim flow.
 type Custodian struct {
 	// aead is built once at construction and reused: DecryptActorKey sits
 	// on every commit's hot path, and cipher.AEAD is safe for concurrent

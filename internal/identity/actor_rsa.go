@@ -12,7 +12,10 @@ import (
 // RSA private keys sealed under the bridge KEK, AAD-bound to their DID with
 // a constant DISTINCT from actorKeyAADPrefix (the K256 escrow keys), so a
 // ciphertext moved between columns fails to open. New keys never touch the
-// plaintext-PEM path the v1 service-actor key still uses (keys.go:147).
+// plaintext-PEM path the v1 SERVICE-actor key still travels — that key is
+// PEM-encoded by ap.EncodePrivateKeyPEM and stored in service_keys as text
+// (see ap.LoadOrCreateServiceActor); every per-actor AP key minted here is
+// ciphertext at rest instead.
 //
 // The sealed plaintext is PKCS#8 DER, not PEM: PEM is base64 with a header,
 // so it would be ~40% larger and would put the string "-----BEGIN" inside a

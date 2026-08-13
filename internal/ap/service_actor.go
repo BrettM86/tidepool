@@ -19,6 +19,16 @@ const ServiceKeyName = "service-actor"
 // from (the HTTP route itself lands with the inbox in task 06).
 const ServiceActorPath = "/actor"
 
+// SoftwareName and SoftwareVersion identify this implementation in every
+// nodeinfo document the deployment serves. Lemmy admins allowlist by the
+// exact name string, and both of the bridge's origins describe the SAME
+// deployment — so the pair lives here rather than once per surface, where
+// the two could drift into claiming to be different software.
+const (
+	SoftwareName    = "tidepool"
+	SoftwareVersion = "0.1.0"
+)
+
 // serviceActorContext is the JSON-LD context for the service actor document:
 // core AS2 plus the security vocabulary that defines publicKey.
 const serviceActorContext = `["https://www.w3.org/ns/activitystreams","https://w3id.org/security/v1"]`

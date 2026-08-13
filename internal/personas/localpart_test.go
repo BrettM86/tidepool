@@ -170,3 +170,68 @@ func TestDeriveLocalPart_Deterministic(t *testing.T) {
 	assert.Equal(t, first, second)
 	assert.Equal(t, "alice", first)
 }
+
+// dottedLongHandle is 253 chars laid out so the MaxLocalPartLen cut lands
+// immediately after a dot: 63 + 1 + 63 + 1 + 63 + 1 + 58 = 250 chars, the
+// separator at index 250, then a 2-char TLD.
+var dottedLongHandle = strings.Repeat("a", 63) + "." +
+	strings.Repeat("b", 63) + "." +
+	strings.Repeat("c", 63) + "." +
+	strings.Repeat("d", 58) + ".ee"
+
+// hyphenLongHandle is 253 chars whose final label carries a hyphen exactly
+// at the cut (index 250).
+var hyphenLongHandle = strings.Repeat("a", 63) + "." +
+	strings.Repeat("b", 63) + "." +
+	strings.Repeat("c", 63) + "." +
+	strings.Repeat("d", 58) + "-" + strings.Repeat("e", 2)
+
+// TestDeriveLocalPart_TruncationShape: truncation is a blind cut, so it can
+// land on a separator. A local part ending in "." or "-" is not a name any
+// implementation renders or matches sanely — Lemmy's mention regex needs a
+// trailing alphanumeric, and a trailing dot reads as a hostname root.
+func TestDeriveLocalPart_TruncationShape(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		handle string
+	}{
+		{"cut lands on a dot", dottedLongHandle},
+		{"cut lands on a hyphen", hyphenLongHandle},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Len(t, tc.handle, 253, "fixture must sit on the handle length limit")
+			require.Contains(t, ".-", string(tc.handle[MaxLocalPartLen-1]),
+				"fixture must make the LAST KEPT character a separator")
+
+			got, err := DeriveLocalPart(tc.handle, "coves.social")
+			require.NoError(t, err)
+			assert.LessOrEqual(t, len(got), MaxLocalPartLen)
+			assert.False(t, strings.HasSuffix(got, "."), "a local part must not end in a dot: %q", got)
+			assert.False(t, strings.HasSuffix(got, "-"), "a local part must not end in a hyphen: %q", got)
+			assert.Equal(t, strings.TrimRight(tc.handle[:MaxLocalPartLen], ".-"), got,
+				"the cut is trimmed of trailing separators, nothing else")
+		})
+	}
+}
+
+// TestDeriveLocalPart_NormalizesSuffix: the suffix arrives from config and
+// from a routed Host, which spell the same authority several ways. Failing
+// to normalize it silently demotes native handles to foreign ones — they
+// would mint as "alice.coves.social" instead of "alice", permanently.
+func TestDeriveLocalPart_NormalizesSuffix(t *testing.T) {
+	for _, suffix := range []string{"coves.social", "Coves.Social", "coves.social.", "COVES.SOCIAL."} {
+		t.Run(suffix, func(t *testing.T) {
+			got, err := DeriveLocalPart("alice.coves.social", suffix)
+			require.NoError(t, err)
+			assert.Equal(t, "alice", got, "suffix %q names the native space", suffix)
+		})
+	}
+
+	// The apex is refused through every spelling too — it is the instance
+	// actor's own name.
+	for _, suffix := range []string{"coves.social.", "Coves.Social"} {
+		_, err := DeriveLocalPart("coves.social", suffix)
+		require.Error(t, err, "the apex must be refused under suffix %q", suffix)
+		assert.True(t, errors.IsValidation(err), "got %v", err)
+	}
+}

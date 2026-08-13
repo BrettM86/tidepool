@@ -1,6 +1,7 @@
 package personas
 
 import (
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -379,4 +380,126 @@ func TestWebFinger_Errors(t *testing.T) {
 	missing := serveOnUserOrigin(svc, http.MethodGet, "/.well-known/webfinger", nil)
 	assert.Equal(t, http.StatusBadRequest, missing.Code,
 		"a webfinger request without a resource parameter is malformed, not a miss")
+}
+
+// seedVanityActor inserts an actor minted under a DIFFERENT origin than the
+// service's, the way a vanity-origin deployment would.
+func seedVanityActor(t *testing.T, database *sql.DB) *store.APActor {
+	t.Helper()
+	did := testDID(t)
+	actor, err := store.NewAPActors(database).Create(t.Context(), store.APActor{
+		DID:              did,
+		Kind:             store.ActorTypePerson,
+		ActorID:          vanityOrigin + "/ap/actor/" + did,
+		NormalizedOrigin: vanityHost,
+		LocalPart:        "alice",
+		RSAKeySealed:     []byte{0x01, 0x02, 0x03},
+		RSAKeyVersion:    1,
+		PublicKeyPEM:     "seeded",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, actor)
+	return actor
+}
+
+// TestServeActorDocument_BoundToItsOwnOrigin: the DID is global but the
+// actor is not. Serving a vanity-origin actor's document under coves.social
+// would publish a document whose id is on ANOTHER authority — exactly the
+// cross-authority claim ap.Client's key resolution refuses, and the
+// mirror-image of the binding webfinger already enforces.
+func TestServeActorDocument_BoundToItsOwnOrigin(t *testing.T) {
+	database := personasTestDB(t)
+	svc, _ := newTestService(t, database)
+	vanity := seedVanityActor(t, database)
+
+	for _, path := range []string{actorPath(vanity.DID), actorPath(vanity.DID) + "/outbox"} {
+		t.Run(path, func(t *testing.T) {
+			foreign := serveOnUserOrigin(svc, http.MethodGet, path, nil)
+			assert.Equal(t, http.StatusNotFound, foreign.Code,
+				"%s is hosted on %s; %s must not answer for it", path, vanityHost, userHost)
+
+			// ... and it DOES answer under its own Host, so this is a
+			// binding rather than a blanket refusal.
+			own := serveOnHost(svc, vanityHost, http.MethodGet, path, nil)
+			assert.Equal(t, http.StatusOK, own.Code,
+				"%s must still resolve under its own origin; body=%s", path, own.Body.String())
+		})
+	}
+}
+
+// TestWebFinger_URLResourceBinding: the URL spelling of a resource must be
+// bound to the routed Host and gated on `enabled` exactly like the acct
+// spelling — two branches, one policy.
+func TestWebFinger_URLResourceBinding(t *testing.T) {
+	database := personasTestDB(t)
+	svc, _ := newTestService(t, database)
+	actors := store.NewAPActors(database)
+	vanity := seedVanityActor(t, database)
+	native := mintTestActor(t, svc, "bob."+userHost)
+
+	// Two independent layers refuse a foreign actor, and each needs its own
+	// case or the other one hides it.
+	//
+	// Layer 1 — the resource's own authority: the URL names vanity.example,
+	// so it is rejected before any lookup happens.
+	foreign := serveOnUserOrigin(svc, http.MethodGet, webfingerTarget(vanity.ActorID), nil)
+	assert.Equal(t, http.StatusNotFound, foreign.Code,
+		"an actor URL on another origin must not resolve here")
+
+	// Layer 2 — the FOUND actor's origin. Spelling the resource with OUR
+	// prefix and a foreign DID walks past layer 1 (the authority matches the
+	// routed Host) and past the path cut, and GetByDID succeeds because DIDs
+	// are global. Only the stored normalized_origin comparison stops it —
+	// without that check this origin would answer for an actor it does not
+	// host, handing a vanity actor a second identity on coves.social.
+	spoofed := serveOnUserOrigin(svc, http.MethodGet,
+		webfingerTarget(userOrigin+"/ap/actor/"+vanity.DID), nil)
+	assert.Equal(t, http.StatusNotFound, spoofed.Code,
+		"a foreign DID under this origin's prefix must not resolve; body=%s", spoofed.Body.String())
+
+	// The same spelling for a local actor resolves...
+	ok := serveOnUserOrigin(svc, http.MethodGet, webfingerTarget(native.ActorID), nil)
+	require.Equal(t, http.StatusOK, ok.Code, "body=%s", ok.Body.String())
+
+	// ... until it is disabled, which removes it from discovery through
+	// BOTH spellings.
+	require.NoError(t, actors.SetEnabled(t.Context(), native.DID, false))
+	byURL := serveOnUserOrigin(svc, http.MethodGet, webfingerTarget(native.ActorID), nil)
+	assert.Equal(t, http.StatusNotFound, byURL.Code,
+		"a disabled actor must not resolve by actor URL either")
+	byAcct := serveOnUserOrigin(svc, http.MethodGet,
+		webfingerTarget("acct:"+native.LocalPart+"@"+userHost), nil)
+	assert.Equal(t, http.StatusNotFound, byAcct.Code)
+}
+
+// TestServeActorDocument_PartialProfile: the cache fills field by field
+// (task 14 syncs whatever the appview has), so an avatar without a summary —
+// or the reverse — must render exactly the field that is known.
+func TestServeActorDocument_PartialProfile(t *testing.T) {
+	database := personasTestDB(t)
+	svc, _ := newTestService(t, database)
+	actors := store.NewAPActors(database)
+
+	t.Run("avatar without summary", func(t *testing.T) {
+		actor := mintTestActor(t, svc, testHandle)
+		const avatar = "https://cdn.example/only-avatar.png"
+		require.NoError(t, actors.UpdateProfile(t.Context(), actor.DID,
+			store.APActorProfile{AvatarURL: avatar}))
+
+		doc := decodeJSON(t, serveOnUserOrigin(svc, http.MethodGet, actorPath(actor.DID), nil))
+		icon, ok := doc["icon"].(map[string]any)
+		require.True(t, ok, "an avatar with no summary must still render an icon, got %v", doc["icon"])
+		assert.Equal(t, avatar, icon["url"])
+		assert.NotContains(t, doc, "summary", "an unknown summary stays absent")
+	})
+
+	t.Run("summary without avatar", func(t *testing.T) {
+		actor := mintTestActor(t, svc, "carol."+userHost)
+		require.NoError(t, actors.UpdateProfile(t.Context(), actor.DID,
+			store.APActorProfile{Summary: "tide pools only"}))
+
+		doc := decodeJSON(t, serveOnUserOrigin(svc, http.MethodGet, actorPath(actor.DID), nil))
+		assert.Equal(t, "tide pools only", doc["summary"])
+		assert.NotContains(t, doc, "icon", "an actor with no avatar publishes no icon")
+	})
 }

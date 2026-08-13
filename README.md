@@ -500,7 +500,11 @@ and is versioned by nsid: breaking changes ship under a new name.
 Its sibling under the same Tidepool-owned namespace is
 [`lexicons/social/coves/bridge/federation.json`](lexicons/social/coves/bridge/federation.json)
 (`key: literal:self`, one record per repo), the user-facing federation
-preference. It is an **opt-OUT**: federation is on by default, so the record's
+preference. **Staged contract:** the lexicon is published so Coves' settings
+UI can write against a stable shape — the bridge does not read it yet.
+Enforcement (honoring `enabled: false`, and the `deleteRemote` tier) lands
+with the task-14 consumer; until then the record is inert and federation is
+on for every minted actor. It is an **opt-OUT**: federation is on by default, so the record's
 ABSENCE means enabled and it only ever exists to turn federation down.
 `enabled: false` is a soft disable — the actor stops resolving via WebFinger
 and stops delivering, while its actor document and already-federated

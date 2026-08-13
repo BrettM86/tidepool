@@ -5,6 +5,8 @@ import (
 	"context"
 	"crypto/rsa"
 	"database/sql"
+	stderrors "errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -307,4 +309,73 @@ func countActors(t *testing.T, database *sql.DB, did string) int {
 	require.NoError(t, database.QueryRowContext(context.Background(),
 		`SELECT count(*) FROM ap_actors WHERE did = $1`, did).Scan(&count))
 	return count
+}
+
+// TestNew_CanonicalizesUserOrigin: config canonicalizes AP_USER_ORIGIN, but
+// personas.New is also constructed directly (tests, future callers), so it
+// normalizes defensively. A ":443" that slipped through would mint actors
+// under a SECOND namespace — normalized_origin "coves.social:443" — that
+// Host routing, which sees the canonical authority, could never resolve.
+func TestNew_CanonicalizesUserOrigin(t *testing.T) {
+	database := personasTestDB(t)
+	custodian, err := identity.NewCustodian(testKEK)
+	require.NoError(t, err)
+
+	svc, err := New(Options{
+		DB:         database,
+		Custodian:  custodian,
+		UserOrigin: "https://coves.social:443",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, svc)
+
+	did := testDID(t)
+	actor, err := svc.CreateActorForDID(t.Context(), did, testHandle)
+	require.NoError(t, err)
+	require.NotNil(t, actor)
+
+	assert.Equal(t, userHost, actor.NormalizedOrigin,
+		"the default https port is not part of the authority webfinger routes on")
+	assert.Equal(t, userOrigin+"/ap/actor/"+did, actor.ActorID,
+		"the actor id must carry the canonical origin: it is frozen at mint")
+}
+
+// TestCreateActorForDID_NamespaceExhaustion: the suffix search is bounded,
+// and the error at the end must not read as a uniqueness conflict. A caller
+// treating IsAlreadyExists as "someone else won, re-read the row" would
+// spin forever on a name that has no free suffix left.
+func TestCreateActorForDID_NamespaceExhaustion(t *testing.T) {
+	database := personasTestDB(t)
+	svc, _ := newTestService(t, database)
+	actors := store.NewAPActors(database)
+	ctx := t.Context()
+
+	// Seed the whole suffix range directly: alice, alice-2 ... alice-99.
+	// Going through CreateActorForDID would generate 99 RSA keys for no
+	// added coverage.
+	for attempt := 1; attempt <= 99; attempt++ {
+		local := testLocalPart
+		if attempt > 1 {
+			local = fmt.Sprintf("%s-%d", testLocalPart, attempt)
+		}
+		did := testDID(t)
+		_, err := actors.Create(ctx, store.APActor{
+			DID:              did,
+			Kind:             store.ActorTypePerson,
+			ActorID:          userOrigin + "/ap/actor/" + did,
+			NormalizedOrigin: userHost,
+			LocalPart:        local,
+			RSAKeySealed:     []byte{0x01, 0x02, 0x03},
+			RSAKeyVersion:    1,
+			PublicKeyPEM:     "seeded",
+		})
+		require.NoError(t, err, "seed %q", local)
+	}
+
+	_, err := svc.CreateActorForDID(ctx, testDID(t), testHandle)
+	require.Error(t, err, "the 100th claimant of one name has nowhere to go")
+	assert.True(t, stderrors.Is(err, ErrLocalPartExhausted),
+		"exhaustion is a branchable condition, not a message to grep: got %v", err)
+	assert.False(t, errors.IsAlreadyExists(err),
+		"exhaustion is not a conflict a caller can resolve by re-reading: got %v", err)
 }

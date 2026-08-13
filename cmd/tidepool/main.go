@@ -482,9 +482,15 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("host router: %w", err)
 	}
 
+	// The host router runs OUTSIDE the chi router, so chi's middleware no
+	// longer covers the user origin's requests. The two that must apply to
+	// every request on this listener are re-applied here in the same order
+	// chi chains them (RequestID first, so a panic recovered below is logged
+	// with one): without Recoverer a panic in the user surface would kill the
+	// whole process, taking the bridge down with it.
 	server := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           hostRouter,
+		Handler:           middleware.RequestID(middleware.Recoverer(hostRouter)),
 		ReadHeaderTimeout: readHeaderTimeout,
 		WriteTimeout:      writeTimeout,
 		IdleTimeout:       idleTimeout,

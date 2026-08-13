@@ -10,10 +10,9 @@ import (
 	"database/sql"
 	stderrors "errors"
 	"fmt"
+	"log/slog"
 	"net/http"
-	"net/url"
 	"strconv"
-	"strings"
 
 	"tidepool/internal/ap"
 	"tidepool/internal/errors"
@@ -24,6 +23,13 @@ import (
 // currentRSAKeyVersion stamps newly minted actor keys. Rotation would mint a
 // version 2 alongside the published key it replaces; nothing does yet.
 const currentRSAKeyVersion = 1
+
+// ErrLocalPartExhausted reports that every suffix in the collision range is
+// taken for one derived local part. It is deliberately NOT a conflict error:
+// a caller that read it as "someone else won the race, re-read the row" would
+// retry a name that has nowhere left to go, forever. An operator has to widen
+// the range or the namespace.
+var ErrLocalPartExhausted = stderrors.New("personas: local part namespace exhausted")
 
 // maxLocalPartAttempts bounds the collision search: attempt 1 claims the bare
 // local part and the rest append "-2" ... "-99", the suffix range
@@ -53,6 +59,10 @@ type Options struct {
 	// and queueing (ingest.Inbox.InboxHandler). Nil means the origin
 	// advertises an inbox it cannot serve, so the route 404s.
 	InboxHandler http.Handler
+	// Logger receives the conditions nobody sees from a response code: a
+	// 500 on the serve path, an exhausted namespace, a missing bridge
+	// identity. Nil uses slog.Default().
+	Logger *slog.Logger
 }
 
 // Service mints and serves Coves user actors.
@@ -71,38 +81,49 @@ type Service struct {
 	// inboxHandler is the ingest inbox this origin's shared inbox dispatches
 	// to. Nil means the route 404s.
 	inboxHandler http.Handler
+	logger       *slog.Logger
 }
 
-// New builds a Service. UserOrigin is parsed once here: the host it yields
-// keys every actor this service mints, so an origin that cannot produce one
-// is a startup error rather than a surprise at mint time.
+// New builds a Service. The origin is canonicalized once here — config
+// already did it, but a Service is also constructed directly, and a ":443"
+// that slipped through would mint actors under a second namespace whose
+// normalized_origin the routed Host could never match. A missing dependency
+// is a startup error rather than a nil-panic on the first request.
 func New(opts Options) (*Service, error) {
-	host, err := originHost(opts.UserOrigin)
+	if opts.DB == nil {
+		return nil, errors.NewValidationError("db", "must not be nil")
+	}
+	if opts.Custodian == nil {
+		return nil, errors.NewValidationError("custodian", "must not be nil")
+	}
+	origin, host, err := CanonicalizeOrigin(opts.UserOrigin)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("personas: user origin: %w", err)
+	}
+	logger := opts.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if opts.ServiceActor == nil {
+		// Not fatal, but not silent either: Lemmy delivers its
+		// send-to-all-instances activities — Delete{Person} above all —
+		// ONLY to the inbox on a peer's instance-actor row. Without one
+		// this origin never receives them, and nothing about that failure
+		// is visible from the outside.
+		logger.Warn("user origin has no service actor: the origin apex publishes no instance actor, "+
+			"so peers cannot deliver instance-wide activities (account deletions) here",
+			"user_origin", origin)
 	}
 	return &Service{
 		actors:     store.NewAPActors(opts.DB),
 		custodian:  opts.Custodian,
-		userOrigin: opts.UserOrigin,
+		userOrigin: origin,
 		userHost:   host,
 
 		serviceActor: opts.ServiceActor,
 		inboxHandler: opts.InboxHandler,
+		logger:       logger,
 	}, nil
-}
-
-// originHost reduces an origin URL to the scheme-less lowercase host.
-func originHost(origin string) (string, error) {
-	parsed, err := url.Parse(origin)
-	if err != nil {
-		return "", errors.NewValidationError("user_origin", err.Error())
-	}
-	if parsed.Host == "" {
-		return "", errors.NewValidationError("user_origin",
-			fmt.Sprintf("must be an absolute origin URL, got %q", origin))
-	}
-	return strings.ToLower(parsed.Host), nil
 }
 
 // CreateActorForDID get-or-creates the AP Person actor for a Coves DID:
@@ -187,7 +208,9 @@ func (s *Service) CreateActorForDID(ctx context.Context, did, handle string) (*s
 		}
 		return nil, fmt.Errorf("personas: create actor for %s: %w", did, createErr)
 	}
-	return nil, errors.NewConflictError("ap_actor", "local_part", base)
+	s.logger.Error("local part namespace exhausted: no free suffix left for a derived name",
+		"local_part", base, "attempts", maxLocalPartAttempts, "did", did)
+	return nil, fmt.Errorf("%w: %q after %d attempts", ErrLocalPartExhausted, base, maxLocalPartAttempts)
 }
 
 // suffixedLocalPart names the attempt'th claimant of base: the first keeps

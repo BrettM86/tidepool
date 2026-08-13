@@ -20,6 +20,9 @@ type marker struct {
 	calls    int
 	hosts    []string
 	notFound map[string]bool
+	// statuses overrides the answer for a path, so a test can prove which
+	// statuses the composed handler treats as "not mine".
+	statuses map[string]int
 }
 
 func newMarker(name string, notFound ...string) *marker {
@@ -35,6 +38,12 @@ func (m *marker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	m.hosts = append(m.hosts, r.Host)
 	if m.notFound[r.URL.Path] {
 		http.NotFound(w, r)
+		return
+	}
+	if status, ok := m.statuses[r.URL.Path]; ok {
+		w.Header().Set("X-Handler", m.name)
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(m.name + " " + r.URL.Path))
 		return
 	}
 	w.Header().Set("X-Handler", m.name)
@@ -93,9 +102,14 @@ func TestHostRouter_ServiceBucket(t *testing.T) {
 		{"localhost with port", "localhost:80"},
 		{"loopback v4", "127.0.0.1:8080"},
 		{"loopback v6", "[::1]:8080"},
-		{"public IP literal", "192.0.2.10"},
-		{"IPv6 literal", "[2001:db8::1]:443"},
 		{"absent Host", ""},
+		// PUBLIC IP literals used to live here. The review narrowed the
+		// address rule to LOOPBACK only: a bare public address names no
+		// configured surface, and admitting it let anyone reaching the
+		// process directly bypass whatever the proxy enforces per-name.
+		// They are now refused in production — see
+		// TestHostRouter_RejectsPublicIPLiterals, which also pins that dev
+		// fallthrough still keeps them on the service bucket.
 	}
 
 	for _, tc := range serviceHosts {
@@ -329,4 +343,102 @@ func TestNewHostRouter_RequiresHandlers(t *testing.T) {
 		UserHandler:    newMarker("user"),
 	})
 	assert.Error(t, err, "a router without a service host cannot classify anything")
+}
+
+// TestHostRouter_RejectsPublicIPLiterals: a bare IP Host has no registered
+// name behind it, so it cannot be the user origin — but it can absolutely be
+// an attacker probing the service surface directly, bypassing whatever the
+// proxy enforces per-name. Loopback is the exception that must keep working:
+// container healthchecks and local probes arrive that way.
+func TestHostRouter_RejectsPublicIPLiterals(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		host string
+	}{
+		{"public IPv4 literal", "192.0.2.10"},
+		{"public IPv4 literal with port", "192.0.2.10:8091"},
+		{"public IPv6 literal", "[2001:db8::1]:8080"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			router, service, user := newTestRouter(t, false)
+			rec := routeHost(t, router, "https", tc.host, "/healthz")
+			assert.Equal(t, http.StatusMisdirectedRequest, rec.Code,
+				"a public IP Host names no configured surface: %q", tc.host)
+			assert.Zero(t, service.calls)
+			assert.Zero(t, user.calls)
+		})
+	}
+
+	for _, tc := range []struct {
+		name string
+		host string
+	}{
+		{"loopback v4", "127.0.0.1:8091"},
+		{"loopback v6", "[::1]"},
+		{"loopback name", "localhost"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			router, service, _ := newTestRouter(t, false)
+			rec := routeHost(t, router, "http", tc.host, "/healthz")
+			assert.Equal(t, http.StatusOK, rec.Code,
+				"loopback is how healthchecks and local probes arrive; body=%s", rec.Body.String())
+			assert.Equal(t, 1, service.calls)
+		})
+	}
+
+	t.Run("dev fallthrough keeps public IPs on the service surface", func(t *testing.T) {
+		router, service, _ := newTestRouter(t, true)
+		rec := routeHost(t, router, "http", "192.0.2.10", "/healthz")
+		assert.Equal(t, http.StatusOK, rec.Code, "body=%s", rec.Body.String())
+		assert.Equal(t, 1, service.calls, "a dev box IS reached by its address")
+	})
+}
+
+// TestHostRouter_ComposedFallbackOnlyOn404: falling through on any error
+// status would replay a request the user surface already REFUSED — turning
+// its 400 into a service 404 (or worse, letting a rate-limited 503 be
+// retried immediately against another handler). Only "this path is not
+// mine", spelled 404, hands over.
+func TestHostRouter_ComposedFallbackOnlyOn404(t *testing.T) {
+	const shared = "localhost:8091"
+	newRouter := func(t *testing.T) (http.Handler, *marker, *marker) {
+		t.Helper()
+		service := newMarker("service")
+		user := newMarker("user", "/xrpc/_health")
+		user.statuses = map[string]int{
+			// A malformed webfinger: the user surface OWNS this path and
+			// has judged the request.
+			"/.well-known/webfinger": http.StatusBadRequest,
+			// A retryable refusal from the inbox.
+			"/ap/inbox": http.StatusServiceUnavailable,
+		}
+		router, err := NewHostRouter(HostRouterOptions{
+			ServiceHost:    shared,
+			ServiceHandler: service,
+			UserHost:       shared,
+			UserHandler:    user,
+			DevFallthrough: true,
+		})
+		require.NoError(t, err)
+		return router, service, user
+	}
+
+	for _, tc := range []struct {
+		path   string
+		status int
+	}{
+		{"/.well-known/webfinger", http.StatusBadRequest},
+		{"/ap/inbox", http.StatusServiceUnavailable},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			router, service, user := newRouter(t)
+			rec := routeHost(t, router, "http", shared, tc.path)
+			assert.Equal(t, tc.status, rec.Code,
+				"the user surface's own refusal must reach the client unchanged")
+			assert.Equal(t, "user", rec.Header().Get("X-Handler"))
+			assert.Equal(t, 1, user.calls)
+			assert.Zero(t, service.calls,
+				"a judged request must not be replayed against the other surface")
+		})
+	}
 }

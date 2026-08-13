@@ -53,7 +53,12 @@ func DeriveLocalPart(handle, nativeSuffix string) (string, error) {
 	if nativeSuffix == "" {
 		return "", errors.NewValidationError("native_suffix", "must not be empty")
 	}
-	suffix := strings.ToLower(nativeSuffix)
+	// The suffix arrives from config and from a routed Host, which spell the
+	// same authority several ways. It gets the SAME normalization as the
+	// handle: an unnormalized suffix silently demotes native handles to
+	// foreign ones, minting "alice.coves.social" instead of "alice" —
+	// permanently, since the local part is frozen.
+	suffix := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(nativeSuffix)), ".")
 
 	// Case is not identity: handles are compared and stored lowercased, and
 	// normalizing before parsing keeps "Alice.Coves.Social" and its
@@ -80,7 +85,11 @@ func DeriveLocalPart(handle, nativeSuffix string) (string, error) {
 		local = prefix
 	}
 	if len(local) > MaxLocalPartLen {
-		local = local[:MaxLocalPartLen]
+		// The cut is blind, so it can land on a separator. A local part
+		// ending in "." or "-" is not a name anything renders or matches
+		// sanely: Lemmy's mention regex wants a trailing alphanumeric, and
+		// a trailing dot reads as a hostname root.
+		local = strings.TrimRight(local[:MaxLocalPartLen], ".-")
 	}
 	return local, nil
 }

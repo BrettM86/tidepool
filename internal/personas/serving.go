@@ -3,6 +3,7 @@ package personas
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -33,8 +34,15 @@ const (
 	securityNamespace = "https://w3id.org/security/v1"
 )
 
-// ServeHTTP serves the user-origin surface: /.well-known/webfinger,
-// /ap/actor/{did}, and /ap/actor/{did}/outbox.
+// ServeHTTP serves the user-origin surface:
+//
+//	GET  /.well-known/webfinger   discovery for a local part on the routed Host
+//	GET  /ap/actor/{did}          the user's Person document
+//	GET  /ap/actor/{did}/outbox   the (empty) outbox Lemmy requires
+//	POST /ap/inbox                shared inbox, dispatched to the ingest inbox
+//	GET  /                        the origin's instance (Application) actor
+//	GET  /.well-known/nodeinfo    nodeinfo discovery
+//	GET  /nodeinfo/2.0            nodeinfo 2.0 document
 //
 // Routing reads r.URL.Path, which net/http has already percent-decoded. A
 // DID's colons are legal unescaped, so both "did:plc:x" and "did%3Aplc%3Ax"
@@ -129,11 +137,21 @@ func (s *Service) handleInbox(w http.ResponseWriter, r *http.Request) {
 func (s *Service) handleActorDocument(w http.ResponseWriter, r *http.Request, did string) {
 	actor, err := s.actors.GetByDID(r.Context(), did)
 	if err != nil {
-		writeStoreError(w, err)
+		s.writeStoreError(w, r, err)
+		return
+	}
+	if !s.servesActor(actor, r) {
+		http.NotFound(w, r)
 		return
 	}
 
-	origin := actorOrigin(actor, s.userOrigin)
+	origin, err := actorOrigin(actor)
+	if err != nil {
+		s.logger.Error("stored actor_id is not an absolute URL",
+			"did", actor.DID, "actor_id", actor.ActorID, "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
 	inbox := origin + inboxPath
 	// The display name falls back to the local part: Lemmy renders `name`,
 	// and an empty one shows as a blank user until task 14's profile sync
@@ -184,7 +202,11 @@ func (s *Service) handleActorDocument(w http.ResponseWriter, r *http.Request, di
 func (s *Service) handleOutbox(w http.ResponseWriter, r *http.Request, did string) {
 	actor, err := s.actors.GetByDID(r.Context(), did)
 	if err != nil {
-		writeStoreError(w, err)
+		s.writeStoreError(w, r, err)
+		return
+	}
+	if !s.servesActor(actor, r) {
+		http.NotFound(w, r)
 		return
 	}
 	writeJSON(w, ap.ContentTypeActivityJSON, map[string]any{
@@ -213,7 +235,7 @@ func (s *Service) handleWebFinger(w http.ResponseWriter, r *http.Request) {
 	host := normalizeHost(r.Host)
 	actor, err := s.lookupResource(r.Context(), resource, host)
 	if err != nil {
-		writeStoreError(w, err)
+		s.writeStoreError(w, r, err)
 		return
 	}
 	if !actor.Enabled {
@@ -277,16 +299,30 @@ func (s *Service) lookupResource(ctx context.Context, resource, host string) (*s
 	return actor, nil
 }
 
+// servesActor reports whether the routed Host is the actor's OWN origin. The
+// DID is global but the actor is not: serving a vanity-origin actor's
+// document under another Host would publish a document whose id sits on a
+// different authority — the cross-authority claim ap.Client's key resolution
+// refuses, and the mirror image of the binding webfinger already enforces.
+func (s *Service) servesActor(actor *store.APActor, r *http.Request) bool {
+	return actor.NormalizedOrigin == normalizeHost(r.Host)
+}
+
 // actorOrigin recovers the scheme+host an actor was minted under from its
 // stored actor_id, so a vanity-origin actor advertises its own inbox rather
-// than the configured one. The configured origin is only the fallback for an
-// actor_id that cannot be parsed.
-func actorOrigin(actor *store.APActor, fallback string) string {
+// than the configured one. It FAILS CLOSED: an actor_id that will not parse
+// means the row is corrupt, and falling back to the configured origin would
+// publish a document whose inbox and key belong to a different authority than
+// its id — quietly, and cached by every peer that fetched it.
+func actorOrigin(actor *store.APActor) (string, error) {
 	parsed, err := url.Parse(actor.ActorID)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return fallback
+	if err != nil {
+		return "", fmt.Errorf("parse actor_id %q: %w", actor.ActorID, err)
 	}
-	return parsed.Scheme + "://" + parsed.Host
+	if parsed.Scheme == "" || parsed.Host == "" {
+		return "", fmt.Errorf("actor_id %q is not an absolute URL", actor.ActorID)
+	}
+	return parsed.Scheme + "://" + parsed.Host, nil
 }
 
 func writeJSON(w http.ResponseWriter, contentType string, doc any) {
@@ -296,14 +332,19 @@ func writeJSON(w http.ResponseWriter, contentType string, doc any) {
 
 // writeStoreError maps a store/validation error onto the status a remote
 // resolver will read correctly: a miss is cacheable as "no such account", a
-// malformed request is the caller's fault, and anything else is ours.
-func writeStoreError(w http.ResponseWriter, err error) {
+// malformed request is the caller's fault, and anything else is ours — and
+// the last case is LOGGED, because a 500 body says nothing and a database
+// that has started failing under a peer's discovery traffic is otherwise
+// invisible.
+func (s *Service) writeStoreError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.IsNotFound(err):
 		http.Error(w, "resource not found", http.StatusNotFound)
 	case errors.IsValidation(err):
 		http.Error(w, "malformed request", http.StatusBadRequest)
 	default:
+		s.logger.Error("user origin request failed",
+			"path", r.URL.Path, "host", r.Host, "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 	}
 }

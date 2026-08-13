@@ -11,12 +11,6 @@ const (
 	nodeInfoDiscoveryPath = "/.well-known/nodeinfo"
 	nodeInfoSchemaPath    = "/nodeinfo/2.0"
 	nodeInfoSchemaRel     = "http://nodeinfo.diaspora.software/ns/schema/2.0"
-	// nodeInfoSoftwareName is what Lemmy admins allowlist by; it and the
-	// version mirror the service surface's nodeinfo (ingest/inbox.go), which
-	// describes the same deployment from its other origin.
-	nodeInfoSoftwareName    = "tidepool"
-	nodeInfoSoftwareVersion = "0.1.0"
-
 	// instanceOutboxPath is advertised, not served — the same shape the
 	// service surface's instance actor publishes. Lemmy's Instance parser
 	// REQUIRES the field but never dereferences it.
@@ -101,8 +95,8 @@ func (s *Service) handleNodeInfo(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, "application/json", map[string]any{
 		"version": "2.0",
 		"software": map[string]any{
-			"name":    nodeInfoSoftwareName,
-			"version": nodeInfoSoftwareVersion,
+			"name":    ap.SoftwareName,
+			"version": ap.SoftwareVersion,
 		},
 		"protocols": []any{"activitypub"},
 		"services":  map[string]any{"inbound": []any{}, "outbound": []any{}},

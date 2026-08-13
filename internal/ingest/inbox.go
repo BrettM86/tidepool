@@ -74,13 +74,6 @@ const (
 	defaultTombstoneConfirmBurst         = 10
 )
 
-// softwareName is what nodeinfo reports; Lemmy admins allowlist by this
-// name.
-const (
-	softwareName    = "tidepool"
-	softwareVersion = "0.1.0"
-)
-
 // ActorFetcher fetches an AP actor document by IRI — the slice of
 // *ap.Client the inbox needs to confirm an actor tombstone (see
 // tombstonedSelfDelete). The same-authority variant is required because that
@@ -532,8 +525,8 @@ func (ib *Inbox) handleNodeInfo(w http.ResponseWriter, _ *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"version": "2.0",
 		"software": map[string]any{
-			"name":    softwareName,
-			"version": softwareVersion,
+			"name":    ap.SoftwareName,
+			"version": ap.SoftwareVersion,
 		},
 		"protocols":         []any{"activitypub"},
 		"services":          map[string]any{"inbound": []any{}, "outbound": []any{}},

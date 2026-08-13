@@ -25,12 +25,34 @@ func TestMigrations_UpDownUp(t *testing.T) {
 		SELECT COUNT(*) FROM information_schema.tables
 		WHERE table_schema = 'public'
 		  AND table_name IN ('ap_objects', 'ap_actors', 'bridged_actors', 'communities', 'inbox_events', 'service_keys',
-		                     'blocks', 'repo_state', 'firehose_events', 'vote_aggregates', 'vote_events')
+		                     'blocks', 'repo_state', 'firehose_events', 'vote_aggregates', 'vote_events',
+		                     -- task 14 (migration 018): the consumer's own state and the
+		                     -- outbound state deletes are rebuilt from.
+		                     'consumer_cursors', 'jetstream_record_revs', 'jetstream_dead_letters',
+		                     'outbound_objects', 'outbound_votes', 'federation_prefs')
 	`).Scan(&remaining)
 	require.NoError(t, err)
 	assert.Zero(t, remaining, "down migrations must drop every Tidepool table")
 
 	require.NoError(t, db.MigrateUp(ctx, database), "re-applying up migrations must succeed")
+
+	// The down list above only bites if the tables were there to begin with:
+	// a migration whose Down forgets a table is caught only when its Up
+	// created one. Assert the newest tables exist after the re-up so the two
+	// halves stay in step.
+	for _, table := range []string{
+		"consumer_cursors", "jetstream_record_revs", "jetstream_dead_letters",
+		"outbound_objects", "outbound_votes", "federation_prefs",
+	} {
+		var exists bool
+		err = database.QueryRowContext(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM information_schema.tables
+				WHERE table_schema = 'public' AND table_name = $1
+			)`, table).Scan(&exists)
+		require.NoError(t, err)
+		assert.True(t, exists, "migration 018 must create %q", table)
+	}
 
 	// Leave the schema usable and prove it is: exercise a write.
 	repo := NewAPObjects(database)
@@ -63,6 +85,26 @@ func TestMigrations_UniqueConstraintNames(t *testing.T) {
 		"inbox_events_activity_id_key",
 		"service_keys_name_key",
 		"vote_events_activity_id_key", // the vote dedupe key (task 07)
+
+		// Task 14 (migration 018). The composite cursor key is the whole
+		// point of consumer_cursors: (consumer_name, schema_version), so a
+		// future incompatible handler replays without stomping production.
+		"consumer_cursors_pkey",
+		"jetstream_record_revs_pkey",
+		// The dead-letter dedup index — same name as the Coves original this
+		// is ported from. Without it a poison frame replayed by the reconnect
+		// rewind grows a fresh row per pass instead of being absorbed, and
+		// AddDeadLetter stops being the no-op success that lets the cursor
+		// advance past it.
+		"idx_jetstream_dead_letters_dedup",
+		"outbound_objects_pkey",
+		// outbound_votes is keyed by the VOTE record's at-uri, because that
+		// is the only thing a vote delete commit carries. The (actor,
+		// subject) pair is a second, EXPLICITLY NAMED unique constraint: the
+		// store's 23505 → ConflictError mapping switches on the name.
+		"outbound_votes_pkey",
+		"outbound_votes_actor_subject_key",
+		"federation_prefs_pkey",
 	}
 	for _, name := range expected {
 		var exists bool

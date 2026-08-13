@@ -167,6 +167,127 @@ type ServiceKey struct {
 	CreatedAt   time.Time
 }
 
+// DeliveredState tracks how far an outbound vote has travelled. The consumer
+// (task 14) only ever writes pending; task 15 flips it on DELIVERY SUCCESS,
+// never on enqueue — a state that claimed delivery before the wire confirmed
+// it would make an Undo unsendable.
+type DeliveredState string
+
+const (
+	// DeliveredStatePending means the intent is recorded but unconfirmed.
+	DeliveredStatePending DeliveredState = "pending"
+	// DeliveredStateDelivered means a peer accepted the Like/Dislike.
+	DeliveredStateDelivered DeliveredState = "delivered"
+	// DeliveredStateUndone means the Undo was delivered; the row is kept as
+	// the record of what was withdrawn.
+	DeliveredStateUndone DeliveredState = "undone"
+)
+
+// Valid reports whether the value is a known delivered state.
+func (s DeliveredState) Valid() bool {
+	switch s {
+	case DeliveredStatePending, DeliveredStateDelivered, DeliveredStateUndone:
+		return true
+	}
+	return false
+}
+
+// FederationPrefSource records where a federation preference came from: a
+// social.coves.bridge.federation record the consumer saw, or a direct probe of
+// the user's repo. It is stated explicitly — the zero value is invalid —
+// because "we read this from a record" and "we went and asked" have different
+// staleness, and a defaulted source hides which one applied.
+type FederationPrefSource string
+
+const (
+	// FederationPrefSourceRecord means a Jetstream commit carried the record.
+	FederationPrefSourceRecord FederationPrefSource = "record"
+	// FederationPrefSourceProbe means the bridge fetched the record itself.
+	FederationPrefSourceProbe FederationPrefSource = "probe"
+)
+
+// Valid reports whether the value is a known source.
+func (s FederationPrefSource) Valid() bool {
+	switch s {
+	case FederationPrefSourceRecord, FederationPrefSourceProbe:
+		return true
+	}
+	return false
+}
+
+// OutboundObject is the durable outbound state for one native record Tidepool
+// federates outward (task 14, decision 14). It exists because a Jetstream
+// DELETE commit carries the DID, collection and rkey and NOTHING else — no
+// record body, no CID — so every fact a Delete{Note} needs must already be at
+// rest here before the delete arrives.
+type OutboundObject struct {
+	// ATURI is the record's at-uri and the row's primary key.
+	ATURI string
+	// APObjectID is the AP id this record federates as.
+	APObjectID string
+	// LastCID and LastRev are PROVENANCE ONLY — what the last applied commit
+	// looked like. The ordering gate is jetstream_record_revs, never this
+	// column: a rev read from here is a check→write race by construction.
+	LastCID string
+	LastRev string
+	// CommunityDID and CommunityAPID are the target community on both sides
+	// of the bridge.
+	CommunityDID  string
+	CommunityAPID string
+	// TranslatedSnapshot is the JSONB state task 15 serves the object from and
+	// task 17 restores it from.
+	TranslatedSnapshot []byte
+	// LastActivitySeq feeds ActivityID: create is 0, every applied
+	// update/delete bumps it, so each operation gets its own stable id.
+	LastActivitySeq int
+	// Depth is the reply depth. Lemmy caps comment depth at 50.
+	Depth        int
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+	TombstonedAt *time.Time
+}
+
+// IsTombstoned reports whether the record was deleted upstream. Tombstoned
+// rows are KEPT: they are what a late replay is rejected against.
+func (o *OutboundObject) IsTombstoned() bool { return o.TombstonedAt != nil }
+
+// OutboundVote is the durable outbound state for one native vote (decision
+// 16). A vote DELETE commit names only the vote record, so direction and the
+// activity id it was delivered under have to be readable back from here to
+// build the Undo.
+type OutboundVote struct {
+	// VoteATURI is the vote record's at-uri and the row's primary key — the
+	// delete path's only lookup key.
+	VoteATURI string
+	// ActorDID and SubjectATURI are UNIQUE TOGETHER: one actor holds at most
+	// one live vote per subject.
+	ActorDID     string
+	SubjectATURI string
+	SubjectAPID  string
+	CommunityDID string
+	// Direction is up or down.
+	Direction string
+	// CurrentActivityID is the id the Like/Dislike went out under; the Undo
+	// must embed it.
+	CurrentActivityID string
+	DeliveredState    DeliveredState
+	// ActivitySeq feeds ActivityID for this vote's operations.
+	ActivitySeq int
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
+// FederationPref is a Coves user's federation preference (decision 11). The
+// record is an OPT-OUT and federation is DEFAULT-ON, so an ABSENT row means
+// enabled: this table only ever holds rows for users who said something.
+type FederationPref struct {
+	DID          string
+	Enabled      bool
+	DeleteRemote bool
+	Source       FederationPrefSource
+	UpdatedAt    time.Time
+}
+
 // InboxEvent is a received AP activity: the dedupe record AND the durable
 // work-queue item task 06's worker pool consumes.
 type InboxEvent struct {

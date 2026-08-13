@@ -292,6 +292,111 @@ type InboxEvents interface {
 	GetEvent(ctx context.Context, activityID string) (*InboxEvent, error)
 }
 
+// OutboundObjects persists the state every outbound Delete and Update is
+// rebuilt from (task 14, decision 14). A Jetstream delete commit carries the
+// DID, collection and rkey and nothing else — no record body, no CID — so a
+// Delete{Note} can only be built from what was written here at create time.
+//
+// Rows are TOMBSTONED, never removed: the row is what a late replay of the
+// create is rejected against.
+type OutboundObjects interface {
+	// Upsert idempotently writes the outbound state keyed on ATURI and
+	// returns the stored row. A new row starts at LastActivitySeq 0; every
+	// later upsert of the same at-uri bumps it, so each applied operation
+	// gets its own stable activity id. CreatedAt is preserved.
+	//
+	// The bump is safe ONLY because the rev gate runs first: a replayed
+	// commit never reaches this method, so the seq (and therefore the
+	// activity id) is stable under replay.
+	Upsert(ctx context.Context, object OutboundObject) (*OutboundObject, error)
+
+	// UpsertTx is Upsert on an existing transaction — the seam that lets the
+	// rev-gate claim and the outbound state land in ONE commit. A nil tx is
+	// an error satisfying errors.IsValidation.
+	UpsertTx(ctx context.Context, tx *sql.Tx, object OutboundObject) (*OutboundObject, error)
+
+	// GetByATURI returns the outbound state for an at-uri, tombstoned rows
+	// included (callers check IsTombstoned). A miss is an error satisfying
+	// errors.IsNotFound.
+	GetByATURI(ctx context.Context, atURI string) (*OutboundObject, error)
+
+	// Tombstone stamps tombstoned_at, bumps LastActivitySeq and returns the
+	// full stored row — the state the Delete activity is built from, handed
+	// back in the same statement that tombstones it so no read/write window
+	// exists. Tombstoning an already-tombstoned row is a no-op success that
+	// preserves the original tombstoned_at AND the seq (a redelivered delete
+	// must reuse the id the first one sent). A missing row is an error
+	// satisfying errors.IsNotFound.
+	Tombstone(ctx context.Context, atURI string) (*OutboundObject, error)
+
+	// TombstoneTx is Tombstone on an existing transaction. A nil tx is an
+	// error satisfying errors.IsValidation.
+	TombstoneTx(ctx context.Context, tx *sql.Tx, atURI string) (*OutboundObject, error)
+}
+
+// OutboundVotes persists the state an outbound Undo is rebuilt from (decision
+// 16). A vote delete commit names the vote record and nothing else, so the
+// direction and the activity id the Like/Dislike went out under have to be
+// readable back from here.
+type OutboundVotes interface {
+	// Upsert idempotently writes the vote intent keyed on VoteATURI and
+	// returns the stored row. An empty DeliveredState defaults to
+	// DeliveredStatePending — the consumer records intent only; delivery is
+	// task 15's to claim. A new row starts at ActivitySeq 0; re-upserting the
+	// same vote at-uri bumps it. Writing a DIFFERENT vote at-uri for an
+	// (ActorDID, SubjectATURI) pair that already has one returns an error
+	// satisfying errors.IsAlreadyExists: one actor holds at most one live
+	// vote per subject, and silently clobbering the old row would strand its
+	// Undo.
+	Upsert(ctx context.Context, vote OutboundVote) (*OutboundVote, error)
+
+	// UpsertTx is Upsert on an existing transaction. A nil tx is an error
+	// satisfying errors.IsValidation.
+	UpsertTx(ctx context.Context, tx *sql.Tx, vote OutboundVote) (*OutboundVote, error)
+
+	// GetByATURI returns the vote for a vote record's at-uri — the DELETE
+	// path's lookup key, because a delete commit carries nothing else. A miss
+	// is an error satisfying errors.IsNotFound.
+	GetByATURI(ctx context.Context, voteATURI string) (*OutboundVote, error)
+
+	// GetByActorSubject returns the actor's live vote on a subject — the
+	// CREATE path's lookup, which asks "did this actor already vote here?".
+	// A miss is an error satisfying errors.IsNotFound.
+	GetByActorSubject(ctx context.Context, actorDID, subjectATURI string) (*OutboundVote, error)
+
+	// SetDeliveredState transitions the delivery state. An unknown state is
+	// an error satisfying errors.IsValidation; a missing vote is an error
+	// satisfying errors.IsNotFound.
+	SetDeliveredState(ctx context.Context, voteATURI string, state DeliveredState) error
+
+	// Delete removes the vote state once its Undo is delivered. Deleting a
+	// missing vote is a no-op success.
+	Delete(ctx context.Context, voteATURI string) error
+}
+
+// FederationPrefs stores Coves users' federation preferences (decision 11).
+//
+// Federation is DEFAULT-ON and social.coves.bridge.federation is an OPT-OUT
+// record, so an ABSENT row means enabled. Get therefore returns NotFound for
+// a user who never said anything — it never invents an enabled row, because a
+// caller that cannot tell "opted in" from "never spoke" cannot tell a
+// re-enable from a first sighting either.
+type FederationPrefs interface {
+	// Upsert writes the preference keyed on DID and returns the stored row.
+	// Every field is overwritten, so re-enabling (Enabled true) also clears a
+	// previously requested DeleteRemote. Source must be stated explicitly:
+	// the zero value is an error satisfying errors.IsValidation.
+	Upsert(ctx context.Context, pref FederationPref) (*FederationPref, error)
+
+	// Get returns the preference for a DID. A miss is an error satisfying
+	// errors.IsNotFound and MEANS default-on, not "unknown".
+	Get(ctx context.Context, did string) (*FederationPref, error)
+
+	// Delete removes the preference — the record-delete path, which restores
+	// the default-on state. Deleting a missing preference is a no-op success.
+	Delete(ctx context.Context, did string) error
+}
+
 // Tombstones remembers AP object ids whose Delete arrived before (or
 // without) a materialization — the create-after-delete gap: a Create
 // delivered after its Delete must not resurrect content the origin removed.

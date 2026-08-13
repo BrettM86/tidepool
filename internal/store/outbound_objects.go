@@ -49,8 +49,9 @@ func (r *postgresOutboundObjects) upsert(ctx context.Context, q execer, object O
 	// skip — an activity id a peer has already seen.
 	//
 	// tombstoned_at is likewise untouched here. A tombstoned row that receives
-	// a later write keeps its tombstone: un-deleting is a decision for a
-	// restore path (task 17), not a side effect of an upsert.
+	// a later write keeps its tombstone: clearing it is an explicit decision,
+	// never a side effect of an upsert. (Task 17's echo-moderation restore is a
+	// fresh acceptance, not an un-tombstone of this row.)
 	query := `
 		INSERT INTO outbound_objects (
 			at_uri, ap_object_id, last_cid, last_rev,

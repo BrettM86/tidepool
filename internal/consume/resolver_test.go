@@ -2,6 +2,7 @@ package consume
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"testing"
 
@@ -302,4 +303,66 @@ func TestHandleResolver_TXTWithoutAnATProtoRecordFallsThrough(t *testing.T) {
 	assert.Equal(t, 1, fake.WellKnownHits(),
 		"an unrelated TXT record set is not an atproto answer, so verification "+
 			"continues rather than failing")
+}
+
+// ---------------------------------------------------------------------------
+// Second-opinion C5: a DNS OUTAGE must not turn into a permanent verdict
+// ---------------------------------------------------------------------------
+//
+// Impersonation is permanent ONLY when DNS authoritatively said the handle has
+// no record and the well-known then named a different DID. If DNS was
+// UNREACHABLE (SERVFAIL, timeout) we never learned what the real owner's DNS
+// claims, so a mismatched well-known cannot be trusted as impersonation — an
+// attacker who controls the handle's web server but not its DNS would win a
+// permanent verdict exactly during a DNS blip. The result must be TRANSIENT so
+// the redrive re-checks once DNS recovers.
+
+func TestHandleResolver_DNSOutageWithMismatchedWellKnownIsTransient(t *testing.T) {
+	fake := newFakeIdentity(t)
+	fake.claimOneWay(resolveOtherDID, resolveHandle) // doc claims the handle
+	fake.txtFails(resolveHandle, &net.DNSError{Err: "server misbehaving", Name: "_atproto." + resolveHandle, IsTemporary: true})
+	fake.wellKnownReturns(resolveHandle, resolveDID) // well-known names a DIFFERENT DID
+
+	handle, err := fake.resolver(t).ResolveDIDHandle(context.Background(), resolveOtherDID)
+
+	require.Error(t, err)
+	assert.Empty(t, handle)
+	assert.NotErrorIs(t, err, ErrPermanentEvent,
+		"DNS was unreachable, so we never learned the owner's authoritative claim — a "+
+			"mismatched well-known during a DNS outage cannot be trusted as "+
+			"impersonation, and burning the redrive budget on it would strand a "+
+			"legitimate mint whenever DNS blips")
+	assert.Positive(t, fake.TXTHits(), "DNS was actually consulted")
+}
+
+func TestHandleResolver_NXDOMAINWithMismatchedWellKnownStaysPermanent(t *testing.T) {
+	fake := newFakeIdentity(t)
+	fake.claimOneWay(resolveOtherDID, resolveHandle)
+	// No TXT registered → the fake returns an NXDOMAIN (IsNotFound) error:
+	// DNS authoritatively has no record, so the well-known is the answer.
+	fake.wellKnownReturns(resolveHandle, resolveDID)
+
+	handle, err := fake.resolver(t).ResolveDIDHandle(context.Background(), resolveOtherDID)
+
+	require.Error(t, err)
+	assert.Empty(t, handle)
+	assert.ErrorIs(t, err, ErrPermanentEvent,
+		"NXDOMAIN is authoritative — the handle publishes no DNS claim — so a "+
+			"well-known naming a different DID is a real impersonation and stays "+
+			"permanent. Only a DNS OUTAGE downgrades the verdict")
+}
+
+func TestHandleResolver_WellKnown404IsTransient(t *testing.T) {
+	fake := newFakeIdentity(t)
+	fake.claimOneWay(resolveDID, resolveHandle) // no TXT, no well-known body
+	fake.wellKnownFails(resolveHandle, http.StatusNotFound)
+
+	handle, err := fake.resolver(t).ResolveDIDHandle(context.Background(), resolveDID)
+
+	require.Error(t, err)
+	assert.Empty(t, handle)
+	assert.NotErrorIs(t, err, ErrPermanentEvent,
+		"a 404 well-known is NOT a disavowal: the handle may be mid-setup, or publish "+
+			"its claim only over DNS. Treating it as permanent would strand a user who "+
+			"finishes configuring their PDS a minute later")
 }

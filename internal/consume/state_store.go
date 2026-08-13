@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // The SQL here is a PORT of the Coves AppView's state_store.go — the monotonic
@@ -85,18 +86,38 @@ func (s *PostgresStateStore) SaveCursor(ctx context.Context, consumerName string
 // the cursor may advance past a poison frame.
 func (s *PostgresStateStore) AddDeadLetter(ctx context.Context, consumerName string, eventTimeUS int64, eventData []byte, handleErr string, redriveAttempts int) error {
 	// event_data is written as raw bytes so byte-corrupt frames are capturable.
+	// last_error is TEXT, so it is SANITIZED first: a malformed frame's error
+	// can carry the very bytes that made it malformed (a NUL, invalid UTF-8),
+	// and postgres TEXT rejects a NUL outright. An unsanitized error would fail
+	// the dead-letter write, the connector would tear the connection down
+	// without advancing the cursor, and the same poison frame would replay
+	// forever — this is the fallback that must never itself fail.
+	//
 	// redriveAttempts seeds the budget: 0 for transient failures, and
 	// MaxRedriveAttempts for permanent ones, which are kept for forensics only.
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO jetstream_dead_letters (consumer_name, event_time_us, event_data, last_error, attempts)
 		VALUES ($1, $2, $3, $4, $5)
 		ON CONFLICT DO NOTHING`,
-		consumerName, eventTimeUS, eventData, handleErr, redriveAttempts,
+		consumerName, eventTimeUS, eventData, sanitizeErrorText(handleErr), redriveAttempts,
 	)
 	if err != nil {
 		return fmt.Errorf("add dead letter for %s: %w", consumerName, err)
 	}
 	return nil
+}
+
+// sanitizeErrorText makes an error string safe for a postgres TEXT column
+// while keeping it readable. NUL bytes are stripped (postgres rejects them
+// outright) and any remaining invalid UTF-8 is coerced to the replacement
+// rune, so an operator can still read the diagnostic out of the DLQ. Scrubbing
+// the bad bytes, not discarding the message.
+func sanitizeErrorText(s string) string {
+	if s == "" {
+		return s
+	}
+	s = strings.ReplaceAll(s, "\x00", "")
+	return strings.ToValidUTF8(s, "�")
 }
 
 // ListRetryable returns up to limit dead letters for the consumer that have

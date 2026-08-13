@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -280,11 +281,19 @@ func commentFrameFor(did, rev, rkey string) []byte {
 		did, rev, rkey, acceptRootATURI, acceptRootCID, acceptRootATURI, acceptRootCID))
 }
 
+// accountSeqCounter hands out a strictly increasing seq to every
+// accountFrameFor frame. #account carries a monotonic seq per DID, and the
+// consumer now rejects a stale one (C4), so a deactivate→reactivate flow built
+// from two frames needs the second to out-rank the first. Tests that pin the
+// seq gate itself use accountFrameSeq with explicit values instead.
+var accountSeqCounter atomic.Int64
+
 func accountFrameFor(did string, active bool, status string) []byte {
+	seq := accountSeqCounter.Add(1)
 	return []byte(fmt.Sprintf(
-		`{"did":%q,"time_us":6500,"kind":"account",`+
-			`"account":{"did":%q,"seq":9,"time":"2026-08-12T10:00:00.000Z","active":%t,"status":%q}}`,
-		did, did, active, status))
+		`{"did":%q,"time_us":%d,"kind":"account",`+
+			`"account":{"did":%q,"seq":%d,"time":"2026-08-12T10:00:00.000Z","active":%t,"status":%q}}`,
+		did, 6500+seq, did, seq, active, status))
 }
 
 func identityFrameFor(did, handle string) []byte {

@@ -2,6 +2,7 @@ package consume
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log/slog"
 
@@ -26,13 +27,15 @@ const (
 	directionDown = "down"
 )
 
-// handleVote applies one vote commit.
-func (d *Dispatcher) handleVote(ctx context.Context, did string, commit *CommitEvent) error {
+// handleVote applies one vote commit. tx is the rev-gate's transaction: the
+// outbound_votes write rides it, so the state write, the gate advance and the
+// enqueue commit together — a failed enqueue rolls all three back.
+func (d *Dispatcher) handleVote(ctx context.Context, tx *sql.Tx, did string, commit *CommitEvent) error {
 	switch commit.Operation {
 	case operationCreate, operationUpdate:
-		return d.applyVoteWrite(ctx, did, commit)
+		return d.applyVoteWrite(ctx, tx, did, commit)
 	case operationDelete:
-		return d.applyVoteDelete(ctx, did, commit)
+		return d.applyVoteDelete(ctx, tx, did, commit)
 	default:
 		d.logger.Debug("unknown vote operation",
 			slog.String("operation", commit.Operation), slog.String("did", did))
@@ -47,7 +50,7 @@ func (d *Dispatcher) handleVote(ctx context.Context, did string, commit *CommitE
 // earlier draft of this task missed that gate), then everything that decides
 // whether the vote can federate at all, and only then the identity and the
 // state.
-func (d *Dispatcher) applyVoteWrite(ctx context.Context, did string, commit *CommitEvent) error {
+func (d *Dispatcher) applyVoteWrite(ctx context.Context, tx *sql.Tx, did string, commit *CommitEvent) error {
 	federating, err := d.mayFederate(ctx, did)
 	if err != nil {
 		return err
@@ -101,7 +104,7 @@ func (d *Dispatcher) applyVoteWrite(ctx context.Context, did string, commit *Com
 		return fmt.Errorf("read vote state for %s: %w", voteATURI, err)
 	}
 
-	stored, err := d.votes.Upsert(ctx, store.OutboundVote{
+	stored, err := d.votes.UpsertTx(ctx, tx, store.OutboundVote{
 		VoteATURI:    voteATURI,
 		ActorDID:     did,
 		SubjectATURI: subjectATURI,
@@ -151,7 +154,7 @@ func (d *Dispatcher) applyVoteWrite(ctx context.Context, did string, commit *Com
 // Like a comment delete, this is NOT gated on the opt-out: an Undo only ever
 // removes something, and blocking it would leave the user's vote standing on
 // the peer forever — the opposite of what asking to stop federating means.
-func (d *Dispatcher) applyVoteDelete(ctx context.Context, did string, commit *CommitEvent) error {
+func (d *Dispatcher) applyVoteDelete(ctx context.Context, tx *sql.Tx, did string, commit *CommitEvent) error {
 	voteATURI := commitRecordURI(did, commit)
 
 	stored, err := d.votes.GetByATURI(ctx, voteATURI)
@@ -165,12 +168,21 @@ func (d *Dispatcher) applyVoteDelete(ctx context.Context, did string, commit *Co
 		return fmt.Errorf("read vote state for %s: %w", voteATURI, err)
 	}
 
+	// The community must resolve BEFORE the row is bumped, so a failed lookup
+	// rolls back on the gate transaction rather than leaving a bumped seq
+	// behind an Undo that was never enqueued.
+	communityAPID, err := d.communityAPID(ctx, stored.CommunityDID)
+	if err != nil {
+		return err
+	}
+
 	// Re-upserting the row bumps the seq — the Undo is the next activity, and
 	// its id must not collide with the Like's — while keeping every other
 	// column, CurrentActivityID above all: that is the id the Like was
 	// delivered under, and the Undo has to embed it. The row SURVIVES: task 15
-	// needs it to retry the Undo and clears it only once delivery succeeds.
-	undone, err := d.votes.Upsert(ctx, *stored)
+	// needs it to retry the Undo and clears it only once delivery succeeds. It
+	// rides the gate transaction so the bump and the enqueue commit together.
+	undone, err := d.votes.UpsertTx(ctx, tx, *stored)
 	if err != nil {
 		return fmt.Errorf("bump vote state for %s: %w", voteATURI, err)
 	}
@@ -185,7 +197,7 @@ func (d *Dispatcher) applyVoteDelete(ctx context.Context, did string, commit *Co
 		Direction:       stored.Direction,
 		ID:              ActivityID(d.userOrigin, voteATURI, operationUndo, undone.ActivitySeq),
 		InnerActivityID: stored.CurrentActivityID,
-		CommunityAPID:   d.communityAPID(ctx, stored.CommunityDID),
+		CommunityAPID:   communityAPID,
 	})
 }
 
@@ -194,18 +206,24 @@ func (d *Dispatcher) applyVoteDelete(ctx context.Context, did string, commit *Co
 // withdraws rather than an object.
 const operationUndo = "undo"
 
-// communityAPID resolves a community's AP Group id for addressing. A miss
-// yields "" rather than an error: the withdrawal still has to go out, and task
-// 15 can address it from the subject.
-func (d *Dispatcher) communityAPID(ctx context.Context, communityDID string) string {
+// communityAPID resolves a community's AP Group id for addressing.
+//
+// An empty community DID, or a community with no row (NotFound), yields "":
+// the withdrawal still has to go out, and task 15 can address it from the
+// subject. But a real error PROPAGATES — addressing an Undo to nobody off a
+// statement timeout would drop the withdrawal into the void and never retry.
+func (d *Dispatcher) communityAPID(ctx context.Context, communityDID string) (string, error) {
 	if communityDID == "" {
-		return ""
+		return "", nil
 	}
 	community, err := d.communities.GetByDID(ctx, communityDID)
-	if err != nil {
-		return ""
+	if errors.IsNotFound(err) {
+		return "", nil
 	}
-	return community.APGroupID
+	if err != nil {
+		return "", fmt.Errorf("resolve community %s: %w", communityDID, err)
+	}
+	return community.APGroupID, nil
 }
 
 // refURI reads a strong-ref's uri out of a decoded record.

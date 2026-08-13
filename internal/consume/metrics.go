@@ -18,6 +18,9 @@ const (
 	MetricReconnects          = "tidepool_consumer_reconnects"
 	MetricEventsProcessed     = "tidepool_consumer_events_processed"
 	MetricEventsDeadLettered  = "tidepool_consumer_events_dead_lettered"
+	MetricConnected           = "tidepool_consumer_connected"
+	MetricDialFailures        = "tidepool_consumer_dial_failures"
+	MetricDisconnectedSeconds = "tidepool_consumer_disconnected_seconds"
 )
 
 // deadLetterDepthUnavailable is what the backlog gauge reports when storage
@@ -25,6 +28,11 @@ const (
 // unmistakable — where a 0 would claim the backlog is empty at exactly the
 // moment nobody can tell.
 const deadLetterDepthUnavailable = -1
+
+// deadLetterScrapeTimeout bounds the per-scrape storage read. A gauge is read
+// while an operator watches a possibly-broken system, so a hung query must not
+// hang the metrics handler with it.
+const deadLetterScrapeTimeout = 3 * time.Second
 
 // publishOnce guards the expvar registration. expvar PANICS on a duplicate
 // name, and both main and the tests call PublishMetrics.
@@ -39,12 +47,25 @@ var publishOnce sync.Once
 //
 // A stalled consumer is the failure this task most has to make visible,
 // because it is otherwise invisible: the process is up, the health check is
-// green, and events simply stop arriving. Cursor age and last-event age are
-// the pair that tells a dead upstream from a dead consumer — a quiet stream
-// keeps the cursor current while last-event age grows.
+// green, and events simply stop arriving. How to READ the gauges:
+//
+//   - cursor age HIGH, last-event age LOW: events are arriving but the
+//     consumer's processed position trails them — it is lagging behind live
+//     traffic. (Both ages move together on a quiet stream, so last-event age
+//     alone cannot distinguish lag; the SPREAD between the two is the lag.)
+//   - cursor age HIGH, last-event age HIGH: no events are arriving at all —
+//     either the stream is quiet or the connection is dead. `connected` and
+//     `dial_failures`/`disconnected_seconds` disambiguate: connected=1 with no
+//     events is a quiet upstream; connected=0 with climbing dial_failures is
+//     the consumer unable to reach Jetstream.
+//   - connected=0 with disconnected_seconds climbing from boot and reconnects
+//     still 0 is a consumer that has NEVER connected — the failure a
+//     healthy-looking zero would otherwise hide.
 //
 // Idempotent: a second call is a no-op, so the FIRST connector and queue
-// handed in are the ones the gauges read for the life of the process.
+// handed in are the ones the gauges read for the life of the process. The ctx
+// is used only to derive per-scrape deadlines; it is not the scrape's own
+// lifetime.
 func PublishMetrics(ctx context.Context, connector *Connector, queue DeadLetterQueue) {
 	publishOnce.Do(func() {
 		expvar.Publish(MetricCursorAgeSeconds, expvar.Func(func() any {
@@ -60,7 +81,12 @@ func PublishMetrics(ctx context.Context, connector *Connector, queue DeadLetterQ
 		expvar.Publish(MetricDeadLetterDepth, expvar.Func(func() any {
 			// Read from STORAGE at scrape time, not counted in memory: a
 			// restart must not reset the backlog to zero and declare it gone.
-			counts, err := queue.CountDeadLetters(ctx)
+			// Bounded by its own deadline so a hung query cannot hang the
+			// scrape — the parent ctx supplies only cancellation, not a
+			// wall-clock the scrape should wait out.
+			scrapeCtx, cancel := context.WithTimeout(ctx, deadLetterScrapeTimeout)
+			defer cancel()
+			counts, err := queue.CountDeadLetters(scrapeCtx)
 			if err != nil {
 				// This gauge is read while somebody is looking at a broken
 				// system, so a failing storage read reports unavailable rather
@@ -82,6 +108,24 @@ func PublishMetrics(ctx context.Context, connector *Connector, queue DeadLetterQ
 		}))
 		expvar.Publish(MetricEventsDeadLettered, expvar.Func(func() any {
 			return connector.Status().EventsDeadLettered
+		}))
+		// Liveness gauges: without these a consumer that never achieves its
+		// first connection reports every counter at a healthy-looking zero.
+		expvar.Publish(MetricConnected, expvar.Func(func() any {
+			if connector.Status().Connected {
+				return 1
+			}
+			return 0
+		}))
+		expvar.Publish(MetricDialFailures, expvar.Func(func() any {
+			return connector.Status().DialFailures
+		}))
+		expvar.Publish(MetricDisconnectedSeconds, expvar.Func(func() any {
+			status := connector.Status()
+			if status.Connected || status.DisconnectedSince == nil {
+				return 0.0
+			}
+			return ageSeconds(*status.DisconnectedSince)
 		}))
 	})
 }

@@ -37,6 +37,16 @@ const ConsumerNative = "native"
 // belongs to. consumer_cursors is keyed (consumer_name, schema_version) so a
 // future incompatible handler can replay the retained store from scratch
 // without overwriting the production cursor; the two rows coexist.
+//
+// OPERATIONAL COUPLING (second-opinion C6): the rev gate
+// (jetstream_record_revs) is keyed by record_uri ALONE, with no schema notion.
+// So a from-scratch replay after a bump would hit the OLD version's gate rows,
+// read every record as already-applied, and process nothing — the replay the
+// versioned cursor promised is silently a no-op. Therefore, whoever bumps this
+// to force a clean replay MUST, in the same deploy, TRUNCATE
+// jetstream_record_revs AND jetstream_dead_letters. This requirement is pinned
+// machine-readably by GateResetRequiredOnSchemaBump; the long-term fix is a
+// schema-scoped gate, deferred until a real v2 exists.
 const CursorSchemaVersion = 1
 
 // The collections this consumer subscribes to (Jetstream wantedCollections).

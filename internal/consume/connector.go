@@ -57,6 +57,11 @@ type ConnectorStatus struct {
 	EventsProcessed       uint64     `json:"eventsProcessed"`
 	EventsDeadLettered    uint64     `json:"eventsDeadLettered"`
 	Reconnects            uint64     `json:"reconnects"`
+	// DialFailures counts dial attempts that never established a connection.
+	// A consumer that can never reach Jetstream leaves Reconnects at 0 while
+	// this climbs, which is how "upstream unreachable" is told apart from
+	// "connected but idle".
+	DialFailures uint64 `json:"dialFailures"`
 	// LastError is excluded from JSON on purpose: raw error strings leak
 	// hosts, SQL fragments and file paths.
 	LastError   string     `json:"-"`
@@ -100,6 +105,7 @@ type Connector struct {
 	lastEventAt        time.Time
 	dials              uint64
 	reconnects         uint64
+	dialFailures       uint64
 	eventsProcessed    uint64
 	eventsDeadLettered uint64
 	lastError          string
@@ -264,6 +270,7 @@ func (c *Connector) Status() ConnectorStatus {
 		EventsProcessed:       c.eventsProcessed,
 		EventsDeadLettered:    c.eventsDeadLettered,
 		Reconnects:            c.reconnects,
+		DialFailures:          c.dialFailures,
 		LastError:             c.lastError,
 	}
 	if !c.connectedSince.IsZero() {
@@ -353,6 +360,7 @@ func (c *Connector) connect(ctx context.Context) error {
 
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, dialURL, nil)
 	if err != nil {
+		c.countDialFailure()
 		return fmt.Errorf("connect to jetstream: %w", err)
 	}
 
@@ -643,6 +651,15 @@ func (c *Connector) countDial() {
 		c.reconnects++
 	}
 	c.dials++
+}
+
+// countDialFailure records a dial that never established a connection, so a
+// consumer that cannot reach Jetstream is visible as failing dials rather than
+// as a silent, never-connected zero.
+func (c *Connector) countDialFailure() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.dialFailures++
 }
 
 // advanceCursor moves the in-memory cursor and lastEventAt past an event that

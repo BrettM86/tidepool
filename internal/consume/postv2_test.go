@@ -1,11 +1,14 @@
 package consume
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"tidepool/internal/store"
 )
 
 // Task 14 cycle G: community.postv2 → the task 16 acceptance engine.
@@ -188,4 +191,102 @@ func TestPostV2_DeleteIsNotGatedOnACommunityItCannotSee(t *testing.T) {
 			"delete has none, so gating it would silently drop every author delete and "+
 			"strand the acceptance records they were supposed to remove; the engine "+
 			"already knows which posts it accepted and can no-op the rest")
+}
+
+// ---------------------------------------------------------------------------
+// Second-opinion C3: the opt-out gate applies to postv2 too
+// ---------------------------------------------------------------------------
+//
+// A postv2 create/update pushes the author's content OUTWARD (into the
+// community's repo, via the acceptance engine), so an opted-out author's post
+// must not be admitted — the same gate comments and votes already carry. A
+// delete is a retraction and stays ungated, for the same reason it does on the
+// comment path: removing content is always safe, and it is the only way an
+// opted-out user can take down what is already federated.
+
+func TestPostV2_OptedOutAuthorCreateNeverReachesTheEngine(t *testing.T) {
+	database := dispatchTestDB(t)
+	seedBridgedCommunity(t, database)
+	ctx := context.Background()
+
+	_, err := store.NewFederationPrefs(database).Upsert(ctx, store.FederationPref{
+		DID:    dispatchNativeDID,
+		Source: store.FederationPrefSourceRecord,
+	})
+	require.NoError(t, err)
+
+	fixture := newDispatchFixture(t, database)
+	require.NoError(t, fixture.handle(t,
+		postV2Frame(dispatchNativeDID, dispatchRev, "3lzpostopt01", acceptCommunityDID)))
+
+	assert.Zero(t, fixture.engine.Calls(),
+		"an opted-out author's post must not be admitted: admission writes an "+
+			"acceptance record and federates the post, which is exactly the outward "+
+			"push the opt-out forbids")
+}
+
+func TestPostV2_OptedOutAuthorUpdateNeverReachesTheEngine(t *testing.T) {
+	database := dispatchTestDB(t)
+	seedBridgedCommunity(t, database)
+	ctx := context.Background()
+
+	_, err := store.NewFederationPrefs(database).Upsert(ctx, store.FederationPref{
+		DID:    dispatchNativeDID,
+		Source: store.FederationPrefSourceRecord,
+	})
+	require.NoError(t, err)
+
+	fixture := newDispatchFixture(t, database)
+	frame := []byte(fmt.Sprintf(
+		`{"did":%q,"time_us":8300,"kind":"commit","commit":{"rev":%q,"operation":"update",`+
+			`"collection":"social.coves.community.postv2","rkey":"3lzpostopt02",`+
+			`"cid":"bafyreievgu2ty7qbiaaom5zhmkznsnajuzideek3lo7e65dwqlrvrxnmo4",`+
+			`"record":{"$type":"social.coves.community.postv2","community":%q,`+
+			`"title":"edited","createdAt":"2026-08-13T10:00:00.000Z"}}}`,
+		dispatchNativeDID, dispatchRev, acceptCommunityDID))
+	require.NoError(t, fixture.handle(t, frame))
+
+	assert.Zero(t, fixture.engine.Calls(),
+		"an edit is still an outward push, so it is gated exactly like a create")
+}
+
+func TestPostV2_OptedOutAuthorDeleteStillReachesTheEngine(t *testing.T) {
+	database := dispatchTestDB(t)
+	seedBridgedCommunity(t, database)
+	ctx := context.Background()
+
+	_, err := store.NewFederationPrefs(database).Upsert(ctx, store.FederationPref{
+		DID:    dispatchNativeDID,
+		Source: store.FederationPrefSourceRecord,
+	})
+	require.NoError(t, err)
+
+	fixture := newDispatchFixture(t, database)
+	require.NoError(t, fixture.handle(t,
+		postV2DeleteFrame(dispatchNativeDID, dispatchRev, "3lzpostopt03")))
+
+	assert.Equal(t, 1, fixture.engine.Calls(),
+		"a delete is a retraction and stays ungated: the acceptance record has to come "+
+			"down even for an author who has since opted out, or their post stands on "+
+			"the fediverse forever — the same asymmetry comments and votes carry")
+}
+
+// ---------------------------------------------------------------------------
+// Second-opinion C7: a nil-engine skip must not claim a gate row
+// ---------------------------------------------------------------------------
+
+func TestPostV2_NilEngineSkipLeavesNoGateRow(t *testing.T) {
+	database := dispatchTestDB(t)
+	seedBridgedCommunity(t, database)
+	// A deployment where the acceptance engine (task 16) is not wired yet.
+	fixture := newDispatchFixture(t, database, func(opts *Options) { opts.Engine = nil })
+
+	require.NoError(t, fixture.handle(t,
+		postV2Frame(dispatchNativeDID, dispatchRev, "3lzpostnil01", acceptCommunityDID)))
+
+	assert.Zero(t, countRows(t, database, "jetstream_record_revs"),
+		"a postv2 skipped because the engine is nil must NOT advance the gate: the "+
+			"whole point of leaving it unhandled is that a later build WITH the engine "+
+			"replays and admits it. A gate row here would make that replay a no-op, "+
+			"silently dropping the post forever")
 }

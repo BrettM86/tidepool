@@ -30,6 +30,22 @@ import (
 // synthetic events are rev-less: real Jetstream frames always carry rev, and
 // the DLQ stores the raw frame, so redriven events keep theirs.
 
+// GateResetRequiredOnSchemaBump records the C6 coupling (second-opinion): the
+// gate (jetstream_record_revs) is keyed by record_uri alone, with no schema
+// version, so a CursorSchemaVersion bump that expects a from-scratch replay
+// must first reset the gate and the DLQ — otherwise every record reads as
+// already-applied and the replay is silently a no-op.
+//
+// OPERATIONAL REQUIREMENT (the machine-readable half of the ruling in
+// consume.CursorSchemaVersion's doc): whoever bumps CursorSchemaVersion to
+// force a clean replay MUST, in the same deploy, TRUNCATE jetstream_record_revs
+// and jetstream_dead_letters. Skip it and the new handlers process nothing —
+// the versioned cursor's promised replay is a no-op. The better long-term fix
+// is a schema-scoped gate (a schema_version column threaded through every gate
+// call, plus a migration); it is deferred until a real v2 lands, and doing it
+// is what would let this flag flip back to false.
+const GateResetRequiredOnSchemaBump = true
+
 // revGateQuerier is the subset of *sql.DB / *sql.Tx the gate needs, so the
 // same statements run standalone or inside a caller's transaction.
 type revGateQuerier interface {
@@ -102,11 +118,16 @@ func logSkippedStaleRev(consumer, operation, uri, rev string) {
 		slog.String("rev", rev))
 }
 
-// RevGate carries the gate's own DB handle. applyGated uses it to open the
-// claim transaction held across apply; IsStale/Advance expose the
-// non-transactional check→write→advance flavor for paths whose write is an
-// idempotent last-write-wins update (the profile cache), where a brief
-// unguarded window is acceptable. A nil *RevGate disables gating entirely.
+// RevGate carries the gate's own DB handle. applyGated/applyGatedTx use it to
+// open the claim transaction held across apply, which is how EVERY commit
+// handler is currently gated.
+//
+// IsStale/Advance expose a non-transactional check→write→advance flavor for
+// FUTURE non-commit paths whose write is an idempotent last-write-wins update
+// and can tolerate a brief unguarded window. Nothing in production uses them
+// today — every commit handler runs under applyGated — so they exist only as
+// the exported seam (and are exercised by the rev_gate tests). A nil *RevGate
+// disables gating entirely.
 type RevGate struct {
 	db *sql.DB
 }
@@ -118,6 +139,10 @@ func NewRevGate(db *sql.DB) *RevGate {
 
 // IsStale reports whether the event's rev is superseded by the stored rev for
 // the record URI. Nil-safe: a nil gate never reports stale.
+//
+// Part of the non-transactional seam described on RevGate: currently unused by
+// production code (all commit handling goes through applyGated), retained for
+// future non-commit paths.
 func (g *RevGate) IsStale(ctx context.Context, uri, rev string) (bool, error) {
 	if g == nil {
 		return false, nil
@@ -129,6 +154,10 @@ func (g *RevGate) IsStale(ctx context.Context, uri, rev string) (bool, error) {
 // whichever is greater — a late Advance for an older event must not lower the
 // gate. Called AFTER the write succeeds, so a failure in between replays the
 // event instead of losing it. Nil-safe: a nil gate is a no-op.
+//
+// Part of the non-transactional seam described on RevGate: currently unused by
+// production code (all commit handling goes through applyGated), retained for
+// future non-commit paths.
 func (g *RevGate) Advance(ctx context.Context, uri, rev string) error {
 	if g == nil {
 		return nil
@@ -158,8 +187,29 @@ func (g *RevGate) Advance(ctx context.Context, uri, rev string) error {
 // A gate SKIP returns nil, not an error: the event is fully accounted for and
 // the cursor must advance past it.
 func applyGated(ctx context.Context, gate *RevGate, consumer, did string, commit *CommitEvent, apply func() error) error {
+	return applyGatedTx(ctx, gate, consumer, did, commit, func(*sql.Tx) error { return apply() })
+}
+
+// applyGatedTx is applyGated with the claim's transaction handed to apply, so a
+// handler can write its durable outbound state ON that transaction
+// (UpsertTx/TombstoneTx). The state write, the gate advance and the enqueue
+// then commit as ONE unit: a failed enqueue returns an error and the deferred
+// rollback releases the row AND the gate advance together.
+//
+// This is what closes the C2 split. Without it the handler wrote outbound state
+// on its own autocommit connection, then the gate advanced, then the enqueue
+// ran — so a failed enqueue left a committed row behind an unadvanced gate, and
+// a replay would bump the seq off that phantom base into a SECOND, distinct
+// activity id for one operation, which a peer sees as two Creates for one
+// comment.
+//
+// The tx passed to apply is nil only when the gate is bypassed (nil gate or an
+// empty rev — synthetic test events); a handler that writes state on nil would
+// get a validation error from UpsertTx, which is the correct refusal for a
+// path that has opted out of gating.
+func applyGatedTx(ctx context.Context, gate *RevGate, consumer, did string, commit *CommitEvent, apply func(tx *sql.Tx) error) error {
 	if gate == nil || commit.Rev == "" {
-		return apply()
+		return apply(nil)
 	}
 	uri := commitRecordURI(did, commit)
 	tx, err := gate.db.BeginTx(ctx, nil)
@@ -181,7 +231,7 @@ func applyGated(ctx context.Context, gate *RevGate, consumer, did string, commit
 		logSkippedStaleRev(consumer, commit.Operation, uri, commit.Rev)
 		return nil
 	}
-	if err := apply(); err != nil {
+	if err := apply(tx); err != nil {
 		return err // the deferred rollback releases the claim un-advanced
 	}
 	if err := tx.Commit(); err != nil {

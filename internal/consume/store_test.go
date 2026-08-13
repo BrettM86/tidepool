@@ -3,7 +3,9 @@ package consume
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -292,4 +294,49 @@ func TestDeadLetters_DeleteRemovesRedrivenEvent(t *testing.T) {
 
 	require.NoError(t, store.DeleteDeadLetter(ctx, listed[0].ID),
 		"deleting an already-deleted dead letter is a no-op success")
+}
+
+// ---------------------------------------------------------------------------
+// Second-opinion C1: the dead-letter write must survive a poison error string
+// ---------------------------------------------------------------------------
+
+// TestDeadLetters_NULInErrorStringIsSanitizedNotRejected is the other half of
+// the poison-frame defense. The connector passes cause.Error() as last_error,
+// and a malformed frame's error can carry the very bytes that made it
+// malformed — a NUL, invalid UTF-8. postgres TEXT rejects a NUL outright, so
+// if AddDeadLetter passed it through, the dead-letter write would FAIL, the
+// connector would tear down the connection without advancing the cursor, and
+// the same poison frame would replay forever. AddDeadLetter must sanitize the
+// error string and store the row.
+func TestDeadLetters_NULInErrorStringIsSanitizedNotRejected(t *testing.T) {
+	database := consumeStateTestDB(t)
+	store := NewPostgresStateStore(database, CursorSchemaVersion)
+	ctx := context.Background()
+
+	poison := "failed to handle event: rkey \x00\x00 is invalid \xff\xfe"
+	err := store.AddDeadLetter(ctx, ConsumerNative, 42,
+		[]byte(`{"kind":"commit"}`), poison, 0)
+	require.NoError(t, err,
+		"a NUL (or invalid UTF-8) in the error string must NOT fail the dead-letter "+
+			"write — that failure blocks cursor advance and wedges the consumer on the "+
+			"one frame it most needs to get past")
+
+	// The row must actually be there and readable: capture that survives the
+	// insert but cannot be listed is no capture at all.
+	dead, err := store.ListRetryable(ctx, ConsumerNative, MaxRedriveAttempts, 10)
+	require.NoError(t, err)
+	require.Len(t, dead, 1, "the poison frame is captured, not lost")
+
+	assert.False(t, strings.ContainsRune(dead[0].LastError, 0),
+		"the stored last_error carries no NUL")
+	assert.True(t, utf8.ValidString(dead[0].LastError),
+		"and is valid UTF-8, so an operator can read it out of the queue")
+	assert.Contains(t, dead[0].LastError, "rkey",
+		"while keeping the readable part of the message — sanitizing is scrubbing the "+
+			"bad bytes, not discarding the diagnostic")
+
+	// The event bytes themselves are BYTEA and keep their exact contents; only
+	// the TEXT error column is sanitized.
+	assert.Equal(t, []byte(`{"kind":"commit"}`), dead[0].EventData,
+		"the raw frame is preserved verbatim in the BYTEA column for a faithful redrive")
 }

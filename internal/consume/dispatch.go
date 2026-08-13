@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/bluesky-social/indigo/atproto/syntax"
+
 	"tidepool/internal/errors"
 	"tidepool/internal/materialize"
 	"tidepool/internal/store"
@@ -41,8 +43,9 @@ type CommentIntent struct {
 	ID string
 	// CommunityAPID is the target community's AP Group id.
 	CommunityAPID string
-	// ParentAPID is the AP object id of the thing replied to, resolved
-	// through ap_objects (either origin).
+	// ParentAPID is the AP object id of the thing replied to, resolved through
+	// ap_objects OR the parent's own outbound state (a native accepted post or
+	// an earlier native comment, which have no ap_objects mapping).
 	ParentAPID string
 	// Snapshot is the translated state a Delete is rebuilt from — the delete
 	// commit itself carries no record body.
@@ -146,6 +149,14 @@ type Options struct {
 	// local part is frozen at creation, so minting without a verified handle
 	// would freeze a guess.
 	Resolver DIDResolver
+	// The store overrides below exist for fault injection in tests: each is
+	// nil in production and constructed from DB. A test wraps the real store
+	// in a double that fails one method, to prove the handler PROPAGATES the
+	// failure (retry/redrive) rather than swallowing it into a default value.
+	Objects        store.OutboundObjects
+	Votes          store.OutboundVotes
+	Communities    store.Communities
+	ObjectMappings store.APObjects
 	// UserOrigin is AP_USER_ORIGIN: the origin every deterministic activity
 	// id is minted under.
 	UserOrigin string
@@ -182,6 +193,17 @@ type Dispatcher struct {
 
 var _ EventHandler = (*Dispatcher)(nil)
 
+// orDefault returns override when it is non-nil, else fallback. It exists so
+// the fault-injection Options can replace one store without every call site
+// spelling out the nil check.
+func orDefault[T comparable](override, fallback T) T {
+	var zero T
+	if override != zero {
+		return override
+	}
+	return fallback
+}
+
 // NewDispatcher builds the event dispatcher. DB, Actors, Enqueuer and
 // UserOrigin are required; Engine and RemoteDeleter are the not-yet-landed
 // seams and may be nil.
@@ -210,6 +232,13 @@ func NewDispatcher(opts Options) (*Dispatcher, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	if opts.Engine == nil {
+		// Warned ONCE, at construction, rather than on every postv2 frame: a
+		// deployment without the acceptance engine (task 16) skips postv2
+		// events pre-gate, and an operator should see that surface stated
+		// plainly instead of inferring it from a silence in the metrics.
+		logger.Warn("no acceptance engine wired: community.postv2 events will be skipped until task 16 lands")
+	}
 	return &Dispatcher{
 		db:             opts.DB,
 		actors:         opts.Actors,
@@ -220,10 +249,10 @@ func NewDispatcher(opts Options) (*Dispatcher, error) {
 		resolver:       opts.Resolver,
 		prefs:          store.NewFederationPrefs(opts.DB),
 		apActors:       store.NewAPActors(opts.DB),
-		objectMappings: store.NewAPObjects(opts.DB),
-		objects:        store.NewOutboundObjects(opts.DB),
-		votes:          store.NewOutboundVotes(opts.DB),
-		communities:    store.NewCommunities(opts.DB),
+		objectMappings: orDefault[store.APObjects](opts.ObjectMappings, store.NewAPObjects(opts.DB)),
+		objects:        orDefault[store.OutboundObjects](opts.Objects, store.NewOutboundObjects(opts.DB)),
+		votes:          orDefault[store.OutboundVotes](opts.Votes, store.NewOutboundVotes(opts.DB)),
+		communities:    orDefault[store.Communities](opts.Communities, store.NewCommunities(opts.DB)),
 		records:        opts.Records,
 		hosted:         newHostedRepos(opts.DB),
 		gate:           NewRevGate(opts.DB),
@@ -237,6 +266,14 @@ func NewDispatcher(opts Options) (*Dispatcher, error) {
 // accounted for and the cursor must advance past it, while an error blocks the
 // cursor and eventually dead-letters.
 func (d *Dispatcher) HandleEvent(ctx context.Context, event *JetstreamEvent) error {
+	// time_us is the CURSOR position, and it is validated for EVERY kind before
+	// anything else runs. A parseable frame carrying 0 (or negative) would let
+	// the cursor sit at or before every retained event and replay the entire
+	// store on the next reconnect. This can never become valid on retry.
+	if event.TimeUS <= 0 {
+		return fmt.Errorf("%w: time_us must be positive, got %d", ErrPermanentEvent, event.TimeUS)
+	}
+
 	switch event.Kind {
 	case eventKindCommit:
 		return d.handleCommit(ctx, event)
@@ -260,8 +297,11 @@ const (
 
 // commitHandler applies one commit for a repo. Handlers run INSIDE the rev
 // gate's claim, so they may assume the event is the newest one seen for that
-// record URI and need no ordering logic of their own.
-type commitHandler func(ctx context.Context, did string, commit *CommitEvent) error
+// record URI and need no ordering logic of their own. tx is that claim's
+// transaction: a handler that writes durable outbound state writes it on tx
+// (UpsertTx/TombstoneTx) so the write, the gate advance and the enqueue commit
+// as one unit. Handlers that write nothing durable ignore it.
+type commitHandler func(ctx context.Context, tx *sql.Tx, did string, commit *CommitEvent) error
 
 // commitHandlerFor maps a collection to its handler, or nil when this
 // dispatcher does not handle the collection. It is the SINGLE place that
@@ -307,6 +347,19 @@ func (d *Dispatcher) handleCommit(ctx context.Context, event *JetstreamEvent) er
 		return fmt.Errorf("%w: commit event for %s carries no commit", ErrPermanentEvent, event.DID)
 	}
 
+	// SECURITY: the envelope is validated BEFORE any storage access. A commit
+	// is attacker-influenced — a native user writes the record it carries — and
+	// a did or rkey with a NUL byte reaches a TEXT column, turns an INSERT into
+	// a transient error retried forever, and (if the error echoes the NUL) the
+	// dead-letter fallback fails too, wedging the whole consumer on one frame.
+	// Rejecting it here, permanently and with a sanitized message, dead-letters
+	// it cleanly and the cursor moves on. This runs before the gate, so a
+	// rejected event claims no gate row to shadow the legitimate record that
+	// later reuses the URI.
+	if err := validateCommitEnvelope(event.DID, commit); err != nil {
+		return err
+	}
+
 	handler := d.commitHandlerFor(commit.Collection)
 	if handler == nil {
 		d.logger.Debug("skipping unhandled collection",
@@ -327,9 +380,52 @@ func (d *Dispatcher) handleCommit(ctx context.Context, event *JetstreamEvent) er
 		return nil
 	}
 
-	return applyGated(ctx, d.gate, ConsumerNative, event.DID, commit, func() error {
-		return handler(ctx, event.DID, commit)
+	// A postv2 with no acceptance engine wired is skipped BEFORE the gate, not
+	// inside a handler: the whole point of leaving it unhandled is that a later
+	// build WITH the engine replays and admits it, and a gate row claimed here
+	// would make that replay a silent no-op, dropping the post forever.
+	if commit.Collection == CollectionPostV2 && d.engine == nil {
+		d.logger.Debug("skipping postv2: no acceptance engine wired",
+			slog.String("did", event.DID), slog.String("rkey", commit.RKey))
+		return nil
+	}
+
+	return applyGatedTx(ctx, d.gate, ConsumerNative, event.DID, commit, func(tx *sql.Tx) error {
+		return handler(ctx, tx, event.DID, commit)
 	})
+}
+
+// validateCommitEnvelope rejects a structurally malformed commit as PERMANENT,
+// with a message that names the offending field and NEVER echoes raw bytes
+// (strconv.Quote escapes a NUL to the four printable characters `\x00`, so the
+// message stays NUL-free and valid UTF-8 for the last_error TEXT column and for
+// an operator reading the DLQ).
+func validateCommitEnvelope(did string, commit *CommitEvent) error {
+	if _, err := syntax.ParseDID(did); err != nil {
+		return fmt.Errorf("%w: repo DID %s is not a valid DID", ErrPermanentEvent, strconv.Quote(did))
+	}
+	switch commit.Operation {
+	case operationCreate, operationUpdate, operationDelete:
+	default:
+		return fmt.Errorf("%w: commit operation %s is not create, update or delete",
+			ErrPermanentEvent, strconv.Quote(commit.Operation))
+	}
+	if commit.Rev == "" {
+		// A real wire frame always carries rev; an empty one would bypass the
+		// gate (empty rev is the bypass sentinel) and replay forever.
+		return fmt.Errorf("%w: commit for %s carries no rev", ErrPermanentEvent, strconv.Quote(commit.RKey))
+	}
+	if _, err := syntax.ParseRecordKey(commit.RKey); err != nil {
+		return fmt.Errorf("%w: commit rkey %s is not a valid record key",
+			ErrPermanentEvent, strconv.Quote(commit.RKey))
+	}
+	if commit.Operation != operationDelete && commit.CID == "" {
+		// A create/update names the CID of what it wrote; missing means the
+		// frame is truncated or forged.
+		return fmt.Errorf("%w: %s commit for %s carries no CID",
+			ErrPermanentEvent, commit.Operation, strconv.Quote(commit.RKey))
+	}
+	return nil
 }
 
 // handlePostV2 hands a native post to the task 16 acceptance engine. Admission,
@@ -339,19 +435,31 @@ func (d *Dispatcher) handleCommit(ctx context.Context, event *JetstreamEvent) er
 // here is also what makes the lexicon's community-immutability rule
 // enforceable in ONE place: there is no second copy of the answer to disagree
 // with the engine's.
-func (d *Dispatcher) handlePostV2(ctx context.Context, did string, commit *CommitEvent) error {
-	if d.engine == nil {
-		d.logger.Debug("no acceptance engine wired; skipping postv2",
-			slog.String("did", did), slog.String("rkey", commit.RKey))
-		return nil
-	}
+func (d *Dispatcher) handlePostV2(ctx context.Context, _ *sql.Tx, did string, commit *CommitEvent) error {
+	// The nil-engine skip happens before the gate (see handleCommit), so a
+	// non-nil engine is guaranteed here.
 
-	// A DELETE passes through ungated. It carries no record, so there is no
-	// community field to check — and gating on one it cannot see would drop
-	// every author delete and strand the acceptance records those deletes
-	// exist to take down. The engine already knows which posts it accepted
-	// and can no-op the rest.
+	// A DELETE passes through ungated on both the community check AND the
+	// opt-out: it carries no record, so there is no community field to check —
+	// and gating it would drop every author delete and strand the acceptance
+	// records those deletes exist to take down. A delete is a retraction, the
+	// only way an opted-out author takes down what is already federated, so it
+	// must reach the engine even from a user who has since opted out. The
+	// engine already knows which posts it accepted and can no-op the rest.
 	if commit.Operation != operationDelete {
+		// The opt-out gate: a create or an update pushes the author's content
+		// OUTWARD (an acceptance record plus federation), which is exactly what
+		// an opted-out author has refused. Same gate comments and votes carry.
+		federating, err := d.mayFederate(ctx, did)
+		if err != nil {
+			return err
+		}
+		if !federating {
+			d.logger.Debug("skipping postv2 from an opted-out author",
+				slog.String("did", did), slog.String("rkey", commit.RKey))
+			return nil
+		}
+
 		communityDID := stringField(commit.Record, "community")
 		if communityDID == "" {
 			// The lexicon REQUIRES community. A post without one is malformed
@@ -399,16 +507,23 @@ func (d *Dispatcher) handleAccount(ctx context.Context, event *JetstreamEvent) e
 	if account == nil {
 		return fmt.Errorf("%w: account event for %s carries no account", ErrPermanentEvent, event.DID)
 	}
-	did := account.DID
-	if did == "" {
-		did = event.DID
+
+	// The envelope DID is authoritative. A nested payload naming a DIFFERENT
+	// DID is malformed or hostile — acting on the inner one lets a frame about
+	// DID A mutate DID B — and cannot resolve itself on retry, so it is
+	// rejected as permanent before any state is touched.
+	if account.DID != "" && account.DID != event.DID {
+		return fmt.Errorf("%w: account payload DID %s disagrees with the envelope DID %s",
+			ErrPermanentEvent, strconv.Quote(account.DID), strconv.Quote(event.DID))
 	}
+	did := event.DID
 
 	// The actor check comes first for EVERY status. Nothing was ever federated
 	// under a DID with no AP identity, so there is no delivery to pause and
 	// nothing for the terminal tier to withdraw — and minting an actor in
 	// order to pause or delete it would create the very identity the event is
-	// about losing.
+	// about losing. No seq is recorded on this skip: if the actor is later
+	// minted, a redelivered event still applies.
 	if _, err := d.apActors.GetByDID(ctx, did); err != nil {
 		if errors.IsNotFound(err) {
 			d.logger.Debug("account status for a DID with no actor",
@@ -416,6 +531,21 @@ func (d *Dispatcher) handleAccount(ctx context.Context, event *JetstreamEvent) e
 			return nil
 		}
 		return fmt.Errorf("look up actor for %s: %w", did, err)
+	}
+
+	// #account is UNGATED by the rev gate (it carries no rev), so its own
+	// monotonic per-DID seq is the ordering guard: a stale replay from the
+	// reconnect rewind (a pause at seq N redelivered after a reactivation at
+	// N+1) must not flip a recovered user back. A seq at or below the last
+	// applied one is a duplicate or a stale copy and is a no-op.
+	lastSeq, err := d.lastAccountSeq(ctx, did)
+	if err != nil {
+		return err
+	}
+	if account.Seq <= lastSeq {
+		d.logger.Debug("skipping stale or duplicate #account",
+			slog.String("did", did), slog.Int64("seq", account.Seq), slog.Int64("last_seq", lastSeq))
+		return nil
 	}
 
 	if account.Status == accountStatusDeleted {
@@ -428,22 +558,26 @@ func (d *Dispatcher) handleAccount(ctx context.Context, event *JetstreamEvent) e
 			// and is not.
 			d.logger.Warn("account reported deleted but no terminal tier is wired",
 				slog.String("did", did))
-			return nil
+			return d.advanceAccountSeq(ctx, did, account.Seq)
 		}
 		if err := d.terminator.TerminateAccount(ctx, did); err != nil {
 			return fmt.Errorf("terminate account %s: %w", did, err)
 		}
-		return nil
+		return d.advanceAccountSeq(ctx, did, account.Seq)
 	}
 
 	// Everything else is transient — deactivated, suspended, takendown,
 	// throttled are all states a user comes back from. Delivery stops; the
 	// identity, and every federated reference to it, survives.
-	err := d.apActors.SetPaused(ctx, did, !account.Active)
-	if errors.IsNotFound(err) {
-		return nil // the actor vanished between the check and the write
+	if err := d.apActors.SetPaused(ctx, did, !account.Active); err != nil {
+		if errors.IsNotFound(err) {
+			return nil // the actor vanished between the check and the write
+		}
+		return err
 	}
-	return err
+	// Record the applied seq only AFTER the state change succeeds, so a failed
+	// write replays instead of being locked out by an advanced seq.
+	return d.advanceAccountSeq(ctx, did, account.Seq)
 }
 
 // accountStatusDeleted is the ONLY #account status that means deletion.

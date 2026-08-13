@@ -143,7 +143,7 @@ func (r *DeadLetterRedriver) redriveAll(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			redriven, failed, listed, err := r.redriveConsumer(ctx, consumerName, handler)
+			redriven, retired, failed, listed, err := r.redriveConsumer(ctx, consumerName, handler)
 			if err != nil {
 				r.logger.Error("jetstream dead letter redrive pass failed",
 					slog.String("consumer", consumerName), slog.String("error", err.Error()))
@@ -153,6 +153,17 @@ func (r *DeadLetterRedriver) redriveAll(ctx context.Context) {
 			totalFailed += failed
 			// A short batch means the retryable backlog is drained.
 			if listed < r.batchSize {
+				break
+			}
+			// A FULL batch that removed NO row from the retryable set (every
+			// row was a handler failure, only marked +1) means the next
+			// ListRetryable returns the SAME oldest rows. Re-selecting them
+			// here would burn every row's whole redrive budget in this one
+			// pass instead of one attempt per scheduled pass. Stop and let the
+			// interval bring the next attempt. Rows that were redriven
+			// (deleted) or retired (exhausted) DID leave the set, so forward
+			// progress keeps the drain going.
+			if redriven+retired == 0 {
 				break
 			}
 		}
@@ -173,16 +184,20 @@ func (r *DeadLetterRedriver) redriveAll(ctx context.Context) {
 // filed under its own name — replaying another consumer's events through it
 // would apply them wrongly — so an unregistered consumer's backlog is left
 // untouched rather than handed to whoever is available.
-func (r *DeadLetterRedriver) redriveConsumer(ctx context.Context, consumerName string, handler EventHandler) (redriven, failed, listed int, err error) {
+// redriven counts rows successfully re-handled and deleted; retired counts
+// rows exhausted in one step (unparseable). Both LEAVE the retryable set, which
+// is how the caller tells forward progress from a batch that only burned
+// attempts on rows that will be re-selected.
+func (r *DeadLetterRedriver) redriveConsumer(ctx context.Context, consumerName string, handler EventHandler) (redriven, retired, failed, listed int, err error) {
 	deadLetters, err := r.queue.ListRetryable(ctx, consumerName, r.maxAttempts, r.batchSize)
 	if err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, 0, err
 	}
 	listed = len(deadLetters)
 
 	for _, deadLetter := range deadLetters {
 		if ctx.Err() != nil {
-			return redriven, failed, listed, nil
+			return redriven, retired, failed, listed, nil
 		}
 
 		var event JetstreamEvent
@@ -195,6 +210,8 @@ func (r *DeadLetterRedriver) redriveConsumer(ctx context.Context, consumerName s
 			if retireErr := r.queue.RetireDeadLetter(ctx, deadLetter.ID, "unparseable event: "+parseErr.Error()); retireErr != nil {
 				r.logger.Error("failed to retire unparseable dead letter",
 					slog.Int64("id", deadLetter.ID), slog.String("error", retireErr.Error()))
+			} else {
+				retired++ // exhausted, so it leaves the retryable set
 			}
 			continue
 		}
@@ -203,7 +220,7 @@ func (r *DeadLetterRedriver) redriveConsumer(ctx context.Context, consumerName s
 			// A failure caused by shutdown is not the event's fault: return
 			// without burning one of its redrive attempts.
 			if ctx.Err() != nil || stderrors.Is(handleErr, context.Canceled) || stderrors.Is(handleErr, context.DeadlineExceeded) {
-				return redriven, failed, listed, nil
+				return redriven, retired, failed, listed, nil
 			}
 			failed++
 			// The NEWEST error replaces the captured one, so the row explains
@@ -224,5 +241,5 @@ func (r *DeadLetterRedriver) redriveConsumer(ctx context.Context, consumerName s
 		}
 		redriven++
 	}
-	return redriven, failed, listed, nil
+	return redriven, retired, failed, listed, nil
 }

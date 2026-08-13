@@ -3,6 +3,7 @@ package consume
 import (
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -58,7 +59,7 @@ type ResolverOptions struct {
 	// (config.PLCDirectoryURL, e.g. https://plc.directory).
 	PLCDirectoryURL string
 	// HTTPClient makes both the directory and the well-known requests.
-	// Production wires ap.NewGuardedHTTPClient(cfg.AllowPrivateAddresses, 0)
+	// Production wires ap.NewGuardedHTTPClient(cfg.AllowPrivateAddresses, 30s)
 	// so this egress shares the AP client's SSRF guard — which matters more
 	// here than almost anywhere else, because the well-known host comes from
 	// a DID document a stranger controls.
@@ -246,52 +247,79 @@ func handleFromAlsoKnownAs(alsoKnownAs []string) (string, error) {
 }
 
 // verifyHandleClaimsDID is the reverse direction: the handle must name the DID
-// back. DNS is authoritative when it answers; the well-known is the fallback
-// the spec allows, and is what most PDS-hosted handles use.
+// back. DNS is tried first; the well-known is the fallback the spec allows,
+// and is what most PDS-hosted handles use.
+//
+// The DNS RESULT taxonomy is load-bearing (second-opinion C5). A well-known
+// naming a different DID is impersonation and permanent ONLY when DNS
+// authoritatively said the handle has no record — because then the well-known
+// is the whole answer. When DNS was UNREACHABLE (SERVFAIL, a timeout) we never
+// learned the owner's authoritative claim, so a mismatched well-known cannot
+// be trusted as impersonation: an attacker who controls the handle's web
+// server but not its DNS would otherwise win a permanent verdict during a DNS
+// blip, stranding a legitimate mint. That case is TRANSIENT so the redrive
+// re-checks once DNS recovers.
 func (r *HandleResolver) verifyHandleClaimsDID(ctx context.Context, handle, did string) error {
+	dnsAuthoritative := true
 	if r.lookupTXT != nil {
-		claimed, found := r.lookupTXTDID(ctx, handle)
+		claimed, found, authoritative := r.lookupTXTDID(ctx, handle)
 		if found {
 			if claimed == did {
 				return nil
 			}
-			return fmt.Errorf("%w: handle %s claims %s, not %s", ErrPermanentEvent, handle, claimed, did)
+			// DNS itself named a different DID: authoritative impersonation.
+			return fmt.Errorf("%w: handle %s DNS claims %s, not %s", ErrPermanentEvent, handle, claimed, did)
 		}
+		dnsAuthoritative = authoritative
 	}
-	return r.verifyWellKnown(ctx, handle, did)
+	return r.verifyWellKnown(ctx, handle, did, dnsAuthoritative)
 }
 
 // atprotoTXTPrefix is the subdomain the handle's DID claim is published under.
 const atprotoTXTPrefix = "_atproto."
 
-// lookupTXTDID reads the DID a handle publishes over DNS. A lookup error or a
-// missing record is reported as "not found" rather than as a failure: the
-// well-known fallback is the answer for every handle that does not use DNS,
-// and DNS being unreachable must not condemn one that does.
-func (r *HandleResolver) lookupTXTDID(ctx context.Context, handle string) (did string, found bool) {
+// lookupTXTDID reads the DID a handle publishes over DNS.
+//
+// The third return distinguishes an AUTHORITATIVE answer from an outage.
+// authoritative is true when DNS gave a definitive result — a record was
+// found, OR the name resolved to NXDOMAIN (net.DNSError.IsNotFound), which is
+// an authoritative "this handle publishes no DNS claim". It is false only when
+// DNS was UNREACHABLE (SERVFAIL, timeout), where the absence of a record tells
+// us nothing about the real owner's claim.
+func (r *HandleResolver) lookupTXTDID(ctx context.Context, handle string) (did string, found, authoritative bool) {
 	records, err := r.lookupTXT(ctx, atprotoTXTPrefix+handle)
 	if err != nil {
-		r.logger.Debug("no _atproto TXT record; falling back to the well-known",
+		var dnsErr *net.DNSError
+		if stderrors.As(err, &dnsErr) && dnsErr.IsNotFound {
+			// NXDOMAIN: DNS authoritatively has no record for this handle, so
+			// the well-known is the answer.
+			return "", false, true
+		}
+		// Reachable-but-broken DNS: not authoritative. The well-known must not
+		// be trusted to condemn the handle on its own.
+		r.logger.Debug("DNS lookup for _atproto record failed (not authoritative); falling back to the well-known",
 			slog.String("handle", handle), slog.String("error", err.Error()))
-		return "", false
+		return "", false, false
 	}
 	for _, record := range records {
 		if claimed, ok := strings.CutPrefix(strings.TrimSpace(record), "did="); ok {
-			return strings.TrimSpace(claimed), true
+			return strings.TrimSpace(claimed), true, true
 		}
 	}
-	return "", false
+	// DNS answered but published no atproto claim: authoritative "no record".
+	return "", false, true
 }
 
 // verifyWellKnown fetches https://{handle}/.well-known/atproto-did and
 // compares it to the DID.
 //
-// A 200 naming a DIFFERENT DID is the impersonation case and is permanent: the
-// handle has answered, and the answer is no. Everything else — a 5xx, a
-// network error, or a 404 — is transient. A 404 in particular is NOT a
-// disavowal: the handle may publish its claim over DNS only, or its owner may
-// not have finished setting it up, and both become true later.
-func (r *HandleResolver) verifyWellKnown(ctx context.Context, handle, did string) error {
+// A 200 naming a DIFFERENT DID is impersonation and permanent ONLY when DNS
+// was authoritative (dnsAuthoritative); during a DNS outage the same mismatch
+// is transient (see verifyHandleClaimsDID). Everything else — a 5xx, a network
+// error, or a 404 — is transient regardless: a 404 is NOT a disavowal, since
+// the handle may publish its claim over DNS only or not have finished setting
+// it up, and both become true later.
+func (r *HandleResolver) verifyWellKnown(ctx context.Context, handle, did string, dnsAuthoritative bool) error {
 	endpoint := "https://" + handle + wellKnownDIDPath
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
@@ -318,10 +346,17 @@ func (r *HandleResolver) verifyWellKnown(ctx context.Context, handle, did string
 	}
 	// Real PDSes serve the DID with a trailing newline; a byte-exact
 	// comparison would reject every genuine handle on the network.
-	if claimed := strings.TrimSpace(string(body)); claimed != did {
-		return fmt.Errorf("%w: handle %s claims %s, not %s", ErrPermanentEvent, handle, claimed, did)
+	claimed := strings.TrimSpace(string(body))
+	if claimed == did {
+		return nil
 	}
-	return nil
+	if !dnsAuthoritative {
+		// DNS was unreachable, so we never learned the owner's authoritative
+		// claim; a mismatched well-known cannot be trusted as impersonation.
+		// Transient, so the redrive re-checks once DNS recovers.
+		return fmt.Errorf("handle %s well-known claims %s, not %s, but DNS was unreachable", handle, claimed, did)
+	}
+	return fmt.Errorf("%w: handle %s claims %s, not %s", ErrPermanentEvent, handle, claimed, did)
 }
 
 // validatePLCDID rejects everything this task cannot resolve, and does it

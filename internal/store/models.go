@@ -234,8 +234,9 @@ type OutboundObject struct {
 	// of the bridge.
 	CommunityDID  string
 	CommunityAPID string
-	// TranslatedSnapshot is the JSONB state task 15 serves the object from and
-	// task 17 restores it from.
+	// TranslatedSnapshot is the JSONB state task 15 renders the object and its
+	// Delete from. (Task 17's restore is a delete-removal plus a fresh
+	// acceptance, not a replay of these bytes — the snapshot is task 15's.)
 	TranslatedSnapshot []byte
 	// LastActivitySeq feeds ActivityID: create is 0, every applied
 	// update/delete bumps it, so each operation gets its own stable id.

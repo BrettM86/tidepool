@@ -2,6 +2,7 @@ package consume
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log/slog"
 
@@ -23,7 +24,7 @@ import (
 // A DID with no actor row is skipped rather than minted: a profile edit is not
 // a federating interaction, and minting here would give an AP identity to
 // every Coves user who ever set a display name.
-func (d *Dispatcher) handleProfile(ctx context.Context, did string, commit *CommitEvent) error {
+func (d *Dispatcher) handleProfile(ctx context.Context, _ *sql.Tx, did string, commit *CommitEvent) error {
 	if _, err := d.apActors.GetByDID(ctx, did); err != nil {
 		if errors.IsNotFound(err) {
 			d.logger.Debug("profile record for a DID with no actor", slog.String("did", did))
@@ -98,10 +99,18 @@ func (d *Dispatcher) handleIdentity(ctx context.Context, event *JetstreamEvent) 
 	}
 
 	if actor.DisplayName != "" {
-		// A display name the user SET wins over their handle: the profile
-		// record is the user speaking about themselves, while the handle is
-		// only what the cache falls back to when they have not.
-		d.logger.Debug("handle change leaves a user-set display name alone",
+		// Any NON-EMPTY display name is left alone. The guard is only
+		// DisplayName != "" — it cannot tell a name the user actually set from
+		// a handle a PRIOR rename already cached here, so it treats both the
+		// same: a rename never overwrites an existing display name.
+		//
+		// The staleness consequence, accepted deliberately: once a handle has
+		// been cached as the display name (the fallback path below), a LATER
+		// handle change will not refresh it — the cache keeps showing the old
+		// handle until a real actor.profile record sets or clears the field.
+		// The profile handler, not this one, is the authority on the display
+		// name; a handle is only the fallback when none exists.
+		d.logger.Debug("handle change leaves an existing display name alone",
 			slog.String("did", did), slog.String("handle", handle))
 		return nil
 	}

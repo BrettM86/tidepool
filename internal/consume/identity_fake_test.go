@@ -40,6 +40,10 @@ type fakeIdentity struct {
 	// raw record set. Absent from both = NXDOMAIN.
 	txt    map[string]string
 	txtRaw map[string][]string
+	// txtErr forces lookupTXT to return a specific (non-NXDOMAIN) error for a
+	// handle — SERVFAIL, a timeout: DNS reachable-but-broken, which is NOT the
+	// same as DNS authoritatively having no record.
+	txtErr map[string]error
 
 	plcHits       int
 	wellKnownHits int
@@ -59,6 +63,7 @@ func newFakeIdentity(t *testing.T) *fakeIdentity {
 		wellKnownStatus: map[string]int{},
 		txt:             map[string]string{},
 		txtRaw:          map[string][]string{},
+		txtErr:          map[string]error{},
 	}
 
 	mux := http.NewServeMux()
@@ -180,6 +185,14 @@ func (f *fakeIdentity) txtClaims(handle, did string) {
 	f.txt[strings.ToLower(handle)] = did
 }
 
+// txtFails makes DNS resolution for a handle return a non-NXDOMAIN error,
+// modelling a resolver outage rather than an authoritative "no such record".
+func (f *fakeIdentity) txtFails(handle string, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.txtErr[strings.ToLower(handle)] = err
+}
+
 // txtRecords sets a handle's raw TXT record set — for the case where DNS
 // answers but says nothing about atproto.
 func (f *fakeIdentity) txtRecords(handle string, records ...string) {
@@ -197,6 +210,9 @@ func (f *fakeIdentity) lookupTXT(_ context.Context, name string) ([]string, erro
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.txtHits++
+	if err, ok := f.txtErr[handle]; ok {
+		return nil, err
+	}
 	if records, ok := f.txtRaw[handle]; ok {
 		return records, nil
 	}

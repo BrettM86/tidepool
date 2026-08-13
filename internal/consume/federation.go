@@ -2,6 +2,7 @@ package consume
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log/slog"
 
@@ -29,7 +30,7 @@ import (
 // — because absence is what default-on looks like in this table. That also
 // clears any stored deleteRemote: a stale destructive flag on a re-enabled
 // user is a loaded gun pointed at the task 17 tier.
-func (d *Dispatcher) handleFederation(ctx context.Context, did string, commit *CommitEvent) error {
+func (d *Dispatcher) handleFederation(ctx context.Context, _ *sql.Tx, did string, commit *CommitEvent) error {
 	if commit.Operation == operationDelete {
 		// A delete commit carries no record body, which costs nothing here:
 		// the DID is the whole question.

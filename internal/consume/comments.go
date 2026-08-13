@@ -2,6 +2,7 @@ package consume
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -24,13 +25,17 @@ import (
 // DLQ rather than dropped at debug.
 const maxCommentDepth = 50
 
-// handleComment applies one comment commit.
-func (d *Dispatcher) handleComment(ctx context.Context, did string, commit *CommitEvent) error {
+// handleComment applies one comment commit. tx is the rev-gate's transaction:
+// the outbound_objects write rides it, so the state write, the gate advance
+// and the enqueue commit together — a failed enqueue rolls all three back,
+// which is what stops a committed row under an unadvanced gate from letting a
+// replay bump the seq into a SECOND activity id for one comment.
+func (d *Dispatcher) handleComment(ctx context.Context, tx *sql.Tx, did string, commit *CommitEvent) error {
 	switch commit.Operation {
 	case operationCreate, operationUpdate:
-		return d.applyCommentWrite(ctx, did, commit)
+		return d.applyCommentWrite(ctx, tx, did, commit)
 	case operationDelete:
-		return d.applyCommentDelete(ctx, did, commit)
+		return d.applyCommentDelete(ctx, tx, did, commit)
 	default:
 		d.logger.Debug("unknown comment operation",
 			slog.String("operation", commit.Operation), slog.String("did", did))
@@ -55,7 +60,7 @@ func (d *Dispatcher) handleComment(ctx context.Context, did string, commit *Comm
 //  5. the outbound state, then the intent — state first, because the intent's
 //     activity id comes from the seq the write bumps, and a delete one day has
 //     nothing else to be built from.
-func (d *Dispatcher) applyCommentWrite(ctx context.Context, did string, commit *CommitEvent) error {
+func (d *Dispatcher) applyCommentWrite(ctx context.Context, tx *sql.Tx, did string, commit *CommitEvent) error {
 	federating, err := d.mayFederate(ctx, did)
 	if err != nil {
 		return err
@@ -101,7 +106,7 @@ func (d *Dispatcher) applyCommentWrite(ctx context.Context, did string, commit *
 	if err != nil {
 		return err
 	}
-	stored, err := d.objects.Upsert(ctx, store.OutboundObject{
+	stored, err := d.objects.UpsertTx(ctx, tx, store.OutboundObject{
 		ATURI:      atURI,
 		APObjectID: d.apObjectID(did, commit),
 		LastCID:    commit.CID,
@@ -129,14 +134,16 @@ func (d *Dispatcher) applyCommentWrite(ctx context.Context, did string, commit *
 // out can retract what is already on the fediverse — blocking it would leave
 // the peer's copy standing forever, the exact opposite of what asking to stop
 // federating means.
-func (d *Dispatcher) applyCommentDelete(ctx context.Context, did string, commit *CommitEvent) error {
+func (d *Dispatcher) applyCommentDelete(ctx context.Context, tx *sql.Tx, did string, commit *CommitEvent) error {
 	atURI := commitRecordURI(did, commit)
 
 	// Tombstone returns the state the Delete is built from in the same
 	// statement that stamps it, and is idempotent: a redelivered delete
 	// preserves the original tombstone time AND seq, so it reuses the activity
 	// id the first one sent and the peer recognises it as the same activity.
-	dead, err := d.objects.Tombstone(ctx, atURI)
+	// It rides the gate transaction so the tombstone and the enqueue commit
+	// together.
+	dead, err := d.objects.TombstoneTx(ctx, tx, atURI)
 	if errors.IsNotFound(err) {
 		// A comment this bridge never federated. There is nothing to withdraw,
 		// and most native comment deletes are exactly this.
@@ -148,7 +155,7 @@ func (d *Dispatcher) applyCommentDelete(ctx context.Context, did string, commit 
 		return fmt.Errorf("tombstone outbound state for %s: %w", atURI, err)
 	}
 
-	parent := parentFromSnapshot(dead.TranslatedSnapshot)
+	parent := d.parentFromSnapshot(dead.TranslatedSnapshot)
 	return d.enqueueComment(ctx, did, operationDelete, dead, parent.ATURI, parent.APID)
 }
 
@@ -200,7 +207,7 @@ func (d *Dispatcher) commentThread(ctx context.Context, atURI string, commit *Co
 		if err != nil {
 			return nil, fmt.Errorf("read outbound state for %s: %w", atURI, err)
 		}
-		parent := parentFromSnapshot(stored.TranslatedSnapshot)
+		parent := d.parentFromSnapshot(stored.TranslatedSnapshot)
 		return &resolvedThread{
 			ParentATURI:   parent.ATURI,
 			ParentAPID:    parent.APID,
@@ -310,10 +317,16 @@ type snapshotParent struct {
 // parentFromSnapshot reads the parent back out of stored state. An unreadable
 // or older snapshot yields empty strings rather than an error: the delete
 // still has to go out, and delivery without the causal hint is better than a
-// retraction that never leaves.
-func parentFromSnapshot(snapshot []byte) snapshotParent {
+// retraction that never leaves. The unmarshal error is not swallowed silently
+// though — it is logged, because a snapshot that will not parse means every
+// delete for that object loses its causal ordering, which an operator should
+// be able to see rather than infer from missing parents downstream.
+func (d *Dispatcher) parentFromSnapshot(snapshot []byte) snapshotParent {
 	var parent snapshotParent
-	_ = json.Unmarshal(snapshot, &parent)
+	if err := json.Unmarshal(snapshot, &parent); err != nil {
+		d.logger.Debug("stored snapshot did not parse; delete proceeds without a parent hint",
+			slog.String("error", err.Error()))
+	}
 	return parent
 }
 

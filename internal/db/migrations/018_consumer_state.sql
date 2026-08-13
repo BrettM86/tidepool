@@ -92,17 +92,22 @@ CREATE UNIQUE INDEX idx_jetstream_dead_letters_dedup
 -- already be at rest here before the delete arrives.
 --
 -- Rows are TOMBSTONED, never deleted: the row is what a late replay of the
--- create is rejected against, and task 17 restores content from the snapshot.
+-- create is rejected against. (Task 17's echo-moderation does NOT restore from
+-- this snapshot — a restore there is a delete-removal plus a fresh acceptance,
+-- not a replay of stored bytes; the snapshot's consumer is task 15, which
+-- renders the object and its Delete from it.)
 --
 -- last_cid/last_rev are PROVENANCE ONLY. The ordering gate is
 -- jetstream_record_revs; reading a rev back from here to decide whether to
 -- apply an event would be a check→write race by construction.
 --
 -- last_activity_seq is the counter behind the deterministic activity id
--- (decision 12: sha256(at_uri + op + seq)). It is a seq and not the CID
--- because deletes have no CID. A create is seq 0; every APPLIED write bumps
--- it, so each operation gets its own stable id — stable because the rev gate
--- runs first and a replayed commit never reaches the bump.
+-- (decision 12: hex(sha256("tidepool:activity:v1" \n at_uri \n op \n seq)) —
+-- version-tagged and newline-delimited, NOT a bare concatenation; see
+-- consume.ActivityID). It is a seq and not the CID because deletes have no CID.
+-- A create is seq 0; every APPLIED write bumps it, so each operation gets its
+-- own stable id — stable because the rev gate runs first and a replayed commit
+-- never reaches the bump.
 CREATE TABLE outbound_objects (
     at_uri TEXT PRIMARY KEY,
     ap_object_id TEXT NOT NULL,                                 -- the AP id this record federates as
@@ -110,7 +115,7 @@ CREATE TABLE outbound_objects (
     last_rev TEXT NOT NULL DEFAULT '',                           -- provenance only
     community_did TEXT NOT NULL,
     community_ap_id TEXT NOT NULL,
-    translated_snapshot JSONB NOT NULL,                          -- what task 15 serves and task 17 restores
+    translated_snapshot JSONB NOT NULL,                          -- what task 15 renders the object and its Delete from
     last_activity_seq INT NOT NULL DEFAULT 0,
     depth INT NOT NULL DEFAULT 0,                                -- reply depth; Lemmy caps comments at 50
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -118,7 +123,8 @@ CREATE TABLE outbound_objects (
     tombstoned_at TIMESTAMPTZ
 );
 
--- Task 15 serves an actor's outbound work and task 17 sweeps a community's.
+-- Task 15 serves an actor's outbound work; task 17 sweeps a community's rows
+-- (removing/re-accepting content), which is why the community is indexed.
 CREATE INDEX idx_outbound_objects_community ON outbound_objects (community_did);
 
 -- outbound_votes is the state an Undo is rebuilt from (decision 16).

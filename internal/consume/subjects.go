@@ -51,7 +51,10 @@ func (d *Dispatcher) resolveSubject(ctx context.Context, atURI string) (*resolve
 	if err != nil && !errors.IsNotFound(err) {
 		return nil, fmt.Errorf("resolve subject %s: %w", atURI, err)
 	}
-	if err == nil {
+	// A soft-deleted mapping is NOT live: the content was removed upstream, so
+	// a reply to it or a vote on it has nowhere legitimate to go. Skip rather
+	// than federate against a tombstone.
+	if err == nil && !mapping.IsDeleted() {
 		communityDID, err := d.subjectCommunityDID(ctx, mapping)
 		if err != nil {
 			return nil, err
@@ -66,12 +69,16 @@ func (d *Dispatcher) resolveSubject(ctx context.Context, atURI string) (*resolve
 			if err != nil {
 				return nil, fmt.Errorf("resolve community %s: %w", communityDID, err)
 			}
+			depth, err := d.recordedDepth(ctx, atURI)
+			if err != nil {
+				return nil, err
+			}
 			return &resolvedSubject{
 				ATURI:         atURI,
 				APID:          mapping.APID,
 				CommunityDID:  communityDID,
 				CommunityAPID: community.APGroupID,
-				Depth:         d.recordedDepth(ctx, atURI),
+				Depth:         depth,
 			}, nil
 		}
 	}
@@ -82,6 +89,11 @@ func (d *Dispatcher) resolveSubject(ctx context.Context, atURI string) (*resolve
 	}
 	if err != nil {
 		return nil, fmt.Errorf("read subject outbound state %s: %w", atURI, err)
+	}
+	if state.IsTombstoned() {
+		// The bridge already withdrew this object: replying to or voting on it
+		// again must not resurrect it.
+		return nil, nil
 	}
 	return &resolvedSubject{
 		ATURI:         atURI,
@@ -120,11 +132,19 @@ func (d *Dispatcher) subjectCommunityDID(ctx context.Context, mapping *store.APO
 // recordedDepth reads a subject's own reply depth, which exists only if the
 // bridge federated it OUTWARD too. A mapped subject with no outbound row is a
 // post, or a Lemmy object whose depth this bridge does not track, so it counts
-// as the top: replies to it are depth 1.
-func (d *Dispatcher) recordedDepth(ctx context.Context, atURI string) int {
+// as the top: replies to it are depth 1 (this returns 0).
+//
+// Only a genuine MISS defaults to 0. A real error — postgres down, a timeout —
+// PROPAGATES: recording depth 0 off a dropped connection would federate a
+// deeply nested comment at the wrong nesting and, past Lemmy's cap, keep
+// federating ones it will reject, silently and with no retry.
+func (d *Dispatcher) recordedDepth(ctx context.Context, atURI string) (int, error) {
 	state, err := d.objects.GetByATURI(ctx, atURI)
-	if err != nil {
-		return 0
+	if errors.IsNotFound(err) {
+		return 0, nil
 	}
-	return state.Depth
+	if err != nil {
+		return 0, fmt.Errorf("read recorded depth for %s: %w", atURI, err)
+	}
+	return state.Depth, nil
 }

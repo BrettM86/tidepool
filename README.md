@@ -280,6 +280,8 @@ production**:
 | `SYNC_MAX_SUBSCRIBERS` | `100` | concurrent `subscribeRepos` connection cap |
 | `FOLLOW_LIST_PATH` | *(optional)* | declarative follow list (see below); unset = the `/admin` API is the only subscription control |
 | `FOLLOW_LIST_INTERVAL` | `15m` | follow-list reconciler sweep cadence |
+| `CONSUMER_ENABLED` | **off** | turns on the task-14 Jetstream consumer (native users' opt-outs, profiles, posts, comments, votes → durable outbound state). Default off: it writes durable state and hands work to delivery seams that are still stubbed until tasks 15–17 land, so a deployment that has not been wired end to end should not silently start accumulating it. Enabling it now runs the pipeline with a logging-noop enqueuer (nothing is delivered), a nil acceptance engine (postv2 skipped), and nil destructive/terminal tiers (opt-out `deleteRemote` and account deletions recorded, not acted on) |
+| `JETSTREAM_URL` | *(optional)* | the self-hosted Jetstream the consumer subscribes to (`ws://` or `wss://`); **required** when `CONSUMER_ENABLED`, and validated at boot whenever set so a typo fails fast instead of becoming a reconnect loop. May be staged ahead of the flag |
 
 ## Subscribing to communities (admin API)
 
@@ -500,19 +502,21 @@ and is versioned by nsid: breaking changes ship under a new name.
 Its sibling under the same Tidepool-owned namespace is
 [`lexicons/social/coves/bridge/federation.json`](lexicons/social/coves/bridge/federation.json)
 (`key: literal:self`, one record per repo), the user-facing federation
-preference. **Staged contract:** the lexicon is published so Coves' settings
-UI can write against a stable shape — the bridge does not read it yet.
-Enforcement (honoring `enabled: false`, and the `deleteRemote` tier) lands
-with the task-14 consumer; until then the record is inert and federation is
-on for every minted actor. It is an **opt-OUT**: federation is on by default, so the record's
-ABSENCE means enabled and it only ever exists to turn federation down.
-`enabled: false` is a soft disable — the actor stops resolving via WebFinger
-and stops delivering, while its actor document and already-federated
-references stay intact. Adding `deleteRemote: true` escalates to the
-destructive tier (ask peers to delete the user's federated content —
-irreversible on their side). Deleting the record, or writing
-`enabled: true`, restores the default under the SAME actor identity: the local
-part is frozen at creation and never re-derived.
+preference. It is an **opt-OUT**: federation is on by default, so the record's
+ABSENCE means enabled and it only ever exists to turn federation down. When
+`CONSUMER_ENABLED` is set, the task-14 Jetstream consumer reads this record and
+enforces it: `enabled: false` is a **soft disable** — the actor stops resolving
+via WebFinger and stops delivering, while its actor document and
+already-federated references stay intact. Adding `deleteRemote: true` escalates
+to the destructive tier (ask peers to delete the user's federated content —
+irreversible on their side); the consumer **records** that intent in
+`federation_prefs` but does not act on it until task 17's destructive tier is
+wired, so the request survives a crash and is honored once that seam lands.
+Deleting the record, or writing `enabled: true`, restores the default under the
+SAME actor identity: the local part is frozen at creation and never re-derived.
+With `CONSUMER_ENABLED` off (the default), nothing reads the record and
+federation stays on for every minted actor — the lexicon is still published so
+Coves' settings UI can write against a stable shape ahead of the switch.
 
 Counts reflect each distinct voter's **latest** state — flips
 (`Like` → `Dislike`) and `Undo`s are folded in, re-delivered activities are

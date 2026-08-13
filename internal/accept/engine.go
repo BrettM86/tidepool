@@ -22,6 +22,7 @@ import (
 	"log/slog"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/bluesky-social/indigo/atproto/atdata"
 	"github.com/bluesky-social/indigo/atproto/lexicon"
@@ -29,6 +30,7 @@ import (
 	"tidepool/internal/acceptrec"
 	"tidepool/internal/consume"
 	"tidepool/internal/errors"
+	"tidepool/internal/materialize"
 	"tidepool/internal/repo"
 	"tidepool/internal/store"
 	"tidepool/lexicons"
@@ -63,6 +65,11 @@ const (
 	// community's admissions row as a no-op annotation, if at all — the engine
 	// writes nothing to the target community.)
 	DecisionCommunityImmutable = "community-immutable"
+	// DecisionCommunityNotFollowed: the target community is not one Tidepool has
+	// an ACCEPTED Follow to (follow_state none/pending). We are not its key holder
+	// for federation purposes, so we must not sign an acceptance or deliver into
+	// it. SECURITY: a communities row alone (existence) is not authority to bridge.
+	DecisionCommunityNotFollowed = "community-not-followed"
 )
 
 // RemovalCodeAdmissionRevoked is the removal `code` written when a post that WAS
@@ -116,6 +123,10 @@ type Options struct {
 	// ADMISSION_MAX_PER_AUTHOR_PER_COMMUNITY). 0 means UNLIMITED (the generous
 	// default); a positive value is the cap the rate check enforces.
 	MaxPerAuthorPerCommunity int
+	// Now is the clock a moderation/removal record's createdAt is stamped from —
+	// the DECISION time, not the post's publication time (a removal on an old post
+	// is dated ~now). Injectable for tests. Nil uses time.Now.
+	Now func() time.Time
 	// UserOrigin is AP_USER_ORIGIN: the origin every deterministic activity id
 	// is minted under.
 	UserOrigin string
@@ -136,6 +147,7 @@ type Engine struct {
 	apActors        store.APActors
 	maxPerCommunity int
 	catalog         *lexicon.BaseCatalog
+	now             func() time.Time
 	userOrigin      string
 	logger          *slog.Logger
 }
@@ -170,6 +182,10 @@ func NewEngine(opts Options) (*Engine, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	now := opts.Now
+	if now == nil {
+		now = time.Now
+	}
 	// The vendored lexicon catalog validates native postv2 input strictly: WE
 	// sign the acceptance, so input that does not validate is fail-closed. Loaded
 	// once at construction — a broken vendored file fails startup, not admission.
@@ -189,6 +205,7 @@ func NewEngine(opts Options) (*Engine, error) {
 		apActors:        opts.APActors,
 		maxPerCommunity: opts.MaxPerAuthorPerCommunity,
 		catalog:         catalog,
+		now:             now,
 		userOrigin:      opts.UserOrigin,
 		logger:          logger,
 	}, nil
@@ -216,27 +233,39 @@ func (e *Engine) AdmitPost(ctx context.Context, did string, commit *consume.Comm
 	}
 
 	// The post's current binding: whether it was already accepted (so a now-failing
-	// re-admission is a REMOVAL, not a fresh rejection) and which community it is
-	// bound to (so a community-moving edit is discarded whole). The engine writes
+	// re-admission is a REMOVAL, not a fresh rejection). The engine writes
 	// outbound_objects ONLY on accept, so a row here means the post federated.
 	prior, priorBound, err := e.priorBinding(ctx, postURI)
 	if err != nil {
 		return err
 	}
+	// The community this post is already bound to, read from EITHER surviving
+	// state — outbound_objects (accepted posts) OR the admissions ledger (a
+	// rejected post has a ledger row but no outbound row). A post is bound to one
+	// community forever; this is what makes community-immutability enforceable
+	// even for a post that was only ever rejected.
+	boundCommunity, err := e.boundCommunityOf(ctx, postURI, prior, priorBound)
+	if err != nil {
+		return err
+	}
 
 	// Decide admission. The order is deliberate (fail closed first, cheap policy
-	// last): lexicon-validate → community-immutable → opt-out → paused → title →
-	// rate cap. A discard means the whole event is dropped (nothing written to
-	// either community); a non-empty code is a rejection/removal cause.
-	code, discard, err := e.decide(ctx, did, commit, communityDID, prior, priorBound)
+	// last): lexicon-validate → community-immutable → community-followed → opt-out
+	// → paused → title → rate cap. A discard means the whole event is dropped
+	// (nothing written to either community); a non-empty code is a rejection/
+	// removal cause.
+	code, discard, err := e.decide(ctx, did, commit, communityDID, boundCommunity)
 	if err != nil {
 		return err
 	}
 	if discard {
-		e.logger.Debug("discarding community-moving edit",
+		// A community-moving edit: write NOTHING to the target community, and
+		// annotate the ORIGINAL community's ledger row (status unchanged) so the
+		// admin surface shows the attempted move instead of a silent drop.
+		e.logger.Info("discarding community-moving edit",
 			slog.String("did", did), slog.String("post", postURI),
-			slog.String("bound_community", prior.CommunityDID), slog.String("event_community", communityDID))
-		return nil
+			slog.String("bound_community", boundCommunity), slog.String("event_community", communityDID))
+		return e.annotateCommunityImmutable(ctx, postURI)
 	}
 
 	if code != "" {
@@ -259,38 +288,64 @@ func (e *Engine) AdmitPost(ctx context.Context, did string, commit *consume.Comm
 			// The record body + context this decision was made against, so a later
 			// force re-admit can re-run admission from stored state (a rejection
 			// writes no outbound_objects, and the author's PDS is not local).
-			EvaluatedSnapshot: evaluatedSnapshot(commit),
+			EvaluatedSnapshot: e.evaluatedSnapshot(commit),
 		})
 	}
 
 	return e.accept(ctx, did, communityDID, postURI, commit)
 }
 
-// operationDelete is the Jetstream commit operation for a record deletion.
-const operationDelete = "delete"
+// The AP op strings the deterministic activity id and the Page translation key
+// on. operationDelete is also the Jetstream commit operation for a deletion; the
+// others are DERIVED from outbound state, not read off the commit (see accept).
+const (
+	operationCreate = "create"
+	operationUpdate = "update"
+	operationDelete = "delete"
+)
 
 // decide runs the admission checks in order and returns the rejection/removal
 // code ("" = admit), or discard=true when the event must be dropped whole (a
 // community-moving edit). The order fails closed first: garbage input never
 // reaches a policy check, and a hijack (community move) is refused before the
 // author's own preferences are consulted.
-func (e *Engine) decide(ctx context.Context, did string, commit *consume.CommitEvent, communityDID string,
-	prior *store.OutboundObject, priorBound bool) (code string, discard bool, err error) {
+func (e *Engine) decide(ctx context.Context, did string, commit *consume.CommitEvent,
+	communityDID, boundCommunity string) (code string, discard bool, err error) {
 
-	// 1. Strict lexicon validation of the native input — fail closed.
-	if !e.lexiconValid(commit.Record) {
+	// 1. Strict lexicon validation of the native input, bound to the postv2
+	// schema — fail closed. A marshal/unmarshal fault is an INTERNAL error
+	// (retryable), NOT a permanent lexicon-invalid verdict.
+	valid, err := e.lexiconValid(commit.Record)
+	if err != nil {
+		return "", false, err
+	}
+	if !valid {
 		return DecisionLexiconInvalid, false, nil
 	}
 
 	// 2. Community immutability. The lexicon marks `community` immutable: an
-	// UPDATE that names a different community than the post was accepted into is
-	// a retarget, which means writing a NEW post — so the whole event is
-	// discarded, not partially applied.
-	if priorBound && prior.CommunityDID != communityDID {
+	// UPDATE that names a different community than the post was bound to is a
+	// retarget, which means writing a NEW post — so the whole event is discarded,
+	// not partially applied.
+	if boundCommunity != "" && boundCommunity != communityDID {
 		return "", true, nil
 	}
 
-	// 3. Opt-out (decision 11): content pushed outward is exactly what an
+	// 3. Community follow gate (SECURITY): a communities row's mere existence is
+	// NOT authority to sign an acceptance into it. We federate only communities
+	// we hold an ACCEPTED Follow to; none/pending/unfollowed reject.
+	community, err := e.communities.GetByDID(ctx, communityDID)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return DecisionCommunityNotFollowed, false, nil
+		}
+		return "", false, fmt.Errorf("accept: resolve community %s: %w", communityDID, err)
+	}
+	if community.FollowState != store.FollowStateAccepted {
+		return DecisionCommunityNotFollowed, false, nil
+	}
+
+	// 4. Opt-out (decision 11): content pushed outward is exactly what an
 	// opted-out author refused.
 	federating, err := e.mayFederate(ctx, did)
 	if err != nil {
@@ -300,7 +355,7 @@ func (e *Engine) decide(ctx context.Context, did string, commit *consume.CommitE
 		return DecisionOptedOut, false, nil
 	}
 
-	// 4. Paused (#account, decision 19): delivery is halted while the identity is
+	// 5. Paused (#account, decision 19): delivery is halted while the identity is
 	// deactivated/suspended/takendown/throttled, so a new post is not admitted.
 	if e.apActors != nil {
 		actor, err := e.apActors.GetByDID(ctx, did)
@@ -316,17 +371,19 @@ func (e *Engine) decide(ctx context.Context, did string, commit *consume.CommitE
 		}
 	}
 
-	// 5. Title: required and within Lemmy's cap (postv2 title is OPTIONAL in the
-	// lexicon, so this is admission policy, not validation).
+	// 6. Title: required and within Lemmy's cap (postv2 title is OPTIONAL in the
+	// lexicon, so this is admission policy, not validation). The cap counts RUNES,
+	// not bytes — Lemmy's limit is on grapheme length, so a multibyte title well
+	// under 200 characters must not be rejected for being over 200 bytes.
 	title, _ := commit.Record["title"].(string)
 	if title == "" {
 		return DecisionTitleRequired, false, nil
 	}
-	if len(title) > lemmyTitleCap {
+	if utf8.RuneCountInString(title) > lemmyTitleCap {
 		return DecisionTitleTooLong, false, nil
 	}
 
-	// 6. Rate cap: one author must not flood a community Tidepool vouches for.
+	// 7. Rate cap: one author must not flood a community Tidepool vouches for.
 	// Counts the author's currently-accepted posts in this community, excluding
 	// this post so a repin never counts against itself. 0 means unlimited.
 	if e.maxPerCommunity > 0 {
@@ -364,6 +421,18 @@ func (e *Engine) accept(ctx context.Context, did, communityDID, postURI string, 
 		return err
 	}
 
+	// The AP op is a function of what LEMMY already holds, not of the Jetstream
+	// commit operation: Lemmy has a live copy only if a non-tombstoned outbound
+	// row already exists. An UPDATE of a never-federated post is a Create{Page};
+	// an edit after a Delete (removal / author-delete then restore) is a Create
+	// too, because the live copy was withdrawn. This is read BEFORE the upsert
+	// bumps the row.
+	priorRow, priorErr := e.objects.GetByATURI(ctx, postURI)
+	if priorErr != nil && !errors.IsNotFound(priorErr) {
+		return fmt.Errorf("accept: read outbound state for %s: %w", postURI, priorErr)
+	}
+	wasLive := priorErr == nil && !priorRow.IsTombstoned()
+
 	snapshot, err := json.Marshal(map[string]any{
 		"atUri":         postURI,
 		"cid":           commit.CID,
@@ -398,10 +467,18 @@ func (e *Engine) accept(ctx context.Context, did, communityDID, postURI string, 
 		if err != nil {
 			return fmt.Errorf("accept: write outbound state for %s: %w", postURI, err)
 		}
+		// Create unless Lemmy already holds a live copy AND this is a later
+		// activity (seq bumped past the initial 0). The seq is guarded on CID
+		// change (UpsertTx), so an unchanged redelivery keeps seq 0 and reuses the
+		// original Create id rather than minting an Update to a peer.
+		op := operationCreate
+		if wasLive && stored.LastActivitySeq > 0 {
+			op = operationUpdate
+		}
 		intent := consume.PostIntent{
-			Op:            commit.Operation,
+			Op:            op,
 			ATURI:         postURI,
-			ID:            consume.ActivityID(e.userOrigin, postURI, commit.Operation, stored.LastActivitySeq),
+			ID:            consume.ActivityID(e.userOrigin, postURI, op, stored.LastActivitySeq),
 			CommunityAPID: community.APGroupID,
 			Snapshot:      snapshot,
 		}
@@ -418,12 +495,26 @@ func (e *Engine) accept(ctx context.Context, did, communityDID, postURI string, 
 			EvaluatedCID:      commit.CID,
 			AcceptanceRKey:    rkey,
 			AcceptedCID:       commit.CID,
-			EvaluatedSnapshot: evaluatedSnapshot(commit),
+			EvaluatedSnapshot: e.evaluatedSnapshot(commit),
 		})
 	}
 
-	if _, err := acceptrec.AcceptSubject(ctx, e.repos, communityDID, postURI, commit.CID,
-		publishedAtOf(commit.Record), sideEffect); err != nil {
+	_, err = acceptrec.AcceptSubject(ctx, e.repos, communityDID, postURI, commit.CID,
+		publishedAtOf(commit.Record), sideEffect)
+	if stderrors.Is(err, acceptrec.ErrRemovalStands) {
+		// An admission-revoked removal stands (a prior failing edit withdrew the
+		// post), but admission passes NOW. The revocation was OUR decision, so a
+		// corrective edit AUTO-RESTORES rather than erroring and redriving forever
+		// against the terminal removal: delete the removal + write a fresh
+		// acceptance + enqueue (a Create, since Lemmy's live copy is gone). The
+		// same side effect rides the restore commit.
+		if _, rerr := acceptrec.Restore(ctx, e.repos, communityDID, postURI, commit.CID,
+			publishedAtOf(commit.Record), sideEffect); rerr != nil {
+			return fmt.Errorf("accept: restore %s into %s: %w", postURI, communityDID, rerr)
+		}
+		return nil
+	}
+	if err != nil {
 		return fmt.Errorf("accept: admit %s into %s: %w", postURI, communityDID, err)
 	}
 	return nil
@@ -463,15 +554,17 @@ func (e *Engine) removeAccepted(ctx context.Context, did, communityDID, postURI 
 			Status:            StatusRemoved,
 			DecisionCode:      code,
 			EvaluatedCID:      commit.CID,
-			EvaluatedSnapshot: evaluatedSnapshot(commit),
+			EvaluatedSnapshot: e.evaluatedSnapshot(commit),
 		})
 	}
 
 	// The removal pins the version that was accepted when it was removed (audit
 	// metadata); the code is the open-set admission-revoked, not a moderation
-	// reason — no moderator acted.
+	// reason — no moderator acted. createdAt is the DECISION time (the engine's
+	// clock), NOT the post's publication time — a removal is a claim about when we
+	// decided, so an old post removed today is dated today.
 	if _, err := acceptrec.Remove(ctx, e.repos, communityDID, postURI, prior.LastCID,
-		RemovalCodeAdmissionRevoked, "", publishedAtOf(commit.Record), sideEffect); err != nil {
+		RemovalCodeAdmissionRevoked, "", e.now(), sideEffect); err != nil {
 		return fmt.Errorf("accept: remove %s from %s: %w", postURI, communityDID, err)
 	}
 	return nil
@@ -535,23 +628,95 @@ func (e *Engine) priorBinding(ctx context.Context, postURI string) (*store.Outbo
 	return stored, true, nil
 }
 
-// lexiconValid reports whether the postv2 record passes strict validation against
-// the vendored lexicon catalog. Invalid input is fail-closed (rejected), never
-// signed. A record with no $type, or one whose $type has no schema, is invalid.
-func (e *Engine) lexiconValid(record map[string]any) bool {
-	recordType, _ := record["$type"].(string)
-	if recordType == "" {
-		return false
+// lexiconValid reports whether the record is a valid social.coves.community
+// .postv2, validated against THAT schema specifically. SECURITY: the type is
+// bound to postv2, not trusted from the record's self-declared $type — WE sign
+// the acceptance, so a profile- or comment-shaped record carrying a full postv2
+// body must not be signed as a community post just because it is a valid instance
+// of the type it claims.
+//
+// The bool is the schema VERDICT (false → a real lexicon-invalid rejection). The
+// error is an INTERNAL fault (marshal/unmarshal) — retryable, and NOT a permanent
+// lexicon-invalid decision, so the caller must not record a rejection for it.
+func (e *Engine) lexiconValid(record map[string]any) (bool, error) {
+	if t, _ := record["$type"].(string); t != materialize.CollectionPostV2 {
+		e.logger.Debug("record rejected: $type is not a postv2",
+			slog.String("type", t), slog.String("want", materialize.CollectionPostV2))
+		return false, nil
 	}
 	raw, err := json.Marshal(record)
 	if err != nil {
-		return false
+		return false, fmt.Errorf("accept: marshal record for validation: %w", err)
 	}
 	data, err := atdata.UnmarshalJSON(raw)
 	if err != nil {
-		return false
+		return false, fmt.Errorf("accept: decode record for validation: %w", err)
 	}
-	return lexicon.ValidateRecord(e.catalog, data, recordType, lexicon.ValidateFlags(0)) == nil
+	if verr := lexicon.ValidateRecord(e.catalog, data, materialize.CollectionPostV2, lexicon.ValidateFlags(0)); verr != nil {
+		// A real schema verdict, logged with the offending field so an operator
+		// can tell a genuine bad record from a validator disagreement.
+		e.logger.Debug("record failed postv2 lexicon validation",
+			slog.String("detail", verr.Error()))
+		return false, nil
+	}
+	return true, nil
+}
+
+// boundCommunityOf returns the community a post is already bound to, from EITHER
+// surviving state: the outbound_objects row (an accepted post) or, failing that,
+// the admissions ledger (a rejected post keeps a ledger row but no outbound row).
+// "" means the engine has never decided on this post. This is what makes
+// one-community-per-post enforceable even for a post that was only ever rejected.
+func (e *Engine) boundCommunityOf(ctx context.Context, postURI string, priorRow *store.OutboundObject, priorBound bool) (string, error) {
+	if priorBound {
+		return priorRow.CommunityDID, nil
+	}
+	adm, err := e.admissions.GetByPostURI(ctx, postURI)
+	if errors.IsNotFound(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return adm.CommunityDID, nil
+}
+
+// annotateCommunityImmutable records the attempted community move on the post's
+// EXISTING ledger row (status unchanged, decision_code = community-immutable) so
+// the admin surface shows it, instead of a silent drop. It writes NOTHING to the
+// target community — the row it updates is the one already keyed to the post's
+// bound community.
+func (e *Engine) annotateCommunityImmutable(ctx context.Context, postURI string) error {
+	adm, err := e.admissions.GetByPostURI(ctx, postURI)
+	if errors.IsNotFound(err) {
+		return nil // nothing decided yet; nothing to annotate
+	}
+	if err != nil {
+		return err
+	}
+	adm.DecisionCode = DecisionCommunityImmutable
+	return e.admissions.Record(ctx, *adm)
+}
+
+// evaluatedSnapshot serializes the postv2 record and the context a Readmit needs
+// to rebuild the CommitEvent it re-runs admission against. It is stored on EVERY
+// decision (accept, reject, remove). A marshal failure is LOGGED (not silently
+// masqueraded as a legacy row) and yields nil — the store coalesces that to '{}',
+// which makes a later readmit surface as unrecoverable rather than re-run wrong.
+func (e *Engine) evaluatedSnapshot(commit *consume.CommitEvent) []byte {
+	b, err := json.Marshal(map[string]any{
+		"record":     commit.Record,
+		"cid":        commit.CID,
+		"rev":        commit.Rev,
+		"operation":  commit.Operation,
+		"collection": commit.Collection,
+	})
+	if err != nil {
+		e.logger.Warn("failed to marshal evaluated snapshot; readmit will be unrecoverable for this decision",
+			slog.String("rkey", commit.RKey), slog.String("error", err.Error()))
+		return nil
+	}
+	return b
 }
 
 // mayFederate reports whether the author permits outbound federation. A missing
@@ -642,7 +807,11 @@ func (e *Engine) Readmit(ctx context.Context, postATURI string) (*ReadmitResult,
 	if err != nil {
 		return nil, err
 	}
-	code, discard, err := e.decide(ctx, did, commit, communityDID, prior, priorBound)
+	boundCommunity, err := e.boundCommunityOf(ctx, postATURI, prior, priorBound)
+	if err != nil {
+		return nil, err
+	}
+	code, discard, err := e.decide(ctx, did, commit, communityDID, boundCommunity)
 	if err != nil {
 		return nil, err
 	}
@@ -669,7 +838,7 @@ func (e *Engine) Readmit(ctx context.Context, postATURI string) (*ReadmitResult,
 			Status:            StatusRejected,
 			DecisionCode:      code,
 			EvaluatedCID:      commit.CID,
-			EvaluatedSnapshot: evaluatedSnapshot(commit),
+			EvaluatedSnapshot: e.evaluatedSnapshot(commit),
 		}); err != nil {
 			return nil, err
 		}
@@ -681,24 +850,6 @@ func (e *Engine) Readmit(ctx context.Context, postATURI string) (*ReadmitResult,
 		return nil, err
 	}
 	return &ReadmitResult{PostURI: postATURI, Status: StatusAccepted, Enqueued: true}, nil
-}
-
-// evaluatedSnapshot serializes the postv2 record and the context a Readmit needs
-// to rebuild the CommitEvent it re-runs admission against. It is stored on EVERY
-// decision (accept, reject, remove). A marshal failure yields nil, which the
-// store coalesces to '{}' — an unrecoverable readmit, never a wrong one.
-func evaluatedSnapshot(commit *consume.CommitEvent) []byte {
-	b, err := json.Marshal(map[string]any{
-		"record":     commit.Record,
-		"cid":        commit.CID,
-		"rev":        commit.Rev,
-		"operation":  commit.Operation,
-		"collection": commit.Collection,
-	})
-	if err != nil {
-		return nil
-	}
-	return b
 }
 
 // rebuildCommit reconstructs the CommitEvent (and its author DID) a Readmit

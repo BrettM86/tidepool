@@ -165,6 +165,15 @@ func TestEngineCrashInjectionIsAtomic(t *testing.T) {
 	assert.Zero(t, countRows(t, conn, "outbound_activities"),
 		"and no outbound activity: the whole acceptance+enqueue transaction rolled back")
 	assert.Zero(t, countRows(t, conn, "outbound_deliveries"))
+
+	// The side effect writes the outbound_objects row AND the admissions ledger
+	// row on the SAME acceptance tx, so a rollback must leave NEITHER. A non-tx
+	// write of either would leak past the rollback undetected — pin both absent.
+	assert.Zero(t, countRows(t, conn, "outbound_objects"),
+		"the post's outbound_objects row must roll back with the acceptance (written on the tx)")
+	assert.Zero(t, countRows(t, conn, "admissions"),
+		"the accepted admissions row must roll back too — no ledger row may claim the post was "+
+			"accepted when the acceptance itself did not commit")
 }
 
 // TestEngineRecordsOptedOutRejection pins the opt-out check MOVED into the

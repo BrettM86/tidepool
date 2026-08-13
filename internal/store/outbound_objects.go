@@ -65,7 +65,19 @@ func (r *postgresOutboundObjects) upsert(ctx context.Context, q execer, object O
 			community_ap_id = EXCLUDED.community_ap_id,
 			translated_snapshot = EXCLUDED.translated_snapshot,
 			depth = EXCLUDED.depth,
-			last_activity_seq = outbound_objects.last_activity_seq + 1,
+			-- The seq bumps ONLY when the commit actually changed — the record CID
+			-- OR the commit rev — mirroring how TombstoneTx guards its bump on
+			-- tombstoned_at IS NULL. A redelivery or a force re-admit of UNCHANGED
+			-- content re-runs the outbound side effect against byte-identical state
+			-- (same cid AND same rev); it must reuse the same activity id, or every
+			-- replay invents a new one and re-delivers the same object. A real edit
+			-- (new cid, and always a new rev) still bumps — including an edit that
+			-- happens to reserialize to the same cid but under a fresh rev.
+			last_activity_seq = CASE
+				WHEN outbound_objects.last_cid IS DISTINCT FROM EXCLUDED.last_cid
+				  OR outbound_objects.last_rev IS DISTINCT FROM EXCLUDED.last_rev
+				THEN outbound_objects.last_activity_seq + 1
+				ELSE outbound_objects.last_activity_seq END,
 			updated_at = now()
 		RETURNING` + outboundObjectColumns
 

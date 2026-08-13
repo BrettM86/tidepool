@@ -171,7 +171,7 @@ func adminBearer(token string, logger *slog.Logger) func(http.Handler) http.Hand
 	}
 }
 
-// writeJSON is the shared JSON responder GREEN's handlers use.
+// writeJSON is the shared JSON responder the admin handlers use.
 func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)

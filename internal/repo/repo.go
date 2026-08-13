@@ -361,7 +361,20 @@ func (m *Manager) ApplyOpsTx(ctx context.Context, did string, ops []RecordOp, si
 			// Nothing exists and nothing is being written: every op is a
 			// delete against a repo with no records, so the whole batch is
 			// inert. Genesis is reserved for commits that put something.
-			return &CommitResult{NoOp: true}, nil
+			res := &CommitResult{NoOp: true}
+			if sideEffect != nil {
+				// The at-least-once side effect (the outbound enqueue) still runs
+				// and must be made durable even though no repo commit happened —
+				// a retraction whose community repo was never created must still
+				// enqueue its Delete{Page}. Mirrors the len(emitted)==0 branch.
+				if err := sideEffect(ctx, tx, res); err != nil {
+					return nil, err
+				}
+				if err := tx.Commit(); err != nil {
+					return nil, fmt.Errorf("repo: commit genesis-delete side effect for %s: %w", did, err)
+				}
+			}
+			return res, nil
 		}
 		empty := mst.NewEmptyTree()
 		tree = &empty

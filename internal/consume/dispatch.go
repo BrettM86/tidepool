@@ -481,9 +481,8 @@ func (d *Dispatcher) handlePostV2(ctx context.Context, _ *sql.Tx, did string, co
 		// (decision_code opted-out) in the admissions ledger rather than the
 		// consumer dropping it silently at debug. post.getStatus and the admin
 		// surface both need the "why", and only the engine writes it. The
-		// consumer keeps only the pre-gate an opted-out author's post still fails
-		// for a DIFFERENT reason: it must name a bridged community for the engine
-		// to have a repo to reject it INTO.
+		// consumer keeps just one pre-gate check: a post must name a bridged
+		// community for the engine to have a repo to reject it INTO.
 		communityDID := stringField(commit.Record, "community")
 		if communityDID == "" {
 			// The lexicon REQUIRES community. A post without one is malformed

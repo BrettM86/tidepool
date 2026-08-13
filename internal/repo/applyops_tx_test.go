@@ -176,3 +176,33 @@ func TestApplyOpsTx_SuccessRunsSideEffectInSameCommit(t *testing.T) {
 	_, _, err = manager.GetRecord(ctx, testDID, testCollection, testRKey(2))
 	assert.NoError(t, err, "the written record exists")
 }
+
+// TestApplyOpsTx_GenesisDeleteRunsSideEffect: an all-delete batch against a
+// community that has NO repo yet (state == nil, KeyUseDelete) currently returns
+// early NoOp WITHOUT running the side effect. Per the at-least-once side-effect
+// contract (the enqueue must fire even when the repo commit is inert), the side
+// effect MUST still run and commit — a DeleteAcceptance-shaped retraction whose
+// community repo was never created must still enqueue its Delete{Page}.
+//
+// RULING (flagged): the side effect runs here too, for the SAME reason the
+// len(emitted)==0 branch runs it. If the coordinator rules this an intentional
+// no-side-effect exit instead, this pin is the place to invert.
+func TestApplyOpsTx_GenesisDeleteRunsSideEffect(t *testing.T) {
+	manager, database, _ := testManager(t)
+	applyOpsTxMarker(t, database)
+	ctx := context.Background()
+
+	// testDID has no repo_state row (no PutRecord ran), so state == nil and the
+	// all-delete batch takes the genesis-delete branch.
+	res, err := manager.ApplyOpsTx(ctx, testDID, []RecordOp{
+		{Action: OpActionDelete, Collection: testCollection, RKey: testRKey(1)},
+		{Action: OpActionDelete, Collection: testOtherCollection, RKey: testRKey(2)},
+	}, writeMarker(ctx, "genesis-delete-enqueue", nil))
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	assert.True(t, res.NoOp, "no records exist, so the batch commits no records")
+
+	assert.Equal(t, 1, markerCount(t, database),
+		"the side effect must run on the genesis-delete branch too: the at-least-once outbound "+
+			"enqueue has to fire even when the community repo was never created")
+}

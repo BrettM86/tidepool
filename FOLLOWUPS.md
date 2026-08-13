@@ -70,8 +70,9 @@ task documents and git history rather than this list.
   index, but the outer `c.seq = ANY(ARRAY(...)) FOR UPDATE` re-check has no
   index on `seq` alone (`seq` is BIGSERIAL, not the PK `(activity_id,
   target_inbox)`). Unlike inbox_events (where `id` IS the PK), this is not a
-  point-fetch. A dedicated `UNIQUE INDEX (seq)` in its OWN migration (021 —
-  amending the already-applied 020 is a silent no-op under goose) would
+  point-fetch. A dedicated `UNIQUE INDEX (seq)` in its OWN migration (the next
+  free number — 023 as of this writing; amending an already-applied migration
+  is a silent no-op under goose) would
   restore O(keys × log N); add it if the claim path profiles hot.
 - **OutboundDeliveries is a 12-method interface** (go-proverbs SHOULD). It
   is one cohesive repository seam but the worker uses only the

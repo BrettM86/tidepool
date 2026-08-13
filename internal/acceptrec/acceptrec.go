@@ -211,11 +211,21 @@ func DeleteAcceptance(ctx context.Context, repos RepoManager, communityDID, subj
 // inside the commit.
 func Remove(ctx context.Context, repos RepoManager, communityDID, subjectURI, subjectCID, code, reason string, at time.Time, sideEffect repo.TxSideEffect) (*repo.CommitResult, error) {
 	rkey := SubjectRKey(subjectURI)
+	// createdAt is the DECISION time (`at`, the engine's clock), but a standing
+	// removal carries its createdAt FORWARD so a redelivery re-puts byte-identical
+	// bytes and the repo layer's NoOp path absorbs it — only the first write
+	// stamps the clock.
+	createdAt := recordDatetime(at)
+	if existing, _, err := repos.GetRecord(ctx, communityDID, CollectionRemoval, rkey); err == nil {
+		if when, ok := existing["createdAt"].(string); ok && when != "" {
+			createdAt = when
+		}
+	}
 	removal := map[string]any{
 		"$type":     CollectionRemoval,
 		"subject":   strongRef(subjectURI, subjectCID),
 		"code":      code,
-		"createdAt": recordDatetime(at),
+		"createdAt": createdAt,
 	}
 	// Omitted rather than written blank: an empty reason renders in a moderation
 	// log as a blank explanation instead of as none given.
@@ -231,6 +241,34 @@ func Remove(ctx context.Context, repos RepoManager, communityDID, subjectURI, su
 	}, sideEffect)
 	if err != nil {
 		return nil, fmt.Errorf("acceptrec: remove %s from %s: %w", subjectURI, communityDID, err)
+	}
+	return res, nil
+}
+
+// Restore is the inverse of Remove: it deletes the standing removal and writes a
+// fresh acceptance at the shared rkey in ONE commit, running sideEffect (the
+// re-delivery enqueue) inside it. It is what a corrective edit routes through
+// after an admission-revoked removal — the removal was OUR decision, so a post
+// that now passes admission is reinstated rather than left withdrawn. Unlike
+// AcceptSubject, it does NOT trip the removal guard: deleting the removal is the
+// point. createdAt is derived from publishedAt (a fresh acceptance stands for the
+// current version), so a redelivery re-puts byte-identical bytes.
+func Restore(ctx context.Context, repos RepoManager, communityDID, subjectURI, subjectCID string, publishedAt time.Time, sideEffect repo.TxSideEffect) (*repo.CommitResult, error) {
+	rkey := SubjectRKey(subjectURI)
+	acceptance := map[string]any{
+		"$type":     CollectionAcceptance,
+		"subject":   strongRef(subjectURI, subjectCID),
+		"createdAt": recordDatetime(publishedAt),
+	}
+	// One commit: the removal is withdrawn and the acceptance written together,
+	// so the firehose never shows a window where the post is neither removed nor
+	// accepted.
+	res, err := repos.ApplyOpsTx(ctx, communityDID, []repo.RecordOp{
+		{Action: repo.OpActionDelete, Collection: CollectionRemoval, RKey: rkey},
+		{Action: repo.OpActionUpdate, Collection: CollectionAcceptance, RKey: rkey, Record: acceptance},
+	}, sideEffect)
+	if err != nil {
+		return nil, fmt.Errorf("acceptrec: restore %s into %s: %w", subjectURI, communityDID, err)
 	}
 	return res, nil
 }

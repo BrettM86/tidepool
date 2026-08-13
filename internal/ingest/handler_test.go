@@ -129,17 +129,17 @@ func TestAnnounceCreatePageEndToEnd(t *testing.T) {
 	require.NotNil(t, event.ProcessedAt)
 	assert.Empty(t, event.Error)
 
-	// The post is mapped and lives in the community repo.
+	// The post is mapped and lives in the AUTHOR's repo (PLAN.md decision 20).
 	mapping, err := h.objects.GetByAPID(context.Background(), pageID)
 	require.NoError(t, err)
-	communityDID := testDIDFor("technology", "lemmy.world")
-	assert.Equal(t, communityDID, mapping.DID)
-	assert.Equal(t, materialize.CollectionPost, mapping.Collection)
+	authorDID := testDIDFor("LeftLeaningFreedomFighters", "lemmy.world")
+	assert.Equal(t, authorDID, mapping.DID)
+	assert.Equal(t, materialize.CollectionPostV2, mapping.Collection)
 
 	// ... and is visible via the firehose (task 04 reads the same log).
 	var postOps int
 	for _, path := range h.firehoseOps() {
-		if strings.HasPrefix(path, materialize.CollectionPost+"/") {
+		if strings.HasPrefix(path, materialize.CollectionPostV2+"/") {
 			postOps++
 		}
 	}

@@ -154,7 +154,7 @@ func (m *Materializer) materializeCommentLeaf(ctx context.Context, note *ap.Obje
 		return nil, err
 	}
 
-	reply, err := m.resolveReplyRefs(ctx, note)
+	reply, communityDID, err := m.resolveReplyRefs(ctx, note)
 	if err != nil {
 		return nil, err
 	}
@@ -185,7 +185,7 @@ func (m *Materializer) materializeCommentLeaf(ctx context.Context, note *ap.Obje
 	if note.Sensitive != nil && *note.Sensitive {
 		record["labels"] = selfLabels("nsfw")
 	}
-	return m.commitRecord(ctx, author.DID, CollectionComment, rkey, record, note, author.DID)
+	return m.commitRecord(ctx, author.DID, CollectionComment, rkey, record, note, author.DID, communityDID)
 }
 
 // resolveReplyRefs builds the reply {root, parent} strongRefs for a
@@ -193,41 +193,57 @@ func (m *Materializer) materializeCommentLeaf(ctx context.Context, note *ap.Obje
 // itself when the parent is a post, otherwise the parent comment's own
 // stored reply.root (every materialized comment carries it, so one record
 // read resolves the thread root without walking AP again).
-func (m *Materializer) resolveReplyRefs(ctx context.Context, note *ap.Object) (map[string]any, error) {
+//
+// It also returns the community the thread belongs to, taken from the
+// PARENT's mapping. A comment record has nowhere to state its community, so
+// this is the only moment the bridge knows it cheaply — and recording it is
+// what lets an announced delete or vote authorize a comment without walking
+// back up the thread through records that may since have been removed.
+func (m *Materializer) resolveReplyRefs(ctx context.Context, note *ap.Object) (map[string]any, string, error) {
 	parentID := note.InReplyTo.ID
 	parentURI, parentCID, err := m.objects.ResolveStrongRef(ctx, parentID)
 	switch {
 	case err == nil:
 	case errors.IsTombstoned(err):
-		return nil, skip(note.ID, fmt.Sprintf("parent %s is tombstoned", parentID))
+		return nil, "", skip(note.ID, fmt.Sprintf("parent %s is tombstoned", parentID))
 	case errors.IsNotFound(err):
-		return nil, skip(note.ID, fmt.Sprintf("parent %s is not materialized", parentID))
+		return nil, "", skip(note.ID, fmt.Sprintf("parent %s is not materialized", parentID))
 	default:
-		return nil, fmt.Errorf("materialize: resolve parent %s of %s: %w", parentID, note.ID, err)
+		return nil, "", fmt.Errorf("materialize: resolve parent %s of %s: %w", parentID, note.ID, err)
 	}
 
 	parentMapping, err := m.objects.GetByAPID(ctx, parentID)
 	if err != nil {
-		return nil, fmt.Errorf("materialize: load parent mapping %s: %w", parentID, err)
+		return nil, "", fmt.Errorf("materialize: load parent mapping %s: %w", parentID, err)
+	}
+	communityDID, err := CommunityDIDOf(ctx, m.repos, parentMapping)
+	if err != nil {
+		return nil, "", err
 	}
 
 	reply := map[string]any{"parent": strongRef(parentURI, parentCID)}
-	if parentMapping.Collection == CollectionPost {
+	if parentMapping.Collection == CollectionPost || parentMapping.Collection == CollectionPostV2 {
+		// A post of EITHER era is the thread root. Both collections are asked
+		// about because they coexist indefinitely: postv2 for everything
+		// materialized since the flip, the deprecated collection for the posts
+		// already written before it. Recognising only one era would send the
+		// other down the parent-is-a-comment path, which looks for a reply.root
+		// a post never carries.
 		reply["root"] = strongRef(parentURI, parentCID)
-		return reply, nil
+		return reply, communityDID, nil
 	}
 
 	// Parent is a comment: reuse its stored reply.root.
 	parentRecord, _, err := m.repos.GetRecord(ctx, parentMapping.DID, parentMapping.Collection, parentMapping.RKey)
 	if err != nil {
-		return nil, fmt.Errorf("materialize: read parent comment %s: %w", parentMapping.ATURI, err)
+		return nil, "", fmt.Errorf("materialize: read parent comment %s: %w", parentMapping.ATURI, err)
 	}
 	root, ok := extractStrongRef(parentRecord, "reply", "root")
 	if !ok {
-		return nil, fmt.Errorf("materialize: parent comment %s carries no reply.root", parentMapping.ATURI)
+		return nil, "", fmt.Errorf("materialize: parent comment %s carries no reply.root", parentMapping.ATURI)
 	}
 	reply["root"] = root
-	return reply, nil
+	return reply, communityDID, nil
 }
 
 // extractStrongRef digs a {uri, cid} pair out of a decoded record.

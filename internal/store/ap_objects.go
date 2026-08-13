@@ -22,8 +22,8 @@ func NewAPObjects(db *sql.DB) APObjects {
 }
 
 const apObjectColumns = `
-	id, ap_id, ap_type, origin_instance, origin, did, author_did, collection,
-	rkey, at_uri, cid, ap_published_at, indexed_at, deleted_at`
+	id, ap_id, ap_type, origin_instance, origin, did, author_did, community_did,
+	collection, rkey, at_uri, cid, ap_published_at, indexed_at, deleted_at`
 
 func (r *postgresAPObjects) PutMapping(ctx context.Context, mapping APObjectMapping) (*APObjectMapping, error) {
 	return r.putMapping(ctx, r.db, mapping)
@@ -49,13 +49,14 @@ func (r *postgresAPObjects) putMapping(ctx context.Context, q queryRower, mappin
 	query := `
 		INSERT INTO ap_objects (
 			ap_id, ap_type, origin_instance, origin, did, author_did,
-			collection, rkey, at_uri, cid, ap_published_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+			community_did, collection, rkey, at_uri, cid, ap_published_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		ON CONFLICT (ap_id) DO UPDATE SET
 			ap_type = EXCLUDED.ap_type,
 			origin = EXCLUDED.origin,
 			did = EXCLUDED.did,
 			author_did = EXCLUDED.author_did,
+			community_did = EXCLUDED.community_did,
 			collection = EXCLUDED.collection,
 			rkey = EXCLUDED.rkey,
 			at_uri = EXCLUDED.at_uri,
@@ -67,8 +68,8 @@ func (r *postgresAPObjects) putMapping(ctx context.Context, q queryRower, mappin
 
 	row := q.QueryRowContext(ctx, query,
 		mapping.APID, mapping.APType, mapping.OriginInstance, string(mapping.Origin),
-		mapping.DID, nullIfEmpty(mapping.AuthorDID), mapping.Collection, mapping.RKey,
-		mapping.ATURI, mapping.CID, mapping.PublishedAt,
+		mapping.DID, nullIfEmpty(mapping.AuthorDID), nullIfEmpty(mapping.CommunityDID),
+		mapping.Collection, mapping.RKey, mapping.ATURI, mapping.CID, mapping.PublishedAt,
 	)
 	stored, err := scanAPObject(row)
 	if err != nil {
@@ -247,6 +248,11 @@ func validateMapping(mapping *APObjectMapping) error {
 			return errors.NewValidationError("author_did", err.Error())
 		}
 	}
+	if mapping.CommunityDID != "" {
+		if _, err := syntax.ParseDID(mapping.CommunityDID); err != nil {
+			return errors.NewValidationError("community_did", err.Error())
+		}
+	}
 	collection, err := syntax.ParseNSID(mapping.Collection)
 	if err != nil {
 		return errors.NewValidationError("collection", err.Error())
@@ -267,11 +273,11 @@ type rowScanner interface {
 func scanAPObject(row rowScanner) (*APObjectMapping, error) {
 	var mapping APObjectMapping
 	var origin string
-	var authorDID sql.NullString
+	var authorDID, communityDID sql.NullString
 	err := row.Scan(
 		&mapping.ID, &mapping.APID, &mapping.APType, &mapping.OriginInstance,
-		&origin, &mapping.DID, &authorDID, &mapping.Collection, &mapping.RKey,
-		&mapping.ATURI, &mapping.CID,
+		&origin, &mapping.DID, &authorDID, &communityDID,
+		&mapping.Collection, &mapping.RKey, &mapping.ATURI, &mapping.CID,
 		&mapping.PublishedAt, &mapping.IndexedAt, &mapping.DeletedAt,
 	)
 	if err != nil {
@@ -279,6 +285,7 @@ func scanAPObject(row rowScanner) (*APObjectMapping, error) {
 	}
 	mapping.Origin = Origin(origin)
 	mapping.AuthorDID = authorDID.String
+	mapping.CommunityDID = communityDID.String
 	return &mapping, nil
 }
 

@@ -51,8 +51,24 @@ var ValidationFailures = expvar.NewInt("tidepool_lexicon_validation_failures")
 const (
 	CollectionActorProfile     = "social.coves.actor.profile"
 	CollectionCommunityProfile = "social.coves.community.profile"
-	CollectionPost             = "social.coves.community.post"
-	CollectionComment          = "social.coves.community.comment"
+	// CollectionPost is the DEPRECATED post collection: a post in the
+	// COMMUNITY's repo carrying an in-record `author`. Nothing is created
+	// under it any more (PLAN.md decision 20 flipped new posts to postv2),
+	// but it stays because the records already written under it do not
+	// migrate — Coves indexes both collections indefinitely — so update,
+	// delete, stats and comment-parent dispatch still meet it.
+	CollectionPost = "social.coves.community.post"
+	// CollectionPostV2 is the post collection after the author-owned flip:
+	// the record lives in the AUTHOR's repo, authorship IS that repo (no
+	// in-record author), and `community` names the community it was
+	// submitted to.
+	CollectionPostV2 = "social.coves.community.postv2"
+	// CollectionAcceptance is the community's attestation that it accepts a
+	// post. It lives in the COMMUNITY's repo at a digest of the subject's
+	// at-uri (SubjectRKey), and it is what makes a postv2 visible in the
+	// community at all.
+	CollectionAcceptance = "social.coves.community.acceptance"
+	CollectionComment    = "social.coves.community.comment"
 )
 
 // ProfileRKey is the fixed record key of actor and community profiles.
@@ -238,8 +254,9 @@ type Result struct {
 // mapping in ONE transaction (repo.PutRecordTx + PutMappingTx — task 11
 // closed the crash window where a record could land on the firehose with
 // no mapping). authorDID records who authored the record (differs from did
-// for posts).
-func (m *Materializer) commitRecord(ctx context.Context, did, collection, rkey string, record map[string]any, obj *ap.Object, authorDID string) (*Result, error) {
+// for posts); communityDID records which community's content it is, for the
+// membership binding announced deletes and announced votes authorize against.
+func (m *Materializer) commitRecord(ctx context.Context, did, collection, rkey string, record map[string]any, obj *ap.Object, authorDID, communityDID string) (*Result, error) {
 	// Don't resurrect deleted content. AP delivery is unordered, so a Create
 	// or Update can arrive (or be re-delivered) after a Delete already
 	// tombstoned this object's mapping. Re-materializing would un-tombstone it
@@ -250,14 +267,19 @@ func (m *Materializer) commitRecord(ctx context.Context, did, collection, rkey s
 	//
 	// carryForward marks the update path for a live post/comment mapping: only
 	// there does the rebuild carry fields it cannot reconstruct forward
-	// (bridgedStats, and comments' reply refs), and only there does the commit
-	// need the optimistic-concurrency guard against a racing stats stamp.
+	// (bridgedStats, postv2's immutable community, and comments' reply refs),
+	// and only there does the commit need the optimistic-concurrency guard
+	// against a racing stats stamp. postv2 is gated exactly as the collection
+	// it replaced: an edit that skipped the carry would drop the vote counts
+	// the refresher stamped and mint a needless firehose event.
 	carryForward := false
 	if existing, err := m.objects.GetByAPID(ctx, obj.ID); err == nil {
 		if existing.IsDeleted() {
 			return nil, skip(obj.ID, "object was deleted upstream; not resurrecting")
 		}
-		carryForward = collection == CollectionPost || collection == CollectionComment
+		carryForward = collection == CollectionPost ||
+			collection == CollectionPostV2 ||
+			collection == CollectionComment
 	} else if !errors.IsNotFound(err) {
 		return nil, fmt.Errorf("materialize: check mapping for %s: %w", obj.ID, err)
 	}
@@ -280,6 +302,12 @@ func (m *Materializer) commitRecord(ctx context.Context, did, collection, rkey s
 	var stored *store.APObjectMapping
 	putMapping := func(ctx context.Context, tx *sql.Tx, res *repo.CommitResult) error {
 		mapping.CID = res.RecordCID
+		// Derived HERE, not above, because carryForwardFields may have
+		// rewritten the record between the two points: an update whose
+		// audience was retargeted has had the stored (immutable) community
+		// restored by then, and the mapping must agree with the record it
+		// maps or the two would authorize different communities.
+		mapping.CommunityDID = mappingCommunityDID(collection, did, record, communityDID)
 		var mapErr error
 		stored, mapErr = m.objects.PutMappingTx(ctx, tx, mapping)
 		if mapErr != nil {
@@ -351,6 +379,11 @@ func (m *Materializer) commitRecord(ctx context.Context, did, collection, rkey s
 //     rejects as thread hijacking. Carrying the stored refs verbatim keeps the
 //     thread anchoring stable across edits. The CREATE path still resolves
 //     fresh refs (this runs only for a live existing mapping).
+//   - community (postv2 only): the lexicon makes it IMMUTABLE, and Coves'
+//     consumers discard the WHOLE update event that changes it — so a rebuild
+//     that re-derived it from an edited (or hostile) `audience` would not
+//     retarget the post, it would freeze the post at its pre-edit version
+//     while every later edit was thrown away too. The stored value wins.
 //
 // A record absent on the FIRST attempt is the crash window between a delete
 // commit and its soft-delete: let the rebuild stand as a guarded create
@@ -368,6 +401,11 @@ func (m *Materializer) carryForwardFields(ctx context.Context, did, collection, 
 		if collection == CollectionComment {
 			if reply, ok := stored["reply"]; ok {
 				record["reply"] = reply
+			}
+		}
+		if collection == CollectionPostV2 {
+			if community, ok := stored["community"]; ok {
+				record["community"] = community
 			}
 		}
 		return storedCID, nil

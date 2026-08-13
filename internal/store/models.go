@@ -87,19 +87,26 @@ func (o Origin) Valid() bool {
 // mapping between an AP object and the atproto record it materialized as.
 type APObjectMapping struct {
 	ID             int64
-	APID           string     // canonical AP object id (URL)
-	APType         string     // AP type: Page, Note, Group, Person, ...
-	OriginInstance string     // host the object originated from, e.g. lemmy.world
-	Origin         Origin     // which side authored the object; defaults to fediverse
-	DID            string     // repo the record was written into
-	AuthorDID      string     // bridged actor who authored the record; differs from DID for posts (community repo). Optional.
-	Collection     string     // record NSID, e.g. social.coves.community.post
-	RKey           string     // deterministic TID rkey
-	ATURI          string     // at://did/collection/rkey (derived; set by PutMapping)
-	CID            string     // CID of the current record version
-	PublishedAt    *time.Time // AP `published` time (may be absent upstream)
-	IndexedAt      time.Time
-	DeletedAt      *time.Time
+	APID           string // canonical AP object id (URL)
+	APType         string // AP type: Page, Note, Group, Person, ...
+	OriginInstance string // host the object originated from, e.g. lemmy.world
+	Origin         Origin // which side authored the object; defaults to fediverse
+	DID            string // repo the record was written into
+	AuthorDID      string // bridged actor who authored the record; differs from DID for posts (community repo). Optional.
+	// CommunityDID is the community whose content this is — the membership
+	// answer announced deletes and announced votes authorize against. Since
+	// the author-owned flip it can no longer be read off DID (a postv2 lives
+	// in the author's repo), so it is recorded at materialization time.
+	// Optional: "" means unset, and readers fall back to deriving it from the
+	// record (migration 016 says which rows that covers and why).
+	CommunityDID string
+	Collection   string     // record NSID, e.g. social.coves.community.post
+	RKey         string     // deterministic TID rkey
+	ATURI        string     // at://did/collection/rkey (derived; set by PutMapping)
+	CID          string     // CID of the current record version
+	PublishedAt  *time.Time // AP `published` time (may be absent upstream)
+	IndexedAt    time.Time
+	DeletedAt    *time.Time
 }
 
 // IsDeleted reports whether the mapping has been soft-deleted.

@@ -145,8 +145,31 @@ func (m *Materializer) SetBridgedStats(ctx context.Context, mapping *store.APObj
 		if err != nil {
 			return nil, fmt.Errorf("materialize: put stats for %s: %w", mapping.ATURI, err)
 		}
+		if err := m.repinAcceptance(ctx, &updated, res.RecordCID); err != nil {
+			return nil, err
+		}
 		return &Result{DID: mapping.DID, ATURI: mapping.ATURI, CID: res.RecordCID, NoOp: res.NoOp}, nil
 	}
+}
+
+// repinAcceptance re-points a postv2's acceptance at the version this stamp
+// just produced. A stats stamp rewrites the record, so its CID moves — and an
+// acceptance pinning the OLD CID is, to Coves' consumers, an acceptance of a
+// version that no longer exists: the lexicon tells them not to render the new
+// CID under it, so a post would fall out of its community every time the vote
+// sweep touched it. Nothing about the community's decision changed, so the
+// stored createdAt is carried forward and only the pin moves.
+//
+// A repin cannot join the stats commit — that lands in the AUTHOR's repo and
+// this in the COMMUNITY's — so it is a second commit with the same heal
+// property as the create path: redelivery re-runs it. It is skipped, rather
+// than guessed at, when the mapping cannot say where or when to write; the
+// next materialization of the post heals it.
+func (m *Materializer) repinAcceptance(ctx context.Context, mapping *store.APObjectMapping, recordCID string) error {
+	if mapping.Collection != CollectionPostV2 || mapping.CommunityDID == "" || mapping.PublishedAt == nil {
+		return nil
+	}
+	return m.acceptPost(ctx, mapping.CommunityDID, mapping.ATURI, recordCID, *mapping.PublishedAt)
 }
 
 // bridgedStatsCounts reads the upvotes/downvotes a record's bridgedStats field

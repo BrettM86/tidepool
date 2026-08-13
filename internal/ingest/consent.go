@@ -22,7 +22,6 @@ package ingest
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"tidepool/internal/ap"
 	"tidepool/internal/errors"
@@ -298,7 +297,10 @@ func (h *Handler) handleUndoDelete(ctx context.Context, undo, del *ap.Object, si
 // (Delete(Actor) is terminal by design).
 func restoredTypeMatches(collection, apType string) bool {
 	switch collection {
-	case materialize.CollectionPost:
+	case materialize.CollectionPost, materialize.CollectionPostV2:
+		// Both eras answer to a Page/Article: a restored post re-materializes
+		// through MaterializePost, which writes a postv2 unless the mapping
+		// already says otherwise.
 		return apType == ap.TypePage || apType == ap.TypeArticle
 	case materialize.CollectionComment:
 		return apType == ap.TypeNote
@@ -409,82 +411,48 @@ func (h *Handler) authorizeDelete(ctx context.Context, activityID, targetID, sig
 		// whose actor row was scrubbed is still an actor, not content.
 		return skip(activityID, fmt.Sprintf(
 			"community %s may not delete actor %s", announcer.APGroupID, targetID))
-	case materialize.CollectionComment:
-		return h.authorizeAnnouncedCommentDelete(ctx, activityID, mapping, announcer)
 	}
-	if mapping.DID != announcer.DID {
-		return skip(activityID, fmt.Sprintf(
-			"announced delete of %s targets a record outside %s's repo", targetID, announcer.APGroupID))
-	}
-	return nil
+	return h.authorizeAnnouncedContentDelete(ctx, activityID, mapping, announcer)
 }
 
-// authorizeAnnouncedCommentDelete answers community membership for a
-// COMMENT, which its mapping cannot: comments commit into their AUTHOR's
-// repo (only posts land in the community's), so mapping.DID is the author's
-// DID for every comment in every community — comparing it to the announcer's
-// repo would drop every announced comment delete there is. The thread is the
-// membership signal instead: the materializer guarantees reply.root on every
-// comment and the thread's root post lives in the community's own repo, so
-// one record read recovers the owning community's DID (the same derivation
-// the vote aggregator uses to bind announced votes).
-func (h *Handler) authorizeAnnouncedCommentDelete(ctx context.Context, activityID string, mapping *store.APObjectMapping, announcer *store.Community) error {
-	if mapping.IsDeleted() {
-		// Already soft-deleted: the record — and with it the reply.root this
-		// check reads — is gone from the repo, so there is nothing left to
-		// authorize against, and re-deleting is a downstream no-op. The
-		// allowance is exactly that and no more: idempotence for re-delivered
-		// deletes. The RESTORE path rides the same authorizeDelete call and is
-		// therefore admitted here too, but it is not authorized here — its
-		// guarantees are post-fetch (handleUndoDelete): the origin must serve
-		// the object again over a pinned fetch, its type must match the
-		// mapping, and an announced restore must NAME the announcing community.
-		// Those are what stop a sibling community from reviving another
-		// community's soft-deleted comment.
-		return nil
-	}
-	record, _, err := h.records.GetRecord(ctx, mapping.DID, mapping.Collection, mapping.RKey)
-	if errors.IsNotFound(err) {
-		// A live mapping with no record is a permanent inconsistency: a retry
-		// would re-read the same missing record forever and wedge the
-		// ordering key behind it. Log it and drop the delete.
-		h.logger.Warn("announced comment delete: live mapping has no record",
-			"ap_id", mapping.APID, "at_uri", mapping.ATURI)
-		return skip(activityID, "comment "+mapping.ATURI+" has no record to authorize against")
-	}
+// authorizeAnnouncedContentDelete answers community membership for one piece
+// of bridged CONTENT. Repo placement used to answer it directly — posts sat in
+// the community's repo — but a postv2 sits in the author's, and a comment
+// never sat there at all, so the membership answer is recorded on the mapping
+// and read back through materialize.CommunityDIDOf (which also covers the rows
+// predating that column). An answer that cannot be determined REFUSES: an
+// announced delete is a moderation action by a community over its own
+// content, and content whose community we cannot name is not that.
+func (h *Handler) authorizeAnnouncedContentDelete(ctx context.Context, activityID string, mapping *store.APObjectMapping, announcer *store.Community) error {
+	communityDID, err := materialize.CommunityDIDOf(ctx, h.records, mapping)
 	if err != nil {
-		return fmt.Errorf("ingest: read comment record %s: %w", mapping.ATURI, err)
+		return fmt.Errorf("ingest: bind %s to a community: %w", mapping.APID, err)
 	}
-	rootDID := replyRootDID(record)
-	if rootDID == "" {
-		h.logger.Warn("announced comment delete: record carries no reply.root",
-			"ap_id", mapping.APID, "at_uri", mapping.ATURI)
-		return skip(activityID, "comment "+mapping.ATURI+" carries no reply.root to authorize against")
+	if communityDID == "" {
+		if mapping.IsDeleted() {
+			// Already soft-deleted: the record the derivation reads is gone, so
+			// there is nothing left to authorize against and re-deleting is a
+			// downstream no-op. The allowance is exactly that and no more —
+			// idempotence for re-delivered deletes, never for a live mapping.
+			// The RESTORE path rides this same call and is therefore admitted
+			// here too, but it is not authorized here: its guarantees are
+			// post-fetch (handleUndoDelete) — the origin must serve the object
+			// again over a pinned fetch, its type must match the mapping, and an
+			// announced restore must NAME the announcing community. Those are
+			// what stop a sibling community reviving another's soft-deleted
+			// content.
+			return nil
+		}
+		// A live mapping we cannot bind is a permanent inconsistency (a missing
+		// record, a comment with no reply.root). Retrying would re-read the same
+		// hole forever and wedge the ordering key behind it: log and drop.
+		h.logger.Warn("announced delete: cannot bind target to a community",
+			"ap_id", mapping.APID, "at_uri", mapping.ATURI, "collection", mapping.Collection)
+		return skip(activityID, mapping.ATURI+" cannot be bound to a community to authorize against")
 	}
-	if rootDID != announcer.DID {
+	if communityDID != announcer.DID {
 		return skip(activityID, fmt.Sprintf(
-			"announced delete of %s targets a comment in a thread outside %s",
-			mapping.APID, announcer.APGroupID))
+			"announced delete of %s targets content outside %s", mapping.APID, announcer.APGroupID))
 	}
 	return nil
-}
-
-// replyRootDID extracts the repo DID from a comment record's reply.root
-// strongRef uri (at://did/collection/rkey). Malformed records yield "".
-func replyRootDID(record map[string]any) string {
-	reply, ok := record["reply"].(map[string]any)
-	if !ok {
-		return ""
-	}
-	root, ok := reply["root"].(map[string]any)
-	if !ok {
-		return ""
-	}
-	uri, _ := root["uri"].(string)
-	rest, ok := strings.CutPrefix(uri, "at://")
-	if !ok {
-		return ""
-	}
-	did, _, _ := strings.Cut(rest, "/")
-	return did
 }

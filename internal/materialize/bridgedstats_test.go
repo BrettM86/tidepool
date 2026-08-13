@@ -160,7 +160,7 @@ func TestEditCarriesBridgedStatsForward(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, res.NoOp, "an edited body is a real commit")
 
-	record, _, err := h.manager.GetRecord(ctx, res.DID, CollectionPost, mapping.RKey)
+	record, _, err := h.manager.GetRecord(ctx, res.DID, CollectionPostV2, mapping.RKey)
 	require.NoError(t, err)
 	assert.Equal(t, "edited body text", record["content"], "the edit applied")
 	stats, ok := record["bridgedStats"].(map[string]any)
@@ -200,7 +200,9 @@ func TestUnchangedReingestAfterStatsIsNoOp(t *testing.T) {
 // TestBridgedStatsRecordsLexiconValidate pins that a bridgedStats-bearing post
 // and comment validate against the vendored Coves lexicons, and that a
 // malformed one (missing required asOf) is rejected — the synced #bridgedStats
-// def is what the emission path relies on.
+// def is what the emission path relies on. Both post eras are checked: postv2
+// is what the bridge emits now, and the deprecated collection must keep
+// validating for as long as the records already written under it exist.
 func TestBridgedStatsRecordsLexiconValidate(t *testing.T) {
 	h := newHarness(t)
 	stats := map[string]any{
@@ -208,6 +210,15 @@ func TestBridgedStatsRecordsLexiconValidate(t *testing.T) {
 		"downvotes": int64(4),
 		"asOf":      recordDatetime(statsAsOf),
 	}
+
+	postV2 := map[string]any{
+		"$type":        CollectionPostV2,
+		"community":    testServiceDID,
+		"createdAt":    recordDatetime(statsAsOf),
+		"title":        "a bridged post",
+		"bridgedStats": stats,
+	}
+	require.NoError(t, h.m.validateRecord(postV2), "a bridgedStats postv2 must validate")
 
 	post := map[string]any{
 		"$type":        CollectionPost,
@@ -217,7 +228,7 @@ func TestBridgedStatsRecordsLexiconValidate(t *testing.T) {
 		"title":        "a bridged post",
 		"bridgedStats": stats,
 	}
-	require.NoError(t, h.m.validateRecord(post), "a bridgedStats post must validate")
+	require.NoError(t, h.m.validateRecord(post), "a bridgedStats legacy post must validate")
 
 	comment := map[string]any{
 		"$type": CollectionComment,

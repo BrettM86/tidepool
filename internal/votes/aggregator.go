@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
-	"strings"
 	"time"
 
 	"tidepool/internal/ap"
@@ -591,11 +590,14 @@ func (a *Aggregator) subjectMapping(ctx context.Context, subject string) (*store
 //
 // The binding is by community DID, not IRI authority: Lemmy hosts a post's
 // AP object on the AUTHOR's instance, so a legitimate cross-instance-authored
-// post would fail any SameAuthority(subject, announcer) check. Posts are
-// written into the community's own repo (PLAN.md decision 3), so the
-// mapping's DID IS the community DID. Comments live in the author's repo;
-// their stored record's reply.root strongRef names the thread's root post in
-// the community repo, so one record read recovers the community DID.
+// post would fail any SameAuthority(subject, announcer) check. Which community
+// a subject belongs to is materialize.CommunityDIDOf's question — the same one
+// ingest's announced-delete authorization asks, answered in one place so the
+// two cannot drift into disagreeing about who owns a piece of content.
+//
+// A subject that cannot be bound counts for NOBODY: an unbindable subject is
+// indistinguishable from another community's, and the cost of erring the safe
+// way is a vote that does not move a counter.
 func (a *Aggregator) subjectBelongsToCommunity(ctx context.Context, mapping *store.APObjectMapping, communityIRI string) (bool, error) {
 	community, err := a.communities.GetByAPGroupID(ctx, communityIRI)
 	if errors.IsNotFound(err) {
@@ -604,43 +606,11 @@ func (a *Aggregator) subjectBelongsToCommunity(ctx context.Context, mapping *sto
 	if err != nil {
 		return false, fmt.Errorf("votes: resolve announcing community %s: %w", communityIRI, err)
 	}
-	switch mapping.Collection {
-	case materialize.CollectionPost:
-		return mapping.DID == community.DID, nil
-	case materialize.CollectionComment:
-		record, _, err := a.records.GetRecord(ctx, mapping.DID, mapping.Collection, mapping.RKey)
-		if errors.IsNotFound(err) {
-			return false, nil
-		}
-		if err != nil {
-			return false, fmt.Errorf("votes: read comment record %s: %w", mapping.ATURI, err)
-		}
-		rootDID := replyRootDID(record)
-		return rootDID != "" && rootDID == community.DID, nil
-	default:
-		// Votes bind to posts and comments only.
-		return false, nil
+	subjectCommunityDID, err := materialize.CommunityDIDOf(ctx, a.records, mapping)
+	if err != nil {
+		return false, fmt.Errorf("votes: bind subject %s to a community: %w", mapping.APID, err)
 	}
-}
-
-// replyRootDID extracts the repo DID from a comment record's reply.root
-// strongRef uri (at://did/collection/rkey). Malformed records yield "".
-func replyRootDID(record map[string]any) string {
-	reply, ok := record["reply"].(map[string]any)
-	if !ok {
-		return ""
-	}
-	root, ok := reply["root"].(map[string]any)
-	if !ok {
-		return ""
-	}
-	uri, _ := root["uri"].(string)
-	rest, ok := strings.CutPrefix(uri, "at://")
-	if !ok {
-		return ""
-	}
-	did, _, _ := strings.Cut(rest, "/")
-	return did
+	return subjectCommunityDID != "" && subjectCommunityDID == community.DID, nil
 }
 
 // inTx runs fn inside a transaction, committing on nil and rolling back on

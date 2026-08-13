@@ -4,12 +4,12 @@
   "createdAt": "2026-07-07T05:00:00.000Z",
   "reply": {
     "parent": {
-      "cid": "bafyreia77sa3os74ia7zsxjpn72bl2rt7szeklulzltslb6kylnkp23iu4",
-      "uri": "at://did:plc:ercpobr77dxb3e5h2gwued43/social.coves.community.post/3mpznwj74ndra"
+      "cid": "bafyreies3dibltj2xwfvz2aai2wvljccbfhoqcsyccalfbnngqoshul3qi",
+      "uri": "at://did:plc:tkvgcn4onp7yaeidusiiv4o2/social.coves.community.postv2/3mpznwj74ndra"
     },
     "root": {
-      "cid": "bafyreia77sa3os74ia7zsxjpn72bl2rt7szeklulzltslb6kylnkp23iu4",
-      "uri": "at://did:plc:ercpobr77dxb3e5h2gwued43/social.coves.community.post/3mpznwj74ndra"
+      "cid": "bafyreies3dibltj2xwfvz2aai2wvljccbfhoqcsyccalfbnngqoshul3qi",
+      "uri": "at://did:plc:tkvgcn4onp7yaeidusiiv4o2/social.coves.community.postv2/3mpznwj74ndra"
     }
   }
 }

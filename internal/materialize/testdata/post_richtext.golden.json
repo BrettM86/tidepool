@@ -1,6 +1,5 @@
 {
-  "$type": "social.coves.community.post",
-  "author": "did:plc:tkvgcn4onp7yaeidusiiv4o2",
+  "$type": "social.coves.community.postv2",
   "community": "did:plc:ercpobr77dxb3e5h2gwued43",
   "content": "The Button is back!\n\nThey said\n\nDo not press\n\nSign up at thebutton.social for bonuses — it's complicated simple.\n\n• one\n• two\n\na | b\n--- | ---\n1 | 2\n\nfmt.Println(\"press\")",
   "createdAt": "2026-07-07T03:27:37.028Z",
@@ -124,8 +123,19 @@
       }
     }
   ],
+  "federatedFrom": {
+    "apId": "https://lemmy.world/post/49131386",
+    "instance": "lemmy.world",
+    "platform": "lemmy"
+  },
   "langs": [
     "en"
   ],
+  "originalAuthor": {
+    "apId": "https://lemmy.world/u/LeftLeaningFreedomFighters",
+    "displayName": "Surprised Neelix",
+    "handle": "LeftLeaningFreedomFighters",
+    "instance": "lemmy.world"
+  },
   "title": "Inside the history of DRAM price-fixing lawsuits — how HBM allocations could make a difference after two decades of failed cases"
 }

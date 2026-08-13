@@ -81,7 +81,7 @@ func TestBackfillProducesMappedHistory(t *testing.T) {
 	for _, id := range []string{pageID, secondPageID} {
 		mapping, err := h.objects.GetByAPID(ctx, id)
 		require.NoError(t, err, "outbox post %s must be materialized", id)
-		assert.Equal(t, materialize.CollectionPost, mapping.Collection)
+		assert.Equal(t, materialize.CollectionPostV2, mapping.Collection)
 	}
 	// The advertised reply landed too.
 	replyMapping, err := h.objects.GetByAPID(ctx, "https://lemmy.world/comment/3001")

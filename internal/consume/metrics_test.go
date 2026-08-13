@@ -130,13 +130,13 @@ func TestNewNoopEnqueuer_AcceptsIntentsAndDeliversNothing(t *testing.T) {
 	require.NotNil(t, enqueuer,
 		"a nil logger must default rather than nil-panic on the first intent")
 
-	err := enqueuer.EnqueueActivity(context.Background(), dispatchNativeDID, "key", "at://parent",
+	err := enqueuer.EnqueueActivity(context.Background(), nil, dispatchNativeDID, "key", "at://parent",
 		CommentIntent{Op: "create", ATURI: "at://x", ID: "https://coves.social/ap/activity/abc"})
 	assert.NoError(t, err,
 		"until task 15 lands, main wires this so the consumer still RUNS and writes its "+
 			"durable state — disabling the whole path instead would leave everything "+
 			"downstream of the cursor unexercised until delivery exists")
 
-	assert.NoError(t, enqueuer.EnqueueActivity(context.Background(), dispatchNativeDID, "key", "",
+	assert.NoError(t, enqueuer.EnqueueActivity(context.Background(), nil, dispatchNativeDID, "key", "",
 		VoteIntent{Op: "undo", VoteATURI: "at://v", Direction: "up"}))
 }

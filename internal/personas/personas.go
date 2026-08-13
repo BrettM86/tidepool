@@ -81,7 +81,12 @@ type Service struct {
 	// inboxHandler is the ingest inbox this origin's shared inbox dispatches
 	// to. Nil means the route 404s.
 	inboxHandler http.Handler
-	logger       *slog.Logger
+	// outboundObjects / outboundActivities back the task-15 serving surface:
+	// GET /ap/object renders from the object snapshot, GET /ap/activity serves
+	// the canonical payload. Constructed from Options.DB (no new Options field).
+	outboundObjects    store.OutboundObjects
+	outboundActivities store.OutboundActivities
+	logger             *slog.Logger
 }
 
 // New builds a Service. The origin is canonicalized once here — config
@@ -120,9 +125,11 @@ func New(opts Options) (*Service, error) {
 		userOrigin: origin,
 		userHost:   host,
 
-		serviceActor: opts.ServiceActor,
-		inboxHandler: opts.InboxHandler,
-		logger:       logger,
+		serviceActor:       opts.ServiceActor,
+		inboxHandler:       opts.InboxHandler,
+		outboundObjects:    store.NewOutboundObjects(opts.DB),
+		outboundActivities: store.NewOutboundActivities(opts.DB),
+		logger:             logger,
 	}, nil
 }
 
@@ -221,6 +228,14 @@ func suffixedLocalPart(base string, attempt int) string {
 		return base
 	}
 	return base + "-" + strconv.Itoa(attempt)
+}
+
+// ActorSigner is the exported per-actor signer accessor (task 15 seam): the
+// outbound delivery worker signs each activity as the persona that authored the
+// record, not as the service actor. It is actorSigner promoted to the package
+// surface; internal callers keep using the unexported form.
+func (s *Service) ActorSigner(ctx context.Context, did string) (*ap.Signer, error) {
+	return s.actorSigner(ctx, did)
 }
 
 // actorSigner unseals a minted actor's RSA key and returns a Signer whose

@@ -29,7 +29,9 @@ func TestMigrations_UpDownUp(t *testing.T) {
 		                     -- task 14 (migration 018): the consumer's own state and the
 		                     -- outbound state deletes are rebuilt from.
 		                     'consumer_cursors', 'jetstream_record_revs', 'jetstream_dead_letters',
-		                     'outbound_objects', 'outbound_votes', 'federation_prefs')
+		                     'outbound_objects', 'outbound_votes', 'federation_prefs',
+		                     -- task 15 (migration 020): the outbound delivery queue.
+		                     'outbound_activities', 'outbound_deliveries')
 	`).Scan(&remaining)
 	require.NoError(t, err)
 	assert.Zero(t, remaining, "down migrations must drop every Tidepool table")
@@ -40,19 +42,42 @@ func TestMigrations_UpDownUp(t *testing.T) {
 	// a migration whose Down forgets a table is caught only when its Up
 	// created one. Assert the newest tables exist after the re-up so the two
 	// halves stay in step.
-	for _, table := range []string{
-		"consumer_cursors", "jetstream_record_revs", "jetstream_dead_letters",
-		"outbound_objects", "outbound_votes", "federation_prefs",
+	for _, tc := range []struct {
+		table     string
+		migration string
+	}{
+		{"consumer_cursors", "018"},
+		{"jetstream_record_revs", "018"},
+		{"jetstream_dead_letters", "018"},
+		{"outbound_objects", "018"},
+		{"outbound_votes", "018"},
+		{"federation_prefs", "018"},
+		{"outbound_activities", "020"},
+		{"outbound_deliveries", "020"},
 	} {
 		var exists bool
 		err = database.QueryRowContext(ctx, `
 			SELECT EXISTS (
 				SELECT 1 FROM information_schema.tables
 				WHERE table_schema = 'public' AND table_name = $1
-			)`, table).Scan(&exists)
+			)`, tc.table).Scan(&exists)
 		require.NoError(t, err)
-		assert.True(t, exists, "migration 018 must create %q", table)
+		assert.True(t, exists, "migration %s must create %q", tc.migration, tc.table)
 	}
+
+	// The causal-gating marker migration 020 ALTERs onto outbound_objects:
+	// NULL accepted_at is what keeps a bridge-origin child ineligible until its
+	// parent lands.
+	var acceptedAtExists bool
+	err = database.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_schema = 'public'
+			  AND table_name = 'outbound_objects'
+			  AND column_name = 'accepted_at'
+		)`).Scan(&acceptedAtExists)
+	require.NoError(t, err)
+	assert.True(t, acceptedAtExists, "migration 020 must add outbound_objects.accepted_at")
 
 	// Leave the schema usable and prove it is: exercise a write.
 	repo := NewAPObjects(database)
@@ -105,6 +130,14 @@ func TestMigrations_UniqueConstraintNames(t *testing.T) {
 		"outbound_votes_pkey",
 		"outbound_votes_actor_subject_key",
 		"federation_prefs_pkey",
+
+		// Task 15 (migration 020). The activity id is globally unique (one
+		// canonical payload fans out to many inboxes); the delivery PK is the
+		// (activity, inbox) fan-out key; the partial queue index is the
+		// loose-index-scan support the generalized ClaimNext depends on.
+		"outbound_activities_pkey",
+		"outbound_deliveries_pkey",
+		"idx_outbound_deliveries_queue",
 	}
 	for _, name := range expected {
 		var exists bool

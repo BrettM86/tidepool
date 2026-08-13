@@ -124,7 +124,7 @@ func (d *Dispatcher) applyCommentWrite(ctx context.Context, tx *sql.Tx, did stri
 		return fmt.Errorf("write outbound state for %s: %w", atURI, err)
 	}
 
-	return d.enqueueComment(ctx, did, commit.Operation, stored, thread.ParentATURI, thread.ParentAPID)
+	return d.enqueueComment(ctx, tx, did, commit.Operation, stored, thread.ParentATURI, thread.ParentAPID)
 }
 
 // applyCommentDelete withdraws a comment, using ONLY state.
@@ -156,13 +156,13 @@ func (d *Dispatcher) applyCommentDelete(ctx context.Context, tx *sql.Tx, did str
 	}
 
 	parent := d.parentFromSnapshot(dead.TranslatedSnapshot)
-	return d.enqueueComment(ctx, did, operationDelete, dead, parent.ATURI, parent.APID)
+	return d.enqueueComment(ctx, tx, did, operationDelete, dead, parent.ATURI, parent.APID)
 }
 
 // enqueueComment hands one intent to task 15. The activity id comes from the
 // seq the write just produced, so every applied operation gets its own stable
 // id and a redelivery reuses it.
-func (d *Dispatcher) enqueueComment(ctx context.Context, did, operation string, stored *store.OutboundObject, parentATURI, parentAPID string) error {
+func (d *Dispatcher) enqueueComment(ctx context.Context, tx *sql.Tx, did, operation string, stored *store.OutboundObject, parentATURI, parentAPID string) error {
 	intent := CommentIntent{
 		Op:            operation,
 		ATURI:         stored.ATURI,
@@ -173,8 +173,9 @@ func (d *Dispatcher) enqueueComment(ctx context.Context, did, operation string, 
 	}
 	// parentATURI carries the causal dependency (decision 15): delivery must
 	// not present a reply to a peer before the thing it replies to. On a
-	// delete it comes from state, because the frame carries no reply refs.
-	if err := d.enqueuer.EnqueueActivity(ctx, did, did, parentATURI, intent); err != nil {
+	// delete it comes from state, because the frame carries no reply refs. The
+	// enqueue rides tx so it commits with the gate advance.
+	if err := d.enqueuer.EnqueueActivity(ctx, tx, did, did, parentATURI, intent); err != nil {
 		return fmt.Errorf("enqueue comment intent for %s: %w", stored.ATURI, err)
 	}
 	return nil

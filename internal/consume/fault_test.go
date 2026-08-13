@@ -2,6 +2,7 @@ package consume
 
 import (
 	"context"
+	"database/sql"
 
 	"tidepool/internal/store"
 )
@@ -21,7 +22,7 @@ type failingEnqueuer struct {
 	calls int
 }
 
-func (e *failingEnqueuer) EnqueueActivity(_ context.Context, _, _, _ string, _ Intent) error {
+func (e *failingEnqueuer) EnqueueActivity(_ context.Context, _ *sql.Tx, _, _, _ string, _ Intent) error {
 	e.calls++
 	return e.err
 }

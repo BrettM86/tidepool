@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"tidepool/internal/ap"
+	"tidepool/internal/apobject"
 	"tidepool/internal/errors"
 	"tidepool/internal/store"
 )
@@ -23,6 +24,11 @@ const (
 	actorPathPrefix = "/ap/actor/"
 	outboxSuffix    = "/outbox"
 	inboxPath       = "/ap/inbox"
+	// objectPathPrefix and activityPathPrefix are the outbound serving surface
+	// (task 15): a peer re-fetches a native object or activity by the id the
+	// bridge minted under it.
+	objectPathPrefix   = "/ap/object/"
+	activityPathPrefix = "/ap/activity/"
 
 	// jrdContentType is WebFinger's media type (v1 precedent:
 	// ingest/inbox.go's service-actor webfinger).
@@ -78,6 +84,16 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.handleInbox(w, r)
+	case strings.HasPrefix(path, objectPathPrefix):
+		if !isGET(w, r) {
+			return
+		}
+		s.handleObject(w, r, strings.TrimPrefix(path, objectPathPrefix))
+	case strings.HasPrefix(path, activityPathPrefix):
+		if !isGET(w, r) {
+			return
+		}
+		s.handleActivity(w, r, strings.TrimPrefix(path, activityPathPrefix))
 	case strings.HasPrefix(path, actorPathPrefix):
 		rest := strings.TrimPrefix(path, actorPathPrefix)
 		if !isGET(w, r) {
@@ -95,6 +111,69 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// handleObject serves a native record as its AP object (Note/Page), rendered
+// from the outbound_objects SNAPSHOT so it survives a PDS outage — Lemmy
+// re-fetches a delivered object by id, and the snapshot is the byte-stable
+// source the delivery itself was built from. A tombstoned row is 410 Gone (the
+// record was deleted, and serving the stale body would resurrect it); an object
+// we hold no state for is 404. Serving is bound to the origin's own host, like
+// the actor document: the object id sits on this authority, and answering under
+// another Host would publish a cross-authority claim.
+func (s *Service) handleObject(w http.ResponseWriter, r *http.Request, rest string) {
+	if normalizeHost(r.Host) != s.userHost {
+		http.NotFound(w, r)
+		return
+	}
+	// rest is did/collection/rkey — the at-uri's three parts.
+	parts := strings.SplitN(rest, "/", 3)
+	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
+		http.NotFound(w, r)
+		return
+	}
+	atURI := "at://" + parts[0] + "/" + parts[1] + "/" + parts[2]
+
+	object, err := s.outboundObjects.GetByATURI(r.Context(), atURI)
+	if err != nil {
+		s.writeStoreError(w, r, err)
+		return
+	}
+	if object.IsTombstoned() {
+		http.Error(w, "gone", http.StatusGone)
+		return
+	}
+
+	doc, err := apobject.RenderObject(s.userOrigin, object.TranslatedSnapshot)
+	if err != nil {
+		s.logger.Error("failed to render served object from snapshot",
+			"at_uri", atURI, "host", r.Host, "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, ap.ContentTypeActivityJSON, doc)
+}
+
+// handleActivity serves a canonical activity payload VERBATIM. Activities are
+// immutable (objects are current): an already-served activity must not change
+// when the object it created is later edited, so the stored payload is written
+// byte-for-byte. An activity id we never minted is 404.
+func (s *Service) handleActivity(w http.ResponseWriter, r *http.Request, hash string) {
+	if normalizeHost(r.Host) != s.userHost {
+		http.NotFound(w, r)
+		return
+	}
+	if hash == "" || strings.Contains(hash, "/") {
+		http.NotFound(w, r)
+		return
+	}
+	activity, err := s.outboundActivities.Get(r.Context(), s.userOrigin+activityPathPrefix+hash)
+	if err != nil {
+		s.writeStoreError(w, r, err)
+		return
+	}
+	w.Header().Set("Content-Type", ap.ContentTypeActivityJSON)
+	_, _ = w.Write(activity.Payload)
 }
 
 func isGET(w http.ResponseWriter, r *http.Request) bool {

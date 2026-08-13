@@ -320,3 +320,94 @@ type InboxEvent struct {
 	ProcessedAt *time.Time
 	Error       string // last processing error; empty if none
 }
+
+// DeliveryState tracks a single per-inbox delivery attempt through its
+// terminal fates (task 15, decision 15). pending is the only non-terminal
+// state; delivered/poisoned/cancelled are all final. cancelled (not poisoned)
+// is the kill-switch/consent outcome — a delivery parked because the actor
+// opted out or a community was unfollowed, never a failure the operator must
+// triage.
+type DeliveryState string
+
+const (
+	// DeliveryStatePending means the delivery is queued or backing off.
+	DeliveryStatePending DeliveryState = "pending"
+	// DeliveryStateDelivered means a peer accepted the activity (including
+	// Lemmy's duplicate-activity response, which is a success by our stable
+	// id).
+	DeliveryStateDelivered DeliveryState = "delivered"
+	// DeliveryStatePoisoned means the delivery permanently failed (a 4xx, an
+	// attempt-cap breach, an unaccepted or poisoned parent).
+	DeliveryStatePoisoned DeliveryState = "poisoned"
+	// DeliveryStateCancelled means a consent/kill-switch withdrawal parked the
+	// delivery: create/update for a disabled or paused actor, or a community
+	// unfollowed out from under pending work. Never a failure.
+	DeliveryStateCancelled DeliveryState = "cancelled"
+)
+
+// Valid reports whether the value is a known delivery state.
+func (s DeliveryState) Valid() bool {
+	switch s {
+	case DeliveryStatePending, DeliveryStateDelivered, DeliveryStatePoisoned, DeliveryStateCancelled:
+		return true
+	}
+	return false
+}
+
+// OutboundActivity is the canonical, IMMUTABLE wire payload for one activity id
+// (task 15, decision 15). One row fans out to many outbound_deliveries; GET
+// /ap/activity/{hash} serves Payload verbatim, and a redelivery re-sends it
+// byte-for-byte so a peer dedupes on the stable id. Its payload never changes
+// once written — a later edit is a NEW activity, not a rewrite of this one.
+type OutboundActivity struct {
+	// ActivityID is the deterministic AP activity id (consume.ActivityID) and
+	// the row's primary key.
+	ActivityID string
+	// ActorDID is the persona whose key signs every delivery of this activity.
+	ActorDID string
+	// Kind is the AP activity type: Create, Update, Delete, Like, Dislike, Undo.
+	Kind string
+	// Payload is the canonical wire activity JSON, byte-stable after first write.
+	Payload []byte
+	// ParentATURI is the causal dependency (decision 15): a delivery for this
+	// activity is ineligible until the parent's mapping is accepted. "" = none.
+	ParentATURI string
+	CreatedAt   time.Time
+}
+
+// OutboundDelivery is one delivery attempt of an activity to one inbox (task
+// 15). It generalizes the inbox_events queue: ClaimedUntil is the same fencing
+// token, OrderingKey (the community AP id) serializes deliveries per community,
+// and the loose-index-scan head is the min-Seq pending row of a key.
+type OutboundDelivery struct {
+	// Seq is the monotonic ordering column the per-key serialization descends.
+	Seq int64
+	// ActivityID + TargetInbox are the composite primary key: one activity
+	// fans out to many inboxes.
+	ActivityID  string
+	TargetInbox string
+	// OrderingKey is the community AP id — deliveries sharing it are handled
+	// strictly in Seq order.
+	OrderingKey string
+	// State is the delivery's fate (pending until terminal).
+	State DeliveryState
+	// Attempts counts how many times a worker claimed this delivery.
+	Attempts int
+	// NextAttemptAt is the retry-backoff schedule; claimable when <= now.
+	NextAttemptAt time.Time
+	// ClaimedUntil is the current worker lease AND the fencing/claim token;
+	// nil/past means unclaimed. MarkDelivered/Release/MarkPoisoned require it.
+	ClaimedUntil *time.Time
+	// DeliveredAt stamps the successful delivery.
+	DeliveredAt *time.Time
+	// LastStatusCode is the last HTTP status seen (nil before any attempt
+	// produced one).
+	LastStatusCode *int
+	// LastErrorClass is a coarse retry-taxonomy label (transport, 4xx, 5xx,
+	// duplicate, attempt_cap, parent_unaccepted, parent_poisoned).
+	LastErrorClass string
+	// ResponseExcerpt is a bounded sample of the peer's response body.
+	ResponseExcerpt string
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+}

@@ -332,6 +332,15 @@ type OutboundObjects interface {
 	// TombstoneTx is Tombstone on an existing transaction. A nil tx is an
 	// error satisfying errors.IsValidation.
 	TombstoneTx(ctx context.Context, tx *sql.Tx, atURI string) (*OutboundObject, error)
+
+	// SetAccepted stamps accepted_at — the causal-gating marker (task 15,
+	// decision 15). Delivery SUCCESS sets it; a NULL accepted_at means the
+	// object has not yet been delivered to its community, which is what keeps a
+	// BRIDGE-origin child (a reply) ineligible until its parent lands.
+	// Stamping an already-accepted row preserves the original time (a
+	// redelivery must not move the causal boundary). A missing row is an error
+	// satisfying errors.IsNotFound.
+	SetAccepted(ctx context.Context, atURI string) error
 }
 
 // OutboundVotes persists the state an outbound Undo is rebuilt from (decision
@@ -436,4 +445,91 @@ type Tombstones interface {
 	// TOMBSTONE_RETENTION's default (30 days) is orders of magnitude above
 	// any observed redelivery horizon.
 	Prune(ctx context.Context, cutoff time.Time) (int64, error)
+}
+
+// OutboundActivities persists the canonical, immutable wire payloads outbound
+// deliveries fan out from (task 15, decision 15). One activity id maps to one
+// payload byte-string that GET /ap/activity/{hash} serves and a redelivery
+// re-sends verbatim; a peer dedupes on the stable id. The payload never
+// changes once written — an edit is a NEW activity, not a rewrite.
+type OutboundActivities interface {
+	// Insert idempotently writes one activity. It returns inserted=true when a
+	// new row was written and inserted=false (no error) when the activity id
+	// already existed: the ON CONFLICT DO NOTHING is deliberate — the payload
+	// of an activity a peer may already hold must never be overwritten.
+	Insert(ctx context.Context, activity OutboundActivity) (inserted bool, err error)
+
+	// InsertTx is Insert on an existing transaction — the seam the enqueuer
+	// uses so the activity, its deliveries and the rev-gate advance land in ONE
+	// commit (an enqueue whose gate tx rolls back must leave no activity or
+	// delivery row). A nil tx is an error satisfying errors.IsValidation.
+	InsertTx(ctx context.Context, tx *sql.Tx, activity OutboundActivity) (inserted bool, err error)
+
+	// Get returns the canonical activity for an id. A miss is an error
+	// satisfying errors.IsNotFound.
+	Get(ctx context.Context, activityID string) (*OutboundActivity, error)
+}
+
+// OutboundDeliveries is the per-inbox delivery queue (task 15). It generalizes
+// the inbox_events fenced work queue: claimed_until fencing, per-ordering-key
+// serialization via a loose index scan, SKIP LOCKED concurrency. The ordering
+// key is the community AP id, so all deliveries bound for one community form a
+// single serial line.
+type OutboundDeliveries interface {
+	// Enqueue writes one pending delivery keyed on (ActivityID, TargetInbox)
+	// and returns the stored row. A duplicate (activity, inbox) is an error
+	// satisfying errors.IsAlreadyExists.
+	Enqueue(ctx context.Context, delivery OutboundDelivery) (*OutboundDelivery, error)
+
+	// EnqueueTx is Enqueue on an existing transaction — rides the enqueuer's
+	// gate tx. A nil tx is an error satisfying errors.IsValidation.
+	EnqueueTx(ctx context.Context, tx *sql.Tx, delivery OutboundDelivery) (*OutboundDelivery, error)
+
+	// ClaimNext atomically claims the oldest processable delivery and
+	// increments its attempt counter. A delivery is processable when it is
+	// pending, past its next_attempt_at, unleased (or the lease expired), and —
+	// the per-community ordering guarantee — is the head (min Seq) of its
+	// ordering key among pending rows: a younger delivery on a key is invisible
+	// while an older PENDING sibling exists, and a delivered/poisoned/cancelled
+	// sibling stops blocking. An empty queue returns an error satisfying
+	// errors.IsNotFound.
+	//
+	// The returned delivery's ClaimedUntil is the fencing/claim token: the
+	// Mark*/Release methods require it so a worker whose lease expired and was
+	// re-claimed by another cannot clobber the newer attempt's outcome.
+	ClaimNext(ctx context.Context, lease time.Duration) (*OutboundDelivery, error)
+
+	// MarkDelivered stamps the delivery delivered (delivered_at set, lease
+	// cleared), recording lastStatusCode. claimToken must equal the claim's
+	// ClaimedUntil. It returns exists=false for a missing (activity, inbox);
+	// applied=false (no error) when the claim was stale or the row already
+	// terminal, so the outcome was discarded without a clobber.
+	MarkDelivered(ctx context.Context, activityID, targetInbox string, lastStatusCode int, claimToken time.Time) (exists, applied bool, err error)
+
+	// Release records a transient failure and schedules the retry (error class,
+	// status and excerpt stored, lease cleared, next_attempt_at set), leaving
+	// the delivery pending. claimToken must equal the claim's ClaimedUntil.
+	// Same (exists, applied) split as MarkDelivered.
+	Release(ctx context.Context, activityID, targetInbox, errorClass, excerpt string, lastStatusCode int, nextAttempt, claimToken time.Time) (exists, applied bool, err error)
+
+	// MarkPoisoned permanently fails the delivery (state=poisoned, lease
+	// cleared, error class/status/excerpt stored). Poisoned rows are skipped by
+	// ClaimNext and stop blocking their ordering key. claimToken must equal the
+	// claim's ClaimedUntil. Same (exists, applied) split.
+	MarkPoisoned(ctx context.Context, activityID, targetInbox, errorClass, excerpt string, lastStatusCode int, claimToken time.Time) (exists, applied bool, err error)
+
+	// CancelForActor moves every PENDING delivery of the actor's activities to
+	// cancelled (the consent/kill-switch withdrawal — a disabled or paused
+	// actor's create/update work is parked, never poisoned). Terminal
+	// deliveries are untouched. Returns how many rows were cancelled.
+	CancelForActor(ctx context.Context, actorDID string) (int64, error)
+
+	// CancelForCommunity moves every PENDING delivery on an ordering key (a
+	// community AP id) to cancelled — a community deleted or unfollowed out
+	// from under pending work. Returns how many rows were cancelled.
+	CancelForCommunity(ctx context.Context, orderingKey string) (int64, error)
+
+	// Get returns the delivery for an (activity, inbox) pair. A miss is an
+	// error satisfying errors.IsNotFound.
+	Get(ctx context.Context, activityID, targetInbox string) (*OutboundDelivery, error)
 }

@@ -2,6 +2,7 @@ package consume
 
 import (
 	"context"
+	"database/sql"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -143,7 +144,7 @@ type recordingEnqueuer struct {
 	calls []recordedIntent
 }
 
-func (e *recordingEnqueuer) EnqueueActivity(_ context.Context, actorDID, orderingKey, parentATURI string, intent Intent) error {
+func (e *recordingEnqueuer) EnqueueActivity(_ context.Context, _ *sql.Tx, actorDID, orderingKey, parentATURI string, intent Intent) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.calls = append(e.calls, recordedIntent{

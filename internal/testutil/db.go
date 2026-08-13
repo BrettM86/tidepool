@@ -88,8 +88,14 @@ func Truncate(t testing.TB, conn *sql.DB, tables ...string) {
 	if len(tables) == 0 {
 		return
 	}
+	// CASCADE so truncating a table that is the target of a foreign key also
+	// clears its referencing tables (e.g. outbound_activities ← outbound_
+	// deliveries): setup-time truncation wants a clean slate, and a caller that
+	// lists the parent but not the child would otherwise fail with a 0A000 FK
+	// error. Truncation runs before any seeding, so cascading never wipes data a
+	// test meant to keep.
 	_, err := conn.ExecContext(context.Background(),
-		fmt.Sprintf(`TRUNCATE %s RESTART IDENTITY`, strings.Join(tables, ", ")))
+		fmt.Sprintf(`TRUNCATE %s RESTART IDENTITY CASCADE`, strings.Join(tables, ", ")))
 	if err != nil {
 		t.Fatalf("truncate test tables: %v", err)
 	}

@@ -2,6 +2,7 @@ package consume
 
 import (
 	"context"
+	"database/sql"
 	"log/slog"
 )
 
@@ -26,7 +27,7 @@ func NewNoopEnqueuer(logger *slog.Logger) OutboundEnqueuer {
 // EnqueueActivity records what WOULD have been delivered and drops it. The
 // activity id is logged because it is the one field a later delivery has to
 // reproduce exactly: it is what a peer dedupes on.
-func (e *noopEnqueuer) EnqueueActivity(_ context.Context, actorDID, orderingKey, parentATURI string, intent Intent) error {
+func (e *noopEnqueuer) EnqueueActivity(_ context.Context, _ *sql.Tx, actorDID, orderingKey, parentATURI string, intent Intent) error {
 	e.logger.Info("outbound intent dropped: no delivery queue wired",
 		slog.String("actor", actorDID),
 		slog.String("ordering_key", orderingKey),

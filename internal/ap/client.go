@@ -594,6 +594,26 @@ func (c *Client) SendActivity(ctx context.Context, inboxURL string, activity any
 	if c.signer == nil {
 		return errors.NewValidationError("signer", "SendActivity requires a configured Signer")
 	}
+	return c.sendActivityWith(ctx, c.signer, inboxURL, activity)
+}
+
+// SendActivityAs signed-POSTs an activity to a remote inbox using the GIVEN
+// per-actor signer, not the client's configured Signer (which stays reserved
+// for the service actor's Follow/Undo). Task 15's delivery worker signs each
+// activity as the persona that authored the record. Retry/status handling
+// mirrors SendActivity.
+func (c *Client) SendActivityAs(ctx context.Context, signer *Signer, inboxURL string, activity any) error {
+	if signer == nil {
+		return errors.NewValidationError("signer", "SendActivityAs requires a per-actor Signer")
+	}
+	return c.sendActivityWith(ctx, signer, inboxURL, activity)
+}
+
+// sendActivityWith is the shared POST loop: it marshals the activity once,
+// then retries the signed POST under the client's backoff / egress guard,
+// signing each attempt with the given signer. SendActivity supplies the
+// service actor's configured signer; SendActivityAs supplies a per-actor one.
+func (c *Client) sendActivityWith(ctx context.Context, signer *Signer, inboxURL string, activity any) error {
 	payload, err := json.Marshal(activity)
 	if err != nil {
 		return fmt.Errorf("ap: encode activity: %w", err)
@@ -614,7 +634,7 @@ func (c *Client) SendActivity(ctx context.Context, inboxURL string, activity any
 		}
 		req.Header.Set("User-Agent", c.userAgent)
 		req.Header.Set("Content-Type", ContentTypeActivityJSON)
-		if err := c.signer.SignRequest(req, payload); err != nil {
+		if err := signer.SignRequest(req, payload); err != nil {
 			return err
 		}
 

@@ -80,13 +80,41 @@ type VoteIntent struct {
 // ActivityID reports the deterministic activity id.
 func (i VoteIntent) ActivityID() string { return i.ID }
 
+// PostIntent is a Create/Update/Delete of a native post (a bridged
+// social.coves.community.postv2 record). Task 15 OWNS the Page translation, but
+// this consumer does not construct a PostIntent: a post rides the acceptance
+// engine (task 16), which admits the post, writes the acceptance record, and
+// constructs the PostIntent for the same outbound enqueue — so the shape lives
+// here (beside its Comment/Vote siblings) while the producer lives there.
+type PostIntent struct {
+	// Op is the commit operation: create, update or delete.
+	Op string
+	// ATURI is the post record's at-uri.
+	ATURI string
+	// ID is the deterministic activity id.
+	ID string
+	// CommunityAPID is the target community's AP Group id — for a Page it goes
+	// in `to` (the Page/Note addressing split), not `cc`.
+	CommunityAPID string
+	// Snapshot is the translated state a Delete is rebuilt from and a
+	// Create/Update{Page} is rendered from — the postv2 record plus resolved
+	// context, same envelope shape as a comment's snapshot.
+	Snapshot []byte
+}
+
+// ActivityID reports the deterministic activity id.
+func (i PostIntent) ActivityID() string { return i.ID }
+
 // OutboundEnqueuer is the task 15 seam. main.go wires a logging noop until
 // task 15 swaps in the real delivery queue.
 type OutboundEnqueuer interface {
-	// EnqueueActivity hands one intent to delivery. orderingKey serializes
-	// causally related work; parentATURI carries the causal dependency
-	// (decision 15) so a reply is never delivered before its parent.
-	EnqueueActivity(ctx context.Context, actorDID, orderingKey, parentATURI string, intent Intent) error
+	// EnqueueActivity hands one intent to delivery ON THE CALLER'S TX — the
+	// enqueue must commit with the rev-gate advance the consumer is holding, or
+	// a rolled-back gate would strand an activity a replay cannot reproduce.
+	// orderingKey serializes causally related work; parentATURI carries the
+	// causal dependency (decision 15) so a reply is never delivered before its
+	// parent.
+	EnqueueActivity(ctx context.Context, tx *sql.Tx, actorDID, orderingKey, parentATURI string, intent Intent) error
 }
 
 // AcceptanceEngine is the task 16 seam. A native post to a bridged community

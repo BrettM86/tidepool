@@ -134,6 +134,31 @@ func (r *postgresOutboundObjects) tombstone(ctx context.Context, q execer, atURI
 	return object, nil
 }
 
+// SetAccepted stamps accepted_at, the causal-gating marker (task 15).
+//
+// COALESCE preserves the original time on a redelivery: accepted_at is the
+// causal boundary a bridge-origin child gates on, and a re-accept must not move
+// it. A missing object is NotFound, not a no-op — accepting an object we hold no
+// state for is a bug, since there is nothing whose children we could unblock.
+func (r *postgresOutboundObjects) SetAccepted(ctx context.Context, atURI string) error {
+	query := `
+		UPDATE outbound_objects
+		SET accepted_at = COALESCE(accepted_at, now())
+		WHERE at_uri = $1`
+	result, err := r.db.ExecContext(ctx, query, atURI)
+	if err != nil {
+		return fmt.Errorf("set accepted_at for outbound_object %q: %w", atURI, err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("set accepted_at for outbound_object %q: rows affected: %w", atURI, err)
+	}
+	if affected == 0 {
+		return errors.NewNotFoundError("outbound_object", atURI)
+	}
+	return nil
+}
+
 func scanOutboundObject(row rowScanner) (*OutboundObject, error) {
 	var object OutboundObject
 	var tombstonedAt sql.NullTime

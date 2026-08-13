@@ -139,7 +139,7 @@ func (d *Dispatcher) applyVoteWrite(ctx context.Context, tx *sql.Tx, did string,
 		return fmt.Errorf("write vote state for %s: %w", voteATURI, err)
 	}
 
-	return d.enqueuer.EnqueueActivity(ctx, did, did, subjectATURI, VoteIntent{
+	return d.enqueuer.EnqueueActivity(ctx, tx, did, did, subjectATURI, VoteIntent{
 		Op:            operationCreate,
 		VoteATURI:     voteATURI,
 		SubjectAPID:   stored.SubjectAPID,
@@ -187,7 +187,7 @@ func (d *Dispatcher) applyVoteDelete(ctx context.Context, tx *sql.Tx, did string
 		return fmt.Errorf("bump vote state for %s: %w", voteATURI, err)
 	}
 
-	return d.enqueuer.EnqueueActivity(ctx, did, did, stored.SubjectATURI, VoteIntent{
+	return d.enqueuer.EnqueueActivity(ctx, tx, did, did, stored.SubjectATURI, VoteIntent{
 		Op:          operationUndo,
 		VoteATURI:   voteATURI,
 		SubjectAPID: stored.SubjectAPID,

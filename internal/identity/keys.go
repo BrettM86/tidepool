@@ -36,7 +36,14 @@ const RotationKeyName = "plc-rotation"
 // sealed key copied into another row (or another column) fails to open.
 const (
 	actorKeyAADPrefix = "tidepool:actor-signing-key:v1:"
-	rotationKeyAAD    = "tidepool:plc-rotation-key:v1"
+	// actorRSAKeyAADPrefix seals the AP-side RSA keys of task 13. It is
+	// deliberately distinct from actorKeyAADPrefix even though both bind the
+	// same DID under the same KEK: the atproto escrow key and the
+	// ActivityPub signing key are different trust domains, and a ciphertext
+	// that wandered from one column into the other must fail to open rather
+	// than silently authenticate in the wrong domain.
+	actorRSAKeyAADPrefix = "tidepool:actor-rsa-key:v1:"
+	rotationKeyAAD       = "tidepool:plc-rotation-key:v1"
 )
 
 // Custodian seals and opens per-actor secp256k1 private keys with the

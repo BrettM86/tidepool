@@ -121,6 +121,50 @@ type BridgedActors interface {
 	MarkProfileSynced(ctx context.Context, apActorID string, syncedAt time.Time) error
 }
 
+// APActors persists the ActivityPub identities Coves users get on the user
+// origin (task 13): one Person actor per DID, its sealed RSA key, and the
+// webfinger lookup key (normalized_origin, local_part).
+//
+// The local part is FROZEN at creation: a handle change updates the profile
+// cache only, never the local part, so a minted @alice@coves.social keeps
+// resolving after the user renames.
+type APActors interface {
+	// Create inserts a new actor and returns the stored row. A created
+	// actor is always enabled and unpaused (default-on federation,
+	// decision 11): the lifecycle fields on the argument are ignored, and
+	// disabling goes through SetEnabled. Uniqueness violations — did,
+	// actor_id, or (normalized_origin, local_part) — return an error
+	// satisfying errors.IsAlreadyExists, mapped from the constraint name
+	// rather than pre-checked (a pre-check races).
+	Create(ctx context.Context, actor APActor) (*APActor, error)
+
+	// GetByDID returns the actor for a Coves DID. A miss is an error
+	// satisfying errors.IsNotFound.
+	GetByDID(ctx context.Context, did string) (*APActor, error)
+
+	// GetByOriginLocalPart returns the actor for a (normalized origin,
+	// local part) pair — the webfinger lookup, scoped to the routed Host so
+	// vanity origins hosting the same local part stay distinct. A miss is
+	// an error satisfying errors.IsNotFound.
+	GetByOriginLocalPart(ctx context.Context, normalizedOrigin, localPart string) (*APActor, error)
+
+	// SetEnabled toggles federation for an actor: disabling stamps
+	// disabled_at, re-enabling clears it and re-stamps enabled_at. A
+	// missing actor is an error satisfying errors.IsNotFound.
+	SetEnabled(ctx context.Context, did string, enabled bool) error
+
+	// SetPaused toggles delivery_paused (the transient #account state).
+	// A missing actor is an error satisfying errors.IsNotFound.
+	SetPaused(ctx context.Context, did string, paused bool) error
+
+	// UpdateProfile refreshes the cached display name, summary, and avatar
+	// and bumps updated_at. It NEVER touches local_part — the identity
+	// handler (task 14) reaches this method on handle changes, and the
+	// frozen local part is what keeps federated mentions resolving.
+	// A missing actor is an error satisfying errors.IsNotFound.
+	UpdateProfile(ctx context.Context, did string, profile APActorProfile) error
+}
+
 // Communities tracks the AP groups the bridge subscribes to and their
 // backfill progress.
 type Communities interface {

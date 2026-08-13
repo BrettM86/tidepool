@@ -24,7 +24,7 @@ func TestMigrations_UpDownUp(t *testing.T) {
 	err := database.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM information_schema.tables
 		WHERE table_schema = 'public'
-		  AND table_name IN ('ap_objects', 'bridged_actors', 'communities', 'inbox_events', 'service_keys',
+		  AND table_name IN ('ap_objects', 'ap_actors', 'bridged_actors', 'communities', 'inbox_events', 'service_keys',
 		                     'blocks', 'repo_state', 'firehose_events', 'vote_aggregates', 'vote_events')
 	`).Scan(&remaining)
 	require.NoError(t, err)
@@ -47,6 +47,12 @@ func TestMigrations_UniqueConstraintNames(t *testing.T) {
 	ctx := context.Background()
 
 	expected := []string{
+		// ap_actors (task 13). The composite name is EXPLICIT: postgres
+		// would default it to ap_actors_normalized_origin_local_part_key,
+		// so the migration must name the constraint itself.
+		"ap_actors_pkey",
+		"ap_actors_actor_id_key",
+		"ap_actors_origin_local_part_key",
 		"ap_objects_ap_id_key",
 		"ap_objects_at_uri_key",
 		"bridged_actors_ap_actor_id_key",

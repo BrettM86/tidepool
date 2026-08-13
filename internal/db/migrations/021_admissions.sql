@@ -1,0 +1,54 @@
+-- +goose Up
+-- Task 16: the acceptance engine's admission ledger.
+--
+-- Coves' post.getStatus reads a post's admission state from the
+-- firehose-visible acceptance/removal records the engine writes — that is the
+-- authoritative, cross-network answer. This table is the engine's OWN debug and
+-- admin surface: it records, for every (community, post) the engine has decided
+-- on, the machine-readable WHY of that decision (decision_code) and the state it
+-- left the post in, so an operator can list pending/rejected admissions with
+-- reasons and force a re-admit. It is NOT a watermark and it is NOT consulted on
+-- the correctness path: losing it re-derives from a replay.
+--
+-- PK is (community_did, post_uri): one row per post per community. A post edited
+-- and re-evaluated updates its row in place (evaluated_cid moves); it is not a
+-- log.
+CREATE TABLE admissions (
+    community_did TEXT NOT NULL,                                 -- the bridged community the post was submitted to
+    post_uri TEXT NOT NULL,                                      -- the postv2 at-uri (author repo)
+    status TEXT NOT NULL
+        CHECK (status IN ('pending', 'accepted', 'pending_reacceptance', 'rejected', 'removed')),
+    -- decision_code is the machine-readable reason for the current status: ''
+    -- for a clean accept, else the rejection/removal reason (opted-out,
+    -- title-required, banned, community-gone, parent-locked, rate-limited,
+    -- lexicon-invalid, …). Distinct codes are what the admin surface needs and
+    -- the firehose records cannot carry.
+    decision_code TEXT NOT NULL DEFAULT '',
+    -- evaluated_cid is the post CID this decision was made AGAINST (decision 5.5:
+    -- admission runs against the EVENT's CID). A later event with a different CID
+    -- supersedes it — the digest rkey converges, and this column is how a replay
+    -- or a concurrent engine tells "already decided this version" from "new
+    -- content to re-run admission on".
+    evaluated_cid TEXT NOT NULL DEFAULT '',
+    -- acceptance_rkey / accepted_cid pin what the engine actually wrote when it
+    -- accepted: the community-repo record key (SubjectRKey) and the CID the
+    -- acceptance pinned. Empty on a rejection.
+    acceptance_rkey TEXT NOT NULL DEFAULT '',
+    accepted_cid TEXT NOT NULL DEFAULT '',
+    -- redrivable marks a rejection an admin (or a transient-cause re-scan) may
+    -- retry. A hard, permanent rejection (opted-out-history, lexicon-invalid) is
+    -- NOT redrivable; a soft one (community temporarily gone) is.
+    redrivable BOOLEAN NOT NULL DEFAULT false,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (community_did, post_uri)
+);
+
+-- The admin "list pending/rejected admissions" query filters by status; the
+-- ledger is small (one row per bridged post) but the index keeps that listing
+-- from scanning removed/accepted rows.
+CREATE INDEX idx_admissions_status ON admissions (status) WHERE status IN ('pending', 'rejected');
+
+-- +goose Down
+DROP INDEX IF EXISTS idx_admissions_status;
+DROP TABLE IF EXISTS admissions;

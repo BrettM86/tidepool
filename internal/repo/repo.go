@@ -270,6 +270,17 @@ type RecordOp struct {
 // rejection costs no commit work; anything that fails later rolls back with
 // the transaction, leaving neither a record change nor a firehose event.
 func (m *Manager) ApplyOps(ctx context.Context, did string, ops []RecordOp) (*CommitResult, error) {
+	return m.ApplyOpsTx(ctx, did, ops, nil)
+}
+
+// ApplyOpsTx is ApplyOps with a side effect executed inside the commit
+// transaction (see TxSideEffect). The side effect runs on BOTH the committed
+// branch (after the ops write, before COMMIT) AND the all-inert NoOp branch
+// (every op turned out to change nothing, so there is no new commit — but the
+// side effect must still run and be made durable, because it carries the
+// at-least-once outbound enqueue a redelivery has to re-fire). A nil sideEffect
+// is exactly ApplyOps.
+func (m *Manager) ApplyOpsTx(ctx context.Context, did string, ops []RecordOp, sideEffect TxSideEffect) (*CommitResult, error) {
 	if len(ops) == 0 {
 		return nil, errors.NewValidationError("ops", "must not be empty")
 	}
@@ -419,6 +430,20 @@ func (m *Manager) ApplyOps(ctx context.Context, did string, ops []RecordOp) (*Co
 			// head exactly and can go back in the cache.
 			m.cacheTree(did, state.headCID, *prevData, tree)
 		}
+		if sideEffect != nil {
+			// The side effect (the at-least-once outbound enqueue) still runs
+			// and must still be durable, so this — otherwise write-free —
+			// transaction commits even though no repo commit happened. A
+			// redelivery whose acceptance record is byte-identical must re-fire
+			// the enqueue; dedupe is the peer's job. The head is unchanged
+			// whatever the side effect does, so the cacheTree above stays valid.
+			if err := sideEffect(ctx, tx, res); err != nil {
+				return nil, err
+			}
+			if err := tx.Commit(); err != nil {
+				return nil, fmt.Errorf("repo: commit no-op side effect for %s: %w", did, err)
+			}
+		}
 		return res, nil
 	}
 
@@ -426,6 +451,14 @@ func (m *Manager) ApplyOps(ctx context.Context, did string, ops []RecordOp) (*Co
 		tree, prevRev, prevData, records, emitted)
 	if err != nil {
 		return nil, err
+	}
+	if sideEffect != nil {
+		// Inside the transaction, after the ops write and before COMMIT: a
+		// failing side effect rolls the record ops back too — the acceptance
+		// commit and the outbound enqueue land together or not at all.
+		if err := sideEffect(ctx, tx, res); err != nil {
+			return nil, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("repo: commit tx for %s: %w", did, err)

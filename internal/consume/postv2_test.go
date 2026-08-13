@@ -194,17 +194,17 @@ func TestPostV2_DeleteIsNotGatedOnACommunityItCannotSee(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Second-opinion C3: the opt-out gate applies to postv2 too
+// Task 16: the opt-out check MOVED into the engine
 // ---------------------------------------------------------------------------
 //
-// A postv2 create/update pushes the author's content OUTWARD (into the
-// community's repo, via the acceptance engine), so an opted-out author's post
-// must not be admitted — the same gate comments and votes already carry. A
-// delete is a retraction and stays ungated, for the same reason it does on the
-// comment path: removing content is always safe, and it is the only way an
-// opted-out user can take down what is already federated.
+// Before task 16 the consumer dropped an opted-out author's postv2 create/update
+// at debug. Now the check lives in the acceptance engine, which RECORDS the
+// rejection (decision_code opted-out) in the admissions ledger — post.getStatus
+// and the admin surface both need the "why". So an opted-out author's post must
+// REACH the engine; the consumer no longer silently gates it here. A delete
+// stays ungated for the same reason it does on the comment path.
 
-func TestPostV2_OptedOutAuthorCreateNeverReachesTheEngine(t *testing.T) {
+func TestPostV2_OptedOutAuthorCreateReachesTheEngine(t *testing.T) {
 	database := dispatchTestDB(t)
 	seedBridgedCommunity(t, database)
 	ctx := context.Background()
@@ -219,13 +219,13 @@ func TestPostV2_OptedOutAuthorCreateNeverReachesTheEngine(t *testing.T) {
 	require.NoError(t, fixture.handle(t,
 		postV2Frame(dispatchNativeDID, dispatchRev, "3lzpostopt01", acceptCommunityDID)))
 
-	assert.Zero(t, fixture.engine.Calls(),
-		"an opted-out author's post must not be admitted: admission writes an "+
-			"acceptance record and federates the post, which is exactly the outward "+
-			"push the opt-out forbids")
+	assert.Equal(t, 1, fixture.engine.Calls(),
+		"an opted-out author's post now REACHES the engine: the engine records a distinct "+
+			"rejection (decision_code opted-out) in the admissions ledger rather than the "+
+			"consumer dropping it silently — the admin surface needs the reason")
 }
 
-func TestPostV2_OptedOutAuthorUpdateNeverReachesTheEngine(t *testing.T) {
+func TestPostV2_OptedOutAuthorUpdateReachesTheEngine(t *testing.T) {
 	database := dispatchTestDB(t)
 	seedBridgedCommunity(t, database)
 	ctx := context.Background()
@@ -246,8 +246,9 @@ func TestPostV2_OptedOutAuthorUpdateNeverReachesTheEngine(t *testing.T) {
 		dispatchNativeDID, dispatchRev, acceptCommunityDID))
 	require.NoError(t, fixture.handle(t, frame))
 
-	assert.Zero(t, fixture.engine.Calls(),
-		"an edit is still an outward push, so it is gated exactly like a create")
+	assert.Equal(t, 1, fixture.engine.Calls(),
+		"an edit reaches the engine exactly like a create: the engine, not the consumer, "+
+			"decides admission and records the reason")
 }
 
 func TestPostV2_OptedOutAuthorDeleteStillReachesTheEngine(t *testing.T) {

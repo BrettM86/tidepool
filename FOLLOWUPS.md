@@ -63,6 +63,37 @@ task documents and git history rather than this list.
   subtract Tidepool's written-back tally during subsequent Lemmy re-seeds.
 - Moderation federation and DMs.
 
+## Outbound delivery (task 15)
+
+- **outbound_deliveries.ClaimNext lacks a standalone `seq` index.** The
+  loose-scan CTE builds the head set via the `(ordering_key, seq)` partial
+  index, but the outer `c.seq = ANY(ARRAY(...)) FOR UPDATE` re-check has no
+  index on `seq` alone (`seq` is BIGSERIAL, not the PK `(activity_id,
+  target_inbox)`). Unlike inbox_events (where `id` IS the PK), this is not a
+  point-fetch. A dedicated `UNIQUE INDEX (seq)` in its OWN migration (021 —
+  amending the already-applied 020 is a silent no-op under goose) would
+  restore O(keys × log N); add it if the claim path profiles hot.
+- **OutboundDeliveries is a 12-method interface** (go-proverbs SHOULD). It
+  is one cohesive repository seam but the worker uses only the
+  claim/mark subset and the admin API only inspect/redrive/cancel. If it
+  grows, split into a `deliveryClaimer` (worker) + `deliveryAdmin`
+  (admin) at the consumer packages.
+- **DeliveredStateUndone is reserved but never written** — task 15 deletes
+  the outbound_votes row on Undo-delivery success rather than transitioning
+  to 'undone'. Kept in the enum + CHECK against a future keep-the-record
+  policy; nothing consumes it today.
+- **Image embeds don't federate outbound yet** — `social.coves.embed.images`
+  → `attachment [{Image,url}]` and external-embed thumbnails need a
+  blob→author-PDS-getBlob-URL seam not yet designed (decision 13: native
+  blobs live on the author's PDS, never Tidepool). Link embeds + text +
+  nsfw + name + content/source all federate; images are dropped with a
+  documented gap in apobject/translator.
+- **Enqueuer resolves the inbox (a network fetch on cache miss) inside the
+  consumer's rev-gate tx** — a slow/hanging community Group doc head-of-line
+  blocks the consumer's hot path (gate row locks held for fetch latency).
+  Rare (1h TTL), but consider pre-resolving before the gate tx or a short
+  distinct resolve timeout.
+
 ## Postv2 flip (task 19)
 
 - **Legacy-set migration is deferred deliberately** (product decision

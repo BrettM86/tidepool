@@ -20,6 +20,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"tidepool/internal/accept"
 	"tidepool/internal/ap"
 	"tidepool/internal/config"
 	"tidepool/internal/consume"
@@ -665,11 +666,32 @@ func startConsumer(
 		}
 	}
 
+	// The acceptance engine (task 16): a native postv2 targeting a bridged
+	// community is admitted here, the community-signed acceptance is written, and
+	// the Create{Page} enqueued atomically with it. Wired whenever the consumer
+	// runs, so postv2 events are admitted rather than skipped at debug.
+	engine, err := accept.NewEngine(accept.Options{
+		Repos:       repoManager,
+		Enqueuer:    enqueuer,
+		Actors:      minter,
+		Resolver:    resolver,
+		Communities: store.NewCommunities(database),
+		Objects:     store.NewOutboundObjects(database),
+		Prefs:       store.NewFederationPrefs(database),
+		Admissions:  accept.NewAdmissions(database),
+		UserOrigin:  cfg.APUserOrigin,
+		Logger:      logger,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("consumer: acceptance engine: %w", err)
+	}
+
 	dispatcher, err := consume.NewDispatcher(consume.Options{
 		DB:       database,
 		Actors:   minter,
 		Resolver: resolver,
 		Enqueuer: enqueuer,
+		Engine:   engine,
 		// Reads committed records so a subject's community resolves for
 		// mappings written before migration 016 filled community_did.
 		Records:    repoManager,

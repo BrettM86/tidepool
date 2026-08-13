@@ -476,19 +476,14 @@ func (d *Dispatcher) handlePostV2(ctx context.Context, _ *sql.Tx, did string, co
 	// must reach the engine even from a user who has since opted out. The
 	// engine already knows which posts it accepted and can no-op the rest.
 	if commit.Operation != operationDelete {
-		// The opt-out gate: a create or an update pushes the author's content
-		// OUTWARD (an acceptance record plus federation), which is exactly what
-		// an opted-out author has refused. Same gate comments and votes carry.
-		federating, err := d.mayFederate(ctx, did)
-		if err != nil {
-			return err
-		}
-		if !federating {
-			d.logger.Debug("skipping postv2 from an opted-out author",
-				slog.String("did", did), slog.String("rkey", commit.RKey))
-			return nil
-		}
-
+		// The opt-out check MOVED into the engine (task 16): an opted-out
+		// author's post REACHES the engine, which records a distinct rejection
+		// (decision_code opted-out) in the admissions ledger rather than the
+		// consumer dropping it silently at debug. post.getStatus and the admin
+		// surface both need the "why", and only the engine writes it. The
+		// consumer keeps only the pre-gate an opted-out author's post still fails
+		// for a DIFFERENT reason: it must name a bridged community for the engine
+		// to have a repo to reject it INTO.
 		communityDID := stringField(commit.Record, "community")
 		if communityDID == "" {
 			// The lexicon REQUIRES community. A post without one is malformed

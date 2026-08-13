@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"tidepool/internal/acceptrec"
 	"tidepool/internal/errors"
 	"tidepool/internal/repo"
 	"tidepool/internal/store"
@@ -49,6 +50,10 @@ func (m *Materializer) acceptPost(ctx context.Context, communityDID, postURI, po
 	// restore path does not come through here: it deletes the removal and
 	// writes the acceptance in ONE commit (RestorePost), so it never has to
 	// argue with this guard.
+	//
+	// This pre-loop read is an OPTIMIZATION and a test seam (removalCheck): the
+	// authoritative refusal is the commit-time removal guard inside
+	// acceptrec.AcceptSubject, which holds even when this read answers stale.
 	removed, err := m.removalCheck(ctx, communityDID, rkey)
 	if err != nil {
 		return err
@@ -59,85 +64,23 @@ func (m *Materializer) acceptPost(ctx context.Context, communityDID, postURI, po
 		return nil
 	}
 
-	// Read-modify-write under a CAS precondition, bounded like the stats
-	// stamp: the read happens outside the commit serialization, so a racing
-	// repin (or a stats-driven CID change on the subject) can move the record
-	// underneath it. Losing that race means re-reading, never overwriting.
-	for attempt := 0; ; attempt++ {
-		createdAt := recordDatetime(publishedAt)
-		expectPrevCID := ""
-
-		stored, storedCID, err := m.repos.GetRecord(ctx, communityDID, CollectionAcceptance, rkey)
-		switch {
-		case err == nil:
-			expectPrevCID = storedCID
-			if when, ok := stored["createdAt"].(string); ok && when != "" {
-				createdAt = when
-			}
-		case errors.IsNotFound(err):
-			// Either the first acceptance or the crash-window heal. The empty
-			// precondition asserts the record is still absent, so a concurrent
-			// writer that got there first sends us round the loop instead of
-			// clobbering its acceptance.
-		default:
-			return fmt.Errorf("materialize: read acceptance %s/%s/%s: %w",
-				communityDID, CollectionAcceptance, rkey, err)
-		}
-
-		record := map[string]any{
-			"$type":     CollectionAcceptance,
-			"subject":   strongRef(postURI, postCID),
-			"createdAt": createdAt,
-		}
-		if err := m.validateRecord(record); err != nil {
-			return err
-		}
-
-		// The terminality guard is re-asserted HERE, at commit time, as an
-		// inert op: deleting the removal with a precondition of "must not
-		// exist" claims nothing and changes nothing, but it makes the batch
-		// fail if a removal has appeared since the read above. Without it the
-		// guard is check-then-act, and a RemovePost landing in the window
-		// leaves an acceptance beside a standing removal — a post
-		// simultaneously visible and removed, which nothing reconciles because
-		// each writer believed it saw a consistent world.
-		//
-		// Deliberately NOT commitRecord: that path upserts an ap_objects row,
-		// and an acceptance has no AP object behind it — the bridge mints it as
-		// the community's own attestation. A mapping would invent an ap_id for
-		// it, expose it to every spine consumer, and let an announced delete
-		// aimed at the POST address the acceptance through the same key space.
-		noRemoval := ""
-		_, err = m.repos.ApplyOps(ctx, communityDID, []repo.RecordOp{
-			{Action: repo.OpActionDelete, Collection: CollectionRemoval, RKey: rkey, ExpectPrevCID: &noRemoval},
-			{Action: repo.OpActionUpdate, Collection: CollectionAcceptance, RKey: rkey, Record: record, ExpectPrevCID: &expectPrevCID},
-		})
-		if stderrors.Is(err, repo.ErrPreconditionFailed) {
-			// Either a removal appeared or the acceptance moved. Ask which,
-			// against the repo itself rather than the seam: a removal means the
-			// community has since decided this post is out, and that decision
-			// stands — the acceptance is simply not written.
-			removed, rerr := m.removalStands(ctx, communityDID, rkey)
-			if rerr != nil {
-				return rerr
-			}
-			if removed {
-				m.logger.Debug("post was removed from the community while accepting; not re-accepting",
-					"community_did", communityDID, "post", postURI)
-				return nil
-			}
-			if attempt+1 < maxStatsCommitAttempts {
-				continue
-			}
-			return fmt.Errorf("materialize: accept %s: acceptance kept changing across %d attempts: %w",
-				postURI, maxStatsCommitAttempts, err)
-		}
-		if err != nil {
-			return fmt.Errorf("materialize: put acceptance %s/%s/%s for %s: %w",
-				communityDID, CollectionAcceptance, rkey, postURI, err)
-		}
+	// The CAS/removal-guard mechanics live in acceptrec now, shared with the
+	// acceptance engine so both build on ONE implementation. The materializer
+	// drives it with a nil side effect: it attests what the bridge already
+	// decided by materializing the post, and owns no outbound enqueue here.
+	_, err = acceptrec.AcceptSubject(ctx, m.repos, communityDID, postURI, postCID, publishedAt, nil)
+	if stderrors.Is(err, acceptrec.ErrRemovalStands) {
+		// A removal appeared under the write: the community decided this post is
+		// out, and that decision is terminal. A refused acceptance is not an
+		// error — the removal simply stands.
+		m.logger.Debug("post was removed from the community while accepting; not re-accepting",
+			"community_did", communityDID, "post", postURI)
 		return nil
 	}
+	if err != nil {
+		return fmt.Errorf("materialize: accept %s into %s: %w", postURI, communityDID, err)
+	}
+	return nil
 }
 
 // removalStands reports whether the community currently holds a removal for

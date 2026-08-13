@@ -63,6 +63,32 @@ task documents and git history rather than this list.
   subtract Tidepool's written-back tally during subsequent Lemmy re-seeds.
 - Moderation federation and DMs.
 
+## Postv2 flip (task 19)
+
+- **Legacy-set migration is deferred deliberately** (product decision
+  2026-08-11): pre-flip bridged posts stay on the deprecated
+  `social.coves.community.post` collection in community repos forever;
+  every era-sensitive path dispatches on the mapping's collection. A
+  future migration needs Coves' PRD §11 remap decision (comment/vote
+  refs point at the old URIs) plus an old→new ledger. Recorded
+  consequence: Coves' legacy-drain gate never fires while bridged
+  legacy posts exist.
+- **postv2 provenance costs one extra actor fetch per post
+  create/edit**: `originalAuthor.displayName` is read from the fetched,
+  authority-bound actor document on every materialization (deterministic
+  records; inline `attributedTo` is never trusted). The zero-extra-fetch
+  alternative is persisting the display name on `bridged_actors`,
+  refreshed with the profile — a migration plus plumbing. Revisit if
+  actor-fetch egress on post paths matters at scale.
+- **`SetBridgedStats`' NoOp result carries `mapping.CID`**, which can be
+  stale relative to the record the unchanged-counts read just observed.
+  Callers currently ignore it; worth aligning with the read's CID.
+- **No standalone acceptance-reconcile sweep**: every acceptance heal is
+  driven by an event on the post (redelivery, edit, stats sweep). A
+  quiet community's crash-window acceptance gap persists until any such
+  event. The decision-19 reconciliation job (task 18) is the natural
+  home for a periodic acceptance-vs-record pin audit.
+
 ## Production rollout
 
 - Bluesky's public relay accepts new PDS hosts, but its documented default

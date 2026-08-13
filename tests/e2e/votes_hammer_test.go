@@ -41,7 +41,7 @@ func TestVoteHammer_ConcurrentVotersExactAggregates(t *testing.T) {
 	post := author.createPost(t, community.ID, title, "vote target")
 	postEv := l.await("hammer post create", func(e *jsEvent) bool {
 		got, _ := fieldOf(e.Commit.Record, "title")
-		return e.Commit.Collection == colPost && e.Did == sub.DID &&
+		return e.Commit.Collection == colPostV2 &&
 			e.Commit.Operation == opCreate && got == title
 	})
 	postURI := postEv.atURI()
@@ -95,6 +95,25 @@ func TestVoteHammer_ConcurrentVotersExactAggregates(t *testing.T) {
 		return 0 // clear: Undo with a reconstructed inner vote
 	})
 	awaitAggregates(t, h, postURI, 0, upVoters)
+
+	// The stats sweep folds the settled counts onto the POST record (author
+	// repo), which moves its CID — so the community's acceptance must be
+	// re-pinned to the version that now exists. This is the bridgedStats
+	// exception to the acceptance flow (PRD §5.5: we are the engine for our
+	// own communities, so a stats stamp repins synchronously rather than
+	// re-running admission), and it is the one cross-repo write a vote sweep
+	// performs. Left unpinned, every sweep would drop the post out of its
+	// community until somebody edited it.
+	statsEv := l.await("bridgedStats stamp on the hammered post", func(e *jsEvent) bool {
+		return e.Commit != nil && e.Did == postEv.Did && e.Commit.Collection == colPostV2 &&
+			e.Commit.RKey == postEv.Commit.RKey && isBridgedStatsUpdate(e)
+	})
+	l.await("acceptance repin following the stats stamp", func(e *jsEvent) bool {
+		cid, _ := fieldOf(e.Commit.Record, "subject", "cid")
+		return e.Commit.Collection == colAcceptance && e.Did == sub.DID &&
+			e.Commit.RKey == subjectRKey(postURI) && cid == statsEv.Commit.CID
+	})
+	h.awaitAcceptanceConverged(t, sub.DID, postEv.Did, postEv.Commit.RKey)
 
 	// Belt on locked decision 7: everything consumed during the hammer was
 	// already vetted (vetEvent Fatalfs on any unexpected collection inside

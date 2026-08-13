@@ -19,6 +19,8 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base32"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -117,13 +119,42 @@ const sweepTimeout = 3 * time.Minute
 
 // ── Firehose vocabulary ────────────────────────────────────────────────────
 
-// Collections the bridge emits (task 05's materializer).
+// Collections the bridge emits (task 05's materializer, task 19's flip).
 const (
 	colCommunityProfile = "social.coves.community.profile"
 	colActorProfile     = "social.coves.actor.profile"
-	colPost             = "social.coves.community.post"
-	colComment          = "social.coves.community.comment"
+	// colPost is the DEPRECATED post collection: a post in the COMMUNITY's
+	// repo carrying an in-record author. Nothing is created under it since
+	// the author-owned flip (PLAN.md decision 20), but records written
+	// before it are never migrated — Coves indexes both collections
+	// indefinitely — so the suite must still tolerate it on the firehose.
+	colPost = "social.coves.community.post"
+	// colPostV2 is the post collection after the flip: the record lives in
+	// the AUTHOR's repo and only NAMES its community.
+	colPostV2 = "social.coves.community.postv2"
+	// colAcceptance is the community's attestation that makes a postv2
+	// visible in it; colRemoval is the moderation record that replaces it.
+	// Both live in the COMMUNITY's repo at the subject digest rkey.
+	colAcceptance = "social.coves.community.acceptance"
+	colRemoval    = "social.coves.community.removal"
+	colComment    = "social.coves.community.comment"
 )
+
+// subjectRKey derives an acceptance/removal record key from its subject's
+// at-uri: unpadded lowercase base32 of the SHA-256 digest, a fixed 52
+// characters.
+//
+// Re-derived HERE rather than called from internal/materialize on purpose.
+// This suite's job is to catch a change in the production derivation, and a
+// test that computed the key with the same function under test would follow
+// it silently wherever it went — including into a fork with Coves, whose
+// engine writes acceptance records into these same community repos. The
+// golden vectors that pin the encoding itself live in
+// internal/materialize/subject_rkey_test.go.
+func subjectRKey(subjectURI string) string {
+	digest := sha256.Sum256([]byte(subjectURI))
+	return strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(digest[:]))
+}
 
 // Event kinds, operations, and rkeys as they appear on the Jetstream wire.
 // Consts, not inline strings: a typo'd operation in an await predicate would
@@ -152,6 +183,9 @@ var expectedCollections = map[string]bool{
 	colCommunityProfile: true,
 	colActorProfile:     true,
 	colPost:             true,
+	colPostV2:           true,
+	colAcceptance:       true,
+	colRemoval:          true,
 	colComment:          true,
 }
 
@@ -494,6 +528,32 @@ func (c *lemmyClient) deleteComment(t *testing.T, commentID int) {
 	if err := c.do(http.MethodPost, "/api/v3/comment/delete",
 		map[string]any{"comment_id": commentID, "deleted": true}, nil); err != nil {
 		t.Fatalf("delete comment %d: %v", commentID, err)
+	}
+}
+
+// removePost is a MODERATOR action: Lemmy federates it as
+// Announce{Delete{post}} whose inner Delete carries a `summary` — present
+// (and EMPTY when no reason is given) is exactly what distinguishes it from
+// the author's own delete, which carries no summary key at all. Verified
+// against Lemmy 0.19.20 on the wire.
+func (c *lemmyClient) removePost(t *testing.T, postID int, removed bool, reason string) {
+	t.Helper()
+	body := map[string]any{"post_id": postID, "removed": removed}
+	if reason != "" {
+		body["reason"] = reason
+	}
+	if err := c.do(http.MethodPost, "/api/v3/post/remove", body, nil); err != nil {
+		t.Fatalf("remove post %d (removed=%v): %v", postID, removed, err)
+	}
+}
+
+// deletePost is the AUTHOR's own delete — no summary on the wire, so the
+// bridge must read it as a self-delete and write no moderation record.
+func (c *lemmyClient) deletePost(t *testing.T, postID int) {
+	t.Helper()
+	if err := c.do(http.MethodPost, "/api/v3/post/delete",
+		map[string]any{"post_id": postID, "deleted": true}, nil); err != nil {
+		t.Fatalf("delete post %d: %v", postID, err)
 	}
 }
 
@@ -1036,6 +1096,135 @@ func bridgedHandle(username string) string {
 	return b.String() + ".lemmy." + bridgeHostname()
 }
 
+// bridgeRecord is one record read back from the bridge's repo surface.
+type bridgeRecord struct {
+	URI   string         `json:"uri"`
+	CID   string         `json:"cid"`
+	Value map[string]any `json:"value"`
+}
+
+// bridgeGetRecord reads one record through com.atproto.repo.getRecord — the
+// END-STATE surface, as distinct from the firehose. Both matter to this
+// suite: the firehose proves the transition was PUBLISHED (a consumer that
+// only ever tails the stream must be able to follow the moderation state),
+// and the record read proves the repo actually converged. found=false is a
+// clean not-found, not a transport failure (which fails the test).
+func (h *harness) bridgeGetRecord(t *testing.T, did, collection, rkey string) (rec bridgeRecord, found bool) {
+	t.Helper()
+	res, err := h.bridgeXRPC("/xrpc/com.atproto.repo.getRecord", url.Values{
+		"repo": {did}, "collection": {collection}, "rkey": {rkey},
+	})
+	if err != nil {
+		t.Fatalf("getRecord(%s/%s/%s): %v", did, collection, rkey, err)
+	}
+	switch res.status {
+	case http.StatusOK:
+		if err := json.Unmarshal(res.body, &rec); err != nil {
+			t.Fatalf("getRecord(%s/%s/%s): decode: %v", did, collection, rkey, err)
+		}
+		return rec, true
+	case http.StatusBadRequest, http.StatusNotFound:
+		return bridgeRecord{}, false
+	default:
+		t.Fatalf("getRecord(%s/%s/%s): unexpected status %d: %s",
+			did, collection, rkey, res.status, truncate(res.body, 200))
+		return bridgeRecord{}, false
+	}
+}
+
+// awaitRecordGone polls the repo surface until a record disappears. The
+// firehose delete op and the repo read are separate observations of one
+// commit, and the suite asserts both — but Jetstream delivery and the
+// bridge's own read path settle independently, so the end-state check gets a
+// bounded poll rather than a single racy read.
+func (h *harness) awaitRecordGone(t *testing.T, did, collection, rkey, desc string) {
+	t.Helper()
+	deadline := time.Now().Add(eventTimeout)
+	for time.Now().Before(deadline) {
+		if _, found := h.bridgeGetRecord(t, did, collection, rkey); !found {
+			return
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	t.Fatalf("%s: %s/%s/%s still present after %s", desc, did, collection, rkey, eventTimeout)
+}
+
+// awaitRecordPresent is awaitRecordGone's positive twin.
+func (h *harness) awaitRecordPresent(t *testing.T, did, collection, rkey, desc string) bridgeRecord {
+	t.Helper()
+	deadline := time.Now().Add(eventTimeout)
+	for time.Now().Before(deadline) {
+		if rec, found := h.bridgeGetRecord(t, did, collection, rkey); found {
+			return rec
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	t.Fatalf("%s: %s/%s/%s never appeared within %s", desc, did, collection, rkey, eventTimeout)
+	return bridgeRecord{}
+}
+
+// awaitAcceptanceConverged asserts the END STATE of the acceptance flow: the
+// community's acceptance exists at the subject digest rkey and pins the
+// post's CURRENT version.
+//
+// Convergence, not a fixed CID, is the assertion. The pinned CID is a moving
+// target by design — every edit and every vote-stats stamp rewrites the post
+// and drives a repin — so comparing against a CID captured earlier races any
+// stamp that lands in between and fails on correct behavior. What must always
+// hold is that the two agree once the system settles: an acceptance naming a
+// version the post no longer has is exactly the state the lexicon tells Coves
+// not to render, i.e. the post silently gone from its community.
+//
+// The per-transition assertions (a repin followed THIS edit, THIS stamp) live
+// on the firehose awaits, where the specific commit is identified.
+func (h *harness) awaitAcceptanceConverged(t *testing.T, communityDID, postRepoDID, postRKey string) {
+	t.Helper()
+	deadline := time.Now().Add(eventTimeout)
+	lastPost, lastPin := "", ""
+	for time.Now().Before(deadline) {
+		post, found := h.bridgeGetRecord(t, postRepoDID, colPostV2, postRKey)
+		if !found {
+			t.Fatalf("post %s/%s/%s is gone — cannot check its acceptance",
+				postRepoDID, colPostV2, postRKey)
+		}
+		acceptance, found := h.bridgeGetRecord(t, communityDID, colAcceptance, subjectRKey(post.URI))
+		if found {
+			pinnedURI, _ := softString(acceptance.Value, "subject", "uri")
+			pinnedCID, _ := softString(acceptance.Value, "subject", "cid")
+			if pinnedURI != post.URI {
+				t.Fatalf("acceptance subject.uri = %q, want %q", pinnedURI, post.URI)
+			}
+			if _, ok := softString(acceptance.Value, "createdAt"); !ok {
+				t.Fatalf("acceptance carries no createdAt: %+v", acceptance.Value)
+			}
+			lastPost, lastPin = post.CID, pinnedCID
+			if pinnedCID == post.CID {
+				return
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	t.Fatalf("acceptance never converged on the post's current version within %s: pins %q, post is at %q — "+
+		"a stale pin means Coves stops rendering the post", eventTimeout, lastPin, lastPost)
+}
+
+// softString reads a nested string without failing the test when it is
+// absent (the polling loops above need to retry, not abort).
+func softString(root map[string]any, path ...string) (string, bool) {
+	var cur any = root
+	for _, key := range path {
+		m, ok := cur.(map[string]any)
+		if !ok {
+			return "", false
+		}
+		if cur, ok = m[key]; !ok {
+			return "", false
+		}
+	}
+	s, ok := cur.(string)
+	return s, ok
+}
+
 // bridgeGetBlob fetches a stored blob from the bridge's
 // com.atproto.sync.getBlob (the AppView's media path for bridged images),
 // returning the bytes and the served Content-Type.
@@ -1243,6 +1432,10 @@ type jsListener struct {
 	// listeners each see a per-repo-ordered stream of their own. Only
 	// touched from the test goroutine.
 	lastRev map[string]string
+	// revPaths tracks which record paths have already been seen at the
+	// CURRENT rev per repo, so a multi-op commit's several events (which
+	// share one rev) are told apart from the same record emitted twice.
+	revPaths map[string]map[string]bool
 
 	mu      sync.Mutex
 	readErr error // readLoop's terminal error, nil on deliberate close
@@ -1311,12 +1504,13 @@ func (h *harness) newListener(t *testing.T, cursorMicros int64, collections ...s
 		time.Sleep(2 * time.Second)
 	}
 	l := &jsListener{
-		t:       t,
-		conn:    conn,
-		events:  make(chan *jsEvent, 1024),
-		closed:  make(chan struct{}),
-		done:    make(chan struct{}),
-		lastRev: map[string]string{},
+		t:        t,
+		conn:     conn,
+		events:   make(chan *jsEvent, 1024),
+		closed:   make(chan struct{}),
+		done:     make(chan struct{}),
+		lastRev:  map[string]string{},
+		revPaths: map[string]map[string]bool{},
 	}
 	go l.readLoop()
 	t.Cleanup(l.close)
@@ -1395,7 +1589,9 @@ func (l *jsListener) close() {
 //     lands in;
 //   - every create/update record must validate against the vendored Coves
 //     lexicons (deletes carry no record);
-//   - commit revs must be strictly increasing per repo DID (see lastRev):
+//   - commit revs must be non-decreasing per repo DID (see lastRev), with
+//     equal revs admitted only across DISTINCT records — a multi-op commit
+//     reaches Jetstream as one event per op, all carrying its single rev:
 //     the relay guarantees per-repo order even though cross-repo order is
 //     lost, and this is the one place every consumed event passes through.
 func (l *jsListener) vetEvent(ev *jsEvent) {
@@ -1404,11 +1600,36 @@ func (l *jsListener) vetEvent(ev *jsEvent) {
 		return
 	}
 	if !expectedCollections[ev.Commit.Collection] {
-		l.t.Fatalf("unexpected collection on firehose: %s — only community/actor profiles, posts, and comments may ever appear (votes never become records)", ev)
+		l.t.Fatalf("unexpected collection on firehose: %s — only community/actor profiles, posts (both eras), acceptances, removals, and comments may ever appear (votes never become records)", ev)
 	}
-	if prev, ok := l.lastRev[ev.Did]; ok && ev.Commit.Rev <= prev {
-		l.t.Fatalf("per-repo rev order violated on firehose: %s has rev %q after rev %q — bigsky preserves per-repo commit order, so this is a relay/bridge ordering bug",
-			ev, ev.Commit.Rev, prev)
+	// Per-repo rev order. NON-decreasing, not strictly increasing: one
+	// commit may carry SEVERAL ops (the moderation transitions commit
+	// delete-acceptance + write-removal together so the firehose never shows
+	// a half-completed action), and Jetstream flattens a commit into one
+	// event per op — so those events legitimately share a rev. Equal revs are
+	// therefore admitted, but only for DISTINCT records: the same record
+	// twice at one rev, or any rev going backwards, is still the ordering bug
+	// this check exists to catch.
+	if prev, ok := l.lastRev[ev.Did]; ok {
+		path := ev.Commit.Collection + "/" + ev.Commit.RKey
+		switch {
+		case ev.Commit.Rev < prev:
+			l.t.Fatalf("per-repo rev order violated on firehose: %s has rev %q after rev %q — bigsky preserves per-repo commit order, so this is a relay/bridge ordering bug",
+				ev, ev.Commit.Rev, prev)
+		case ev.Commit.Rev == prev:
+			if l.revPaths[ev.Did][path] {
+				l.t.Fatalf("record %s emitted twice at the same rev %q on repo %s: %s — one commit may carry several ops, but never two ops on one record",
+					path, ev.Commit.Rev, ev.Did, ev)
+			}
+		default:
+			l.revPaths[ev.Did] = map[string]bool{}
+		}
+		if l.revPaths[ev.Did] == nil {
+			l.revPaths[ev.Did] = map[string]bool{}
+		}
+		l.revPaths[ev.Did][path] = true
+	} else {
+		l.revPaths[ev.Did] = map[string]bool{ev.Commit.Collection + "/" + ev.Commit.RKey: true}
 	}
 	l.lastRev[ev.Did] = ev.Commit.Rev
 	if op := ev.Commit.Operation; op == opCreate || op == opUpdate {
@@ -1431,11 +1652,22 @@ func (l *jsListener) vetEvent(ev *jsEvent) {
 // perform no content edits on the affected records, so an update-with-stats
 // there is unambiguously a stats emission — the helper is not a general
 // "is this only a stats change" classifier.
+// isContentCollection reports whether a collection carries bridged CONTENT —
+// the records the vote-stats refresher stamps bridgedStats onto. Posts of
+// BOTH eras qualify: the deprecated collection because its records still
+// exist and still get swept, postv2 because it is what every new post is.
+// Acceptance and removal are deliberately excluded: they are the community's
+// attestations ABOUT content, they carry no bridgedStats, and an acceptance
+// repin riding a stats sweep is a different event from the stamp itself.
+func isContentCollection(collection string) bool {
+	return collection == colPost || collection == colPostV2 || collection == colComment
+}
+
 func isBridgedStatsUpdate(ev *jsEvent) bool {
 	if ev.Kind != kindCommit || ev.Commit == nil || ev.Commit.Operation != opUpdate {
 		return false
 	}
-	if ev.Commit.Collection != colPost && ev.Commit.Collection != colComment {
+	if !isContentCollection(ev.Commit.Collection) {
 		return false
 	}
 	if len(ev.Commit.Record) == 0 {
@@ -1477,7 +1709,7 @@ func (s *statsDedup) isPureStatsEmission(ev *jsEvent, key string) bool {
 	if !seen || ev.Commit.Operation != opUpdate {
 		return false
 	}
-	if ev.Commit.Collection != colPost && ev.Commit.Collection != colComment {
+	if !isContentCollection(ev.Commit.Collection) {
 		return false
 	}
 	return recordEqualsModuloBridgedStats(prev, ev.Commit.Record)
@@ -1731,4 +1963,26 @@ func (h *harness) restartTidepool(t *testing.T) {
 		}
 		time.Sleep(time.Second)
 	}
+}
+
+// isPostCollection reports whether a collection holds POST records of either
+// era — the deprecated community-repo collection or the author-repo postv2.
+func isPostCollection(collection string) bool {
+	return collection == colPost || collection == colPostV2
+}
+
+// isAcceptanceRepinOf reports whether a commit is an update to the acceptance
+// of one specific post — the community-repo event a stats stamp or an edit on
+// that post produces. Scoped to the subject on purpose: it is used to excuse a
+// legitimate settle inside a negative window, and an excuse that matched ANY
+// acceptance would excuse exactly the leak the window exists to catch.
+func isAcceptanceRepinOf(ev *jsEvent, postURI string) bool {
+	if ev.Kind != kindCommit || ev.Commit == nil || ev.Commit.Operation != opUpdate {
+		return false
+	}
+	if ev.Commit.Collection != colAcceptance || ev.Commit.RKey != subjectRKey(postURI) {
+		return false
+	}
+	uri, ok := fieldOf(ev.Commit.Record, "subject", "uri")
+	return ok && uri == postURI
 }

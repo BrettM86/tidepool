@@ -4,6 +4,7 @@ package e2e
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -72,7 +73,7 @@ func TestPost_ActorProfileThenPost(t *testing.T) {
 	user := h.registerUser(t, username)
 
 	cursor := cursorNow()
-	l := h.newListener(t, cursor, colActorProfile, colPost)
+	l := h.newListener(t, cursor, colActorProfile, colPostV2, colAcceptance)
 
 	title := "Hello from " + username
 	// A link post. The url stays on the compose network (LOCAL-ONLY): Lemmy
@@ -92,21 +93,67 @@ func TestPost_ActorProfileThenPost(t *testing.T) {
 		t.Errorf("actor.profile rkey = %q, want %q", profileEv.Commit.RKey, rkeySelf)
 	}
 
-	postEv := l.await("community.post create", func(e *jsEvent) bool {
+	postEv := l.await("community.postv2 create", func(e *jsEvent) bool {
 		got, _ := fieldOf(e.Commit.Record, "title")
-		return e.Commit.Collection == colPost && e.Did == sub.DID &&
+		return e.Commit.Collection == colPostV2 &&
 			e.Commit.Operation == opCreate && got == title
 	})
 
-	if got := recordField(t, postEv.Commit.Record, "author"); got != profileEv.Did {
-		t.Errorf("post author = %q, want the author's DID %q", got, profileEv.Did)
+	// Authorship IS the repo (PLAN.md decision 20): the post is committed
+	// into the AUTHOR's repo and carries no in-record author field at all.
+	if postEv.Did != profileEv.Did {
+		t.Errorf("postv2 landed in repo %q, want the AUTHOR's repo %q", postEv.Did, profileEv.Did)
+	}
+	if _, ok := fieldOf(postEv.Commit.Record, "author"); ok {
+		t.Errorf("postv2 carries an author field — authorship is the repo it lives in: %s",
+			truncate(postEv.Commit.Record, 300))
 	}
 	if got := recordField(t, postEv.Commit.Record, "community"); got != sub.DID {
-		t.Errorf("post community = %q, want repo DID %q (posts live in the community's repo)", got, sub.DID)
+		t.Errorf("post community = %q, want the community's DID %q", got, sub.DID)
 	}
 	if got := recordField(t, postEv.Commit.Record, "embed", "external", "uri"); got != linkURL {
 		t.Errorf("post embed.external.uri = %q, want the shared link %q", got, linkURL)
 	}
+
+	// Bridged provenance: who wrote it upstream, and where it came from.
+	// The lexicon leaves both shapes open, so THIS is the bridge's published
+	// convention and the suite is where it is pinned.
+	if got := recordField(t, postEv.Commit.Record, "originalAuthor", "apId"); !strings.Contains(got, username) {
+		t.Errorf("originalAuthor.apId = %q, want the origin actor IRI for %s", got, username)
+	}
+	if got := recordField(t, postEv.Commit.Record, "originalAuthor", "instance"); got != "lemmy" {
+		t.Errorf("originalAuthor.instance = %q, want %q", got, "lemmy")
+	}
+	if got := recordField(t, postEv.Commit.Record, "originalAuthor", "handle"); got != username {
+		t.Errorf("originalAuthor.handle = %q, want the ORIGIN username %q (not the bridged handle)", got, username)
+	}
+	if got := recordField(t, postEv.Commit.Record, "federatedFrom", "platform"); got != "lemmy" {
+		t.Errorf("federatedFrom.platform = %q, want %q", got, "lemmy")
+	}
+	if got := recordField(t, postEv.Commit.Record, "federatedFrom", "instance"); got != "lemmy" {
+		t.Errorf("federatedFrom.instance = %q, want %q", got, "lemmy")
+	}
+
+	// The community's acceptance is what makes the post VISIBLE in it:
+	// Coves renders community surfaces from acceptance records alone, so a
+	// postv2 without one is a post nobody can see. It rides the firehose as
+	// its own commit in the COMMUNITY's repo, at the subject digest rkey.
+	acceptEv := l.await("community.acceptance create", func(e *jsEvent) bool {
+		uri, _ := fieldOf(e.Commit.Record, "subject", "uri")
+		return e.Commit.Collection == colAcceptance && uri == postEv.atURI()
+	})
+	if acceptEv.Did != sub.DID {
+		t.Errorf("acceptance landed in repo %q, want the COMMUNITY's repo %q", acceptEv.Did, sub.DID)
+	}
+	if want := subjectRKey(postEv.atURI()); acceptEv.Commit.RKey != want {
+		t.Errorf("acceptance rkey = %q, want the subject digest %q — Coves derives the same key, "+
+			"and a mismatch silently forks acceptance identity between the two engines",
+			acceptEv.Commit.RKey, want)
+	}
+	if got := recordField(t, acceptEv.Commit.Record, "subject", "cid"); got != postEv.Commit.CID {
+		t.Errorf("acceptance subject.cid = %q, want the post's cid %q", got, postEv.Commit.CID)
+	}
+	h.awaitAcceptanceConverged(t, sub.DID, postEv.Did, postEv.Commit.RKey)
 }
 
 // Scenario 3: comment + nested reply → comment records in the AUTHOR's repo
@@ -122,7 +169,7 @@ func TestComments_StrongRefsResolve(t *testing.T) {
 	user := h.registerUser(t, username)
 
 	cursor := cursorNow()
-	l := h.newListener(t, cursor, colActorProfile, colPost, colComment)
+	l := h.newListener(t, cursor, colActorProfile, colPostV2, colComment)
 
 	title := "Comment thread " + h.suffix
 	post := user.createPost(t, community.ID, title, "root post")
@@ -138,8 +185,13 @@ func TestComments_StrongRefsResolve(t *testing.T) {
 
 	postEv := l.await("post create", func(e *jsEvent) bool {
 		got, _ := fieldOf(e.Commit.Record, "title")
-		return e.Commit.Collection == colPost && e.Did == sub.DID && got == title
+		return e.Commit.Collection == colPostV2 && e.Did == authorDID && got == title
 	})
+	// Post and comments now share one repo (the author's), so the thread's
+	// community linkage lives in the record rather than in the repo DID.
+	if got := recordField(t, postEv.Commit.Record, "community"); got != sub.DID {
+		t.Errorf("post community = %q, want %q", got, sub.DID)
+	}
 	postURI, postCID := postEv.atURI(), postEv.Commit.CID
 
 	comment := user.createComment(t, post.ID, 0, "top-level comment")
@@ -199,14 +251,18 @@ func TestUpdateAndDelete(t *testing.T) {
 	user := h.registerUser(t, username)
 
 	cursor := cursorNow()
-	l := h.newListener(t, cursor, colPost, colComment)
+	l := h.newListener(t, cursor, colPostV2, colAcceptance, colComment)
 
 	title := "Editable " + h.suffix
 	post := user.createPost(t, community.ID, title, "original body")
 	postEv := l.await("post create", func(e *jsEvent) bool {
 		got, _ := fieldOf(e.Commit.Record, "title")
-		return e.Commit.Collection == colPost && e.Commit.Operation == opCreate &&
-			e.Did == sub.DID && got == title
+		return e.Commit.Collection == colPostV2 && e.Commit.Operation == opCreate &&
+			got == title
+	})
+	l.await("acceptance for the new post", func(e *jsEvent) bool {
+		uri, _ := fieldOf(e.Commit.Record, "subject", "uri")
+		return e.Commit.Collection == colAcceptance && uri == postEv.atURI()
 	})
 
 	comment := user.createComment(t, post.ID, 0, "doomed comment")
@@ -218,8 +274,8 @@ func TestUpdateAndDelete(t *testing.T) {
 
 	user.editPost(t, post.ID, "edited body")
 	updateEv := l.await("post update", func(e *jsEvent) bool {
-		return e.Commit.Collection == colPost && e.Commit.Operation == opUpdate &&
-			e.Did == sub.DID && e.Commit.RKey == postEv.Commit.RKey
+		return e.Commit.Collection == colPostV2 && e.Commit.Operation == opUpdate &&
+			e.Did == postEv.Did && e.Commit.RKey == postEv.Commit.RKey
 	})
 	if got := recordField(t, updateEv.Commit.Record, "content"); got != "edited body" {
 		t.Errorf("updated post content = %q, want %q", got, "edited body")
@@ -227,6 +283,23 @@ func TestUpdateAndDelete(t *testing.T) {
 	if updateEv.Commit.CID == postEv.Commit.CID {
 		t.Error("update event carries the same cid as the create — no new commit?")
 	}
+
+	// An edit moves the post's CID, so the community's acceptance must be
+	// RE-PINNED to the new version — at the same rkey, and without
+	// restamping createdAt (the community accepted this post once; re-pinning
+	// the version it accepts is not a new acceptance). An acceptance left on
+	// the old CID means Coves stops rendering the post the moment its author
+	// edits it.
+	repinEv := l.await("acceptance repin after the edit", func(e *jsEvent) bool {
+		cid, _ := fieldOf(e.Commit.Record, "subject", "cid")
+		return e.Commit.Collection == colAcceptance && e.Did == sub.DID &&
+			e.Commit.RKey == subjectRKey(postEv.atURI()) && cid == updateEv.Commit.CID
+	})
+	if repinEv.Commit.Operation != opUpdate {
+		t.Errorf("acceptance repin arrived as %q, want %q — the record is updated in place",
+			repinEv.Commit.Operation, opUpdate)
+	}
+	h.awaitAcceptanceConverged(t, sub.DID, postEv.Did, postEv.Commit.RKey)
 
 	user.deleteComment(t, comment.ID)
 	deleteEv := l.await("comment delete", func(e *jsEvent) bool {
@@ -259,8 +332,11 @@ func TestVotes_SideChannelOnly(t *testing.T) {
 	post := author.createPost(t, community.ID, title, "vote on me")
 	postEv := l.await("post create", func(e *jsEvent) bool {
 		got, _ := fieldOf(e.Commit.Record, "title")
-		return e.Commit.Collection == colPost && e.Did == sub.DID && got == title
+		return e.Commit.Collection == colPostV2 && got == title
 	})
+	if got := recordField(t, postEv.Commit.Record, "community"); got != sub.DID {
+		t.Errorf("post community = %q, want %q", got, sub.DID)
+	}
 	postURI := postEv.atURI()
 
 	// Upvote → aggregates show it.
@@ -362,7 +438,7 @@ func TestBackfill_PreexistingPosts(t *testing.T) {
 	voter.likePost(t, votedPost.ID, 1)
 
 	cursor := cursorNow()
-	l := h.newListener(t, cursor, colCommunityProfile, colActorProfile, colPost)
+	l := h.newListener(t, cursor, colCommunityProfile, colActorProfile, colPostV2)
 
 	sub := h.subscribeCommunity(t, "!"+name+"@lemmy")
 
@@ -386,9 +462,9 @@ func TestBackfill_PreexistingPosts(t *testing.T) {
 			switch e.Commit.Collection {
 			case colActorProfile:
 				return true // consume every profile to track the author set
-			case colPost:
+			case colPostV2:
 				title, _ := fieldOf(e.Commit.Record, "title")
-				return e.Did == sub.DID && e.Commit.Operation == opCreate && titles[title]
+				return e.Commit.Operation == opCreate && titles[title]
 			}
 			return false
 		})
@@ -397,7 +473,9 @@ func TestBackfill_PreexistingPosts(t *testing.T) {
 			continue
 		}
 		title := recordField(t, ev.Commit.Record, "title")
-		postAuthors[recordField(t, ev.Commit.Record, "author")] = title
+		// The repo IS the authorship claim now — there is no author field to
+		// read, so the post's own DID is the author whose profile must exist.
+		postAuthors[ev.Did] = title
 		if title == votedTitle {
 			votedURI = ev.atURI()
 		}
@@ -446,14 +524,14 @@ func TestRestart_ReplayIsIdempotent(t *testing.T) {
 	author.createPost(t, community.ID, title, "pre-restart post")
 
 	cursor := cursorNow()
-	l := h.newListener(t, cursor, colCommunityProfile, colActorProfile, colPost)
+	l := h.newListener(t, cursor, colCommunityProfile, colActorProfile, colPostV2)
 
 	handle := "!" + name + "@lemmy"
 	sub := h.subscribeCommunity(t, handle)
 
 	firstEv := l.await("pre-restart post create", func(e *jsEvent) bool {
 		got, _ := fieldOf(e.Commit.Record, "title")
-		return e.Did == sub.DID && e.Commit.Collection == colPost && got == title
+		return e.Commit.Collection == colPostV2 && got == title
 	})
 	if firstEv.Commit.Operation != opCreate {
 		t.Fatalf("pre-restart post arrived as %q, want %q", firstEv.Commit.Operation, opCreate)
@@ -506,7 +584,7 @@ func TestRestart_ReplayIsIdempotent(t *testing.T) {
 	// non-idempotent rebuild that duplicated a record's CONTENT would also carry
 	// it and slip past — the modulo comparison still catches that (its content
 	// differs), so this assertion keeps its teeth.
-	l2 := h.newListener(t, cursor, colCommunityProfile, colActorProfile, colPost)
+	l2 := h.newListener(t, cursor, colCommunityProfile, colActorProfile, colPostV2)
 
 	title2 := "Post-restart " + h.suffix
 	author.createPost(t, community.ID, title2, "after the bounce")
@@ -538,7 +616,7 @@ func TestRestart_ReplayIsIdempotent(t *testing.T) {
 			if !pureStats {
 				seen[keyOf(ev)]++
 			}
-			if ev.Did == sub.DID && ev.Commit.Collection == colPost && !pureStats {
+			if ev.Commit.Collection == colPostV2 && !pureStats {
 				switch got, _ := fieldOf(ev.Commit.Record, "title"); got {
 				case gapTitle:
 					sawGap, gapKey = true, keyOf(ev)
@@ -563,7 +641,7 @@ func TestRestart_ReplayIsIdempotent(t *testing.T) {
 	// The replayed pre-restart post must appear EXACTLY once: zero would
 	// mean Jetstream lost history, twice would mean the backfill redo
 	// re-committed it (deterministic-rkey idempotency broken).
-	firstKey := fmt.Sprintf("%s %s/%s", sub.DID, colPost, firstEv.Commit.RKey)
+	firstKey := fmt.Sprintf("%s %s/%s", firstEv.Did, colPostV2, firstEv.Commit.RKey)
 	if n := seen[firstKey]; n != 1 {
 		t.Errorf("pre-restart post replayed %d times (want exactly 1): %s", n, firstKey)
 	}
@@ -585,8 +663,8 @@ func TestRestart_ReplayIsIdempotent(t *testing.T) {
 func TestBurst_ConcurrentIngestionExactlyOnce(t *testing.T) {
 	h := newHarness(t)
 
-	commA, subA := setupSubscribedCommunity(t, h, "ba")
-	commB, subB := setupSubscribedCommunity(t, h, "bb")
+	commA, _ := setupSubscribedCommunity(t, h, "ba")
+	commB, _ := setupSubscribedCommunity(t, h, "bb")
 
 	users := []*lemmyClient{
 		h.registerUser(t, h.uniqueName(t, "ivy")),
@@ -595,7 +673,7 @@ func TestBurst_ConcurrentIngestionExactlyOnce(t *testing.T) {
 	}
 
 	cursor := cursorNow()
-	l := h.newListener(t, cursor, colPost)
+	l := h.newListener(t, cursor, colPostV2)
 
 	const perCommunity = 6
 	titles := make(map[string]bool, 2*perCommunity)
@@ -615,20 +693,26 @@ func TestBurst_ConcurrentIngestionExactlyOnce(t *testing.T) {
 	// stay pure now that non-matches are buffered and rescanned), and it is
 	// inherently order-agnostic — which the relay's cross-repo reordering
 	// demands anyway.
+	// Scoped by TITLE, not by repo DID: postv2 records land in each author's
+	// own repo (of which there are three here), so the two community DIDs no
+	// longer identify this scenario's posts. The titles are unique per run
+	// and are already the identity the exactly-once accounting turns on.
 	seen := map[string]int{}
 	keyTitle := map[string]string{}
 	count := func(e *jsEvent) {
 		if e.Kind != kindCommit || e.Commit == nil {
 			return
 		}
-		if e.Did != subA.DID && e.Did != subB.DID {
+		if e.Commit.Collection != colPostV2 {
+			return
+		}
+		title, ok := fieldOf(e.Commit.Record, "title")
+		if !ok || !titles[title] {
 			return
 		}
 		key := fmt.Sprintf("%s %s/%s", e.Did, e.Commit.Collection, e.Commit.RKey)
 		seen[key]++
-		if title, ok := fieldOf(e.Commit.Record, "title"); ok && titles[title] {
-			keyTitle[key] = title
-		}
+		keyTitle[key] = title
 	}
 
 	// Every post arrives…
@@ -641,9 +725,6 @@ func TestBurst_ConcurrentIngestionExactlyOnce(t *testing.T) {
 		for _, ev := range l.drain(time.Second) {
 			count(ev)
 			if ev.Kind != kindCommit || ev.Commit == nil || ev.Commit.Operation != opCreate {
-				continue
-			}
-			if ev.Did != subA.DID && ev.Did != subB.DID {
 				continue
 			}
 			if title, ok := fieldOf(ev.Commit.Record, "title"); ok && titles[title] {

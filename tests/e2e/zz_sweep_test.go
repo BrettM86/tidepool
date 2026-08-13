@@ -84,7 +84,11 @@ func TestZZ_SuiteEndSweep(t *testing.T) {
 			total++
 			repos[ev.Did] = true
 			counts[ev.Commit.Collection+" "+ev.Commit.Operation]++
-			if ev.Commit.Collection == colPost && ev.Commit.Operation == opCreate {
+			// Both post eras count: the suite creates postv2 records now,
+			// but a replay reaching far enough back can still legally
+			// surface pre-flip legacy posts, and either one proves the
+			// replayed history is real.
+			if isPostCollection(ev.Commit.Collection) && ev.Commit.Operation == opCreate {
 				postCreates++
 			}
 			if ev.Commit.Operation == opDelete {
@@ -128,7 +132,7 @@ func TestZZ_SuiteEndSweep(t *testing.T) {
 	}
 	if postCreates == 0 {
 		t.Errorf("sweep saw no %s create — a full suite run always emits posts, so the replayed history is incomplete: %v",
-			colPost, counts)
+			colPostV2, counts)
 	}
 	if deleteOps == 0 {
 		t.Errorf("sweep saw no delete op in any collection — a full suite run always emits deletes (edits/deletes, scrubs), so the replayed history is incomplete: %v",

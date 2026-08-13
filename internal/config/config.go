@@ -131,6 +131,12 @@ type Config struct {
 	// ConsumerEnabled: until a deployment is wired end to end, the consumer
 	// still records outbound state but the noop enqueuer federates nothing.
 	OutboundWorkers int
+	// AdmissionMaxPerAuthorPerCommunity caps how many posts one native author may
+	// have accepted into one bridged community — the acceptance engine's flood
+	// guard (ADMISSION_MAX_PER_AUTHOR_PER_COMMUNITY, generous default 50). 0 means
+	// UNLIMITED. Tidepool signs the community's acceptance, so it must not let one
+	// account flood a Lemmy community it vouches for.
+	AdmissionMaxPerAuthorPerCommunity int
 	// OutboundDryRun makes workers translate + log but POST nothing, leaving
 	// deliveries pending (OUTBOUND_DRY_RUN, default false).
 	OutboundDryRun bool
@@ -471,6 +477,12 @@ func Load(logger *slog.Logger) (*Config, error) {
 	// OUTBOUND_WORKERS>0 AND the consumer is on, so a not-yet-wired deployment
 	// keeps the noop enqueuer and federates nothing.
 	cfg.OutboundWorkers, err = intVarNonNegative(logger, "OUTBOUND_WORKERS", 0)
+	if err != nil {
+		return nil, err
+	}
+	// The acceptance engine's per-author-per-community flood cap. Generous by
+	// default so a legitimate poster is never throttled; 0 disables it entirely.
+	cfg.AdmissionMaxPerAuthorPerCommunity, err = intVarNonNegative(logger, "ADMISSION_MAX_PER_AUTHOR_PER_COMMUNITY", 50)
 	if err != nil {
 		return nil, err
 	}

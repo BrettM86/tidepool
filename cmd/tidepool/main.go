@@ -671,16 +671,18 @@ func startConsumer(
 	// the Create{Page} enqueued atomically with it. Wired whenever the consumer
 	// runs, so postv2 events are admitted rather than skipped at debug.
 	engine, err := accept.NewEngine(accept.Options{
-		Repos:       repoManager,
-		Enqueuer:    enqueuer,
-		Actors:      minter,
-		Resolver:    resolver,
-		Communities: store.NewCommunities(database),
-		Objects:     store.NewOutboundObjects(database),
-		Prefs:       store.NewFederationPrefs(database),
-		Admissions:  accept.NewAdmissions(database),
-		UserOrigin:  cfg.APUserOrigin,
-		Logger:      logger,
+		Repos:                    repoManager,
+		Enqueuer:                 enqueuer,
+		Actors:                   minter,
+		Resolver:                 resolver,
+		Communities:              store.NewCommunities(database),
+		Objects:                  store.NewOutboundObjects(database),
+		Prefs:                    store.NewFederationPrefs(database),
+		Admissions:               accept.NewAdmissions(database),
+		APActors:                 store.NewAPActors(database),
+		MaxPerAuthorPerCommunity: cfg.AdmissionMaxPerAuthorPerCommunity,
+		UserOrigin:               cfg.APUserOrigin,
+		Logger:                   logger,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("consumer: acceptance engine: %w", err)

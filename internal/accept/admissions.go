@@ -26,6 +26,7 @@ const (
 type Admission struct {
 	CommunityDID   string
 	PostURI        string
+	AuthorDID      string
 	Status         string
 	DecisionCode   string
 	EvaluatedCID   string
@@ -70,10 +71,11 @@ func (a *Admissions) record(ctx context.Context, ex execer, adm Admission) error
 	}
 	_, err := ex.ExecContext(ctx, `
 		INSERT INTO admissions
-		    (community_did, post_uri, status, decision_code, evaluated_cid,
+		    (community_did, post_uri, author_did, status, decision_code, evaluated_cid,
 		     acceptance_rkey, accepted_cid, redrivable)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		ON CONFLICT (community_did, post_uri) DO UPDATE SET
+		    author_did = EXCLUDED.author_did,
 		    status = EXCLUDED.status,
 		    decision_code = EXCLUDED.decision_code,
 		    evaluated_cid = EXCLUDED.evaluated_cid,
@@ -81,7 +83,7 @@ func (a *Admissions) record(ctx context.Context, ex execer, adm Admission) error
 		    accepted_cid = EXCLUDED.accepted_cid,
 		    redrivable = EXCLUDED.redrivable,
 		    updated_at = now()`,
-		adm.CommunityDID, adm.PostURI, adm.Status, adm.DecisionCode, adm.EvaluatedCID,
+		adm.CommunityDID, adm.PostURI, adm.AuthorDID, adm.Status, adm.DecisionCode, adm.EvaluatedCID,
 		adm.AcceptanceRKey, adm.AcceptedCID, adm.Redrivable)
 	if err != nil {
 		return fmt.Errorf("accept: record admission %s/%s: %w", adm.CommunityDID, adm.PostURI, err)
@@ -94,11 +96,11 @@ func (a *Admissions) record(ctx context.Context, ex execer, adm Admission) error
 func (a *Admissions) Get(ctx context.Context, communityDID, postURI string) (*Admission, error) {
 	var adm Admission
 	err := a.db.QueryRowContext(ctx, `
-		SELECT community_did, post_uri, status, decision_code, evaluated_cid,
+		SELECT community_did, post_uri, author_did, status, decision_code, evaluated_cid,
 		       acceptance_rkey, accepted_cid, redrivable
 		  FROM admissions WHERE community_did = $1 AND post_uri = $2`,
 		communityDID, postURI).Scan(
-		&adm.CommunityDID, &adm.PostURI, &adm.Status, &adm.DecisionCode, &adm.EvaluatedCID,
+		&adm.CommunityDID, &adm.PostURI, &adm.AuthorDID, &adm.Status, &adm.DecisionCode, &adm.EvaluatedCID,
 		&adm.AcceptanceRKey, &adm.AcceptedCID, &adm.Redrivable)
 	if stderrors.Is(err, sql.ErrNoRows) {
 		return nil, errors.NewNotFoundError("admission", communityDID+"/"+postURI)
@@ -107,4 +109,39 @@ func (a *Admissions) Get(ctx context.Context, communityDID, postURI string) (*Ad
 		return nil, fmt.Errorf("accept: get admission %s/%s: %w", communityDID, postURI, err)
 	}
 	return &adm, nil
+}
+
+// CountAccepted reports how many posts one author currently has ACCEPTED in one
+// community, excluding one post_uri (the post being decided — a repin must not
+// count against its own author). It backs the per-author-per-community flood
+// cap. The (author_did, community_did, created_at) index serves it index-only.
+func (a *Admissions) CountAccepted(ctx context.Context, authorDID, communityDID, excludePostURI string) (int, error) {
+	var n int
+	err := a.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM admissions
+		 WHERE author_did = $1 AND community_did = $2 AND status = $3 AND post_uri <> $4`,
+		authorDID, communityDID, StatusAccepted, excludePostURI).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("accept: count accepted for %s in %s: %w", authorDID, communityDID, err)
+	}
+	return n, nil
+}
+
+// DeleteTx removes the ledger row for a (community, post) on an existing
+// transaction — the author-delete path, which rides the acceptance-delete commit
+// so the ledger row and the acceptance record go away together. The post no
+// longer exists to re-decide, and no removal record stands to explain a
+// 'removed' status, so the row is dropped rather than left behind. Deleting a
+// missing row is a no-op success (a redelivered delete). A nil tx is a
+// validation error.
+func (a *Admissions) DeleteTx(ctx context.Context, tx *sql.Tx, communityDID, postURI string) error {
+	if tx == nil {
+		return errors.NewValidationError("tx", "must not be nil")
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM admissions WHERE community_did = $1 AND post_uri = $2`,
+		communityDID, postURI); err != nil {
+		return fmt.Errorf("accept: delete admission %s/%s: %w", communityDID, postURI, err)
+	}
+	return nil
 }

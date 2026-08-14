@@ -25,6 +25,7 @@ import (
 	"tidepool/internal/config"
 	"tidepool/internal/consume"
 	"tidepool/internal/db"
+	"tidepool/internal/echo"
 	"tidepool/internal/identity"
 	"tidepool/internal/ingest"
 	"tidepool/internal/materialize"
@@ -352,6 +353,18 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	// The echo classifier reads the four tables the user origin serves from,
+	// so "is this ours?" is answered against the ids this process actually
+	// minted and actually serves.
+	echoClassifier, err := echo.New(echo.Options{
+		Objects:         objects,
+		OutboundObjects: store.NewOutboundObjects(database),
+		Activities:      store.NewOutboundActivities(database),
+		Actors:          store.NewAPActors(database),
+	})
+	if err != nil {
+		return err
+	}
 	handler, err := ingest.NewHandler(ingest.HandlerOptions{
 		Materializer:   materializer,
 		Fetcher:        apClient,
@@ -362,6 +375,7 @@ func run(logger *slog.Logger) error {
 		Records:        repoManager,
 		Votes:          voteAggregator,
 		Backfill:       backfill,
+		Echo:           echoClassifier,
 		ServiceActorID: serviceActor.ID,
 		Logger:         logger,
 	})

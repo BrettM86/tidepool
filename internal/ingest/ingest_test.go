@@ -5,8 +5,10 @@ import (
 	"context"
 	"crypto/rsa"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base32"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -21,6 +23,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"tidepool/internal/ap"
+	"tidepool/internal/echo"
 	"tidepool/internal/identity"
 	"tidepool/internal/materialize"
 	"tidepool/internal/repo"
@@ -161,6 +164,16 @@ func (v *recordingVotes) RetractVote(_ context.Context, vote *ap.Object, _ strin
 type harness struct {
 	t *testing.T
 
+	// db and custodian are the raw seams the outbound half of the echo
+	// acceptance test needs (it wires the real enqueuer/worker against this
+	// same database and unseals the personas' AP keys).
+	db        *sql.DB
+	custodian *identity.Custodian
+	// logs captures the dispatcher's own log output, so a test can assert that
+	// a drop was INTENTIONAL — an incidental drop and a deliberate one are
+	// indistinguishable from state alone.
+	logs *syncBuffer
+
 	router      chi.Router
 	queue       *Queue
 	handler     *Handler
@@ -213,7 +226,12 @@ func newHarness(t *testing.T) *harness {
 	database := testutil.DB(t)
 	testutil.Truncate(t, database,
 		"ap_objects", "bridged_actors", "communities", "inbox_events",
-		"ap_tombstones", "blocks", "repo_state", "firehose_events", "blobs")
+		"ap_tombstones", "blocks", "repo_state", "firehose_events", "blobs",
+		// The outbound half (echo acceptance test): a leftover activity or
+		// persona from another package's run would make an echo look like
+		// someone else's.
+		"outbound_deliveries", "outbound_activities", "outbound_objects",
+		"outbound_votes", "ap_actors")
 
 	custodian, err := identity.NewCustodian(testKEK)
 	require.NoError(t, err)
@@ -227,6 +245,8 @@ func newHarness(t *testing.T) *harness {
 
 	h := &harness{
 		t:           t,
+		db:          database,
+		custodian:   custodian,
 		objects:     objects,
 		actors:      actors,
 		communities: communities,
@@ -284,6 +304,16 @@ func newHarness(t *testing.T) *harness {
 
 	h.backfills = &recordingBackfill{}
 	h.votes = &recordingVotes{}
+	h.logs = &syncBuffer{}
+	// The echo classifier reads the same database the outbound half writes:
+	// what the bridge sent is what must not come back in.
+	classifier, err := echo.New(echo.Options{
+		Objects:         objects,
+		OutboundObjects: store.NewOutboundObjects(database),
+		Activities:      store.NewOutboundActivities(database),
+		Actors:          store.NewAPActors(database),
+	})
+	require.NoError(t, err)
 	h.handler, err = NewHandler(HandlerOptions{
 		Materializer:   h.mat,
 		Fetcher:        h.client,
@@ -294,7 +324,10 @@ func newHarness(t *testing.T) *harness {
 		Records:        manager,
 		Votes:          h.votes,
 		Backfill:       h.backfills,
+		Echo:           classifier,
 		ServiceActorID: h.service.ID,
+		Logger: slog.New(slog.NewTextHandler(h.logs,
+			&slog.HandlerOptions{Level: slog.LevelDebug})),
 	})
 	require.NoError(t, err)
 
@@ -332,6 +365,25 @@ func newHarness(t *testing.T) *harness {
 	h.admin.Routes(router)
 	h.router = router
 	return h
+}
+
+// syncBuffer is a concurrency-safe log sink: the queue worker and the harness
+// goroutine both write through the handler's logger.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 func readAll(r *http.Request) ([]byte, error) {

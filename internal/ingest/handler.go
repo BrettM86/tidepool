@@ -4,12 +4,22 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"tidepool/internal/ap"
+	"tidepool/internal/echo"
 	"tidepool/internal/errors"
 	"tidepool/internal/materialize"
+	"tidepool/internal/ratelimit"
 	"tidepool/internal/store"
 )
+
+// echoDropLogInterval throttles the echo-drop log (hostrouter's refusal log is
+// the precedent). Echoes are rare by construction, so the sampler costs
+// nothing in steady state — but a classifier that started matching genuine
+// community traffic would emit one line per announced activity and bury the
+// evidence that this log exists to preserve.
+const echoDropLogInterval = time.Second
 
 // Materializer is the slice of *materialize.Materializer the dispatcher
 // drives (task 05's entry points).
@@ -78,6 +88,9 @@ type HandlerOptions struct {
 	Records      RecordGetter
 	Votes        VoteAggregator
 	Backfill     Backfiller
+	// Echo classifies inbound ids against the bridge's own serving surface so
+	// an activity we sent never re-enters as content (task 17a).
+	Echo *echo.Classifier
 	// ServiceActorID is the bridge's own AP actor id; Accepts must wrap a
 	// Follow issued by it.
 	ServiceActorID string
@@ -98,6 +111,8 @@ type Handler struct {
 	records     RecordGetter
 	votes       VoteAggregator
 	backfill    Backfiller
+	echo        *echo.Classifier
+	echoLog     *ratelimit.Sampler
 	serviceID   string
 	logger      *slog.Logger
 }
@@ -145,6 +160,8 @@ func NewHandler(opts HandlerOptions) (*Handler, error) {
 		records:     opts.Records,
 		votes:       opts.Votes,
 		backfill:    opts.Backfill,
+		echo:        opts.Echo,
+		echoLog:     ratelimit.NewSampler(echoDropLogInterval),
 		serviceID:   opts.ServiceActorID,
 		logger:      logger,
 	}, nil
@@ -220,6 +237,19 @@ func (h *Handler) handleAnnounce(ctx context.Context, announce *ap.Object, signe
 	if inner == nil || (inner.ID == "" && inner.Type == "") {
 		return errors.NewValidationError("announce", "announce carries no object")
 	}
+	// Echo suppression on the RAW envelope, BEFORE anything is dereferenced.
+	// The community fans our own activities straight back at us, and a bare
+	// IRI that is ours must be dropped WITHOUT being fetched: dialing our own
+	// origin to learn whether we minted an id is a round trip for an answer we
+	// already hold, and it makes a remote redirect part of the decision.
+	//
+	// It runs AFTER the followed-community gate on purpose — an announce from
+	// a community we do not follow must skip for THAT reason, or it lands in
+	// the echo counters and corrupts the very signal that would expose a
+	// classifier false positive.
+	if err := h.suppressEcho(ctx, announce.ID, announce); err != nil {
+		return err
+	}
 	// A bare-IRI announce (object is just an id): fetch it. FetchObject
 	// fetches exactly inner.ID, and resolveDelivered below re-checks the
 	// body's self-asserted id, so cross-host forgery cannot slip in.
@@ -229,6 +259,13 @@ func (h *Handler) handleAnnounce(ctx context.Context, announce *ap.Object, signe
 			return err
 		}
 		inner = fetched
+		// Classify the FETCHED body too: the IRI can be one we do not
+		// recognize while the document behind it is our own activity re-served
+		// under a different id. The embedded shapes need no second pass — the
+		// walk above already descended through them.
+		if err := h.suppressEcho(ctx, announce.ID, inner); err != nil {
+			return err
+		}
 	}
 
 	switch inner.Type {
@@ -254,6 +291,45 @@ func (h *Handler) handleAnnounce(ctx context.Context, announce *ap.Object, signe
 		// does not translate in v1.
 		return skip(announce.ID, "unsupported announced activity type "+inner.Type)
 	}
+}
+
+// suppressEcho drops an announced activity the bridge itself sent. Returning
+// our own content back into materialization duplicates it, double-counts our
+// own votes, and — worst — reads as MODERATION of our own records.
+//
+// It returns a skip when the envelope resolves to one of our own entities, nil
+// when it is genuine remote traffic, and the classifier's error otherwise. A
+// failed lookup is never a verdict: calling it "not ours" re-materializes the
+// echo, calling it "ours" drops real Lemmy content permanently, and only the
+// retry the wrapped error buys is honest.
+//
+// A nil classifier means echo suppression is not configured; the handler then
+// behaves exactly as it did before task 17a rather than refusing traffic.
+func (h *Handler) suppressEcho(ctx context.Context, announceID string, envelope *ap.Object) error {
+	if h.echo == nil {
+		return nil
+	}
+	identity, err := h.echo.Classify(ctx, envelope)
+	if err != nil {
+		return fmt.Errorf("ingest: echo classification for %s: %w", announceID, err)
+	}
+	if identity.Class == echo.ClassNone {
+		return nil
+	}
+	// Per-class, never a total: a spike in one class is a different bug from a
+	// spike in another, and a false positive is only legible in the split.
+	echo.CountDrop(identity.Class)
+	// INFO, not Debug: this line is the human-readable half of the
+	// false-positive detector, and genuine community content dropped as an
+	// echo is invisible at Debug in production.
+	if h.echoLog.Allow(time.Now()) {
+		h.logger.Info("dropped an announced echo of our own activity",
+			"announce_id", announceID,
+			"class", string(identity.Class),
+			"did", identity.DID,
+			"at_uri", identity.ATURI)
+	}
+	return skip(announceID, "echo of our own "+string(identity.Class))
 }
 
 // handleBareCreateUpdate processes a Create/Update delivered directly by a

@@ -2,6 +2,7 @@ package accept
 
 import (
 	"context"
+	"database/sql"
 	"sync"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 
 	"tidepool/internal/acceptrec"
 	"tidepool/internal/repo"
+	"tidepool/internal/store"
 )
 
 // TERMINALITY IS DECIDED ACROSS TWO OPERATIONS, AND THE GAP IS THE BUG.
@@ -51,6 +53,13 @@ type racingRepos struct {
 	// read and the restore.
 	beforeRemovalDelete func()
 	deleteFired         bool
+
+	// beforeAcceptanceWrite fires once, immediately before the commit that
+	// WRITES an acceptance — the moment after admission has decided and before
+	// anything of that decision is durable. It is where a ban lands in the
+	// window between the gate reading it and the acceptance committing.
+	beforeAcceptanceWrite func()
+	acceptanceFired       bool
 }
 
 func (r *racingRepos) GetRecord(ctx context.Context, did, collection, rkey string) (map[string]any, string, error) {
@@ -95,15 +104,33 @@ func (r *racingRepos) ApplyOpsTx(ctx context.Context, did string, ops []repo.Rec
 			deletesRemoval = true
 		}
 	}
+	// The acceptance WRITE is the other side of the same window: any op that
+	// puts an acceptance record (never a delete of one) is the commit admission
+	// has already decided on.
+	writesAcceptance := false
+	for _, op := range ops {
+		if op.Action != repo.OpActionDelete && op.Collection == acceptrec.CollectionAcceptance {
+			writesAcceptance = true
+		}
+	}
+
 	r.mu.Lock()
 	fire := deletesRemoval && r.beforeRemovalDelete != nil && !r.deleteFired
 	if fire {
 		r.deleteFired = true
 	}
 	hook := r.beforeRemovalDelete
+	fireAccept := writesAcceptance && r.beforeAcceptanceWrite != nil && !r.acceptanceFired
+	if fireAccept {
+		r.acceptanceFired = true
+	}
+	acceptHook := r.beforeAcceptanceWrite
 	r.mu.Unlock()
 	if fire {
 		hook()
+	}
+	if fireAccept {
+		acceptHook()
 	}
 	return r.RepoManager.ApplyOpsTx(ctx, did, ops, sideEffect)
 }
@@ -230,4 +257,105 @@ func TestVanishedRemovalIsNotRecordedAsTerminal(t *testing.T) {
 		"a redrive after the removal was lifted must admit the edit — otherwise a post the "+
 			"moderators reinstated stays invisible until its author edits again")
 	assert.Equal(t, acPostCID2, cid, "pinning the version the redrive evaluated")
+}
+
+// TASK 17c-3 REVIEW, P1-a — THE BAN GATE IS READ OUTSIDE THE TRANSACTION IT
+// PROTECTS.
+//
+// Admission asks Standing() before opening the transaction that writes the
+// acceptance and enqueues the delivery. Between those two moments a ban can
+// land — and a ban is not just a row: the same transaction cancels every pending
+// delivery the author has for that community. So the interleaving is
+//
+//	post: Standing() → no ban
+//	ban:  INSERT the row + CANCEL every pending delivery      (commits)
+//	post: write the acceptance + enqueue a NEW delivery       (commits)
+//
+// and the post lands AFTER the cancellation that existed to stop exactly it.
+// The result is banned content accepted into the community's repo — visible in
+// Coves under that community's name — and a fresh pending delivery carrying it
+// to the instance that just banned its author, where it will be rejected,
+// retried and poisoned.
+//
+// This is 17c-1's TERM-1 one verb over: a decision read outside the transaction
+// that acts on it. The window is small and entirely ordinary — a moderator bans
+// someone mid-thread while their client is uploading the next post.
+func TestAPostCannotSlipPastABanThatLandsMidAdmission(t *testing.T) {
+	conn := acceptanceDB(t)
+	ctx := context.Background()
+	repos := newRepos(t, conn)
+	seedBridgedCommunity(t, conn)
+
+	racing := &racingRepos{RepoManager: repos}
+	enqueuer := realEnqueuer(t, conn)
+	engine := wireEngine(t, conn, racing, enqueuer)
+	dispatcher := wireDispatcher(t, conn, engine, enqueuer)
+
+	// An earlier accepted post, so the ban has queued work to cancel. Without it
+	// the ban is only a row, and the race would be about visibility alone — the
+	// point here is that the post slips past a cancellation that already ran.
+	admittedCreate(t, dispatcher)
+	require.NotZero(t, pendingDeliveries(t, conn, acAuthorDID),
+		"precondition: the author has queued work for this community")
+
+	bans := store.NewCommunityBans(conn)
+	racing.beforeAcceptanceWrite = func() {
+		cancelled, err := bans.Ban(ctx, store.CommunityBan{
+			CommunityDID:  acCommunityDID,
+			SubjectDID:    acAuthorDID,
+			CommunityAPID: acCommunityAPID,
+			Reason:        "banned while their next post was in flight",
+		})
+		require.NoError(t, err, "the community's ban lands mid-admission")
+		require.NotZero(t, cancelled,
+			"and it cancels the work already queued — the state the racing post must not be "+
+				"admitted behind")
+	}
+
+	const racingRKey = "3lzpostban001"
+	racingURI := "at://" + acAuthorDID + "/social.coves.community.postv2/" + racingRKey
+	createsBefore := activityKindCount(t, conn, "Create")
+
+	admitErr := dispatcher.HandleEvent(ctx,
+		postEvent("create", racingRKey, "3lzpostrev900", acPostCID, acPostTimeUS+10, pv2Record()))
+	require.True(t, racing.acceptanceFired,
+		"the fixture must have raced the acceptance commit, or this test is asserting nothing")
+	// Logged, not asserted: whether the engine reports success is not the
+	// property — an admission that returns nil while the ban stands is exactly
+	// the shape nothing upstream notices.
+	t.Logf("the racing admission reported: %v", admitErr)
+
+	_, accepted := acceptanceSubjectCID(t, repos, acCommunityDID, racingURI)
+	assert.False(t, accepted,
+		"no acceptance may be written for a post the community has banned its author over: "+
+			"the acceptance IS the community's endorsement, published in its own repo under "+
+			"its own key, and it appears in Coves moments after the moderators excluded them")
+
+	assert.Zero(t, pendingDeliveries(t, conn, acAuthorDID),
+		"and NOTHING may be left pending: the ban cancelled this author's queue, so a "+
+			"delivery enqueued after that is one the cancellation could never have caught — "+
+			"it goes to the instance that just banned them, is rejected, retries, and poisons")
+
+	assert.Equal(t, createsBefore, activityKindCount(t, conn, "Create"),
+		"nor may a new Create activity exist for it at all")
+
+	status, code := admissionOf(t, conn, acCommunityDID, racingURI)
+	assert.NotEqual(t, StatusAccepted, status,
+		"and the ledger must not record it as accepted: that row is what an operator reads "+
+			"when the moderators ask why a banned author's post is in their community")
+	if status != StatusAccepted {
+		assert.NotEmpty(t, code, "with a machine-readable why")
+	}
+}
+
+// pendingDeliveries counts an actor's queued outbound work.
+func pendingDeliveries(t *testing.T, conn *sql.DB, actorDID string) int {
+	t.Helper()
+	var n int
+	require.NoError(t, conn.QueryRowContext(context.Background(), `
+		SELECT COUNT(*)
+		FROM outbound_deliveries d
+		JOIN outbound_activities a ON a.activity_id = d.activity_id
+		WHERE a.actor_did = $1 AND d.state = 'pending'`, actorDID).Scan(&n))
+	return n
 }

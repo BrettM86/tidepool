@@ -247,6 +247,11 @@ type CommunityBans interface {
 	// Re-banning preserves the original banned_at (a re-delivered Block is the
 	// same ban twice) while taking the expiry, reason and removeData from the
 	// new activity, which are the parts a moderator can genuinely re-issue.
+	//
+	// A ban whose expiry has ALREADY PASSED is still RECORDED — it is a faithful
+	// account of what the moderator sent, and a redelivery must find the same row
+	// — but it cancels nothing, because it is not in force and a cancelled
+	// delivery is never re-queued.
 	Ban(ctx context.Context, ban CommunityBan) (cancelled int64, err error)
 
 	// Lift removes the ban (Undo{Block}), reporting whether one was standing.
@@ -259,6 +264,15 @@ type CommunityBans interface {
 	// no ban: Lemmy sends no Undo when a timed ban runs out, so the clock is the
 	// only thing that ever lifts it.
 	Standing(ctx context.Context, communityDID, subjectDID string) (bool, error)
+
+	// StandingTx is Standing on an existing transaction — the seam the
+	// acceptance commit uses to re-ask the question INSIDE the transaction that
+	// writes the acceptance and enqueues the delivery. A ban read before that
+	// transaction opens is a decision made about state that can change before it
+	// is acted on: the ban's own transaction cancels every pending delivery, so
+	// a post admitted after it lands is one the cancellation could never catch.
+	// A nil tx is an error satisfying errors.IsValidation.
+	StandingTx(ctx context.Context, tx *sql.Tx, communityDID, subjectDID string) (bool, error)
 }
 
 // Communities tracks the AP groups the bridge subscribes to and their

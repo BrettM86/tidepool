@@ -387,10 +387,10 @@ func (h *Handler) handleAnnounce(ctx context.Context, announce *ap.Object, signe
 		// moderator's Person and cannot satisfy decision 18 by construction.
 		return h.handleBlock(ctx, inner, community, true)
 	default:
-		// Add, Remove, Block, ... — moderation activities the bridge does not
+		// Add, Remove, Flag, ... — moderation activities the bridge does not
 		// translate yet. Remove in particular is NOT content removal in Lemmy
 		// (it is un-pin / demote-moderator, dispatched by `target`), so it must
-		// never be folded in beside Lock on the assumption that it is.
+		// never be folded in beside Lock or Block on the assumption that it is.
 		return skip(announce.ID, "unsupported announced activity type "+inner.Type)
 	}
 }

@@ -195,6 +195,11 @@ type Options struct {
 	Votes          store.OutboundVotes
 	Communities    store.Communities
 	ObjectMappings store.APObjects
+	// Bans reads whether the community a comment or vote is bound for has banned
+	// its author (task 17c-3 review). The acceptance engine gates POSTS; nothing
+	// else does, and a banned author's replies and votes enqueue to a community
+	// that refuses them until each delivery poisons.
+	Bans store.CommunityBans
 	// Moderation is the bridge-owned moderation state the comment path reads to
 	// refuse a reply in a locked thread. It is a SEPARATE store from
 	// ObjectMappings on purpose: this consumer only ever reads it, while the
@@ -229,6 +234,7 @@ type Dispatcher struct {
 	votes          store.OutboundVotes
 	communities    store.Communities
 	moderation     store.ObjectModeration
+	bans           store.CommunityBans
 	records        materialize.RecordGetter
 	hosted         *hostedRepos
 	gate           *RevGate
@@ -299,6 +305,7 @@ func NewDispatcher(opts Options) (*Dispatcher, error) {
 		votes:          orDefault[store.OutboundVotes](opts.Votes, store.NewOutboundVotes(opts.DB)),
 		communities:    orDefault[store.Communities](opts.Communities, store.NewCommunities(opts.DB)),
 		moderation:     orDefault[store.ObjectModeration](opts.Moderation, store.NewObjectModeration(opts.DB)),
+		bans:           orDefault[store.CommunityBans](opts.Bans, store.NewCommunityBans(opts.DB)),
 		records:        opts.Records,
 		hosted:         newHostedRepos(opts.DB),
 		gate:           NewRevGate(opts.DB),

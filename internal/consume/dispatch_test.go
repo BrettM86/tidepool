@@ -31,7 +31,13 @@ func dispatchTestDB(t *testing.T) *sql.DB {
 	testutil.Truncate(t, database,
 		"ap_actors", "ap_objects", "communities", "repo_state",
 		"outbound_objects", "outbound_votes", "federation_prefs",
-		"consumer_cursors", "jetstream_record_revs", "jetstream_dead_letters")
+		"consumer_cursors", "jetstream_record_revs", "jetstream_dead_letters",
+		// The gates the comment and vote paths now read (17c-2 locks, 17c-3
+		// bans). FIFTH package to need this: any table a GATE READS belongs
+		// here the moment any test WRITES it, or a leftover row refuses the
+		// next test's author and the failure names neither the ban nor the
+		// test that left one.
+		"object_moderation", "community_bans")
 	return database
 }
 

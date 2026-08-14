@@ -3,7 +3,10 @@ package ingest
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	stderrors "errors"
 	"expvar"
+	"fmt"
 	"net/http"
 	"testing"
 	"time"
@@ -13,6 +16,7 @@ import (
 
 	"tidepool/internal/accept"
 	"tidepool/internal/ap"
+	"tidepool/internal/consume"
 	"tidepool/internal/errors"
 	"tidepool/internal/materialize"
 )
@@ -252,16 +256,18 @@ func blockActivity(group *remoteActor, activityID, subjectDID, target string, ex
 type communityBan struct {
 	communityAPID string
 	expires       sql.NullTime
+	reason        string
+	removeData    bool
 }
 
 func banFor(t *testing.T, db *sql.DB, communityDID, subjectDID string) (communityBan, bool) {
 	t.Helper()
 	var ban communityBan
 	err := db.QueryRowContext(context.Background(), `
-		SELECT community_ap_id, expires_at
+		SELECT community_ap_id, expires_at, reason, remove_data
 		FROM community_bans
 		WHERE community_did = $1 AND subject_did = $2`,
-		communityDID, subjectDID).Scan(&ban.communityAPID, &ban.expires)
+		communityDID, subjectDID).Scan(&ban.communityAPID, &ban.expires, &ban.reason, &ban.removeData)
 	if err == sql.ErrNoRows {
 		return communityBan{}, false
 	}
@@ -285,6 +291,21 @@ func requireEveryDelivery(t *testing.T, db *sql.DB, actorDID, orderingKey, want,
 		why, actorDID, orderingKey)
 	for i, state := range states {
 		require.Equal(t, want, state, "%s (delivery %d of %d)", why, i+1, len(states))
+	}
+}
+
+// assertEveryDelivery is requireEveryDelivery without the abort. A test pinning
+// SEVERAL independent consequences of one activity uses this so a broken first
+// consequence does not hide the others — the vacuity guard stays fatal, because
+// a test asserting over no rows has stopped measuring anything.
+func assertEveryDelivery(t *testing.T, db *sql.DB, actorDID, orderingKey, want, why string) {
+	t.Helper()
+	states := deliveryStates(t, db, actorDID, orderingKey)
+	require.NotEmpty(t, states,
+		"%s — and there must BE deliveries to say that about: %s has no rows on %s at all",
+		why, actorDID, orderingKey)
+	for i, state := range states {
+		assert.Equal(t, want, state, "%s (delivery %d of %d)", why, i+1, len(states))
 	}
 }
 
@@ -407,33 +428,81 @@ func TestADirectBlockIsIgnoredWhateverItClaims(t *testing.T) {
 			"shadowban nobody issued and nobody can lift")
 }
 
-// TestALapsedBanDoesNotRefuseAdmission is the half of `expires` that has no
-// activity behind it.
+// TestALapsedBanIsInert is the half of `expires` that has no activity behind it,
+// and it covers ALL THREE things a lapsed Block must not do.
 //
 // Lemmy's BlockUser carries `expires` for a temporary ban, and when that ban
-// lapses Lemmy sends NOTHING — no Undo, no second activity, nothing. The ban
-// simply stops applying on their side. So an implementation that stores the ban
-// and ignores the column turns every 3-day ban into a permanent one, and there
-// is no message that will ever clear it: the author is excluded forever by a
-// moderator who chose three days.
-func TestALapsedBanDoesNotRefuseAdmission(t *testing.T) {
+// lapses Lemmy sends NOTHING — no Undo, no second activity. The ban simply stops
+// applying on their side. So a Block whose expiry has ALREADY PASSED when it
+// reaches us — delayed in a queue, redelivered after an outage, replayed from a
+// backfill — is a description of a ban that is already over.
+//
+// Reading it as live is destructive in two directions that no later activity can
+// repair: it cancels queued work that was never banned, and with removeData it
+// PERMANENTLY removes accepted posts. Both are unreachable from the admission
+// gate, which is why an admission-only test of the lapsed case passes while both
+// are broken — the expiry has to be weighed where the ban ACTS, not only where
+// it is later read.
+func TestALapsedBanIsInert(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
 	world := newModerationWorld(t, h)
 
-	h.announceBlock(world.groupA, mbBlockActivity, mtAuthorDID, groupID,
-		map[string]any{"expires": "2020-01-01T00:00:00Z"})
+	// Queued work, and an accepted post: the two things a live ban destroys.
+	admitPost(t, world, mtAuthorDID, mbPostInARKey, world.communityADID, "3lzmbrev00050", 1_775_000_009_000_001)
+	requireEveryDelivery(t, h.db, mtAuthorDID, groupID, "pending",
+		"precondition: the author has queued work for A")
+	_, _, err := h.manager.GetRecord(ctx,
+		world.communityADID, materialize.CollectionAcceptance, world.digestRKey)
+	require.NoError(t, err, "precondition: and an accepted post in A")
 
+	// A ban that ended before it arrived — carrying removeData, so every
+	// destructive branch is on the table.
+	h.announceBlock(world.groupA, mbBlockActivity, mtAuthorDID, groupID,
+		map[string]any{"expires": "2020-01-01T00:00:00Z", "removeData": true})
+
+	// (1) It cancels nothing.
+	assertEveryDelivery(t, h.db, mtAuthorDID, groupID, "pending",
+		"a LAPSED ban cancels nothing: these posts were queued by an author who is not "+
+			"banned now and was not banned when the ban expired — cancelling them silently "+
+			"unpublishes work on the strength of an exclusion that has already ended, and "+
+			"nothing re-queues a cancelled delivery")
+
+	// (2) It removes nothing.
+	_, _, err = h.manager.GetRecord(ctx,
+		world.communityADID, materialize.CollectionRemoval, world.digestRKey)
+	assert.True(t, errors.IsNotFound(err),
+		"and it removes NOTHING: removeData on a lapsed ban strips accepted posts for an "+
+			"exclusion that is over, and a removal is terminal — no Undo{Block} restores "+
+			"content, by design, so this is unrecoverable (err=%v)", err)
+	_, _, err = h.manager.GetRecord(ctx,
+		world.communityADID, materialize.CollectionAcceptance, world.digestRKey)
+	assert.NoError(t, err, "the acceptance stands (err=%v)", err)
+
+	// (3) It refuses no admission — the half that was already covered, kept
+	//     because the three only mean anything together.
+	// CONDITIONAL, and deliberately so: both outcomes are correct here. Not
+	// recording a lapsed ban at all is the stronger reading — a ban row is
+	// CURRENT STATE, not a log (Lift deletes rather than marks), so a row for an
+	// exclusion that is already over is state no reader wants and one more thing
+	// that has to remember the expiry filter. Recording it with its expiry is
+	// also sound, since every read is scoped by `expires_at > now()`.
+	//
+	// What this conditional CANNOT hide is the regression that matters: the only
+	// dangerous row shape is one with a NULL expiry, because that reads as
+	// permanent forever, and it fails inside the guard. An absent row cannot be
+	// mistaken for a standing ban by anything.
 	if ban, found := banFor(t, h.db, world.communityADID, mtAuthorDID); found {
 		require.True(t, ban.expires.Valid,
-			"a ban recorded from an activity carrying `expires` must carry the expiry with it: "+
-				"dropping the column is what makes the lapse unrepresentable")
-		assert.True(t, ban.expires.Time.Before(timeNow()),
+			"a lapsed ban that IS recorded must carry its expiry: storing it unbounded turns "+
+				"a ban that already ended into a permanent one, and no activity will ever "+
+				"correct that — Lemmy sends nothing when a ban lapses")
+		assert.True(t, ban.expires.Time.Before(time.Now()),
 			"and it must be the moment the moderator chose, in the past")
 	}
 
 	admitPost(t, world, mtAuthorDID, mbPostAfterBanRKey, world.communityADID,
-		"3lzmbrev00011", 1_775_000_003_000_001)
+		"3lzmbrev00051", 1_775_000_009_000_002)
 	postURI := mbPostATURI(mtAuthorDID, mbPostAfterBanRKey)
 	status, code := admissionFor(t, h.db, world.communityADID, postURI)
 	assert.Equal(t, accept.StatusAccepted, status,
@@ -441,9 +510,64 @@ func TestALapsedBanDoesNotRefuseAdmission(t *testing.T) {
 			"expires_at > now()`, because no Undo is coming — the expiry IS the lift")
 	assert.NotEqual(t, "author-banned", code, "and certainly not for being banned")
 
-	_, _, err := h.manager.GetRecord(ctx,
+	_, _, err = h.manager.GetRecord(ctx,
 		world.communityADID, materialize.CollectionAcceptance, testDigestRKey(postURI))
 	assert.NoError(t, err, "with the acceptance to prove it (err=%v)", err)
+}
+
+// TestABanWhoseExpiryCannotBeReadIsNotStoredAsPermanent is the fail-safe
+// direction on the one field whose absence means FOREVER.
+//
+// `expires` absent and `expires` present-but-unparseable are different facts,
+// and the wire parser keeps them apart (a nil *Time versus a Time with
+// Valid=false) precisely so a caller can. Collapsing them maps "we could not
+// read how long" onto "no expiry", which is the most consequential possible
+// misreading: the moderator asked for a time limit, and the author is excluded
+// forever instead.
+//
+// Nothing ever repairs it. Lemmy sends no activity when a timed ban lapses, so
+// there is no message whose arrival could correct the record, and no operator
+// has a reason to look — from every side this reads like an ordinary permanent
+// ban that a moderator chose.
+//
+// The honest outcome is to refuse the activity rather than store a ban we cannot
+// bound: we know what they meant and we could not read how long.
+func TestABanWhoseExpiryCannotBeReadIsNotStoredAsPermanent(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	world := newModerationWorld(t, h)
+
+	const malformed = "https://lemmy.world/activities/announce/block/mb-badexpiry"
+	h.announceBlock(world.groupA, malformed, mtAuthorDID, groupID,
+		map[string]any{"expires": "next tuesday"})
+
+	ban, found := banFor(t, h.db, world.communityADID, mtAuthorDID)
+	if found {
+		assert.True(t, ban.expires.Valid,
+			"a ban stored from an activity that CARRIED an expiry must carry one: storing it "+
+				"with a NULL expiry records a permanent exclusion the moderator did not ask "+
+				"for, and nothing will ever clear it")
+	} else {
+		assert.False(t, found,
+			"or it is not stored at all, which is the safer reading of an unbounded ban")
+	}
+
+	event, err := h.events.GetEvent(ctx, malformed)
+	require.NoError(t, err)
+	assert.Nil(t, event.ProcessedAt,
+		"and the activity is NOT marked handled: an expiry we cannot read is a ban we cannot "+
+			"bound, so the honest outcome is a failure an operator can see — retryable or "+
+			"poisoned, either says 'we did not apply this'. Marking it processed tells the "+
+			"community we honoured a ban whose duration we silently replaced with forever: %s",
+		event.Error)
+
+	admitPost(t, world, mtAuthorDID, mbPostAfterBanRKey, world.communityADID,
+		"3lzmbrev00060", 1_775_000_010_000_001)
+	status, code := admissionFor(t, h.db, world.communityADID, mbPostATURI(mtAuthorDID, mbPostAfterBanRKey))
+	assert.Equal(t, accept.StatusAccepted, status,
+		"and the author is not excluded on an unreadable instruction: the failure mode this "+
+			"guards is a permanent shadowban created by a typo in someone else's software")
+	assert.NotEqual(t, "author-banned", code, "least of all as author-banned")
 }
 
 // TestAStandingTimedBanRefusesAdmission is the other half: the same activity
@@ -463,7 +587,7 @@ func TestAStandingTimedBanRefusesAdmission(t *testing.T) {
 	ban, found := banFor(t, h.db, world.communityADID, mtAuthorDID)
 	require.True(t, found, "a temporary ban is still a ban and must be recorded")
 	require.True(t, ban.expires.Valid, "carrying its expiry")
-	assert.True(t, ban.expires.Time.After(timeNow()), "which has not arrived")
+	assert.True(t, ban.expires.Time.After(time.Now()), "which has not arrived")
 
 	admitPost(t, world, mtAuthorDID, mbPostAfterBanRKey, world.communityADID,
 		"3lzmbrev00012", 1_775_000_004_000_001)
@@ -529,6 +653,7 @@ func TestASiteScopedBlockIsSkippedWithItsOwnReason(t *testing.T) {
 	// against another outcome, not against a substring.
 	const siteActor = "https://lemmy.world/"
 	const siteBlock = "https://lemmy.world/activities/announce/block/mb-site"
+	unscopedBefore := metricValue(mbUnscopedTargetMetric)
 	h.announceBlock(world.groupA, siteBlock, mtAuthorDID, siteActor, nil)
 
 	_, found := banFor(t, h.db, world.communityADID, mtAuthorDID)
@@ -536,19 +661,43 @@ func TestASiteScopedBlockIsSkippedWithItsOwnReason(t *testing.T) {
 		"a site ban is not a community ban: recording it against the announcing community "+
 			"would understate it — the user is excluded from every community on that instance, "+
 			"and we would enforce it in one")
+	assert.Equal(t, unscopedBefore+1, metricValue(mbUnscopedTargetMetric),
+		"and it is COUNTED under its own class: this is the scope we chose not to model, and "+
+			"the counter is what tells an operator how much of it is arriving — a user "+
+			"collecting 403s across a whole instance is invisible otherwise")
 
-	// The same activity, targeted at the community, is the shape that WORKS.
-	const communityBlock = "https://lemmy.world/activities/announce/block/mb-site-control"
-	h.announceBlock(world.groupA, communityBlock, mtCommenterDID, groupID, nil)
+	// THE CONTROL, ASSERTED: the same activity targeted at the announcer's own
+	// community WORKS. Without this the comparison below could be satisfied by a
+	// control that silently failed too.
+	const workingBlock = "https://lemmy.world/activities/announce/block/mb-site-control"
+	// The control's subject needs an AP persona to be bannable at all — the
+	// subject is resolved by ENTITY EXISTENCE, so an actor who has never
+	// federated anything is refused as a foreign subject, and the control would
+	// fail for a reason that has nothing to do with targets.
+	admitPost(t, world, mtCommenterDID, mbOtherPostRKey, world.communityADID,
+		"3lzmbrev00080", 1_775_000_012_000_001)
+	h.announceBlock(world.groupA, workingBlock, mtCommenterDID, groupID, nil)
+	_, worked := banFor(t, h.db, world.communityADID, mtCommenterDID)
+	require.True(t, worked,
+		"precondition: a community-targeted Block from the same announcer is recorded — the "+
+			"shape under test differs from this one ONLY in its target")
 
-	assert.NotEqual(t,
-		skipReasonFor(t, h, communityBlock, communityBlock),
-		skipReasonFor(t, h, siteBlock, siteBlock),
-		"a target this scope does not model must be distinguishable from one it does: today "+
-			"both land in the same 'unsupported activity type' default, so an operator whose "+
-			"user is collecting 403s across a whole instance reads the same line as someone "+
-			"whose ban was applied — and silently no-op'ing the site ban leaves that user "+
-			"posting into the instance until their deliveries poison")
+	// And the discrimination is against another REFUSAL, not against a success:
+	// a successful Block logs no skip at all, so comparing with it would reduce
+	// to 'the site block produced some reason', which the generic
+	// unsupported-type default already satisfies.
+	const wrongCommunityBlock = "https://lemmy.world/activities/announce/block/mb-site-cross"
+	h.announceBlock(world.groupB, wrongCommunityBlock, mtAuthorDID, groupID, nil)
+
+	siteReason := skipReasonFor(t, h, siteBlock, siteBlock)
+	crossReason := skipReasonFor(t, h, wrongCommunityBlock, wrongCommunityBlock)
+	require.NotEmpty(t, siteReason, "the site-targeted Block must be skipped with a reason")
+	require.NotEmpty(t, crossReason, "and so must the wrong-community one")
+	assert.NotEqual(t, crossReason, siteReason,
+		"a target this scope does not model must be distinguishable from a target that "+
+			"belongs to somebody else: one means 'we do not implement instance bans' and the "+
+			"other means 'that is not your community', and an operator who cannot tell them "+
+			"apart cannot tell a missing feature from a rejected forgery")
 
 	event, err := h.events.GetEvent(ctx, siteBlock)
 	require.NoError(t, err)
@@ -560,7 +709,15 @@ func TestASiteScopedBlockIsSkippedWithItsOwnReason(t *testing.T) {
 // NAME so the test survives the var being renamed or moved — the counter's
 // identity is its published name, which is what an operator's dashboard binds
 // to, not the Go symbol.
-const mbDirectIgnoredMetric = "tidepool_block_direct_ignored"
+const (
+	mbDirectIgnoredMetric = "tidepool_block_direct_ignored"
+	// mbUnscopedTargetMetric counts announced Blocks whose target is not a
+	// community we follow — the instance-wide scope this bridge does not model.
+	mbUnscopedTargetMetric = "tidepool_block_unscoped_target"
+	// mbForeignSubjectMetric counts announced Blocks naming somebody who is not
+	// one of our personas.
+	mbForeignSubjectMetric = "tidepool_block_foreign_subject"
+)
 
 func metricValue(name string) int64 {
 	counter, _ := expvar.Get(name).(*expvar.Int)
@@ -569,8 +726,6 @@ func metricValue(name string) int64 {
 	}
 	return counter.Value()
 }
-
-func timeNow() time.Time { return time.Now() }
 
 // TestABanWithRemoveDataRemovesTheirPostsInThatCommunityOnly is the destructive
 // half, and its scope is the whole design.
@@ -693,6 +848,9 @@ func TestABanLeavesTerminalDeliveriesAlone(t *testing.T) {
 	// about the ban rather than about delivery.
 	terminal := forceDeliveryStates(t, h.db, mtAuthorDID, groupID, "delivered", "poisoned")
 	require.Len(t, terminal, 2, "precondition: two terminal deliveries to ban across")
+	pendingBefore := pendingActivityIDs(t, h.db, mtAuthorDID, groupID)
+	require.NotEmpty(t, pendingBefore,
+		"precondition: and a PENDING one beside them, so the ban has something to cancel")
 
 	h.announceBlock(world.groupA, mbBlockActivity, mtAuthorDID, groupID, nil)
 
@@ -704,6 +862,19 @@ func TestABanLeavesTerminalDeliveriesAlone(t *testing.T) {
 		"and a POISONED row is untouched: sweeping it hides a delivery that failed for its "+
 			"own reason behind a ban that arrived afterwards, and redrive is how an operator "+
 			"gets it back")
+
+	// THE BAN MUST HAVE DONE SOMETHING. Every assertion above is satisfied by a
+	// Block that was skipped entirely, which is the mis-attributed control in
+	// its purest form: a test that proves cancellation is correctly scoped by
+	// arranging for no cancellation to happen at all.
+	_, found := banFor(t, h.db, world.communityADID, mtAuthorDID)
+	require.True(t, found, "the ban was recorded — this test is about what it did NOT touch")
+	for _, id := range pendingBefore {
+		assert.Equal(t, "cancelled", deliveryState(t, h.db, id),
+			"...having cancelled the PENDING row beside them: if that one survived too, "+
+				"nothing was cancelled and the two assertions above proved nothing about "+
+				"scope — they would hold just as well for a Block that was skipped entirely")
+	}
 }
 
 // forceDeliveryStates stamps states onto an actor's pending deliveries for one
@@ -735,6 +906,27 @@ func forceDeliveryStates(t *testing.T, db *sql.DB, actorDID, orderingKey string,
 			`UPDATE outbound_deliveries SET state = $2 WHERE activity_id = $1`, id, states[i])
 		require.NoError(t, err)
 	}
+	return ids
+}
+
+// pendingActivityIDs lists an actor's pending deliveries on one ordering key.
+func pendingActivityIDs(t *testing.T, db *sql.DB, actorDID, orderingKey string) []string {
+	t.Helper()
+	rows, err := db.QueryContext(context.Background(), `
+		SELECT d.activity_id
+		FROM outbound_deliveries d
+		JOIN outbound_activities a ON a.activity_id = d.activity_id
+		WHERE a.actor_did = $1 AND d.ordering_key = $2 AND d.state = 'pending'
+		ORDER BY d.seq`, actorDID, orderingKey)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, rows.Close()) }()
+	var ids []string
+	for rows.Next() {
+		var id string
+		require.NoError(t, rows.Scan(&id))
+		ids = append(ids, id)
+	}
+	require.NoError(t, rows.Err())
 	return ids
 }
 
@@ -799,4 +991,397 @@ func TestAnAnnouncedBlockLaunderedThroughAPersonIsRefused(t *testing.T) {
 	assert.Equal(t, accept.StatusAccepted, status,
 		"and admission is unaffected: a half-applied forged ban is a shadowban nobody issued "+
 			"and no Undo can lift, because no moderator ever made the decision to reverse")
+}
+
+// TASK 17c-3 REVIEW, P2 — WHAT THE BAN PATH RECORDS AND COUNTS.
+
+// TestADirectUndoBlockIsCountedLikeADirectBlock closes an asymmetry in the one
+// number that reports on this door.
+//
+// Lemmy sends BOTH halves of a ban directly to the banned user's inbox: the
+// Block, and later the Undo{Block}. Only the announced copies can be authorized,
+// so both direct copies are ignored — but only the Block is counted. Direct
+// unban traffic is therefore invisible, and the counter that is supposed to say
+// "this is how much of the ban conversation arrives on the door we do not open"
+// reports half of it.
+//
+// That matters precisely when it is read: if the announced path ever breaks, the
+// operator compares direct traffic against recorded bans. A counter that moves
+// for bans and not unbans makes a broken announce path look like a community
+// that bans and never forgives.
+func TestADirectUndoBlockIsCountedLikeADirectBlock(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	world := newModerationWorld(t, h)
+	moderator := h.newRemoteActor(modActorID, person(modActorID, "moderator", nil))
+
+	before := metricValue(mbDirectIgnoredMetric)
+
+	const directUndo = "https://lemmy.world/activities/undo/mb-direct-undo"
+	require.Equal(t, http.StatusAccepted, h.deliver(moderator, map[string]any{
+		"id":       directUndo,
+		"type":     "Undo",
+		"actor":    modActorID,
+		"audience": groupID,
+		"cc":       []any{groupID},
+		"object":   blockActivity(world.groupA, directUndo+"/block", mtAuthorDID, groupID, nil),
+	}))
+	h.drain()
+
+	assert.Equal(t, before+1, metricValue(mbDirectIgnoredMetric),
+		"a direct Undo{Block} is the same decided non-action as a direct Block and must be "+
+			"counted the same way: Lemmy sends both to this door, and a counter that moves for "+
+			"one and not the other reports the door as quieter than it is")
+
+	event, err := h.events.GetEvent(ctx, directUndo)
+	require.NoError(t, err)
+	assert.NotNil(t, event.ProcessedAt, "decided once, not retried: %s", event.Error)
+	assert.Nil(t, event.FailedAt, "nor poisoned")
+}
+
+// TestABanRecordsTheModeratorsReasonAndScope pins the two fields the row carries
+// for people rather than for logic.
+//
+// `removeData` decides whether content goes, and the reason is what a moderator
+// typed. The schema holds both and the repository writes both — but nothing
+// fills them in, so every ban reads as reasonless. It matters because the SAME
+// moderator action already writes the reason somewhere else: a removeData
+// removal carries the summary into the removal record. Two audit surfaces
+// describing one decision, one of them blank, is worse than neither having it —
+// whoever reads the empty one concludes no reason was given.
+func TestABanRecordsTheModeratorsReasonAndScope(t *testing.T) {
+	h := newHarness(t)
+	world := newModerationWorld(t, h)
+
+	const reason = "repeated rule 3 violations after two warnings"
+	h.announceBlock(world.groupA, mbBlockActivity, mtAuthorDID, groupID,
+		map[string]any{"summary": reason, "removeData": true})
+
+	ban, found := banFor(t, h.db, world.communityADID, mtAuthorDID)
+	require.True(t, found, "the ban is recorded")
+	assert.Equal(t, reason, ban.reason,
+		"with the moderator's own words: the column exists, the repository writes it, and the "+
+			"same summary already reaches the removal records this ban produced — a blank here "+
+			"tells an operator no reason was given while the removal beside it quotes one")
+	assert.True(t, ban.removeData,
+		"and with the scope it was issued under: whether content went is the difference "+
+			"between an exclusion and a purge, and after the fact the row is the only place "+
+			"that answers it")
+}
+
+// TestABanCancelsWorkAWorkerHasAlreadyClaimed is the honest half of the
+// in-flight problem.
+//
+// A worker claims a delivery in its own committed transaction and then POSTs.
+// If a ban lands between those, nothing can un-send the request — the bytes are
+// on the wire, and fencing only stops the settlement afterwards. So what is
+// pinned here is what remains true and reachable: a CLAIMED row is still
+// cancelled, and its claim is released rather than left to expire, so no further
+// attempt is made for it.
+//
+// The unfixable remainder is a pre-send re-check, which this test deliberately
+// does not pretend to cover.
+func TestABanCancelsWorkAWorkerHasAlreadyClaimed(t *testing.T) {
+	h := newHarness(t)
+	world := newModerationWorld(t, h)
+
+	admitPost(t, world, mtAuthorDID, mbPostInARKey, world.communityADID, "3lzmbrev00070", 1_775_000_011_000_001)
+	claimed := claimDeliveries(t, h.db, mtAuthorDID, groupID)
+	require.NotZero(t, claimed, "precondition: a worker holds a claim on this author's work")
+
+	h.announceBlock(world.groupA, mbBlockActivity, mtAuthorDID, groupID, nil)
+
+	assertEveryDelivery(t, h.db, mtAuthorDID, groupID, "cancelled",
+		"a claimed row is cancelled like any other: the claim is a lease, not an exemption, "+
+			"and leaving claimed work pending would let it be re-attempted for the whole lease "+
+			"after the community banned its author")
+	assert.Zero(t, claimedDeliveries(t, h.db, mtAuthorDID, groupID),
+		"and the claim is RELEASED rather than left to expire: a cancelled row still holding "+
+			"a lease is one a worker sweep has to reason about, and the point of cancelling is "+
+			"that no further attempt is made")
+}
+
+// claimDeliveries simulates a worker claim — a lease stamped in a transaction
+// that has already committed, which is exactly the state a ban can arrive in the
+// middle of. It returns how many rows it claimed.
+func claimDeliveries(t *testing.T, db *sql.DB, actorDID, orderingKey string) int64 {
+	t.Helper()
+	result, err := db.ExecContext(context.Background(), `
+		UPDATE outbound_deliveries d
+		SET claimed_until = now() + interval '1 minute'
+		FROM outbound_activities a
+		WHERE d.activity_id = a.activity_id
+		  AND a.actor_did = $1 AND d.ordering_key = $2 AND d.state = 'pending'`,
+		actorDID, orderingKey)
+	require.NoError(t, err)
+	affected, err := result.RowsAffected()
+	require.NoError(t, err)
+	return affected
+}
+
+func claimedDeliveries(t *testing.T, db *sql.DB, actorDID, orderingKey string) int {
+	t.Helper()
+	var n int
+	require.NoError(t, db.QueryRowContext(context.Background(), `
+		SELECT COUNT(*)
+		FROM outbound_deliveries d
+		JOIN outbound_activities a ON a.activity_id = d.activity_id
+		WHERE a.actor_did = $1 AND d.ordering_key = $2 AND d.claimed_until IS NOT NULL`,
+		actorDID, orderingKey).Scan(&n))
+	return n
+}
+
+// TASK 17c-3 REVIEW, HIGH-1 — THE GATE COVERS POSTS ONLY.
+//
+// A ban excludes an AUTHOR from a community, and admission enforces it for
+// postv2 alone. Comments gate on opt-out, thread, depth and the parent lock;
+// votes gate on opt-out. So a banned author's replies and votes keep leaving for
+// the community that banned them, Lemmy refuses each one, and the deliveries
+// retry to poisoned with the cause three tables away — precisely the outcome the
+// thread-lock refusal exists to prevent, and the same fix shape.
+//
+// The tell that this is a GAP and not a decision: the ban's own cancellation
+// already sweeps this author's queued comments and votes. It joins actor_did and
+// ordering_key, and never looks at what kind of activity a row carries. So the
+// system already agrees that a banned author's comments and votes must not go to
+// that community — it just enforces it on the traffic that happens to be queued
+// when the ban lands, and not on anything written afterwards.
+
+// TestABannedAuthorsCommentIsRefusedInThatCommunityOnly is HIGH-1 for comments.
+func TestABannedAuthorsCommentIsRefusedInThatCommunityOnly(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	world := newModerationWorld(t, h)
+
+	// The same author, accepted in BOTH communities: the ban must reach exactly
+	// one of the two threads they can reply in.
+	admitPost(t, world, mtAuthorDID, mbPostInBRKey, world.communityBDID, "3lzmbrev00090", 1_775_000_013_000_001)
+	postInB := mbPostATURI(mtAuthorDID, mbPostInBRKey)
+
+	h.announceBlock(world.groupA, mbBlockActivity, mtAuthorDID, groupID, nil)
+	_, banned := banFor(t, h.db, world.communityADID, mtAuthorDID)
+	require.True(t, banned, "precondition: the author is banned from A and not from B")
+
+	deliveriesBefore := rowCount(t, h.db, "outbound_deliveries")
+
+	// --- Their comment into the community that banned them.
+	inA := mbCommentBy(mtAuthorDID, "3lzmbcomment01", mtPostATURI, mtPostCID, "3lzmbrev00091")
+	err := world.dispatcher.HandleEvent(ctx, inA.create(t))
+	require.Error(t, err,
+		"a banned author's COMMENT must be refused: a ban excludes the author from the "+
+			"community, not their postv2 records from admission — Lemmy rejects the comment "+
+			"server-side, so federating it buys a failed delivery, a retry loop and a poisoned "+
+			"row whose cause is a moderator decision nothing in the queue names")
+	assert.True(t, stderrors.Is(err, consume.ErrPermanentEvent),
+		"with the same permanence as a locked thread: retrying cannot change a moderator's "+
+			"decision, and parking it holds every other native user behind it (err=%v)", err)
+	assert.Contains(t, err.Error(), "author-banned",
+		"and naming the cause in the one string the DLQ carries — the operator answering "+
+			"'where did my comment go' has nothing else")
+	assert.Zero(t, outboundRowsFor(t, h.db, inA.atURI()),
+		"nothing is written for the refused comment")
+	assert.Equal(t, deliveriesBefore, rowCount(t, h.db, "outbound_deliveries"),
+		"and nothing is sent to a community that will reject it")
+
+	// --- The same author, the same moment, the community they are NOT banned in.
+	inB := mbCommentBy(mtAuthorDID, "3lzmbcomment02", postInB, mtPostCID, "3lzmbrev00092")
+	require.NoError(t, world.dispatcher.HandleEvent(ctx, inB.create(t)),
+		"their comment in B must still federate: a ban is one community's ruling about its "+
+			"own space, and a gate that reads 'is this author banned anywhere' silences them "+
+			"everywhere on one moderator's decision")
+	assert.Equal(t, 1, outboundRowsFor(t, h.db, inB.atURI()))
+	assert.Greater(t, rowCount(t, h.db, "outbound_deliveries"), deliveriesBefore,
+		"and it really went out")
+}
+
+// TestABannedAuthorsVoteIsRefusedInThatCommunityOnly is HIGH-1 for votes.
+//
+// A vote is the smallest thing an excluded author can still send, and the one
+// they will send most: a banned user scrolling their own feed upvotes as they
+// read. Every one of those is a delivery to an instance that refuses it.
+func TestABannedAuthorsVoteIsRefusedInThatCommunityOnly(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	world := newModerationWorld(t, h)
+
+	admitPost(t, world, mtAuthorDID, mbPostInBRKey, world.communityBDID, "3lzmbrev00100", 1_775_000_014_000_001)
+	postInB := mbPostATURI(mtAuthorDID, mbPostInBRKey)
+
+	h.announceBlock(world.groupA, mbBlockActivity, mtAuthorDID, groupID, nil)
+	_, banned := banFor(t, h.db, world.communityADID, mtAuthorDID)
+	require.True(t, banned, "precondition: banned in A, not in B")
+
+	votesBefore := rowCount(t, h.db, "outbound_votes")
+	deliveriesBefore := rowCount(t, h.db, "outbound_deliveries")
+
+	err := world.dispatcher.HandleEvent(ctx,
+		mbVoteEvent(t, mtAuthorDID, "3lzmbvote00001", "3lzmbrev00101", mtPostATURI, "up", 1_775_000_014_000_002))
+	require.Error(t, err,
+		"a banned author's VOTE must be refused too: it is the highest-volume thing they can "+
+			"still send into a community that refuses all of it")
+	assert.True(t, stderrors.Is(err, consume.ErrPermanentEvent),
+		"permanently, like every other refusal in this family (err=%v)", err)
+	assert.Contains(t, err.Error(), "author-banned", "with the cause named")
+	assert.Equal(t, votesBefore, rowCount(t, h.db, "outbound_votes"),
+		"and NO outbound vote state is written: that row is what a later Undo is rebuilt "+
+			"from, so recording one for a vote we never sent leaves a retraction with nothing "+
+			"behind it")
+	assert.Equal(t, deliveriesBefore, rowCount(t, h.db, "outbound_deliveries"))
+
+	require.NoError(t, world.dispatcher.HandleEvent(ctx,
+		mbVoteEvent(t, mtAuthorDID, "3lzmbvote00002", "3lzmbrev00102", postInB, "up", 1_775_000_014_000_003)),
+		"their vote in B still counts: the ban is scoped to A's space")
+	assert.Greater(t, rowCount(t, h.db, "outbound_votes"), votesBefore, "and it was recorded")
+}
+
+// TestABannedAuthorEditingAnAcceptedPostRemovesNothing is HIGH-2, and it is the
+// destructive one.
+//
+// An edit re-runs admission. Once the ban gate rejects it, the post takes the
+// "was accepted and now fails re-admission" path: the acceptance is DELETED, a
+// removal is written, and a Delete{Page} is ENQUEUED to the community — which
+// with removeData=false is content Lemmy explicitly KEPT. So a typo fix, minutes
+// after a ban, deletes the author's post from the community view and pushes a
+// Delete at the moderators who chose to leave it up.
+//
+// That is 17c-1's F2 in mirror image: there the engine reversed a moderator's
+// removal on an edit; here it removes what a moderator preserved. And the
+// removal it writes carries admission-revoked — the REVERSIBLE code, whose whole
+// meaning is "our own decision, a corrective edit may undo it" — for a cause
+// that no edit can ever satisfy.
+func TestABannedAuthorEditingAnAcceptedPostRemovesNothing(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	world := newModerationWorld(t, h)
+
+	_, _, err := h.manager.GetRecord(ctx,
+		world.communityADID, materialize.CollectionAcceptance, world.digestRKey)
+	require.NoError(t, err, "precondition: the post is accepted in A")
+
+	h.announceBlock(world.groupA, mbBlockActivity, mtAuthorDID, groupID, nil)
+	activitiesBefore := rowCount(t, h.db, "outbound_activities")
+	deliveriesBefore := rowCount(t, h.db, "outbound_deliveries")
+
+	// The ordinary thing an author does minutes after being banned: fix a typo.
+	require.NoError(t, world.dispatcher.HandleEvent(ctx,
+		mtPostEvent(t, "update", mtEditRev, mtEditCID, mtEditTime)))
+
+	_, _, err = h.manager.GetRecord(ctx,
+		world.communityADID, materialize.CollectionAcceptance, world.digestRKey)
+	assert.NoError(t, err,
+		"the ACCEPTANCE MUST STAND: the moderators banned the author and left this post up — "+
+			"removing it on their next edit destroys content the community chose to keep, and "+
+			"the post disappearing from Coves is the visible half (err=%v)", err)
+	_, _, err = h.manager.GetRecord(ctx,
+		world.communityADID, materialize.CollectionRemoval, world.digestRKey)
+	assert.True(t, errors.IsNotFound(err),
+		"and NO removal may be written — least of all under admission-revoked, whose meaning "+
+			"is 'we withdrew this and a corrective edit may restore it', for a cause no edit "+
+			"can ever satisfy (err=%v)", err)
+
+	assert.Equal(t, activitiesBefore, rowCount(t, h.db, "outbound_activities"),
+		"NOTHING may be enqueued: a Delete{Page} here is the unrecoverable half — it is on "+
+			"the wire, aimed at the moderators who deliberately kept this post, and no later "+
+			"fix retracts it")
+	assert.Equal(t, deliveriesBefore, rowCount(t, h.db, "outbound_deliveries"), "...and no delivery")
+
+	status, code := admissionFor(t, h.db, world.communityADID, mtPostATURI)
+	assert.Equal(t, "author-banned", code,
+		"and the ledger records WHY the edit did nothing: it is the surface an operator reads "+
+			"when the author asks, and 'the edit silently vanished' is the only alternative")
+	assert.NotEqual(t, accept.StatusRemoved, status,
+		"while the post itself is not recorded as removed — it is still up, and the ledger "+
+			"must not say otherwise")
+}
+
+// TestAnAnnouncedBlockNamingAFediverseUserIsNotOurs pins the branch that decides
+// a Block is somebody else's business.
+//
+// Lemmy announces every ban it issues, including bans of its OWN users, and we
+// follow those communities — so this arrives constantly. It is enforced entirely
+// on their instance; we hold no state that could apply it and no persona it
+// could be about. The counter is what separates "we saw it and it was not ours"
+// from "we never received it", which is the question asked the day the ban path
+// looks broken.
+func TestAnAnnouncedBlockNamingAFediverseUserIsNotOurs(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	world := newModerationWorld(t, h)
+	before := metricValue(mbForeignSubjectMetric)
+
+	const foreign = "https://lemmy.world/activities/announce/block/mb-foreign"
+	require.Equal(t, http.StatusAccepted, h.deliver(world.groupA, map[string]any{
+		"id":       foreign,
+		"type":     "Announce",
+		"actor":    groupID,
+		"audience": groupID,
+		"cc":       []any{groupID + "/followers"},
+		"object": map[string]any{
+			"id":       foreign + "/block",
+			"type":     "Block",
+			"actor":    modActorID,
+			"object":   "https://lemmy.world/u/SomeLemmyUser",
+			"target":   groupID,
+			"audience": groupID,
+			"cc":       []any{groupID},
+		},
+	}))
+	h.drain()
+
+	assert.Zero(t, bansIn(t, h.db, world.communityADID),
+		"a ban on a LEMMY user records nothing here: we hold no persona it could be about, "+
+			"and inventing a row keyed on an id we cannot resolve to a DID would gate "+
+			"admission on a subject that can never post")
+	assert.Equal(t, before+1, metricValue(mbForeignSubjectMetric),
+		"and it is counted as not-ours: every community we follow announces its own bans, so "+
+			"this is the common case, and the day the ban path looks broken this counter is "+
+			"what distinguishes 'none of them were ours' from 'we stopped receiving them'")
+
+	event, err := h.events.GetEvent(ctx, foreign)
+	require.NoError(t, err)
+	assert.NotNil(t, event.ProcessedAt, "decided once, not retried: %s", event.Error)
+	assert.Nil(t, event.FailedAt, "nor poisoned")
+}
+
+// mbCommentBy is one native comment by an author, replying to a post.
+func mbCommentBy(did, rkey, parentURI, parentCID, rev string) nativeComment {
+	return nativeComment{
+		did: did, rkey: rkey,
+		root:      nativeRef{parentURI, parentCID},
+		parent:    nativeRef{parentURI, parentCID},
+		createRev: rev, createCID: "bafyreih5xbmigkq5ikyhqiqhqzbwuqjxeitgtzwyxvjhfsfvswsxmnnf8a",
+		editRev: rev + "e", editCID: "bafyreih5xbmigkq5ikyhqiqhqzbwuqjxeitgtzwyxvjhfsfvswsxmnnf8b",
+		timeUS: 1_775_000_015_000_000,
+	}
+}
+
+// mbVoteEvent builds a native vote commit.
+func mbVoteEvent(t *testing.T, did, rkey, rev, subjectURI, direction string, timeUS int64) *consume.JetstreamEvent {
+	t.Helper()
+	frame := fmt.Sprintf(`{
+  "did": %q, "time_us": %d, "kind": "commit",
+  "commit": {
+    "rev": %q, "operation": "create",
+    "collection": "social.coves.feed.vote",
+    "rkey": %q, "cid": %q,
+    "record": {
+      "$type": "social.coves.feed.vote",
+      "subject": {"uri": %q, "cid": %q},
+      "direction": %q,
+      "createdAt": "2026-08-13T12:00:00.000Z"
+    }
+  }
+}`, did, timeUS, rev, rkey, mtPostCID, subjectURI, mtPostCID, direction)
+	var event consume.JetstreamEvent
+	require.NoError(t, json.Unmarshal([]byte(frame), &event), "the frame must be valid wire JSON")
+	return &event
+}
+
+// bansIn counts the bans standing in one community.
+func bansIn(t *testing.T, db *sql.DB, communityDID string) int {
+	t.Helper()
+	var n int
+	require.NoError(t, db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM community_bans WHERE community_did = $1`, communityDID).Scan(&n))
+	return n
 }

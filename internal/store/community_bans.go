@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 
 	"tidepool/internal/errors"
 )
@@ -67,9 +68,21 @@ func (r *postgresCommunityBans) Ban(ctx context.Context, ban CommunityBan) (canc
 		return 0, fmt.Errorf("ban %q in %q: %w", ban.SubjectDID, ban.CommunityDID, err)
 	}
 
-	cancelled, err = cancelPendingForActorInCommunity(ctx, tx, ban.SubjectDID, ban.CommunityAPID)
-	if err != nil {
-		return 0, err
+	// THE ROW IS RECORDED EITHER WAY; THE CANCELLATION IS NOT. A Block whose
+	// expiry has already passed when it reaches us — delayed, redelivered after
+	// an outage, replayed from a backfill — is a faithful record of a ban that is
+	// over, and storing it keeps the audit trail honest (and idempotent, since a
+	// later redelivery finds the same row). But it is not in force, so it must
+	// not cancel work by an author nobody is currently excluding: a cancelled
+	// delivery is never re-queued.
+	//
+	// The condition is the SAME predicate Standing() reads, kept here rather than
+	// at the call site so no caller can cancel on a ban that does not apply.
+	if ban.ExpiresAt == nil || ban.ExpiresAt.After(time.Now()) {
+		cancelled, err = cancelPendingForActorInCommunity(ctx, tx, ban.SubjectDID, ban.CommunityAPID)
+		if err != nil {
+			return 0, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("ban %q in %q: commit: %w", ban.SubjectDID, ban.CommunityDID, err)
@@ -103,6 +116,17 @@ func (r *postgresCommunityBans) Lift(ctx context.Context, communityDID, subjectD
 }
 
 func (r *postgresCommunityBans) Standing(ctx context.Context, communityDID, subjectDID string) (bool, error) {
+	return standingBan(ctx, r.db, communityDID, subjectDID)
+}
+
+func (r *postgresCommunityBans) StandingTx(ctx context.Context, tx *sql.Tx, communityDID, subjectDID string) (bool, error) {
+	if tx == nil {
+		return false, errors.NewValidationError("tx", "must not be nil")
+	}
+	return standingBan(ctx, tx, communityDID, subjectDID)
+}
+
+func standingBan(ctx context.Context, q queryRower, communityDID, subjectDID string) (bool, error) {
 	if communityDID == "" || subjectDID == "" {
 		return false, errors.NewValidationError("ban", "community_did and subject_did must not be empty")
 	}
@@ -110,7 +134,7 @@ func (r *postgresCommunityBans) Standing(ctx context.Context, communityDID, subj
 	// The expiry test is in the STATEMENT, not in Go, so no reader can forget
 	// it: a lapsed ban is indistinguishable from no ban, and the only signal
 	// that it lapsed is the clock — Lemmy sends nothing.
-	if err := r.db.QueryRowContext(ctx, `
+	if err := q.QueryRowContext(ctx, `
 		SELECT EXISTS (
 			SELECT 1 FROM community_bans
 			 WHERE community_did = $1 AND subject_did = $2

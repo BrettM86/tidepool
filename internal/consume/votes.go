@@ -88,6 +88,10 @@ func (d *Dispatcher) applyVoteWrite(ctx context.Context, tx *sql.Tx, did string,
 		return nil
 	}
 
+	if err := d.refuseBannedAuthor(ctx, did, subject.CommunityDID, "vote "+commitRecordURI(did, commit)); err != nil {
+		return err
+	}
+
 	if err := d.ensureActor(ctx, did); err != nil {
 		return err
 	}

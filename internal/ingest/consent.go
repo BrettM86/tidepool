@@ -325,6 +325,15 @@ func (h *Handler) handleUndo(ctx context.Context, undo *ap.Object, signer string
 		// only one Lemmy will ever send about it.
 		return h.handleLock(ctx, inner, announcer, false)
 	case ap.TypeBlock:
+		if announcer == nil {
+			// Lemmy sends BOTH halves of a ban to the banned user's inbox
+			// directly. Only the announced copies can be authorized, so both
+			// direct copies are ignored — and both are COUNTED, on the same
+			// counter: a number that moves for direct bans but not direct unbans
+			// makes a broken announce path look like a community that bans and
+			// never forgives.
+			return h.ignoreDirectBlock(inner, signer)
+		}
 		// The unban, with the Block carried INLINE. It lifts the exclusion and
 		// nothing else: content removed under removeData stays removed, because
 		// Lemmy models restoration as a separate restore_data flag.

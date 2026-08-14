@@ -146,12 +146,18 @@ type Object struct {
 	// of language objects on Group actors; Languages accepts both.
 	Language Languages `json:"language,omitempty"`
 
-	// Expires is a Block's ban expiry. It is LOAD-BEARING and not decoration:
-	// Lemmy sends NO Undo when a temporary ban lapses — the ban simply stops
-	// applying on their side — so an implementation that drops this column turns
-	// every timed ban into a permanent one with no activity that can ever clear
-	// it.
+	// Expires and EndTime are the two spellings of a Block's ban expiry. Lemmy
+	// 0.19 sends `expires`; newer versions send AS2's `endTime` for the same
+	// fact. Both are kept as they arrived rather than merged at parse time —
+	// the wire said what it said — and BanExpiry answers which one applies.
+	//
+	// The field is LOAD-BEARING and not decoration: Lemmy sends NO Undo when a
+	// temporary ban lapses (it simply stops applying on their side), so an
+	// implementation that misses it turns every timed ban into a permanent one
+	// with no activity that could ever clear it. Reading only one spelling is
+	// exactly that bug, arriving on a version upgrade.
 	Expires *Time `json:"expires,omitempty"`
+	EndTime *Time `json:"endTime,omitempty"`
 
 	// Lemmy extensions.
 	// RemoveData is Block's purge flag: the moderator also removed that author's
@@ -300,6 +306,23 @@ func (o Object) isIDOnly() bool {
 	clone := o
 	clone.ID = ""
 	return reflect.DeepEqual(clone, Object{})
+}
+
+// BanExpiry is the expiry a Block carries, under whichever spelling the sender
+// used (`expires`, or AS2's `endTime` from newer Lemmy). nil means the activity
+// carried NO expiry — a permanent ban — which is a different fact from an
+// expiry that was present and could not be parsed: that one comes back non-nil
+// with Valid false, and callers MUST tell the two apart. Collapsing them maps
+// "we could not read how long" onto "forever", on the one field where forever
+// is unrecoverable.
+func (o *Object) BanExpiry() *Time {
+	if o == nil {
+		return nil
+	}
+	if o.Expires != nil {
+		return o.Expires
+	}
+	return o.EndTime
 }
 
 // IsActor reports whether the object's type is an AP actor type.

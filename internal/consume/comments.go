@@ -102,6 +102,10 @@ func (d *Dispatcher) applyCommentWrite(ctx context.Context, tx *sql.Tx, did stri
 		return err
 	}
 
+	if err := d.refuseBannedAuthor(ctx, did, thread.CommunityDID, "comment "+atURI); err != nil {
+		return err
+	}
+
 	if err := d.ensureActor(ctx, did); err != nil {
 		return err
 	}
@@ -129,6 +133,45 @@ func (d *Dispatcher) applyCommentWrite(ctx context.Context, tx *sql.Tx, did stri
 	}
 
 	return d.enqueueComment(ctx, tx, did, commit.Operation, stored, thread.ParentATURI, thread.ParentAPID)
+}
+
+// refuseBannedAuthor refuses anything a BANNED author writes into the community
+// that banned them (task 17c-3 review).
+//
+// The admission gate covers POSTS only — it lives in the acceptance engine,
+// which never sees a comment or a vote — so without this a banned author's
+// replies and votes keep enqueueing on that community's ordering key. Lemmy
+// refuses a banned actor's activity, so each one fails, retries and poisons with
+// the cause three tables away: the same harm refuseInLockedThread exists to
+// prevent, over a cause that is even better known here, because WE recorded it.
+//
+// The ban's own arrival already swept this author's queued comments and votes —
+// its cancellation joins on actor_did and ordering_key, not on activity kind —
+// so only NEW writes escaped, which is exactly what this closes.
+//
+// PERMANENT, like the lock refusal and for the same reasons: the event
+// dead-letters with a reason an operator can read, the cursor advances rather
+// than blocking every other native user behind one banned account, and only a
+// moderator lifting the ban (or its expiry) changes the answer.
+//
+// The `what` argument is the short label the DLQ shows ("comment at://…", "vote
+// at://…"): both paths share this refusal, and last_error is the only place the
+// queue says which kind of write was refused.
+func (d *Dispatcher) refuseBannedAuthor(ctx context.Context, did, communityDID, what string) error {
+	if communityDID == "" {
+		// Nothing resolved a community, so there is no ban to ask about: the
+		// caller has already decided this write goes nowhere.
+		return nil
+	}
+	banned, err := d.bans.Standing(ctx, communityDID, did)
+	if err != nil {
+		return fmt.Errorf("read ban on %s in %s: %w", did, communityDID, err)
+	}
+	if !banned {
+		return nil
+	}
+	return fmt.Errorf("%w: author-banned: %s is by an author %s has banned",
+		ErrPermanentEvent, what, communityDID)
 }
 
 // refuseInLockedThread refuses a comment in a thread a community has LOCKED

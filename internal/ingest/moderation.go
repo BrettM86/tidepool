@@ -4,6 +4,7 @@ import (
 	"context"
 	"expvar"
 	"fmt"
+	"time"
 
 	"tidepool/internal/ap"
 	"tidepool/internal/echo"
@@ -45,7 +46,20 @@ var (
 	// of our personas. A Lemmy user banned from a Lemmy community is entirely
 	// their instance's business; we hold no state that could apply it.
 	BlockForeignSubject = expvar.NewInt("tidepool_block_foreign_subject")
+	// BlockLapsedIgnored counts announced Blocks whose expiry had already passed
+	// when they arrived — a description of a ban that is over, applied to
+	// nothing.
+	BlockLapsedIgnored = expvar.NewInt("tidepool_block_lapsed_ignored")
+	// BlockExpiryUnreadable counts Blocks refused because their expiry could not
+	// be parsed. It is the counter that says "a peer is sending us a duration we
+	// do not understand" — which, unlike most parse failures, would otherwise
+	// have become a permanent ban.
+	BlockExpiryUnreadable = expvar.NewInt("tidepool_block_expiry_unreadable")
 )
+
+// timeNow is the clock the ban path weighs an expiry against. A package
+// variable so a test can hold time still; production never replaces it.
+var timeNow = time.Now
 
 // ignoreDirectBlock is the DECIDED non-action at the other door.
 //
@@ -177,17 +191,56 @@ func (h *Handler) applyBan(ctx context.Context, block *ap.Object, announcer *sto
 		// event processed would leave the community believing we honoured it.
 		return fmt.Errorf("ingest: no community-ban store is wired, so this ban cannot be recorded")
 	}
+	// THE EXPIRY IS DECIDED BEFORE ANY CONSEQUENCE, because every consequence
+	// below is irreversible: cancelled deliveries are never re-queued, and
+	// removeData's removals are terminal by design (no Undo{Block} restores
+	// content). A ban's duration therefore has to be settled while doing nothing
+	// is still an option.
+	expiry := block.BanExpiry()
+	switch {
+	case expiry == nil:
+		// No expiry: a permanent ban, which is the common case.
+	case !expiry.Valid:
+		// PRESENT BUT UNREADABLE. The parser keeps this apart from absent
+		// precisely so it can be refused: treating it as "no expiry" records a
+		// permanent exclusion the moderator did not ask for, and nothing would
+		// ever correct it — Lemmy sends no activity when a ban lapses, so there
+		// is no later message whose arrival could say "that should have ended".
+		// From every side it would read as an ordinary permanent ban.
+		//
+		// A validation error POISONS rather than retries: the bytes will not
+		// re-parse, and the honest outcome is a visible failure saying we did not
+		// apply this ban, not a queue that re-reads the same string forever.
+		BlockExpiryUnreadable.Add(1)
+		return errors.NewValidationError("expires",
+			"block for "+subjectDID+" carries an expiry that cannot be parsed; refusing to "+
+				"store it as a permanent ban")
+	}
+	// ALREADY OVER when it arrived — delayed in a queue, redelivered after an
+	// outage, replayed from a backfill. The ROW is still written below: it is a
+	// faithful account of what the moderator sent, it makes a redelivery
+	// idempotent, and Standing() reads the expiry so it excludes nobody.
+	//
+	// What a lapsed ban must NOT do is ACT. Every consequence here is one no
+	// later activity can undo — a cancelled delivery is never re-queued, and a
+	// removeData removal is terminal by design — so applying them over an
+	// exclusion that has already ended is unrecoverable damage done on behalf of
+	// a decision that expired. The cancellation is gated inside Ban() (one place,
+	// beside the statement); the purge is gated here.
+	lapsed := expiry != nil && expiry.Valid && !expiry.After(timeNow())
+
 	ban := store.CommunityBan{
 		CommunityDID:  announcer.DID,
 		SubjectDID:    subjectDID,
 		CommunityAPID: announcer.APGroupID,
-		RemoveData:    block.RemoveData != nil && *block.RemoveData,
+		// The moderator's own words, kept because the SAME action already writes
+		// them into any removal record it produces: a blank here beside a quoted
+		// reason there tells an operator no reason was given.
+		Reason:     block.Summary,
+		RemoveData: block.RemoveData != nil && *block.RemoveData,
 	}
-	// The expiry is carried through EXACTLY as sent. Lemmy sends no activity when
-	// a timed ban lapses — it simply stops applying there — so dropping this
-	// makes a three-day ban permanent with nothing that could ever clear it.
-	if block.Expires.OK() {
-		expires := block.Expires.Time
+	if expiry != nil {
+		expires := expiry.Time
 		ban.ExpiresAt = &expires
 	}
 
@@ -201,8 +254,15 @@ func (h *Handler) applyBan(ctx context.Context, block *ap.Object, announcer *sto
 	h.logger.Info("community banned a native author",
 		"community", announcer.APGroupID, "subject_did", subjectDID,
 		"expires", ban.ExpiresAt, "remove_data", ban.RemoveData,
-		"cancelled_deliveries", cancelled, "activity", block.ID)
+		"lapsed", lapsed, "cancelled_deliveries", cancelled, "activity", block.ID)
 
+	if lapsed {
+		BlockLapsedIgnored.Add(1)
+		return skip(block.ID,
+			"announced Block expired before it arrived: the ban is recorded as sent, but it "+
+				"is not in force — nothing was cancelled and nothing was removed, because both "+
+				"are irreversible and this exclusion is already over")
+	}
 	if !ban.RemoveData {
 		return nil
 	}

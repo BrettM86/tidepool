@@ -220,7 +220,14 @@ func acceptanceDB(t *testing.T) *sql.DB {
 	testutil.Truncate(t, database,
 		"ap_actors", "ap_objects", "communities", "repo_state", "blocks", "firehose_events",
 		"outbound_activities", "outbound_deliveries", "outbound_objects", "outbound_votes",
-		"federation_prefs", "jetstream_record_revs", "jetstream_dead_letters", "admissions")
+		"federation_prefs", "jetstream_record_revs", "jetstream_dead_letters", "admissions",
+		// community_bans (migration 027). THIRD package to need this line, and
+		// the failure never names it: a ban left by one test makes decide()
+		// reject the NEXT test's author, which surfaces as "no acceptance
+		// record" and "no actor was minted" — the engine looking broken rather
+		// than the fixture being dirty. Any table a gate READS belongs here the
+		// moment a test WRITES it.
+		"community_bans")
 	return database
 }
 

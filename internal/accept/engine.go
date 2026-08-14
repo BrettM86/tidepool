@@ -100,6 +100,14 @@ const (
 // that records "removed / moderator-removed" answers 200 accepted/enqueued.
 var ErrModeratorRemovalStands = stderrors.New("accept: a moderator removal stands")
 
+// ErrAuthorBanned reports that the acceptance transaction found a ban the
+// admission gate had not seen — the community banned this author between the
+// two. Like the removal sentinel it is a DECISION rather than a failure: the
+// transaction rolls back (so no acceptance, no outbound row, no delivery), the
+// ledger records the rejection, and the live path treats the event as handled.
+// Retrying would re-decide against a ban that is not going to move.
+var ErrAuthorBanned = stderrors.New("accept: the author is banned from this community")
+
 // errRemovalChanged reports that the removal an edit was deciding about is no
 // longer the record it inspected — it vanished, or a different one replaced it.
 // The decision is re-run against whatever stands now: an edit may only reverse
@@ -256,6 +264,18 @@ func NewEngine(opts Options) (*Engine, error) {
 			bans = fromCommunities
 		}
 	}
+	if bans == nil {
+		// REQUIRED, like the echo classifier and for the same reason: this is a
+		// gate, and a gate that is absent does not fail — it ADMITS. An engine
+		// built with a Communities that is not ban-capable (a fake, a decorator,
+		// a future backend) would accept every banned author's post into the
+		// community that excluded them, silently, with no counter and no log,
+		// and the deployment that did it would look identical to a correct one.
+		// The write side already refuses loudly when it cannot record a ban; the
+		// read side must not be the lenient half of the same feature.
+		return nil, errors.NewValidationError("bans",
+			"must not be nil: pass a store.CommunityBans, or a Communities that provides one")
+	}
 	return &Engine{
 		repos:           opts.Repos,
 		enqueuer:        opts.Enqueuer,
@@ -337,6 +357,33 @@ func (e *Engine) AdmitPost(ctx context.Context, did string, commit *consume.Comm
 		// federated once, so leaving it alone would strand it live on Lemmy); one
 		// that was never accepted is simply a recorded rejection.
 		priorAccepted := priorBound && !prior.IsTombstoned()
+		if priorAccepted && code == DecisionAuthorBanned {
+			// EXCEPT for a ban, which is not a judgement of this post. Removing
+			// here would do two things the ban itself deliberately did not:
+			// strip content Lemmy KEPT (a ban without removeData leaves it
+			// standing on their side, so we would be hiding a post they still
+			// show), and ENQUEUE a Delete{Page} at the community that banned the
+			// author — the outbound echo every other moderation path exists to
+			// avoid. It would also record RemovalCodeAdmissionRevoked, whose
+			// meaning is "a corrective edit may restore this", against a decision
+			// documented to survive an unban: one cause, two removals, opposite
+			// reversals, depending on which door the author knocked on.
+			//
+			// The ban already stopped everything new and cancelled everything
+			// queued. The edit is simply refused, and the ledger says why.
+			e.logger.Info("refusing a banned author's edit; the standing acceptance is left alone",
+				slog.String("did", did), slog.String("post", postURI),
+				slog.String("community", communityDID))
+			return e.admissions.Record(ctx, Admission{
+				AuthorDID:         did,
+				CommunityDID:      communityDID,
+				PostURI:           postURI,
+				Status:            StatusRejected,
+				DecisionCode:      code,
+				EvaluatedCID:      commit.CID,
+				EvaluatedSnapshot: e.evaluatedSnapshot(commit),
+			})
+		}
 		if priorAccepted {
 			return e.removeAccepted(ctx, did, communityDID, postURI, commit, prior, code)
 		}
@@ -357,6 +404,24 @@ func (e *Engine) AdmitPost(ctx context.Context, did string, commit *consume.Comm
 	}
 
 	if err := e.accept(ctx, did, communityDID, postURI, commit); err != nil {
+		if stderrors.Is(err, ErrAuthorBanned) {
+			// The ban landed between the gate and the commit. The transaction
+			// rolled back, so nothing of this post exists outward; all that is
+			// owed is the ledger row an operator reads when the moderators ask
+			// why a banned author's post appeared — which it now will not.
+			e.logger.Info("a ban landed mid-admission; the post was not accepted",
+				slog.String("did", did), slog.String("post", postURI),
+				slog.String("community", communityDID))
+			return e.admissions.Record(ctx, Admission{
+				AuthorDID:         did,
+				CommunityDID:      communityDID,
+				PostURI:           postURI,
+				Status:            StatusRejected,
+				DecisionCode:      DecisionAuthorBanned,
+				EvaluatedCID:      commit.CID,
+				EvaluatedSnapshot: e.evaluatedSnapshot(commit),
+			})
+		}
 		if stderrors.Is(err, ErrModeratorRemovalStands) {
 			// Decided and recorded inside accept(): the community removed this
 			// post, so the edit does not re-enter it. Nothing is owed on the
@@ -425,17 +490,14 @@ func (e *Engine) decide(ctx context.Context, did string, commit *consume.CommitE
 	// decision about its own space, and admitting the post would sign that
 	// community's name to content from someone it has excluded.
 	//
-	// A nil store is "this deployment records no bans", not "nobody is banned":
-	// production wires it and NewEngine defaults it off the communities store,
-	// so the nil is only reachable from a caller that passes neither.
-	if e.bans != nil {
-		banned, err := e.bans.Standing(ctx, communityDID, did)
-		if err != nil {
-			return "", false, fmt.Errorf("accept: read ban on %s in %s: %w", did, communityDID, err)
-		}
-		if banned {
-			return DecisionAuthorBanned, false, nil
-		}
+	// NewEngine refuses to build without a ban store, so this is never a
+	// conditional check that quietly does not run.
+	banned, err := e.bans.Standing(ctx, communityDID, did)
+	if err != nil {
+		return "", false, fmt.Errorf("accept: read ban on %s in %s: %w", did, communityDID, err)
+	}
+	if banned {
+		return DecisionAuthorBanned, false, nil
 	}
 
 	// 5. Opt-out (decision 11): content pushed outward is exactly what an
@@ -547,6 +609,26 @@ func (e *Engine) accept(ctx context.Context, did, communityDID, postURI string, 
 	// which rolls the acceptance back too (ApplyOpsTx side-effect atomicity), and
 	// AdmitPost propagates it so the event retries.
 	sideEffect := func(sctx context.Context, tx *sql.Tx, _ *repo.CommitResult) error {
+		// THE BAN IS RE-ASKED HERE, inside the transaction that acts on the
+		// answer. decide() read it before this transaction existed, and a ban is
+		// not just a row: the transaction that writes one also CANCELS every
+		// pending delivery the author has for this community. So a post that
+		// passed the gate and then commits behind the ban lands an acceptance —
+		// the community's own endorsement, in its own repo — plus a fresh
+		// delivery the cancellation could never have caught, aimed at the
+		// instance that just banned its author.
+		//
+		// It narrows the window rather than closing it: under READ COMMITTED a
+		// ban committing after this read and before this commit is still
+		// possible. What remains is microseconds wide and self-correcting on the
+		// next edit, where the old shape was seconds wide and permanent.
+		banned, err := e.bans.StandingTx(sctx, tx, communityDID, did)
+		if err != nil {
+			return fmt.Errorf("accept: re-read ban on %s in %s: %w", did, communityDID, err)
+		}
+		if banned {
+			return fmt.Errorf("%w: %s in %s", ErrAuthorBanned, postURI, communityDID)
+		}
 		stored, err := e.objects.UpsertTx(sctx, tx, store.OutboundObject{
 			ATURI:              postURI,
 			APObjectID:         apObjectID,

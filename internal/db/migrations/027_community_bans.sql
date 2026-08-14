@@ -10,13 +10,19 @@
 CREATE TABLE community_bans (
     community_did TEXT NOT NULL,                                 -- the bridged community that issued the ban
     subject_did TEXT NOT NULL,                                   -- the native author it excludes
-    -- community_ap_id is DENORMALIZED, and it is not tidiness: the two readers
-    -- hold different handles for the same community. The admission gate has the
-    -- community DID (it is deciding about a repo it writes into); the delivery
-    -- queue has only OrderingKey, which IS the AP group id. A join the delivery
-    -- side cannot make is a scope it cannot apply — and it can never drift,
-    -- because the DID↔group-id mapping is immutable 1:1 (store.Communities
-    -- rejects an upsert that moves either).
+    -- community_ap_id is DENORMALIZED, and the honest status is: ONE reader
+    -- today, and it is this table's own write path. Ban() cancels the author's
+    -- pending deliveries, which are keyed by ordering_key — the AP group id, not
+    -- the DID — so the column is what makes the cancellation expressible in the
+    -- same statement as the row.
+    --
+    -- It is kept for a reader that does not exist yet, deliberately: a
+    -- delivery-side ban recheck (claim time, where the worker holds ActorDID and
+    -- OrderingKey and nothing else) is the last line of defence against work
+    -- queued in the window before a ban lands. That reader would need an index on
+    -- (subject_did, community_ap_id); none exists, because nothing reads it that
+    -- way yet. It cannot drift meanwhile — the DID↔group-id mapping is immutable
+    -- 1:1 (store.Communities rejects an upsert that moves either).
     community_ap_id TEXT NOT NULL,
     banned_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     -- expires_at is MANDATORY to honour, not optional to store. Lemmy's

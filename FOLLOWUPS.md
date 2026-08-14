@@ -119,6 +119,46 @@ task documents and git history rather than this list.
   event. The decision-19 reconciliation job (task 18) is the natural
   home for a periodic acceptance-vs-record pin audit.
 
+## Community bans (task 17c-3)
+
+- **The in-transaction ban re-check NARROWS the race, it does not close
+  it.** `accept()`'s side effect asks `StandingTx` on the acceptance
+  transaction before writing, so the common ordering is covered — but
+  under READ COMMITTED a ban committing between that read and the commit
+  is still possible. Closing it needs SERIALIZABLE or a keyed lock shared
+  with the ban path, which is a heavier change than the exposure
+  warrants; the code says so where it happens.
+- **A delivery claimed a moment before the ban commits can still be
+  POSTed.** Cancellation reaches the row, not the socket: the worker's
+  claim transaction has already committed, and the fencing correctly
+  discards its settlement afterwards. So the row can read `cancelled`
+  for something the peer accepted — and the vote reseed subtracts
+  exactly the `delivered` state. A worker-side ban re-check immediately
+  before `SendActivityAs` would shrink the window to the send itself; it
+  was deliberately NOT added, because the escape it was meant to close
+  (new comments and votes) is now closed at the source, and it would be
+  defence-in-depth with no test behind it plus a new index. 17e's
+  reconciliation is the natural place to detect the divergence.
+- **A temporary ban that lapses leaves state divergent.** Posts accepted
+  before the ban keep their acceptance records in the community repo,
+  but their deliveries were cancelled, and `cancelled` is terminal
+  (`RedrivePoisoned` revives only poisoned rows). So the community
+  renders content on Coves that Lemmy will never receive, and nothing
+  re-queues it when the exclusion ends. Exactly the atproto-vs-outbound
+  divergence 17e is meant to report.
+- **No e2e Block coverage.** The wire keys are hand-written in unit
+  fixtures, so nothing exercises a real Lemmy's spelling. Both `expires`
+  and AS2 `endTime` are read, but a third spelling — or a shape
+  difference in `target` — would be invisible until production. Task 18's
+  moderation scenario is the place for a captured Block.
+- **A ban is recorded only in a private table.** A
+  `social.coves.moderation.ban` lexicon exists, and every other
+  moderation decision here is published into the community repo
+  (acceptance, removal) where Coves' surfaces read it. As landed, a
+  banned native author sees their posts rejected and the community's own
+  moderation surface shows no ban. Deliberate scope cut for Scope A;
+  recorded so it is a decision rather than an omission.
+
 ## Moderation state (task 17c-2)
 
 - **Bridge-side comment removal is WRITE-ONLY.** Nothing reads

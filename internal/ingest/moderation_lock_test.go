@@ -354,17 +354,17 @@ func TestAnEditBeneathALockedThreadIsRefused(t *testing.T) {
 		"and the edit went out")
 }
 
-// TestALockReachesOnlyItsOwnThread is the CONTROL, and it PASSES TODAY — nothing
-// refuses a nested reply at all, so it can only fail once a root-aware refusal
-// exists to over-reach. It is here as the negative half of the two tests above,
-// and it has been tooth-checked (an unconditional refusal in
-// refuseUnderLockedParent turns it red).
+// TestALockReachesOnlyItsOwnThread pins the SCOPE of the two refusals above: a
+// lock reaches its own thread and no further.
 //
 // The scope it pins is per-OBJECT. A second thread in a DIFFERENT community
 // could not pin it: an implementation that refused every comment in a community
 // holding any locked post would pass that test and fail this one. Same
 // community, same author, same nesting — the only difference is which post the
 // thread hangs from, which is exactly the difference the lock is keyed on.
+//
+// Tooth-checked when it was written: pointing the lock lookup at a fixed at-uri
+// — the per-community over-reach — turns it red on its own assertion.
 func TestALockReachesOnlyItsOwnThread(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
@@ -732,8 +732,8 @@ func TestAReplyBeneathALockedFediverseThreadIsRefused(t *testing.T) {
 		"and it federates")
 }
 
-// TestAReplyBeneathAnUnlockedFediverseThreadFederates is the CONTROL, and it
-// PASSES TODAY — nothing refuses these replies at all.
+// TestAReplyBeneathAnUnlockedFediverseThreadFederates pins the ordinary case
+// the thread read must never break.
 //
 // It is the half that costs something to get wrong in the other direction:
 // reading a thread root out of a materialized record is a read that can fail,
@@ -758,8 +758,8 @@ func TestAReplyBeneathAnUnlockedFediverseThreadFederates(t *testing.T) {
 	assert.Greater(t, rowCount(t, h.db, "outbound_deliveries"), deliveriesBefore)
 }
 
-// TestAFediverseThreadIsUnaffectedByALockElsewhere is the SCOPE control for the
-// same read, and it also PASSES TODAY.
+// TestAFediverseThreadIsUnaffectedByALockElsewhere is the SCOPE half of the
+// same read.
 //
 // The community holds a real, standing lock — on the NATIVE post — while the
 // Lemmy thread beside it is open. This is the case a conservative fallback
@@ -767,6 +767,10 @@ func TestAReplyBeneathAnUnlockedFediverseThreadFederates(t *testing.T) {
 // holds locks, so refuse" would park every reply to every fediverse comment in
 // any community that has ever locked one post. The refusal must be about THIS
 // thread or it is not about a thread at all.
+//
+// Tooth-checked with its sibling above: making a fediverse parent dead-end and
+// refusing on the dead end turns both red, which is what a conservative
+// fallback would do to every open thread in a community that locked one post.
 func TestAFediverseThreadIsUnaffectedByALockElsewhere(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
@@ -913,8 +917,11 @@ func TestACommunitysRemovalOfANativeCommentIsRecorded(t *testing.T) {
 		"and the restore enqueues nothing either")
 }
 
-// TestCrossCommunityRemovalOfANativeCommentIsRefused is the RELATIONAL control,
-// and it PASSES TODAY — no removal is recorded for anyone yet.
+// TestCrossCommunityRemovalOfANativeCommentIsRefused is the RELATIONAL half of
+// the removal above: community B, co-hosted with A and followed like A, may not
+// remove A's comment. Decision 18's conjunction collapses in a one-community
+// fixture, so this is the only shape that can tell "the signer IS the community"
+// from "the target is IN the community".
 func TestCrossCommunityRemovalOfANativeCommentIsRefused(t *testing.T) {
 	h := newHarness(t)
 	world := newModerationWorld(t, h)
@@ -936,7 +943,7 @@ func TestCrossCommunityRemovalOfANativeCommentIsRefused(t *testing.T) {
 }
 
 // TestAPostRemovalWritesNoBridgeSideRemovalState is the SCOPE control for ruling
-// C, and it PASSES TODAY.
+// C: the bridge-side removal state is COMMENTS ONLY.
 //
 // removed_at is COMMENTS ONLY. A post's removal is a record in the community's
 // own repo, written by acceptrec in ONE commit with the withdrawal of the
@@ -1088,17 +1095,18 @@ func TestASummarylessDeleteOfANativeCommentRecordsNothing(t *testing.T) {
 	assert.NotEqual(t,
 		skipReasonFor(t, h, removalActivity, mtDirectReply.apID()),
 		skipReasonFor(t, h, selfDeleteActivity, mtNestedReply.apID()),
-		"and the bridge must not tell the SAME story about both: today a moderator's removal "+
-			"of a comment and an author's own delete are logged with one reason and counted in "+
-			"one counter, so the operator asking 'did a moderator remove this?' reads an answer "+
-			"that cannot distinguish yes from no")
+		"and the bridge must not tell the SAME story about both: one reason and one counter "+
+			"for a moderator's removal and an author's own delete leaves the operator asking "+
+			"'did a moderator remove this?' reading an answer that cannot distinguish yes from "+
+			"no — and the skip reason is the only place either outcome is written down")
 }
 
 // TestASummarylessDeleteOfANativeCommentByOurPersonaIsDroppedAsAnEcho records
 // which mechanism is actually load-bearing when the attribution is TRUTHFUL.
 //
-// CHARACTERIZATION: this passes today, and it is the comment-shaped twin of the
-// post case 17c-1 pinned. A native comment's author IS one of our personas, so a
+// CHARACTERIZATION of behaviour 17a already established — the comment-shaped
+// twin of the post case 17c-1 pinned, and tooth-checked by removing the
+// classifier's actor probe, which drops the count to zero. A native comment's author IS one of our personas, so a
 // truthful self-delete announced back at us is indistinguishable from our own
 // Delete coming home — and the echo classifier takes it by the inner ACTOR,
 // before any authorization or moderation branch runs.

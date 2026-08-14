@@ -377,16 +377,20 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 	handler, err := ingest.NewHandler(ingest.HandlerOptions{
-		Materializer:   materializer,
-		Fetcher:        apClient,
-		Objects:        objects,
-		Actors:         actors,
-		Communities:    communities,
-		Tombstones:     tombstones,
-		Records:        repoManager,
-		Votes:          voteAggregator,
-		Backfill:       backfill,
-		Echo:           echoClassifier,
+		Materializer: materializer,
+		Fetcher:      apClient,
+		Objects:      objects,
+		Actors:       actors,
+		Communities:  communities,
+		Tombstones:   tombstones,
+		Records:      repoManager,
+		Votes:        voteAggregator,
+		Backfill:     backfill,
+		Echo:         echoClassifier,
+		// Passed explicitly rather than left to NewHandler's default: this is the
+		// store every inbound moderation decision is RECORDED in, and production
+		// should not depend on a type assertion to have one.
+		Moderation:     store.NewObjectModeration(database),
 		ServiceActorID: serviceActor.ID,
 		Logger:         logger,
 	})

@@ -5,19 +5,32 @@ import (
 	"database/sql"
 	stderrors "errors"
 	"fmt"
+	"slices"
 
 	"github.com/lib/pq"
 
 	"tidepool/internal/errors"
 )
 
-// object_moderation is the bridge-owned moderation state described on the
-// ObjectModeration interface and in migration 025. The methods hang off the
-// ap_objects repository — the callers that need them all hold one — but the
-// ROW is separate, because putMapping rewrites a mapping wholesale and a
-// re-pin must never clear a lock.
+// postgresObjectModeration is the object_moderation repository: the moderation
+// state the bridge itself owns, described on the ObjectModeration interface and
+// in migration 025.
+//
+// It is its own repository over its own table, and postgresAPObjects EMBEDS it
+// so a holder of the concrete mapping store can be type-asserted to
+// ObjectModeration (see ingest.NewHandler's default) — a wiring convenience that
+// deliberately does NOT widen the APObjects interface, because a store held for
+// strongRef resolution must not carry moderation mutators.
+type postgresObjectModeration struct {
+	db *sql.DB
+}
 
-func (r *postgresAPObjects) SetLock(ctx context.Context, object ModeratedObject, locked bool) error {
+// NewObjectModeration creates the postgres-backed object_moderation repository.
+func NewObjectModeration(db *sql.DB) ObjectModeration {
+	return &postgresObjectModeration{db: db}
+}
+
+func (r *postgresObjectModeration) SetLock(ctx context.Context, object ModeratedObject, locked bool) error {
 	if object.ATURI == "" {
 		return errors.NewValidationError("at_uri", "must not be empty")
 	}
@@ -63,7 +76,7 @@ func (r *postgresAPObjects) SetLock(ctx context.Context, object ModeratedObject,
 	return nil
 }
 
-func (r *postgresAPObjects) SetRemoval(ctx context.Context, object ModeratedObject, code, reason string) error {
+func (r *postgresObjectModeration) SetRemoval(ctx context.Context, object ModeratedObject, code, reason string) error {
 	if object.ATURI == "" {
 		return errors.NewValidationError("at_uri", "must not be empty")
 	}
@@ -100,33 +113,42 @@ func (r *postgresAPObjects) SetRemoval(ctx context.Context, object ModeratedObje
 	return nil
 }
 
-func (r *postgresAPObjects) ClearRemoval(ctx context.Context, atURI, communityDID string) error {
+func (r *postgresObjectModeration) ClearRemoval(ctx context.Context, atURI, communityDID string) (bool, error) {
 	if atURI == "" {
-		return errors.NewValidationError("at_uri", "must not be empty")
+		return false, errors.NewValidationError("at_uri", "must not be empty")
 	}
 	if communityDID == "" {
-		return errors.NewValidationError("community_did", "must not be empty")
+		return false, errors.NewValidationError("community_did", "must not be empty")
 	}
 	// The code and the reason go with it: they describe a decision that no
 	// longer stands, and leaving them behind would let an admin surface read a
 	// live reason off a lifted removal.
-	if _, err := r.db.ExecContext(ctx, `
+	//
+	// `removed_at IS NOT NULL` is what makes the row count meaningful: without
+	// it, an UPDATE that blanked already-blank columns would report one row
+	// affected and the caller would log a reversal that reversed nothing.
+	result, err := r.db.ExecContext(ctx, `
 		UPDATE object_moderation
 		   SET removed_at = NULL, removal_code = '', removal_reason = '', updated_at = now()
-		 WHERE at_uri = $1 AND community_did = $2`,
-		atURI, communityDID); err != nil {
-		return fmt.Errorf("clear removal of %q: %w", atURI, err)
+		 WHERE at_uri = $1 AND community_did = $2 AND removed_at IS NOT NULL`,
+		atURI, communityDID)
+	if err != nil {
+		return false, fmt.Errorf("clear removal of %q: %w", atURI, err)
 	}
-	return nil
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("clear removal of %q: rows affected: %w", atURI, err)
+	}
+	return affected > 0, nil
 }
 
-func (r *postgresAPObjects) LockedAmong(ctx context.Context, atURIs ...string) (string, error) {
+func (r *postgresObjectModeration) LockedAmong(ctx context.Context, atURIs ...string) (string, error) {
 	// The caller names a thread — a parent and a root, sometimes the same object
 	// twice — so the empties and duplicates it may hold are filtered here rather
 	// than at every call site.
 	candidates := make([]string, 0, len(atURIs))
 	for _, atURI := range atURIs {
-		if atURI != "" && !containsString(candidates, atURI) {
+		if atURI != "" && !slices.Contains(candidates, atURI) {
 			candidates = append(candidates, atURI)
 		}
 	}
@@ -150,7 +172,7 @@ func (r *postgresAPObjects) LockedAmong(ctx context.Context, atURIs ...string) (
 	return locked, nil
 }
 
-func (r *postgresAPObjects) CommunityHoldsAnyLock(ctx context.Context, communityDID string) (bool, error) {
+func (r *postgresObjectModeration) CommunityHoldsAnyLock(ctx context.Context, communityDID string) (bool, error) {
 	if communityDID == "" {
 		return false, errors.NewValidationError("community_did", "must not be empty")
 	}
@@ -165,15 +187,4 @@ func (r *postgresAPObjects) CommunityHoldsAnyLock(ctx context.Context, community
 		return false, fmt.Errorf("read standing locks of %q: %w", communityDID, err)
 	}
 	return held, nil
-}
-
-// containsString reports whether the slice already holds s. The candidate sets
-// here are two or three elements, so a scan beats building a map.
-func containsString(values []string, s string) bool {
-	for _, v := range values {
-		if v == s {
-			return true
-		}
-	}
-	return false
 }

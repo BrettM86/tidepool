@@ -14,11 +14,18 @@ import (
 
 type postgresAPObjects struct {
 	db *sql.DB
+	// The object_moderation repository is EMBEDDED, and only so that a holder of
+	// the concrete mapping store can be type-asserted to store.ObjectModeration
+	// (ingest.NewHandler defaults its moderation store that way). It is
+	// deliberately NOT part of the APObjects interface: five callers hold that
+	// interface to resolve strongRefs, and none of them may reach a moderation
+	// mutator.
+	postgresObjectModeration
 }
 
 // NewAPObjects creates the postgres-backed ap_objects repository.
 func NewAPObjects(db *sql.DB) APObjects {
-	return &postgresAPObjects{db: db}
+	return &postgresAPObjects{db: db, postgresObjectModeration: postgresObjectModeration{db: db}}
 }
 
 const apObjectColumns = `

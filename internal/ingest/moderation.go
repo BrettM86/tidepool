@@ -10,6 +10,23 @@ import (
 	"tidepool/internal/store"
 )
 
+// moderationState is the bridge-owned moderation store, or an error naming the
+// gap. Every moderation path asks for it before deciding anything.
+//
+// The error is RETRYABLE and never a skip. A dispatcher whose mapping store is
+// not also the moderation repository (a substitute view, a future alternate
+// backend) can still serve every read path — but a lock it cannot record reads
+// downstream as "no lock", and a removal it cannot record reads as "nobody
+// moderated this". A decision that cannot be stored has to stay on the queue
+// where an operator sees it, not be marked processed as though it were handled.
+func (h *Handler) moderationState() (store.ObjectModeration, error) {
+	if h.moderation == nil {
+		return nil, fmt.Errorf(
+			"ingest: no moderation state store is wired, so this decision cannot be recorded")
+	}
+	return h.moderation, nil
+}
+
 // moderateNativeComment decides an announced Delete of a NATIVE comment — a
 // record in the AUTHOR's own repo that this bridge federated on their behalf.
 //
@@ -21,10 +38,19 @@ import (
 //   - WITH a summary: a moderator removed the comment. The decision is recorded
 //     bridge-side, bound to the community that made it, under the SAME code a
 //     post removal writes.
-//   - WITHOUT one: the author deleted their own comment. NOTHING is recorded.
-//     Writing moderator-discretion here would assert that a moderator acted when
-//     none did — a removal naming a moderator team that took no action — and it
-//     would stand until somebody sent an Undo for something that never happened.
+//   - WITHOUT one: NOTHING is recorded. Writing moderator-discretion here would
+//     assert that a moderator acted when none did — a removal naming a moderator
+//     team that took no action — and it would stand until somebody sent an Undo
+//     for something that never happened.
+//
+// Lemmy's convention says the summary-less shape IS the author's own delete, and
+// that is why it records nothing. But the bridge cannot VERIFY that, and must
+// not claim it: an Announce's inner actor is unauthenticated, and a truthful
+// author self-delete never even reaches here — the echo classifier takes it by
+// the inner actor first (a native comment's author is one of our personas). So
+// what actually arrives on this branch is a summary-less announce whose
+// attribution is foreign or unverifiable, and the counter and the reason say
+// exactly that rather than narrating a motive.
 //
 // Both are TAKEN, and that is the point of the branch: falling through runs the
 // v1 destructive path against the author's record, soft-deleting our own mapping
@@ -49,16 +75,20 @@ func (h *Handler) moderateNativeComment(ctx context.Context, del *ap.Object,
 	mapping *store.APObjectMapping, announcer *store.Community) error {
 
 	if !del.HasSummary() {
-		NativeCommentSelfDeleted.Add(1)
+		NativeCommentSummarylessDelete.Add(1)
 		return skip(mapping.APID,
-			"announced delete of a native comment carries no summary: the author's own delete, "+
-				"not a moderator's removal — taken so it cannot destroy their record, and "+
-				"recorded nowhere because nobody moderated anything")
+			"announced delete of a native comment carries no summary, so it is not a moderator "+
+				"removal: nothing is recorded, and the activity is taken rather than declined so "+
+				"it cannot reach the path that destroys the author's record")
 	}
 
+	moderation, err := h.moderationState()
+	if err != nil {
+		return err
+	}
 	// announcer.DID is the community authorizeDelete just proved owns this
 	// mapping, so the row is bound to the community that made the decision.
-	if err := h.objects.SetRemoval(ctx, store.ModeratedObject{
+	if err := moderation.SetRemoval(ctx, store.ModeratedObject{
 		ATURI:        mapping.ATURI,
 		APID:         mapping.APID,
 		CommunityDID: announcer.DID,
@@ -86,13 +116,39 @@ func (h *Handler) moderateNativeComment(ctx context.Context, del *ap.Object,
 // key would only create a way for a real restore to be dropped, leaving a
 // removal the moderators lifted standing forever.
 //
-// Clearing an object nobody removed is a no-op success, which is what a
-// re-delivered Undo is.
+// IT ALSO CLEARS THE LEGACY DELETE STATE, exactly as the post restore does, and
+// for exactly the reason RESTORE-1 exists. A native comment mapping CAN be
+// soft-deleted and tombstoned — the pre-17c-1 v1 path did both, and the
+// origin-verified delete sweep still can — and if this Undo returned without
+// clearing them, moderateAnnouncedDelete would decline forever on IsDeleted()
+// and the comment would be permanently unmoderatable, by the community's own
+// legitimate restore. Both are idempotent single statements and cost nothing in
+// the ordinary case, where there is nothing to clear.
+//
+// Clearing a removal nobody made is a no-op success — a re-delivered Undo, or
+// one from a community that never removed this comment — and it is reported as
+// such rather than counted as another reversal.
 func (h *Handler) liftNativeCommentRemoval(ctx context.Context, undo *ap.Object,
-	mapping *store.APObjectMapping, announcer *store.Community) error {
+	mapping *store.APObjectMapping, announcer *store.Community, scope string) error {
 
-	if err := h.objects.ClearRemoval(ctx, mapping.ATURI, announcer.DID); err != nil {
+	moderation, err := h.moderationState()
+	if err != nil {
+		return err
+	}
+	if err := h.tombstones.Remove(ctx, mapping.APID, scope); err != nil {
+		return fmt.Errorf("ingest: clear tombstone for %s: %w", mapping.APID, err)
+	}
+	if err := h.objects.Restore(ctx, mapping.APID); err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("ingest: restore mapping for %s: %w", mapping.APID, err)
+	}
+	cleared, err := moderation.ClearRemoval(ctx, mapping.ATURI, announcer.DID)
+	if err != nil {
 		return fmt.Errorf("ingest: clear removal of %s: %w", mapping.ATURI, err)
+	}
+	if !cleared {
+		return skip(mapping.APID,
+			"announced restore of a native comment that this community had not removed: "+
+				"nothing to lift (a re-delivered undo, or an undo of a delete that recorded nothing)")
 	}
 	NativeCommentRemovalLifted.Add(1)
 	h.logger.Info("community lifted its removal of a native comment",
@@ -162,10 +218,14 @@ func (h *Handler) handleLock(ctx context.Context, lock *ap.Object, announcer *st
 		return err
 	}
 
+	moderation, err := h.moderationState()
+	if err != nil {
+		return err
+	}
 	// announcer.DID is the community the authorization above just proved OWNS
 	// this mapping — the same DID CommunityDIDOf answered with — so the row is
 	// bound to the community that made the decision, not to whoever announced.
-	if err := h.objects.SetLock(ctx, store.ModeratedObject{
+	if err := moderation.SetLock(ctx, store.ModeratedObject{
 		ATURI:        mapping.ATURI,
 		APID:         mapping.APID,
 		CommunityDID: announcer.DID,

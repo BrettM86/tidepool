@@ -28,6 +28,13 @@ CREATE TABLE object_moderation (
     -- ap_id is the same object's fediverse id, denormalized so the row can be
     -- read back from either side of the bridge without a join through
     -- ap_objects (whose row is the very thing this table must not depend on).
+    --
+    -- FORWARD-LOOKING, and honestly so: every write supplies it and NOTHING
+    -- reads it today. It is kept because the readers this table is heading
+    -- towards arrive holding an AP id and not an at-uri — the admin moderation
+    -- surface, and 17d's delivery-side ban checks, whose OrderingKey is an AP
+    -- group id — and because a column backfilled later can only be backfilled
+    -- from the mapping row this table exists to be independent of.
     ap_id TEXT NOT NULL,
     -- community_did BINDS the decision to the community that made it. Unbound,
     -- any co-hosted community's Undo{Lock} could clear a decision it did not
@@ -48,6 +55,17 @@ CREATE TABLE object_moderation (
     removal_reason TEXT NOT NULL DEFAULT '',
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- NO INDEX, deliberately, and here is the one query that will eventually want
+-- one: CommunityHoldsAnyLock filters (community_did) WHERE locked_at IS NOT
+-- NULL. It runs ONLY where a comment's thread could not be determined at all —
+-- a cold branch over a table holding one row per moderated object — so a partial
+-- index today would cost every lock write to serve a scan of a handful of rows.
+-- If that branch ever warms (a backlog of pre-026 rows, a bulk repair), the
+-- index to add is exactly:
+--   CREATE INDEX object_moderation_locked_community_idx
+--       ON object_moderation (community_did) WHERE locked_at IS NOT NULL;
+-- Every other read is by at_uri, which the primary key already serves.
 
 -- +goose Down
 DROP TABLE IF EXISTS object_moderation;

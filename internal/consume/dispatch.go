@@ -195,6 +195,12 @@ type Options struct {
 	Votes          store.OutboundVotes
 	Communities    store.Communities
 	ObjectMappings store.APObjects
+	// Moderation is the bridge-owned moderation state the comment path reads to
+	// refuse a reply in a locked thread. It is a SEPARATE store from
+	// ObjectMappings on purpose: this consumer only ever reads it, while the
+	// interface carries the mutators the ingest side writes with, and the
+	// mapping store is held by half the bridge to resolve strongRefs.
+	Moderation store.ObjectModeration
 	// UserOrigin is AP_USER_ORIGIN: the origin every deterministic activity
 	// id is minted under.
 	UserOrigin string
@@ -222,6 +228,7 @@ type Dispatcher struct {
 	objects        store.OutboundObjects
 	votes          store.OutboundVotes
 	communities    store.Communities
+	moderation     store.ObjectModeration
 	records        materialize.RecordGetter
 	hosted         *hostedRepos
 	gate           *RevGate
@@ -291,6 +298,7 @@ func NewDispatcher(opts Options) (*Dispatcher, error) {
 		objects:        orDefault[store.OutboundObjects](opts.Objects, store.NewOutboundObjects(opts.DB)),
 		votes:          orDefault[store.OutboundVotes](opts.Votes, store.NewOutboundVotes(opts.DB)),
 		communities:    orDefault[store.Communities](opts.Communities, store.NewCommunities(opts.DB)),
+		moderation:     orDefault[store.ObjectModeration](opts.Moderation, store.NewObjectModeration(opts.DB)),
 		records:        opts.Records,
 		hosted:         newHostedRepos(opts.DB),
 		gate:           NewRevGate(opts.DB),

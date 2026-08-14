@@ -15,15 +15,18 @@ import (
 )
 
 // ObjectModeration is the moderation state the BRIDGE owns for one bridged
-// object — today a community's thread LOCK, which has no home in either repo
-// (see migration 025).
+// object: a community's thread LOCK, and its removal of a native COMMENT —
+// decisions with no home in either repo (see migration 025).
 //
-// It rides the APObjects interface, and the two are deliberately different
-// things at different levels: the TABLE is separate, because putMapping
-// rewrites a whole ap_objects row and a re-pin would clear a lock; the
-// ACCESSOR sits here because every holder of a mapping is exactly the caller
-// that needs to ask, and both readers (the announced-moderation dispatch and
-// the native comment consumer) already hold one.
+// It is its OWN interface, held only by the two places that moderate: the
+// announced-moderation dispatch and the native comment consumer. It was briefly
+// embedded in APObjects, which every strongRef resolution holds — the echo
+// classifier, the vote aggregator, the stats refresher, the materializer, the
+// outbound enqueuer — and that put SetLock/SetRemoval/ClearRemoval within reach
+// of five callers that have no business moderating anything. The TABLE is
+// separate from ap_objects for its own reason (putMapping rewrites a whole
+// mapping row, so a re-pin would clear a lock); this separation is the other
+// one, and they are not the same argument.
 type ObjectModeration interface {
 	// SetLock records or clears a community's lock on an object. Locking an
 	// already-locked object preserves the ORIGINAL locked_at — a re-announced
@@ -57,7 +60,12 @@ type ObjectModeration interface {
 	// made it: clearing is a no-op for anyone else, and a no-op success for an
 	// object nobody removed. The row survives — a lock on the same object is a
 	// separate decision and is not lifted with it.
-	ClearRemoval(ctx context.Context, atURI, communityDID string) error
+	//
+	// cleared reports whether a removal was actually standing, so a caller can
+	// count and log what HAPPENED rather than what was attempted: a re-delivered
+	// Undo, or one for a comment this community never removed, is a no-op and
+	// must not read in the metrics as another moderator reversal.
+	ClearRemoval(ctx context.Context, atURI, communityDID string) (cleared bool, err error)
 
 	// CommunityHoldsAnyLock reports whether a community currently holds a lock
 	// on anything at all. It answers the ONE question left when a comment's
@@ -72,8 +80,6 @@ type ObjectModeration interface {
 // as, and back. Every materialization writes a mapping; every strongRef
 // resolution reads one.
 type APObjects interface {
-	ObjectModeration
-
 	// PutMapping idempotently upserts a mapping keyed on APID. It validates
 	// DID, Collection, RKey, and CID, derives ATURI from the first three,
 	// and returns the stored row. An empty Origin defaults to

@@ -167,7 +167,7 @@ func (d *Dispatcher) applyCommentWrite(ctx context.Context, tx *sql.Tx, did stri
 // read the lock" must never be answered with "there is no lock", which is
 // exactly the reply the lock exists to stop.
 func (d *Dispatcher) refuseInLockedThread(ctx context.Context, atURI string, thread *resolvedThread) error {
-	locked, err := d.objectMappings.LockedAmong(ctx, thread.ParentATURI, thread.RootATURI)
+	locked, err := d.moderation.LockedAmong(ctx, thread.ParentATURI, thread.RootATURI)
 	if err != nil {
 		return fmt.Errorf("read lock state of the thread above %s: %w", atURI, err)
 	}
@@ -187,8 +187,7 @@ func (d *Dispatcher) refuseInLockedThread(ctx context.Context, atURI string, thr
 	// strand replies forever under content nobody has moderated. So the question
 	// narrows to the only one that can still matter: does this community hold
 	// ANY lock the unknown root might be? If it holds none, there is provably
-	// nothing to miss. If it holds one, we cannot tell, and a retryable failure
-	// is the honest answer — the operator sees it, and a lifted lock resolves it.
+	// nothing to miss.
 	//
 	// This is NOT a community-scoped refusal, and it is not reachable from
 	// fediverse content: a mapped subject's thread is answered from state the
@@ -196,17 +195,26 @@ func (d *Dispatcher) refuseInLockedThread(ctx context.Context, atURI string, thr
 	// empty answer. A read that could FAIL here would turn one locked post into
 	// a community-wide park of ordinary replies, which is why there is no read
 	// on that path at all.
-	held, err := d.objectMappings.CommunityHoldsAnyLock(ctx, thread.CommunityDID)
+	held, err := d.moderation.CommunityHoldsAnyLock(ctx, thread.CommunityDID)
 	if err != nil {
 		return fmt.Errorf("read standing locks of %s: %w", thread.CommunityDID, err)
 	}
 	if !held {
 		return nil
 	}
+	// RETRYABLE, deliberately — and the recovery is not instant, so it is worth
+	// stating plainly: this comment first burns its in-line attempts, blocking
+	// the consumer behind it for that schedule, and then DEAD-LETTERS. What
+	// makes that acceptable rather than a loss is the redrive window: the
+	// dead-lettered frame keeps this message, and a redrive after the lock is
+	// lifted (or the row repaired) re-runs it against an answerable question.
+	// Nothing about the comment is wrong, so it must not be discarded as
+	// permanent; nothing about the state improves on its own, so it must not be
+	// retried as though it would.
 	return fmt.Errorf(
 		"cannot tell whether comment %s is in a locked thread: the chain above it cannot be followed past %s, "+
-			"whose outbound state names no parent, and %s holds standing locks",
-		atURI, thread.RootDeadEnd, thread.CommunityDID)
+			"and %s holds standing locks — redrive this once the lock is lifted or the row is repaired",
+		atURI, thread.RootUnresolved, thread.CommunityDID)
 }
 
 // applyCommentDelete withdraws a comment, using ONLY state.
@@ -286,12 +294,12 @@ type resolvedThread struct {
 	// the parent itself when the parent IS a root), never from the record's
 	// reply.root, which the author writes and could point anywhere.
 	RootATURI string
-	// RootDeadEnd names the object the thread resolution stopped at when
-	// RootATURI could not be established. It is DIAGNOSTIC ONLY — never written
-	// to the snapshot, never inherited — and exists so the one error that holds
-	// a comment for an undeterminable thread names something an operator can
-	// open, instead of a thread nobody can look up.
-	RootDeadEnd string
+	// RootUnresolved names the object the thread resolution stopped at, and why,
+	// when RootATURI could not be established. It is DIAGNOSTIC ONLY — never
+	// written to the snapshot, never inherited — and exists so the one error that
+	// holds a comment for an undeterminable thread names something an operator
+	// can open, instead of a thread nobody can look up.
+	RootUnresolved *unresolvedThread
 }
 
 // commentThread resolves the thread context for a create or an update.
@@ -318,23 +326,24 @@ func (d *Dispatcher) commentThread(ctx context.Context, atURI string, commit *Co
 			return nil, fmt.Errorf("read outbound state for %s: %w", atURI, err)
 		}
 		parent := d.parentFromSnapshot(stored.TranslatedSnapshot)
-		rootATURI, deadEnd := rootFromSnapshot(stored.TranslatedSnapshot), ""
+		rootATURI := rootFromSnapshot(stored.TranslatedSnapshot)
+		var unresolved *unresolvedThread
 		if rootATURI == "" {
 			// Written before the root was recorded: climb this comment's own
 			// parent chain rather than assuming anything. The successful edit
 			// re-writes the snapshot below, so the walk happens once per row.
-			if rootATURI, deadEnd, err = d.walkThreadRoot(ctx, atURI); err != nil {
+			if rootATURI, unresolved, err = d.walkThreadRoot(ctx, atURI); err != nil {
 				return nil, err
 			}
 		}
 		return &resolvedThread{
-			ParentATURI:   parent.ATURI,
-			ParentAPID:    parent.APID,
-			CommunityDID:  stored.CommunityDID,
-			CommunityAPID: stored.CommunityAPID,
-			Depth:         stored.Depth,
-			RootATURI:     rootATURI,
-			RootDeadEnd:   deadEnd,
+			ParentATURI:    parent.ATURI,
+			ParentAPID:     parent.APID,
+			CommunityDID:   stored.CommunityDID,
+			CommunityAPID:  stored.CommunityAPID,
+			Depth:          stored.Depth,
+			RootATURI:      rootATURI,
+			RootUnresolved: unresolved,
 		}, nil
 	}
 	return d.resolveParent(ctx, commit)
@@ -361,18 +370,18 @@ func (d *Dispatcher) resolveParent(ctx context.Context, commit *CommitEvent) (*r
 	// itself when the parent is a root. Same shape as the depth above: inherited
 	// from the parent's own state, which is what keeps both O(1) instead of
 	// walking the thread on every comment.
-	rootATURI, deadEnd, err := d.threadRootOf(ctx, parent)
+	rootATURI, unresolved, err := d.threadRootOf(ctx, parent)
 	if err != nil {
 		return nil, err
 	}
 	return &resolvedThread{
-		ParentATURI:   parent.ATURI,
-		ParentAPID:    parent.APID,
-		CommunityDID:  parent.CommunityDID,
-		CommunityAPID: parent.CommunityAPID,
-		Depth:         parent.Depth + 1,
-		RootATURI:     rootATURI,
-		RootDeadEnd:   deadEnd,
+		ParentATURI:    parent.ATURI,
+		ParentAPID:     parent.APID,
+		CommunityDID:   parent.CommunityDID,
+		CommunityAPID:  parent.CommunityAPID,
+		Depth:          parent.Depth + 1,
+		RootATURI:      rootATURI,
+		RootUnresolved: unresolved,
 	}, nil
 }
 

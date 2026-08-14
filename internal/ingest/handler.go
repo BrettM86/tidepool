@@ -99,6 +99,13 @@ type HandlerOptions struct {
 	Records      RecordGetter
 	Votes        VoteAggregator
 	Backfill     Backfiller
+	// Moderation is the bridge-owned moderation state announced Locks and
+	// native-comment removals are recorded in (task 17c-2). Optional ONLY in the
+	// wiring sense: when it is nil, NewHandler takes the moderation view of
+	// Objects, which the postgres mapping store provides. A dispatcher that ends
+	// up with neither refuses to moderate rather than silently dropping the
+	// decision — see moderationState.
+	Moderation store.ObjectModeration
 	// Echo classifies inbound ids against the bridge's own serving surface so
 	// an activity we sent never re-enters as content (task 17a).
 	Echo EchoClassifier
@@ -122,6 +129,7 @@ type Handler struct {
 	records     RecordGetter
 	votes       VoteAggregator
 	backfill    Backfiller
+	moderation  store.ObjectModeration
 	classifier  EchoClassifier
 	echoLog     *ratelimit.Sampler
 	serviceID   string
@@ -170,6 +178,20 @@ func NewHandler(opts HandlerOptions) (*Handler, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	// The moderation state and the mapping store are two repositories over two
+	// tables, and only the moderation paths may hold the first — so it is a
+	// separate option rather than methods on APObjects, which the echo
+	// classifier, the vote aggregator, the stats refresher, the materializer and
+	// the enqueuer all hold to resolve strongRefs. The default keeps every
+	// existing call site working: the postgres mapping store IS also that
+	// repository, so callers that pass one and no moderation store get the
+	// matching view of the same database rather than a nil.
+	moderation := opts.Moderation
+	if moderation == nil {
+		if fromObjects, ok := opts.Objects.(store.ObjectModeration); ok {
+			moderation = fromObjects
+		}
+	}
 	return &Handler{
 		mat:         opts.Materializer,
 		fetcher:     opts.Fetcher,
@@ -180,6 +202,7 @@ func NewHandler(opts HandlerOptions) (*Handler, error) {
 		records:     opts.Records,
 		votes:       opts.Votes,
 		backfill:    opts.Backfill,
+		moderation:  moderation,
 		classifier:  opts.Echo,
 		echoLog:     ratelimit.NewSampler(echoDropLogInterval),
 		serviceID:   opts.ServiceActorID,

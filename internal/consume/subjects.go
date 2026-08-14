@@ -137,6 +137,30 @@ func (d *Dispatcher) resolveSubject(ctx context.Context, atURI string) (*resolve
 	}, nil
 }
 
+// mappedThreadRoot answers the thread of an object the bridge holds no outbound
+// state for, from the mapping it holds instead: the materializer records a
+// comment's thread root there (migration 026), and for a post there is nothing
+// to record because a post IS its own thread root.
+//
+// A mapping that names no thread — one written before 026, or a post — leaves
+// the object itself as the answer, which is the boundary this walk would have
+// drawn anyway. A mapping that cannot be READ is an error, because guessing the
+// boundary off a failed lookup is how a locked thread quietly becomes an
+// unlocked one.
+func (d *Dispatcher) mappedThreadRoot(ctx context.Context, atURI string) (root string, unresolved *unresolvedThread, err error) {
+	mapping, err := d.objectMappings.GetByATURI(ctx, atURI)
+	if errors.IsNotFound(err) {
+		return atURI, nil, nil
+	}
+	if err != nil {
+		return "", nil, fmt.Errorf("read mapped thread of %s: %w", atURI, err)
+	}
+	if mapping.ThreadRootATURI != "" {
+		return mapping.ThreadRootATURI, nil, nil
+	}
+	return atURI, nil, nil
+}
+
 // threadRootOf answers which THREAD a new child of subject belongs to — the
 // at-uri a lock on the whole conversation is recorded against.
 //
@@ -155,12 +179,12 @@ func (d *Dispatcher) resolveSubject(ctx context.Context, atURI string) (*resolve
 // The second result names the object the answer stopped at when the root could
 // not be established — the only thing an operator can look up when a comment is
 // held for an undeterminable thread.
-func (d *Dispatcher) threadRootOf(ctx context.Context, subject *resolvedSubject) (root, deadEnd string, err error) {
+func (d *Dispatcher) threadRootOf(ctx context.Context, subject *resolvedSubject) (root string, unresolved *unresolvedThread, err error) {
 	if subject.RootATURI != "" {
-		return subject.RootATURI, "", nil
+		return subject.RootATURI, nil, nil
 	}
 	if subject.Depth == 0 {
-		return subject.ATURI, "", nil
+		return subject.ATURI, nil, nil
 	}
 	return d.walkThreadRoot(ctx, subject.ATURI)
 }
@@ -190,23 +214,32 @@ func (d *Dispatcher) threadRootOf(ctx context.Context, subject *resolvedSubject)
 // object it names is the one an operator has to open to see why. A store failure
 // IS an error: retrying is the only honest response to a question that was never
 // answered.
-func (d *Dispatcher) walkThreadRoot(ctx context.Context, atURI string) (root, deadEnd string, err error) {
+func (d *Dispatcher) walkThreadRoot(ctx context.Context, atURI string) (root string, unresolved *unresolvedThread, err error) {
 	climbed := atURI
 	// Bounded by Lemmy's nesting cap plus the root itself: every hop is one
 	// level up, so a chain longer than that is a cycle, not a conversation.
 	for hop := 0; hop <= maxCommentDepth+1; hop++ {
 		state, err := d.objects.GetByATURI(ctx, climbed)
 		if errors.IsNotFound(err) {
-			return climbed, "", nil
+			// The chain has left the bridge's own OUTBOUND state — but that is
+			// not the same as leaving its state altogether. Content the bridge
+			// materialized IN (a Lemmy comment, which by construction has no
+			// outbound row) carries its thread on its MAPPING, and this is the
+			// row the walk was about to read past. Without this, every legacy
+			// native reply under a Lemmy comment resolves its thread to that
+			// comment and sits outside its own locked thread — most of Lemmy,
+			// and unlike the legacy climb it does not heal when the PARENT is
+			// re-materialized, because the child is what lacks the root.
+			return d.mappedThreadRoot(ctx, climbed)
 		}
 		if err != nil {
-			return "", "", fmt.Errorf("read thread state for %s: %w", climbed, err)
+			return "", nil, fmt.Errorf("read thread state for %s: %w", climbed, err)
 		}
 		if root := rootFromSnapshot(state.TranslatedSnapshot); root != "" {
-			return root, "", nil
+			return root, nil, nil
 		}
 		if state.Depth == 0 {
-			return climbed, "", nil
+			return climbed, nil, nil
 		}
 		parent := d.parentFromSnapshot(state.TranslatedSnapshot)
 		if parent.ATURI == "" {
@@ -214,13 +247,39 @@ func (d *Dispatcher) walkThreadRoot(ctx context.Context, atURI string) (root, de
 			// ever written names its parent, and a post is at depth 0.
 			d.logger.Warn("thread root is undeterminable: nested outbound state names no parent",
 				slog.String("at_uri", atURI), slog.String("dead_end", climbed))
-			return "", climbed, nil
+			return "", &unresolvedThread{ATURI: climbed, Cause: causeNamesNoParent}, nil
 		}
 		climbed = parent.ATURI
 	}
 	d.logger.Warn("thread root is undeterminable: the parent chain is longer than a thread can be",
 		slog.String("at_uri", atURI), slog.String("dead_end", climbed))
-	return "", climbed, nil
+	return "", &unresolvedThread{ATURI: climbed, Cause: causeChainLoops}, nil
+}
+
+// unresolvedThread names the object a thread walk stopped at and WHY it stopped.
+//
+// The cause travels because the two are different findings that want different
+// responses, and an operator reading one message must not be told the other. A
+// row that never recorded its parent is old and repairable — the expected shape
+// on the migration path. A chain longer than a thread can be is CYCLIC: the
+// state is corrupt rather than merely old, waiting fixes nothing, and that is
+// precisely the case where a hard-coded "names no parent" would be false.
+type unresolvedThread struct {
+	ATURI string
+	Cause string
+}
+
+const (
+	causeNamesNoParent = "its outbound state names no parent"
+	causeChainLoops    = "the chain above it loops"
+)
+
+// String renders the pair for the one error that reports it.
+func (u *unresolvedThread) String() string {
+	if u == nil {
+		return ""
+	}
+	return u.ATURI + " (" + u.Cause + ")"
 }
 
 // subjectCommunityDID answers which community a mapped record belongs to.

@@ -187,11 +187,19 @@ var (
 	NativeCommentRemoved = expvar.NewInt("tidepool_moderation_native_comment_removed")
 	// NativeCommentRemovalLifted counts the Undos that cleared one.
 	NativeCommentRemovalLifted = expvar.NewInt("tidepool_moderation_native_comment_removal_lifted")
-	// NativeCommentSelfDeleted counts summary-less announced deletes of native
-	// comments: the author's own delete coming home, taken and deliberately
-	// recorded nowhere. A DECIDED non-action, so it is counted — a flat zero
-	// must not be readable as "this never happens".
-	NativeCommentSelfDeleted = expvar.NewInt("tidepool_moderation_native_comment_self_deleted")
+	// NativeCommentSummarylessDelete counts summary-less announced deletes of
+	// native comments: taken, and deliberately recorded nowhere. A DECIDED
+	// non-action, so it is counted — a flat zero must not be readable as "this
+	// never happens".
+	//
+	// It is named for the SHAPE, not for a motive. The obvious name
+	// (…_self_deleted) would claim the author deleted their own comment, and
+	// nothing here establishes that: an Announce's inner actor is not
+	// authenticated, and a TRUTHFUL author self-delete is dropped as a
+	// local-actor echo before this branch is reached. So what this counter
+	// actually sees is summary-less announces carrying foreign or unverifiable
+	// attribution, and it must not be read as a census of author deletions.
+	NativeCommentSummarylessDelete = expvar.NewInt("tidepool_moderation_native_comment_summaryless_delete")
 )
 
 func (h *Handler) moderateAnnouncedDelete(ctx context.Context, del *ap.Object, targetID string, announcer *store.Community) (bool, error) {
@@ -546,8 +554,9 @@ func (h *Handler) restoreNativeContent(ctx context.Context, undo *ap.Object,
 	if mapping.Collection != materialize.CollectionPostV2 {
 		// A COMMENT: its removal lives in the bridge's own moderation state, not
 		// in the community repo, so lifting it is a state clear rather than the
-		// acceptance transition below.
-		return h.liftNativeCommentRemoval(ctx, undo, mapping, announcer)
+		// acceptance transition below. It takes the SAME legacy repair with it —
+		// see liftNativeCommentRemoval, which does both.
+		return h.liftNativeCommentRemoval(ctx, undo, mapping, announcer, scope)
 	}
 	if err := h.tombstones.Remove(ctx, mapping.APID, scope); err != nil {
 		return fmt.Errorf("ingest: clear tombstone for %s: %w", mapping.APID, err)

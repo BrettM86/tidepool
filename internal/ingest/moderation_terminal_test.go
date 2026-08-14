@@ -60,9 +60,17 @@ const (
 
 	mtAuthorDID    = "did:plc:mtnativeauthor0001"
 	mtAuthorHandle = "mtauthor.coves.social"
-	mtPostRKey     = "3lzmtpost00001"
-	mtPostATURI    = "at://" + mtAuthorDID + "/social.coves.community.postv2/" + mtPostRKey
-	mtPostAPID     = mtUserOrigin + "/ap/object/" + mtAuthorDID +
+	// A SECOND native actor, who never authored the post. Bans are
+	// three-dimensional — (community, actor, content) — so a fixture with one
+	// actor cannot tell "cancel that actor's deliveries to that community" from
+	// "cancel every delivery", and one with one community cannot tell "that
+	// community" from "everywhere". Both are in the world from the start.
+	mtCommenterDID    = "did:plc:mtnativecommnter1"
+	mtCommenterHandle = "mtcommenter.coves.social"
+
+	mtPostRKey  = "3lzmtpost00001"
+	mtPostATURI = "at://" + mtAuthorDID + "/social.coves.community.postv2/" + mtPostRKey
+	mtPostAPID  = mtUserOrigin + "/ap/object/" + mtAuthorDID +
 		"/social.coves.community.postv2/" + mtPostRKey
 	mtPostCID  = "bafyreievgu2ty7qbiaaom5zhmkznsnajuzideek3lo7e65dwqlrvrxnmo4"
 	mtEditCID  = "bafyreib2rxk3rybk3aobmv5cjuql3bm2twh4jo5uxgf5kpqrsqxi3jgxte"
@@ -183,6 +191,14 @@ func newModerationWorld(t *testing.T, h *harness) moderationWorld {
 // mtPostEvent builds a postv2 commit frame the consumer accepts.
 func mtPostEvent(t *testing.T, operation, rev, cid string, timeUS int64) *consume.JetstreamEvent {
 	t.Helper()
+	return mtPostEventFor(t, mtPostRKey, operation, rev, cid, timeUS)
+}
+
+// mtPostEventFor is mtPostEvent for an arbitrary record key: a lock is
+// per-OBJECT, so telling that apart from per-community needs a second thread in
+// the SAME community — which needs a second post to root it.
+func mtPostEventFor(t *testing.T, rkey, operation, rev, cid string, timeUS int64) *consume.JetstreamEvent {
+	t.Helper()
 	frame := fmt.Sprintf(`{
   "did": %q, "time_us": %d, "kind": "commit",
   "commit": {
@@ -197,7 +213,7 @@ func mtPostEvent(t *testing.T, operation, rev, cid string, timeUS int64) *consum
       "createdAt": "2026-08-13T10:00:00.000Z"
     }
   }
-}`, mtAuthorDID, timeUS, rev, operation, mtPostRKey, cid, testDIDFor(mtCommunityAName, "lemmy.world"))
+}`, mtAuthorDID, timeUS, rev, operation, rkey, cid, testDIDFor(mtCommunityAName, "lemmy.world"))
 	var event consume.JetstreamEvent
 	require.NoError(t, json.Unmarshal([]byte(frame), &event), "the frame must be valid wire JSON")
 	return &event
@@ -205,8 +221,23 @@ func mtPostEvent(t *testing.T, operation, rev, cid string, timeUS int64) *consum
 
 type mtResolver struct{}
 
-func (mtResolver) ResolveDIDHandle(context.Context, string) (string, error) {
-	return mtAuthorHandle, nil
+// mtHandles is per-DID rather than one answer for every DID: the persona's
+// local part is DERIVED from the handle and frozen at mint, so a resolver that
+// answered the same handle for two native actors would mint two personas
+// fighting over one name — and the collision search would quietly hand the
+// second one a suffixed identity that no assertion about "that actor" matches.
+var mtHandles = map[string]string{
+	mtAuthorDID:    mtAuthorHandle,
+	mtCommenterDID: mtCommenterHandle,
+}
+
+func (mtResolver) ResolveDIDHandle(_ context.Context, did string) (string, error) {
+	handle, ok := mtHandles[did]
+	if !ok {
+		// Loud, not a fallback: minting on a guessed handle freezes the guess.
+		return "", fmt.Errorf("no test handle registered for %s", did)
+	}
+	return handle, nil
 }
 
 // admissionFor reads the ledger row for one (community, post).

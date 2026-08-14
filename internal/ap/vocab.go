@@ -51,6 +51,18 @@ const (
 	TypeLike     = "Like"
 	TypeDislike  = "Dislike"
 
+	// TypeLock is Lemmy's thread lock (activities/community/lock_page.rs),
+	// announced by the community as Announce{Lock} and lifted with
+	// Announce{Undo{Lock}}.
+	//
+	// Its `object` is the TARGET — the post being locked — never a payload the
+	// activity carries. That is why it must stay OUT of echo.carriesPayload:
+	// the target of every inbound moderation action against native content is,
+	// by definition, one of OUR ids, so descending into it would classify each
+	// one as our own echo and drop inbound moderation entirely while the drop
+	// counter reported it working.
+	TypeLock = "Lock"
+
 	TypeTombstone = "Tombstone"
 	TypeImage     = "Image"
 	TypeLink      = "Link"

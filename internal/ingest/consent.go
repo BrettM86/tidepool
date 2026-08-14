@@ -107,7 +107,7 @@ func (h *Handler) handleDelete(ctx context.Context, del *ap.Object, signer strin
 	// the post's own later Creates and Updates, and deleting the record would
 	// hand one community the power to destroy content in all the others.
 	if announcer != nil {
-		handled, err := h.moderateAnnouncedDelete(ctx, del, targetID)
+		handled, err := h.moderateAnnouncedDelete(ctx, del, targetID, announcer)
 		if err != nil || handled {
 			return err
 		}
@@ -171,17 +171,30 @@ func (h *Handler) handleDelete(ctx context.Context, del *ap.Object, signer strin
 // visibility mechanism Coves does not consult for that collection, so those
 // keep the v1 behaviour exactly: delete the record, tombstone the mapping.
 //
-// A NATIVE (bridge-origin) comment is the one case it TAKES without acting:
-// declining would run that v1 behaviour against a record in the author's own
-// repo. See the branch below.
-// NativeCommentModerationDeferred counts announced deletes of NATIVE comments
-// that were taken and deliberately not acted on, pending 17c-2's comment
-// removal record. It is a DECIDED non-action, so it is counted: the alternative
-// reading of a flat zero is "no community has ever tried", and the two must not
-// look the same when the feature lands.
-var NativeCommentModerationDeferred = expvar.NewInt("tidepool_moderation_native_comment_deferred")
+// A NATIVE (bridge-origin) comment is TAKEN here and decided by
+// moderateNativeComment: declining would run that v1 behaviour against a record
+// in the author's own repo.
+//
+// The three counters below are the operator's answer to "what has this bridge
+// done about native comments?", and they are SEPARATE because the questions are.
+// A moderator's removal and an author's own delete arrive on the same activity,
+// distinguished only by `summary`, so counting them together (as 17c-1's single
+// deferred counter did) reports a number that cannot tell a moderated comment
+// from an unmoderated one.
+var (
+	// NativeCommentRemoved counts announced moderator removals of native
+	// comments that were RECORDED bridge-side.
+	NativeCommentRemoved = expvar.NewInt("tidepool_moderation_native_comment_removed")
+	// NativeCommentRemovalLifted counts the Undos that cleared one.
+	NativeCommentRemovalLifted = expvar.NewInt("tidepool_moderation_native_comment_removal_lifted")
+	// NativeCommentSelfDeleted counts summary-less announced deletes of native
+	// comments: the author's own delete coming home, taken and deliberately
+	// recorded nowhere. A DECIDED non-action, so it is counted — a flat zero
+	// must not be readable as "this never happens".
+	NativeCommentSelfDeleted = expvar.NewInt("tidepool_moderation_native_comment_self_deleted")
+)
 
-func (h *Handler) moderateAnnouncedDelete(ctx context.Context, del *ap.Object, targetID string) (bool, error) {
+func (h *Handler) moderateAnnouncedDelete(ctx context.Context, del *ap.Object, targetID string, announcer *store.Community) (bool, error) {
 	mapping, err := h.objects.GetByAPID(ctx, targetID)
 	if errors.IsNotFound(err) {
 		if del.HasSummary() {
@@ -201,8 +214,7 @@ func (h *Handler) moderateAnnouncedDelete(ctx context.Context, del *ap.Object, t
 		return false, nil
 	}
 	if mapping.Collection != materialize.CollectionPostV2 {
-		// A NATIVE comment: moderation of it is TAKEN here and deferred, never
-		// declined into the path below.
+		// A NATIVE comment: TAKEN here, never declined into the path below.
 		//
 		// Declining used to be safe by accident — a bridge-origin mapping had no
 		// community_did, so authorization refused before reaching this function
@@ -215,19 +227,13 @@ func (h *Handler) moderateAnnouncedDelete(ctx context.Context, del *ap.Object, t
 		// resolveSubject reads the still-live outbound row, so replies to the
 		// "removed" comment keep federating regardless.
 		//
-		// The removal RECORD for comments needs the lexicon work in 17c-2; until
-		// then the honest outcome is a visible non-action.
-		//
 		// EVERY announced delete of a native comment is taken, not only a
 		// summary-bearing one: the author's own deletes arrive through the
 		// consumer (their repo), never announced back at us, so an announced
 		// one is either a moderation action or an echo — and neither may reach
 		// a path that deletes the author's record.
 		if mapping.Origin == store.OriginBridge {
-			NativeCommentModerationDeferred.Add(1)
-			return true, skip(targetID,
-				"announced delete of a native comment: moderation of native comments is not "+
-					"implemented yet (needs the 17c-2 removal record), taking no action")
+			return true, h.moderateNativeComment(ctx, del, mapping, announcer)
 		}
 		return false, nil
 	}
@@ -303,6 +309,13 @@ func (h *Handler) handleUndo(ctx context.Context, undo *ap.Object, signer string
 		return h.votes.RetractVote(ctx, inner, announcerID)
 	case ap.TypeDelete:
 		return h.handleUndoDelete(ctx, undo, inner, signer, announcer)
+	case ap.TypeLock:
+		// Lemmy carries the Lock INLINE inside the Undo rather than referencing
+		// its id, so the same handler that applied it lifts it. A lock the
+		// moderators lifted that still refuses comments is moderation state
+		// nobody can reach: no later activity clears it, because this is the
+		// only one Lemmy will ever send about it.
+		return h.handleLock(ctx, inner, announcer, false)
 	case ap.TypeFollow:
 		// A remote undoing a follow of us — the bridge has no followers in
 		// v1 (read-only), nothing to do.
@@ -531,12 +544,10 @@ func (h *Handler) restoreNativeContent(ctx context.Context, undo *ap.Object,
 		return skip(mapping.APID, "bare undo of a delete cannot restore the bridge's own content")
 	}
 	if mapping.Collection != materialize.CollectionPostV2 {
-		// Same deferral as the removal side: comment-level moderation state
-		// needs 17c-2's record. Taken and counted, never fallen through.
-		NativeCommentModerationDeferred.Add(1)
-		return skip(mapping.APID,
-			"announced restore of a native comment: moderation of native comments is not "+
-				"implemented yet (needs the 17c-2 removal record), taking no action")
+		// A COMMENT: its removal lives in the bridge's own moderation state, not
+		// in the community repo, so lifting it is a state clear rather than the
+		// acceptance transition below.
+		return h.liftNativeCommentRemoval(ctx, undo, mapping, announcer)
 	}
 	if err := h.tombstones.Remove(ctx, mapping.APID, scope); err != nil {
 		return fmt.Errorf("ingest: clear tombstone for %s: %w", mapping.APID, err)
@@ -667,6 +678,11 @@ func (h *Handler) authorizeDelete(ctx context.Context, activityID, targetID, sig
 // predating that column). An answer that cannot be determined REFUSES: an
 // announced delete is a moderation action by a community over its own
 // content, and content whose community we cannot name is not that.
+//
+// Announced Lock/Undo{Lock} (17c-2) ask THIS function, not a copy of it: the
+// conjunction is one rule for every announced moderation verb, and a second
+// implementation of it is a second place for the two conjuncts to drift apart.
+// The messages therefore speak of moderation generally.
 func (h *Handler) authorizeAnnouncedContentDelete(ctx context.Context, activityID string, mapping *store.APObjectMapping, announcer *store.Community) error {
 	communityDID, err := materialize.CommunityDIDOf(ctx, h.records, mapping)
 	if err != nil {
@@ -690,13 +706,13 @@ func (h *Handler) authorizeAnnouncedContentDelete(ctx context.Context, activityI
 		// A live mapping we cannot bind is a permanent inconsistency (a missing
 		// record, a comment with no reply.root). Retrying would re-read the same
 		// hole forever and wedge the ordering key behind it: log and drop.
-		h.logger.Warn("announced delete: cannot bind target to a community",
+		h.logger.Warn("announced moderation: cannot bind target to a community",
 			"ap_id", mapping.APID, "at_uri", mapping.ATURI, "collection", mapping.Collection)
 		return skip(activityID, mapping.ATURI+" cannot be bound to a community to authorize against")
 	}
 	if communityDID != announcer.DID {
 		return skip(activityID, fmt.Sprintf(
-			"announced delete of %s targets content outside %s", mapping.APID, announcer.APGroupID))
+			"announced moderation of %s targets content outside %s", mapping.APID, announcer.APGroupID))
 	}
 	return nil
 }

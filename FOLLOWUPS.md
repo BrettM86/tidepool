@@ -119,6 +119,31 @@ task documents and git history rather than this list.
   event. The decision-19 reconciliation job (task 18) is the natural
   home for a periodic acceptance-vs-record pin audit.
 
+## Thread locks (task 17c-2)
+
+- **Comments materialized before migration 026 carry no
+  `thread_root_at_uri`**, so they resolve to themselves and a lock on the
+  post above them will not refuse native replies hanging under them. It
+  degrades to the pre-lock behaviour rather than to the community-wide
+  park, and it heals the moment each comment is next materialized — an
+  admin backfill of the affected communities is the deliberate fix. A
+  record-read fallback (reading `reply.root` back through `RecordGetter`
+  when the column is empty) would close it for the existing corpus, but
+  the consumer holds no repo manager and wiring one to read a fact the
+  materializer already computes is the wrong trade on the hot path.
+- **The lock read is per-object, keyed by at-uri.** A lock recorded on a
+  Lemmy post reaches native replies anywhere in that thread; it does NOT
+  reach replies whose chain the bridge never materialized. That is the
+  boundary of what the bridge can know, not a policy choice.
+- **`walkThreadRoot`'s dead-end branch remains reachable for native
+  content** whose outbound state predates the root column (legacy rows
+  only, and self-healing on the next successful edit). When it fires and
+  the community holds a standing lock, the event is refused retryably and
+  the error names the at-uri the chain stopped at. If dead ends ever
+  become common, that branch parks traffic — the two fediverse controls in
+  `moderation_lock_test.go` go red the moment it becomes reachable from
+  fediverse resolution, which is what keeps it honest.
+
 ## Vote accounting (task 17b)
 
 - **The re-seed baseline clamp is a FLOOR BREACH, not a discard

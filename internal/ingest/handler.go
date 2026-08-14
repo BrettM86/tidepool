@@ -326,9 +326,15 @@ func (h *Handler) handleAnnounce(ctx context.Context, announce *ap.Object, signe
 		return h.handleDelete(ctx, inner, signer, community)
 	case ap.TypeUndo:
 		return h.handleUndo(ctx, inner, signer, community)
+	case ap.TypeLock:
+		// A community closing one of its own threads. The Undo arrives on the
+		// TypeUndo branch above and lands in the same handler with locked=false.
+		return h.handleLock(ctx, inner, community, true)
 	default:
-		// Lock, Add, Remove, Block, ... — moderation activities the bridge
-		// does not translate in v1.
+		// Add, Remove, Block, ... — moderation activities the bridge does not
+		// translate yet. Remove in particular is NOT content removal in Lemmy
+		// (it is un-pin / demote-moderator, dispatched by `target`), so it must
+		// never be folded in beside Lock on the assumption that it is.
 		return skip(announce.ID, "unsupported announced activity type "+inner.Type)
 	}
 }

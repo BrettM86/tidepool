@@ -108,6 +108,30 @@ func mappingCommunityDID(collection, did string, record map[string]any, fallback
 	}
 }
 
+// mappingThreadRootATURI is the thread a record being committed belongs to, for
+// its mapping's thread_root_at_uri column.
+//
+// Only a COMMENT has one to record. A post IS the top of its thread, and every
+// reader already treats it that way, so writing its own at-uri back at it would
+// add a second spelling of a fact the collection alone already answers.
+//
+// The value comes from the record's own reply.root — the strongRef the
+// materializer just resolved through the thread (resolveReplyRefs), never from
+// anything a delivery asserted about itself.
+func mappingThreadRootATURI(collection string, record map[string]any, stored string) string {
+	if stored != "" {
+		return stored
+	}
+	if collection != CollectionComment {
+		return ""
+	}
+	did, rootCollection, rkey := replyRootRef(record)
+	if did == "" || rootCollection == "" || rkey == "" {
+		return ""
+	}
+	return "at://" + did + "/" + rootCollection + "/" + rkey
+}
+
 // commentThreadCommunityDID recovers a comment's community from its thread
 // root. Which era the root belongs to decides how: a legacy root's repo IS the
 // community, a postv2 root only NAMES one, so the root's own record has to be

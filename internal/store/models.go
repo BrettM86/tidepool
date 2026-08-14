@@ -106,17 +106,39 @@ type APObjectMapping struct {
 	// through materialize.CommunityDIDOf, never compared directly — a direct
 	// comparison silently treats every pre-016 row as belonging to nobody.
 	CommunityDID string
-	Collection   string     // record NSID, e.g. social.coves.community.post
-	RKey         string     // deterministic TID rkey
-	ATURI        string     // at://did/collection/rkey (derived; set by PutMapping)
-	CID          string     // CID of the current record version
-	PublishedAt  *time.Time // AP `published` time (may be absent upstream)
-	IndexedAt    time.Time
-	DeletedAt    *time.Time
+	// ThreadRootATURI is the at-uri of the thread a materialized COMMENT hangs
+	// in — its record's reply.root, recorded at materialization time because
+	// that is the only moment the bridge knows it without re-reading the
+	// record. Empty for posts (a post IS its own thread root) and for comments
+	// materialized before migration 026.
+	//
+	// It is thread STRUCTURE, not moderation state: immutable for the life of
+	// the record, and the answer to "which thread is this in?" that a lock on
+	// the post above a Lemmy comment is read against.
+	ThreadRootATURI string
+	Collection      string     // record NSID, e.g. social.coves.community.post
+	RKey            string     // deterministic TID rkey
+	ATURI           string     // at://did/collection/rkey (derived; set by PutMapping)
+	CID             string     // CID of the current record version
+	PublishedAt     *time.Time // AP `published` time (may be absent upstream)
+	IndexedAt       time.Time
+	DeletedAt       *time.Time
 }
 
 // IsDeleted reports whether the mapping has been soft-deleted.
 func (m *APObjectMapping) IsDeleted() bool { return m.DeletedAt != nil }
+
+// ModeratedObject identifies the object a moderation decision applies to and
+// the community that made it. All three fields travel together because none of
+// them is derivable from another here: the at-uri is what the comment consumer
+// reads back, the AP id is what the announcing community named, and the
+// community DID is the binding without which any co-hosted community could
+// lift the decision.
+type ModeratedObject struct {
+	ATURI        string
+	APID         string
+	CommunityDID string
+}
 
 // BridgedActor is a fediverse actor (person or group) that Tidepool has
 // minted an atproto identity for.

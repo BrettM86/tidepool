@@ -258,7 +258,13 @@ func newHarness(t *testing.T) *harness {
 		// failure surfaces as a missing acceptance record rather than as
 		// anything about revs.
 		"jetstream_record_revs", "jetstream_dead_letters", "consumer_cursors",
-		"admissions", "federation_prefs")
+		"admissions", "federation_prefs",
+		// The moderation state the bridge owns (migration 025). It MUST be
+		// cleared: the moderation fixtures' at-uris are package-level constants,
+		// so a lock left by one run refuses the next run's comment before the
+		// test that locks it has run — green first, red second, which a single CI
+		// run never sees.
+		"object_moderation")
 
 	custodian, err := identity.NewCustodian(testKEK)
 	require.NoError(t, err)
@@ -377,6 +383,12 @@ func newHarness(t *testing.T) *harness {
 		Workers:     1,
 		MaxAttempts: 3,
 		Lease:       time.Minute,
+		// Captured for the same reason the handler's is: a SKIP reason is not
+		// stored on the event row (the queue logs it and marks the event
+		// processed), so this log line is the only place the bridge says WHY it
+		// decided to do nothing — and "did nothing for reason X" versus "did
+		// nothing for reason Y" is a distinction some behaviours are made of.
+		Logger: slog.New(slog.NewTextHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	})
 	require.NoError(t, err)
 

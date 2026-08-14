@@ -99,10 +99,15 @@ func (m *Materializer) removalStands(ctx context.Context, communityDID, rkey str
 	}
 }
 
-// removalCodeModeratorDiscretion is the removal lexicon's catch-all: Lemmy
+// RemovalCodeModeratorDiscretion is the removal lexicon's catch-all: Lemmy
 // sends no machine-readable code, so anything narrower would be the bridge
 // asserting a reason the moderator never gave.
-const removalCodeModeratorDiscretion = "moderator-discretion"
+//
+// Exported because the BRIDGE-SIDE removal of a native comment (ingest, task
+// 17c-2) records the same decision in a different place: one moderator action
+// must not read as two different things depending on whether they removed a
+// post or a comment, and two copies of the literal is exactly how that drifts.
+const RemovalCodeModeratorDiscretion = "moderator-discretion"
 
 // RemovePost records a community's moderator removal of a post: the acceptance
 // is deleted and a removal written IN ONE COMMIT, at the same digest rkey.
@@ -150,7 +155,7 @@ func (m *Materializer) RemovePost(ctx context.Context, mapping *store.APObjectMa
 		// Lemmy sends no machine-readable code, so the open knownValues set's
 		// catch-all applies. Inventing a narrower code (spam, rule-violation)
 		// would be the bridge asserting a reason the moderator never gave.
-		"code":      removalCodeModeratorDiscretion,
+		"code":      RemovalCodeModeratorDiscretion,
 		"createdAt": recordDatetime(m.moderationStamp(ctx, communityDID, CollectionRemoval, rkey)),
 	}
 	// Omitted rather than written blank: Lemmy spells "no reason given" as an
@@ -172,7 +177,7 @@ func (m *Materializer) RemovePost(ctx context.Context, mapping *store.APObjectMa
 	m.logger.Info("post removed from community by moderator",
 		"community_did", communityDID, "post", postURI, "ap_id", mapping.APID)
 	m.recordModeration(ctx, mapping, func() error {
-		return m.ledger.RecordRemoval(ctx, communityDID, postURI, mapping.DID, removalCodeModeratorDiscretion)
+		return m.ledger.RecordRemoval(ctx, communityDID, postURI, mapping.DID, RemovalCodeModeratorDiscretion)
 	})
 	return nil
 }

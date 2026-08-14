@@ -98,6 +98,10 @@ func (d *Dispatcher) applyCommentWrite(ctx context.Context, tx *sql.Tx, did stri
 			ErrPermanentEvent, atURI, thread.Depth, maxCommentDepth)
 	}
 
+	if err := d.refuseInLockedThread(ctx, atURI, thread); err != nil {
+		return err
+	}
+
 	if err := d.ensureActor(ctx, did); err != nil {
 		return err
 	}
@@ -125,6 +129,84 @@ func (d *Dispatcher) applyCommentWrite(ctx context.Context, tx *sql.Tx, did stri
 	}
 
 	return d.enqueueComment(ctx, tx, did, commit.Operation, stored, thread.ParentATURI, thread.ParentAPID)
+}
+
+// refuseInLockedThread refuses a comment in a thread a community has LOCKED
+// (task 17c-2). It is the read half of the lock: recording one and then
+// federating a reply under it is worse than not recording it at all, because
+// Lemmy rejects comments on locked posts server-side — the reply buys a failed
+// delivery, a retry loop and finally a poisoned row whose cause is a moderator
+// decision three tables away.
+//
+// It asks about the PARENT AND THE THREAD ROOT, because Lemmy locks threads and
+// a check on the parent alone stops only direct replies: anyone can keep talking
+// by hitting reply one level down, which is not an edge case but the ordinary
+// shape of a conversation. Both are asked in ONE statement, and the scope stays
+// per-object — a lock on one post says nothing about the community's other
+// threads.
+//
+// The refusal is PERMANENT, and that is the whole design:
+//
+//   - it DEAD-LETTERS and the cursor moves on. A transient error would block
+//     every other native user's traffic behind one locked thread, retrying a
+//     decision only a moderator can change.
+//   - it carries the REASON, "parent-locked" — the same code the admissions
+//     ledger already spells for a post refused under a locked parent, so an
+//     operator meets one vocabulary rather than two. The connector stores
+//     err.Error() as the dead letter's last_error, and that string is the only
+//     surface anyone triaging the queue — or answering the author asking where
+//     their comment went — has to go on.
+//   - it is a GATE, not a verdict on the record. It runs before the mint and
+//     before any outbound state, and it leaves the rev gate un-advanced (the
+//     gate transaction rolls back on any error), so the IDENTICAL comment —
+//     same rkey, same rev, same cid — is admitted once the lock is lifted. A
+//     refusal that advanced the gate would swallow that retry as a stale replay
+//     and lose the comment for good.
+//
+// A store failure PROPAGATES as an ordinary (retryable) error: "we could not
+// read the lock" must never be answered with "there is no lock", which is
+// exactly the reply the lock exists to stop.
+func (d *Dispatcher) refuseInLockedThread(ctx context.Context, atURI string, thread *resolvedThread) error {
+	locked, err := d.objectMappings.LockedAmong(ctx, thread.ParentATURI, thread.RootATURI)
+	if err != nil {
+		return fmt.Errorf("read lock state of the thread above %s: %w", atURI, err)
+	}
+	if locked != "" {
+		return fmt.Errorf("%w: parent-locked: comment %s is in a thread its community locked (%s)",
+			ErrPermanentEvent, atURI, locked)
+	}
+	if thread.RootATURI != "" {
+		return nil
+	}
+
+	// The thread could not be established (walkThreadRoot dead-ended on state
+	// this consumer never wrote — every comment snapshot it has ever written
+	// names its parent, and a post is at depth 0). "We do not know which thread
+	// this is" must not be answered with "the thread is not locked" — that is
+	// the same fail-open the empty root exists to prevent — but neither may it
+	// strand replies forever under content nobody has moderated. So the question
+	// narrows to the only one that can still matter: does this community hold
+	// ANY lock the unknown root might be? If it holds none, there is provably
+	// nothing to miss. If it holds one, we cannot tell, and a retryable failure
+	// is the honest answer — the operator sees it, and a lifted lock resolves it.
+	//
+	// This is NOT a community-scoped refusal, and it is not reachable from
+	// fediverse content: a mapped subject's thread is answered from state the
+	// materializer recorded, so it resolves or it is a thread root, never an
+	// empty answer. A read that could FAIL here would turn one locked post into
+	// a community-wide park of ordinary replies, which is why there is no read
+	// on that path at all.
+	held, err := d.objectMappings.CommunityHoldsAnyLock(ctx, thread.CommunityDID)
+	if err != nil {
+		return fmt.Errorf("read standing locks of %s: %w", thread.CommunityDID, err)
+	}
+	if !held {
+		return nil
+	}
+	return fmt.Errorf(
+		"cannot tell whether comment %s is in a locked thread: the chain above it cannot be followed past %s, "+
+			"whose outbound state names no parent, and %s holds standing locks",
+		atURI, thread.RootDeadEnd, thread.CommunityDID)
 }
 
 // applyCommentDelete withdraws a comment, using ONLY state.
@@ -194,6 +276,22 @@ type resolvedThread struct {
 	CommunityAPID string
 	// Depth is THIS comment's depth: the parent's recorded depth plus one.
 	Depth int
+	// RootATURI is the at-uri of the thread this comment hangs in — the post at
+	// the top of it, whoever the immediate parent is. A community locks a
+	// THREAD, so this is what the lock check asks about; the parent alone would
+	// stop only direct replies, and the reply button under every existing
+	// comment is the normal way a conversation continues.
+	//
+	// It is derived from the bridge's own state (the parent's recorded root, or
+	// the parent itself when the parent IS a root), never from the record's
+	// reply.root, which the author writes and could point anywhere.
+	RootATURI string
+	// RootDeadEnd names the object the thread resolution stopped at when
+	// RootATURI could not be established. It is DIAGNOSTIC ONLY — never written
+	// to the snapshot, never inherited — and exists so the one error that holds
+	// a comment for an undeterminable thread names something an operator can
+	// open, instead of a thread nobody can look up.
+	RootDeadEnd string
 }
 
 // commentThread resolves the thread context for a create or an update.
@@ -203,6 +301,13 @@ type resolvedThread struct {
 // allowed to move a comment between communities or up the thread. It also
 // means an edit to a comment that never federated (the author was opted out at
 // the time, or it predates the bridge) resolves to nothing and is skipped.
+//
+// The thread ROOT is read back the same way, and RESOLVED when the stored
+// snapshot predates it (walkThreadRoot). It cannot be defaulted away: an update
+// never re-resolves its thread, so a root the create path knows and the update
+// path does not is a lock the create is refused by and the edit sails through —
+// leaving the author of an existing reply a live, editable surface inside a
+// closed thread.
 func (d *Dispatcher) commentThread(ctx context.Context, atURI string, commit *CommitEvent) (*resolvedThread, error) {
 	if commit.Operation == operationUpdate {
 		stored, err := d.objects.GetByATURI(ctx, atURI)
@@ -213,12 +318,23 @@ func (d *Dispatcher) commentThread(ctx context.Context, atURI string, commit *Co
 			return nil, fmt.Errorf("read outbound state for %s: %w", atURI, err)
 		}
 		parent := d.parentFromSnapshot(stored.TranslatedSnapshot)
+		rootATURI, deadEnd := rootFromSnapshot(stored.TranslatedSnapshot), ""
+		if rootATURI == "" {
+			// Written before the root was recorded: climb this comment's own
+			// parent chain rather than assuming anything. The successful edit
+			// re-writes the snapshot below, so the walk happens once per row.
+			if rootATURI, deadEnd, err = d.walkThreadRoot(ctx, atURI); err != nil {
+				return nil, err
+			}
+		}
 		return &resolvedThread{
 			ParentATURI:   parent.ATURI,
 			ParentAPID:    parent.APID,
 			CommunityDID:  stored.CommunityDID,
 			CommunityAPID: stored.CommunityAPID,
 			Depth:         stored.Depth,
+			RootATURI:     rootATURI,
+			RootDeadEnd:   deadEnd,
 		}, nil
 	}
 	return d.resolveParent(ctx, commit)
@@ -241,12 +357,22 @@ func (d *Dispatcher) resolveParent(ctx context.Context, commit *CommitEvent) (*r
 	if err != nil || parent == nil {
 		return nil, err
 	}
+	// The thread is the parent's thread — its recorded root, or the parent
+	// itself when the parent is a root. Same shape as the depth above: inherited
+	// from the parent's own state, which is what keeps both O(1) instead of
+	// walking the thread on every comment.
+	rootATURI, deadEnd, err := d.threadRootOf(ctx, parent)
+	if err != nil {
+		return nil, err
+	}
 	return &resolvedThread{
 		ParentATURI:   parent.ATURI,
 		ParentAPID:    parent.APID,
 		CommunityDID:  parent.CommunityDID,
 		CommunityAPID: parent.CommunityAPID,
 		Depth:         parent.Depth + 1,
+		RootATURI:     rootATURI,
+		RootDeadEnd:   deadEnd,
 	}, nil
 }
 
@@ -294,6 +420,12 @@ func (d *Dispatcher) apObjectID(did string, commit *CommitEvent) string {
 // the PARENT, whose at-uri and AP id the Delete needs for causal ordering and
 // addressing. Rendering all of it into ActivityPub vocabulary is task 15's;
 // this is the input.
+//
+// The thread ROOT is here for a different consumer: the update path, which
+// never re-resolves its thread and would otherwise have no way to know which
+// conversation an edit belongs to. It is also what every LATER comment inherits
+// its own root from, so recording it once at create time is what keeps the
+// answer O(1) forever after.
 func commentSnapshot(atURI string, commit *CommitEvent, thread *resolvedThread) ([]byte, error) {
 	snapshot, err := json.Marshal(map[string]any{
 		"atUri":         atURI,
@@ -303,6 +435,7 @@ func commentSnapshot(atURI string, commit *CommitEvent, thread *resolvedThread) 
 		"record":        commit.Record,
 		"parentAtUri":   thread.ParentATURI,
 		"parentApId":    thread.ParentAPID,
+		"rootAtUri":     thread.RootATURI,
 		"communityApId": thread.CommunityAPID,
 	})
 	if err != nil {
@@ -333,6 +466,30 @@ func (d *Dispatcher) parentFromSnapshot(snapshot []byte) snapshotParent {
 			slog.String("error", err.Error()))
 	}
 	return parent
+}
+
+// rootFromSnapshot reads the thread root back out of stored state, or "" when
+// the snapshot does not carry one (a row written before the root was recorded,
+// or one that will not parse).
+//
+// The empty answer is NOT "no thread": every caller resolves it (threadRootOf,
+// commentThread), because defaulting it to the object itself would quietly
+// exempt every pre-existing nested comment from its thread's lock — and that
+// does not self-heal, since the snapshot only advances on a successful edit and
+// the edit is what would be wrongly allowed.
+//
+// A parse failure is deliberately indistinguishable from an absent key here:
+// both mean "this snapshot cannot tell us", parentFromSnapshot already logs the
+// unmarshal error for the same bytes, and the resolution the caller falls into
+// is the correct response to either.
+func rootFromSnapshot(snapshot []byte) string {
+	var thread struct {
+		RootATURI string `json:"rootAtUri"`
+	}
+	if err := json.Unmarshal(snapshot, &thread); err != nil {
+		return ""
+	}
+	return thread.RootATURI
 }
 
 // replyRef reads reply.{name}.uri out of a decoded comment record.

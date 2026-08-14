@@ -14,10 +14,66 @@ import (
 	"time"
 )
 
+// ObjectModeration is the moderation state the BRIDGE owns for one bridged
+// object — today a community's thread LOCK, which has no home in either repo
+// (see migration 025).
+//
+// It rides the APObjects interface, and the two are deliberately different
+// things at different levels: the TABLE is separate, because putMapping
+// rewrites a whole ap_objects row and a re-pin would clear a lock; the
+// ACCESSOR sits here because every holder of a mapping is exactly the caller
+// that needs to ask, and both readers (the announced-moderation dispatch and
+// the native comment consumer) already hold one.
+type ObjectModeration interface {
+	// SetLock records or clears a community's lock on an object. Locking an
+	// already-locked object preserves the ORIGINAL locked_at — a re-announced
+	// Lock is the same decision, not a new one. Unlocking is scoped to the
+	// community that holds the lock: clearing is a no-op for anyone else, and a
+	// no-op success for an object that was never locked.
+	SetLock(ctx context.Context, object ModeratedObject, locked bool) error
+
+	// LockedAmong returns the first of the given at-uris that currently carries
+	// a lock, or "" when none does. It takes a SET because the question is
+	// always asked of a thread — a comment is refused by a lock on its parent
+	// OR on its thread root — and one statement keeps that one round trip
+	// however many ancestors it names. Empty at-uris are ignored; an object no
+	// community has ever moderated simply has no row, which is the answer
+	// "open" rather than an error.
+	LockedAmong(ctx context.Context, atURIs ...string) (string, error)
+
+	// SetRemoval records a community's removal of a COMMENT: when it happened,
+	// under which code, and with the moderator's own reason. Re-recording an
+	// existing removal keeps the ORIGINAL removed_at — a re-delivered Delete is
+	// the same decision arriving twice.
+	//
+	// COMMENTS ONLY, deliberately. A post's removal is a record in the
+	// community's own repo, written atomically with the withdrawal of the
+	// acceptance it replaces; a second copy here would be a second source of
+	// truth for one decision, and the two would disagree the first time the
+	// commit succeeded and this write did not.
+	SetRemoval(ctx context.Context, object ModeratedObject, code, reason string) error
+
+	// ClearRemoval lifts a removal (Undo{Delete}), scoped to the community that
+	// made it: clearing is a no-op for anyone else, and a no-op success for an
+	// object nobody removed. The row survives — a lock on the same object is a
+	// separate decision and is not lifted with it.
+	ClearRemoval(ctx context.Context, atURI, communityDID string) error
+
+	// CommunityHoldsAnyLock reports whether a community currently holds a lock
+	// on anything at all. It answers the ONE question left when a comment's
+	// thread cannot be determined: a community holding no lock cannot have
+	// locked the thread we failed to name, so there is provably nothing to miss.
+	// It is never the refusal rule itself — a lock is per-object, and a
+	// community holding one says nothing about its other threads.
+	CommunityHoldsAnyLock(ctx context.Context, communityDID string) (bool, error)
+}
+
 // APObjects maps AP object ids to the atproto records they materialized
 // as, and back. Every materialization writes a mapping; every strongRef
 // resolution reads one.
 type APObjects interface {
+	ObjectModeration
+
 	// PutMapping idempotently upserts a mapping keyed on APID. It validates
 	// DID, Collection, RKey, and CID, derives ATURI from the first three,
 	// and returns the stored row. An empty Origin defaults to

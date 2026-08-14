@@ -23,7 +23,8 @@ func NewAPObjects(db *sql.DB) APObjects {
 
 const apObjectColumns = `
 	id, ap_id, ap_type, origin_instance, origin, did, author_did, community_did,
-	collection, rkey, at_uri, cid, ap_published_at, indexed_at, deleted_at`
+	thread_root_at_uri, collection, rkey, at_uri, cid, ap_published_at, indexed_at,
+	deleted_at`
 
 func (r *postgresAPObjects) PutMapping(ctx context.Context, mapping APObjectMapping) (*APObjectMapping, error) {
 	return r.putMapping(ctx, r.db, mapping)
@@ -49,8 +50,9 @@ func (r *postgresAPObjects) putMapping(ctx context.Context, q queryRower, mappin
 	query := `
 		INSERT INTO ap_objects (
 			ap_id, ap_type, origin_instance, origin, did, author_did,
-			community_did, collection, rkey, at_uri, cid, ap_published_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			community_did, thread_root_at_uri, collection, rkey, at_uri, cid,
+			ap_published_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		ON CONFLICT (ap_id) DO UPDATE SET
 			ap_type = EXCLUDED.ap_type,
 			origin = EXCLUDED.origin,
@@ -67,6 +69,13 @@ func (r *postgresAPObjects) putMapping(ctx context.Context, q queryRower, mappin
 			-- write path) would NULL a good binding and make moderation refuse
 			-- forever, silently. A write that HAS the value still wins.
 			community_did = COALESCE(EXCLUDED.community_did, ap_objects.community_did),
+			-- COALESCE for the same reason, with one difference worth stating:
+			-- the materializer re-derives this from the record it is committing,
+			-- so a re-put normally re-supplies it and a row written before
+			-- migration 026 heals itself. The COALESCE is what stops a write path
+			-- that does NOT know the thread (any non-materializer mapping write)
+			-- from blanking one that does.
+			thread_root_at_uri = COALESCE(EXCLUDED.thread_root_at_uri, ap_objects.thread_root_at_uri),
 			collection = EXCLUDED.collection,
 			rkey = EXCLUDED.rkey,
 			at_uri = EXCLUDED.at_uri,
@@ -79,6 +88,7 @@ func (r *postgresAPObjects) putMapping(ctx context.Context, q queryRower, mappin
 	row := q.QueryRowContext(ctx, query,
 		mapping.APID, mapping.APType, mapping.OriginInstance, string(mapping.Origin),
 		mapping.DID, nullIfEmpty(mapping.AuthorDID), nullIfEmpty(mapping.CommunityDID),
+		nullIfEmpty(mapping.ThreadRootATURI),
 		mapping.Collection, mapping.RKey, mapping.ATURI, mapping.CID, mapping.PublishedAt,
 	)
 	stored, err := scanAPObject(row)
@@ -283,10 +293,10 @@ type rowScanner interface {
 func scanAPObject(row rowScanner) (*APObjectMapping, error) {
 	var mapping APObjectMapping
 	var origin string
-	var authorDID, communityDID sql.NullString
+	var authorDID, communityDID, threadRootATURI sql.NullString
 	err := row.Scan(
 		&mapping.ID, &mapping.APID, &mapping.APType, &mapping.OriginInstance,
-		&origin, &mapping.DID, &authorDID, &communityDID,
+		&origin, &mapping.DID, &authorDID, &communityDID, &threadRootATURI,
 		&mapping.Collection, &mapping.RKey, &mapping.ATURI, &mapping.CID,
 		&mapping.PublishedAt, &mapping.IndexedAt, &mapping.DeletedAt,
 	)
@@ -296,6 +306,7 @@ func scanAPObject(row rowScanner) (*APObjectMapping, error) {
 	mapping.Origin = Origin(origin)
 	mapping.AuthorDID = authorDID.String
 	mapping.CommunityDID = communityDID.String
+	mapping.ThreadRootATURI = threadRootATURI.String
 	return &mapping, nil
 }
 

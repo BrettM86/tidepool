@@ -341,6 +341,12 @@ func (m *Materializer) commitRecord(ctx context.Context, did, collection, rkey s
 	// inReplyTo would hand another community moderation authority over content
 	// posted somewhere else.
 	var storedCommunityDID string
+	// storedThreadRoot is the thread a previous materialization recorded. A
+	// comment cannot change threads, so a binding already made wins — exactly
+	// like the community above, and for the same reason: it is read back on the
+	// moderation path, and re-deriving it from an edited delivery would let an
+	// edit move a comment out from under its thread's lock.
+	var storedThreadRoot string
 	if existing, err := m.objects.GetByAPID(ctx, obj.ID); err == nil {
 		if existing.IsDeleted() {
 			return nil, skip(obj.ID, "object was deleted upstream; not resurrecting")
@@ -349,6 +355,7 @@ func (m *Materializer) commitRecord(ctx context.Context, did, collection, rkey s
 			collection == CollectionPostV2 ||
 			collection == CollectionComment
 		storedCommunityDID = existing.CommunityDID
+		storedThreadRoot = existing.ThreadRootATURI
 	} else if !errors.IsNotFound(err) {
 		return nil, fmt.Errorf("materialize: check mapping for %s: %w", obj.ID, err)
 	}
@@ -377,6 +384,11 @@ func (m *Materializer) commitRecord(ctx context.Context, did, collection, rkey s
 		// restored by then, and the mapping must agree with the record it
 		// maps or the two would authorize different communities.
 		mapping.CommunityDID = mappingCommunityDID(collection, did, record, communityDID, storedCommunityDID)
+		// Same rule, same moment, for the same reason: the thread a comment
+		// hangs in is decided once and read off the RECORD being committed, so
+		// an update whose reply refs were carried forward maps the thread the
+		// record actually names rather than one this delivery asserted.
+		mapping.ThreadRootATURI = mappingThreadRootATURI(collection, record, storedThreadRoot)
 		var mapErr error
 		stored, mapErr = m.objects.PutMappingTx(ctx, tx, mapping)
 		if mapErr != nil {

@@ -191,16 +191,15 @@ func (m *Materializer) RestorePost(ctx context.Context, mapping *store.APObjectM
 		return nil
 	}
 
-	_, currentCID, err := m.repos.GetRecord(ctx, mapping.DID, mapping.Collection, mapping.RKey)
+	currentCID, ok, err := m.restorePin(ctx, mapping)
 	if err != nil {
-		// No post to re-accept. The removal stays: it is terminal on the URI,
-		// and an acceptance pinning nothing would be worse than none.
-		if errors.IsNotFound(err) {
-			m.logger.Warn("restore target has no record to re-accept; leaving the removal in place",
-				"ap_id", mapping.APID, "at_uri", mapping.ATURI)
-			return nil
-		}
-		return fmt.Errorf("materialize: read %s for restore: %w", mapping.ATURI, err)
+		return err
+	}
+	if !ok {
+		// No version to pin. The removal stays: it is terminal on the URI, and
+		// an acceptance pinning nothing — or pinning a record that is gone —
+		// would be worse than none.
+		return nil
 	}
 
 	acceptance := map[string]any{
@@ -221,6 +220,67 @@ func (m *Materializer) RestorePost(ctx context.Context, mapping *store.APObjectM
 	m.logger.Info("post restored to community by moderator",
 		"community_did", communityDID, "post", postURI, "ap_id", mapping.APID)
 	return nil
+}
+
+// restorePin is the CID a fresh acceptance pins, dispatched on ORIGIN because
+// the two origins keep the post's current version in different places.
+//
+// A fediverse-origin post was materialized into a repo this bridge hosts, so
+// Repos can read it back. A BRIDGE-ORIGIN (native) post cannot: mapping.DID is
+// the AUTHOR's DID and their PDS is not ours, so that read returns NotFound for
+// every native post — which is why restoring one used to log "no record to
+// re-accept" and leave every moderator restore silently unapplied.
+//
+// For those, outbound_objects.LastCID is the bridge's own record of the version
+// it last federated. Migration 018 marks that column PROVENANCE ONLY, and this
+// respects the reason: the caveat is about using it as an ORDERING GATE (a rev
+// read from it is a check-then-write race). As a PIN it is exactly right — it
+// names the version the community last saw — and it self-heals, because the
+// author's next edit re-accepts against the fresh CID.
+//
+// ok=false means "no version to pin, leave the removal standing". A TOMBSTONED
+// outbound row is the sharpest case: the author deleted the post while it was
+// removed, so restoring would publish an acceptance for a record that no longer
+// exists — the community asserting it admitted something deleted.
+func (m *Materializer) restorePin(ctx context.Context, mapping *store.APObjectMapping) (string, bool, error) {
+	if mapping.Origin != store.OriginBridge {
+		_, cid, err := m.repos.GetRecord(ctx, mapping.DID, mapping.Collection, mapping.RKey)
+		if err != nil {
+			if errors.IsNotFound(err) {
+				m.logger.Warn("restore target has no record to re-accept; leaving the removal in place",
+					"ap_id", mapping.APID, "at_uri", mapping.ATURI)
+				return "", false, nil
+			}
+			return "", false, fmt.Errorf("materialize: read %s for restore: %w", mapping.ATURI, err)
+		}
+		return cid, true, nil
+	}
+
+	if m.outbound == nil {
+		m.logger.Warn("restore of a native post needs outbound state, which is not wired; leaving the removal in place",
+			"ap_id", mapping.APID, "at_uri", mapping.ATURI)
+		return "", false, nil
+	}
+	state, err := m.outbound.GetByATURI(ctx, mapping.ATURI)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			m.logger.Warn("restore target has no outbound state to re-accept; leaving the removal in place",
+				"ap_id", mapping.APID, "at_uri", mapping.ATURI)
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("materialize: read outbound state for %s: %w", mapping.ATURI, err)
+	}
+	if state.IsTombstoned() {
+		m.logger.Warn("restore refused: the author deleted this post while it was removed",
+			"ap_id", mapping.APID, "at_uri", mapping.ATURI)
+		return "", false, nil
+	}
+	if state.LastCID == "" {
+		m.logger.Warn("restore target has no recorded CID to pin; leaving the removal in place",
+			"ap_id", mapping.APID, "at_uri", mapping.ATURI)
+		return "", false, nil
+	}
+	return state.LastCID, true, nil
 }
 
 // moderationTarget resolves the community, subject uri and digest rkey a

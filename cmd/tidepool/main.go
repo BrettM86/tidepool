@@ -306,13 +306,16 @@ func run(logger *slog.Logger) error {
 	}
 
 	materializer, err := materialize.New(materialize.Options{
-		Fetcher:           apClient,
-		Objects:           objects,
-		Actors:            actors,
-		Communities:       communities,
-		Repos:             repoManager,
-		Minter:            mintGate,
-		Votes:             voteAggregator,
+		Fetcher:     apClient,
+		Objects:     objects,
+		Actors:      actors,
+		Communities: communities,
+		Repos:       repoManager,
+		Minter:      mintGate,
+		Votes:       voteAggregator,
+		// Restoring a NATIVE post reads its pinned CID from here: the author's
+		// repo is not one this bridge hosts.
+		OutboundObjects:   store.NewOutboundObjects(database),
 		ServiceDID:        serviceDID,
 		ProfileRefreshTTL: cfg.ProfileRefreshTTL,
 		MaxBlobBytes:      cfg.MaxBlobBytes,

@@ -150,6 +150,12 @@ type Options struct {
 	// Votes scrubs a deleted actor's vote_events rows alongside the record
 	// scrub (optional; nil skips it).
 	Votes VoteScrubber
+	// OutboundObjects is the bridge's own outbound state for NATIVE records.
+	// RestorePost needs it: a native post lives in the AUTHOR's repo, which
+	// this bridge does not host, so its CID cannot be read back through Repos.
+	// OPTIONAL: nil leaves a bridge-origin restore refusing (it logs and leaves
+	// the removal standing) exactly as it did before this seam existed.
+	OutboundObjects store.OutboundObjects
 	// ServiceDID is the bridge's own DID: community.profile createdBy and
 	// hostedBy (PLAN.md locked decision 6).
 	ServiceDID string
@@ -173,6 +179,7 @@ type Options struct {
 type Materializer struct {
 	fetcher     Fetcher
 	objects     store.APObjects
+	outbound    store.OutboundObjects
 	actors      store.BridgedActors
 	communities store.Communities
 	repos       *repo.Manager
@@ -232,6 +239,7 @@ func New(opts Options) (*Materializer, error) {
 	m := &Materializer{
 		fetcher:     opts.Fetcher,
 		objects:     opts.Objects,
+		outbound:    opts.OutboundObjects,
 		actors:      opts.Actors,
 		communities: opts.Communities,
 		repos:       opts.Repos,

@@ -137,8 +137,10 @@ func setupNativeDeleteEcho(t *testing.T, h *harness, communityDID, authorDID str
 	require.NoError(t, err, "federating the post must have written its bridge-origin mapping")
 	require.Equal(t, store.OriginBridge, mapping.Origin)
 	require.Equal(t, materialize.CollectionPostV2, mapping.Collection)
-	require.Empty(t, mapping.CommunityDID,
-		"precondition: today's enqueuer records no community on the mapping — the accident this test exists to outlive")
+	// (The tripwire that stood here — "today's enqueuer records no community" —
+	// fired in 17c-1 and has been removed. Its whole purpose was to fail on the
+	// day M1b stopped simulating: community_did is populated now, so this
+	// scenario is the real world rather than a construction of it.)
 	mapping.CommunityDID = communityDID
 	mapping.AuthorDID = authorDID
 	_, err = h.objects.PutMapping(ctx, *mapping)

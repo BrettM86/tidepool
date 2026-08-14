@@ -168,8 +168,12 @@ func (d *Dispatcher) enqueueComment(ctx context.Context, tx *sql.Tx, did, operat
 		ATURI:         stored.ATURI,
 		ID:            ActivityID(d.userOrigin, stored.ATURI, operation, stored.LastActivitySeq),
 		CommunityAPID: stored.CommunityAPID,
-		ParentAPID:    parentAPID,
-		Snapshot:      stored.TranslatedSnapshot,
+		// Read off the stored outbound row rather than re-resolved: it is the
+		// same community this comment was admitted into, and the mapping the
+		// enqueuer writes needs it to be moderatable.
+		CommunityDID: stored.CommunityDID,
+		ParentAPID:   parentAPID,
+		Snapshot:     stored.TranslatedSnapshot,
 	}
 	// parentATURI carries the causal dependency (decision 15): delivery must
 	// not present a reply to a peer before the thing it replies to. On a

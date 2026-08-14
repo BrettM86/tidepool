@@ -165,7 +165,7 @@ func (e *Enqueuer) EnqueueActivity(ctx context.Context, tx *sql.Tx, actorDID, or
 // object; a self-delete's object was mapped on its create. ok=false means no
 // mapping is written.
 func (e *Enqueuer) objectMapping(intent consume.Intent) (store.APObjectMapping, bool, error) {
-	var atURI, apType string
+	var atURI, apType, communityDID string
 	var snapshot []byte
 	switch typed := intent.(type) {
 	case consume.CommentIntent:
@@ -173,11 +173,13 @@ func (e *Enqueuer) objectMapping(intent consume.Intent) (store.APObjectMapping, 
 			return store.APObjectMapping{}, false, nil
 		}
 		atURI, apType, snapshot = typed.ATURI, "Note", typed.Snapshot
+		communityDID = typed.CommunityDID
 	case consume.PostIntent:
 		if typed.Op == "delete" {
 			return store.APObjectMapping{}, false, nil
 		}
 		atURI, apType, snapshot = typed.ATURI, "Page", typed.Snapshot
+		communityDID = typed.CommunityDID
 	default:
 		return store.APObjectMapping{}, false, nil
 	}
@@ -199,9 +201,15 @@ func (e *Enqueuer) objectMapping(intent consume.Intent) (store.APObjectMapping, 
 		OriginInstance: e.originHost,
 		Origin:         store.OriginBridge,
 		DID:            parts[0],
-		Collection:     parts[1],
-		RKey:           parts[2],
-		CID:            cid,
+		// The COMMUNITY this object was federated into. Without it
+		// CommunityDIDOf answers "" for a bridge-origin mapping — an
+		// author-owned postv2 lives in the AUTHOR's repo, so the community
+		// cannot be read off DID — and every announced moderation action
+		// against native content is refused before it is even evaluated.
+		CommunityDID: communityDID,
+		Collection:   parts[1],
+		RKey:         parts[2],
+		CID:          cid,
 	}, true, nil
 }
 

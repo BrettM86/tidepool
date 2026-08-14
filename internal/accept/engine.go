@@ -70,6 +70,17 @@ const (
 	// for federation purposes, so we must not sign an acceptance or deliver into
 	// it. SECURITY: a communities row alone (existence) is not authority to bridge.
 	DecisionCommunityNotFollowed = "community-not-followed"
+	// DecisionModeratorRemoved: the author edited a post the COMMUNITY has
+	// removed. The edit is not rejected — the author's record is theirs and it
+	// stands — but it does not re-enter a community that removed it, and no
+	// acceptance is written and nothing is enqueued.
+	//
+	// It is deliberately NOT RemovalCodeAdmissionRevoked: that code means "we
+	// withdrew this and a corrective edit may restore it", which is precisely
+	// the reasoning that must not reach a moderator's decision. The two must
+	// stay distinguishable in the ledger, because they are the two branches of
+	// what an edit against a standing removal is allowed to do.
+	DecisionModeratorRemoved = "moderator-removed"
 )
 
 // RemovalCodeAdmissionRevoked is the removal `code` written when a post that WAS
@@ -480,7 +491,10 @@ func (e *Engine) accept(ctx context.Context, did, communityDID, postURI string, 
 			ATURI:         postURI,
 			ID:            consume.ActivityID(e.userOrigin, postURI, op, stored.LastActivitySeq),
 			CommunityAPID: community.APGroupID,
-			Snapshot:      snapshot,
+			// The mapping the enqueuer writes carries this binding; without it
+			// no announced moderation of this post can ever be authorized.
+			CommunityDID: communityDID,
+			Snapshot:     snapshot,
 		}
 		// A post has no causal parent, so orderingKey is the author DID and there
 		// is no parentATURI.
@@ -502,22 +516,79 @@ func (e *Engine) accept(ctx context.Context, did, communityDID, postURI string, 
 	_, err = acceptrec.AcceptSubject(ctx, e.repos, communityDID, postURI, commit.CID,
 		publishedAtOf(commit.Record), sideEffect)
 	if stderrors.Is(err, acceptrec.ErrRemovalStands) {
-		// An admission-revoked removal stands (a prior failing edit withdrew the
-		// post), but admission passes NOW. The revocation was OUR decision, so a
-		// corrective edit AUTO-RESTORES rather than erroring and redriving forever
-		// against the terminal removal: delete the removal + write a fresh
-		// acceptance + enqueue (a Create, since Lemmy's live copy is gone). The
-		// same side effect rides the restore commit.
-		if _, rerr := acceptrec.Restore(ctx, e.repos, communityDID, postURI, commit.CID,
-			publishedAtOf(commit.Record), sideEffect); rerr != nil {
-			return fmt.Errorf("accept: restore %s into %s: %w", postURI, communityDID, rerr)
-		}
-		return nil
+		return e.editAgainstRemoval(ctx, did, communityDID, postURI, commit, sideEffect)
 	}
 	if err != nil {
 		return fmt.Errorf("accept: admit %s into %s: %w", postURI, communityDID, err)
 	}
 	return nil
+}
+
+// editAgainstRemoval decides what an edit may do when a removal already stands
+// at the subject's rkey. WHOSE removal it is decides, and nothing else.
+//
+//   - admission-revoked is OUR OWN decision: a prior edit failed admission and
+//     we withdrew the post. A corrective edit is exactly the event that should
+//     reverse it, so it auto-restores — delete the removal, write a fresh
+//     acceptance, enqueue (a Create, since Lemmy's live copy is gone), all on
+//     the one restore commit.
+//   - ANY OTHER CODE IS A MODERATOR'S DECISION AND IS TERMINAL. Reversing it
+//     would delete the moderators' removal record, write an acceptance over it,
+//     and — because the same side effect rides that commit — ENQUEUE the post
+//     back to the community that removed it. Every other consequence of getting
+//     this wrong is internal and correctable; that one is on the wire, at the
+//     people who made the decision.
+//
+// A terminal removal is recorded in the ledger and nothing else happens: no
+// commit, no enqueue, no error. The author's edit is not a failure — their
+// record is theirs and it stands — it simply does not re-enter a community that
+// has removed it, and the ledger is where an operator reads why.
+func (e *Engine) editAgainstRemoval(ctx context.Context, did, communityDID, postURI string,
+	commit *consume.CommitEvent, sideEffect repo.TxSideEffect) error {
+
+	code, err := e.standingRemovalCode(ctx, communityDID, postURI)
+	if err != nil {
+		return err
+	}
+	if code != RemovalCodeAdmissionRevoked {
+		e.logger.Info("edit against a standing moderator removal: acceptance refused, nothing enqueued",
+			"community_did", communityDID, "post", postURI, "removal_code", code)
+		return e.admissions.Record(ctx, Admission{
+			AuthorDID:         did,
+			CommunityDID:      communityDID,
+			PostURI:           postURI,
+			Status:            StatusRemoved,
+			DecisionCode:      DecisionModeratorRemoved,
+			EvaluatedCID:      commit.CID,
+			EvaluatedSnapshot: e.evaluatedSnapshot(commit),
+		})
+	}
+	if _, rerr := acceptrec.Restore(ctx, e.repos, communityDID, postURI, commit.CID,
+		publishedAtOf(commit.Record), sideEffect); rerr != nil {
+		return fmt.Errorf("accept: restore %s into %s: %w", postURI, communityDID, rerr)
+	}
+	return nil
+}
+
+// standingRemovalCode reads the `code` off the removal AcceptSubject refused
+// against. A removal that has vanished between the refusal and this read is a
+// genuine race — the moderators restored the post in the window — and returns
+// an error so the event RETRIES: the retry's AcceptSubject finds no removal and
+// admits the edit normally. Treating the miss as "not ours, terminal" would
+// strand a post whose removal no longer exists.
+//
+// An unreadable code is treated as a moderator's, i.e. terminal. The direction
+// is deliberate: the recoverable mistake is refusing an edit, and the
+// unrecoverable one is pushing a removed post back at its community.
+func (e *Engine) standingRemovalCode(ctx context.Context, communityDID, postURI string) (string, error) {
+	rkey := acceptrec.SubjectRKey(postURI)
+	record, _, err := e.repos.GetRecord(ctx, communityDID, acceptrec.CollectionRemoval, rkey)
+	if err != nil {
+		return "", fmt.Errorf("accept: read standing removal %s/%s/%s: %w",
+			communityDID, acceptrec.CollectionRemoval, rkey, err)
+	}
+	code, _ := record["code"].(string)
+	return code, nil
 }
 
 // removeAccepted withdraws a post that WAS accepted and now fails re-admission:

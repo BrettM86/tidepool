@@ -249,7 +249,15 @@ func newHarness(t *testing.T) *harness {
 		// persona from another package's run would make an echo look like
 		// someone else's.
 		"outbound_deliveries", "outbound_activities", "outbound_objects",
-		"outbound_votes", "ap_actors", "vote_events", "vote_aggregates")
+		"outbound_votes", "ap_actors", "vote_events", "vote_aggregates",
+		// Consumer + engine state, for the tests that drive a real Jetstream
+		// commit through the acceptance engine. The rev gate is the one that
+		// bites: a leftover jetstream_record_revs row makes the SECOND test to
+		// use a given rev skip its own fixture as already-applied, and the
+		// failure surfaces as a missing acceptance record rather than as
+		// anything about revs.
+		"jetstream_record_revs", "jetstream_dead_letters", "consumer_cursors",
+		"admissions", "federation_prefs")
 
 	custodian, err := identity.NewCustodian(testKEK)
 	require.NoError(t, err)

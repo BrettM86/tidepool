@@ -43,6 +43,12 @@ type CommentIntent struct {
 	ID string
 	// CommunityAPID is the target community's AP Group id.
 	CommunityAPID string
+	// CommunityDID is that same community's bridged repo DID. It rides the
+	// intent so the enqueuer can BIND the mapping it writes to a community
+	// without growing a Communities dependency: every caller already holds the
+	// resolved community, and the binding is what later authorizes announced
+	// moderation of this object (materialize.CommunityDIDOf).
+	CommunityDID string
 	// ParentAPID is the AP object id of the thing replied to, resolved through
 	// ap_objects OR the parent's own outbound state (a native accepted post or
 	// an earlier native comment, which have no ap_objects mapping).
@@ -96,6 +102,9 @@ type PostIntent struct {
 	// CommunityAPID is the target community's AP Group id — for a Page it goes
 	// in `to` (the Page/Note addressing split), not `cc`.
 	CommunityAPID string
+	// CommunityDID is that same community's bridged repo DID; see
+	// CommentIntent.CommunityDID for why it travels on the intent.
+	CommunityDID string
 	// Snapshot is the translated state a Delete is rebuilt from and a
 	// Create/Update{Page} is rendered from — the postv2 record plus resolved
 	// context, same envelope shape as a comment's snapshot.

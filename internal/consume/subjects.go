@@ -69,9 +69,19 @@ func (d *Dispatcher) resolveSubject(ctx context.Context, atURI string) (*resolve
 			if err != nil {
 				return nil, fmt.Errorf("resolve community %s: %w", communityDID, err)
 			}
-			depth, err := d.recordedDepth(ctx, atURI)
+			depth, tombstoned, err := d.recordedState(ctx, atURI)
 			if err != nil {
 				return nil, err
+			}
+			if tombstoned {
+				// The bridge already withdrew this object. This branch USED to
+				// be unreachable for native content — with no community_did on
+				// a bridge-origin mapping the lookup fell through to the
+				// outbound_objects branch below, whose IsTombstoned check
+				// caught it. Populating that column (17c) moves native parents
+				// up here, and without this check replies to and votes on an
+				// author-DELETED native post would start federating again.
+				return nil, nil
 			}
 			return &resolvedSubject{
 				ATURI:         atURI,
@@ -129,22 +139,31 @@ func (d *Dispatcher) subjectCommunityDID(ctx context.Context, mapping *store.APO
 	return communityDID, nil
 }
 
-// recordedDepth reads a subject's own reply depth, which exists only if the
-// bridge federated it OUTWARD too. A mapped subject with no outbound row is a
-// post, or a Lemmy object whose depth this bridge does not track, so it counts
-// as the top: replies to it are depth 1 (this returns 0).
+// recordedState reads what the bridge's OWN outbound row says about a mapped
+// subject: its reply depth, and whether it has been withdrawn.
 //
-// Only a genuine MISS defaults to 0. A real error — postgres down, a timeout —
-// PROPAGATES: recording depth 0 off a dropped connection would federate a
-// deeply nested comment at the wrong nesting and, past Lemmy's cap, keep
-// federating ones it will reject, silently and with no retry.
-func (d *Dispatcher) recordedDepth(ctx context.Context, atURI string) (int, error) {
+// depth exists only if the bridge federated the subject outward too. A mapped
+// subject with no outbound row is a post, or a Lemmy object whose depth this
+// bridge does not track, so it counts as the top: replies to it are depth 1
+// (this returns 0).
+//
+// tombstoned is the same fact the outbound_objects branch of resolveSubject
+// checks, read HERE because both facts come off one row and the caller needs
+// them together — a second read could see a delete land between them and
+// federate against a subject the first read had already shown as live.
+//
+// Only a genuine MISS defaults to zero values. A real error — postgres down, a
+// timeout — PROPAGATES: reading depth 0 off a dropped connection would federate
+// a deeply nested comment at the wrong nesting and, past Lemmy's cap, keep
+// federating ones it will reject, silently and with no retry; and reading
+// "not tombstoned" off one would resurrect deleted content.
+func (d *Dispatcher) recordedState(ctx context.Context, atURI string) (depth int, tombstoned bool, err error) {
 	state, err := d.objects.GetByATURI(ctx, atURI)
 	if errors.IsNotFound(err) {
-		return 0, nil
+		return 0, false, nil
 	}
 	if err != nil {
-		return 0, fmt.Errorf("read recorded depth for %s: %w", atURI, err)
+		return 0, false, fmt.Errorf("read recorded state for %s: %w", atURI, err)
 	}
-	return state.Depth, nil
+	return state.Depth, state.IsTombstoned(), nil
 }

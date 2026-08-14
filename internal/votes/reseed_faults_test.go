@@ -95,6 +95,20 @@ func deliverTolerating(t *testing.T, l *lifecycle) {
 	}
 }
 
+// releaseHeldDelivery lets the worker pick the delivery up again. A settlement
+// that fails after a confirmed POST HOLDS its delivery — still pending, still
+// claimed for the rest of the lease — so a redelivery is a minute away in
+// production and unreachable inside a test that refuses to sleep. Clearing the
+// claim is how the lease lapsing is spelled here; what is under test is what
+// happens when the worker gets its next look, not the clock that gives it one.
+func releaseHeldDelivery(t *testing.T, l *lifecycle) {
+	t.Helper()
+	_, err := l.db.ExecContext(context.Background(),
+		`UPDATE outbound_deliveries SET claimed_until = NULL, next_attempt_at = now()
+		 WHERE state = 'pending'`)
+	require.NoError(t, err)
+}
+
 // TestDeliveredLikeNeverStrandsThePendingLedgerRow is (a).
 //
 // The POST succeeded — Lemmy holds the vote — and the delivery is recorded as
@@ -129,6 +143,7 @@ func TestDeliveredLikeNeverStrandsThePendingLedgerRow(t *testing.T) {
 	// Whatever the mechanism, once the fault clears the worker must be able to
 	// finish the job — a delivery it can no longer claim cannot be finished.
 	faulty.failSet = false
+	releaseHeldDelivery(t, l)
 	deliverTolerating(t, l)
 	assert.Equal(t, string(store.DeliveredStateDelivered), l.state(t),
 		"after the blip passes the ledger must catch up: the vote IS at Lemmy")
@@ -179,6 +194,7 @@ func TestDeliveredUndoNeverStrandsTheDeliveredLedgerRow(t *testing.T) {
 	}
 
 	faulty.failDelete = false
+	releaseHeldDelivery(t, l)
 	deliverTolerating(t, l)
 	assert.Equal(t, "", l.state(t),
 		"once the blip passes the row must go: the peer is not holding this vote")

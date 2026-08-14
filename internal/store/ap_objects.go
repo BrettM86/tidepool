@@ -56,7 +56,12 @@ func (r *postgresAPObjects) putMapping(ctx context.Context, q queryRower, mappin
 			origin = EXCLUDED.origin,
 			did = EXCLUDED.did,
 			author_did = EXCLUDED.author_did,
-			community_did = EXCLUDED.community_did,
+			-- COALESCE, never a bare overwrite: community_did is the binding
+			-- that authorizes announced moderation of this object, and a
+			-- re-put that simply omits it (a re-materialization, a legacy
+			-- write path) would NULL a good binding and make moderation refuse
+			-- forever, silently. A write that HAS the value still wins.
+			community_did = COALESCE(EXCLUDED.community_did, ap_objects.community_did),
 			collection = EXCLUDED.collection,
 			rkey = EXCLUDED.rkey,
 			at_uri = EXCLUDED.at_uri,

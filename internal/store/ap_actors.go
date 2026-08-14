@@ -44,6 +44,12 @@ type APActor struct {
 	// DeliveryPaused is the transient #account state (decision 19):
 	// delivery stops, identity stays.
 	DeliveryPaused bool
+	// TombstonedAt is set when the DESTRUCTIVE tier withdrew this identity
+	// (task 17d): the actor document answers 410 Gone from then on. It is
+	// TERMINAL — no path clears it — because peers that honoured the Delete
+	// cannot restore what they dropped, so nothing here may promise
+	// resurrection.
+	TombstonedAt *time.Time
 	// Profile cache, refreshed from the appview/PDS (task 14 owns sync).
 	DisplayName string
 	Summary     string
@@ -72,7 +78,7 @@ func NewAPActors(db *sql.DB) APActors {
 const apActorColumns = `
 	did, kind, actor_id, normalized_origin, local_part,
 	rsa_key_sealed, rsa_key_version, public_key_pem,
-	enabled, enabled_at, disabled_at, delivery_paused,
+	enabled, enabled_at, disabled_at, delivery_paused, tombstoned_at,
 	display_name, summary, avatar_url, created_at, updated_at`
 
 func (r *postgresAPActors) Create(ctx context.Context, actor APActor) (*APActor, error) {
@@ -144,6 +150,17 @@ func (r *postgresAPActors) GetByOriginLocalPart(ctx context.Context, normalizedO
 }
 
 func (r *postgresAPActors) SetEnabled(ctx context.Context, did string, enabled bool) error {
+	return r.setEnabled(ctx, r.db, did, enabled)
+}
+
+func (r *postgresAPActors) SetEnabledTx(ctx context.Context, tx *sql.Tx, did string, enabled bool) error {
+	if tx == nil {
+		return errors.NewValidationError("tx", "must not be nil")
+	}
+	return r.setEnabled(ctx, tx, did, enabled)
+}
+
+func (r *postgresAPActors) setEnabled(ctx context.Context, ex execer, did string, enabled bool) error {
 	// Both transitions are stamped, and disabled_at is CLEARED on re-enable
 	// so the column answers "is this actor currently disabled, and since
 	// when" rather than "was it ever disabled". enabled_at is not cleared on
@@ -155,7 +172,41 @@ func (r *postgresAPActors) SetEnabled(ctx context.Context, did string, enabled b
 			disabled_at = CASE WHEN $2 THEN NULL ELSE now() END,
 			updated_at = now()
 		WHERE did = $1`
-	return r.execOne(ctx, "set enabled", did, query, did, enabled)
+	return execOneRow(ctx, ex, "set enabled", did, query, did, enabled)
+}
+
+// IsTombstoned reports whether the destructive tier withdrew this identity.
+func (a *APActor) IsTombstoned() bool { return a.TombstonedAt != nil }
+
+func (r *postgresAPActors) Tombstone(ctx context.Context, did string) error {
+	return r.tombstone(ctx, r.db, did)
+}
+
+func (r *postgresAPActors) TombstoneTx(ctx context.Context, tx *sql.Tx, did string) error {
+	if tx == nil {
+		return errors.NewValidationError("tx", "must not be nil")
+	}
+	return r.tombstone(ctx, tx, did)
+}
+
+func (r *postgresAPActors) tombstone(ctx context.Context, ex execer, did string) error {
+	// COALESCE keeps the ORIGINAL withdrawal time on a re-run, which makes the
+	// whole thing one idempotent statement: affected == 0 can only mean the
+	// actor does not exist. A destructive tier that re-stamped would lose the
+	// only record of when the user was actually withdrawn.
+	//
+	// enabled is set false in the same statement, because a tombstoned actor
+	// that still resolved through webfinger would be discoverable after being
+	// withdrawn — the two say the same thing from different sides and must not
+	// be able to disagree.
+	query := `
+		UPDATE ap_actors SET
+			tombstoned_at = COALESCE(tombstoned_at, now()),
+			enabled = FALSE,
+			disabled_at = COALESCE(disabled_at, now()),
+			updated_at = now()
+		WHERE did = $1`
+	return execOneRow(ctx, ex, "tombstone", did, query, did)
 }
 
 func (r *postgresAPActors) SetPaused(ctx context.Context, did string, paused bool) error {
@@ -180,7 +231,13 @@ func (r *postgresAPActors) UpdateProfile(ctx context.Context, did string, profil
 
 // execOne runs a single-row mutator and reports a missed DID as NotFound.
 func (r *postgresAPActors) execOne(ctx context.Context, what, did, query string, args ...any) error {
-	result, err := r.db.ExecContext(ctx, query, args...)
+	return execOneRow(ctx, r.db, what, did, query, args...)
+}
+
+// execOneRow runs a single-row UPDATE on either the pool or a caller's
+// transaction, mapping "matched nothing" to NotFound.
+func execOneRow(ctx context.Context, ex execer, what, did, query string, args ...any) error {
+	result, err := ex.ExecContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("%s for ap_actor %q: %w", what, did, err)
 	}
@@ -197,12 +254,12 @@ func (r *postgresAPActors) execOne(ctx context.Context, what, did, query string,
 func scanAPActor(row rowScanner) (*APActor, error) {
 	var actor APActor
 	var kind string
-	var enabledAt, disabledAt sql.NullTime
+	var enabledAt, disabledAt, tombstonedAt sql.NullTime
 	err := row.Scan(
 		&actor.DID, &kind, &actor.ActorID,
 		&actor.NormalizedOrigin, &actor.LocalPart,
 		&actor.RSAKeySealed, &actor.RSAKeyVersion, &actor.PublicKeyPEM,
-		&actor.Enabled, &enabledAt, &disabledAt, &actor.DeliveryPaused,
+		&actor.Enabled, &enabledAt, &disabledAt, &actor.DeliveryPaused, &tombstonedAt,
 		&actor.DisplayName, &actor.Summary, &actor.AvatarURL,
 		&actor.CreatedAt, &actor.UpdatedAt,
 	)
@@ -215,6 +272,9 @@ func scanAPActor(row rowScanner) (*APActor, error) {
 	}
 	if disabledAt.Valid {
 		actor.DisabledAt = &disabledAt.Time
+	}
+	if tombstonedAt.Valid {
+		actor.TombstonedAt = &tombstonedAt.Time
 	}
 	return &actor, nil
 }

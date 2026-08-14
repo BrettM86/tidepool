@@ -30,11 +30,18 @@ import (
 // — because absence is what default-on looks like in this table. That also
 // clears any stored deleteRemote: a stale destructive flag on a re-enabled
 // user is a loaded gun pointed at the task 17 tier.
-func (d *Dispatcher) handleFederation(ctx context.Context, _ *sql.Tx, did string, commit *CommitEvent) error {
+//
+// tx is the REV-GATE's transaction, and the disable path writes on it: the
+// actor mirror and the cancellation of that actor's queued deliveries are one
+// decision, and they commit with the gate advance or not at all. Atomicity here
+// is structural rather than defended — there is no window in which one landed
+// and the other did not, and a failure leaves the gate un-advanced so the record
+// replays and re-applies both.
+func (d *Dispatcher) handleFederation(ctx context.Context, tx *sql.Tx, did string, commit *CommitEvent) error {
 	if commit.Operation == operationDelete {
 		// A delete commit carries no record body, which costs nothing here:
 		// the DID is the whole question.
-		return d.restoreDefaultFederation(ctx, did)
+		return d.restoreDefaultFederation(ctx, tx, did)
 	}
 
 	enabled, ok := boolField(commit.Record, "enabled")
@@ -47,16 +54,19 @@ func (d *Dispatcher) handleFederation(ctx context.Context, _ *sql.Tx, did string
 			ErrPermanentEvent, did)
 	}
 	if enabled {
-		return d.restoreDefaultFederation(ctx, did)
+		return d.restoreDefaultFederation(ctx, tx, did)
 	}
 
 	// deleteRemote is optional and defaults to false: the soft tier. Nothing
 	// destructive is ever INFERRED — only an explicit true escalates.
 	deleteRemote, _ := boolField(commit.Record, "deleteRemote")
 
-	// The preference is recorded BEFORE the destructive seam is reached.
-	// Peers that honor a Delete cannot restore what they dropped, so the
-	// user's intent must survive a crash between recording and sending.
+	// The preference is recorded BEFORE the destructive seam is reached, and
+	// deliberately NOT on the transaction below. Peers that honor a Delete
+	// cannot restore what they dropped, so the user's intent must be durable
+	// before anything is sent — and the gate transaction has not committed by
+	// the time the destructive seam runs. It is the authority besides: it
+	// answers for every DID, including the ones with no actor to mirror onto.
 	if _, err := d.prefs.Upsert(ctx, store.FederationPref{
 		DID:          did,
 		Enabled:      false,
@@ -66,13 +76,56 @@ func (d *Dispatcher) handleFederation(ctx context.Context, _ *sql.Tx, did string
 		return fmt.Errorf("record federation opt-out for %s: %w", did, err)
 	}
 
-	if err := d.mirrorActorEnabled(ctx, did, false); err != nil {
-		return err
+	// STOP MEANS TWO FACTS AT ONCE: nothing new goes out, and nothing already
+	// queued goes out either. The cancellation answers the second, and it runs
+	// FIRST — before the destructive tier below — because that tier ENQUEUES
+	// the withdrawal, and a cancellation of "this actor's pending work" that ran
+	// afterwards would cancel the Delete{Person} it just queued. The order is
+	// not a preference: the two statements are the same predicate pointed at
+	// different moments.
+	cancelled, err := d.deliveries.CancelForActorTx(ctx, tx, did)
+	if err != nil {
+		return fmt.Errorf("cancel queued deliveries for %s: %w", did, err)
+	}
+	if cancelled > 0 {
+		d.logger.Info("federation opt-out cancelled queued deliveries",
+			slog.String("did", did), slog.Int64("cancelled", cancelled))
 	}
 
-	if !deleteRemote {
-		return nil
+	if deleteRemote {
+		if err := d.deleteRemoteContent(ctx, did); err != nil {
+			return err
+		}
 	}
+
+	// The mirror answers the first fact — the consumer, the admission gate and
+	// the delivery claim all read it — and it lands LAST, for a reason that is
+	// about locks rather than meaning: it UPDATEs the actor row, and the
+	// destructive tier updates that same row from its own transaction. Holding
+	// this one across that call deadlocks the two against each other, and the
+	// handler cannot release a lock it holds without committing.
+	//
+	// It still rides the rev-gate transaction, so the cancellation and the flag
+	// commit together with the gate advance: nothing retries the missing half,
+	// because the record is applied ONCE under a gate that rejects the replay.
+	return d.mirrorActorEnabled(ctx, tx, did, false)
+}
+
+// deleteRemoteContent runs the DESTRUCTIVE tier: peers are asked to delete what
+// they already hold, the votes they still count are retracted, and the identity
+// stops resolving.
+//
+// It runs on its OWN transaction rather than the gate's (the seam takes no tx),
+// which is why the caller must not be holding a lock on anything it writes. The
+// consequence of that split is stated plainly: if the gate transaction later
+// rolls back, the withdrawal has still been enqueued and the record replays —
+// which is safe only because every part of the purge is idempotent (a
+// deterministic activity id, a delivery insert that returns the standing row,
+// a tombstone that keeps its first timestamp).
+//
+// IRREVERSIBLE. Peers that honour a Delete cannot restore what they dropped,
+// and Lemmy's own un-delete on refetch is not something other software promises.
+func (d *Dispatcher) deleteRemoteContent(ctx context.Context, did string) error {
 	if d.remoteDeleter == nil {
 		// A deployment where the destructive tier has not landed yet. The
 		// request is already recorded, so it can be acted on from the backlog
@@ -93,19 +146,24 @@ func (d *Dispatcher) handleFederation(ctx context.Context, _ *sql.Tx, did string
 // restoreDefaultFederation is the re-enable path shared by enabled=true and a
 // record delete: the preference row goes away (absence IS default-on) and an
 // EXISTING actor is re-enabled under its original identity.
-func (d *Dispatcher) restoreDefaultFederation(ctx context.Context, did string) error {
+//
+// Cancelled deliveries are NOT resurrected. Re-enabling restores the user's
+// ability to federate from now on; the work they cancelled by asking us to stop
+// was withdrawn at their request, and re-sending it would publish on their
+// behalf something they had already taken back.
+func (d *Dispatcher) restoreDefaultFederation(ctx context.Context, tx *sql.Tx, did string) error {
 	if err := d.prefs.Delete(ctx, did); err != nil {
 		return fmt.Errorf("clear federation preference for %s: %w", did, err)
 	}
-	return d.mirrorActorEnabled(ctx, did, true)
+	return d.mirrorActorEnabled(ctx, tx, did, true)
 }
 
 // mirrorActorEnabled updates the ap_actors mirror IF the actor exists. A
 // missing actor is a no-op success, not an error: an opt-out (or an enable)
 // from a DID that has never federated anything is the ordinary case, and
 // actors mint at the first federating interaction — never here.
-func (d *Dispatcher) mirrorActorEnabled(ctx context.Context, did string, enabled bool) error {
-	err := d.apActors.SetEnabled(ctx, did, enabled)
+func (d *Dispatcher) mirrorActorEnabled(ctx context.Context, tx *sql.Tx, did string, enabled bool) error {
+	err := d.apActors.SetEnabledTx(ctx, tx, did, enabled)
 	if errors.IsNotFound(err) {
 		d.logger.Debug("federation preference for a DID with no actor",
 			slog.String("did", did), slog.Bool("enabled", enabled))

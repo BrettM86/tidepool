@@ -172,9 +172,12 @@ func (r *HandleResolver) ResolveDIDHandle(ctx context.Context, did string) (stri
 	return handle, nil
 }
 
-// didDocument is the sliver of a DID document this resolver reads.
+// didDocument is the sliver of a DID document this resolver reads: the handle
+// claims, and the services that name where the repo is hosted (see
+// account_status.go, which confirms a deletion against that PDS).
 type didDocument struct {
-	AlsoKnownAs []string `json:"alsoKnownAs"`
+	AlsoKnownAs []string     `json:"alsoKnownAs"`
+	Service     []didService `json:"service"`
 }
 
 // fetchDIDDocument reads the DID document from the PLC directory. Every

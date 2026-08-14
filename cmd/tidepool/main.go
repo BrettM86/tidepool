@@ -29,6 +29,7 @@ import (
 	"tidepool/internal/identity"
 	"tidepool/internal/ingest"
 	"tidepool/internal/materialize"
+	"tidepool/internal/optout"
 	"tidepool/internal/outbound"
 	"tidepool/internal/personas"
 	"tidepool/internal/prune"
@@ -737,12 +738,39 @@ func startConsumer(
 		return nil, nil, fmt.Errorf("consumer: acceptance engine: %w", err)
 	}
 
+	// The DESTRUCTIVE tier (decision 11's second tier): one Delete{Person,
+	// removeData:true} to every inbox this actor's content reached, an Undo for
+	// every vote peers still hold, and a 410 on the actor document. Reached from
+	// TWO doors — an explicit deleteRemote=true record, and a CONFIRMED account
+	// deletion — and never inferred from either.
+	purger := outbound.NewPurger(database, cfg.APUserOrigin, enqueuer).WithLogger(logger)
+
+	// The TERMINAL tier (decision 19): a #account status of deleted is a claim
+	// about a moment that may have passed, so this confirms it against PLC and
+	// the PDS before anything irreversible is sent. The resolver is the
+	// confirmer — it already holds the guarded egress and the directory URL —
+	// and the purger only runs once that confirm comes back true.
+	terminator, err := optout.NewTerminator(optout.Options{
+		Confirmer: resolver,
+		Prefs:     store.NewFederationPrefs(database),
+		Deleter:   purger,
+		Logger:    logger,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("consumer: account terminator: %w", err)
+	}
+
 	dispatcher, err := consume.NewDispatcher(consume.Options{
-		DB:       database,
-		Actors:   minter,
-		Resolver: resolver,
-		Enqueuer: enqueuer,
-		Engine:   engine,
+		DB:         database,
+		Actors:     minter,
+		Resolver:   resolver,
+		Enqueuer:   enqueuer,
+		Engine:     engine,
+		Terminator: terminator,
+		// The record door: enabled=false + deleteRemote=true, written by the
+		// user themselves, so no confirmation is owed — the record IS the
+		// instruction.
+		RemoteDeleter: purger,
 		// Reads committed records so a subject's community resolves for
 		// mappings written before migration 016 filled community_did.
 		Records:    repoManager,

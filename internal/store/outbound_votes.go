@@ -125,6 +125,42 @@ func (r *postgresOutboundVotes) GetByActivityID(ctx context.Context, activityID 
 	return vote, nil
 }
 
+func (r *postgresOutboundVotes) ListDeliveredForActor(ctx context.Context, actorDID string) ([]OutboundVote, error) {
+	if actorDID == "" {
+		return nil, errors.NewValidationError("actor_did", "must not be empty")
+	}
+	// LIVE means exactly delivered_state = 'delivered' — POSITIVE equality, per
+	// decision 16: those are the votes a peer still holds, and the same set the
+	// reseed subtracts from the origin's API tally. A purged actor leaving them
+	// standing is a number the reseed keeps subtracting from a score readers
+	// see, forever, on behalf of somebody who no longer exists.
+	//
+	// Served by the partial index on the same predicate (migration 029).
+	query := `SELECT` + outboundVoteColumns + `
+		FROM outbound_votes
+		WHERE actor_did = $1 AND delivered_state = 'delivered'
+		ORDER BY vote_at_uri`
+
+	rows, err := r.db.QueryContext(ctx, query, actorDID)
+	if err != nil {
+		return nil, fmt.Errorf("list delivered votes for %q: %w", actorDID, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var votes []OutboundVote
+	for rows.Next() {
+		vote, err := scanOutboundVote(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan delivered vote for %q: %w", actorDID, err)
+		}
+		votes = append(votes, *vote)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list delivered votes for %q: %w", actorDID, err)
+	}
+	return votes, nil
+}
+
 func (r *postgresOutboundVotes) SetDeliveredState(ctx context.Context, voteATURI string, state DeliveredState) error {
 	// Validated in Go rather than left to the CHECK constraint: an unknown
 	// state is a caller bug, and the caller needs it back as a validation

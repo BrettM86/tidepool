@@ -150,12 +150,17 @@ func newModerationWorld(t *testing.T, h *harness) moderationWorld {
 	})
 	require.NoError(t, err)
 	dispatcher, err := consume.NewDispatcher(consume.Options{
-		DB:         h.db,
-		Actors:     userOrigin,
-		Enqueuer:   enqueuer,
-		Resolver:   mtResolver{},
-		Engine:     engine,
-		UserOrigin: mtUserOrigin,
+		DB:       h.db,
+		Actors:   userOrigin,
+		Enqueuer: enqueuer,
+		Resolver: mtResolver{},
+		Engine:   engine,
+		// The DESTRUCTIVE opt-out tier, wired exactly as production wires it.
+		// A nil deleter makes deleteRemote=true a Warn and a no-op, which would
+		// let every destructive-tier assertion pass against a tier that was
+		// never reached.
+		RemoteDeleter: outbound.NewPurger(h.db, mtUserOrigin, enqueuer),
+		UserOrigin:    mtUserOrigin,
 	})
 	require.NoError(t, err)
 

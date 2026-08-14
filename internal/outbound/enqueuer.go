@@ -114,23 +114,32 @@ func (e *Enqueuer) EnqueueActivity(ctx context.Context, tx *sql.Tx, actorDID, or
 	}
 
 	// The activity is the atomicity anchor: ON CONFLICT DO NOTHING, so a
-	// redelivered intent re-derives the same id and reports inserted=false.
-	// Because the activity, its mapping and its delivery all ride ONE
-	// transaction, an already-present activity id already has the other two —
-	// so a re-enqueue returns here without re-inserting the delivery (which
-	// would violate its PK and poison the tx).
-	inserted, err := e.activities.InsertTx(ctx, tx, store.OutboundActivity{
+	// redelivered intent re-derives the same id and simply finds it there. The
+	// canonical payload is never rewritten — a peer may already hold it.
+	//
+	// IT DOES NOT DECIDE WHETHER THE DELIVERY EXISTS, and it used to: an early
+	// return here on an already-present activity assumed one activity meant one
+	// delivery, which is true of everything addressed to a single community and
+	// false of the one case the fan-out schema was built for. Delete{Person} is
+	// ONE activity to EVERY inbox an actor reached, so the second leg found the
+	// activity present and returned before resolving an inbox or writing
+	// anything — an erasure request reaching one instance out of many, with an
+	// activity row, a delivery row, a clean worker and clean metrics. It bit on
+	// REDELIVERY rather than first send, which is exactly when the destructive
+	// tier runs.
+	//
+	// The two questions are now asked separately: this one is "does the activity
+	// exist", the delivery's own idempotent insert below is "does THIS delivery
+	// exist" (EnqueueTx, which returns the standing row rather than violating
+	// its PK and poisoning this transaction).
+	if _, err := e.activities.InsertTx(ctx, tx, store.OutboundActivity{
 		ActivityID:  intent.ActivityID(),
 		ActorDID:    actorDID,
 		Kind:        translated.Kind,
 		Payload:     translated.Payload,
 		ParentATURI: parentATURI,
-	})
-	if err != nil {
+	}); err != nil {
 		return fmt.Errorf("insert outbound activity %s: %w", intent.ActivityID(), err)
-	}
-	if !inserted {
-		return nil
 	}
 
 	// The object mapping (bridge-origin) makes GET /ap/object serve the record.
@@ -156,6 +165,63 @@ func (e *Enqueuer) EnqueueActivity(ctx context.Context, tx *sql.Tx, actorDID, or
 		OrderingKey: community,
 	}); err != nil {
 		return fmt.Errorf("enqueue delivery for %s: %w", intent.ActivityID(), err)
+	}
+	return nil
+}
+
+// EnqueueFanOut writes ONE activity and a delivery for EVERY target — the shape
+// EnqueueActivity cannot express, because that one derives its single inbox from
+// the intent's community and this one is addressed to instances rather than to a
+// community.
+//
+// It is the destructive tier's entry point: Delete{Person} goes to every inbox
+// the actor's content reached, from the delivery history (store's
+// DistinctInboxesForActor). The canonical payload is shared by all of them, so
+// the peer sees one erasure request however many times it is addressed.
+//
+// Each target keeps its own ordering key so the withdrawal serializes on the
+// line that instance's other traffic already uses. Duplicates are no-ops: the
+// delivery insert returns the standing row rather than violating its PK, which
+// is what makes a retried fan-out reach the inboxes it missed without disturbing
+// the ones it did not.
+//
+// Zero targets is NOT an error. An actor whose content never reached anyone has
+// nothing to withdraw, and failing here would turn "nothing to do" into an event
+// that retries forever.
+func (e *Enqueuer) EnqueueFanOut(ctx context.Context, tx *sql.Tx, actorDID string,
+	intent consume.Intent, targets []store.DeliveryTarget) error {
+
+	if tx == nil {
+		return errors.NewValidationError("tx", "must not be nil")
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+	actor, err := e.actors.GetByDID(ctx, actorDID)
+	if err != nil {
+		return fmt.Errorf("resolve actor %s: %w", actorDID, err)
+	}
+	translated, err := e.translator.Translate(actor.ActorID, intent)
+	if err != nil {
+		return fmt.Errorf("translate intent %s: %w", intent.ActivityID(), err)
+	}
+	if _, err := e.activities.InsertTx(ctx, tx, store.OutboundActivity{
+		ActivityID: intent.ActivityID(),
+		ActorDID:   actorDID,
+		Kind:       translated.Kind,
+		Payload:    translated.Payload,
+	}); err != nil {
+		return fmt.Errorf("insert outbound activity %s: %w", intent.ActivityID(), err)
+	}
+	for _, target := range targets {
+		if _, err := e.deliveries.EnqueueTx(ctx, tx, store.OutboundDelivery{
+			ActivityID:  intent.ActivityID(),
+			TargetInbox: target.Inbox,
+			OrderingKey: target.OrderingKey,
+		}); err != nil {
+			return fmt.Errorf("enqueue delivery for %s to %s: %w",
+				intent.ActivityID(), target.Inbox, err)
+		}
 	}
 	return nil
 }

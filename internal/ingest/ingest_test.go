@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -687,6 +688,15 @@ func (h *harness) subscribeTechnology() *remoteActor {
 	return group
 }
 
+// originOf is the scheme://host of an AP id.
+func originOf(apID string) string {
+	parsed, err := url.Parse(apID)
+	if err != nil || parsed.Host == "" {
+		return apID
+	}
+	return parsed.Scheme + "://" + parsed.Host
+}
+
 // subscribeCommunityURL subscribes to a SECOND community through the real admin
 // path — resolve, mint, Follow, Accept — and returns its signing handle.
 //
@@ -706,8 +716,13 @@ func (h *harness) subscribeCommunityURL(apGroupID, username string) *remoteActor
 		"id":                apGroupID,
 		"preferredUsername": username,
 		"inbox":             apGroupID + "/inbox",
-		"endpoints":         map[string]any{"sharedInbox": "https://lemmy.world/inbox"},
-		"published":         "2024-01-01T00:00:00.000000Z",
+		// The shared inbox is derived from the community's OWN host, so
+		// co-hosted communities share one (which is what makes ordering_key
+		// rather than target_inbox the thing that carries scope) while
+		// communities on different instances do not (which is what makes a
+		// fan-out across instances expressible at all).
+		"endpoints": map[string]any{"sharedInbox": originOf(apGroupID) + "/inbox"},
+		"published": "2024-01-01T00:00:00.000000Z",
 	})
 
 	rec := h.adminRequest(http.MethodPost, "/admin/communities",

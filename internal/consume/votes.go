@@ -208,7 +208,16 @@ func (d *Dispatcher) applyVoteDelete(ctx context.Context, tx *sql.Tx, did string
 // operationUndo is not a commit operation: it is the outbound op a vote delete
 // becomes, kept distinct from "delete" because an Undo names the activity it
 // withdraws rather than an object.
-const operationUndo = "undo"
+//
+// It is EXPORTED as OperationUndo because the activity id derives from it, and
+// a second producer of vote Undos now exists: the destructive opt-out tier
+// retracts a withdrawn actor's live votes (outbound.Purger). Two copies of the
+// string would mint two different ids for the same operation.
+const operationUndo = OperationUndo
+
+// OperationUndo is the outbound op a vote retraction is derived under. See
+// operationUndo.
+const OperationUndo = "undo"
 
 // communityAPID resolves a community's AP Group id for addressing.
 //

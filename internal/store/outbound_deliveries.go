@@ -28,17 +28,6 @@ const deliveryColumns = `
 	last_error_class, response_excerpt, created_at, updated_at`
 
 func (r *postgresOutboundDeliveries) Enqueue(ctx context.Context, delivery OutboundDelivery) (*OutboundDelivery, error) {
-	return r.enqueue(ctx, r.db, delivery)
-}
-
-func (r *postgresOutboundDeliveries) EnqueueTx(ctx context.Context, tx *sql.Tx, delivery OutboundDelivery) (*OutboundDelivery, error) {
-	if tx == nil {
-		return nil, errors.NewValidationError("tx", "must not be nil")
-	}
-	return r.enqueue(ctx, tx, delivery)
-}
-
-func (r *postgresOutboundDeliveries) enqueue(ctx context.Context, q execer, delivery OutboundDelivery) (*OutboundDelivery, error) {
 	// A fresh delivery is pending, unattempted, unclaimed: state, attempts,
 	// next_attempt_at and seq are all defaulted by the table. A duplicate
 	// (activity, inbox) pair violates the PK — mapped to AlreadyExists rather
@@ -48,13 +37,63 @@ func (r *postgresOutboundDeliveries) enqueue(ctx context.Context, q execer, deli
 		VALUES ($1, $2, $3)
 		RETURNING` + deliveryColumns
 
-	stored, err := scanOutboundDelivery(q.QueryRowContext(ctx, query,
+	stored, err := scanOutboundDelivery(r.db.QueryRowContext(ctx, query,
 		delivery.ActivityID, delivery.TargetInbox, delivery.OrderingKey))
 	if err != nil {
 		if _, ok := uniqueViolation(err); ok {
 			return nil, errors.NewConflictError("outbound_delivery", "activity_inbox",
 				delivery.ActivityID+" "+delivery.TargetInbox)
 		}
+		return nil, fmt.Errorf("enqueue outbound_delivery %q -> %q: %w",
+			delivery.ActivityID, delivery.TargetInbox, err)
+	}
+	return stored, nil
+}
+
+func (r *postgresOutboundDeliveries) EnqueueTx(ctx context.Context, tx *sql.Tx, delivery OutboundDelivery) (*OutboundDelivery, error) {
+	if tx == nil {
+		return nil, errors.NewValidationError("tx", "must not be nil")
+	}
+	// IDEMPOTENT, unlike its pool-backed sibling above, and the difference is
+	// deliberate on both sides.
+	//
+	// This one rides a CALLER'S transaction, where a unique violation is not an
+	// error the caller can inspect and move past — postgres aborts the whole
+	// transaction, taking the rev-gate advance riding it down too, so the event
+	// replays forever. And a duplicate here is not a caller bug: ONE activity
+	// fans out to MANY inboxes (Delete{Person} to every community an actor
+	// delivered to), so a redelivery legitimately re-enqueues pairs that already
+	// exist while others still need writing.
+	//
+	// The STANDING row wins. Re-enqueueing must never reset a delivery that has
+	// since been delivered, cancelled by an opt-out, or poisoned — the row's
+	// state is the record of what happened to it. That also settles the
+	// co-hosted case: two communities sharing one inbox collapse to a single
+	// delivery, keeping the ordering key of the first, because one POST to that
+	// inbox is one POST however many communities it serves.
+	query := `
+		INSERT INTO outbound_deliveries (activity_id, target_inbox, ordering_key)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (activity_id, target_inbox) DO NOTHING
+		RETURNING` + deliveryColumns
+
+	stored, err := scanOutboundDelivery(tx.QueryRowContext(ctx, query,
+		delivery.ActivityID, delivery.TargetInbox, delivery.OrderingKey))
+	if stderrors.Is(err, sql.ErrNoRows) {
+		// DO NOTHING returns no row, so the delivery was already there. Read it
+		// back on the same transaction: callers get the same contract either way
+		// — a row that exists — and never have to tell the two apart.
+		existing, rerr := scanOutboundDelivery(tx.QueryRowContext(ctx,
+			`SELECT`+deliveryColumns+` FROM outbound_deliveries
+			  WHERE activity_id = $1 AND target_inbox = $2`,
+			delivery.ActivityID, delivery.TargetInbox))
+		if rerr != nil {
+			return nil, fmt.Errorf("read existing outbound_delivery %q -> %q: %w",
+				delivery.ActivityID, delivery.TargetInbox, rerr)
+		}
+		return existing, nil
+	}
+	if err != nil {
 		return nil, fmt.Errorf("enqueue outbound_delivery %q -> %q: %w",
 			delivery.ActivityID, delivery.TargetInbox, err)
 	}
@@ -225,9 +264,22 @@ func (r *postgresOutboundDeliveries) markResult(ctx context.Context, op, query s
 }
 
 func (r *postgresOutboundDeliveries) CancelForActor(ctx context.Context, actorDID string) (int64, error) {
-	// Consent/kill-switch withdrawal: park the actor's PENDING work as
-	// cancelled (never poisoned — this is not a failure). Terminal deliveries
-	// are left untouched. Joined through outbound_activities.actor_did.
+	return cancelForActor(ctx, r.db, actorDID)
+}
+
+func (r *postgresOutboundDeliveries) CancelForActorTx(ctx context.Context, tx *sql.Tx, actorDID string) (int64, error) {
+	if tx == nil {
+		return 0, errors.NewValidationError("tx", "must not be nil")
+	}
+	return cancelForActor(ctx, tx, actorDID)
+}
+
+// cancelForActor is the consent/kill-switch withdrawal: park the actor's
+// PENDING work as cancelled (never poisoned — this is not a failure) across
+// EVERY community they have work in, because the decision is about the actor.
+// Terminal deliveries are left untouched. Joined through
+// outbound_activities.actor_did.
+func cancelForActor(ctx context.Context, ex execer, actorDID string) (int64, error) {
 	query := `
 		UPDATE outbound_deliveries d
 		SET state = 'cancelled', claimed_until = NULL, updated_at = now()
@@ -236,7 +288,15 @@ func (r *postgresOutboundDeliveries) CancelForActor(ctx context.Context, actorDI
 		  AND a.actor_did = $1
 		  AND d.state = 'pending'`
 
-	return r.cancel(ctx, "cancel outbound_deliveries for actor", query, actorDID)
+	result, err := ex.ExecContext(ctx, query, actorDID)
+	if err != nil {
+		return 0, fmt.Errorf("cancel outbound_deliveries for actor %q: %w", actorDID, err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("cancel outbound_deliveries for actor %q: rows affected: %w", actorDID, err)
+	}
+	return affected, nil
 }
 
 func (r *postgresOutboundDeliveries) CancelForCommunity(ctx context.Context, orderingKey string) (int64, error) {
@@ -298,6 +358,57 @@ func (r *postgresOutboundDeliveries) cancel(ctx context.Context, op, query strin
 		return 0, fmt.Errorf("%s %q: rows affected: %w", op, arg, err)
 	}
 	return affected, nil
+}
+
+func (r *postgresOutboundDeliveries) DistinctInboxesForActor(ctx context.Context, actorDID string) ([]DeliveryTarget, error) {
+	if actorDID == "" {
+		return nil, errors.NewValidationError("actor_did", "must not be empty")
+	}
+	// THE DELIVERY HISTORY IS THE ADDRESS BOOK. There is no other record of
+	// which instances hold a user's content: an erasure has to go where the
+	// content actually went, and that is these rows.
+	//
+	// DISTINCT ON the inbox, because the fan-out is per INSTANCE: co-hosted
+	// communities share one inbox, and asking it twice sends the same instance
+	// the same erasure twice. Each surviving row keeps a REAL ordering key from
+	// the history, so the withdrawal serializes on a line the actor's other work
+	// already uses rather than jumping an independent queue.
+	//
+	// EVERY state counts, terminal ones included. A delivered post is exactly
+	// what has to be withdrawn; a poisoned or cancelled one may still have
+	// reached the peer (the wire and the ledger disagree by definition in those
+	// states), and reaching an instance that does not hold the content is
+	// harmless while missing one that does is not.
+	//
+	// KNOWN GAP, and it is the honest boundary of what this can reach: an
+	// instance that discovered the actor through search or WebFinger and never
+	// received a delivery from us has no row here, so the erasure never reaches
+	// it. Nothing in the bridge's state knows about that instance.
+	query := `
+		SELECT DISTINCT ON (d.target_inbox) d.target_inbox, d.ordering_key
+		FROM outbound_deliveries d
+		JOIN outbound_activities a ON a.activity_id = d.activity_id
+		WHERE a.actor_did = $1
+		ORDER BY d.target_inbox, d.seq`
+
+	rows, err := r.db.QueryContext(ctx, query, actorDID)
+	if err != nil {
+		return nil, fmt.Errorf("list delivery inboxes for %q: %w", actorDID, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var targets []DeliveryTarget
+	for rows.Next() {
+		var target DeliveryTarget
+		if err := rows.Scan(&target.Inbox, &target.OrderingKey); err != nil {
+			return nil, fmt.Errorf("scan delivery inbox for %q: %w", actorDID, err)
+		}
+		targets = append(targets, target)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list delivery inboxes for %q: %w", actorDID, err)
+	}
+	return targets, nil
 }
 
 func (r *postgresOutboundDeliveries) Get(ctx context.Context, activityID, targetInbox string) (*OutboundDelivery, error) {

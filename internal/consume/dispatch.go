@@ -114,6 +114,30 @@ type PostIntent struct {
 // ActivityID reports the deterministic activity id.
 func (i PostIntent) ActivityID() string { return i.ID }
 
+// PersonDeleteIntent withdraws a native user's whole identity from the
+// fediverse: Delete{Person, removeData: true}, the destructive opt-out tier
+// (decision 11's second tier, task 17d).
+//
+// It is ONE activity addressed to MANY inboxes — every instance this actor's
+// content ever reached — which is what makes it the only intent here with no
+// CommunityAPID: the targets come from the delivery history, not from a
+// community, and the canonical payload is shared by every one of them.
+//
+// The shape lives here beside its siblings while the producer lives in
+// outbound (the Purger), exactly as PostIntent's does.
+//
+// IRREVERSIBLE. Lemmy un-deletes a person on refetch; other software does not,
+// and nothing in this codebase may promise resurrection.
+type PersonDeleteIntent struct {
+	// ActorDID is the user being withdrawn.
+	ActorDID string
+	// ID is the deterministic activity id.
+	ID string
+}
+
+// ActivityID reports the deterministic activity id.
+func (i PersonDeleteIntent) ActivityID() string { return i.ID }
+
 // OutboundEnqueuer is the task 15 seam. main wires the real persisting enqueuer
 // (outbound.Enqueuer, which writes outbound_activities/deliveries on the gate
 // tx) whenever CONSUMER_ENABLED; the noop is the consumer-disabled default.
@@ -195,6 +219,9 @@ type Options struct {
 	Votes          store.OutboundVotes
 	Communities    store.Communities
 	ObjectMappings store.APObjects
+	// Deliveries is the outbound queue the opt-out cancels an actor's pending
+	// work in — on the rev-gate transaction, together with the actor mirror.
+	Deliveries store.OutboundDeliveries
 	// Bans reads whether the community a comment or vote is bound for has banned
 	// its author (task 17c-3 review). The acceptance engine gates POSTS; nothing
 	// else does, and a banned author's replies and votes enqueue to a community
@@ -235,6 +262,7 @@ type Dispatcher struct {
 	communities    store.Communities
 	moderation     store.ObjectModeration
 	bans           store.CommunityBans
+	deliveries     store.OutboundDeliveries
 	records        materialize.RecordGetter
 	hosted         *hostedRepos
 	gate           *RevGate
@@ -306,6 +334,7 @@ func NewDispatcher(opts Options) (*Dispatcher, error) {
 		communities:    orDefault[store.Communities](opts.Communities, store.NewCommunities(opts.DB)),
 		moderation:     orDefault[store.ObjectModeration](opts.Moderation, store.NewObjectModeration(opts.DB)),
 		bans:           orDefault[store.CommunityBans](opts.Bans, store.NewCommunityBans(opts.DB)),
+		deliveries:     orDefault[store.OutboundDeliveries](opts.Deliveries, store.NewOutboundDeliveries(opts.DB)),
 		records:        opts.Records,
 		hosted:         newHostedRepos(opts.DB),
 		gate:           NewRevGate(opts.DB),

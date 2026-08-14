@@ -196,6 +196,16 @@ type CommunityBan struct {
 	RemoveData bool
 }
 
+// DeliveryTarget is one place an actor's content has already been delivered:
+// the inbox that received it, and an ordering key that inbox's traffic is
+// already serialized on. It is what a fan-out addresses — one activity, many
+// targets — and it comes from the delivery history rather than from the
+// communities table, because the question is where the content WENT.
+type DeliveryTarget struct {
+	Inbox       string
+	OrderingKey string
+}
+
 // ServiceKey is one of the bridge's own long-lived keys, keyed by purpose
 // name. KeyMaterial's encoding is per-row: plaintext PKCS#8 PEM for
 // "service-actor" (the AP-side RSA signing key — the bridge's own service
@@ -251,12 +261,18 @@ const (
 	FederationPrefSourceRecord FederationPrefSource = "record"
 	// FederationPrefSourceProbe means the bridge fetched the record itself.
 	FederationPrefSourceProbe FederationPrefSource = "probe"
+	// FederationPrefSourceAccount means the preference was not expressed by the
+	// user at all: their ACCOUNT is gone, confirmed against PLC and the PDS by
+	// the terminal tier (decision 19). It is the one value that distinguishes a
+	// user who opted out — a decision they can reverse — from one who was
+	// deleted, which they cannot.
+	FederationPrefSourceAccount FederationPrefSource = "account"
 )
 
 // Valid reports whether the value is a known source.
 func (s FederationPrefSource) Valid() bool {
 	switch s {
-	case FederationPrefSourceRecord, FederationPrefSourceProbe:
+	case FederationPrefSourceRecord, FederationPrefSourceProbe, FederationPrefSourceAccount:
 		return true
 	}
 	return false

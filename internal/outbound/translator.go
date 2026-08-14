@@ -64,6 +64,8 @@ func (t *Translator) Translate(actorID string, intent consume.Intent) (*Translat
 		return t.post(actorID, typed)
 	case consume.VoteIntent:
 		return t.vote(actorID, typed)
+	case consume.PersonDeleteIntent:
+		return t.personDelete(actorID, typed)
 	default:
 		return nil, errors.NewValidationError("intent", fmt.Sprintf("no translation for %T", intent))
 	}
@@ -201,6 +203,36 @@ func (t *Translator) wrapActivity(kind, id, actorID, communityAPID string, objec
 		"audience": communityAPID,
 		"object":   object,
 	}
+}
+
+// personDelete renders the destructive opt-out: Delete{Person, removeData:true}.
+//
+// The ACTOR AND THE OBJECT ARE THE SAME ID, because this is the user withdrawing
+// themselves — the one activity this bridge sends that is about its own sender.
+//
+// removeData is what makes it a purge rather than a marker. Verified against
+// Lemmy 0.19: without it, Delete{Person} marks the person deleted and KEEPS
+// their content; with it, the content is purged. A destructive tier that omitted
+// it would leave every post standing while reporting success.
+//
+// It carries NO cc and NO audience, unlike every other activity here. Those name
+// the one community an activity is for, and this one is for every instance the
+// user ever reached — one canonical payload, fanned out over many inboxes, so it
+// cannot name any of them. `to` is Public, which is what the addressing means
+// when the audience is "everyone who holds this identity".
+func (t *Translator) personDelete(actorID string, intent consume.PersonDeleteIntent) (*TranslatedActivity, error) {
+	if intent.ActorDID == "" {
+		return nil, errors.NewValidationError("actorDid", "must not be empty")
+	}
+	return t.finish(intent.ID, "Delete", "", map[string]any{
+		"@context":   contextActivityStreams,
+		"id":         intent.ID,
+		"type":       "Delete",
+		"actor":      actorID,
+		"object":     actorID,
+		"removeData": true,
+		"to":         []string{ap.PublicAudience},
+	})
 }
 
 // deleteActivity is a self-delete: a Delete of the bare object URL and NOTHING

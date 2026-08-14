@@ -215,9 +215,35 @@ type APActors interface {
 	// missing actor is an error satisfying errors.IsNotFound.
 	SetEnabled(ctx context.Context, did string, enabled bool) error
 
+	// SetEnabledTx is SetEnabled on an existing transaction — the seam the
+	// opt-out uses so the flag and the cancellation of the actor's queued work
+	// land together. Half of that state is a silent wrong answer in either
+	// direction: an actor disabled with live deliveries keeps publishing for
+	// someone who opted out, and cancelled deliveries under an enabled actor
+	// lose work while the bridge believes it still federates for them. A nil tx
+	// is an error satisfying errors.IsValidation.
+	SetEnabledTx(ctx context.Context, tx *sql.Tx, did string, enabled bool) error
+
 	// SetPaused toggles delivery_paused (the transient #account state).
 	// A missing actor is an error satisfying errors.IsNotFound.
 	SetPaused(ctx context.Context, did string, paused bool) error
+
+	// Tombstone withdraws the identity (task 17d's destructive tier): the actor
+	// document answers 410 Gone from then on, and the actor is disabled in the
+	// same statement so it cannot stay discoverable after being withdrawn.
+	//
+	// TERMINAL. Nothing clears it, and nothing here promises resurrection:
+	// peers that honoured the Delete this accompanies cannot restore what they
+	// dropped. Re-tombstoning preserves the original time. A missing actor is an
+	// error satisfying errors.IsNotFound.
+	Tombstone(ctx context.Context, did string) error
+
+	// TombstoneTx is Tombstone on an existing transaction — the seam the
+	// destructive tier uses so the withdrawal and the activities that announce
+	// it commit together. An actor tombstoned without the Delete being enqueued
+	// is an identity that vanished while its content stayed. A nil tx is an
+	// error satisfying errors.IsValidation.
+	TombstoneTx(ctx context.Context, tx *sql.Tx, did string) error
 
 	// UpdateProfile refreshes the cached display name, summary, and avatar
 	// and bumps updated_at. It NEVER touches local_part — the identity
@@ -490,6 +516,12 @@ type OutboundVotes interface {
 	// from the one activity id. A miss is an error satisfying errors.IsNotFound.
 	GetByActivityID(ctx context.Context, activityID string) (*OutboundVote, error)
 
+	// ListDeliveredForActor returns the actor's LIVE votes — the ones a peer
+	// still holds (delivered_state = 'delivered'). It is the destructive tier's
+	// input: a purged actor's standing votes are what the reseed keeps
+	// subtracting from a served score forever.
+	ListDeliveredForActor(ctx context.Context, actorDID string) ([]OutboundVote, error)
+
 	// SetDeliveredState transitions the delivery state. An unknown state is
 	// an error satisfying errors.IsValidation; a missing vote is an error
 	// satisfying errors.IsNotFound.
@@ -599,7 +631,18 @@ type OutboundDeliveries interface {
 	Enqueue(ctx context.Context, delivery OutboundDelivery) (*OutboundDelivery, error)
 
 	// EnqueueTx is Enqueue on an existing transaction — rides the enqueuer's
-	// gate tx. A nil tx is an error satisfying errors.IsValidation.
+	// gate tx — and is IDEMPOTENT where Enqueue refuses: a duplicate (activity,
+	// inbox) returns the STANDING row instead of an error.
+	//
+	// Both halves of that are load-bearing. A unique violation inside a caller's
+	// transaction aborts the whole transaction, so the rev-gate advance riding it
+	// dies too and the event replays forever. And a duplicate is not a caller
+	// bug here: ONE activity fans out to MANY inboxes, so a redelivery re-visits
+	// pairs that already exist while others still need writing. Returning the
+	// standing row (never resetting it) is what keeps a delivered, cancelled or
+	// poisoned delivery from being revived by a replay.
+	//
+	// A nil tx is an error satisfying errors.IsValidation.
 	EnqueueTx(ctx context.Context, tx *sql.Tx, delivery OutboundDelivery) (*OutboundDelivery, error)
 
 	// ClaimNext atomically claims the oldest processable delivery and
@@ -639,7 +682,17 @@ type OutboundDeliveries interface {
 	// cancelled (the consent/kill-switch withdrawal — a disabled or paused
 	// actor's create/update work is parked, never poisoned). Terminal
 	// deliveries are untouched. Returns how many rows were cancelled.
+	//
+	// It is scoped to the ACTOR across every community they have work in,
+	// because that is the scope of the decision: an opt-out cancelled per
+	// community would leave the user federating everywhere else they ever
+	// posted. (A community BAN is the other shape and has its own statement.)
 	CancelForActor(ctx context.Context, actorDID string) (int64, error)
+
+	// CancelForActorTx is CancelForActor on an existing transaction — the other
+	// half of the opt-out's atomic pair (see APActors.SetEnabledTx). A nil tx is
+	// an error satisfying errors.IsValidation.
+	CancelForActorTx(ctx context.Context, tx *sql.Tx, actorDID string) (int64, error)
 
 	// CancelForCommunity moves every PENDING delivery on an ordering key (a
 	// community AP id) to cancelled — a community deleted or unfollowed out
@@ -649,6 +702,14 @@ type OutboundDeliveries interface {
 	// Get returns the delivery for an (activity, inbox) pair. A miss is an
 	// error satisfying errors.IsNotFound.
 	Get(ctx context.Context, activityID, targetInbox string) (*OutboundDelivery, error)
+
+	// DistinctInboxesForActor lists every inbox this actor's content has been
+	// delivered to, one row per inbox, each carrying an ordering key from the
+	// history. It is the address book the destructive tier fans a Delete{Person}
+	// out over — the delivery history is the only record of which instances hold
+	// a user's content — and it is deliberately blind to delivery STATE (see the
+	// implementation for why, and for the instances it cannot reach).
+	DistinctInboxesForActor(ctx context.Context, actorDID string) ([]DeliveryTarget, error)
 
 	// ParentDeliveryPoisoned reports whether the delivery of the child's ACTUAL
 	// parent (the activity that federated parentATURI as its object, to the same

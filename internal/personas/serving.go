@@ -223,6 +223,21 @@ func (s *Service) handleActorDocument(w http.ResponseWriter, r *http.Request, di
 		http.NotFound(w, r)
 		return
 	}
+	// WITHDRAWN (task 17d's destructive tier): 410 Gone, and specifically not
+	// 404. Gone is the statement "this existed and was withdrawn", which is what
+	// lets a peer stop re-fetching and clean up its own copy; 404 reads as
+	// "never heard of them", which several implementations treat as a transient
+	// lookup failure and retry indefinitely.
+	//
+	// This is the ONE observable difference between the two opt-out tiers, which
+	// is why it is a status code rather than a flag: a soft-disabled actor's
+	// document keeps resolving, because every Note and Page already delivered
+	// names it and revoking it would orphan the author reference on every
+	// existing thread.
+	if actor.IsTombstoned() {
+		http.Error(w, "gone", http.StatusGone)
+		return
+	}
 
 	origin, err := actorOrigin(actor)
 	if err != nil {

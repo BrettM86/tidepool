@@ -91,7 +91,12 @@ type moderationWorld struct {
 	digestRKey    string
 }
 
-func newModerationWorld(t *testing.T, h *harness) moderationWorld {
+// newModerationWorld builds that world. The variadic hooks mutate the
+// consumer's Options just before the dispatcher is built, which is the only way
+// to express a deployment where one 17d SEAM IS ABSENT — a nil seam and a seam
+// that is never called are different states, and only the first one can be
+// reached by leaving the field unset.
+func newModerationWorld(t *testing.T, h *harness, mutate ...func(*consume.Options)) moderationWorld {
 	t.Helper()
 	ctx := context.Background()
 	groupA := h.subscribeTechnology()
@@ -149,7 +154,7 @@ func newModerationWorld(t *testing.T, h *harness) moderationWorld {
 		UserOrigin:  mtUserOrigin,
 	})
 	require.NoError(t, err)
-	dispatcher, err := consume.NewDispatcher(consume.Options{
+	consumerOpts := consume.Options{
 		DB:       h.db,
 		Actors:   userOrigin,
 		Enqueuer: enqueuer,
@@ -161,7 +166,11 @@ func newModerationWorld(t *testing.T, h *harness) moderationWorld {
 		// never reached.
 		RemoteDeleter: outbound.NewPurger(h.db, mtUserOrigin, enqueuer),
 		UserOrigin:    mtUserOrigin,
-	})
+	}
+	for _, apply := range mutate {
+		apply(&consumerOpts)
+	}
+	dispatcher, err := consume.NewDispatcher(consumerOpts)
 	require.NoError(t, err)
 
 	// --- The post is admitted through the real path: acceptance record,

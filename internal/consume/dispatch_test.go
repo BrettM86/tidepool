@@ -37,7 +37,12 @@ func dispatchTestDB(t *testing.T) *sql.DB {
 		// here the moment any test WRITES it, or a leftover row refuses the
 		// next test's author and the failure names neither the ban nor the
 		// test that left one.
-		"object_moderation", "community_bans")
+		"object_moderation", "community_bans",
+		// The outbound queue. Nothing in this package writes it through a
+		// recorder, which is exactly why it belongs here: 17d's terminal tier
+		// asserts that an unwired destructive seam sends NOTHING, and "no rows"
+		// is only an assertion about this event if the table started empty.
+		"outbound_deliveries", "outbound_activities")
 	return database
 }
 

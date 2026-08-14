@@ -528,7 +528,12 @@ func (w *Worker) poison(ctx context.Context, delivery *store.OutboundDelivery, c
 // an outcome class, not an error class — park and parkCausal already use the
 // same column for held-not-failed states — and it is the durable fact that lets
 // a retry finish the job without repeating the POST.
-const deliveryLedgerUnsettled = "ledger_unsettled"
+//
+// It is the STORE's constant, not a copy: every cancellation excludes rows
+// carrying this class, and a second spelling here would let the resume path and
+// the cancellations disagree about which rows are held — the disagreement being
+// silent, and fatal in the direction where a cancel wins.
+const deliveryLedgerUnsettled = store.DeliveryHeldForSettlement
 
 // statusOf is the status a held delivery was accepted with, so its settlement
 // records the same outcome the wire actually produced.

@@ -274,6 +274,51 @@ func (r *postgresOutboundDeliveries) CancelForActorTx(ctx context.Context, tx *s
 	return cancelForActor(ctx, tx, actorDID)
 }
 
+// DeliveryHeldForSettlement is the last_error_class of a delivery the PEER HAS
+// ALREADY ACCEPTED whose local settlement — the causal stamp, the vote ledger —
+// has not committed yet. The row deliberately stays `pending` so a worker can
+// re-claim it and finish the bookkeeping WITHOUT repeating the POST (task 17b).
+//
+// The column is this package's, so the vocabulary lives here and the worker
+// reads it from here: two copies of the string would let a cancellation and a
+// resume disagree about which rows are held, which is exactly the bug the
+// predicate below exists to prevent.
+const DeliveryHeldForSettlement = "ledger_unsettled"
+
+// notHeldForSettlement is the term EVERY cancellation carries, and it is one
+// constant rather than three because forgetting it is silent.
+//
+// A cancellation answers "this must not go out". A held delivery already WENT
+// out: the peer holds the activity, and the only thing outstanding is our own
+// record of that. Cancelling is terminal, so the worker never returns to it and
+// the settlement is stranded — and the stranding is invisible until it surfaces
+// somewhere else entirely. Two places, both crossing sub-run boundaries: the
+// vote reseed subtracts only `delivered` rows, so a stranded one over-counts a
+// served score forever; and the destructive tier enumerates a purged actor's
+// live votes from that same column, so the Undo an erasure owes the peer is
+// never enqueued and an erased user's vote stands on an instance nobody told.
+//
+// It is the same rule as "terminal rows are untouched", one state over: a
+// decision that arrives LATER may not rewrite the record of something that has
+// already happened. There is nothing to stop here — the send is done.
+//
+// IS DISTINCT FROM rather than <>, and the reason is NOT that NULLs exist:
+// last_error_class is NOT NULL DEFAULT ” (migration 020), so a plain <> is
+// correct today and both forms cancel the ordinary never-failed row. The
+// NULL-safe form is used because this one fragment is pasted into every
+// cancellation there is, and under <> the day that column becomes nullable is
+// the day EVERY cancellation silently stops matching the rows it exists to
+// cancel — a failure that shows up as deliveries going out after a user asked
+// us to stop, nowhere near the schema change that caused it.
+//
+// The value is interpolated from a CONSTANT and never from input, which is what
+// lets one fragment drop into statements with different parameter counts. The
+// column name is unqualified deliberately: outbound_activities (the only table
+// any of these statements joins) has no such column, so it is unambiguous
+// everywhere and stays correct whether the target is aliased or not.
+const notHeldForSettlement = `
+		  AND last_error_class IS DISTINCT FROM '` + DeliveryHeldForSettlement + `'`
+
 // cancelForActor is the consent/kill-switch withdrawal: park the actor's
 // PENDING work as cancelled (never poisoned — this is not a failure) across
 // EVERY community they have work in, because the decision is about the actor.
@@ -286,7 +331,7 @@ func cancelForActor(ctx context.Context, ex execer, actorDID string) (int64, err
 		FROM outbound_activities a
 		WHERE d.activity_id = a.activity_id
 		  AND a.actor_did = $1
-		  AND d.state = 'pending'`
+		  AND d.state = 'pending'` + notHeldForSettlement
 
 	result, err := ex.ExecContext(ctx, query, actorDID)
 	if err != nil {
@@ -305,7 +350,7 @@ func (r *postgresOutboundDeliveries) CancelForCommunity(ctx context.Context, ord
 	query := `
 		UPDATE outbound_deliveries
 		SET state = 'cancelled', claimed_until = NULL, updated_at = now()
-		WHERE ordering_key = $1 AND state = 'pending'`
+		WHERE ordering_key = $1 AND state = 'pending'` + notHeldForSettlement
 
 	return r.cancel(ctx, "cancel outbound_deliveries for community", query, orderingKey)
 }
@@ -336,7 +381,7 @@ func cancelPendingForActorInCommunity(ctx context.Context, ex execer, actorDID, 
 		WHERE d.activity_id = a.activity_id
 		  AND a.actor_did = $1
 		  AND d.ordering_key = $2
-		  AND d.state = 'pending'`, actorDID, orderingKey)
+		  AND d.state = 'pending'`+notHeldForSettlement, actorDID, orderingKey)
 	if err != nil {
 		return 0, fmt.Errorf("cancel outbound_deliveries for %q in %q: %w", actorDID, orderingKey, err)
 	}
@@ -458,7 +503,7 @@ func (r *postgresOutboundDeliveries) CancelClaimed(ctx context.Context, activity
 			SET state = 'cancelled', claimed_until = NULL, updated_at = now()
 			WHERE activity_id = $1 AND target_inbox = $2
 			  AND state = 'pending'
-			  AND claimed_until = $3
+			  AND claimed_until = $3` + notHeldForSettlement + `
 			RETURNING 1
 		)
 		SELECT

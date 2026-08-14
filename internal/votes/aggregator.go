@@ -18,6 +18,7 @@ import (
 	"context"
 	"database/sql"
 	stderrors "errors"
+	"expvar"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -31,11 +32,46 @@ import (
 	"tidepool/internal/store"
 )
 
-// echoVoteLogInterval throttles the suppressed-voter log. Suppression is rare
-// by construction, so the sampler costs nothing in steady state — but the
-// failure mode this log exists to expose is a probe that has started matching
-// GENUINE voters, and that one arrives at full vote volume.
-const echoVoteLogInterval = time.Second
+// voteWarnInterval throttles each of the aggregator's rare-but-loud notices: a
+// suppressed voter, and a clamped seed baseline. Both are rare by construction,
+// so a sampler costs nothing in steady state — but each announces itself at
+// volume in exactly the failure it exists to expose (a probe that has started
+// matching GENUINE voters; an origin whose totals no longer contain the votes
+// we wrote back), and one line per vote or per backfilled post would bury it.
+//
+// The interval is shared; the SAMPLERS are not. Their causes are correlated —
+// switching write-back on produces echoed votes AND clamped baselines — so one
+// sampler would let each signal suppress the other in every window of precisely
+// the incident both lines exist to describe.
+const voteWarnInterval = time.Second
+
+// SeedBaselineClamped counts seeds whose computed baseline came out NEGATIVE
+// and was clamped to zero: the origin's total for that DIRECTION was smaller
+// than the votes we can already account for on that subject.
+//
+// Read it for what it is — a floor breach, not a discard detector. It can only
+// fire where api_total < live + ours, i.e. on subjects whose entire fediverse
+// tally is smaller than the deficit; on any post with a real score, an origin
+// silently discarding the votes we write back (a restrictive Lemmy
+// FederationMode, decision 16's named risk) understates the served tally with
+// the raw baseline still comfortably positive, and this counter stays at zero.
+// SeedOursSubtracted is the signal that covers those subjects.
+//
+// The "tidepool_" prefix is load-bearing: the admin metrics surface serves ONLY
+// that prefix, so a counter named without it is published to expvar and then
+// filtered straight back out — indistinguishable from a counter that never
+// fires.
+var SeedBaselineClamped = expvar.NewInt("tidepool_vote_seed_baseline_clamped")
+
+// SeedOursSubtracted totals the delivered outbound votes netted out of seeded
+// baselines, across directions and subjects.
+//
+// It is the volume half of the clamp's signal, and unlike the clamp it advances
+// on ordinary healthy subjects: it says how many votes the bridge BELIEVES the
+// origin is holding for our personas. Compared against a Lemmy-side sample of
+// the same posts, a persistent gap is a discard being absorbed silently —
+// which the clamp only ever catches on near-zero-score subjects.
+var SeedOursSubtracted = expvar.NewInt("tidepool_vote_seed_ours_subtracted")
 
 // Vote directions (vote_events.direction).
 const (
@@ -90,6 +126,7 @@ type Aggregator struct {
 	records     RecordReader
 	voters      VoterProbe
 	echoLog     *ratelimit.Sampler
+	clampLog    *ratelimit.Sampler
 	logger      *slog.Logger
 }
 
@@ -119,7 +156,10 @@ func NewAggregator(db *sql.DB, objects store.APObjects, communities store.Commun
 		logger = slog.Default()
 	}
 	return &Aggregator{db: db, objects: objects, communities: communities, records: records,
-		voters: voters, echoLog: ratelimit.NewSampler(echoVoteLogInterval), logger: logger}, nil
+		voters:   voters,
+		echoLog:  ratelimit.NewSampler(voteWarnInterval),
+		clampLog: ratelimit.NewSampler(voteWarnInterval),
+		logger:   logger}, nil
 }
 
 // ApplyVote records one Like or Dislike: insert the activity (duplicate
@@ -401,27 +441,62 @@ func (a *Aggregator) RetractVote(ctx context.Context, vote *ap.Object, community
 // activities the bridge never saw (Lemmy outboxes announce historical votes
 // only sparsely). Live vote_events stack on top of the baseline.
 //
-// The origin's counts are a TOTAL: they include every vote that ALSO
-// federated live and sits in vote_events as a live row (any vote cast after
-// the community was subscribed). Storing them raw would count those voters
-// twice — once in the baseline, once in the recompute's live term — so the
-// baseline is stored NET of the subject's live counts, per direction,
-// clamped at zero. Served totals therefore equal the origin's counts at
-// seed time, and live events stack on top from there. This also makes a
-// re-seed (backfill redo) the drift healer: a voter counted only in the
-// baseline who later flips federates a bare Dislike (Lemmy sends no Undo on
+// WHAT THE SERVED AGGREGATE MEANS (task 17b). The Coves appview (a separate
+// repo) keeps native and bridged tallies in SEPARATE columns on its post
+// record — bridged_upvote_count beside the native count — so what Tidepool
+// serves is the FEDIVERSE-ONLY tally:
+//
+//	served(subject) = api_total(subject) − { our personas' votes Lemmy currently holds }
+//
+// The origin's counts are a TOTAL, and two populations inside it are already
+// accounted for elsewhere:
+//
+//   - votes that ALSO federated live and sit in vote_events as live rows (any
+//     vote cast after the community was subscribed). Keeping them counts those
+//     voters twice — once in the baseline, once in the recompute's live term;
+//   - votes TIDEPOOL ITSELF wrote back for native users, which Lemmy is holding
+//     and reporting. Coves counts those in its NATIVE column, so keeping them
+//     counts one person's single vote twice across the two columns in the UI.
+//
+// So the baseline is stored NET of both, per direction, clamped at zero. See
+// reportSeed for what the seed publishes about that: the volume it subtracted,
+// and — on the rare subject whose whole tally is smaller than the deficit — the
+// clamp that would otherwise absorb the difference in silence.
+//
+// The subtraction lives in the BASELINE rather than the served columns because
+// recomputeAggregate rewrites the served columns on every single inbound vote:
+// a correction applied there would be undone minutes later by the next voter,
+// with nothing connecting the drift back to the seed.
+//
+// A re-seed (backfill redo) is also the drift healer: a voter counted only in
+// the baseline who later flips federates a bare Dislike (Lemmy sends no Undo on
 // flips), leaving the retired upvote in the baseline next to the new live
-// downvote — until the next re-seed, whose subtraction converges the served
-// totals back to the origin's truth. Two symmetric residual races span the
-// origin API fetch and this transaction, both transient and self-healing on
-// the next re-seed (the pre-fix over-count race was PERMANENT and compounding):
+// downvote — until the next re-seed converges the served totals back. But
+// nothing re-seeds PERIODICALLY: the one caller is ingest's Backfill.seedCounts
+// on its post walk, behind SEED_COUNTS_FROM_API, and an un-forced trigger skips
+// the whole run inside the freshness window — so for a quiet community "heals
+// on the next re-seed" can mean "heals when an admin forces a backfill", and
+// may mean never.
+//
+// Three residual races span the origin API fetch and this transaction. All are
+// transient and self-healing on the next re-seed, with the caveat above (the
+// pre-fix over-count race was PERMANENT and compounding):
 //   - under-count by one: a vote federates AFTER the fetch but is live here, so
 //     it is net-subtracted from the baseline yet not present in the fetched
 //     total;
 //   - over-count by one (the mirror): a vote already IN the fetched total whose
 //     federated activity arrives AFTER this seed tx — the net-of-live
 //     subtraction cannot yet see it as a live row, so the baseline keeps it AND
-//     the later live event adds it again, until the next re-seed reconciles.
+//     the later live event adds it again, until the next re-seed reconciles;
+//   - over-count by one, outbound side: a native user RE-CASTS a vote they had
+//     already delivered. consume's applyVoteWrite re-upserts the row and
+//     OutboundVotes.Upsert resets delivered_state to 'pending', while Lemmy
+//     still holds the OLD vote in the OLD direction — so this seed subtracts
+//     nothing for it and the stale vote stays in the served tally. Transient
+//     (the redelivery flips the row back to 'delivered') but PERMANENT if that
+//     delivery poisons. Fixing it needs a second column pair modelling "what
+//     the peer holds" against "what the user wants", which is task 17e's, not
+//     this one's.
 //
 // Subjects not present in ap_objects are dropped and logged at debug, like
 // ApplyVote.
@@ -447,7 +522,12 @@ func (a *Aggregator) SeedAggregates(ctx context.Context, subjectAPID string, upv
 	}
 	atURI := mapping.ATURI
 
-	return a.inTx(ctx, func(tx *sql.Tx) error {
+	// Seed facts are collected inside the transaction and reported AFTER it
+	// commits: recomputeAggregate can still fail and roll the whole seed back,
+	// and a counter advanced for a seed that never happened — then advanced
+	// again by the caller's retry — is worse than no counter.
+	var seed seedOutcome
+	if err := a.inTx(ctx, func(tx *sql.Tx) error {
 		// Upsert-and-lock the aggregate row first — the per-subject
 		// serialization point every mutation goes through — so the live-count
 		// read below cannot interleave with a concurrent ApplyVote/RetractVote
@@ -455,23 +535,125 @@ func (a *Aggregator) SeedAggregates(ctx context.Context, subjectAPID string, upv
 		if err := lockAggregate(ctx, tx, subjectAPID, atURI); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `
+		// ONE statement for both subtrahends, deliberately: a second statement
+		// would read on its own READ COMMITTED snapshot (inTx takes the default
+		// isolation), so the two counts could come from different moments —
+		// creating exactly the torn read the aggregate lock exists to prevent.
+		//
+		// ours.* is the votes LEMMY CURRENTLY HOLDS for our personas, and the
+		// predicate is the POSITIVE EQUALITY delivered_state = 'delivered':
+		//
+		//	pending (first try, retrying, poisoned) → the peer does not hold it
+		//	delivered                               → it does: subtract
+		//	delivered, Undo in flight               → still subtract; consume's
+		//	                                          applyVoteDelete re-upserts
+		//	                                          'delivered' precisely because the
+		//	                                          peer has not yet processed the
+		//	                                          withdrawal
+		//	row gone (Undo delivered)               → nothing to subtract
+		//
+		// A negation ("NOT undone", "<> 'pending'") reads identically TODAY only
+		// because nothing writes 'undone'. If a policy ever does, it will mean
+		// the peer ACCEPTED the withdrawal — not live — and every negation
+		// silently inverts while this equality stays correct. A poisoned Undo
+		// leaves a delivered row subtracting forever, which is the same hazard
+		// decision 16 cites for banning queue-history arithmetic: "delivered
+		// Likes minus delivered Undos" gets that row permanently wrong.
+		//
+		// The read takes no row locks. The seed holds the aggregate lock and
+		// reads outbound_votes lock-free; the delivery worker locks
+		// outbound_votes and never touches vote_aggregates — so there is no
+		// cycle, and FOR UPDATE would both create one and park a backfill's
+		// seeding behind in-flight HTTP deliveries.
+		if err := tx.QueryRowContext(ctx, `
 			UPDATE vote_aggregates a
-			SET seeded_upvotes = GREATEST(0, $2 - live.up),
-			    seeded_downvotes = GREATEST(0, $3 - live.down)
+			SET seeded_upvotes = GREATEST(0, $2 - live.up - ours.up),
+			    seeded_downvotes = GREATEST(0, $3 - live.down - ours.down)
 			FROM (
 				SELECT
 					COUNT(*) FILTER (WHERE direction = 'up') AS up,
 					COUNT(*) FILTER (WHERE direction = 'down') AS down
 				FROM vote_events
 				WHERE subject_ap_id = $1 AND NOT undone
-			) live
-			WHERE a.subject_ap_id = $1`,
-			subjectAPID, upvotes, downvotes); err != nil {
+			) live, (
+				SELECT
+					COUNT(*) FILTER (WHERE direction = 'up') AS up,
+					COUNT(*) FILTER (WHERE direction = 'down') AS down
+				FROM outbound_votes
+				WHERE subject_ap_id = $1 AND delivered_state = 'delivered'
+			) ours
+			WHERE a.subject_ap_id = $1
+			RETURNING $2 - live.up - ours.up, $3 - live.down - ours.down,
+			          live.up, live.down, ours.up, ours.down`,
+			subjectAPID, upvotes, downvotes).Scan(
+			&seed.rawUp, &seed.rawDown, &seed.liveUp, &seed.liveDown,
+			&seed.oursUp, &seed.oursDown); err != nil {
 			return fmt.Errorf("seed vote aggregate for %q: %w", subjectAPID, err)
 		}
 		return recomputeAggregate(ctx, tx, subjectAPID)
-	})
+	}); err != nil {
+		return err
+	}
+	a.reportSeed(subjectAPID, upvotes, downvotes, seed)
+	return nil
+}
+
+// seedOutcome is what one committed seed observed: the raw (pre-clamp) signed
+// baselines, and the two subtrahends they were computed from.
+type seedOutcome struct {
+	rawUp, rawDown   int64
+	liveUp, liveDown int64
+	oursUp, oursDown int64
+}
+
+// reportSeed publishes what a COMMITTED seed observed.
+//
+// SeedOursSubtracted is the routine half: how many of our personas' votes this
+// seed believes the origin is holding. It advances on healthy subjects, which
+// is the point — a persistent gap against a Lemmy-side sample is how a silent
+// discard shows up on posts with real scores.
+//
+// The clamp is the exceptional half, and it makes GREATEST(0, …) visible: a
+// negative raw baseline means the origin's total for that direction is smaller
+// than what we can already account for, and the clamp then absorbs the deficit
+// silently. Counters always advance (a sampled counter counts nothing); only
+// the line is sampled, because a backfill seeds one subject per post and a
+// systemic cause produces one line per post for the whole run.
+func (a *Aggregator) reportSeed(subject string, apiUp, apiDown int, seed seedOutcome) {
+	if ours := seed.oursUp + seed.oursDown; ours > 0 {
+		SeedOursSubtracted.Add(ours)
+	}
+	if seed.rawUp >= 0 && seed.rawDown >= 0 {
+		return
+	}
+	SeedBaselineClamped.Add(1)
+	// Both directions are reported, always: when both breach, naming one hides
+	// the other, and the pair is what says whether the cause is directional.
+	direction := directionUp
+	switch {
+	case seed.rawUp < 0 && seed.rawDown < 0:
+		direction = directionUp + "+" + directionDown
+	case seed.rawDown < 0:
+		direction = directionDown
+	}
+	if a.clampLog.Allow(time.Now()) {
+		a.logger.Warn("vote seed baseline clamped: the origin's total is short of the votes we can account for",
+			"subject", subject, "direction", direction,
+			"deficit_up", min64(seed.rawUp, 0), "deficit_down", min64(seed.rawDown, 0),
+			"api_up", apiUp, "api_down", apiDown,
+			"live_up", seed.liveUp, "live_down", seed.liveDown,
+			"ours_up", seed.oursUp, "ours_down", seed.oursDown)
+	}
+}
+
+// min64 reports the smaller of two int64s (the deficit fields log 0 for a
+// direction that did not breach, rather than a positive baseline that would
+// read as one).
+func min64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // ScrubVoter erases every vote_events row a voter ever produced — the vote

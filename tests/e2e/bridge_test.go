@@ -313,9 +313,9 @@ func TestUpdateAndDelete(t *testing.T) {
 
 // Scenario 5: votes — on posts AND comments — update the getVoteAggregates
 // side channel and NEVER appear as records on the firehose (PLAN.md locked
-// decision 7). Covers the full lifecycle: upvote, flip to downvote
-// (Undo{Like} + Dislike), retract (bare Undo), and a comment vote (task
-// 07's reply.root community-binding path).
+// decision 7). Covers the full lifecycle: upvote, flip to downvote (a BARE
+// Dislike), retract (an Undo carrying a reconstructed inner vote), and a
+// comment vote (task 07's reply.root community-binding path).
 func TestVotes_SideChannelOnly(t *testing.T) {
 	h := newHarness(t)
 	community, sub := setupSubscribedCommunity(t, h, "vote")
@@ -343,12 +343,16 @@ func TestVotes_SideChannelOnly(t *testing.T) {
 	voter.likePost(t, post.ID, 1)
 	awaitAggregates(t, h, postURI, 1, 0)
 
-	// Flip to downvote → Lemmy sends Undo{Like} + Dislike; the aggregator
-	// must retract the upvote and apply the downvote.
+	// Flip to downvote → Lemmy sends a BARE Dislike with no Undo at all
+	// (measured against the pinned 0.19; see votes/aggregator.go). ApplyVote's
+	// supersede marks the prior live upvote undone and applies the downvote.
 	voter.likePost(t, post.ID, -1)
 	awaitAggregates(t, h, postURI, 0, 1)
 
-	// Retract → a bare Undo{Dislike}; back to zero on both sides.
+	// Retract → an Undo whose inner vote is RECONSTRUCTED: a freshly generated
+	// activity id, and typed "Like" even though the live vote is a Dislike.
+	// That is why the aggregator keys retraction on the voter, not the id.
+	// Back to zero on both sides.
 	voter.likePost(t, post.ID, 0)
 	awaitAggregates(t, h, postURI, 0, 0)
 

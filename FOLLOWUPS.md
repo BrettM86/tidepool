@@ -59,8 +59,6 @@ task documents and git history rather than this list.
 - Key claiming/migration for bridged users. Handle-collision recovery should
   eventually reuse an orphaned minted DID via a PLC `updateHandle` operation
   rather than minting another DID.
-- If vote write-back is added, suppress echoes of Tidepool-managed voters and
-  subtract Tidepool's written-back tally during subsequent Lemmy re-seeds.
 - Moderation federation and DMs.
 
 ## Outbound delivery (task 15)
@@ -120,6 +118,34 @@ task documents and git history rather than this list.
   quiet community's crash-window acceptance gap persists until any such
   event. The decision-19 reconciliation job (task 18) is the natural
   home for a periodic acceptance-vs-record pin audit.
+
+## Vote accounting (task 17b)
+
+- **The re-seed baseline clamp is a FLOOR BREACH, not a discard
+  detector.** `GREATEST(0, …)` fires only where the deficit exceeds a
+  subject's entire fediverse tally, so on any post with a real score a
+  Lemmy `FederationMode` silently discarding our written-back votes
+  understates the served total with the raw baseline still positive and
+  the counter at zero. `tidepool_vote_seed_ours_subtracted` is the
+  signal that advances on healthy subjects; comparing it against a
+  Lemmy-side sample is the actual audit.
+- **Nothing re-seeds periodically.** `SeedPostCounts` has one caller,
+  behind `SEED_COUNTS_FROM_API`, skipped inside a 1h window unless an
+  admin forces a backfill. Any claim that drift "heals on the next
+  re-seed" may mean never for a quiet community.
+- **Migration 023's cleanup DELETE is narrower than the runtime guard
+  it backfills.** It matches `voter_ap_id` by exact string equality
+  while `echo.identifyActor` matches normalized host + scheme, so a
+  legacy row carrying a non-canonical spelling of one of our actor ids
+  would survive and then be counted in BOTH subtrahends — the one
+  reachable way they double-subtract the same human. Accepted because
+  the set is empty in production (write-back never shipped) and no code
+  path here ever wrote non-canonical ids; a normalizing DELETE would
+  mean re-implementing the probe in SQL.
+- **A `Down` of migration 023 leaves baselines understated
+  indefinitely.** Anything seeded while 023 was applied is net of our
+  delivered votes, the pre-023 code does not re-derive it, and with no
+  periodic re-seed only a forced backfill corrects it.
 
 ## Echo suppression (task 17a)
 

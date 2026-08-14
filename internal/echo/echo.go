@@ -169,13 +169,15 @@ func (c *Classifier) identify(ctx context.Context, apID string, node *ap.Object)
 }
 
 // identifyObject mirrors personas.handleObject: rest is did/collection/rkey,
-// and the body is served from OUTBOUND_OBJECTS (serving.go:137) — so that table
-// is the route's real oracle, and the ap_objects read is defence in depth.
+// and the body is served from OUTBOUND_OBJECTS (personas' handleObject reads
+// GetByATURI) — so that table is the route's real oracle, and the ap_objects
+// read is defence in depth.
 //
 // Both are consulted because the two rows are written by different halves of
 // the bridge and neither implies the other: the enqueuer records a
-// bridge-origin ap_objects mapping (enqueuer.go:136-144, 196-205) alongside the
-// outbound row, but a legacy v1 write has only the mapping, and a state where
+// bridge-origin ap_objects mapping (outbound's Enqueuer.EnqueueActivity, via
+// objectMapping) alongside the outbound row, but a legacy v1 write has only the
+// mapping, and a state where
 // the outbound row is missing must not make our own object answer "remote".
 //
 // The ap_objects read is keyed by the requested id, but a row alone is NOT

@@ -26,6 +26,18 @@ func TestLemmyPostAPIURL(t *testing.T) {
 		{"http with port (tests)", "http://127.0.0.1:8080/post/7",
 			"http://127.0.0.1:8080/api/v3/post?id=7", true},
 		{"comment", "https://lemmy.world/comment/123", "", false},
+		// 17b: the subtraction of our own delivered votes is only correct for a
+		// subject whose ORIGIN total includes them — a Lemmy post. For a NATIVE
+		// post the origin is us: Coves holds the native tally in its own column,
+		// there is no external total to net against, and subtracting would
+		// corrupt a number nobody seeded. Nothing enforces that with a check;
+		// it is enforced HERE, by the shapes this parser refuses.
+		{"a native post's AP id",
+			"https://coves.social/ap/object/did:plc:ewvi7nxzyoun6zhxrhs64oiz/social.coves.community.postv2/3lznative0001",
+			"", false},
+		{"a native object on a vanity origin",
+			"https://vanity.example/ap/object/did:plc:ewvi7nxzyoun6zhxrhs64oiz/social.coves.community.postv2/3lznative0002",
+			"", false},
 		{"non-numeric id", "https://lemmy.world/post/abc", "", false},
 		{"trailing path", "https://lemmy.world/post/1/extra", "", false},
 		{"empty id", "https://lemmy.world/post/", "", false},

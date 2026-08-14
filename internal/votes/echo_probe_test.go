@@ -13,7 +13,6 @@ import (
 	"tidepool/internal/echo"
 	"tidepool/internal/errors"
 	"tidepool/internal/store"
-	"tidepool/internal/testutil"
 )
 
 // The aggregator-level echo guard (task 17a, decision-16 AMENDMENT).
@@ -62,11 +61,7 @@ const (
 // probeWorld is testDB plus the two actor tables the probe distinguishes.
 func probeWorld(t *testing.T) (*sql.DB, store.APObjects) {
 	t.Helper()
-	database := testutil.DB(t)
-	testutil.Truncate(t, database,
-		"vote_events", "vote_aggregates", "ap_objects", "communities",
-		"ap_actors", "bridged_actors", "outbound_deliveries", "outbound_activities",
-		"outbound_objects")
+	database := testDB(t)
 	ctx := context.Background()
 
 	_, err := store.NewAPActors(database).Create(ctx, store.APActor{

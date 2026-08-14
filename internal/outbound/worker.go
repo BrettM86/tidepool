@@ -221,6 +221,16 @@ func (w *Worker) handle(ctx context.Context, delivery *store.OutboundDelivery) e
 		return fmt.Errorf("load activity %s: %w", delivery.ActivityID, err)
 	}
 
+	// A delivery the peer ALREADY ACCEPTED, held because its local settlement
+	// failed, resumes at the settlement — never at the wire. Re-POSTing would
+	// re-send an activity the peer holds, and every gate below decides whether
+	// to SEND: the kill switch, the causal wait and the consent recheck are all
+	// answers to "should this go out?", asked after it already has. Cancelling
+	// it here would strand the ledger it was held to settle.
+	if delivery.LastErrorClass == deliveryLedgerUnsettled {
+		return w.deliverSuccess(ctx, delivery, activity, statusOf(delivery))
+	}
+
 	// Kill switch (decision 19): an operator block PARKS the delivery — it stays
 	// pending and resumes when the switch clears, never poisoned or cancelled.
 	scope := DeliveryScope{
@@ -364,27 +374,73 @@ func (w *Worker) rotateInbox(ctx context.Context, delivery *store.OutboundDelive
 	return w.poison(ctx, delivery, "inbox_gone", "inbox still unreachable after re-resolution", status)
 }
 
-// deliverSuccess opens the causal gate and marks the delivery delivered, in
-// that order so the two are effectively atomic: a parent must NEVER be observed
-// delivered while its accepted_at is unset (that strands every child forever).
-// The accepted_at stamp is written FIRST; only if it commits is the delivered
-// mark applied. If the stamp genuinely fails, we return before marking and the
-// retry re-runs both (Lemmy dedupes the re-POST). The only reachable states are
-// (¬accepted,¬delivered), (accepted,¬delivered), (accepted,delivered) — never
-// the forbidden (¬accepted,delivered).
+// deliverSuccess settles everything a successful POST implies, and marks the
+// delivery delivered LAST.
+//
+// The order is the invariant. Marking delivered is TERMINAL — the queue never
+// re-claims that row — so every write that happens after it is a write nothing
+// will ever retry. Two of them matter:
+//
+//   - accepted_at (the causal gate): a parent observed delivered with its stamp
+//     unset strands every child forever;
+//   - the vote ledger: since task 17b, outbound_votes is an INPUT to the number
+//     users read, so a delivery left terminal beside a 'pending' row over-counts
+//     that subject permanently, and beside a stale 'delivered' row under-counts
+//     it permanently. Nothing reconciles either — SeedAggregates only runs
+//     behind a backfill.
+//
+// So the reachable states are (¬settled,¬delivered) and (settled,delivered),
+// never the forbidden (¬settled,delivered). Both settlements are idempotent, so
+// a retry that repeats them costs nothing.
+//
+// When a settlement fails, the delivery is HELD FOR SETTLEMENT rather than
+// failed: see settleLater. Failing it would re-POST an activity the peer has
+// already accepted; poisoning it would make the disagreement permanent, which
+// is the whole bug.
 func (w *Worker) deliverSuccess(ctx context.Context, delivery *store.OutboundDelivery, activity *store.OutboundActivity, status int) error {
 	if err := w.stampAccepted(ctx, activity); err != nil {
-		return fmt.Errorf("stamp accepted for %s: %w", delivery.ActivityID, err)
+		return w.settleLater(ctx, delivery, status,
+			fmt.Errorf("stamp accepted for %s: %w", delivery.ActivityID, err))
+	}
+	if err := w.voteCallback(ctx, activity); err != nil {
+		return w.settleLater(ctx, delivery, status, err)
 	}
 	_, applied, err := w.deliveries.MarkDelivered(ctx, delivery.ActivityID, delivery.TargetInbox, status, *delivery.ClaimedUntil)
 	if err != nil {
 		return fmt.Errorf("mark delivered %s: %w", delivery.ActivityID, err)
 	}
 	if !applied {
-		return nil // a stale claim: another worker already recorded the outcome
+		// A stale claim: our lease lapsed mid-POST and another worker owns the
+		// row now. The settlements above already ran — they are keyed on the
+		// ACTIVITY, not on the claim, so the ledger is correct whichever worker
+		// loses the fencing race, and the winner's redelivery repeats them
+		// idempotently.
+		return nil
 	}
 	metricDelivered.Add(1)
-	return w.voteCallback(ctx, activity)
+	return nil
+}
+
+// settleLater holds a delivery whose POST SUCCEEDED but whose settlement did
+// not. The row stays PENDING — non-terminal, so the queue will come back to it
+// — carrying deliveryLedgerUnsettled as its outcome class, which is what tells
+// the next claim to resume at the settlement instead of at the wire.
+//
+// It never poisons. A poisoned delivery is terminal, and terminal-with-unsettled
+// is exactly the permanent disagreement this exists to prevent; the failure here
+// is a LOCAL write, so retrying is both safe and the only thing that can help.
+// The backoff still spaces the retries (production's base is 30s), so a
+// persistently broken local write does not spin the worker.
+func (w *Worker) settleLater(ctx context.Context, delivery *store.OutboundDelivery, status int, cause error) error {
+	w.logger.Warn("delivery accepted by the peer but not yet settled locally; holding for settlement",
+		"activity", delivery.ActivityID, "inbox", delivery.TargetInbox,
+		"attempts", delivery.Attempts, "error", cause)
+	next := time.Now().Add(w.backoff(delivery.Attempts))
+	if _, _, err := w.deliveries.Release(ctx, delivery.ActivityID, delivery.TargetInbox,
+		deliveryLedgerUnsettled, cause.Error(), status, next, *delivery.ClaimedUntil); err != nil {
+		return fmt.Errorf("hold %s for settlement: %w", delivery.ActivityID, err)
+	}
+	return nil
 }
 
 // stampAccepted opens the causal gate for this object's children: on a
@@ -465,6 +521,22 @@ func (w *Worker) poison(ctx context.Context, delivery *store.OutboundDelivery, c
 	}
 	metricPoisoned.Add(1)
 	return nil
+}
+
+// deliveryLedgerUnsettled labels a delivery the peer accepted whose LOCAL
+// settlement (the causal stamp, the vote ledger) has not committed yet. It is
+// an outcome class, not an error class — park and parkCausal already use the
+// same column for held-not-failed states — and it is the durable fact that lets
+// a retry finish the job without repeating the POST.
+const deliveryLedgerUnsettled = "ledger_unsettled"
+
+// statusOf is the status a held delivery was accepted with, so its settlement
+// records the same outcome the wire actually produced.
+func statusOf(delivery *store.OutboundDelivery) int {
+	if delivery.LastStatusCode == nil {
+		return http.StatusAccepted
+	}
+	return *delivery.LastStatusCode
 }
 
 // parkDelay is how long a kill-switched or dry-run delivery waits before it can

@@ -145,19 +145,32 @@ type recordingVotes struct {
 	mu        sync.Mutex
 	applied   []string
 	retracted []string
+	// delegate, when set, receives the hand-off after it is recorded: the echo
+	// tests need the REAL aggregator behind the dispatcher, because the
+	// aggregator-level voter guard is a different guard from the classifier and
+	// only vote_events can tell them apart.
+	delegate VoteAggregator
 }
 
-func (v *recordingVotes) ApplyVote(_ context.Context, vote *ap.Object, _ string) error {
+func (v *recordingVotes) ApplyVote(ctx context.Context, vote *ap.Object, communityIRI string) error {
 	v.mu.Lock()
-	defer v.mu.Unlock()
 	v.applied = append(v.applied, vote.Type+" "+refID(vote.Object))
+	delegate := v.delegate
+	v.mu.Unlock()
+	if delegate != nil {
+		return delegate.ApplyVote(ctx, vote, communityIRI)
+	}
 	return nil
 }
 
-func (v *recordingVotes) RetractVote(_ context.Context, vote *ap.Object, _ string) error {
+func (v *recordingVotes) RetractVote(ctx context.Context, vote *ap.Object, communityIRI string) error {
 	v.mu.Lock()
-	defer v.mu.Unlock()
 	v.retracted = append(v.retracted, vote.Type+" "+refID(vote.Object))
+	delegate := v.delegate
+	v.mu.Unlock()
+	if delegate != nil {
+		return delegate.RetractVote(ctx, vote, communityIRI)
+	}
 	return nil
 }
 
@@ -231,7 +244,7 @@ func newHarness(t *testing.T) *harness {
 		// persona from another package's run would make an echo look like
 		// someone else's.
 		"outbound_deliveries", "outbound_activities", "outbound_objects",
-		"outbound_votes", "ap_actors")
+		"outbound_votes", "ap_actors", "vote_events", "vote_aggregates")
 
 	custodian, err := identity.NewCustodian(testKEK)
 	require.NoError(t, err)

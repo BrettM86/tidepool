@@ -192,8 +192,28 @@ func (h *Handler) Process(ctx context.Context, event *store.InboxEvent) error {
 	case ap.TypeCreate, ap.TypeUpdate:
 		return h.handleBareCreateUpdate(ctx, activity, signer)
 	case ap.TypeDelete:
+		// A bare Delete/Undo has no envelope for handleAnnounce's guard to
+		// read, and the ordinary path each falls into is DESTRUCTIVE when the
+		// target is one of our own ids: the delete lays a tombstone marker and
+		// soft-deletes the mapping — which makes ResolveStrongRef answer
+		// Tombstoned and silently drops every genuine Lemmy reply beneath the
+		// post — while the undo's restore dereferences our own origin and
+		// re-materializes what comes back, minting a bridged actor for our own
+		// persona along the way.
+		//
+		// The suppression therefore runs HERE, before the handler: both lay
+		// their marker before authorizing, so a check any later leaves behind
+		// exactly the damage it was meant to prevent.
+		if err := h.suppressEcho(ctx, activity.ID, activity); err != nil {
+			return err
+		}
 		return h.handleDelete(ctx, activity, signer, nil)
 	case ap.TypeUndo:
+		// Same guard, same reason, on the branch whose restore path is the
+		// more dangerous of the two (see the Delete case above).
+		if err := h.suppressEcho(ctx, activity.ID, activity); err != nil {
+			return err
+		}
 		return h.handleUndo(ctx, activity, signer, nil)
 	case ap.TypeAccept:
 		return h.handleAccept(ctx, activity, signer)

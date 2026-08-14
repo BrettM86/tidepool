@@ -279,12 +279,28 @@ func run(logger *slog.Logger) error {
 	tombstones := store.NewTombstones(database)
 	inboxEvents := store.NewInboxEvents(database)
 
+	// The echo classifier reads the four tables the user origin serves from, so
+	// "is this ours?" is answered against the ids this process actually minted
+	// and actually serves. It is built HERE, before its first consumer: both
+	// the vote aggregator's voter probe and the ingest dispatcher's envelope
+	// suppression are the same classifier over the same state.
+	echoClassifier, err := echo.New(echo.Options{
+		Objects:         objects,
+		OutboundObjects: store.NewOutboundObjects(database),
+		Activities:      store.NewOutboundActivities(database),
+		Actors:          store.NewAPActors(database),
+	})
+	if err != nil {
+		return err
+	}
+
 	// The vote aggregation side channel (task 07): Like/Dislike activities
 	// maintain bridge-side counts (never records), served over
 	// social.coves.bridge.getVoteAggregates. Built before the materializer
 	// because the materializer's actor scrub erases a deleted voter's
 	// vote_events rows through it.
-	voteAggregator, err := votes.NewAggregator(database, objects, communities, repoManager, logger)
+	voteAggregator, err := votes.NewAggregator(database, objects, communities, repoManager,
+		echoClassifier, logger)
 	if err != nil {
 		return err
 	}
@@ -349,18 +365,6 @@ func run(logger *slog.Logger) error {
 		// it, and an interrupted run leaves last_backfill_at unset (resumable).
 		BaseContext: ctx,
 		Logger:      logger,
-	})
-	if err != nil {
-		return err
-	}
-	// The echo classifier reads the four tables the user origin serves from,
-	// so "is this ours?" is answered against the ids this process actually
-	// minted and actually serves.
-	echoClassifier, err := echo.New(echo.Options{
-		Objects:         objects,
-		OutboundObjects: store.NewOutboundObjects(database),
-		Activities:      store.NewOutboundActivities(database),
-		Actors:          store.NewAPActors(database),
 	})
 	if err != nil {
 		return err

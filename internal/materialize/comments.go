@@ -5,7 +5,9 @@ import (
 	"fmt"
 
 	"tidepool/internal/ap"
+	"tidepool/internal/echo"
 	"tidepool/internal/errors"
+	"tidepool/internal/store"
 )
 
 // maxAncestorDepth caps how many unmapped ancestors a comment's inReplyTo
@@ -51,6 +53,32 @@ func (m *Materializer) MaterializeComment(ctx context.Context, note *ap.Object) 
 	return m.materializeCommentLeaf(ctx, note)
 }
 
+// countAncestorShortCircuit records the anchor as an echo suppression when the
+// parent is one of OUR OWN objects: the walk declines to fetch and
+// re-materialize a record the bridge itself federated, which is the ancestor
+// short-circuit and is counted under its own class.
+//
+// Anchoring on a FEDIVERSE parent is ordinary threading — every inbound reply
+// to an already-seen Lemmy comment lands here — and must not be counted, or the
+// class drowns in exactly the volume the split exists to see through.
+//
+// The origin comes from a point read on the branch that already returns, rather
+// than from widening ResolveStrongRef: a shared read seam should not grow a
+// return value to feed a metric. That also makes the read's failure harmless —
+// it is observability, never the walk's decision, so an unreadable mapping
+// leaves the counter alone instead of failing a comment that anchored fine.
+func (m *Materializer) countAncestorShortCircuit(ctx context.Context, parentID string) {
+	mapping, err := m.objects.GetByAPID(ctx, parentID)
+	if err != nil {
+		m.logger.Debug("ancestor anchor origin unreadable; short-circuit not counted",
+			"parent", parentID, "error", err)
+		return
+	}
+	if mapping.Origin == store.OriginBridge {
+		echo.CountDrop(echo.ClassAncestorShortCircuit)
+	}
+}
+
 // collectUnmappedAncestors walks note's inReplyTo chain upward until it
 // hits an already-mapped object or the thread's root Page, returning the
 // unmapped ancestors oldest-first. Nothing is written during the walk.
@@ -75,6 +103,7 @@ func (m *Materializer) collectUnmappedAncestors(ctx context.Context, note *ap.Ob
 		switch {
 		case err == nil:
 			// Anchored: the parent is already materialized.
+			m.countAncestorShortCircuit(ctx, parentID)
 			return chain, nil
 		case errors.IsTombstoned(err):
 			// The parent was deleted: the subtree is dropped, never

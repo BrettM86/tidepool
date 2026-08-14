@@ -24,10 +24,18 @@ import (
 	"time"
 
 	"tidepool/internal/ap"
+	"tidepool/internal/echo"
 	"tidepool/internal/errors"
 	"tidepool/internal/materialize"
+	"tidepool/internal/ratelimit"
 	"tidepool/internal/store"
 )
+
+// echoVoteLogInterval throttles the suppressed-voter log. Suppression is rare
+// by construction, so the sampler costs nothing in steady state — but the
+// failure mode this log exists to expose is a probe that has started matching
+// GENUINE voters, and that one arrives at full vote volume.
+const echoVoteLogInterval = time.Second
 
 // Vote directions (vote_events.direction).
 const (
@@ -54,6 +62,20 @@ type RecordReader interface {
 	GetRecord(ctx context.Context, did, collection, rkey string) (record map[string]any, recordCID string, err error)
 }
 
+// VoterProbe answers whether a voter is one of the bridge's OWN minted
+// personas (ap_actors) rather than a genuine remote human. *echo.Classifier
+// satisfies it: the actor route's lookup is exactly this question, including
+// the vanity-origin rule and the fail-safe error direction.
+//
+// This guard is NOT redundant with ingest's envelope classifier. That one asks
+// an ENVELOPE question at the dispatch boundary ("is this announced traffic
+// ours?"); this one asks a VOTER question at the MUTATION site, and so also
+// covers callers that never pass through handleAnnounce at all — the bare
+// /ap/inbox vote branch, the community-outbox backfill, and the seed paths.
+type VoterProbe interface {
+	Identify(ctx context.Context, apID string) (echo.Identity, error)
+}
+
 // Aggregator implements ingest.VoteAggregator over the vote_aggregates /
 // vote_events tables. It owns its SQL (multi-statement transactions across
 // both tables, like internal/repo) and uses store.APObjects only to resolve
@@ -66,11 +88,13 @@ type Aggregator struct {
 	objects     store.APObjects
 	communities store.Communities
 	records     RecordReader
+	voters      VoterProbe
+	echoLog     *ratelimit.Sampler
 	logger      *slog.Logger
 }
 
 // NewAggregator validates dependencies and builds an Aggregator.
-func NewAggregator(db *sql.DB, objects store.APObjects, communities store.Communities, records RecordReader, logger *slog.Logger) (*Aggregator, error) {
+func NewAggregator(db *sql.DB, objects store.APObjects, communities store.Communities, records RecordReader, voters VoterProbe, logger *slog.Logger) (*Aggregator, error) {
 	if db == nil {
 		return nil, errors.NewValidationError("db", "must not be nil")
 	}
@@ -83,10 +107,19 @@ func NewAggregator(db *sql.DB, objects store.APObjects, communities store.Commun
 	if records == nil {
 		return nil, errors.NewValidationError("records", "must not be nil")
 	}
+	// REQUIRED, not optional. A nil probe is an aggregator that counts our own
+	// votes as inbound ones — silently, and only in whichever binary forgot to
+	// pass it, which is exactly how this guard was left out of production while
+	// every test had it. There is no caller for whom "no echo suppression" is
+	// the right behaviour, so it is not expressible.
+	if voters == nil {
+		return nil, errors.NewValidationError("voters", "must not be nil")
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Aggregator{db: db, objects: objects, communities: communities, records: records, logger: logger}, nil
+	return &Aggregator{db: db, objects: objects, communities: communities, records: records,
+		voters: voters, echoLog: ratelimit.NewSampler(echoVoteLogInterval), logger: logger}, nil
 }
 
 // ApplyVote records one Like or Dislike: insert the activity (duplicate
@@ -110,6 +143,20 @@ func (a *Aggregator) ApplyVote(ctx context.Context, vote *ap.Object, communityIR
 	if vote.ID == "" || voter == "" || subject == "" {
 		a.logger.Debug("vote dropped: missing activity id, voter, or subject",
 			"activity", vote.ID, "voter", voter, "subject", subject, "community", communityIRI)
+		return nil
+	}
+
+	// The voter probe runs BEFORE anything is read or locked for this subject:
+	// a suppressed vote must leave no trace at all, and lockAggregate would
+	// mint a 0/0 vote_aggregates row that the XRPC contract reads as "this
+	// subject has been voted on". Outside inTx by construction, so it adds no
+	// lock-ordering hazard to the transaction below.
+	ours, err := a.isOurPersona(ctx, voter)
+	if err != nil {
+		return err
+	}
+	if ours {
+		a.dropEchoedVote("vote", vote, voter, subject, communityIRI)
 		return nil
 	}
 
@@ -233,6 +280,21 @@ func (a *Aggregator) RetractVote(ctx context.Context, vote *ap.Object, community
 			"activity", vote.ID, "voter", voter, "subject", subject, "community", communityIRI)
 		return nil
 	}
+
+	// The SAME probe on the retraction path, and for a sharper reason than
+	// symmetry: step 2 below retracts the voter's live vote regardless of
+	// activity id, so an unsuppressed echo of our own Undo would retract a row
+	// this very guard stopped us from writing — a phantom retraction driven by
+	// whatever that persona's history happens to hold.
+	ours, err := a.isOurPersona(ctx, voter)
+	if err != nil {
+		return err
+	}
+	if ours {
+		a.dropEchoedVote("vote retraction", vote, voter, subject, communityIRI)
+		return nil
+	}
+
 	if communityIRI != "" {
 		mapping, err := a.subjectMapping(ctx, subject)
 		if err != nil {
@@ -563,6 +625,41 @@ func (a *Aggregator) PruneUndoneEvents(ctx context.Context, cutoff time.Time) (i
 		if n < pruneVoteEventsBatchSize {
 			return total, nil
 		}
+	}
+}
+
+// isOurPersona reports whether the voter is one of the personas the bridge
+// mints and SPEAKS AS (ap_actors) — a vote of ours coming home, which must
+// never be counted as inbound.
+//
+// The probe is the classifier's actor route, so it distinguishes the one thing
+// that matters: a bridged actor is a real fediverse human the bridge MIRRORS
+// into atproto, holding a DID we minted and a bridged_actors row, and their
+// votes are genuine. Matching that table instead would drop every inbound vote
+// in the network and take the served tallies to zero.
+//
+// An error is returned, never absorbed into a verdict: "not ours" on a failed
+// read double-counts our own vote, "ours" loses a real one, and only the retry
+// is honest.
+func (a *Aggregator) isOurPersona(ctx context.Context, voter string) (bool, error) {
+	identity, err := a.voters.Identify(ctx, voter)
+	if err != nil {
+		return false, fmt.Errorf("probe voter %q: %w", voter, err)
+	}
+	return identity.Class == echo.ClassLocalActor, nil
+}
+
+// dropEchoedVote records a suppressed vote: the per-class echo counter plus a
+// sampled INFO line. INFO, not Debug, and deliberately unlike the surrounding
+// vote drops: those are ordinary traffic, while this one is the only visible
+// evidence if the probe ever starts matching genuine voters — which would
+// silently zero every community's tallies.
+func (a *Aggregator) dropEchoedVote(what string, vote *ap.Object, voter, subject, communityIRI string) {
+	echo.CountDrop(echo.ClassLocalActor)
+	if a.echoLog.Allow(time.Now()) {
+		a.logger.Info(what+" dropped: voter is one of our own personas",
+			"activity", vote.ID, "type", vote.Type, "voter", voter,
+			"subject", subject, "community", communityIRI)
 	}
 }
 

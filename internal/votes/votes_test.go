@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"tidepool/internal/ap"
+	"tidepool/internal/echo"
 	"tidepool/internal/errors"
 	"tidepool/internal/store"
 	"tidepool/internal/testutil"
@@ -62,7 +63,17 @@ func testAggregatorWithRecords(t *testing.T, database *sql.DB) (*Aggregator, sto
 	t.Helper()
 	objects := store.NewAPObjects(database)
 	records := &fakeRecords{records: map[string]map[string]any{}}
-	agg, err := NewAggregator(database, objects, store.NewCommunities(database), records, slog.Default())
+	// The REAL voter probe over the same database: every existing case votes as
+	// a fediverse user, so it answers ClassNone for all of them — and would stop
+	// answering that the moment the probe started matching the wrong table.
+	probe, err := echo.New(echo.Options{
+		Objects:         objects,
+		OutboundObjects: store.NewOutboundObjects(database),
+		Activities:      store.NewOutboundActivities(database),
+		Actors:          store.NewAPActors(database),
+	})
+	require.NoError(t, err)
+	agg, err := NewAggregator(database, objects, store.NewCommunities(database), records, probe, slog.Default())
 	require.NoError(t, err)
 	return agg, objects, records
 }

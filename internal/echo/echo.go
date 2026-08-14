@@ -3,9 +3,10 @@
 // community Announce, and re-materializing it would duplicate content,
 // double-count votes, or — worst — read as MODERATION of our own content.
 //
-// It is a LEAF package on purpose (store + errors only, no ingest/materialize
-// import): the ingest dispatcher, the vote aggregator and the ancestor walk all
-// have to ask the same question, and none of them may import each other.
+// It is a LEAF package on purpose (ap + store + errors only, no
+// ingest/materialize import): the ingest dispatcher, the vote aggregator and
+// the ancestor walk all have to ask the same question, and none of them may
+// import each other.
 //
 // An id is "ours" IFF the serving surface (internal/personas) would answer 200
 // for it — ENTITY EXISTENCE, never path shape alone, because vanity origins
@@ -97,8 +98,23 @@ type Classifier struct {
 	actors          store.APActors
 }
 
-// New wires a Classifier.
+// New wires a Classifier. All four stores are REQUIRED: this classifier's whole
+// contract is that an unanswerable question surfaces as a retryable error, and
+// a missing store answers it with a nil dereference on the first inbound
+// activity instead.
 func New(opts Options) (*Classifier, error) {
+	if opts.Objects == nil {
+		return nil, errors.NewValidationError("objects", "must not be nil")
+	}
+	if opts.OutboundObjects == nil {
+		return nil, errors.NewValidationError("outbound_objects", "must not be nil")
+	}
+	if opts.Activities == nil {
+		return nil, errors.NewValidationError("activities", "must not be nil")
+	}
+	if opts.Actors == nil {
+		return nil, errors.NewValidationError("actors", "must not be nil")
+	}
 	return &Classifier{
 		objects:         opts.Objects,
 		outboundObjects: opts.OutboundObjects,
@@ -116,7 +132,18 @@ func New(opts Options) (*Classifier, error) {
 // unenumerable, so the host test is folded into the row itself — the actor's
 // stored NormalizedOrigin, or the stored id the object/activity rows are keyed
 // by. Anything else is remote content and stays remote.
+//
+// An id ALONE is all this can weigh, and our ids are public and derivable. When
+// the id arrives inside a node the walk can read, Classify corroborates it
+// against the activity we actually sent; see identifyActivity.
 func (c *Classifier) Identify(ctx context.Context, apID string) (Identity, error) {
+	return c.identify(ctx, apID, nil)
+}
+
+// identify is Identify with the NODE the id was read from, when there is one.
+// node is corroboration material, never the decision: an id that names nothing
+// of ours stays not-ours whatever the node claims.
+func (c *Classifier) identify(ctx context.Context, apID string, node *ap.Object) (Identity, error) {
 	if apID == "" {
 		return Identity{Class: ClassNone}, nil
 	}
@@ -133,24 +160,38 @@ func (c *Classifier) Identify(ctx context.Context, apID string) (Identity, error
 	case strings.HasPrefix(parsed.Path, objectPathPrefix):
 		return c.identifyObject(ctx, apID, strings.TrimPrefix(parsed.Path, objectPathPrefix))
 	case strings.HasPrefix(parsed.Path, activityPathPrefix):
-		return c.identifyActivity(ctx, apID, strings.TrimPrefix(parsed.Path, activityPathPrefix))
+		return c.identifyActivity(ctx, apID, strings.TrimPrefix(parsed.Path, activityPathPrefix), node)
 	case strings.HasPrefix(parsed.Path, actorPathPrefix):
-		return c.identifyActor(ctx, apID, normalizeHost(parsed.Host),
+		return c.identifyActor(ctx, apID, parsed.Scheme, normalizeHost(parsed.Host),
 			strings.TrimPrefix(parsed.Path, actorPathPrefix))
 	}
 	return Identity{Class: ClassNone}, nil
 }
 
 // identifyObject mirrors personas.handleObject: rest is did/collection/rkey,
-// and the body is served from outbound_objects. Two tables answer for this
-// route because two halves of the bridge write it — the v1 write side records
-// an ap_objects mapping with origin=bridge, while an author-owned record has no
-// ap_objects row at all.
+// and the body is served from OUTBOUND_OBJECTS (serving.go:137) — so that table
+// is the route's real oracle, and the ap_objects read is defence in depth.
+//
+// Both are consulted because the two rows are written by different halves of
+// the bridge and neither implies the other: the enqueuer records a
+// bridge-origin ap_objects mapping (enqueuer.go:136-144, 196-205) alongside the
+// outbound row, but a legacy v1 write has only the mapping, and a state where
+// the outbound row is missing must not make our own object answer "remote".
 //
 // The ap_objects read is keyed by the requested id, but a row alone is NOT
 // enough: genuine Lemmy content the bridge materialized has an ap_objects row
 // too (origin=fediverse), and treating that as our own echo would drop a whole
 // community's content. Only origin=bridge is ours.
+//
+// RESIDUAL (accepted, not closed here): like the actor route, this weighs the
+// ID and not the node it was read from — our object ids are public, so a peer
+// can paint one onto a node wrapping different content and have that node
+// dropped. There is no stored per-object payload to corroborate against the way
+// identifyActivity has one, and the reachable harm is bounded: the announce
+// path runs behind the followed-community gate, so the peer must be a community
+// we follow suppressing content it chose to announce, and the bare paths
+// authorize separately. Closing it needs the outbound snapshot, which belongs
+// with the fetch-binding belt, not here.
 //
 // outbound_objects is keyed by AT-URI, so a row found under the at-uri this
 // path spells is only ours if the row's own ap id is the id we were asked
@@ -197,7 +238,21 @@ func (c *Classifier) identifyObject(ctx context.Context, apID, rest string) (Ide
 // identifyActivity mirrors personas.handleActivity: the stored id carries its
 // own origin, so looking the FULL requested id up is both the existence test
 // and the authority test in one read.
-func (c *Classifier) identifyActivity(ctx context.Context, apID, hash string) (Identity, error) {
+//
+// When the id arrives inside a node, that node is CORROBORATED against the
+// activity we stored. Our activity ids are public and derivable, so the id
+// alone lets a peer paint one onto a node wrapping somebody else's content and
+// have it dropped as "our echo" — suppression turned into a deletion primitive.
+// The stored payload is kept for byte-stable replay, which makes it exactly the
+// witness this needs.
+//
+// The rule is CONTRADICTION DISQUALIFIES, ABSENCE DOES NOT, on IDENTIFYING
+// FIELDS only — never on bytes. A community re-serializes what it announces:
+// keys are reordered, addressing is added, names are re-rendered. Comparing
+// bytes (or any field a re-render may touch) would refuse every genuine echo
+// and re-materialize all of them, which is the bug this package exists to
+// prevent. So a bare IRI, carrying neither type nor object, still classifies.
+func (c *Classifier) identifyActivity(ctx context.Context, apID, hash string, node *ap.Object) (Identity, error) {
 	if hash == "" || strings.Contains(hash, "/") {
 		return Identity{Class: ClassNone}, nil
 	}
@@ -208,16 +263,90 @@ func (c *Classifier) identifyActivity(ctx context.Context, apID, hash string) (I
 		}
 		return Identity{Class: ClassNone}, fmt.Errorf("echo: outbound activity for %s: %w", apID, err)
 	}
+	corroborated, err := c.corroborates(ctx, node, activity)
+	if err != nil || !corroborated {
+		return Identity{Class: ClassNone}, err
+	}
 	return Identity{Class: ClassLocalActivity, DID: activity.ActorDID}, nil
+}
+
+// corroborates reports whether node can be the activity we stored under that
+// id. A nil node (a bare id probe) corroborates trivially — there is nothing to
+// contradict.
+func (c *Classifier) corroborates(ctx context.Context, node *ap.Object, activity *store.OutboundActivity) (bool, error) {
+	if node == nil {
+		return true, nil
+	}
+	// The VERB. We recorded what we sent; a node calling itself something else
+	// is not it — and honouring the id alone would let a peer suppress any
+	// Delete it likes by wearing the id of a Create we sent.
+	if node.Type != "" && activity.Kind != "" && !strings.EqualFold(node.Type, activity.Kind) {
+		return false, nil
+	}
+
+	// The CARRIED OBJECT. Same id, same verb, different content is the forgery
+	// the verb check cannot see. The comparison is against the object our
+	// stored payload names, and it disqualifies only when the substituted
+	// object is NOT ours: swapping one of our objects for another cannot lose
+	// anybody's content, while swapping in a remote human's note is precisely
+	// the content loss dressed as echo suppression.
+	carried := refObjectID(node)
+	if carried == "" {
+		return true, nil
+	}
+	stored := refObjectID(parsePayload(activity.Payload))
+	if stored == "" || stored == carried {
+		return true, nil
+	}
+	identity, err := c.identify(ctx, carried, nil)
+	if err != nil {
+		return false, err
+	}
+	return identity.Class != ClassNone, nil
+}
+
+// parsePayload reads a stored activity back into its object form. A payload
+// that will not parse yields no corroboration material rather than a verdict —
+// absence, like any other missing field.
+func parsePayload(payload []byte) *ap.Object {
+	if len(payload) == 0 {
+		return nil
+	}
+	parsed, err := ap.ParseObject(payload)
+	if err != nil {
+		return nil
+	}
+	return parsed
+}
+
+// refObjectID is the id of the object an activity carries, or "" when it names
+// none (including a nil activity).
+func refObjectID(activity *ap.Object) string {
+	if activity == nil || activity.Object == nil {
+		return ""
+	}
+	return activity.Object.ID
 }
 
 // identifyActor mirrors personas.lookupResource: the DID is global but the
 // actor is not, so a row alone is not the answer — the actor must have been
-// minted on the very host the id names. The comparison is against the stored
+// minted on the very origin the id names. The comparison is against the stored
 // NormalizedOrigin in full, which makes it label-boundary-safe by
 // construction: neither a host we are a suffix of nor one we are a prefix of
 // can equal it.
-func (c *Classifier) identifyActor(ctx context.Context, apID, host, rest string) (Identity, error) {
+//
+// The SCHEME is compared too, against the one the actor was actually minted
+// under. The other two routes match a stored id exactly and so cannot be
+// spoofed by re-spelling it; without this, http://our.host/ap/actor/{did} — an
+// id we never mint and never serve — would classify as ours.
+//
+// RESIDUAL (accepted, as for identifyObject): an actor id is public, and a node
+// can name one of our personas as its actor without our persona having done
+// anything. An actor has no per-activity payload to corroborate against, and a
+// forged actor claim is already a signature failure at the inbox for the
+// top-level activity; what remains is an inner node inside an announce from a
+// community we follow.
+func (c *Classifier) identifyActor(ctx context.Context, apID, scheme, host, rest string) (Identity, error) {
 	if rest == "" || strings.Contains(rest, "/") {
 		return Identity{Class: ClassNone}, nil
 	}
@@ -228,10 +357,21 @@ func (c *Classifier) identifyActor(ctx context.Context, apID, host, rest string)
 		}
 		return Identity{Class: ClassNone}, fmt.Errorf("echo: actor for %s: %w", apID, err)
 	}
-	if actor.NormalizedOrigin != host {
+	if actor.NormalizedOrigin != host || !strings.EqualFold(scheme, schemeOf(actor.ActorID)) {
 		return Identity{Class: ClassNone}, nil
 	}
 	return Identity{Class: ClassLocalActor, DID: actor.DID}, nil
+}
+
+// schemeOf is the URL scheme a stored actor id was minted under, or "" if the
+// stored id will not parse — which fails closed, since no requested id's scheme
+// can equal "".
+func schemeOf(actorID string) string {
+	parsed, err := url.Parse(actorID)
+	if err != nil {
+		return ""
+	}
+	return parsed.Scheme
 }
 
 // normalizeHost reduces a URL authority to the authority it names — lowercase,
@@ -273,9 +413,22 @@ const MaxDepth = 8
 // in one is legible as its own bug.
 //
 // At each node it asks about the node's own id, then its actor, then descends
-// into its object. Actor before descent is what catches an echoed vote:
-// Announce{Like}'s object is the LEMMY subject, so the inner ACTOR is the only
-// handle on it once the id fails.
+// into its object — but ONLY through the verbs whose `object` is a PAYLOAD.
+//
+// This is the difference between a payload and a TARGET, and getting it wrong
+// loses content in the most common interaction the product has. For Announce,
+// Create, Update and Undo, `object` is what the activity carries: keep asking.
+// For Like, Dislike, Delete, Flag, Block, Remove — and for anything else,
+// because an unknown verb must fail toward NOT condemning an envelope — it is
+// what somebody else's activity is being done TO. A Lemmy human's Like on a
+// post we federated out, or a Lemmy moderator's Delete of a native postv2, has
+// OUR id as its target; descending would answer "ours" for the whole envelope
+// and discard every vote and every moderation action on native content, with no
+// error and a counter that says the bridge is working.
+//
+// Nothing is lost by stopping there: the echoes these guards exist for are
+// identified by the target-bearing node ITSELF — an echoed Delete by its own
+// activity id, an echoed vote by its actor — never by what sits below it.
 //
 // A VOTE node inverts the first two: the voter is asked about before the
 // activity id. Lemmy 0.19 reconstructs the inner vote of an Announce{Undo{Like}}
@@ -301,19 +454,48 @@ func (c *Classifier) Classify(ctx context.Context, envelope *ap.Object) (Identit
 	// recoverable direction (a duplicate, never a drop).
 	node := envelope
 	for depth := 1; node != nil && depth <= MaxDepth; depth++ {
-		probes := [2]string{node.ID, actorIDOf(node)}
+		// The node travels with its OWN id — that id claims to name this very
+		// activity, so the node is what corroborates it. The actor id names a
+		// different entity entirely and carries no such claim.
+		probes := [2]probe{{id: node.ID, node: node}, {id: actorIDOf(node)}}
 		if isVote(node) {
 			probes[0], probes[1] = probes[1], probes[0]
 		}
-		for _, probe := range probes {
-			identity, err := c.Identify(ctx, probe)
+		for _, p := range probes {
+			identity, err := c.identify(ctx, p.id, p.node)
 			if err != nil || identity.Class != ClassNone {
 				return identity, err
 			}
 		}
+		if !carriesPayload(node) {
+			// node.Object is this activity's TARGET, not its payload: whatever
+			// it names belongs to whoever the activity is being done TO.
+			return Identity{Class: ClassNone}, nil
+		}
 		node = node.Object
 	}
 	return Identity{Class: ClassNone}, nil
+}
+
+// carriesPayload reports whether node.Object is the thing the activity CARRIES
+// (walk on) rather than the thing it acts UPON (stop). It is an allowlist, so
+// an unrecognized verb stops — the recoverable direction, since descending into
+// a target can drop genuine content permanently while declining to descend can
+// at worst let a duplicate through.
+func carriesPayload(node *ap.Object) bool {
+	switch node.Type {
+	case ap.TypeAnnounce, ap.TypeCreate, ap.TypeUpdate, ap.TypeUndo:
+		return true
+	default:
+		return false
+	}
+}
+
+// probe is one question the walk asks: an id, plus the node that id was read
+// FROM when the node is a claim about the id itself.
+type probe struct {
+	id   string
+	node *ap.Object
 }
 
 // isVote reports whether the node is a vote, whose VOTER identifies it.
@@ -336,6 +518,14 @@ func actorIDOf(node *ap.Object) string {
 // endpoint — which looks exactly like a drop site that never fires.
 const dropMetricPrefix = "tidepool_echo_drops_"
 
+// dropMetricName is the metric a class is counted under. The class STRING is
+// the wire and log spelling and stays hyphenated; the metric suffix is
+// underscored, because a hyphen is not legal in a Prometheus metric name and
+// every other counter in this repo is underscored.
+func dropMetricName(class Class) string {
+	return dropMetricPrefix + strings.ReplaceAll(string(class), "-", "_")
+}
+
 // dropCounters is one expvar per class that MEANS "ours". ClassNone is absent
 // on purpose: it is the answer "this is genuine remote content", and remote
 // content is processed, never dropped — a counter for it could only ever
@@ -348,7 +538,7 @@ var dropCounters = func() map[Class]*expvar.Int {
 		ClassLocalActor,
 		ClassAncestorShortCircuit,
 	} {
-		counters[class] = expvar.NewInt(dropMetricPrefix + string(class))
+		counters[class] = expvar.NewInt(dropMetricName(class))
 	}
 	return counters
 }()

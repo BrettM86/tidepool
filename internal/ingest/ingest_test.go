@@ -182,6 +182,11 @@ type harness struct {
 	// same database and unseals the personas' AP keys).
 	db        *sql.DB
 	custodian *identity.Custodian
+	// classifier is the harness's echo classifier over the real stores. It is
+	// kept so a rebuilt dispatcher keeps the SAME guard: echo suppression is
+	// mandatory, and a swap that quietly dropped it would disable it for the
+	// swapped test only.
+	classifier EchoClassifier
 	// logs captures the dispatcher's own log output, so a test can assert that
 	// a drop was INTENTIONAL — an incidental drop and a deliberate one are
 	// indistinguishable from state alone.
@@ -327,6 +332,7 @@ func newHarness(t *testing.T) *harness {
 		Actors:          store.NewAPActors(database),
 	})
 	require.NoError(t, err)
+	h.classifier = classifier
 	h.handler, err = NewHandler(HandlerOptions{
 		Materializer:   h.mat,
 		Fetcher:        h.client,

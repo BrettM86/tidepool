@@ -359,6 +359,7 @@ func run(logger *slog.Logger) error {
 		Communities:  communities,
 		Tombstones:   tombstones,
 		Seeder:       seeder,
+		Echo:         echoClassifier,
 		MaxPosts:     cfg.BackfillMaxPosts,
 		// Async runs derive from the run context so a mid-run backfill stops
 		// pulling remote pages once shutdown starts; the drain below waits for

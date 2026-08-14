@@ -500,3 +500,112 @@ func nestedEnvelope(levels int, deepestID string) string {
 	}
 	return body
 }
+
+// H4 — CLASSIFICATION MUST BIND THE ENVELOPE, NOT A BARE ID STRING.
+//
+// Our activity ids are public and derivable: a peer that has received one can
+// copy it onto a node wrapping somebody ELSE's content and have the whole
+// envelope dropped as "our echo". The practical severity is bounded (the
+// announce path runs after the followed-community gate, so the forger must be a
+// community we follow, suppressing content it chose to announce) — but the fix
+// is cheap and the residual is real: a followed community can make content
+// appear announced to everyone else while we silently drop it.
+//
+// We persist the canonical payload precisely because it is byte-stable for
+// replay, so it is available as corroboration. The rule is CONTRADICTION
+// DISQUALIFIES, ABSENCE DOES NOT: a node that says nothing (a bare IRI, W4
+// above) is still ours, while a node that says something INCOMPATIBLE with what
+// we stored under that id is not.
+func TestClassifyRefusesForgedNodesWearingOurActivityIds(t *testing.T) {
+	classifier, _, database := newWorld(t)
+	seedMirroredLemmyUser(t, database)
+	ctx := context.Background()
+
+	cases := []struct {
+		name string
+		body string
+		why  string
+	}{
+		{
+			name: "a Delete wearing the id of a Create we sent",
+			body: `{
+				"id": "` + ecLemmyAnnounceID + `/forged-kind",
+				"type": "Announce",
+				"actor": "` + ecLemmyGroupAPID + `",
+				"object": {
+					"id": "` + ecActivityID + `",
+					"type": "Delete",
+					"actor": "` + ecLemmyPersonAPID + `",
+					"object": "` + ecLemmyNoteAPID + `"
+				}
+			}`,
+			why: "we stored that id as a Create; a node calling itself a Delete is not the " +
+				"activity we sent, and honouring the id alone lets a peer suppress any " +
+				"delete it likes by wearing one of our ids",
+		},
+		{
+			name: "a Create wearing our id but carrying somebody else's object",
+			body: `{
+				"id": "` + ecLemmyAnnounceID + `/forged-content",
+				"type": "Announce",
+				"actor": "` + ecLemmyGroupAPID + `",
+				"object": {
+					"id": "` + ecActivityID + `",
+					"type": "Create",
+					"actor": "` + ecLemmyPersonAPID + `",
+					"object": {
+						"id": "` + ecLemmyNoteAPID + `",
+						"type": "Note",
+						"attributedTo": "` + ecLemmyPersonAPID + `"
+					}
+				}
+			}`,
+			why: "the type matches, so a Kind check alone is not enough: the stored payload " +
+				"names OUR object and this one names a Lemmy human's note — dropping it is " +
+				"content loss dressed as echo suppression",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			identity, err := classifier.Classify(ctx, envelope(t, tc.body))
+			require.NoError(t, err)
+			assert.Equal(t, ClassNone, identity.Class, tc.why)
+		})
+	}
+}
+
+// TestClassifyStillRecognizesARealEchoAfterReserialization is the control that
+// keeps the H4 fix honest. A community does not hand our activity back
+// byte-for-byte: it re-serializes, reorders keys, and may add or drop
+// addressing fields. Corroboration must therefore be on the IDENTIFYING fields
+// — the activity's type and the object it carries — never on the bytes, or
+// every genuine echo leaks through and re-materializes as remote content.
+func TestClassifyStillRecognizesARealEchoAfterReserialization(t *testing.T) {
+	classifier, _, _ := newWorld(t)
+	ctx := context.Background()
+
+	identity, err := classifier.Classify(ctx, envelope(t, `{
+		"id": "`+ecLemmyAnnounceID+`/reserialized",
+		"type": "Announce",
+		"actor": "`+ecLemmyGroupAPID+`",
+		"object": {
+			"audience": "`+ecLemmyGroupAPID+`",
+			"type": "Create",
+			"cc": ["`+ecLemmyGroupAPID+`/followers", "`+ecLemmyGroupAPID+`"],
+			"actor": "`+ecActorID+`",
+			"id": "`+ecActivityID+`",
+			"object": {
+				"attributedTo": "`+ecActorID+`",
+				"type": "Page",
+				"id": "`+ecNativeAPID+`",
+				"name": "a title the community re-rendered"
+			}
+		}
+	}`))
+	require.NoError(t, err)
+	assert.Equal(t, ClassLocalActivity, identity.Class,
+		"reordered keys, extra addressing and a re-rendered name are what a real Announce "+
+			"looks like: the echo is still ours, and a byte-equality check would let it back in")
+	assert.Equal(t, ecAuthorDID, identity.DID)
+}

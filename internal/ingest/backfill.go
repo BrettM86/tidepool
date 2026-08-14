@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"tidepool/internal/ap"
+	"tidepool/internal/echo"
 	"tidepool/internal/errors"
 	"tidepool/internal/materialize"
 	"tidepool/internal/store"
@@ -43,12 +44,18 @@ type CountSeeder interface {
 }
 
 // BackfillOptions configures NewBackfill. Fetcher, Materializer,
-// Communities, and Tombstones are required.
+// Communities, Tombstones and Echo are required.
 type BackfillOptions struct {
 	Fetcher      BackfillFetcher
 	Materializer Materializer
 	Communities  store.Communities
 	Tombstones   store.Tombstones
+	// Echo keeps the bridge's own federated content out of the walk. A
+	// bridged community's outbox holds OUR posts the moment a native user
+	// participates, and this path reaches the materializer directly — past
+	// the dispatcher's guard, which never sees an outbox item. Required for
+	// the same reason the dispatcher's is (task 17a).
+	Echo EchoClassifier
 	// Seeder, when set, seeds each backfilled post's vote aggregates from
 	// the origin's public API (config SEED_COUNTS_FROM_API).
 	Seeder CountSeeder
@@ -75,6 +82,7 @@ type Backfill struct {
 	mat         Materializer
 	communities store.Communities
 	tombstones  store.Tombstones
+	classifier  EchoClassifier
 	seeder      CountSeeder
 	maxPosts    int
 	minInterval time.Duration
@@ -101,6 +109,9 @@ func NewBackfill(opts BackfillOptions) (*Backfill, error) {
 	if opts.Tombstones == nil {
 		return nil, errors.NewValidationError("tombstones", "must not be nil")
 	}
+	if opts.Echo == nil {
+		return nil, errors.NewValidationError("echo", "must not be nil")
+	}
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -114,6 +125,7 @@ func NewBackfill(opts BackfillOptions) (*Backfill, error) {
 		mat:         opts.Materializer,
 		communities: opts.Communities,
 		tombstones:  opts.Tombstones,
+		classifier:  opts.Echo,
 		seeder:      opts.Seeder,
 		maxPosts:    opts.MaxPosts,
 		minInterval: opts.MinInterval,
@@ -266,6 +278,25 @@ func (b *Backfill) materializeOutboxItem(ctx context.Context, item *ap.Object, c
 		return false, skip(item.ID, "outbox item object has no id")
 	}
 
+	// Our own content, walked past. It runs on the UNRESOLVED node, before
+	// resolveEmbedded: our object id is cross-authority with the outbox host,
+	// so resolving would dereference our own origin to fetch back a record we
+	// already hold — and MaterializePost then calls EnsureActor on its
+	// attributedTo BEFORE reading any mapping, minting a bridged actor for our
+	// own persona. A skip, never an error: our post in a community's history is
+	// an expected item, and failing it would leave every run reporting failures
+	// and the community never cleanly backfilled.
+	//
+	// The question is asked of the unwrapped OBJECT, not the outbox envelope:
+	// the community mints its own Announce/Create ids around our content, so
+	// the object is the only node in the item that can be ours — and it is what
+	// this path would materialize.
+	if ours, err := b.suppressEcho(ctx, obj); err != nil {
+		return false, err
+	} else if ours {
+		return false, skip(obj.ID, "outbox item is our own federated content")
+	}
+
 	// Same funnel rules as live deliveries: never resurrect deleted
 	// content, trust embedded bodies only on the outbox host's authority.
 	// The walk reads markers in the backfilled community's scope — its own,
@@ -299,6 +330,31 @@ func (b *Backfill) materializeOutboxItem(ctx context.Context, item *ap.Object, c
 	default:
 		return false, skip(obj.ID, "unsupported outbox object type "+obj.Type)
 	}
+}
+
+// suppressEcho reports whether an outbox node is content the bridge itself
+// federated, counting and logging the drop when it is.
+//
+// This is the same guard the dispatcher runs, at the only other place content
+// enters: a backfill has no envelope and no signer, so nothing upstream of here
+// can ask the question. An error is propagated rather than resolved into a
+// verdict — the run is resumable and re-walks, where "not ours" would
+// re-materialize our own post and "ours" would drop a community's history.
+func (b *Backfill) suppressEcho(ctx context.Context, node *ap.Object) (bool, error) {
+	identity, err := b.classifier.Classify(ctx, node)
+	if err != nil {
+		return false, fmt.Errorf("ingest: backfill echo check for %s: %w", node.ID, err)
+	}
+	if identity.Class == echo.ClassNone {
+		return false, nil
+	}
+	echo.CountDrop(identity.Class)
+	// INFO, like every other echo drop: this is the only record that a piece of
+	// a community's history was deliberately walked past.
+	b.logger.Info("backfill item skipped: our own federated content",
+		"object", node.ID, "class", string(identity.Class),
+		"did", identity.DID, "at_uri", identity.ATURI)
+	return true, nil
 }
 
 // seedCounts imports a backfilled post's historical vote counts (task 07).
@@ -336,6 +392,17 @@ func (b *Backfill) backfillReplies(ctx context.Context, post *ap.Object, communi
 		}
 		count++
 		note := *item
+		// Before resolveEmbedded, for the same reason as the outbox item: a
+		// reply of ours must not be dereferenced from our own origin, and a
+		// native comment in a Lemmy thread is exactly what this collection
+		// holds once a Coves user replies.
+		if ours, err := b.suppressEcho(ctx, &note); err != nil {
+			b.logger.Warn("backfill reply echo check failed",
+				"post", post.ID, "reply", note.ID, "error", err)
+			return nil
+		} else if ours {
+			return nil
+		}
 		resolved, err := b.resolveEmbedded(ctx, &note, repliesIRI)
 		if err != nil {
 			b.logger.Info("backfill reply skipped", "post", post.ID, "error", err.Error())

@@ -61,6 +61,17 @@ type Fetcher interface {
 	FetchObjectSameAuthority(ctx context.Context, iri string) (*ap.Object, error)
 }
 
+// EchoClassifier answers whether an inbound envelope is the bridge's own
+// traffic coming home (task 17a). *echo.Classifier satisfies it.
+//
+// It is an INTERFACE, like votes.VoterProbe, for one reason: the fail-safe this
+// dispatcher owes — a classification that CANNOT be made must retry, never
+// poison the event and never materialize — is only exercisable by injecting a
+// classifier that fails, and a concrete type leaves that contract untestable.
+type EchoClassifier interface {
+	Classify(ctx context.Context, envelope *ap.Object) (echo.Identity, error)
+}
+
 // Backfiller is notified when a community's Follow is accepted (the
 // backfill trigger). *Backfill implements it; tests inject recorders.
 type Backfiller interface {
@@ -90,7 +101,7 @@ type HandlerOptions struct {
 	Backfill     Backfiller
 	// Echo classifies inbound ids against the bridge's own serving surface so
 	// an activity we sent never re-enters as content (task 17a).
-	Echo *echo.Classifier
+	Echo EchoClassifier
 	// ServiceActorID is the bridge's own AP actor id; Accepts must wrap a
 	// Follow issued by it.
 	ServiceActorID string
@@ -111,7 +122,7 @@ type Handler struct {
 	records     RecordGetter
 	votes       VoteAggregator
 	backfill    Backfiller
-	echo        *echo.Classifier
+	classifier  EchoClassifier
 	echoLog     *ratelimit.Sampler
 	serviceID   string
 	logger      *slog.Logger
@@ -143,6 +154,15 @@ func NewHandler(opts HandlerOptions) (*Handler, error) {
 	if opts.Votes == nil {
 		return nil, errors.NewValidationError("votes", "must not be nil")
 	}
+	// REQUIRED, exactly as votes.NewAggregator requires its voter probe. The
+	// same guard cannot be mandatory on one path and optional on another: a
+	// dispatcher without it re-materializes our own content, mints bridged
+	// actors for our own personas and self-moderates, silently, in whichever
+	// binary forgot to pass it — which is how it was left out of production the
+	// first time.
+	if opts.Echo == nil {
+		return nil, errors.NewValidationError("echo", "must not be nil")
+	}
 	if opts.ServiceActorID == "" {
 		return nil, errors.NewValidationError("service_actor_id", "must not be empty")
 	}
@@ -160,7 +180,7 @@ func NewHandler(opts HandlerOptions) (*Handler, error) {
 		records:     opts.Records,
 		votes:       opts.Votes,
 		backfill:    opts.Backfill,
-		echo:        opts.Echo,
+		classifier:  opts.Echo,
 		echoLog:     ratelimit.NewSampler(echoDropLogInterval),
 		serviceID:   opts.ServiceActorID,
 		logger:      logger,
@@ -313,25 +333,20 @@ func (h *Handler) handleAnnounce(ctx context.Context, announce *ap.Object, signe
 	}
 }
 
-// suppressEcho drops an announced activity the bridge itself sent. Returning
-// our own content back into materialization duplicates it, double-counts our
-// own votes, and — worst — reads as MODERATION of our own records.
+// suppressEcho drops an activity the bridge itself sent, whether it arrived
+// announced by a community or delivered bare. Letting our own content back into
+// materialization duplicates it, double-counts our own votes, and — worst —
+// reads as MODERATION of our own records.
 //
 // It returns a skip when the envelope resolves to one of our own entities, nil
 // when it is genuine remote traffic, and the classifier's error otherwise. A
 // failed lookup is never a verdict: calling it "not ours" re-materializes the
 // echo, calling it "ours" drops real Lemmy content permanently, and only the
 // retry the wrapped error buys is honest.
-//
-// A nil classifier means echo suppression is not configured; the handler then
-// behaves exactly as it did before task 17a rather than refusing traffic.
-func (h *Handler) suppressEcho(ctx context.Context, announceID string, envelope *ap.Object) error {
-	if h.echo == nil {
-		return nil
-	}
-	identity, err := h.echo.Classify(ctx, envelope)
+func (h *Handler) suppressEcho(ctx context.Context, activityID string, envelope *ap.Object) error {
+	identity, err := h.classifier.Classify(ctx, envelope)
 	if err != nil {
-		return fmt.Errorf("ingest: echo classification for %s: %w", announceID, err)
+		return fmt.Errorf("ingest: echo classification for %s: %w", activityID, err)
 	}
 	if identity.Class == echo.ClassNone {
 		return nil
@@ -343,13 +358,13 @@ func (h *Handler) suppressEcho(ctx context.Context, announceID string, envelope 
 	// false-positive detector, and genuine community content dropped as an
 	// echo is invisible at Debug in production.
 	if h.echoLog.Allow(time.Now()) {
-		h.logger.Info("dropped an announced echo of our own activity",
-			"announce_id", announceID,
+		h.logger.Info("dropped an echo of our own activity",
+			"activity_id", activityID,
 			"class", string(identity.Class),
 			"did", identity.DID,
 			"at_uri", identity.ATURI)
 	}
-	return skip(announceID, "echo of our own "+string(identity.Class))
+	return skip(activityID, "echo of our own "+string(identity.Class))
 }
 
 // handleBareCreateUpdate processes a Create/Update delivered directly by a

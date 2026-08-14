@@ -1914,15 +1914,20 @@ func (s *oneShotMissingObjects) GetByAPID(ctx context.Context, apID string) (*st
 func (h *harness) swapHandlerStores(objects store.APObjects, actors store.BridgedActors) {
 	h.t.Helper()
 	handler, err := NewHandler(HandlerOptions{
-		Materializer:   h.mat,
-		Fetcher:        h.client,
-		Objects:        objects,
-		Actors:         actors,
-		Communities:    h.communities,
-		Tombstones:     h.tombstones,
-		Records:        h.manager,
-		Votes:          h.votes,
-		Backfill:       h.backfills,
+		Materializer: h.mat,
+		Fetcher:      h.client,
+		Objects:      objects,
+		Actors:       actors,
+		Communities:  h.communities,
+		Tombstones:   h.tombstones,
+		Records:      h.manager,
+		Votes:        h.votes,
+		Backfill:     h.backfills,
+		// The SAME classifier, deliberately over the harness's real stores: this
+		// helper swaps the dispatcher's store VIEWS, and pointing the guard at a
+		// substitute view would change what is being tested here into a test of
+		// the guard.
+		Echo:           h.classifier,
 		ServiceActorID: h.service.ID,
 	})
 	require.NoError(h.t, err)

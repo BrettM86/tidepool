@@ -175,11 +175,18 @@ func newWorld(t *testing.T) (*Classifier, Options, *sql.DB) {
 	_, err = outboundObjects.Tombstone(ctx, ecGoneATURI)
 	require.NoError(t, err, "tombstone the deleted native post")
 
+	// The payload is the FULL canonical activity, the way the enqueuer stores it
+	// (byte-stable for replay). It is what a node claiming this id can be
+	// corroborated against: the id alone is public and derivable.
 	_, err = activities.Insert(ctx, store.OutboundActivity{
 		ActivityID: ecActivityID,
 		ActorDID:   ecAuthorDID,
 		Kind:       "Create",
-		Payload:    []byte(`{"type":"Create","id":"` + ecActivityID + `"}`),
+		Payload: []byte(`{"@context":"https://www.w3.org/ns/activitystreams",` +
+			`"id":"` + ecActivityID + `","type":"Create","actor":"` + ecActorID + `",` +
+			`"to":["https://www.w3.org/ns/activitystreams#Public"],` +
+			`"cc":["https://lemmy.world/c/technology"],"audience":"https://lemmy.world/c/technology",` +
+			`"object":{"id":"` + ecNativeAPID + `","type":"Page","attributedTo":"` + ecActorID + `"}}`),
 	})
 	require.NoError(t, err, "seed the delivered activity")
 
@@ -251,6 +258,16 @@ func TestIdentifyResolvesOurServingSurface(t *testing.T) {
 			why: "personas answers 410 for it, not 404: an echo of something we later " +
 				"deleted is still an echo, and treating it as remote content would " +
 				"re-materialize the record we just removed",
+		},
+		{
+			name:      "P6 a persona minted under a VANITY origin, on that origin",
+			apID:      ecVanityOrigin + "/ap/actor/" + ecVanityDID,
+			wantClass: ClassLocalActor,
+			wantDID:   ecVanityDID,
+			why: "decision 10 stated POSITIVELY: the origin set is unenumerable, so the host " +
+				"test is the actor's OWN stored NormalizedOrigin. An implementation comparing " +
+				"against one configured origin passes every negative case and fails this one — " +
+				"and it would take every vanity-origin user's traffic with it",
 		},
 		{
 			name:      "P5 soft-deleted bridge mapping is still ours",
@@ -334,6 +351,22 @@ func TestIdentifyRefusesWhatWeDoNotServe(t *testing.T) {
 				"is a different authority that can host the same path",
 		},
 		{
+			name: "N4 a foreign host carrying an at-uri we DO serve (the spoof that reaches the check)",
+			apID: "https://notcoves.social/ap/object/" + ecAuthorDID +
+				"/social.coves.community.postv2/" + ecNativeRKey,
+			why: "outbound_objects is keyed by AT-URI, so this path finds a REAL row — the " +
+				"only thing standing between it and a mapped-object verdict is comparing the " +
+				"row's own ap id against the id we were asked about. Without that comparison " +
+				"any authority can wear our path shape and have its content dropped as our echo",
+		},
+		{
+			name: "N4 a foreign host carrying an activity hash we minted",
+			apID: "https://notcoves.social/ap/activity/" +
+				"9f2c1e6b6d5b4a3f8c7d0e1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e",
+			why: "the activity route is keyed by the FULL id for this reason: a lookup keyed " +
+				"on the hash alone would answer for whoever hosts it",
+		},
+		{
 			name: "N4 a host that merely starts with ours",
 			apID: "https://coves.social.evil.example/ap/actor/" + ecAuthorDID,
 			why:  "same boundary rule in the other direction: ours as a prefix label is not ours",
@@ -364,6 +397,58 @@ func TestIdentifyRefusesWhatWeDoNotServe(t *testing.T) {
 			assert.Equal(t, ClassNone, identity.Class, tc.why)
 			assert.Empty(t, identity.DID, "a non-identity carries no entity")
 			assert.Empty(t, identity.ATURI, "a non-identity carries no record")
+		})
+	}
+}
+
+// TestIdentifyNormalizesTheHostTheWayServingDoes pins echo.normalizeHost, the
+// read-side twin of personas' own. It is a hand-copy, and a hand-copy that
+// drifts is invisible: replacing its body with `return host` leaves every other
+// test in this package green while every actor id a peer spells slightly
+// differently stops being recognized as ours — and an unrecognized echo is a
+// duplicate, an over-normalized one is dropped genuine content.
+func TestIdentifyNormalizesTheHostTheWayServingDoes(t *testing.T) {
+	classifier, _, _ := newWorld(t)
+	ctx := context.Background()
+
+	cases := []struct {
+		name      string
+		apID      string
+		wantClass Class
+		why       string
+	}{
+		{
+			name:      "the default port is the same origin",
+			apID:      "https://coves.social:443/ap/actor/" + ecAuthorDID,
+			wantClass: ClassLocalActor,
+			why:       "https://host:443 and https://host name the same authority",
+		},
+		{
+			name:      "the host is case-insensitive",
+			apID:      "https://COVES.SOCIAL/ap/actor/" + ecAuthorDID,
+			wantClass: ClassLocalActor,
+			why:       "DNS is case-insensitive and normalized_origin is stored lowercased",
+		},
+		{
+			name:      "a fully-qualified trailing dot is the same origin",
+			apID:      "https://coves.social./ap/actor/" + ecAuthorDID,
+			wantClass: ClassLocalActor,
+			why:       "the root label is implicit; a peer that spells it out names the same host",
+		},
+		{
+			name:      "a NON-default port is a DIFFERENT origin",
+			apID:      "https://coves.social:8091/ap/actor/" + ecAuthorDID,
+			wantClass: ClassNone,
+			why: "the dev origin runs on :8091 and is genuinely another origin — stripping " +
+				"ports wholesale would let it answer for production's actors",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			identity, err := classifier.Identify(ctx, tc.apID)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantClass, identity.Class, tc.why)
 		})
 	}
 }

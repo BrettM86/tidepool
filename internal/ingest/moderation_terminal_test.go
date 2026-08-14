@@ -13,6 +13,7 @@ import (
 
 	"tidepool/internal/accept"
 	"tidepool/internal/consume"
+	"tidepool/internal/echo"
 	"tidepool/internal/errors"
 	"tidepool/internal/materialize"
 	"tidepool/internal/outbound"
@@ -445,4 +446,184 @@ func TestAnnouncedRestoreOfANativePostLiftsTheRemovalCleanly(t *testing.T) {
 	assert.NotNil(t, event.ProcessedAt,
 		"and the restore is DECIDED, not left retrying: %s", event.Error)
 	assert.Nil(t, event.FailedAt, "nor poisoned")
+}
+
+// TestRestoredAcceptancePinsTheEditedVersion is PIN-1.
+//
+// RestorePost's own doc says the fresh acceptance pins "the post's CURRENT
+// version, not the one that was removed: the author may have edited it while it
+// was out". Terminality made that false in the common case — an edit against a
+// standing moderator removal is refused and writes NOTHING to outbound_objects,
+// so LastCID keeps naming the pre-removal version, which is exactly the one that
+// was removed.
+//
+// The consequence is not internal. The community SIGNS an acceptance whose
+// strongRef names a CID that may no longer resolve in the author's PDS, and the
+// "self-heals on the author's next edit" argument rests on an edit that may
+// never come — the author has no reason to edit again, because from their side
+// the post is back.
+//
+// The assertion is on the OUTCOME, not the source: an authority-pinned
+// getRecord and the terminal admission's EvaluatedCID both satisfy it, and which
+// one is right is GREEN's call.
+func TestRestoredAcceptancePinsTheEditedVersion(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	world := newModerationWorld(t, h)
+
+	// A moderator removes the post.
+	reason := "removed pending an edit"
+	h.announceDeleteWithSummary(world.groupA,
+		"https://lemmy.world/activities/announce/delete/mt-pin", mtPostAPID, &reason)
+	require.True(t, removalStandsFor(t, h, world), "precondition: the removal stands")
+
+	// The author edits it WHILE REMOVED. The edit is refused (terminal) and
+	// writes nothing outbound — which is precisely why LastCID goes stale.
+	require.NoError(t, world.dispatcher.HandleEvent(ctx,
+		mtPostEvent(t, "update", mtEditRev, mtEditCID, mtEditTime)))
+	require.True(t, removalStandsFor(t, h, world),
+		"precondition: the edit did not reverse the removal (17c-1's terminality)")
+
+	// The moderators reconsider and restore it.
+	h.announceUndoDelete(world.groupA,
+		"https://lemmy.world/activities/announce/undo/mt-pin",
+		"https://lemmy.world/activities/announce/delete/mt-pin/delete",
+		mtPostAPID, &reason)
+
+	acceptance, _, err := h.manager.GetRecord(ctx,
+		world.communityADID, materialize.CollectionAcceptance, world.digestRKey)
+	require.NoError(t, err, "the restore must re-accept the post")
+	subject, ok := acceptance["subject"].(map[string]any)
+	require.True(t, ok, "the acceptance carries a strongRef, got %#v", acceptance["subject"])
+
+	assert.Equal(t, mtEditCID, subject["cid"],
+		"the acceptance must pin the CURRENT record: the author edited while the post was "+
+			"out, and pinning the pre-removal CID signs the community's name to a version "+
+			"that may no longer resolve in the author's PDS — the one version we know the "+
+			"moderators did NOT reinstate")
+	assert.NotEqual(t, mtPostCID, subject["cid"],
+		"and specifically not the version that was removed")
+}
+
+// removalStandsFor reports whether community A currently holds a removal for the
+// fixture's post.
+func removalStandsFor(t *testing.T, h *harness, world moderationWorld) bool {
+	t.Helper()
+	_, _, err := h.manager.GetRecord(context.Background(),
+		world.communityADID, materialize.CollectionRemoval, world.digestRKey)
+	if errors.IsNotFound(err) {
+		return false
+	}
+	require.NoError(t, err)
+	return true
+}
+
+// TestSummarylessCrossCommunityDeleteIsRefused bounds the one attribution the
+// announced-delete path takes on trust.
+//
+// moderateAnnouncedDelete's summary-less branch asks whether the INNER Delete's
+// actor is the post's author — an unverified claim, since only the announcing
+// community's signature is checked. The bound is that authorization runs FIRST:
+// whatever the inner actor claims, the announcer must own the target's mapping,
+// so at most a community can withdraw a post from ITSELF.
+//
+// The inner actor here is a LEMMY moderator, not our persona: a summary-less
+// delete attributed to one of OUR personas never reaches this branch at all (see
+// the sibling test below), so attributing it that way would pin the echo guard
+// while claiming to pin authorization.
+func TestSummarylessCrossCommunityDeleteIsRefused(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	world := newModerationWorld(t, h)
+
+	h.announceDeleteBy(world.groupB,
+		"https://lemmy.world/activities/announce/delete/mt-summaryless",
+		mtPostAPID, modActorID, nil)
+
+	_, _, err := h.manager.GetRecord(ctx,
+		world.communityADID, materialize.CollectionRemoval, world.digestRKey)
+	assert.True(t, errors.IsNotFound(err),
+		"a community that does not own the mapping decides nothing about it, whoever the "+
+			"inner activity claims to be (err=%v)", err)
+	_, _, err = h.manager.GetRecord(ctx,
+		world.communityADID, materialize.CollectionAcceptance, world.digestRKey)
+	assert.NoError(t, err, "A's acceptance is untouched")
+
+	mapping, err := h.objects.GetByAPID(ctx, mtPostAPID)
+	require.NoError(t, err)
+	assert.False(t, mapping.IsDeleted(),
+		"and the post is not deleted either: the summary-less branch's other outcome is the "+
+			"author's own delete, which would destroy the record")
+}
+
+// TestSummarylessDeleteAttributedToOurPersonaIsDroppedAsAnEcho records where the
+// unverified attribution actually lands for NATIVE content.
+//
+// A native post's author IS one of our personas, so a truthful summary-less
+// self-delete announced back by the community is indistinguishable from our own
+// Delete coming home — and the echo classifier takes it first, by the inner
+// ACTOR, before any authorization runs.
+//
+// That is the M1 behaviour working as designed, and it means the attribution
+// this branch trusts is unreachable for native posts from either direction: a
+// forged persona attribution is dropped as an echo, and a foreign attribution is
+// bounded by the ownership conjunct above.
+func TestSummarylessDeleteAttributedToOurPersonaIsDroppedAsAnEcho(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	world := newModerationWorld(t, h)
+	before := dropSnapshot()
+
+	// Community A — the OWNER, so ownership cannot be what refuses this.
+	h.announceDeleteBy(world.groupA,
+		"https://lemmy.world/activities/announce/delete/mt-persona-attributed",
+		mtPostAPID, mtUserOrigin+"/ap/actor/"+mtAuthorDID, nil)
+
+	_, _, err := h.manager.GetRecord(ctx,
+		world.communityADID, materialize.CollectionAcceptance, world.digestRKey)
+	assert.NoError(t, err, "the post stays accepted")
+	mapping, err := h.objects.GetByAPID(ctx, mtPostAPID)
+	require.NoError(t, err)
+	assert.False(t, mapping.IsDeleted(), "and its record is not destroyed")
+
+	assert.Equal(t, before[echo.ClassLocalActor]+1, echo.Drops(echo.ClassLocalActor),
+		"it is dropped as an ECHO, by the inner actor — which is what makes the summary-less "+
+			"branch's unverified author attribution unreachable for native posts")
+}
+
+// TestRestoreWithNoInterveningEditPinsTheFederatedVersion covers the FALLBACK
+// half of restorePin's pair.
+//
+// PIN-1 arose because a primary/fallback pair had only its fallback exercised;
+// wiring the ledger fixes that and creates the mirror risk — every restore now
+// takes the primary, and LastCID's correctness stops being tested at all.
+//
+// The case that must still work is the ordinary one: a moderator removes a post
+// and reinstates it with NO author edit in between. The ledger holds no decision
+// for that post beyond its acceptance, so the pin comes from outbound state —
+// and there it is right, because nothing has changed since it was federated.
+func TestRestoreWithNoInterveningEditPinsTheFederatedVersion(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	world := newModerationWorld(t, h)
+
+	reason := "removed and reinstated, no edit in between"
+	h.announceDeleteWithSummary(world.groupA,
+		"https://lemmy.world/activities/announce/delete/mt-nofallback", mtPostAPID, &reason)
+	require.True(t, removalStandsFor(t, h, world), "precondition: the removal stands")
+
+	h.announceUndoDelete(world.groupA,
+		"https://lemmy.world/activities/announce/undo/mt-nofallback",
+		"https://lemmy.world/activities/announce/delete/mt-nofallback/delete",
+		mtPostAPID, &reason)
+
+	acceptance, _, err := h.manager.GetRecord(ctx,
+		world.communityADID, materialize.CollectionAcceptance, world.digestRKey)
+	require.NoError(t, err, "the restore re-accepts the post")
+	subject, ok := acceptance["subject"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, mtPostCID, subject["cid"],
+		"with no edit to supersede it, the version we federated IS the current one — the "+
+			"fallback has to be right for the common case, or fixing the stale pin just moves "+
+			"the staleness into whichever branch nobody exercises")
 }

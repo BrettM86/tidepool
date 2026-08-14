@@ -262,7 +262,10 @@ func realEnqueuer(t *testing.T, conn *sql.DB) *outbound.Enqueuer {
 	return enq
 }
 
-func wireEngine(t *testing.T, conn *sql.DB, repos *repo.Manager, enqueuer consume.OutboundEnqueuer) *Engine {
+// wireEngine takes the RepoManager INTERFACE, not *repo.Manager, so a test can
+// interpose on the two operations the terminality decision spans (the removal
+// read and the commit that acts on it) without a second wiring helper.
+func wireEngine(t *testing.T, conn *sql.DB, repos acceptrec.RepoManager, enqueuer consume.OutboundEnqueuer) *Engine {
 	t.Helper()
 	engine, err := NewEngine(Options{
 		Repos:       repos,

@@ -152,6 +152,11 @@ type ModerationLedger interface {
 	// RecordRestore marks the post accepted again, pinning the CID the fresh
 	// acceptance was written against.
 	RecordRestore(ctx context.Context, communityDID, postURI, authorDID, cid string) error
+	// LastEvaluatedCID is the CID of the most recent version of the post the
+	// acceptance engine DECIDED on — including a decision that wrote nothing
+	// outward, which is exactly the case a restore has to pin. "" means the
+	// ledger knows of no decision for this (community, post).
+	LastEvaluatedCID(ctx context.Context, communityDID, postURI string) (string, error)
 }
 
 // Options configures New. Fetcher, Objects, Actors, Communities, Repos,

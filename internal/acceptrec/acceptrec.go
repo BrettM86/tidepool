@@ -253,7 +253,20 @@ func Remove(ctx context.Context, repos RepoManager, communityDID, subjectURI, su
 // AcceptSubject, it does NOT trip the removal guard: deleting the removal is the
 // point. createdAt is derived from publishedAt (a fresh acceptance stands for the
 // current version), so a redelivery re-puts byte-identical bytes.
-func Restore(ctx context.Context, repos RepoManager, communityDID, subjectURI, subjectCID string, publishedAt time.Time, sideEffect repo.TxSideEffect) (*repo.CommitResult, error) {
+// expectRemovalCID is a REQUIRED compare-and-set token: the CID of the removal
+// the caller inspected before deciding to reverse it. The delete only applies
+// if that exact record is still standing, so an edit can never delete a removal
+// it never read — a moderator replacing our admission-revoked removal with
+// their own in the decision window would otherwise have theirs deleted, the
+// acceptance written over it, and the side effect (the outbound enqueue) fired,
+// pushing the post back at the community that just removed it. On a mismatch
+// the commit returns repo.ErrPreconditionFailed and NOTHING runs, side effect
+// included.
+func Restore(ctx context.Context, repos RepoManager, communityDID, subjectURI, subjectCID, expectRemovalCID string, publishedAt time.Time, sideEffect repo.TxSideEffect) (*repo.CommitResult, error) {
+	if expectRemovalCID == "" {
+		return nil, errors.NewValidationError("expect_removal_cid",
+			"a restore must name the removal it inspected")
+	}
 	rkey := SubjectRKey(subjectURI)
 	acceptance := map[string]any{
 		"$type":     CollectionAcceptance,
@@ -264,7 +277,7 @@ func Restore(ctx context.Context, repos RepoManager, communityDID, subjectURI, s
 	// so the firehose never shows a window where the post is neither removed nor
 	// accepted.
 	res, err := repos.ApplyOpsTx(ctx, communityDID, []repo.RecordOp{
-		{Action: repo.OpActionDelete, Collection: CollectionRemoval, RKey: rkey},
+		{Action: repo.OpActionDelete, Collection: CollectionRemoval, RKey: rkey, ExpectPrevCID: &expectRemovalCID},
 		{Action: repo.OpActionUpdate, Collection: CollectionAcceptance, RKey: rkey, Record: acceptance},
 	}, sideEffect)
 	if err != nil {

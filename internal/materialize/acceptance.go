@@ -99,6 +99,11 @@ func (m *Materializer) removalStands(ctx context.Context, communityDID, rkey str
 	}
 }
 
+// removalCodeModeratorDiscretion is the removal lexicon's catch-all: Lemmy
+// sends no machine-readable code, so anything narrower would be the bridge
+// asserting a reason the moderator never gave.
+const removalCodeModeratorDiscretion = "moderator-discretion"
+
 // RemovePost records a community's moderator removal of a post: the acceptance
 // is deleted and a removal written IN ONE COMMIT, at the same digest rkey.
 //
@@ -112,11 +117,6 @@ func (m *Materializer) removalStands(ctx context.Context, communityDID, rkey str
 // deleting the author's record would let one community destroy content for
 // every other, and tombstoning the mapping would block the post's later edits
 // and votes from ever materializing again.
-// removalCodeModeratorDiscretion is the removal lexicon's catch-all: Lemmy
-// sends no machine-readable code, so anything narrower would be the bridge
-// asserting a reason the moderator never gave.
-const removalCodeModeratorDiscretion = "moderator-discretion"
-
 func (m *Materializer) RemovePost(ctx context.Context, mapping *store.APObjectMapping, reason string) error {
 	communityDID, postURI, rkey, err := m.moderationTarget(ctx, mapping)
 	if err != nil {
@@ -207,7 +207,7 @@ func (m *Materializer) RestorePost(ctx context.Context, mapping *store.APObjectM
 		return nil
 	}
 
-	currentCID, ok, err := m.restorePin(ctx, mapping)
+	currentCID, ok, err := m.restorePin(ctx, communityDID, mapping)
 	if err != nil {
 		return err
 	}
@@ -281,7 +281,7 @@ func (m *Materializer) recordModeration(ctx context.Context, mapping *store.APOb
 // outbound row is the sharpest case: the author deleted the post while it was
 // removed, so restoring would publish an acceptance for a record that no longer
 // exists — the community asserting it admitted something deleted.
-func (m *Materializer) restorePin(ctx context.Context, mapping *store.APObjectMapping) (string, bool, error) {
+func (m *Materializer) restorePin(ctx context.Context, communityDID string, mapping *store.APObjectMapping) (string, bool, error) {
 	if mapping.Origin != store.OriginBridge {
 		_, cid, err := m.repos.GetRecord(ctx, mapping.DID, mapping.Collection, mapping.RKey)
 		if err != nil {
@@ -314,12 +314,33 @@ func (m *Materializer) restorePin(ctx context.Context, mapping *store.APObjectMa
 			"ap_id", mapping.APID, "at_uri", mapping.ATURI)
 		return "", false, nil
 	}
-	if state.LastCID == "" {
+
+	// The pin is the version the acceptance ENGINE last decided on, not the one
+	// the bridge last FEDERATED, and after task 17c-1 those routinely differ:
+	// an edit against a standing removal is terminal, so it writes no acceptance
+	// and enqueues nothing — outbound_objects keeps naming the pre-removal
+	// version, which is the one version we know the moderators did NOT
+	// reinstate, and it may no longer resolve in the author's PDS at all.
+	//
+	// outbound state remains the fallback, for a post whose latest decision IS
+	// what it federated (the common case) and for a deployment with no ledger
+	// wired.
+	pin := state.LastCID
+	if m.ledger != nil {
+		evaluated, err := m.ledger.LastEvaluatedCID(ctx, communityDID, mapping.ATURI)
+		if err != nil {
+			return "", false, fmt.Errorf("materialize: read evaluated cid for %s: %w", mapping.ATURI, err)
+		}
+		if evaluated != "" {
+			pin = evaluated
+		}
+	}
+	if pin == "" {
 		m.logger.Warn("restore target has no recorded CID to pin; leaving the removal in place",
 			"ap_id", mapping.APID, "at_uri", mapping.ATURI)
 		return "", false, nil
 	}
-	return state.LastCID, true, nil
+	return pin, true, nil
 }
 
 // moderationTarget resolves the community, subject uri and digest rkey a

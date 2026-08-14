@@ -22,6 +22,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/require"
 
+	"tidepool/internal/accept"
 	"tidepool/internal/ap"
 	"tidepool/internal/echo"
 	"tidepool/internal/identity"
@@ -328,7 +329,13 @@ func newHarness(t *testing.T) *harness {
 		// so the origin dispatch, the tombstone refusal and the empty-CID
 		// refusal are all dead code in every ingest test — passing by never
 		// running.
-		OutboundObjects:  store.NewOutboundObjects(database),
+		OutboundObjects: store.NewOutboundObjects(database),
+		// Same rule, same reason (main.go passes *accept.Admissions here): with
+		// a nil ledger restorePin silently takes its LastCID FALLBACK, so the
+		// primary source is never exercised and a restore pins whatever was last
+		// federated — which is the pre-removal version exactly when an author
+		// edited while removed.
+		Ledger:           accept.NewAdmissions(database),
 		ServiceDID:       testServiceDID,
 		StrictValidation: true,
 	})

@@ -154,6 +154,28 @@ func (a *Admissions) markModeration(ctx context.Context, op, communityDID, postU
 	return nil
 }
 
+// LastEvaluatedCID is the CID of the most recent version of a post this engine
+// decided on. It satisfies materialize.ModerationLedger.
+//
+// It is the ONLY record of the current version for a post whose latest decision
+// wrote nothing outward — an edit refused against a standing moderator removal
+// writes no acceptance and enqueues nothing, so outbound_objects keeps naming
+// the version that was removed. A missing row answers "" (no error): a post the
+// engine never decided on has no evaluated version, and the caller falls back.
+func (a *Admissions) LastEvaluatedCID(ctx context.Context, communityDID, postURI string) (string, error) {
+	var cid sql.NullString
+	err := a.db.QueryRowContext(ctx,
+		`SELECT evaluated_cid FROM admissions WHERE community_did = $1 AND post_uri = $2`,
+		communityDID, postURI).Scan(&cid)
+	if stderrors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("accept: read evaluated cid %s/%s: %w", communityDID, postURI, err)
+	}
+	return cid.String, nil
+}
+
 // Get returns the admission for a (community, post), or an error satisfying
 // errors.IsNotFound when the engine has never decided on it.
 func (a *Admissions) Get(ctx context.Context, communityDID, postURI string) (*Admission, error) {

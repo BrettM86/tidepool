@@ -91,11 +91,20 @@ const (
 // that records "removed / moderator-removed" answers 200 accepted/enqueued.
 var ErrModeratorRemovalStands = stderrors.New("accept: a moderator removal stands")
 
-// errRemovalVanished reports that the removal AcceptSubject refused against was
-// gone by the time its code was read — the moderators restored the post inside
-// the window. It is RETRYABLE and self-healing: the retry's AcceptSubject finds
-// no removal and admits the edit normally.
-var errRemovalVanished = stderrors.New("accept: the standing removal vanished before its code could be read")
+// errRemovalChanged reports that the removal an edit was deciding about is no
+// longer the record it inspected — it vanished, or a different one replaced it.
+// The decision is re-run against whatever stands now: an edit may only reverse
+// the exact removal it read, and it may only record a terminal decision about
+// one that is still there.
+//
+// It never escapes accept(): the retry loop consumes it.
+var errRemovalChanged = stderrors.New("accept: the standing removal changed mid-decision")
+
+// maxRemovalDecisionAttempts bounds that loop. Each pass is one repo read plus
+// one commit attempt against a record a moderator is concurrently rewriting;
+// three is generous for a human-paced race and cheap to spend, and running out
+// surfaces as a retryable error rather than a guess.
+const maxRemovalDecisionAttempts = 3
 
 // RemovalCodeAdmissionRevoked is the removal `code` written when a post that WAS
 // accepted fails RE-admission (an edit made it titleless or over the cap).
@@ -537,15 +546,29 @@ func (e *Engine) accept(ctx context.Context, did, communityDID, postURI string, 
 		})
 	}
 
-	_, err = acceptrec.AcceptSubject(ctx, e.repos, communityDID, postURI, commit.CID,
-		publishedAtOf(commit.Record), sideEffect)
-	if stderrors.Is(err, acceptrec.ErrRemovalStands) {
-		return e.editAgainstRemoval(ctx, did, communityDID, postURI, commit, sideEffect)
+	// The decision spans two operations — read the standing removal, then act on
+	// it — and a moderator can write between them. Every such change re-runs the
+	// whole decision against the state that is actually there; nothing is
+	// decided from a record that has since moved.
+	for attempt := 0; ; attempt++ {
+		_, err = acceptrec.AcceptSubject(ctx, e.repos, communityDID, postURI, commit.CID,
+			publishedAtOf(commit.Record), sideEffect)
+		if stderrors.Is(err, acceptrec.ErrRemovalStands) {
+			err = e.editAgainstRemoval(ctx, did, communityDID, postURI, commit, sideEffect)
+			if stderrors.Is(err, errRemovalChanged) && attempt+1 < maxRemovalDecisionAttempts {
+				continue
+			}
+			if stderrors.Is(err, errRemovalChanged) {
+				return fmt.Errorf("accept: %s in %s: the standing removal kept changing across %d attempts",
+					postURI, communityDID, maxRemovalDecisionAttempts)
+			}
+			return err
+		}
+		if err != nil {
+			return fmt.Errorf("accept: admit %s into %s: %w", postURI, communityDID, err)
+		}
+		return nil
 	}
-	if err != nil {
-		return fmt.Errorf("accept: admit %s into %s: %w", postURI, communityDID, err)
-	}
-	return nil
 }
 
 // editAgainstRemoval decides what an edit may do when a removal already stands
@@ -570,14 +593,14 @@ func (e *Engine) accept(ctx context.Context, did, communityDID, postURI string, 
 func (e *Engine) editAgainstRemoval(ctx context.Context, did, communityDID, postURI string,
 	commit *consume.CommitEvent, sideEffect repo.TxSideEffect) error {
 
-	code, err := e.standingRemovalCode(ctx, communityDID, postURI)
+	code, removalCID, err := e.standingRemoval(ctx, communityDID, postURI)
 	if err != nil {
 		return err
 	}
 	if code != RemovalCodeAdmissionRevoked {
 		e.logger.Info("edit against a standing moderator removal: acceptance refused, nothing enqueued",
 			"community_did", communityDID, "post", postURI, "removal_code", code)
-		if rerr := e.admissions.Record(ctx, Admission{
+		terminal := Admission{
 			AuthorDID:         did,
 			CommunityDID:      communityDID,
 			PostURI:           postURI,
@@ -585,7 +608,20 @@ func (e *Engine) editAgainstRemoval(ctx context.Context, did, communityDID, post
 			DecisionCode:      DecisionModeratorRemoved,
 			EvaluatedCID:      commit.CID,
 			EvaluatedSnapshot: e.evaluatedSnapshot(commit),
-		}); rerr != nil {
+		}
+		// Re-verify before recording: the ledger is what an operator reads to
+		// answer "why did my edit do nothing", and a moderator-removed row for a
+		// removal that has since been lifted answers with a removal nobody can
+		// find. The re-read is what turns "a removal stood when we looked" into
+		// "one stands now"; if it has moved, the whole decision re-runs.
+		current, currentCID, verr := e.standingRemoval(ctx, communityDID, postURI)
+		if verr != nil {
+			return verr
+		}
+		if currentCID != removalCID || current != code {
+			return errRemovalChanged
+		}
+		if rerr := e.admissions.Record(ctx, terminal); rerr != nil {
 			return rerr
 		}
 		// The decision is complete; the sentinel only tells the CALLER what was
@@ -594,22 +630,32 @@ func (e *Engine) editAgainstRemoval(ctx context.Context, did, communityDID, post
 		// this very call refused to write.
 		return ErrModeratorRemovalStands
 	}
+	// CAS on the removal we actually inspected: between the read above and this
+	// commit a moderator may have replaced our admission-revoked removal with
+	// their own, and deleting whichever removal happens to be current is the
+	// reversal this whole branch exists to prevent — reachable again through a
+	// smaller window. A mismatch commits nothing (the side effect included) and
+	// re-runs the decision against their record.
 	if _, rerr := acceptrec.Restore(ctx, e.repos, communityDID, postURI, commit.CID,
-		publishedAtOf(commit.Record), sideEffect); rerr != nil {
+		removalCID, publishedAtOf(commit.Record), sideEffect); rerr != nil {
+		if stderrors.Is(rerr, repo.ErrPreconditionFailed) {
+			return errRemovalChanged
+		}
 		return fmt.Errorf("accept: restore %s into %s: %w", postURI, communityDID, rerr)
 	}
 	return nil
 }
 
-// standingRemovalCode reads the `code` off the removal AcceptSubject refused
-// against. The two ways this read can fail are different events and are
-// reported differently:
+// standingRemoval reads the removal AcceptSubject refused against: its `code`,
+// which decides whose decision it is, and its CID, which is the token every
+// later step is checked against. The two ways this read can fail are different
+// events and are reported differently:
 //
 //   - NOT FOUND is the benign race: the moderators restored the post between
-//     the refusal and this read. errRemovalVanished says so, and one retry
-//     resolves it — the retry's AcceptSubject finds no removal and admits the
-//     edit. Reporting it as "not ours, terminal" would strand a post whose
-//     removal no longer exists.
+//     the refusal and this read. errRemovalChanged says so and the decision
+//     re-runs — the next AcceptSubject finds no removal and admits the edit.
+//     Reporting it as "not ours, terminal" would strand a post whose removal no
+//     longer exists.
 //   - ANYTHING ELSE is an infrastructure failure (the repo store is down, a
 //     timeout). It propagates as itself, so the retry budget is spent on a
 //     message about a broken read rather than about a "standing removal" that
@@ -618,18 +664,18 @@ func (e *Engine) editAgainstRemoval(ctx context.Context, did, communityDID, post
 // A record whose `code` is absent or not a string yields "", which the caller
 // treats as a moderator's — terminal. That direction is deliberate: refusing an
 // edit is recoverable, and pushing a removed post back at its community is not.
-func (e *Engine) standingRemovalCode(ctx context.Context, communityDID, postURI string) (string, error) {
+func (e *Engine) standingRemoval(ctx context.Context, communityDID, postURI string) (code, cid string, err error) {
 	rkey := acceptrec.SubjectRKey(postURI)
-	record, _, err := e.repos.GetRecord(ctx, communityDID, acceptrec.CollectionRemoval, rkey)
+	record, cid, err := e.repos.GetRecord(ctx, communityDID, acceptrec.CollectionRemoval, rkey)
 	switch {
 	case errors.IsNotFound(err):
-		return "", fmt.Errorf("%w: %s in %s", errRemovalVanished, postURI, communityDID)
+		return "", "", fmt.Errorf("%w: %s in %s", errRemovalChanged, postURI, communityDID)
 	case err != nil:
-		return "", fmt.Errorf("accept: read standing removal %s/%s/%s: %w",
+		return "", "", fmt.Errorf("accept: read standing removal %s/%s/%s: %w",
 			communityDID, acceptrec.CollectionRemoval, rkey, err)
 	}
-	code, _ := record["code"].(string)
-	return code, nil
+	code, _ = record["code"].(string)
+	return code, cid, nil
 }
 
 // removeAccepted withdraws a post that WAS accepted and now fails re-admission:

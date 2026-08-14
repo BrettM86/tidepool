@@ -119,6 +119,27 @@ task documents and git history rather than this list.
   event. The decision-19 reconciliation job (task 18) is the natural
   home for a periodic acceptance-vs-record pin audit.
 
+## Moderation state (task 17c-2)
+
+- **Bridge-side comment removal is WRITE-ONLY.** Nothing reads
+  `object_moderation.removed_at`, so a moderator-removed native comment
+  still federates the author's later edits and still accepts native
+  replies beneath it. That is the deliberate consequence of the unlanded
+  comment-subject removal lexicon (the state is recorded so it can be
+  honored the moment there is somewhere to publish it), but it is the
+  same asymmetry the lock's own doc warns about: holding state is worth
+  nothing unless something reads it. Closing it means gating child
+  enqueues and edit federation on the parent's removal state, the way
+  the lock already gates them.
+- **The re-materialization test pins a COMPOSITE invariant.** Biting
+  `storedThreadRoot` to `""` leaves it green, because `carryForward`
+  restores the comment's original reply refs so the record still names
+  the right thread and the mapping follows. `storedThreadRoot` is
+  therefore single-covered, not double-covered — isolating it needs a
+  stored record with no reply refs at all, which is repo-record surgery.
+  Recorded so nobody reads that green as proof of the belt when it is
+  proof of the brace.
+
 ## Thread locks (task 17c-2)
 
 - **Comments materialized before migration 026 carry no

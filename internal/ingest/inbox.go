@@ -298,22 +298,35 @@ func (ib *Inbox) handleInbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Bind the activity's claimed actor to the verified signer. Exact
-	// equality is the common case (Lemmy signs as the acting actor); same
-	// authority tolerates instance-actor signing (Mastodon secure-mode
-	// relays) without letting host A speak for host B. The QUEUED actor id
-	// is the activity's actor — downstream authorization (followed
-	// community, delete authority) keys off it.
-	boundActor := actorID
-	if claimed := refID(activity.Actor); claimed != "" {
-		if !ap.SameAuthority(claimed, actorID) {
-			ib.logger.Warn("inbox delivery rejected: actor/signer authority mismatch",
-				"activity_actor", claimed, "signer", actorID)
-			http.Error(w, "activity actor does not match signature", http.StatusForbidden)
-			return
-		}
-		boundActor = claimed
+	// THE QUEUED ACTOR IS THE VERIFIED SIGNER, NEVER THE ACTIVITY'S CLAIM.
+	//
+	// Downstream authorization keys off this id, and several decisions turn on
+	// WHICH IDENTITY it is rather than which host it belongs to: the announcing
+	// community that may moderate its own content, and handleAccept/handleReject
+	// (which set communityID = signer and then compare communityID against
+	// signer — a comparison that cannot fail once the claim is trusted). Queuing
+	// the claim let any account on a host speak AS any other actor on that host:
+	// an ordinary user could remove a native post from a community it has
+	// nothing to do with, drive a pending follow to accepted, or unsubscribe us
+	// from a community outright.
+	//
+	// The previous tolerance existed for instance-actor signing (Mastodon
+	// secure-mode), but that applies to signed FETCHES, not delivery POSTs —
+	// Lemmy signs as the acting actor, and no fixture or live path we receive
+	// has an outer actor differing from its signer. So there is nothing to
+	// tolerate, and the identity has to be the unforgeable one.
+	//
+	// A CROSS-AUTHORITY claim is still refused outright rather than silently
+	// ignored: a delivery whose body claims another host's actor is malformed or
+	// hostile whichever id we end up keying on, and the sender should learn that
+	// at the door.
+	if claimed := refID(activity.Actor); claimed != "" && !ap.SameAuthority(claimed, actorID) {
+		ib.logger.Warn("inbox delivery rejected: actor/signer authority mismatch",
+			"activity_actor", claimed, "signer", actorID)
+		http.Error(w, "activity actor does not match signature", http.StatusForbidden)
+		return
 	}
+	boundActor := actorID
 
 	isNew, err := ib.events.Enqueue(r.Context(), store.InboxEvent{
 		ActivityID:  activity.ID,

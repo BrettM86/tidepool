@@ -21,6 +21,7 @@ package ingest
 
 import (
 	"context"
+	"expvar"
 	"fmt"
 
 	"tidepool/internal/ap"
@@ -169,6 +170,17 @@ func (h *Handler) handleDelete(ctx context.Context, del *ap.Object, signer strin
 // acceptance to replace. Writing a removal for a legacy post would announce a
 // visibility mechanism Coves does not consult for that collection, so those
 // keep the v1 behaviour exactly: delete the record, tombstone the mapping.
+//
+// A NATIVE (bridge-origin) comment is the one case it TAKES without acting:
+// declining would run that v1 behaviour against a record in the author's own
+// repo. See the branch below.
+// NativeCommentModerationDeferred counts announced deletes of NATIVE comments
+// that were taken and deliberately not acted on, pending 17c-2's comment
+// removal record. It is a DECIDED non-action, so it is counted: the alternative
+// reading of a flat zero is "no community has ever tried", and the two must not
+// look the same when the feature lands.
+var NativeCommentModerationDeferred = expvar.NewInt("tidepool_moderation_native_comment_deferred")
+
 func (h *Handler) moderateAnnouncedDelete(ctx context.Context, del *ap.Object, targetID string) (bool, error) {
 	mapping, err := h.objects.GetByAPID(ctx, targetID)
 	if errors.IsNotFound(err) {
@@ -185,7 +197,38 @@ func (h *Handler) moderateAnnouncedDelete(ctx context.Context, del *ap.Object, t
 	if err != nil {
 		return false, fmt.Errorf("ingest: look up mapping for removal of %s: %w", targetID, err)
 	}
-	if mapping.IsDeleted() || mapping.Collection != materialize.CollectionPostV2 {
+	if mapping.IsDeleted() {
+		return false, nil
+	}
+	if mapping.Collection != materialize.CollectionPostV2 {
+		// A NATIVE comment: moderation of it is TAKEN here and deferred, never
+		// declined into the path below.
+		//
+		// Declining used to be safe by accident — a bridge-origin mapping had no
+		// community_did, so authorization refused before reaching this function
+		// at all. Task 17c binds those mappings, so an announced removal of a
+		// native comment now arrives authorized, and falling through would run
+		// the v1 DELETE path on it: soft-delete our own mapping and attempt a
+		// record delete in the AUTHOR's repo, which this bridge does not host.
+		// That is destruction on behalf of a decision (comment removal) that
+		// decision 18 does not authorize, and it is self-inconsistent besides —
+		// resolveSubject reads the still-live outbound row, so replies to the
+		// "removed" comment keep federating regardless.
+		//
+		// The removal RECORD for comments needs the lexicon work in 17c-2; until
+		// then the honest outcome is a visible non-action.
+		//
+		// EVERY announced delete of a native comment is taken, not only a
+		// summary-bearing one: the author's own deletes arrive through the
+		// consumer (their repo), never announced back at us, so an announced
+		// one is either a moderation action or an echo — and neither may reach
+		// a path that deletes the author's record.
+		if mapping.Origin == store.OriginBridge {
+			NativeCommentModerationDeferred.Add(1)
+			return true, skip(targetID,
+				"announced delete of a native comment: moderation of native comments is not "+
+					"implemented yet (needs the 17c-2 removal record), taking no action")
+		}
 		return false, nil
 	}
 	if !del.HasSummary() {
@@ -321,6 +364,24 @@ func (h *Handler) handleUndoDelete(ctx context.Context, undo, del *ap.Object, si
 		return fmt.Errorf("ingest: look up mapping for restore of %s: %w", targetID, err)
 	}
 
+	// OUR OWN CONTENT TAKES THE MODERATION PATH, NEVER THE RE-MATERIALIZATION
+	// ONE — decided BEFORE the fetch, because the fetch is the first step of
+	// the damage.
+	//
+	// A bridge-origin id is a record in a NATIVE author's repo that this bridge
+	// federated outward. There is nothing to re-materialize: the removal never
+	// touched the record, only the community's acceptance of it, so a restore is
+	// that acceptance coming back and nothing else. Falling through would
+	// dereference our own origin, hand the result to HandleUpdate (which never
+	// sees materializeContent's bridge-origin echo guard), MINT a bridged actor
+	// and PLC DID for a native Coves user, fail the commit against a repo we do
+	// not host, and then compensate by soft-deleting our own mapping and
+	// tombstoning our own AP id — after which moderateAnnouncedDelete declines
+	// forever on IsDeleted() and the post can never be moderated again.
+	if mapping.Origin == store.OriginBridge {
+		return h.restoreNativeContent(ctx, undo, mapping, announcer, scope)
+	}
+
 	// Pinned to the target's own authority: this fetch's answer is what
 	// authorizes the restore AND what gets written into the repo, so an open
 	// redirect on the origin must fail it rather than both license the restore
@@ -437,6 +498,56 @@ func restoredTypeMatches(collection, apType string) bool {
 	default:
 		return false
 	}
+}
+
+// restoreNativeContent lifts a community's removal of a post THIS BRIDGE
+// federated on a native author's behalf. It is the mirror of
+// moderateAnnouncedDelete: the same actor (the owning community), the same
+// records (its acceptance and removal, one rkey, one commit), and the same
+// hands-off rule about the author's record, which neither the removal nor the
+// restore ever touches.
+//
+// Only an ANNOUNCED undo may do it. A bare Undo{Delete} would have to come from
+// the target id's own authority, and that authority is US — a bare restore of
+// our own object is either an echo of something we never send or somebody
+// claiming to speak for our origin, and neither is a moderation decision.
+//
+// The two state clears are legacy repair, not part of the restore: an announced
+// delete of native content in the pre-17c era laid a marker and soft-deleted the
+// mapping (there was no community binding, so it fell into the v1 delete path).
+// Both are idempotent and cost one statement each, and leaving either behind
+// would keep the post suppressed or unmoderatable after a legitimate restore.
+//
+// It is deliberately NOT gated on the undone Delete's `summary`. On the delete
+// side that key separates two opposite actions — destroy the author's record,
+// or record a community removal — so presence has to decide. Here both readings
+// converge on the same non-destructive outcome (the acceptance returns), and
+// requiring the key would only create a way for a real restore to be dropped,
+// leaving a removal the moderators lifted standing forever.
+func (h *Handler) restoreNativeContent(ctx context.Context, undo *ap.Object,
+	mapping *store.APObjectMapping, announcer *store.Community, scope string) error {
+
+	if announcer == nil {
+		return skip(mapping.APID, "bare undo of a delete cannot restore the bridge's own content")
+	}
+	if mapping.Collection != materialize.CollectionPostV2 {
+		// Same deferral as the removal side: comment-level moderation state
+		// needs 17c-2's record. Taken and counted, never fallen through.
+		NativeCommentModerationDeferred.Add(1)
+		return skip(mapping.APID,
+			"announced restore of a native comment: moderation of native comments is not "+
+				"implemented yet (needs the 17c-2 removal record), taking no action")
+	}
+	if err := h.tombstones.Remove(ctx, mapping.APID, scope); err != nil {
+		return fmt.Errorf("ingest: clear tombstone for %s: %w", mapping.APID, err)
+	}
+	if err := h.objects.Restore(ctx, mapping.APID); err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("ingest: restore mapping for %s: %w", mapping.APID, err)
+	}
+	h.logger.Info("community lifted its removal of a native post; re-accepting",
+		"ap_id", mapping.APID, "at_uri", mapping.ATURI, "community", announcer.APGroupID,
+		"activity", undo.ID)
+	return h.mat.RestorePost(ctx, mapping)
 }
 
 // retractDeleteMarker is Undo{Delete} for an id with no mapping: the delete

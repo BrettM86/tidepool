@@ -115,6 +115,12 @@ func newModerationWorld(t *testing.T, h *harness) moderationWorld {
 		UserOrigin: mtUserOrigin,
 	})
 	require.NoError(t, err)
+	// The user origin SERVES the post for real. The restore path re-fetches its
+	// target from that target's own authority and re-materializes what comes
+	// back, so without a live origin a restore is refused by the fetch failing —
+	// and a test asserting "the restore was refused" would be passing on the
+	// wrong reason entirely.
+	h.mux.Handle("/ap/", userOrigin)
 	enqueuer, err := outbound.NewEnqueuer(outbound.EnqueuerOptions{
 		DB:         h.db,
 		Translator: outbound.NewTranslator(mtUserOrigin),
@@ -153,18 +159,18 @@ func newModerationWorld(t *testing.T, h *harness) moderationWorld {
 	_, _, err = h.manager.GetRecord(ctx, communityADID, materialize.CollectionAcceptance, digest)
 	require.NoError(t, err, "precondition: the post is accepted into community A")
 
-	// --- The 17c PREREQUISITE, constructed the way 17c will leave the world.
-	//     Without community_did on the mapping, CommunityDIDOf returns "" and
-	//     every announced moderation action is refused before it is evaluated —
-	//     which is the accident that has been standing in for authorization.
-	//     GREEN carries this column through the intent; the fixture states the
-	//     end state so these behaviours can be pinned against it.
+	// --- The 17c PREREQUISITE, asserted rather than constructed. Every
+	//     moderation behaviour below is downstream of this column, so a fixture
+	//     that WROTE it would let an implementation that never populates it pass
+	//     the whole suite — the intent field, the enqueuer's copy, and the
+	//     backfill would all be unpinned by the tests that depend on them most.
 	mapping, err := h.objects.GetByAPID(ctx, mtPostAPID)
 	require.NoError(t, err, "the enqueuer maps the federated post")
 	require.Equal(t, store.OriginBridge, mapping.Origin)
-	mapping.CommunityDID = communityADID
-	_, err = h.objects.PutMapping(ctx, *mapping)
-	require.NoError(t, err)
+	require.Equal(t, communityADID, mapping.CommunityDID,
+		"the enqueuer must bind the mapping to the community it federated into: "+
+			"CommunityDIDOf reads this column, and an empty one refuses every announced "+
+			"moderation action before it is evaluated")
 
 	return moderationWorld{
 		groupA: groupA, groupB: groupB,
@@ -231,6 +237,15 @@ func TestModeratorRemovalSurvivesAnAuthorEdit(t *testing.T) {
 	ctx := context.Background()
 	world := newModerationWorld(t, h)
 
+	// Snapshotted BEFORE the removal, not after: an enqueue caused by the
+	// REMOVAL ITSELF would otherwise be folded into the baseline and invisible.
+	// Boomerang suppression is structural today (materialize.RemovePost uses
+	// ApplyOps, which takes no side effect and so cannot enqueue), but nothing
+	// stops a refactor to ApplyOpsTx, and the failure would be a Delete{Page}
+	// sent back at the community that just removed the post.
+	activitiesAtStart := rowCount(t, h.db, "outbound_activities")
+	deliveriesAtStart := rowCount(t, h.db, "outbound_deliveries")
+
 	// --- A moderator of community A removes the post: Delete WITH summary,
 	//     announced by the community that owns it.
 	reason := "off topic for this community"
@@ -249,6 +264,11 @@ func TestModeratorRemovalSurvivesAnAuthorEdit(t *testing.T) {
 
 	activitiesBefore := rowCount(t, h.db, "outbound_activities")
 	deliveriesBefore := rowCount(t, h.db, "outbound_deliveries")
+	assert.Equal(t, activitiesAtStart, activitiesBefore,
+		"the REMOVAL itself must enqueue nothing: an inbound moderation action is the "+
+			"community telling US what it did, and echoing it back is a Delete{Page} aimed "+
+			"at the moderators who sent it")
+	assert.Equal(t, deliveriesAtStart, deliveriesBefore, "...and no delivery")
 
 	// --- WHEN: the author edits their post. An ordinary commit, the kind that
 	//     happens minutes later when someone fixes a typo.
@@ -339,4 +359,90 @@ func TestCrossCommunityRemovalIsRefused(t *testing.T) {
 	assert.NoError(t, err,
 		"a refused cross-community removal must not leave the post in a state where its own "+
 			"community's edits stop working")
+}
+
+// TestAnnouncedRestoreOfANativePostLiftsTheRemovalCleanly is RESTORE-1.
+//
+// Populating community_did made announced Undo{Delete} reachable for
+// BRIDGE-ORIGIN content for the first time, and that path has no origin guard.
+// handleUndoDelete re-fetches the target from its own authority — which for a
+// native post is OUR OWN /ap/object/… id — and hands the result to
+// mat.HandleUpdate DIRECTLY, bypassing materializeContent's bridge-origin echo
+// guard, the only place that says "this is ours".
+//
+// What follows is a chain of consequences, each worse than the last:
+//
+//	HandleUpdate → MaterializePost → EnsureActor(our own persona's actor id)
+//	  → MINTS a PLC DID and a bridged_actors row for a native Coves user;
+//	then commitRecord targets the AUTHOR's repo, which the bridge does not host,
+//	  so signing fails and HandleUpdate errors;
+//	then the error path compensates by SOFT-DELETING our own bridge-origin
+//	  mapping and recording a tombstone for our own AP id — after which
+//	  moderateAnnouncedDelete declines forever on mapping.IsDeleted().
+//
+// That last step is the one that does not wash out: the post becomes
+// permanently unmoderatable, by the community's own legitimate restore.
+//
+// There is nothing to re-materialize here. The record lives in the author's
+// repo and the removal never touched it; a restore of a native post is the
+// acceptance coming back, nothing more.
+func TestAnnouncedRestoreOfANativePostLiftsTheRemovalCleanly(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	world := newModerationWorld(t, h)
+
+	reason := "removed, then reconsidered"
+	h.announceDeleteWithSummary(world.groupA,
+		"https://lemmy.world/activities/announce/delete/mt-restore", mtPostAPID, &reason)
+	_, _, err := h.manager.GetRecord(ctx,
+		world.communityADID, materialize.CollectionRemoval, world.digestRKey)
+	require.NoError(t, err, "precondition: the removal stands")
+
+	bridgedBefore := rowCount(t, h.db, "bridged_actors")
+
+	// The community lifts its own removal, honestly signed.
+	h.announceUndoDelete(world.groupA,
+		"https://lemmy.world/activities/announce/undo/mt-restore",
+		"https://lemmy.world/activities/announce/delete/mt-restore/delete",
+		mtPostAPID, &reason)
+
+	// --- The restore lands: the acceptance is back.
+	_, _, err = h.manager.GetRecord(ctx,
+		world.communityADID, materialize.CollectionAcceptance, world.digestRKey)
+	assert.NoError(t, err,
+		"the community's own Undo{Delete} must re-accept the post: a removal the moderators "+
+			"lifted that stays standing is moderation nobody can undo")
+	_, _, err = h.manager.GetRecord(ctx,
+		world.communityADID, materialize.CollectionRemoval, world.digestRKey)
+	assert.True(t, errors.IsNotFound(err),
+		"and the removal is gone with it — acceptance and removal share one rkey and one "+
+			"commit precisely so neither outlives the other (err=%v)", err)
+
+	// --- And nothing of ours was mistaken for remote content on the way.
+	assert.Equal(t, bridgedBefore, rowCount(t, h.db, "bridged_actors"),
+		"NO bridged actor may be minted: EnsureActor runs on the re-materialization path, "+
+			"and a native Coves user acquiring a second, bridge-minted fediverse identity is "+
+			"the mint oracle this loop has closed twice already")
+
+	mapping, err := h.objects.GetByAPID(ctx, mtPostAPID)
+	require.NoError(t, err)
+	assert.False(t, mapping.IsDeleted(),
+		"our own mapping must not be soft-deleted: the compensation path does that when the "+
+			"re-materialization fails, and moderateAnnouncedDelete then declines forever on "+
+			"IsDeleted() — the post becomes permanently unmoderatable, by a legitimate restore")
+	assert.Equal(t, store.OriginBridge, mapping.Origin,
+		"and it must still be ours: re-materializing rewrites the row as fediverse-origin, "+
+			"which silently disables the echo guard for this post")
+
+	tombstoned, err := h.tombstones.ExistsFor(ctx, mtPostAPID, groupID)
+	require.NoError(t, err)
+	assert.False(t, tombstoned,
+		"nor may a tombstone be recorded against our own AP id: it suppresses this post's "+
+			"own later Creates and drops every Lemmy reply beneath it")
+
+	event, err := h.events.GetEvent(ctx, "https://lemmy.world/activities/announce/undo/mt-restore")
+	require.NoError(t, err)
+	assert.NotNil(t, event.ProcessedAt,
+		"and the restore is DECIDED, not left retrying: %s", event.Error)
+	assert.Nil(t, event.FailedAt, "nor poisoned")
 }

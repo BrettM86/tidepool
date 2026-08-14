@@ -10,6 +10,11 @@
 -- The enqueuer now carries community_did on the mapping it writes; this
 -- backfills the rows written before it did.
 --
+-- The statement is SAFE TO RE-RUN, by design: it only ever fills rows that have
+-- no binding, so an operator who suspects a binding was NULLed (see the
+-- COALESCE in store.putMapping, which now prevents that) can replay it verbatim
+-- to recover from outbound_objects.
+--
 -- The backfill is an EXACT JOIN, not a derivation. outbound_objects is the
 -- bridge's own record of what it federated where, keyed by the same at-uri, and
 -- it already carries community_did. Guessing (say, from the acceptance records
@@ -21,7 +26,9 @@ UPDATE ap_objects a
   FROM outbound_objects o
  WHERE a.at_uri = o.at_uri
    AND a.origin = 'bridge'
-   AND a.community_did IS NULL
+   -- IS NULL is the state a row is written in; the COALESCE also covers a row
+   -- that somehow holds an empty string, so a re-run heals both.
+   AND COALESCE(a.community_did, '') = ''
    AND o.community_did <> '';
 
 -- +goose Down

@@ -83,6 +83,20 @@ const (
 	DecisionModeratorRemoved = "moderator-removed"
 )
 
+// ErrModeratorRemovalStands reports that an edit was refused because the
+// COMMUNITY has removed the post. It is a DECISION, not a failure: the ledger
+// row is written, nothing is enqueued, and the live consume path treats it as
+// handled. It exists so the operator surfaces cannot report the edit as
+// accepted — Readmit maps it to a removed result, and without it the same call
+// that records "removed / moderator-removed" answers 200 accepted/enqueued.
+var ErrModeratorRemovalStands = stderrors.New("accept: a moderator removal stands")
+
+// errRemovalVanished reports that the removal AcceptSubject refused against was
+// gone by the time its code was read — the moderators restored the post inside
+// the window. It is RETRYABLE and self-healing: the retry's AcceptSubject finds
+// no removal and admits the edit normally.
+var errRemovalVanished = stderrors.New("accept: the standing removal vanished before its code could be read")
+
 // RemovalCodeAdmissionRevoked is the removal `code` written when a post that WAS
 // accepted fails RE-admission (an edit made it titleless or over the cap).
 //
@@ -303,7 +317,17 @@ func (e *Engine) AdmitPost(ctx context.Context, did string, commit *consume.Comm
 		})
 	}
 
-	return e.accept(ctx, did, communityDID, postURI, commit)
+	if err := e.accept(ctx, did, communityDID, postURI, commit); err != nil {
+		if stderrors.Is(err, ErrModeratorRemovalStands) {
+			// Decided and recorded inside accept(): the community removed this
+			// post, so the edit does not re-enter it. Nothing is owed on the
+			// live path — erroring here would redrive the commit forever
+			// against a removal that is terminal by design.
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // The AP op strings the deterministic activity id and the Page translation key
@@ -553,7 +577,7 @@ func (e *Engine) editAgainstRemoval(ctx context.Context, did, communityDID, post
 	if code != RemovalCodeAdmissionRevoked {
 		e.logger.Info("edit against a standing moderator removal: acceptance refused, nothing enqueued",
 			"community_did", communityDID, "post", postURI, "removal_code", code)
-		return e.admissions.Record(ctx, Admission{
+		if rerr := e.admissions.Record(ctx, Admission{
 			AuthorDID:         did,
 			CommunityDID:      communityDID,
 			PostURI:           postURI,
@@ -561,7 +585,14 @@ func (e *Engine) editAgainstRemoval(ctx context.Context, did, communityDID, post
 			DecisionCode:      DecisionModeratorRemoved,
 			EvaluatedCID:      commit.CID,
 			EvaluatedSnapshot: e.evaluatedSnapshot(commit),
-		})
+		}); rerr != nil {
+			return rerr
+		}
+		// The decision is complete; the sentinel only tells the CALLER what was
+		// decided. AdmitPost swallows it (nothing is owed on the live path);
+		// Readmit reports it, so the admin surface stops claiming an acceptance
+		// this very call refused to write.
+		return ErrModeratorRemovalStands
 	}
 	if _, rerr := acceptrec.Restore(ctx, e.repos, communityDID, postURI, commit.CID,
 		publishedAtOf(commit.Record), sideEffect); rerr != nil {
@@ -571,19 +602,29 @@ func (e *Engine) editAgainstRemoval(ctx context.Context, did, communityDID, post
 }
 
 // standingRemovalCode reads the `code` off the removal AcceptSubject refused
-// against. A removal that has vanished between the refusal and this read is a
-// genuine race — the moderators restored the post in the window — and returns
-// an error so the event RETRIES: the retry's AcceptSubject finds no removal and
-// admits the edit normally. Treating the miss as "not ours, terminal" would
-// strand a post whose removal no longer exists.
+// against. The two ways this read can fail are different events and are
+// reported differently:
 //
-// An unreadable code is treated as a moderator's, i.e. terminal. The direction
-// is deliberate: the recoverable mistake is refusing an edit, and the
-// unrecoverable one is pushing a removed post back at its community.
+//   - NOT FOUND is the benign race: the moderators restored the post between
+//     the refusal and this read. errRemovalVanished says so, and one retry
+//     resolves it — the retry's AcceptSubject finds no removal and admits the
+//     edit. Reporting it as "not ours, terminal" would strand a post whose
+//     removal no longer exists.
+//   - ANYTHING ELSE is an infrastructure failure (the repo store is down, a
+//     timeout). It propagates as itself, so the retry budget is spent on a
+//     message about a broken read rather than about a "standing removal" that
+//     was never the problem.
+//
+// A record whose `code` is absent or not a string yields "", which the caller
+// treats as a moderator's — terminal. That direction is deliberate: refusing an
+// edit is recoverable, and pushing a removed post back at its community is not.
 func (e *Engine) standingRemovalCode(ctx context.Context, communityDID, postURI string) (string, error) {
 	rkey := acceptrec.SubjectRKey(postURI)
 	record, _, err := e.repos.GetRecord(ctx, communityDID, acceptrec.CollectionRemoval, rkey)
-	if err != nil {
+	switch {
+	case errors.IsNotFound(err):
+		return "", fmt.Errorf("%w: %s in %s", errRemovalVanished, postURI, communityDID)
+	case err != nil:
 		return "", fmt.Errorf("accept: read standing removal %s/%s/%s: %w",
 			communityDID, acceptrec.CollectionRemoval, rkey, err)
 	}
@@ -918,6 +959,14 @@ func (e *Engine) Readmit(ctx context.Context, postATURI string) (*ReadmitResult,
 
 	// Passes now: write/repin the acceptance and enqueue the Page (reusing accept()).
 	if err := e.accept(ctx, did, communityDID, postATURI, commit); err != nil {
+		if stderrors.Is(err, ErrModeratorRemovalStands) {
+			// Admission passes, but the COMMUNITY removed this post: accept()
+			// wrote the removed ledger row and refused the acceptance. Reporting
+			// it as accepted/enqueued would have the same request answer 200
+			// "accepted" while the row it just wrote says removed.
+			return &ReadmitResult{PostURI: postATURI, Status: StatusRemoved,
+				DecisionCode: DecisionModeratorRemoved}, nil
+		}
 		return nil, err
 	}
 	return &ReadmitResult{PostURI: postATURI, Status: StatusAccepted, Enqueued: true}, nil

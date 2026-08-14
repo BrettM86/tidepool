@@ -138,6 +138,22 @@ type VoteScrubber interface {
 	ScrubVoter(ctx context.Context, voterAPID string) error
 }
 
+// ModerationLedger records a community moderation decision against a NATIVE
+// post in the admissions ledger — the operator surface that answers "why is
+// this post not in the community?".
+//
+// It is an INTERFACE rather than an *accept.Admissions so this package keeps no
+// dependency on the acceptance engine (which already depends on the stores this
+// one writes through); main adapts the concrete type.
+type ModerationLedger interface {
+	// RecordRemoval marks the post removed by its community, with the removal
+	// record's own code. authorDID is the repo the post lives in.
+	RecordRemoval(ctx context.Context, communityDID, postURI, authorDID, code string) error
+	// RecordRestore marks the post accepted again, pinning the CID the fresh
+	// acceptance was written against.
+	RecordRestore(ctx context.Context, communityDID, postURI, authorDID, cid string) error
+}
+
 // Options configures New. Fetcher, Objects, Actors, Communities, Repos,
 // Minter, and ServiceDID are required.
 type Options struct {
@@ -150,6 +166,15 @@ type Options struct {
 	// Votes scrubs a deleted actor's vote_events rows alongside the record
 	// scrub (optional; nil skips it).
 	Votes VoteScrubber
+	// Ledger records inbound moderation decisions against NATIVE posts in the
+	// admissions ledger, so a moderator's removal is visible there when the
+	// MODERATOR acts rather than only if the author later edits (which is the
+	// only thing that writes a row otherwise). It also frees the author's
+	// per-community rate quota, which counts accepted rows.
+	//
+	// OPTIONAL: nil skips the ledger write and changes nothing else — the
+	// community repo records remain the source of truth for removal state.
+	Ledger ModerationLedger
 	// OutboundObjects is the bridge's own outbound state for NATIVE records.
 	// RestorePost needs it: a native post lives in the AUTHOR's repo, which
 	// this bridge does not host, so its CID cannot be read back through Repos.
@@ -180,6 +205,7 @@ type Materializer struct {
 	fetcher     Fetcher
 	objects     store.APObjects
 	outbound    store.OutboundObjects
+	ledger      ModerationLedger
 	actors      store.BridgedActors
 	communities store.Communities
 	repos       *repo.Manager
@@ -240,6 +266,7 @@ func New(opts Options) (*Materializer, error) {
 		fetcher:     opts.Fetcher,
 		objects:     opts.Objects,
 		outbound:    opts.OutboundObjects,
+		ledger:      opts.Ledger,
 		actors:      opts.Actors,
 		communities: opts.Communities,
 		repos:       opts.Repos,

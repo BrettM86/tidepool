@@ -104,6 +104,56 @@ func (a *Admissions) record(ctx context.Context, ex execer, adm Admission) error
 	return nil
 }
 
+// RecordRemoval marks a post removed BY ITS COMMUNITY, with the removal
+// record's own code. It satisfies materialize.ModerationLedger, so the inbound
+// moderation path can keep the ledger honest without importing this package.
+//
+// Why the ledger must learn about it at all: the community repo's removal
+// record is the source of truth, but the ledger is what an operator reads when
+// an author asks why their post is gone, and what decide()'s per-community rate
+// cap counts (a removed post must stop consuming the author's quota).
+//
+// It is a NARROW UPDATE, never Record(): that upsert rewrites every column,
+// including evaluated_snapshot, and blanking that would make the post
+// permanently unreadmittable — a moderation action must not destroy the state a
+// later readmit needs. A post with no ledger row is left alone: the engine
+// writes one for every native post it decides on, so a miss means this post is
+// not the acceptance engine's business.
+func (a *Admissions) RecordRemoval(ctx context.Context, communityDID, postURI, authorDID, code string) error {
+	return a.markModeration(ctx, "record removal", communityDID, postURI, authorDID,
+		StatusRemoved, code, "")
+}
+
+// RecordRestore marks a post accepted again after a moderator restore, pinning
+// the CID the fresh acceptance was written against. Same narrow-update contract
+// as RecordRemoval.
+func (a *Admissions) RecordRestore(ctx context.Context, communityDID, postURI, authorDID, cid string) error {
+	return a.markModeration(ctx, "record restore", communityDID, postURI, authorDID,
+		StatusAccepted, "", cid)
+}
+
+func (a *Admissions) markModeration(ctx context.Context, op, communityDID, postURI, authorDID, status, code, acceptedCID string) error {
+	if communityDID == "" || postURI == "" {
+		return errors.NewValidationError("admission", "community_did and post_uri are required")
+	}
+	// accepted_cid moves only on a restore (the empty string leaves it alone),
+	// so a removal keeps naming the version that was accepted when it was
+	// removed — the same pin the removal record carries.
+	_, err := a.db.ExecContext(ctx, `
+		UPDATE admissions
+		   SET status = $3,
+		       decision_code = $4,
+		       author_did = COALESCE(NULLIF($5, ''), author_did),
+		       accepted_cid = COALESCE(NULLIF($6, ''), accepted_cid),
+		       updated_at = now()
+		 WHERE community_did = $1 AND post_uri = $2`,
+		communityDID, postURI, status, code, authorDID, acceptedCID)
+	if err != nil {
+		return fmt.Errorf("accept: %s %s/%s: %w", op, communityDID, postURI, err)
+	}
+	return nil
+}
+
 // Get returns the admission for a (community, post), or an error satisfying
 // errors.IsNotFound when the engine has never decided on it.
 func (a *Admissions) Get(ctx context.Context, communityDID, postURI string) (*Admission, error) {

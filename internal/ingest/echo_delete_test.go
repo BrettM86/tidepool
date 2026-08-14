@@ -66,7 +66,7 @@ type deleteEchoWorld struct {
 // today's enqueuer leaves community_did and author_did empty, and 17c fills
 // community_did in — the difference between an accidental drop and a
 // destructive one.
-func setupNativeDeleteEcho(t *testing.T, h *harness, communityDID, authorDID string) deleteEchoWorld {
+func setupNativeDeleteEcho(t *testing.T, h *harness, authorDID string) deleteEchoWorld {
 	t.Helper()
 	ctx := context.Background()
 	group := h.subscribeTechnology()
@@ -112,6 +112,7 @@ func setupNativeDeleteEcho(t *testing.T, h *harness, communityDID, authorDID str
 		ATURI:         mdPostATURI,
 		ID:            consume.ActivityID(mdUserOrigin, mdPostATURI, "create", 0),
 		CommunityAPID: groupID,
+		CommunityDID:  actualCommunityDID,
 		Snapshot:      mdSnapshot(t),
 	})
 	// 2. The AUTHOR deletes their own post: engine.go enqueues PostIntent{delete}.
@@ -120,6 +121,7 @@ func setupNativeDeleteEcho(t *testing.T, h *harness, communityDID, authorDID str
 		ATURI:         mdPostATURI,
 		ID:            consume.ActivityID(mdUserOrigin, mdPostATURI, "delete", 1),
 		CommunityAPID: groupID,
+		CommunityDID:  actualCommunityDID,
 		Snapshot:      mdSnapshot(t),
 	}
 	enqueueAs(t, h.db, enqueuer, mdAuthorDID, deleteIntent)
@@ -141,7 +143,11 @@ func setupNativeDeleteEcho(t *testing.T, h *harness, communityDID, authorDID str
 	// fired in 17c-1 and has been removed. Its whole purpose was to fail on the
 	// day M1b stopped simulating: community_did is populated now, so this
 	// scenario is the real world rather than a construction of it.)
-	mapping.CommunityDID = communityDID
+	// community_did is NOT written here: it rides the intent and the enqueuer
+	// copies it, so asserting it is what pins that path. author_did has no such
+	// carrier yet, so it stays a fixture knob.
+	require.Equal(t, actualCommunityDID, mapping.CommunityDID,
+		"the enqueuer must bind the mapping to the community it federated into")
 	mapping.AuthorDID = authorDID
 	_, err = h.objects.PutMapping(ctx, *mapping)
 	require.NoError(t, err, "rewrite the mapping the way this scenario's world has it")
@@ -194,28 +200,19 @@ func mdSnapshot(t *testing.T) []byte {
 // a moderation record against an author who moderated nobody.
 func TestAnnouncedDeleteEchoNeverWritesAModeratorRemoval(t *testing.T) {
 	cases := []struct {
-		name         string
-		communityDID func(actual string) string
-		authorDID    string
-		why          string
+		name      string
+		authorDID string
+		why       string
 	}{
 		{
-			name:         "M1a mapping as today's enqueuer writes it",
-			communityDID: func(string) string { return "" },
-			why: "today the echo dies on an accident — the community binding fails — and " +
-				"the drop must become the classifier's decision instead",
-		},
-		{
-			name:         "M1b mapping carrying its community DID, as 17c will leave it",
-			communityDID: func(actual string) string { return actual },
+			name: "M1b mapping as the enqueuer now leaves it (community bound)",
 			why: "with community_did populated the authorization PASSES, the summary-less " +
 				"Delete is not provably the author's, and RemovePost writes a " +
 				"community-signed removal against a self-delete",
 		},
 		{
-			name:         "M1b mapping carrying community AND author DIDs",
-			communityDID: func(actual string) string { return actual },
-			authorDID:    mdAuthorDID,
+			name:      "M1b mapping carrying community AND author DIDs",
+			authorDID: mdAuthorDID,
 			why: "author_did does not save it: deleteIsByAuthor resolves the author through " +
 				"bridged_actors, and a NATIVE persona has no row there — the answer is " +
 				"false however complete the mapping is",
@@ -226,8 +223,7 @@ func TestAnnouncedDeleteEchoNeverWritesAModeratorRemoval(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t)
 			ctx := context.Background()
-			actualCommunityDID := testDIDFor("technology", "lemmy.world")
-			world := setupNativeDeleteEcho(t, h, tc.communityDID(actualCommunityDID), tc.authorDID)
+			world := setupNativeDeleteEcho(t, h, tc.authorDID)
 
 			acceptanceBefore, acceptanceCIDBefore, err := h.manager.GetRecord(ctx,
 				world.communityDID, materialize.CollectionAcceptance, world.digestRKey)

@@ -55,7 +55,12 @@ func (r *postgresAPObjects) putMapping(ctx context.Context, q queryRower, mappin
 			ap_type = EXCLUDED.ap_type,
 			origin = EXCLUDED.origin,
 			did = EXCLUDED.did,
-			author_did = EXCLUDED.author_did,
+			-- author_did gets the same COALESCE treatment, and for a sharper
+			-- reason than tidiness: deleteIsByAuthor decides SELF-DELETE vs
+			-- MODERATOR REMOVAL from this column, and a re-put that omitted it
+			-- would silently turn every later author delete into "not provably
+			-- the author" — the branch that writes a moderation record.
+			author_did = COALESCE(EXCLUDED.author_did, ap_objects.author_did),
 			-- COALESCE, never a bare overwrite: community_did is the binding
 			-- that authorizes announced moderation of this object, and a
 			-- re-put that simply omits it (a re-materialization, a legacy

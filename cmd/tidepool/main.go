@@ -315,7 +315,10 @@ func run(logger *slog.Logger) error {
 		Votes:       voteAggregator,
 		// Restoring a NATIVE post reads its pinned CID from here: the author's
 		// repo is not one this bridge hosts.
-		OutboundObjects:   store.NewOutboundObjects(database),
+		OutboundObjects: store.NewOutboundObjects(database),
+		// An inbound moderation decision updates the admissions ledger too, so
+		// the operator surface reflects it when the MODERATOR acts.
+		Ledger:            accept.NewAdmissions(database),
 		ServiceDID:        serviceDID,
 		ProfileRefreshTTL: cfg.ProfileRefreshTTL,
 		MaxBlobBytes:      cfg.MaxBlobBytes,

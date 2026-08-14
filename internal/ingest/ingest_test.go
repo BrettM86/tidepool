@@ -317,12 +317,18 @@ func newHarness(t *testing.T) *harness {
 
 	h.minter = &fakeMinter{custodian: custodian}
 	h.mat, err = materialize.New(materialize.Options{
-		Fetcher:          h.client,
-		Objects:          objects,
-		Actors:           actors,
-		Communities:      communities,
-		Repos:            manager,
-		Minter:           h.minter,
+		Fetcher:     h.client,
+		Objects:     objects,
+		Actors:      actors,
+		Communities: communities,
+		Repos:       manager,
+		Minter:      h.minter,
+		// Wired because PRODUCTION wires it: without it restorePin's entire
+		// bridge-origin branch takes the outbound == nil warn-and-refuse path,
+		// so the origin dispatch, the tombstone refusal and the empty-CID
+		// refusal are all dead code in every ingest test — passing by never
+		// running.
+		OutboundObjects:  store.NewOutboundObjects(database),
 		ServiceDID:       testServiceDID,
 		StrictValidation: true,
 	})

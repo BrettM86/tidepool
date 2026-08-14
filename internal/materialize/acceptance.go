@@ -112,6 +112,11 @@ func (m *Materializer) removalStands(ctx context.Context, communityDID, rkey str
 // deleting the author's record would let one community destroy content for
 // every other, and tombstoning the mapping would block the post's later edits
 // and votes from ever materializing again.
+// removalCodeModeratorDiscretion is the removal lexicon's catch-all: Lemmy
+// sends no machine-readable code, so anything narrower would be the bridge
+// asserting a reason the moderator never gave.
+const removalCodeModeratorDiscretion = "moderator-discretion"
+
 func (m *Materializer) RemovePost(ctx context.Context, mapping *store.APObjectMapping, reason string) error {
 	communityDID, postURI, rkey, err := m.moderationTarget(ctx, mapping)
 	if err != nil {
@@ -145,7 +150,7 @@ func (m *Materializer) RemovePost(ctx context.Context, mapping *store.APObjectMa
 		// Lemmy sends no machine-readable code, so the open knownValues set's
 		// catch-all applies. Inventing a narrower code (spam, rule-violation)
 		// would be the bridge asserting a reason the moderator never gave.
-		"code":      "moderator-discretion",
+		"code":      removalCodeModeratorDiscretion,
 		"createdAt": recordDatetime(m.moderationStamp(ctx, communityDID, CollectionRemoval, rkey)),
 	}
 	// Omitted rather than written blank: Lemmy spells "no reason given" as an
@@ -166,9 +171,20 @@ func (m *Materializer) RemovePost(ctx context.Context, mapping *store.APObjectMa
 	}
 	m.logger.Info("post removed from community by moderator",
 		"community_did", communityDID, "post", postURI, "ap_id", mapping.APID)
+	m.recordModeration(ctx, mapping, func() error {
+		return m.ledger.RecordRemoval(ctx, communityDID, postURI, mapping.DID, removalCodeModeratorDiscretion)
+	})
 	return nil
 }
 
+// CHILDREN ARE NOT TOUCHED: replies to and votes on a removed post keep
+// resolving it as a live subject and keep federating. That matches Lemmy, where
+// a removed post's comment thread survives, and it is deliberate rather than an
+// oversight — but it is NOT yet enforceable state on our side: comment-level
+// removal needs the object_moderation table 17c-2 introduces. Until then a
+// community that removes a post and then wants its thread stopped has no
+// mechanism here.
+//
 // RestorePost undoes a moderator removal: the removal is deleted and a fresh
 // acceptance written IN ONE COMMIT, for the same reason the removal was
 // atomic. It is a no-op when no removal stands, so a restore that arrives
@@ -219,7 +235,30 @@ func (m *Materializer) RestorePost(ctx context.Context, mapping *store.APObjectM
 	}
 	m.logger.Info("post restored to community by moderator",
 		"community_did", communityDID, "post", postURI, "ap_id", mapping.APID)
+	m.recordModeration(ctx, mapping, func() error {
+		return m.ledger.RecordRestore(ctx, communityDID, postURI, mapping.DID, currentCID)
+	})
 	return nil
+}
+
+// recordModeration mirrors a committed moderation transition into the
+// admissions ledger, for NATIVE posts only: the ledger is the acceptance
+// engine's record of what it decided about a native author's post, and a
+// fediverse-origin post has no admission to update.
+//
+// It runs AFTER the community-repo commit and its failure is LOGGED, never
+// returned. The repo records are the source of truth for removal state; the
+// ledger is the operator surface over them. Failing the whole activity — and
+// redelivering a moderation action that already committed — to fix a reporting
+// row would trade a correct decision for a repeated one.
+func (m *Materializer) recordModeration(ctx context.Context, mapping *store.APObjectMapping, write func() error) {
+	if m.ledger == nil || mapping.Origin != store.OriginBridge {
+		return
+	}
+	if err := write(); err != nil {
+		m.logger.Warn("moderation applied but the admissions ledger was not updated",
+			"at_uri", mapping.ATURI, "ap_id", mapping.APID, "error", err)
+	}
 }
 
 // restorePin is the CID a fresh acceptance pins, dispatched on ORIGIN because

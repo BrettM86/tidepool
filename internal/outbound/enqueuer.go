@@ -201,6 +201,12 @@ func (e *Enqueuer) objectMapping(intent consume.Intent) (store.APObjectMapping, 
 		OriginInstance: e.originHost,
 		Origin:         store.OriginBridge,
 		DID:            parts[0],
+		// The AUTHOR is the at-uri's repo: an author-owned postv2 or comment
+		// lives in their own repo, so DID and AuthorDID are the same DID here.
+		// Recorded rather than left empty because deleteIsByAuthor reads this
+		// column to tell a self-delete from a moderator removal, and an empty
+		// one answers "not provably the author" for every native record.
+		AuthorDID: parts[0],
 		// The COMMUNITY this object was federated into. Without it
 		// CommunityDIDOf answers "" for a bridge-origin mapping — an
 		// author-owned postv2 lives in the AUTHOR's repo, so the community

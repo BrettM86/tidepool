@@ -15,7 +15,6 @@ import (
 	"tidepool/internal/ap"
 	"tidepool/internal/errors"
 	"tidepool/internal/materialize"
-	"tidepool/internal/testutil"
 )
 
 // TASK 17c-3 — A COMMUNITY BAN IS THREE THINGS AT ONCE.
@@ -71,7 +70,6 @@ func mbPostATURI(did, rkey string) string {
 func TestABanIsScopedToOneAuthorInOneCommunity(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
-	resetBanState(t, h.db)
 	world := newModerationWorld(t, h)
 	communityBAPID := mtCommunityBAPID
 
@@ -258,15 +256,6 @@ type communityBan struct {
 
 func banFor(t *testing.T, db *sql.DB, communityDID, subjectDID string) (communityBan, bool) {
 	t.Helper()
-	if !tableExists(t, db, "community_bans") {
-		// A table that does not exist holds no bans, and saying so is not a
-		// tolerance: every assertion in this file that REQUIRES a ban fails
-		// loudly right here, so a table that is missing — or landed under
-		// another name — is caught by the positive tests rather than hidden by
-		// the negative ones. What it buys is that each test fails on ITS OWN
-		// behaviour instead of six tests reporting one missing relation.
-		return communityBan{}, false
-	}
 	var ban communityBan
 	err := db.QueryRowContext(context.Background(), `
 		SELECT community_ap_id, expires_at
@@ -296,29 +285,6 @@ func requireEveryDelivery(t *testing.T, db *sql.DB, actorDID, orderingKey, want,
 		why, actorDID, orderingKey)
 	for i, state := range states {
 		require.Equal(t, want, state, "%s (delivery %d of %d)", why, i+1, len(states))
-	}
-}
-
-// tableExists reports whether a table has been created yet.
-func tableExists(t *testing.T, db *sql.DB, name string) bool {
-	t.Helper()
-	var relation sql.NullString
-	require.NoError(t, db.QueryRowContext(context.Background(),
-		`SELECT to_regclass($1)`, "public."+name).Scan(&relation))
-	return relation.Valid
-}
-
-// resetBanState clears the ban table between runs.
-//
-// newHarness's truncate list cannot name it until it exists, and it MUST be
-// cleared: the fixture's author and community are package-level constants, so a
-// ban left by one run would refuse the next run's post before the test that
-// issues the ban has run — green first, red second, which a single CI run never
-// sees. Fold this into newHarness and delete it once the migration lands.
-func resetBanState(t *testing.T, db *sql.DB) {
-	t.Helper()
-	if tableExists(t, db, "community_bans") {
-		testutil.Truncate(t, db, "community_bans")
 	}
 }
 
@@ -367,7 +333,6 @@ func deliveryStates(t *testing.T, db *sql.DB, actorDID, orderingKey string) []st
 func TestADirectBlockIsIgnored(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
-	resetBanState(t, h.db)
 	world := newModerationWorld(t, h)
 
 	// The moderator as a real signer: their own key, their own actor document.
@@ -399,18 +364,25 @@ func TestADirectBlockIsIgnored(t *testing.T) {
 	assert.Nil(t, event.FailedAt, "nor poisoned")
 }
 
-// TestADirectBlockClaimingToBeTheGroupIsStillIgnored is SEC-1's fix doing work
-// in a new place.
+// TestADirectBlockIsIgnoredWhateverItClaims pins that the announced-only rule is
+// STRUCTURAL: it does not depend on who the activity says sent it.
 //
 // The activity CLAIMS `actor` = the community Group while being SIGNED by a
 // moderator's Person. Both live on lemmy.world, so the same-authority tolerance
-// at the door lets the delivery in — and before SEC-1 the CLAIM was what got
-// bound, which would have made this indistinguishable from the community's own
-// announced ban. It is the exact shape that was exploitable three sub-runs ago,
-// arriving now at a verb that hands out bans.
-func TestADirectBlockClaimingToBeTheGroupIsStillIgnored(t *testing.T) {
+// at the door lets the delivery in, and the claim is the most authoritative
+// thing a direct Block could possibly assert about itself. It still records
+// nothing, because a direct delivery has no announcer — and the announcer is
+// what the ban path requires, before anyone weighs an actor at all.
+//
+// WHAT THIS DOES NOT COVER, despite how it reads: SEC-1's signer binding. Binding
+// the claimed actor instead of the verified signer leaves this test GREEN,
+// because the refusal happens one gate earlier. That is defence in depth rather
+// than dependence — but the binding itself is pinned by inbox_laundering_test.go
+// and, for the ban path specifically, by the laundered ANNOUNCE below. A green
+// test nobody re-derives the reason for is how a control ends up guarding
+// nothing.
+func TestADirectBlockIsIgnoredWhateverItClaims(t *testing.T) {
 	h := newHarness(t)
-	resetBanState(t, h.db)
 	world := newModerationWorld(t, h)
 	moderator := h.newRemoteActor(modActorID, person(modActorID, "moderator", nil))
 
@@ -447,7 +419,6 @@ func TestADirectBlockClaimingToBeTheGroupIsStillIgnored(t *testing.T) {
 func TestALapsedBanDoesNotRefuseAdmission(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
-	resetBanState(t, h.db)
 	world := newModerationWorld(t, h)
 
 	h.announceBlock(world.groupA, mbBlockActivity, mtAuthorDID, groupID,
@@ -484,7 +455,6 @@ func TestALapsedBanDoesNotRefuseAdmission(t *testing.T) {
 func TestAStandingTimedBanRefusesAdmission(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
-	resetBanState(t, h.db)
 	world := newModerationWorld(t, h)
 
 	h.announceBlock(world.groupA, mbBlockActivity, mtAuthorDID, groupID,
@@ -518,7 +488,6 @@ func TestAStandingTimedBanRefusesAdmission(t *testing.T) {
 // is the co-hosting failure decision 18 exists to prevent.
 func TestACrossCommunityBlockIsRefused(t *testing.T) {
 	h := newHarness(t)
-	resetBanState(t, h.db)
 	world := newModerationWorld(t, h)
 
 	h.announceBlock(world.groupB, "https://lemmy.world/activities/announce/block/mb-cross",
@@ -552,7 +521,6 @@ func TestACrossCommunityBlockIsRefused(t *testing.T) {
 func TestASiteScopedBlockIsSkippedWithItsOwnReason(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
-	resetBanState(t, h.db)
 	world := newModerationWorld(t, h)
 
 	// Lemmy's Site actor is the instance apex — which is a URL PREFIX of every
@@ -620,7 +588,6 @@ func timeNow() time.Time { return time.Now() }
 func TestABanWithRemoveDataRemovesTheirPostsInThatCommunityOnly(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
-	resetBanState(t, h.db)
 	world := newModerationWorld(t, h)
 
 	// The author has accepted posts in BOTH communities. The world already gave
@@ -715,7 +682,6 @@ func TestABanWithRemoveDataRemovesTheirPostsInThatCommunityOnly(t *testing.T) {
 //     nobody will ever diagnose — and redrive is how someone recovers it.
 func TestABanLeavesTerminalDeliveriesAlone(t *testing.T) {
 	h := newHarness(t)
-	resetBanState(t, h.db)
 	world := newModerationWorld(t, h)
 
 	admitPost(t, world, mtAuthorDID, mbPostInARKey, world.communityADID, "3lzmbrev00030", 1_775_000_007_000_001)
@@ -778,4 +744,59 @@ func deliveryState(t *testing.T, db *sql.DB, activityID string) string {
 	require.NoError(t, db.QueryRowContext(context.Background(),
 		`SELECT state FROM outbound_deliveries WHERE activity_id = $1`, activityID).Scan(&state))
 	return state
+}
+
+// TestAnAnnouncedBlockLaunderedThroughAPersonIsRefused is the SEC-1 shape aimed
+// at the ban path — the one the direct-Block control above only appears to
+// cover.
+//
+// Everything here is the announced shape the ban path DOES act on: an Announce
+// carrying a Block, claiming `actor` = the community Group, addressed like every
+// other fan-out. The only thing wrong with it is the signature: it is signed by
+// a moderator's Person key, not the Group's. Both live on lemmy.world, so the
+// same-authority tolerance at the door passes it through, and every downstream
+// check reads the actor the inbox BOUND.
+//
+// That is why binding the claim rather than the verified signer was CRITICAL:
+// it makes this delivery indistinguishable from the community's own ban. And a
+// ban is the worst verb to lose it on — any account on a Lemmy instance could
+// exclude any native author from any community co-hosted there, cancel their
+// pending posts, and with removeData strip their accepted content, all under a
+// community's name and with a moderation record to match.
+func TestAnAnnouncedBlockLaunderedThroughAPersonIsRefused(t *testing.T) {
+	h := newHarness(t)
+	world := newModerationWorld(t, h)
+
+	// A moderator who can really sign — their own key, their own actor document.
+	// Nothing about this delivery is malformed; it is simply not the community.
+	moderator := h.newRemoteActor(modActorID, person(modActorID, "moderator", nil))
+
+	const laundered = "https://lemmy.world/activities/announce/block/mb-laundered"
+	require.Equal(t, http.StatusAccepted, h.deliver(moderator, map[string]any{
+		"id":       laundered,
+		"type":     "Announce",
+		"actor":    groupID, // the claim: "I am the community"
+		"audience": groupID,
+		"cc":       []any{groupID + "/followers"},
+		"object":   blockActivity(world.groupA, laundered+"/block", mtAuthorDID, groupID, nil),
+	}))
+	h.drain()
+
+	_, found := banFor(t, h.db, world.communityADID, mtAuthorDID)
+	assert.False(t, found,
+		"the VERIFIED SIGNER decides, never the claim: an announce is only the community's "+
+			"if the community signed it, and binding the claimed actor would let any account "+
+			"on the instance ban a native author out of a community whose moderators did "+
+			"nothing — decision 18's conjunction reading a forgeable input")
+
+	requireEveryDelivery(t, h.db, mtAuthorDID, groupID, "pending",
+		"and their pending work stands: a forged ban that still cancelled deliveries would "+
+			"unpublish an author on an unsigned claim")
+
+	admitPost(t, world, mtAuthorDID, mbPostAfterBanRKey, world.communityADID,
+		"3lzmbrev00040", 1_775_000_008_000_001)
+	status, _ := admissionFor(t, h.db, world.communityADID, mbPostATURI(mtAuthorDID, mbPostAfterBanRKey))
+	assert.Equal(t, accept.StatusAccepted, status,
+		"and admission is unaffected: a half-applied forged ban is a shadowban nobody issued "+
+			"and no Undo can lift, because no moderator ever made the decision to reverse")
 }

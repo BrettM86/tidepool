@@ -81,6 +81,15 @@ const (
 	// stay distinguishable in the ledger, because they are the two branches of
 	// what an edit against a standing removal is allowed to do.
 	DecisionModeratorRemoved = "moderator-removed"
+	// DecisionAuthorBanned: the community has BANNED this author (task 17c-3), so
+	// nothing they write enters it until the ban is lifted or lapses.
+	//
+	// It is the same string the removal record's code uses — one decision, one
+	// vocabulary — and it is taken from there rather than re-typed, because the
+	// two surfaces answer the same operator question from opposite sides: the
+	// ledger says why the post was refused, the removal record says why an older
+	// one went. Two literals is how those drift apart.
+	DecisionAuthorBanned = materialize.RemovalCodeAuthorBanned
 )
 
 // ErrModeratorRemovalStands reports that an edit was refused because the
@@ -148,6 +157,14 @@ type Options struct {
 	Prefs store.FederationPrefs
 	// Admissions is the decision ledger (migration 021).
 	Admissions *Admissions
+	// Bans reads whether a community has excluded the author (task 17c-3).
+	//
+	// OPTIONAL in the wiring sense only: when it is nil, NewEngine takes the ban
+	// view of Communities, which the postgres communities store provides. It is
+	// a separate option rather than methods on store.Communities because half
+	// the bridge holds that interface to resolve follow state, and none of them
+	// may reach an exclusion.
+	Bans store.CommunityBans
 	// APActors reads the author's AP actor row for the delivery-paused admission
 	// check (decision 19). OPTIONAL: nil skips the paused check (the seam is not
 	// wired yet — flagged for the paused-rejection lifecycle).
@@ -178,6 +195,7 @@ type Engine struct {
 	objects         store.OutboundObjects
 	prefs           store.FederationPrefs
 	admissions      *Admissions
+	bans            store.CommunityBans
 	apActors        store.APActors
 	maxPerCommunity int
 	catalog         *lexicon.BaseCatalog
@@ -227,6 +245,17 @@ func NewEngine(opts Options) (*Engine, error) {
 	if err != nil {
 		return nil, fmt.Errorf("accept: load lexicon catalog: %w", err)
 	}
+	// The ban store and the communities store are two repositories over two
+	// tables; only the admission gate reads the first. The default keeps every
+	// existing call site working — the postgres communities store IS also that
+	// repository — without putting exclusions on an interface half the bridge
+	// holds to resolve follow state.
+	bans := opts.Bans
+	if bans == nil {
+		if fromCommunities, ok := opts.Communities.(store.CommunityBans); ok {
+			bans = fromCommunities
+		}
+	}
 	return &Engine{
 		repos:           opts.Repos,
 		enqueuer:        opts.Enqueuer,
@@ -236,6 +265,7 @@ func NewEngine(opts Options) (*Engine, error) {
 		objects:         opts.Objects,
 		prefs:           opts.Prefs,
 		admissions:      opts.Admissions,
+		bans:            bans,
 		apActors:        opts.APActors,
 		maxPerCommunity: opts.MaxPerAuthorPerCommunity,
 		catalog:         catalog,
@@ -389,7 +419,26 @@ func (e *Engine) decide(ctx context.Context, did string, commit *consume.CommitE
 		return DecisionCommunityNotFollowed, false, nil
 	}
 
-	// 4. Opt-out (decision 11): content pushed outward is exactly what an
+	// 4. Community ban (task 17c-3): this community has excluded this author, so
+	// nothing they write enters it. It sits here — after the community gate,
+	// before the author's own preferences — because it is the community's
+	// decision about its own space, and admitting the post would sign that
+	// community's name to content from someone it has excluded.
+	//
+	// A nil store is "this deployment records no bans", not "nobody is banned":
+	// production wires it and NewEngine defaults it off the communities store,
+	// so the nil is only reachable from a caller that passes neither.
+	if e.bans != nil {
+		banned, err := e.bans.Standing(ctx, communityDID, did)
+		if err != nil {
+			return "", false, fmt.Errorf("accept: read ban on %s in %s: %w", did, communityDID, err)
+		}
+		if banned {
+			return DecisionAuthorBanned, false, nil
+		}
+	}
+
+	// 5. Opt-out (decision 11): content pushed outward is exactly what an
 	// opted-out author refused.
 	federating, err := e.mayFederate(ctx, did)
 	if err != nil {
@@ -399,7 +448,7 @@ func (e *Engine) decide(ctx context.Context, did string, commit *consume.CommitE
 		return DecisionOptedOut, false, nil
 	}
 
-	// 5. Paused (#account, decision 19): delivery is halted while the identity is
+	// 6. Paused (#account, decision 19): delivery is halted while the identity is
 	// deactivated/suspended/takendown/throttled, so a new post is not admitted.
 	if e.apActors != nil {
 		actor, err := e.apActors.GetByDID(ctx, did)
@@ -415,7 +464,7 @@ func (e *Engine) decide(ctx context.Context, did string, commit *consume.CommitE
 		}
 	}
 
-	// 6. Title: required and within Lemmy's cap (postv2 title is OPTIONAL in the
+	// 7. Title: required and within Lemmy's cap (postv2 title is OPTIONAL in the
 	// lexicon, so this is admission policy, not validation). The cap counts RUNES,
 	// not bytes — Lemmy's limit is on grapheme length, so a multibyte title well
 	// under 200 characters must not be rejected for being over 200 bytes.
@@ -427,7 +476,7 @@ func (e *Engine) decide(ctx context.Context, did string, commit *consume.CommitE
 		return DecisionTitleTooLong, false, nil
 	}
 
-	// 7. Rate cap: one author must not flood a community Tidepool vouches for.
+	// 8. Rate cap: one author must not flood a community Tidepool vouches for.
 	// Counts the author's currently-accepted posts in this community, excluding
 	// this post so a repin never counts against itself. 0 means unlimited.
 	if e.maxPerCommunity > 0 {

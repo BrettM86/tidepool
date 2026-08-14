@@ -2,13 +2,255 @@ package ingest
 
 import (
 	"context"
+	"expvar"
 	"fmt"
 
 	"tidepool/internal/ap"
+	"tidepool/internal/echo"
 	"tidepool/internal/errors"
 	"tidepool/internal/materialize"
 	"tidepool/internal/store"
 )
+
+// AuthorModerator removes every post one author has ACCEPTED in one community —
+// a ban's `removeData: true`. *materialize.Materializer implements it.
+//
+// It is a SEPARATE interface, obtained by type assertion on the Materializer the
+// dispatcher already drives, rather than a method on that interface: the purge
+// needs the admissions ledger, which only the materializer holds, and widening
+// the interface would oblige every caller that constructs a dispatcher for
+// unrelated reasons to implement a moderation transition it never invokes.
+type AuthorModerator interface {
+	// RemoveAuthorPosts returns how many posts were removed. code is the
+	// removal's own machine-readable reason (author-banned here, never
+	// moderator-discretion: this content was not judged, its author was).
+	RemoveAuthorPosts(ctx context.Context, communityDID, authorDID, code, reason string) (int, error)
+}
+
+// The ban counters. Each names a DECIDED non-action, and they are separate
+// because the three refusals are different findings an operator has to tell
+// apart — a ban we ignored on purpose, a ban aimed at a scope we do not model,
+// and a ban for somebody who is not our user — where a single number would read
+// as "bans are not arriving".
+var (
+	// BlockDirectIgnored counts Blocks delivered DIRECTLY to the banned user's
+	// inbox rather than announced by the community. Lemmy sends both; only the
+	// announced one can be authorized (see ignoreDirectBlock).
+	BlockDirectIgnored = expvar.NewInt("tidepool_block_direct_ignored")
+	// BlockUnscopedTarget counts announced Blocks whose `target` is not a
+	// community this bridge follows — an instance-wide (Site actor) ban, which
+	// this scope does not model.
+	BlockUnscopedTarget = expvar.NewInt("tidepool_block_unscoped_target")
+	// BlockForeignSubject counts announced Blocks naming somebody who is not one
+	// of our personas. A Lemmy user banned from a Lemmy community is entirely
+	// their instance's business; we hold no state that could apply it.
+	BlockForeignSubject = expvar.NewInt("tidepool_block_foreign_subject")
+)
+
+// ignoreDirectBlock is the DECIDED non-action at the other door.
+//
+// Lemmy sends a ban twice: announced through the community, and delivered
+// directly to the banned user's inbox. They are not redundant copies — they are
+// signed by different actors, and only one of them can be authorized.
+// BlockUser's actor is the MODERATOR's Person, so on this path decision 18's
+// conjunction (the signer IS the community that owns the target) CANNOT pass by
+// construction: no implementation turns a person into a group. The announced
+// copy is the authoritative one, and we follow every bridged community
+// (decision 15), so nothing is lost by refusing this one.
+//
+// It is COUNTED rather than dropped at debug because a ban that arrives only by
+// the path we ignore looks exactly like a ban that never arrived — and the day
+// the announced path breaks, this counter is the only thing that tells those
+// apart.
+//
+// The refusal holds even when the activity CLAIMS actor = the Group: the inbox
+// binds the VERIFIED signer and never the claim (SEC-1), so a Person-signed
+// Block is a Person-signed Block whatever it says about itself.
+func (h *Handler) ignoreDirectBlock(block *ap.Object, signer string) error {
+	BlockDirectIgnored.Add(1)
+	h.logger.Info("ignoring a directly delivered Block",
+		"activity", block.ID, "signer", signer, "target", refID(block.Target))
+	return skip(block.ID,
+		"a directly delivered Block is signed by the moderator's Person, which can never be "+
+			"the community that owns the ban: the community's own announced copy is the "+
+			"authoritative one and is the only path that records it")
+}
+
+// handleBlock applies an announced Block — a community banning a native author —
+// and, with banned=false, the Undo that lifts it.
+//
+// A BAN IS AN INTERSECTION: this author, in this community. Both halves are
+// recorded, because both readers need one each — the admission gate holds a
+// community DID, the delivery queue holds only an ordering key — and every
+// consequence below is scoped by the pair. Cancelling by author alone would
+// unpublish them in every community they write to; by community alone would take
+// the whole community dark over one user.
+//
+// AUTHORIZATION is decision 18's conjunction, arriving in its simplest form. For
+// content verbs the target's community is read off a mapping; a Block names the
+// community DIRECTLY in `target`, so the two conjuncts — the signer IS the
+// community, and the ban is FOR that community — collapse into one comparison
+// against the verified announcer. A target that names a community we follow but
+// is not the announcer is one moderator team excluding somebody from another's
+// space; a target that names no community we follow is an instance-wide ban this
+// scope does not model. They are different findings and get different reasons.
+func (h *Handler) handleBlock(ctx context.Context, block *ap.Object, announcer *store.Community, banned bool) error {
+	if announcer == nil {
+		// Unreachable from the dispatch (a bare Block is taken by
+		// ignoreDirectBlock before it can get here), and refused anyway: without
+		// a verified community there is nothing to authorize against.
+		return skip(block.ID, "a Block with no announcing community authorizes nothing")
+	}
+	target := refID(block.Target)
+	if target == "" {
+		return errors.NewValidationError("block", "block names no target community")
+	}
+	if target != announcer.APGroupID {
+		return h.refuseBlockTarget(ctx, block, target, announcer)
+	}
+
+	subjectAPID := refID(block.Object)
+	if subjectAPID == "" {
+		return errors.NewValidationError("block", "block names no subject actor")
+	}
+	// WHOSE ban is this? The subject is an AP actor id, and the only ids we can
+	// act on are our own personas — the classifier answers that by ENTITY
+	// EXISTENCE against the serving surface and hands back the DID, which is
+	// exactly what echo.Identity carries the DID for. Parsing the id's path
+	// would answer the same question from the shape of a URL a peer chose.
+	identity, err := h.classifier.Classify(ctx, &ap.Object{ID: subjectAPID})
+	if err != nil {
+		return fmt.Errorf("ingest: identify ban subject %s: %w", subjectAPID, err)
+	}
+	if identity.Class != echo.ClassLocalActor || identity.DID == "" {
+		BlockForeignSubject.Add(1)
+		return skip(block.ID,
+			"announced Block names an actor that is not one of our personas: a Lemmy user's ban "+
+				"from a Lemmy community is enforced entirely on their instance, and we hold no "+
+				"state that could apply it")
+	}
+
+	if !banned {
+		return h.liftBan(ctx, block, announcer, identity.DID)
+	}
+	return h.applyBan(ctx, block, announcer, identity.DID)
+}
+
+// refuseBlockTarget decides an announced Block whose target is not the
+// announcing community, and says WHICH of the two it is.
+//
+// The distinction cannot be drawn from the URL: Lemmy's Site actor is the
+// instance apex, a prefix of every id on that host, so any substring test is
+// vacuous. It is drawn from state instead — is this target a community we
+// follow? — which is the same question every other announced verb answers.
+func (h *Handler) refuseBlockTarget(ctx context.Context, block *ap.Object, target string, announcer *store.Community) error {
+	_, err := h.communities.GetByAPGroupID(ctx, target)
+	if errors.IsNotFound(err) {
+		// An instance-wide ban (target = the Site actor) or a community we do
+		// not federate. Either way the scope is not one we model: recording it
+		// against the announcing community would UNDERSTATE it — the author is
+		// excluded from every community on that instance and we would enforce it
+		// in one — and dropping it silently leaves them posting into that
+		// instance collecting 403s until their deliveries poison, with nothing
+		// naming the cause.
+		BlockUnscopedTarget.Add(1)
+		h.logger.Warn("announced Block targets a scope this bridge does not model",
+			"activity", block.ID, "target", target, "announcer", announcer.APGroupID)
+		return skip(block.ID,
+			"announced Block targets "+target+", which is not a community this bridge follows: "+
+				"an instance-wide ban is a scope Tidepool does not model, so it is recorded nowhere "+
+				"and the author keeps posting into that instance")
+	}
+	if err != nil {
+		return fmt.Errorf("ingest: resolve block target %s: %w", target, err)
+	}
+	return skip(block.ID, fmt.Sprintf(
+		"announced Block targets community %s but was announced by %s: a ban is a community's "+
+			"ruling about its OWN space", target, announcer.APGroupID))
+}
+
+// applyBan records the exclusion and acts on everything it implies.
+func (h *Handler) applyBan(ctx context.Context, block *ap.Object, announcer *store.Community, subjectDID string) error {
+	if h.bans == nil {
+		// Loud and retryable, never a skip: a ban we cannot store is one that
+		// stops nothing from the author's next post onward, and marking the
+		// event processed would leave the community believing we honoured it.
+		return fmt.Errorf("ingest: no community-ban store is wired, so this ban cannot be recorded")
+	}
+	ban := store.CommunityBan{
+		CommunityDID:  announcer.DID,
+		SubjectDID:    subjectDID,
+		CommunityAPID: announcer.APGroupID,
+		RemoveData:    block.RemoveData != nil && *block.RemoveData,
+	}
+	// The expiry is carried through EXACTLY as sent. Lemmy sends no activity when
+	// a timed ban lapses — it simply stops applying there — so dropping this
+	// makes a three-day ban permanent with nothing that could ever clear it.
+	if block.Expires.OK() {
+		expires := block.Expires.Time
+		ban.ExpiresAt = &expires
+	}
+
+	// The row and the cancellation of already-queued work commit together (see
+	// store.CommunityBans.Ban): the first stops the author's next post, the
+	// second stops the ones the queue is holding.
+	cancelled, err := h.bans.Ban(ctx, ban)
+	if err != nil {
+		return fmt.Errorf("ingest: record ban on %s in %s: %w", subjectDID, announcer.APGroupID, err)
+	}
+	h.logger.Info("community banned a native author",
+		"community", announcer.APGroupID, "subject_did", subjectDID,
+		"expires", ban.ExpiresAt, "remove_data", ban.RemoveData,
+		"cancelled_deliveries", cancelled, "activity", block.ID)
+
+	if !ban.RemoveData {
+		return nil
+	}
+	if h.authorMod == nil {
+		return fmt.Errorf(
+			"ingest: no author-moderation surface is wired, so removeData for %s in %s cannot be applied",
+			subjectDID, announcer.APGroupID)
+	}
+	// Their content in THIS community, from the ledger that knows which posts
+	// this community admitted. Nothing is enqueued and nothing can be: the
+	// removal rides ApplyOps, which takes no side effect — and Lemmy has already
+	// removed this content, so an outbound Delete would be aimed at the
+	// moderators who just acted.
+	removed, err := h.authorMod.RemoveAuthorPosts(ctx, announcer.DID, subjectDID,
+		materialize.RemovalCodeAuthorBanned, block.Summary)
+	if err != nil {
+		return fmt.Errorf("ingest: remove %s's posts from %s: %w", subjectDID, announcer.APGroupID, err)
+	}
+	h.logger.Info("ban carried removeData; the author's posts in this community were removed",
+		"community", announcer.APGroupID, "subject_did", subjectDID, "removed", removed)
+	return nil
+}
+
+// liftBan is Undo{Block}: the exclusion goes, and NOTHING ELSE does.
+//
+// Content removed under removeData STAYS REMOVED. Lemmy models restoration as a
+// separate restore_data flag, so republishing here would reverse a decision
+// nobody reversed and push the author's posts back at the community that removed
+// them — the same harm as reversing a removal on an author's edit, arriving by
+// another door.
+func (h *Handler) liftBan(ctx context.Context, block *ap.Object, announcer *store.Community, subjectDID string) error {
+	if h.bans == nil {
+		return fmt.Errorf("ingest: no community-ban store is wired, so this ban cannot be lifted")
+	}
+	lifted, err := h.bans.Lift(ctx, announcer.DID, subjectDID)
+	if err != nil {
+		return fmt.Errorf("ingest: lift ban on %s in %s: %w", subjectDID, announcer.APGroupID, err)
+	}
+	if !lifted {
+		return skip(block.ID, fmt.Sprintf(
+			"announced Undo{Block} for %s in %s, which held no standing ban: nothing to lift "+
+				"(a re-delivered undo, or one for a ban that lapsed on its own)",
+			subjectDID, announcer.APGroupID))
+	}
+	h.logger.Info("community lifted a native author's ban",
+		"community", announcer.APGroupID, "subject_did", subjectDID, "activity", block.ID)
+	return nil
+}
 
 // moderationState is the bridge-owned moderation store, or an error naming the
 // gap. Every moderation path asks for it before deciding anything.

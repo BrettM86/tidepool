@@ -267,6 +267,41 @@ func (a *Admissions) CountAccepted(ctx context.Context, authorDID, communityDID,
 	return n, nil
 }
 
+// ListAccepted returns the at-uris of the posts an author currently has ACCEPTED
+// in one community, oldest first — the input to a ban's removeData purge, and
+// the reason idx_admissions_author_community leads with (author_did,
+// community_did).
+//
+// This ledger is the ONLY table that records which community admitted a post,
+// which is exactly the scope a ban is entitled to act on. The obvious
+// alternatives are both wrong: ap_objects and outbound_objects know what was
+// materialized and federated but not by whose decision, so either would purge an
+// author's writing in every community over one community's ban.
+func (a *Admissions) ListAccepted(ctx context.Context, communityDID, authorDID string) ([]string, error) {
+	rows, err := a.db.QueryContext(ctx, `
+		SELECT post_uri FROM admissions
+		 WHERE author_did = $1 AND community_did = $2 AND status = $3
+		 ORDER BY created_at`,
+		authorDID, communityDID, StatusAccepted)
+	if err != nil {
+		return nil, fmt.Errorf("accept: list accepted for %s in %s: %w", authorDID, communityDID, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var postURIs []string
+	for rows.Next() {
+		var postURI string
+		if err := rows.Scan(&postURI); err != nil {
+			return nil, fmt.Errorf("accept: scan accepted for %s in %s: %w", authorDID, communityDID, err)
+		}
+		postURIs = append(postURIs, postURI)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("accept: list accepted for %s in %s: %w", authorDID, communityDID, err)
+	}
+	return postURIs, nil
+}
+
 // DeleteTx removes the ledger row for a (community, post) on an existing
 // transaction — the author-delete path, which rides the acceptance-delete commit
 // so the ledger row and the acceptance record go away together. The post no

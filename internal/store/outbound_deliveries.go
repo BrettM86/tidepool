@@ -250,6 +250,44 @@ func (r *postgresOutboundDeliveries) CancelForCommunity(ctx context.Context, ord
 	return r.cancel(ctx, "cancel outbound_deliveries for community", query, orderingKey)
 }
 
+// cancelPendingForActorInCommunity parks one actor's PENDING deliveries on ONE
+// community's ordering key — the INTERSECTION its two neighbours above cannot
+// express, and the shape a community ban needs.
+//
+// Both one-dimensional versions are wrong for a ban, in opposite directions:
+// CancelForActor stops the author in every community they write to, and
+// CancelForCommunity stops every author in this one. The ordering key is what
+// makes the intersection reachable at all — co-hosted communities SHARE an
+// inbox, so target_inbox says nothing about which community's traffic a row
+// carries.
+//
+// Terminal rows are untouched, as everywhere else here: `delivered` cannot be
+// un-sent (and the vote reseed subtracts exactly that state from the API tally,
+// so rewriting it would move a number the user sees), and `poisoned` is an
+// operator surface whose redrive is the recovery.
+//
+// It runs on a caller's transaction: the ban row and this cancellation are one
+// decision, and store.CommunityBans.Ban commits them together.
+func cancelPendingForActorInCommunity(ctx context.Context, ex execer, actorDID, orderingKey string) (int64, error) {
+	result, err := ex.ExecContext(ctx, `
+		UPDATE outbound_deliveries d
+		SET state = 'cancelled', claimed_until = NULL, updated_at = now()
+		FROM outbound_activities a
+		WHERE d.activity_id = a.activity_id
+		  AND a.actor_did = $1
+		  AND d.ordering_key = $2
+		  AND d.state = 'pending'`, actorDID, orderingKey)
+	if err != nil {
+		return 0, fmt.Errorf("cancel outbound_deliveries for %q in %q: %w", actorDID, orderingKey, err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("cancel outbound_deliveries for %q in %q: rows affected: %w",
+			actorDID, orderingKey, err)
+	}
+	return affected, nil
+}
+
 func (r *postgresOutboundDeliveries) cancel(ctx context.Context, op, query string, arg string) (int64, error) {
 	result, err := r.db.ExecContext(ctx, query, arg)
 	if err != nil {

@@ -227,6 +227,40 @@ type APActors interface {
 	UpdateProfile(ctx context.Context, did string, profile APActorProfile) error
 }
 
+// CommunityBans is one community's exclusion of one native author (migration
+// 027) — the durable half of an announced Block.
+//
+// It is its OWN interface, held only by the two places that need it: the
+// announced-moderation dispatch that writes bans, and the admission gate that
+// reads them. It is not part of Communities, which half the bridge holds to
+// resolve follow state and AP group ids.
+type CommunityBans interface {
+	// Ban records the exclusion AND cancels that author's PENDING deliveries to
+	// that community, in ONE transaction, returning how many were cancelled.
+	//
+	// The two are one decision and cannot be separated: the row stops the
+	// author's NEXT post, the cancellation stops the ones already queued, and a
+	// row that committed without the cancellation would leave the queue pushing
+	// a banned author's posts at a community that rejects them until each
+	// poisons — with nothing to retry, because Lemmy sends the Block once.
+	//
+	// Re-banning preserves the original banned_at (a re-delivered Block is the
+	// same ban twice) while taking the expiry, reason and removeData from the
+	// new activity, which are the parts a moderator can genuinely re-issue.
+	Ban(ctx context.Context, ban CommunityBan) (cancelled int64, err error)
+
+	// Lift removes the ban (Undo{Block}), reporting whether one was standing.
+	// It lifts ONLY the exclusion: content removed under removeData stays
+	// removed, because Lemmy models restoration as a separate restore_data flag.
+	Lift(ctx context.Context, communityDID, subjectDID string) (lifted bool, err error)
+
+	// Standing reports whether the author is CURRENTLY banned from the
+	// community — expiry included, because a lapsed ban must read exactly like
+	// no ban: Lemmy sends no Undo when a timed ban runs out, so the clock is the
+	// only thing that ever lifts it.
+	Standing(ctx context.Context, communityDID, subjectDID string) (bool, error)
+}
+
 // Communities tracks the AP groups the bridge subscribes to and their
 // backfill progress.
 type Communities interface {

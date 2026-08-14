@@ -109,6 +109,17 @@ func (m *Materializer) removalStands(ctx context.Context, communityDID, rkey str
 // post or a comment, and two copies of the literal is exactly how that drifts.
 const RemovalCodeModeratorDiscretion = "moderator-discretion"
 
+// RemovalCodeAuthorBanned is the removal code for content that went because its
+// AUTHOR was banned from the community, not because the post itself was judged.
+//
+// The distinction is the reader's, and it is not cosmetic: the two decisions
+// have different reversals. A moderator-discretion removal is lifted by an
+// Undo{Delete} of that post; this one stands even when the ban is lifted, because
+// Lemmy models content restoration as a SEPARATE restore_data flag. A reader
+// that cannot tell them apart cannot answer why the post went, or what would
+// bring it back.
+const RemovalCodeAuthorBanned = "author-banned"
+
 // RemovePost records a community's moderator removal of a post: the acceptance
 // is deleted and a removal written IN ONE COMMIT, at the same digest rkey.
 //
@@ -122,7 +133,79 @@ const RemovalCodeModeratorDiscretion = "moderator-discretion"
 // deleting the author's record would let one community destroy content for
 // every other, and tombstoning the mapping would block the post's later edits
 // and votes from ever materializing again.
+// It is the MODERATOR-DISCRETION entry point: an announced Delete carrying a
+// summary is a moderator's judgement of the post, and Lemmy gives no
+// machine-readable code to narrow it with. A removal that went for another
+// reason enters through RemoveAuthorPosts, which names its own.
 func (m *Materializer) RemovePost(ctx context.Context, mapping *store.APObjectMapping, reason string) error {
+	return m.removePost(ctx, mapping, RemovalCodeModeratorDiscretion, reason)
+}
+
+// RemoveAuthorPosts removes every post one author currently has ACCEPTED in one
+// community — a ban's `removeData: true`.
+//
+// THE SCOPE IS THE WHOLE DESIGN, and it is why the admissions ledger is the
+// input rather than "every post by this author": the ledger is the only table
+// that records which community ADMITTED a post. A ban entitles a community to
+// act on its own space, so an author banned from one community must not lose
+// their writing in the others — that would be a site-wide purge issued by a
+// single moderator team.
+//
+// Each removal is the same one-commit transition RemovePost performs, under the
+// ban's own code, so a reader sees why each post went. It CANNOT enqueue:
+// removals ride repos.ApplyOps, which takes no side effect — and semantically
+// there is nothing to send, because Lemmy has already removed this content on
+// their side. An outbound Delete would be aimed at the moderators who just
+// acted.
+//
+// One post's failure does not abandon the rest: the ban has already landed, and
+// stopping at the first error would leave an arbitrary prefix removed with no
+// record of what remained. The first error is returned after the sweep, so the
+// activity retries and the removals — each idempotent — converge.
+func (m *Materializer) RemoveAuthorPosts(ctx context.Context, communityDID, authorDID, code, reason string) (int, error) {
+	if m.ledger == nil {
+		// Without the ledger there is no way to know WHICH posts this community
+		// admitted, and "every post by this author" is the wrong answer rather
+		// than an approximate one.
+		return 0, fmt.Errorf("materialize: no admissions ledger wired; cannot scope a removeData purge")
+	}
+	postURIs, err := m.ledger.ListAccepted(ctx, communityDID, authorDID)
+	if err != nil {
+		return 0, fmt.Errorf("materialize: list %s's accepted posts in %s: %w", authorDID, communityDID, err)
+	}
+
+	var removed int
+	var firstErr error
+	for _, postURI := range postURIs {
+		mapping, err := m.objects.GetByATURI(ctx, postURI)
+		if errors.IsNotFound(err) {
+			// Admitted but never mapped: nothing federated under it, so there is
+			// no acceptance/removal pair to rewrite.
+			m.logger.Warn("removeData: accepted post has no mapping; skipping",
+				"community_did", communityDID, "post", postURI)
+			continue
+		}
+		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("materialize: load mapping for %s: %w", postURI, err)
+			}
+			continue
+		}
+		if err := m.removePost(ctx, mapping, code, reason); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		removed++
+	}
+	m.logger.Info("removed a banned author's posts from a community",
+		"community_did", communityDID, "author_did", authorDID,
+		"removed", removed, "accepted", len(postURIs), "code", code)
+	return removed, firstErr
+}
+
+func (m *Materializer) removePost(ctx context.Context, mapping *store.APObjectMapping, code, reason string) error {
 	communityDID, postURI, rkey, err := m.moderationTarget(ctx, mapping)
 	if err != nil {
 		return err
@@ -152,10 +235,15 @@ func (m *Materializer) RemovePost(ctx context.Context, mapping *store.APObjectMa
 	removal := map[string]any{
 		"$type":   CollectionRemoval,
 		"subject": strongRef(postURI, pinned),
-		// Lemmy sends no machine-readable code, so the open knownValues set's
-		// catch-all applies. Inventing a narrower code (spam, rule-violation)
-		// would be the bridge asserting a reason the moderator never gave.
-		"code":      RemovalCodeModeratorDiscretion,
+		// The code comes from the CALLER, because the removal lexicon's
+		// knownValues set is open and the two decisions that reach here are
+		// genuinely different: a post the moderators judged
+		// (moderator-discretion, the catch-all Lemmy's own activity gives us no
+		// better answer than) versus content that went because its author was
+		// banned (author-banned). Inventing anything NARROWER than what the
+		// caller was told — spam, rule-violation — would still be the bridge
+		// asserting a reason the moderator never gave.
+		"code":      code,
 		"createdAt": recordDatetime(m.moderationStamp(ctx, communityDID, CollectionRemoval, rkey)),
 	}
 	// Omitted rather than written blank: Lemmy spells "no reason given" as an
@@ -177,7 +265,7 @@ func (m *Materializer) RemovePost(ctx context.Context, mapping *store.APObjectMa
 	m.logger.Info("post removed from community by moderator",
 		"community_did", communityDID, "post", postURI, "ap_id", mapping.APID)
 	m.recordModeration(ctx, mapping, func() error {
-		return m.ledger.RecordRemoval(ctx, communityDID, postURI, mapping.DID, RemovalCodeModeratorDiscretion)
+		return m.ledger.RecordRemoval(ctx, communityDID, postURI, mapping.DID, code)
 	})
 	return nil
 }

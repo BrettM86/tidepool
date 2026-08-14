@@ -324,6 +324,11 @@ func (h *Handler) handleUndo(ctx context.Context, undo *ap.Object, signer string
 		// nobody can reach: no later activity clears it, because this is the
 		// only one Lemmy will ever send about it.
 		return h.handleLock(ctx, inner, announcer, false)
+	case ap.TypeBlock:
+		// The unban, with the Block carried INLINE. It lifts the exclusion and
+		// nothing else: content removed under removeData stays removed, because
+		// Lemmy models restoration as a separate restore_data flag.
+		return h.handleBlock(ctx, inner, announcer, false)
 	case ap.TypeFollow:
 		// A remote undoing a follow of us — the bridge has no followers in
 		// v1 (read-only), nothing to do.

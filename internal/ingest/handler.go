@@ -99,6 +99,10 @@ type HandlerOptions struct {
 	Records      RecordGetter
 	Votes        VoteAggregator
 	Backfill     Backfiller
+	// Bans is the community-ban store an announced Block is recorded in (task
+	// 17c-3). Optional in the same wiring sense as Moderation: nil takes the ban
+	// view of Communities, which the postgres communities store provides.
+	Bans store.CommunityBans
 	// Moderation is the bridge-owned moderation state announced Locks and
 	// native-comment removals are recorded in (task 17c-2). Optional ONLY in the
 	// wiring sense: when it is nil, NewHandler takes the moderation view of
@@ -130,6 +134,8 @@ type Handler struct {
 	votes       VoteAggregator
 	backfill    Backfiller
 	moderation  store.ObjectModeration
+	bans        store.CommunityBans
+	authorMod   AuthorModerator
 	classifier  EchoClassifier
 	echoLog     *ratelimit.Sampler
 	serviceID   string
@@ -192,6 +198,21 @@ func NewHandler(opts HandlerOptions) (*Handler, error) {
 			moderation = fromObjects
 		}
 	}
+	// Same escape, same reason: a ban is a different table from the communities
+	// row, and the follow-state readers that hold store.Communities must not
+	// gain the power to exclude anyone.
+	bans := opts.Bans
+	if bans == nil {
+		if fromCommunities, ok := opts.Communities.(store.CommunityBans); ok {
+			bans = fromCommunities
+		}
+	}
+	// The materializer is the only thing that can act on removeData — it owns
+	// the one-commit removal AND holds the admissions ledger that says which
+	// posts this community admitted. It is read off the SAME value the
+	// dispatcher already drives rather than a second option, because a
+	// deployment cannot coherently have one and not the other.
+	authorMod, _ := opts.Materializer.(AuthorModerator)
 	return &Handler{
 		mat:         opts.Materializer,
 		fetcher:     opts.Fetcher,
@@ -203,6 +224,8 @@ func NewHandler(opts HandlerOptions) (*Handler, error) {
 		votes:       opts.Votes,
 		backfill:    opts.Backfill,
 		moderation:  moderation,
+		bans:        bans,
+		authorMod:   authorMod,
 		classifier:  opts.Echo,
 		echoLog:     ratelimit.NewSampler(echoDropLogInterval),
 		serviceID:   opts.ServiceActorID,
@@ -262,6 +285,11 @@ func (h *Handler) Process(ctx context.Context, event *store.InboxEvent) error {
 		return h.handleAccept(ctx, activity, signer)
 	case ap.TypeReject:
 		return h.handleReject(ctx, activity, signer)
+	case ap.TypeBlock:
+		// A Block delivered DIRECTLY to the banned user's inbox. Lemmy sends one
+		// of these alongside every announced ban, and it is the copy we cannot
+		// authorize: see ignoreDirectBlock.
+		return h.ignoreDirectBlock(activity, signer)
 	case ap.TypeLike, ap.TypeDislike:
 		// Bare votes (rare; Lemmy normally announces them via the group).
 		// The inbox already bound this top-level activity's actor to the
@@ -353,6 +381,11 @@ func (h *Handler) handleAnnounce(ctx context.Context, announce *ap.Object, signe
 		// A community closing one of its own threads. The Undo arrives on the
 		// TypeUndo branch above and lands in the same handler with locked=false.
 		return h.handleLock(ctx, inner, community, true)
+	case ap.TypeBlock:
+		// A community banning a native author. This is the AUTHORITATIVE copy —
+		// the direct one, delivered to the banned user's inbox, is signed by the
+		// moderator's Person and cannot satisfy decision 18 by construction.
+		return h.handleBlock(ctx, inner, community, true)
 	default:
 		// Add, Remove, Block, ... — moderation activities the bridge does not
 		// translate yet. Remove in particular is NOT content removal in Lemmy

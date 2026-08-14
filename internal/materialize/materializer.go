@@ -157,6 +157,15 @@ type ModerationLedger interface {
 	// outward, which is exactly the case a restore has to pin. "" means the
 	// ledger knows of no decision for this (community, post).
 	LastEvaluatedCID(ctx context.Context, communityDID, postURI string) (string, error)
+	// ListAccepted returns the at-uris of the posts this author currently has
+	// ACCEPTED in this community — the input to a ban's removeData purge.
+	//
+	// The ledger is the only table that knows this. ap_objects knows what was
+	// materialized and outbound_objects knows what was federated, but neither
+	// records which community ADMITTED a post, which is precisely the scope a
+	// ban is entitled to act on: "their content HERE", never everything they
+	// ever wrote.
+	ListAccepted(ctx context.Context, communityDID, authorDID string) ([]string, error)
 }
 
 // Options configures New. Fetcher, Objects, Actors, Communities, Repos,

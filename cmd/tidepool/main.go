@@ -391,6 +391,7 @@ func run(logger *slog.Logger) error {
 		// store every inbound moderation decision is RECORDED in, and production
 		// should not depend on a type assertion to have one.
 		Moderation:     store.NewObjectModeration(database),
+		Bans:           store.NewCommunityBans(database),
 		ServiceActorID: serviceActor.ID,
 		Logger:         logger,
 	})
@@ -715,14 +716,18 @@ func startConsumer(
 	// the Create{Page} enqueued atomically with it. Wired whenever the consumer
 	// runs, so postv2 events are admitted rather than skipped at debug.
 	engine, err := accept.NewEngine(accept.Options{
-		Repos:                    repoManager,
-		Enqueuer:                 enqueuer,
-		Actors:                   minter,
-		Resolver:                 resolver,
-		Communities:              store.NewCommunities(database),
-		Objects:                  store.NewOutboundObjects(database),
-		Prefs:                    store.NewFederationPrefs(database),
-		Admissions:               accept.NewAdmissions(database),
+		Repos:       repoManager,
+		Enqueuer:    enqueuer,
+		Actors:      minter,
+		Resolver:    resolver,
+		Communities: store.NewCommunities(database),
+		Objects:     store.NewOutboundObjects(database),
+		Prefs:       store.NewFederationPrefs(database),
+		Admissions:  accept.NewAdmissions(database),
+		// Passed explicitly rather than left to NewEngine's default: the ban gate
+		// is what keeps a banned author's posts out of a community, and
+		// production should not depend on a type assertion to have one.
+		Bans:                     store.NewCommunityBans(database),
 		APActors:                 store.NewAPActors(database),
 		MaxPerAuthorPerCommunity: cfg.AdmissionMaxPerAuthorPerCommunity,
 		UserOrigin:               cfg.APUserOrigin,

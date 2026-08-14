@@ -98,23 +98,22 @@ func newModerationWorld(t *testing.T, h *harness) moderationWorld {
 	h.serveLemmyWorldContent()
 	communityADID := testDIDFor(mtCommunityAName, "lemmy.world")
 
-	// --- Community B: followed, co-hosted, and able to sign its own deliveries.
+	// --- Community B: followed, co-hosted, and REAL — minted through the same
+	//     admin subscribe the operator uses, so it has a DID, a signing key and
+	//     a repo of its own.
+	//
+	// It was a bare communities row until 17c-3, which was enough while every
+	// test only needed B to SIGN something and be refused. It is not enough for a
+	// ban: "cancel that author's deliveries to THAT community" is only
+	// distinguishable from "cancel them everywhere" if the other community can
+	// hold content and accept posts, and an acceptance is a record in B's own
+	// repo — which needs a key we can only get by minting one.
+	groupB := h.subscribeCommunityURL(mtCommunityBAPID, mtCommunityBName)
 	communityBDID := testDIDFor(mtCommunityBName, "lemmy.world")
-	_, err := h.communities.UpsertCommunity(ctx, store.Community{
-		APGroupID:         mtCommunityBAPID,
-		DID:               communityBDID,
-		PreferredUsername: mtCommunityBName,
-		Instance:          "lemmy.world",
-	})
+	communityB, err := h.communities.GetByAPGroupID(ctx, mtCommunityBAPID)
 	require.NoError(t, err)
-	require.NoError(t, h.communities.SetFollowState(ctx, mtCommunityBAPID, store.FollowStateAccepted))
-	groupB := h.newRemoteActor(mtCommunityBAPID, map[string]any{
-		"type":              "Group",
-		"id":                mtCommunityBAPID,
-		"preferredUsername": mtCommunityBName,
-		"inbox":             mtCommunityBAPID + "/inbox",
-		"published":         "2024-01-01T00:00:00.000000Z",
-	})
+	require.Equal(t, communityBDID, communityB.DID,
+		"precondition: B's minted DID is the one the fixtures name")
 
 	// --- The native side: a persona service, the real enqueuer, the real
 	//     acceptance engine, and the real consumer in front of them.
@@ -199,6 +198,16 @@ func mtPostEvent(t *testing.T, operation, rev, cid string, timeUS int64) *consum
 // the SAME community — which needs a second post to root it.
 func mtPostEventFor(t *testing.T, rkey, operation, rev, cid string, timeUS int64) *consume.JetstreamEvent {
 	t.Helper()
+	return mtPostEventBy(t, mtAuthorDID, rkey, testDIDFor(mtCommunityAName, "lemmy.world"),
+		operation, rev, cid, timeUS)
+}
+
+// mtPostEventBy names the AUTHOR and the COMMUNITY as well. A ban is an
+// intersection of the two — this author, in this community — so a fixture that
+// can only vary one of them cannot express the difference between a ban and a
+// community going dark.
+func mtPostEventBy(t *testing.T, did, rkey, communityDID, operation, rev, cid string, timeUS int64) *consume.JetstreamEvent {
+	t.Helper()
 	frame := fmt.Sprintf(`{
   "did": %q, "time_us": %d, "kind": "commit",
   "commit": {
@@ -213,7 +222,7 @@ func mtPostEventFor(t *testing.T, rkey, operation, rev, cid string, timeUS int64
       "createdAt": "2026-08-13T10:00:00.000Z"
     }
   }
-}`, mtAuthorDID, timeUS, rev, operation, rkey, cid, testDIDFor(mtCommunityAName, "lemmy.world"))
+}`, did, timeUS, rev, operation, rkey, cid, communityDID)
 	var event consume.JetstreamEvent
 	require.NoError(t, json.Unmarshal([]byte(frame), &event), "the frame must be valid wire JSON")
 	return &event

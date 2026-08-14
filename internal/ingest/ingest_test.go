@@ -264,7 +264,15 @@ func newHarness(t *testing.T) *harness {
 		// so a lock left by one run refuses the next run's comment before the
 		// test that locks it has run — green first, red second, which a single CI
 		// run never sees.
-		"object_moderation")
+		"object_moderation",
+		// Bans (migration 027) are the same trap one turn worse. The moderation
+		// fixtures' community and author DIDs are package constants, so a
+		// standing ban refuses the NEXT test's post at admission — and because
+		// nothing here truncated it, a row survived across `go test`
+		// invocations, poisoning tests that run BEFORE the ban tests as well as
+		// after. The failure reads as "my post was not accepted", which names
+		// neither bans nor the test that left one.
+		"community_bans")
 
 	custodian, err := identity.NewCustodian(testKEK)
 	require.NoError(t, err)
@@ -676,6 +684,57 @@ func (h *harness) subscribeTechnology() *remoteActor {
 	community, err := h.communities.GetByAPGroupID(context.Background(), groupID)
 	require.NoError(h.t, err)
 	require.Equal(h.t, store.FollowStateAccepted, community.FollowState)
+	return group
+}
+
+// subscribeCommunityURL subscribes to a SECOND community through the real admin
+// path — resolve, mint, Follow, Accept — and returns its signing handle.
+//
+// It takes the AP URL rather than a !name@instance handle because
+// resolveCommunity passes URLs straight through: the harness serves ONE
+// WebFinger document, so a handle-based second subscribe would have to overwrite
+// the first community's and the two would race for the same path.
+//
+// The Group document advertises the shared inbox the harness captures, exactly
+// as the lemmy.world fixture does. Without it the bridge POSTs the Follow to a
+// per-community inbox nothing answers, and the subscribe fails as a bad gateway
+// — a fixture that looks like a bug in follow delivery.
+func (h *harness) subscribeCommunityURL(apGroupID, username string) *remoteActor {
+	h.t.Helper()
+	group := h.newRemoteActor(apGroupID, map[string]any{
+		"type":              "Group",
+		"id":                apGroupID,
+		"preferredUsername": username,
+		"inbox":             apGroupID + "/inbox",
+		"endpoints":         map[string]any{"sharedInbox": "https://lemmy.world/inbox"},
+		"published":         "2024-01-01T00:00:00.000000Z",
+	})
+
+	rec := h.adminRequest(http.MethodPost, "/admin/communities",
+		map[string]any{"community": apGroupID})
+	require.Equal(h.t, http.StatusAccepted, rec.Code, rec.Body.String())
+
+	h.mu.Lock()
+	require.NotEmpty(h.t, h.inboxLog, "subscribe must deliver a Follow")
+	followRaw := h.inboxLog[len(h.inboxLog)-1]
+	h.mu.Unlock()
+	follow, err := ap.ParseObject(followRaw)
+	require.NoError(h.t, err)
+	require.Equal(h.t, apGroupID, follow.Object.ID, "the Follow must name THIS community")
+
+	status := h.deliver(group, map[string]any{
+		"id":     apGroupID + "/activities/accept/follow-1",
+		"type":   "Accept",
+		"actor":  apGroupID,
+		"object": map[string]any{"id": follow.ID, "type": "Follow", "actor": h.service.ID, "object": apGroupID},
+	})
+	require.Equal(h.t, http.StatusAccepted, status)
+	h.drain()
+
+	community, err := h.communities.GetByAPGroupID(context.Background(), apGroupID)
+	require.NoError(h.t, err)
+	require.Equal(h.t, store.FollowStateAccepted, community.FollowState)
+	require.NotEmpty(h.t, community.DID, "a subscribed community holds a minted repo")
 	return group
 }
 

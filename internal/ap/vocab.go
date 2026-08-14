@@ -63,6 +63,18 @@ const (
 	// counter reported it working.
 	TypeLock = "Lock"
 
+	// TypeBlock is Lemmy's community ban (activities/block/block_user.rs),
+	// announced by the community as Announce{Block} and lifted with
+	// Announce{Undo{Block}}.
+	//
+	// Its `object` is the BANNED ACTOR and its `target` is the community the ban
+	// applies to — neither is a payload. Like Lock it must stay OUT of
+	// echo.carriesPayload, and here the consequence is sharper: the banned actor
+	// of a native author IS one of our own personas by definition, so descending
+	// would classify every inbound ban as our own echo and disable community
+	// bans entirely while the drop counter reported success.
+	TypeBlock = "Block"
+
 	TypeTombstone = "Tombstone"
 	TypeImage     = "Image"
 	TypeLink      = "Link"
@@ -134,7 +146,18 @@ type Object struct {
 	// of language objects on Group actors; Languages accepts both.
 	Language Languages `json:"language,omitempty"`
 
+	// Expires is a Block's ban expiry. It is LOAD-BEARING and not decoration:
+	// Lemmy sends NO Undo when a temporary ban lapses — the ban simply stops
+	// applying on their side — so an implementation that drops this column turns
+	// every timed ban into a permanent one with no activity that can ever clear
+	// it.
+	Expires *Time `json:"expires,omitempty"`
+
 	// Lemmy extensions.
+	// RemoveData is Block's purge flag: the moderator also removed that author's
+	// content in the community they were banned from. A *bool because absent and
+	// false are the same decision here but only one of them is a statement.
+	RemoveData              *bool `json:"removeData,omitempty"`
 	Sensitive               *bool `json:"sensitive,omitempty"`
 	CommentsEnabled         *bool `json:"commentsEnabled,omitempty"`
 	PostingRestrictedToMods *bool `json:"postingRestrictedToMods,omitempty"`

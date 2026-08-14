@@ -1168,6 +1168,13 @@ func skipReasonFor(t *testing.T, h *harness, activityID, target string) string {
 		if !ok {
 			return ""
 		}
+		if target == "" {
+			// Redacting the empty string inserts the placeholder between every
+			// character, which turns a readable reason into noise and can make
+			// a Contains assertion pass or fail for reasons unrelated to the
+			// code under test. An empty target means redact nothing.
+			return reason
+		}
 		return strings.ReplaceAll(reason, target, "<target>")
 	}
 	return ""

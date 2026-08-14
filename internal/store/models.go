@@ -175,6 +175,27 @@ type Community struct {
 	FollowAttempts    int
 }
 
+// CommunityBan is one community's exclusion of one native author.
+//
+// Every field is part of the decision, and two of them are the ones an
+// implementation naturally drops: CommunityAPID, without which the delivery
+// queue cannot scope a cancellation to this community, and ExpiresAt, without
+// which every timed ban becomes permanent.
+type CommunityBan struct {
+	CommunityDID  string
+	SubjectDID    string
+	CommunityAPID string
+	// ExpiresAt is nil for a permanent ban. Lemmy sends no activity when a
+	// timed one lapses, so this is the only thing that ever lifts it.
+	ExpiresAt *time.Time
+	Reason    string
+	// RemoveData records what the moderator asked for — that the author's
+	// content in this community go too. It is acted on ONCE, when the ban lands;
+	// the stored flag is the audit answer to "was their content purged?", never
+	// an input to the Undo.
+	RemoveData bool
+}
+
 // ServiceKey is one of the bridge's own long-lived keys, keyed by purpose
 // name. KeyMaterial's encoding is per-row: plaintext PKCS#8 PEM for
 // "service-actor" (the AP-side RSA signing key — the bridge's own service

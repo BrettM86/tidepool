@@ -121,6 +121,50 @@ task documents and git history rather than this list.
   event. The decision-19 reconciliation job (task 18) is the natural
   home for a periodic acceptance-vs-record pin audit.
 
+## Echo suppression (task 17a)
+
+- **`ClassAncestorShortCircuit` counts ordinary threading, not a
+  suppression.** It fires on the branch where `ResolveStrongRef` already
+  anchored — no fetch was going to happen, identical control flow to a
+  fediverse parent — so it rides inbound-comment volume while the other
+  three classes are rare by construction, and it sits in the
+  `tidepool_echo_drops_*` family though nothing is dropped. Flagged by
+  three reviewers. Either rename it out of the drops family (an
+  ancestor-anchor gauge) or move the counter to a site where a fetch was
+  actually declined. It also costs a second point read of the row
+  `ResolveStrongRef` just read, on the hot comment path.
+- **Echo classification adds up to 4 indexed point reads per node to the
+  highest-volume inbound path.** The 17a plan ruling asked for a cheap
+  authority short-circuit before entity existence; the route-prefix test
+  substitutes for it and is vanity-origin-safe, but an envelope crafted
+  with `/ap/object/`-shaped ids on foreign hosts still forces reads at
+  every probe, `MaxDepth` nodes deep. The inbox is signature-gated and
+  rate-limited, so this is recorded rather than fixed.
+- **No end-to-end vanity-origin announce test.** `Identify` is unit-covered
+  in both directions (a positive case on the vanity origin, negatives for
+  a DID whose `NormalizedOrigin` differs), but no inbound announce is
+  driven for a vanity-origin persona through the full path.
+- **`identifyObject`/`identifyActor` corroborate nothing.** Only
+  `identifyActivity` binds the id to the activity we stored (verb + carried
+  object). Object and actor ids are public and derivable, so a followed
+  community can wear one to have content dropped as our echo. Bounded by
+  the followed-community gate, and the announcer could simply not announce
+  the content instead — but there is no per-entity payload to corroborate
+  against, so closing it needs a different mechanism.
+- **`materializeContent`'s legacy `origin=bridge` check is now a subset of
+  the classifier** for announced traffic, and its only unique coverage is
+  the bare Create/Update branch — the one dispatch branch that
+  deliberately does not call `suppressEcho`, unlike Delete/Undo. The
+  asymmetry is undocumented and the legacy check misses ids the classifier
+  would catch (outbound_objects-only ids, activity ids, our own actor).
+- **`Drops()` is exported with no production caller** and the tests keep a
+  parallel class list; adding a fifth class would silently under-assert
+  every "only this class moved" test. Export the class list instead.
+- **`echo.normalizeHost` is a hand-copy of `personas.normalizeHost`.** The
+  classifier is deliberately the read-side mirror of the serving surface,
+  so divergence between the two copies is the named risk. Now covered by
+  its own tests on both sides, but not by a test asserting the two agree.
+
 ## Production rollout
 
 - Bluesky's public relay accepts new PDS hosts, but its documented default

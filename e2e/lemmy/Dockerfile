@@ -32,7 +32,7 @@ RUN apt-get update \
 
 # Pin the Lemmy release. lemmy-translations is a git submodule required to
 # compile (crates/utils embeds it).
-ARG LEMMY_VERSION=0.19.19
+ARG LEMMY_VERSION=0.19.20
 RUN git clone --depth 1 --branch ${LEMMY_VERSION} https://github.com/LemmyNet/lemmy.git /lemmy \
     && cd /lemmy \
     && git submodule update --init --recursive --depth 1

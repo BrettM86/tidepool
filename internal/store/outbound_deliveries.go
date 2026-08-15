@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lib/pq"
+
 	"tidepool/internal/errors"
 )
 
@@ -274,6 +276,13 @@ func (r *postgresOutboundDeliveries) CancelForActorTx(ctx context.Context, tx *s
 	return cancelForActor(ctx, tx, actorDID)
 }
 
+func (r *postgresOutboundDeliveries) CancelOutwardForActorTx(ctx context.Context, tx *sql.Tx, actorDID string) (int64, error) {
+	if tx == nil {
+		return 0, errors.NewValidationError("tx", "must not be nil")
+	}
+	return cancelOutwardForActor(ctx, tx, actorDID)
+}
+
 // DeliveryHeldForSettlement is the last_error_class of a delivery the PEER HAS
 // ALREADY ACCEPTED whose local settlement — the causal stamp, the vote ledger —
 // has not committed yet. The row deliberately stays `pending` so a worker can
@@ -319,11 +328,33 @@ const DeliveryHeldForSettlement = "ledger_unsettled"
 const notHeldForSettlement = `
 		  AND last_error_class IS DISTINCT FROM '` + DeliveryHeldForSettlement + `'`
 
-// cancelForActor is the consent/kill-switch withdrawal: park the actor's
-// PENDING work as cancelled (never poisoned — this is not a failure) across
-// EVERY community they have work in, because the decision is about the actor.
-// Terminal deliveries are left untouched. Joined through
-// outbound_activities.actor_did.
+// RetractionKinds are the activity kinds that TAKE CONTENT DOWN: a Delete of a
+// post or comment, and the Undo of a vote. They are exempt from every consent
+// decision, in the queue and at the worker alike.
+//
+// The asymmetry is the point. A consent withdrawal means "stop publishing for
+// me"; a retraction is the only way an opted-out user removes what is ALREADY
+// published. Cancelling one leaves that content standing on the peer forever,
+// which is the opposite of what was asked — the worker states exactly this and
+// skips its consent recheck for these kinds, and a cancellation that swept them
+// would undo that decision one layer up, where nothing observes it.
+//
+// It is ONE list shared with outbound.isRetraction so the queue and the worker
+// cannot drift into disagreeing about which activities a stopped user is still
+// owed.
+var RetractionKinds = []string{"Delete", "Undo"}
+
+// notARetraction excludes those kinds from a cancellation. It reads from the
+// joined outbound_activities row, so any statement using it must join a.
+// cancelForActor is the SWEEPING cancel: every pending delivery of this actor's,
+// retractions included, across every community. It is the kill switch and the
+// operator's manual cancel — decisions that mean "stop the queue", not "stop
+// publishing for this user".
+//
+// CancelOutwardForActor is the consent variant, and the difference between them
+// is a user's ability to take their own content down. Two decisions, two
+// statements: one predicate serving both is how the narrower decision silently
+// acquires the wider one's reach.
 func cancelForActor(ctx context.Context, ex execer, actorDID string) (int64, error) {
 	query := `
 		UPDATE outbound_deliveries d
@@ -340,6 +371,46 @@ func cancelForActor(ctx context.Context, ex execer, actorDID string) (int64, err
 	affected, err := result.RowsAffected()
 	if err != nil {
 		return 0, fmt.Errorf("cancel outbound_deliveries for actor %q: rows affected: %w", actorDID, err)
+	}
+	return affected, nil
+}
+
+// cancelOutwardForActor is the CONSENT withdrawal: park the actor's pending
+// OUTWARD work — everything that publishes — while leaving their retractions to
+// go out. Never poisoned (this is not a failure), terminal rows untouched, held
+// settlements untouched, across every community because the decision is about
+// the actor.
+//
+// TWO THINGS DEPEND ON THE RETRACTION EXEMPTION, and the second is not obvious:
+//
+//  1. A user who deletes a post and then opts out must still have the delete
+//     delivered, or the post stays on Lemmy forever — the exact opposite of what
+//     opting out means.
+//  2. THE DESTRUCTIVE TIER'S OWN WITHDRAWAL. Delete{Person} and the vote Undos
+//     are Deletes and Undos, enqueued by the purge on its own transaction. If a
+//     later replay of the opt-out record ran a sweeping cancel, it would cancel
+//     the erasure the previous attempt just committed — and nothing repairs it:
+//     the delivery insert returns the standing (cancelled) row by design, and
+//     the votes are already flipped, so the re-run enumerates nothing. Actor
+//     tombstoned, peers never told, "destructive opt-out applied" in the log.
+func cancelOutwardForActor(ctx context.Context, ex execer, actorDID string) (int64, error) {
+	query := `
+		UPDATE outbound_deliveries d
+		SET state = 'cancelled', claimed_until = NULL, updated_at = now()
+		FROM outbound_activities a
+		WHERE d.activity_id = a.activity_id
+		  AND a.actor_did = $1
+		  AND d.state = 'pending'` + notHeldForSettlement + `
+		  AND a.kind <> ALL($2)`
+
+	result, err := ex.ExecContext(ctx, query, actorDID, pq.Array(RetractionKinds))
+	if err != nil {
+		return 0, fmt.Errorf("cancel outward outbound_deliveries for actor %q: %w", actorDID, err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("cancel outward outbound_deliveries for actor %q: rows affected: %w",
+			actorDID, err)
 	}
 	return affected, nil
 }

@@ -165,11 +165,25 @@ func (r *postgresAPActors) setEnabled(ctx context.Context, ex execer, did string
 	// so the column answers "is this actor currently disabled, and since
 	// when" rather than "was it ever disabled". enabled_at is not cleared on
 	// disable: the last enable is history worth keeping.
+	//
+	// A TOMBSTONED ACTOR CAN NEVER BE RE-ENABLED, and the refusal is in the
+	// statement rather than in the callers because forgetting it is silent and
+	// unrecoverable. The destructive tier told every peer this identity was
+	// withdrawn and its document answers 410 forever; an enable arriving
+	// afterwards — enabled=true, or a DELETE of the opt-out record, which under
+	// default-on means the same thing — would resume signing new content as an
+	// actor peers were explicitly told is gone. "Irreversible" has to mean the
+	// identity cannot be brought back by writing a record.
+	//
+	// The row still MATCHES (so the caller gets a normal one-row result rather
+	// than a spurious NotFound); it is the VALUE that is forced. For an actor
+	// that was never tombstoned every branch below is exactly the old
+	// behaviour.
 	query := `
 		UPDATE ap_actors SET
-			enabled = $2,
-			enabled_at = CASE WHEN $2 THEN now() ELSE enabled_at END,
-			disabled_at = CASE WHEN $2 THEN NULL ELSE now() END,
+			enabled = ($2 AND tombstoned_at IS NULL),
+			enabled_at = CASE WHEN ($2 AND tombstoned_at IS NULL) THEN now() ELSE enabled_at END,
+			disabled_at = CASE WHEN ($2 AND tombstoned_at IS NULL) THEN NULL ELSE now() END,
 			updated_at = now()
 		WHERE did = $1`
 	return execOneRow(ctx, ex, "set enabled", did, query, did, enabled)

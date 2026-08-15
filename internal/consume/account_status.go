@@ -21,7 +21,7 @@ import (
 
 // atprotoPDSServiceID is the DID document service entry that names a repo's
 // hosting PDS.
-const atprotoPDSServiceID = "#atproto_pds"
+const atprotoPDSServiceID = "atproto_pds"
 
 // maxRepoStatusBytes caps the PDS response. getRepoStatus answers a few dozen
 // bytes; the host is named by a document a stranger controls, so it is not read
@@ -82,21 +82,62 @@ type didService struct {
 }
 
 // pdsEndpoint finds the repo's hosting PDS. The id suffix is what identifies it
-// (documents spell it "#atproto_pds" or the full "did:plc:xxx#atproto_pds"),
-// and the endpoint must be an absolute http(s) URL before it reaches a request:
-// it comes from a document its own subject controls.
-func pdsEndpoint(document *didDocument) (string, error) {
+// (documents spell it "#atproto_pds" or the full "did:plc:xxx#atproto_pds").
+//
+// THE ENDPOINT IS UNTRUSTED TEXT IN THE ORDINARY CASE, not merely under attack:
+// it is written by the DID's own controller, which is the party a deletion
+// verdict is about. So it is validated to exhaustion BEFORE the first packet —
+// a guard that fires on the RESPONSE has already sent the bridge somewhere a
+// stranger chose, and has already leaked which DID it is about to act on.
+func pdsEndpoint(document *didDocument) (*url.URL, error) {
 	for _, service := range document.Service {
-		if !strings.HasSuffix(service.ID, atprotoPDSServiceID) {
+		// EXACT fragment match, not a suffix test: "#not_atproto_pds" ends with
+		// the same characters, and a document its own subject writes is where
+		// that shows up. Both spellings are legal — the bare "#atproto_pds" and
+		// the fully-qualified "did:plc:xxx#atproto_pds" — so what is compared is
+		// the fragment itself.
+		if _, fragment, found := strings.Cut(service.ID, "#"); !found || fragment != atprotoPDSServiceID {
 			continue
 		}
-		parsed, err := url.Parse(service.ServiceEndpoint)
-		if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
-			return "", fmt.Errorf("DID document names a PDS endpoint that is not an absolute http(s) URL")
-		}
-		return strings.TrimSuffix(service.ServiceEndpoint, "/"), nil
+		return checkedPDSEndpoint(service.ServiceEndpoint)
 	}
-	return "", fmt.Errorf("DID document names no atproto PDS")
+	return nil, fmt.Errorf("DID document names no atproto PDS")
+}
+
+// checkedPDSEndpoint accepts only a plain, absolute HTTPS origin.
+//
+// HTTPS IS NOT A PREFERENCE HERE. This response decides whether a user's content
+// is erased from every instance that holds it, and no peer un-deletes. Over
+// cleartext, anyone on the path can WRITE {"active":false,"status":"deleted"} —
+// the irreversible verdict, for free, with no credential and no compromise of
+// either endpoint. There is no allow-insecure option on purpose: a deployment
+// whose PDS is reachable only over http cannot confirm deletions, and it fails
+// CLOSED (a retryable error an operator can see) rather than acting on an answer
+// nobody can vouch for.
+//
+// Userinfo is refused too: credentials in a URL a stranger wrote are not ours to
+// send, and Go would put them on the wire.
+func checkedPDSEndpoint(endpoint string) (*url.URL, error) {
+	parsed, err := url.Parse(endpoint)
+	switch {
+	case err != nil:
+		return nil, fmt.Errorf("DID document names an unparseable PDS endpoint")
+	case parsed.Scheme != "https":
+		return nil, fmt.Errorf(
+			"DID document names a PDS endpoint that is not https; a confirmation over a channel "+
+				"anyone can rewrite cannot decide an irreversible erasure (%q)", parsed.Scheme)
+	case parsed.Host == "":
+		return nil, fmt.Errorf("DID document names a PDS endpoint with no host")
+	case parsed.User != nil:
+		return nil, fmt.Errorf("DID document names a PDS endpoint carrying userinfo")
+	case parsed.RawQuery != "" || parsed.Fragment != "":
+		// An XRPC base is an origin with an optional path prefix. A query or
+		// fragment on it means the value is not that, and appending to it would
+		// silently produce a URL nobody wrote.
+		return nil, fmt.Errorf("DID document names a PDS endpoint carrying a query or fragment")
+	}
+	parsed.Path = strings.TrimSuffix(parsed.Path, "/")
+	return parsed, nil
 }
 
 // repoStatus is the sliver of com.atproto.sync.getRepoStatus this reads.
@@ -117,9 +158,14 @@ const repoStatusDeleted = "deleted"
 // 400s an unrecognised repo looks identical to one that is misconfigured, and
 // "the host said something we did not understand" is not evidence a user
 // deleted their account.
-func (r *HandleResolver) repoDeleted(ctx context.Context, endpoint, did string) (bool, error) {
-	target := endpoint + "/xrpc/com.atproto.sync.getRepoStatus?did=" + url.QueryEscape(did)
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+func (r *HandleResolver) repoDeleted(ctx context.Context, endpoint *url.URL, did string) (bool, error) {
+	// BUILT FROM THE PARSED URL, never by concatenation: JoinPath escapes the
+	// segments and preserves a path prefix (https://host/pds), and setting the
+	// query as a value keeps the did from being pasted into a string that may
+	// already contain one.
+	target := endpoint.JoinPath("/xrpc/com.atproto.sync.getRepoStatus")
+	target.RawQuery = url.Values{"did": []string{did}}.Encode()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
 	if err != nil {
 		return false, fmt.Errorf("build repo status request for %s: %w", did, err)
 	}
@@ -128,7 +174,27 @@ func (r *HandleResolver) repoDeleted(ctx context.Context, endpoint, did string) 
 		request.Header.Set("User-Agent", r.userAgent)
 	}
 
-	response, err := r.httpClient.Do(request)
+	// EVERY HOP STAYS ON THE NAMED PDS, over https. The DID document naming that
+	// PDS is the ENTIRE authorization for this answer — it is what makes the
+	// response evidence about this repo rather than an opinion from a stranger —
+	// and a redirect is written by the very server whose answer we are trying to
+	// verify, so "it told us to" is exactly as trustworthy as the answer itself.
+	//
+	// The client is COPIED rather than mutated: this policy belongs to this
+	// request, and the same client also fetches DID documents and well-knowns,
+	// where redirects are ordinary. Copying shares the transport (and its SSRF
+	// guard) while giving this call its own rules.
+	client := *r.httpClient
+	client.CheckRedirect = func(hop *http.Request, _ []*http.Request) error {
+		if hop.URL.Scheme != "https" || !strings.EqualFold(hop.URL.Host, request.URL.Host) {
+			return fmt.Errorf(
+				"refusing redirect to %s: a deletion verdict may come only from the PDS the DID "+
+					"document names, over https", hop.URL.Redacted())
+		}
+		return nil
+	}
+
+	response, err := client.Do(request)
 	if err != nil {
 		return false, fmt.Errorf("fetch repo status for %s: %w", did, err)
 	}

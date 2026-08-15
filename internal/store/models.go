@@ -231,12 +231,23 @@ const (
 	DeliveredStatePending DeliveredState = "pending"
 	// DeliveredStateDelivered means a peer accepted the Like/Dislike.
 	DeliveredStateDelivered DeliveredState = "delivered"
-	// DeliveredStateUndone is RESERVED and currently UNWRITTEN: task 15's worker
-	// DELETES the outbound_votes row on a successful Undo (clear-on-Undo) rather
-	// than transitioning it to "undone", so no code path ever sets this today.
-	// It is kept in the enum and the CHECK constraint (the migration is applied)
-	// against a future "keep the withdrawn-vote record" policy; Valid() still
-	// accepts it so a hand-set or legacy row round-trips.
+	// DeliveredStateUndone means the vote is NO LONGER LIVE on the peer as far as
+	// this bridge is concerned, so nothing may count it: the reseed subtracts
+	// only `delivered`, and the destructive tier enumerates only `delivered`.
+	//
+	// IT IS NO LONGER RESERVED, and its meaning is narrower than the obvious
+	// reading. Task 15's worker still DELETES the row on a successful Undo, so
+	// the ordinary retraction never passes through this state. ONE writer exists
+	// (task 17d's outbound.Purger): when an actor is withdrawn, their live votes
+	// are marked undone AT DECISION TIME, together with the Undo being enqueued
+	// — not when a peer confirms it.
+	//
+	// That distinction matters to anyone reasoning about the ledger: this value
+	// records OUR decision to stop counting a vote, not the peer's acceptance of
+	// the withdrawal. The two coincide for every path except a purge whose Undo
+	// never lands, where the peer may still hold a vote we have stopped counting
+	// — deliberately, because the alternative is subtracting forever on behalf
+	// of an identity that no longer exists.
 	DeliveredStateUndone DeliveredState = "undone"
 )
 
@@ -357,7 +368,13 @@ type FederationPref struct {
 	Enabled      bool
 	DeleteRemote bool
 	Source       FederationPrefSource
-	UpdatedAt    time.Time
+	// PurgedAt is set once the destructive tier has actually asked peers to
+	// delete this user's content. It separates a withdrawal that was REQUESTED
+	// (nil — nothing irreversible has happened, so a live account may still be
+	// restored) from one that COMMITTED (set — there is nothing to come back
+	// to). Only MarkPurged writes it, and nothing clears it.
+	PurgedAt  *time.Time
+	UpdatedAt time.Time
 }
 
 // InboxEvent is a received AP activity: the dedupe record AND the durable

@@ -125,25 +125,38 @@ func (r *postgresOutboundVotes) GetByActivityID(ctx context.Context, activityID 
 	return vote, nil
 }
 
-func (r *postgresOutboundVotes) ListDeliveredForActor(ctx context.Context, actorDID string) ([]OutboundVote, error) {
+func (r *postgresOutboundVotes) ListStandingForActor(ctx context.Context, actorDID string) ([]OutboundVote, error) {
 	if actorDID == "" {
 		return nil, errors.NewValidationError("actor_did", "must not be empty")
 	}
-	// LIVE means exactly delivered_state = 'delivered' — POSITIVE equality, per
-	// decision 16: those are the votes a peer still holds, and the same set the
-	// reseed subtracts from the origin's API tally. A purged actor leaving them
-	// standing is a number the reseed keeps subtracting from a score readers
-	// see, forever, on behalf of somebody who no longer exists.
+	// STANDING ON A PEER is a WIDER set than delivered_state = 'delivered', and
+	// the difference is a real vote on a real instance.
 	//
-	// Served by the partial index on the same predicate (migration 029).
+	// A delivery HELD FOR SETTLEMENT has already been accepted by the peer — the
+	// POST returned, only our own bookkeeping failed — while its ledger row
+	// still reads 'pending' until the worker comes back to finish. Enumerating
+	// 'delivered' alone therefore misses a vote the peer demonstrably holds, and
+	// the miss is permanent rather than transient: that settlement lands AFTER
+	// the withdrawal meant to retract it, and a purge never re-runs. 17b's
+	// reseed then subtracts it from a served score forever, for somebody who no
+	// longer exists.
+	//
+	// The first term is served by the partial index (migration 029); the second
+	// is an EXISTS against the delivery whose id the vote already carries.
 	query := `SELECT` + outboundVoteColumns + `
-		FROM outbound_votes
-		WHERE actor_did = $1 AND delivered_state = 'delivered'
-		ORDER BY vote_at_uri`
+		FROM outbound_votes v
+		WHERE v.actor_did = $1
+		  AND (v.delivered_state = 'delivered'
+		       OR EXISTS (
+		            SELECT 1 FROM outbound_deliveries d
+		             WHERE d.activity_id = v.current_activity_id
+		               AND d.state = 'pending'
+		               AND d.last_error_class = '` + DeliveryHeldForSettlement + `'))
+		ORDER BY v.vote_at_uri`
 
 	rows, err := r.db.QueryContext(ctx, query, actorDID)
 	if err != nil {
-		return nil, fmt.Errorf("list delivered votes for %q: %w", actorDID, err)
+		return nil, fmt.Errorf("list standing votes for %q: %w", actorDID, err)
 	}
 	defer func() { _ = rows.Close() }()
 
@@ -151,12 +164,12 @@ func (r *postgresOutboundVotes) ListDeliveredForActor(ctx context.Context, actor
 	for rows.Next() {
 		vote, err := scanOutboundVote(rows)
 		if err != nil {
-			return nil, fmt.Errorf("scan delivered vote for %q: %w", actorDID, err)
+			return nil, fmt.Errorf("scan standing vote for %q: %w", actorDID, err)
 		}
 		votes = append(votes, *vote)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list delivered votes for %q: %w", actorDID, err)
+		return nil, fmt.Errorf("list standing votes for %q: %w", actorDID, err)
 	}
 	return votes, nil
 }
@@ -168,9 +181,21 @@ func (r *postgresOutboundVotes) SetDeliveredState(ctx context.Context, voteATURI
 	if !state.Valid() {
 		return errors.NewValidationError("delivered_state", "unknown state "+string(state))
 	}
-	result, err := r.db.ExecContext(ctx,
-		`UPDATE outbound_votes SET delivered_state = $2, updated_at = now() WHERE vote_at_uri = $1`,
-		voteATURI, string(state))
+	// UNDONE IS TERMINAL HERE, and the ordering that makes this necessary is
+	// ordinary rather than exotic. A delivery HELD FOR SETTLEMENT has already
+	// been accepted by the peer, so a withdrawal can legitimately retract the
+	// vote while the worker is still on its way back to finish the bookkeeping;
+	// when it arrives it calls this method with `delivered`. Letting that late
+	// settlement win would re-establish exactly the state the erasure removed —
+	// the peer holds a vote we told them to drop, and 17b's reseed subtracts it
+	// from a served score forever.
+	//
+	// Re-setting undone stays allowed, so the write is idempotent.
+	result, err := r.db.ExecContext(ctx, `
+		UPDATE outbound_votes SET delivered_state = $2, updated_at = now()
+		 WHERE vote_at_uri = $1
+		   AND (delivered_state <> $3 OR $2 = $3)`,
+		voteATURI, string(state), string(DeliveredStateUndone))
 	if err != nil {
 		return fmt.Errorf("set delivered_state for outbound_vote %q: %w", voteATURI, err)
 	}
@@ -179,10 +204,20 @@ func (r *postgresOutboundVotes) SetDeliveredState(ctx context.Context, voteATURI
 		return fmt.Errorf("set delivered_state for outbound_vote %q: rows affected: %w", voteATURI, err)
 	}
 	if affected == 0 {
-		// Delivering a vote we hold no state for means the intent and the
-		// delivery disagree about what exists. That is a bug worth surfacing,
-		// not a no-op to swallow.
-		return errors.NewNotFoundError("outbound_vote", voteATURI)
+		// TWO DIFFERENT NOTHINGS, and they cannot share a branch.
+		//
+		// A row that is already retracted was deliberately not moved by the
+		// guard above: that is a DECIDED no-op and must report success. An error
+		// would fail the settlement, leaving the delivery held and retrying a
+		// write that can never apply, against a decision that will never change.
+		//
+		// A row that does not exist at all is the original finding this branch
+		// was written for — the intent and the delivery disagree about what
+		// exists — and is still worth surfacing.
+		if _, err := r.GetByATURI(ctx, voteATURI); err != nil {
+			return err
+		}
+		return nil
 	}
 	return nil
 }

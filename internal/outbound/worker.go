@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -667,7 +668,12 @@ func (w *Worker) backoff(attempts int) time.Duration {
 
 // isRetraction reports whether a kind is a take-down that is exempt from the
 // consent recheck (a Delete or a vote Undo).
-func isRetraction(kind string) bool { return kind == "Delete" || kind == "Undo" }
+//
+// The list is store.RetractionKinds, not a local copy: the QUEUE exempts exactly
+// these kinds from a consent cancellation, and if the two definitions drifted,
+// an activity this worker would still deliver could be cancelled out from under
+// it — or the reverse.
+func isRetraction(kind string) bool { return slices.Contains(store.RetractionKinds, kind) }
 
 // isDuplicate reports whether an HTTPError is Lemmy's duplicate-activity
 // response (a 400 whose body reports the activity was already received).

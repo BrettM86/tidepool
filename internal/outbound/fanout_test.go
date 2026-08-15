@@ -176,7 +176,9 @@ func TestEnqueuer_ARedeliveredActivityToTheSameInboxStaysOneRow(t *testing.T) {
 			"second row would send the peer a duplicate it has to recognise and discard")
 }
 
-// consumeIntentCompileGuard keeps the fan-out fixture honest about the seam it
-// stands in for: whatever intent the destructive tier introduces, it reaches
-// these same two tables through this same method.
-var _ consume.Intent = consume.CommentIntent{}
+// The intent the destructive tier actually introduces. CommentIntent (which
+// every test above already exercises) proves nothing about it: PersonDeleteIntent
+// is the one activity in the system addressed to MANY inboxes, and it is the
+// reason EnqueueFanOut exists at all. Naming it here is what makes the fixture's
+// claim to stand in for the destructive tier true.
+var _ consume.Intent = consume.PersonDeleteIntent{}

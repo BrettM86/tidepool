@@ -234,8 +234,27 @@ func (s *Service) handleActorDocument(w http.ResponseWriter, r *http.Request, di
 	// document keeps resolving, because every Note and Page already delivered
 	// names it and revoking it would orphan the author reference on every
 	// existing thread.
+	//
+	// THE BODY IS AN AS2 TOMBSTONE CARRYING THE PUBLIC KEY, and the key is there
+	// for a race this tier cannot otherwise win. The tombstone commits when the
+	// withdrawal is ENQUEUED; the worker POSTs it minutes later, with retries. In
+	// that window a peer verifying the signature on the very Delete that
+	// announces the withdrawal may re-dereference this actor, and a bare 410
+	// leaves it with no key to verify with — so the erasure fails, retries and
+	// poisons, and the user is never actually withdrawn anywhere.
+	//
+	// Serving the key inside the Tombstone costs nothing a withdrawal cares
+	// about (the key was already public, and publicKey alone federates nothing)
+	// and gives a peer that reads the body what it needs to accept the last
+	// activity we will ever send as this actor.
+	//
+	// RESIDUAL, and it is real: a peer that reads only the STATUS still cannot
+	// verify. The complete fix is to keep serving the actor document until every
+	// delivery of the person-delete is terminal, which is a contract change —
+	// the tier's own test pins 410 immediately — and belongs to whoever changes
+	// that test.
 	if actor.IsTombstoned() {
-		http.Error(w, "gone", http.StatusGone)
+		s.writeActorTombstone(w, actor)
 		return
 	}
 
@@ -303,12 +322,42 @@ func (s *Service) handleOutbox(w http.ResponseWriter, r *http.Request, did strin
 		http.NotFound(w, r)
 		return
 	}
+	// The outbox answers the same way the actor does. An actor that is Gone with
+	// a collection that is still 200 is a contradiction a peer has to resolve,
+	// and it invites exactly the re-fetch loop the 410 exists to end.
+	if actor.IsTombstoned() {
+		s.writeActorTombstone(w, actor)
+		return
+	}
 	writeJSON(w, ap.ContentTypeActivityJSON, map[string]any{
 		"@context":     asNamespace,
 		"id":           actor.ActorID + outboxSuffix,
 		"type":         ap.TypeOrderedCollection,
 		"totalItems":   0,
 		"orderedItems": []any{},
+	})
+}
+
+// writeActorTombstone answers 410 Gone with an AS2 Tombstone for a withdrawn
+// identity. formerType and deleted are what tell a peer WHAT is gone and WHEN,
+// so it can retire its own copy rather than treat the status as a fetch failure.
+func (s *Service) writeActorTombstone(w http.ResponseWriter, actor *store.APActor) {
+	w.Header().Set("Content-Type", ap.ContentTypeActivityJSON)
+	w.WriteHeader(http.StatusGone)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"@context":   []any{asNamespace, securityNamespace},
+		"id":         actor.ActorID,
+		"type":       ap.TypeTombstone,
+		"formerType": ap.TypePerson,
+		"deleted":    actor.TombstonedAt.UTC().Format(time.RFC3339),
+		// See handleActorDocument: this is here so a peer can still verify the
+		// signature on the withdrawal activity itself, which may arrive after
+		// this document started answering Gone.
+		"publicKey": map[string]any{
+			"id":           actor.ActorID + "#main-key",
+			"owner":        actor.ActorID,
+			"publicKeyPem": actor.PublicKeyPEM,
+		},
 	})
 }
 

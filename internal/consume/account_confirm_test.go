@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"tidepool/internal/errors"
 	"tidepool/internal/optout"
 	"tidepool/internal/store"
 )
@@ -120,12 +121,19 @@ func appliedSeq(t *testing.T, database *sql.DB, did string) int64 {
 }
 
 // storedPref reads the terminal preference, or nil when none was recorded.
+//
+// NOT-FOUND IS THE ONLY ABSENCE. Swallowing every error here would make
+// "nothing was recorded" true of a query that failed, a table that was dropped
+// and a typo in the column list — three different nothings, all reading as the
+// assertion passing, on the tests whose whole content is that a row does not
+// exist.
 func storedPref(t *testing.T, database *sql.DB, did string) *store.FederationPref {
 	t.Helper()
 	pref, err := store.NewFederationPrefs(database).Get(context.Background(), did)
-	if err != nil {
+	if errors.IsNotFound(err) {
 		return nil
 	}
+	require.NoError(t, err, "read the federation preference for %s", did)
 	return pref
 }
 
@@ -167,10 +175,10 @@ func TestConfirmedDeletion_RunsTheDestructivePathAndClosesTheEvent(t *testing.T)
 }
 
 // ---------------------------------------------------------------------------
-// (2) CONFIRMED STILL LIVE — nothing destructive, and the seq STILL ADVANCES
+// (2) CONFIRMED LIVE — nothing destructive, and the seq STILL ADVANCES
 // ---------------------------------------------------------------------------
 
-func TestUnconfirmedDeletionOfALiveAccountDoesNothingAndStillAdvances(t *testing.T) {
+func TestConfirmedLiveAccountIsLeftAloneAndTheEventStillAdvances(t *testing.T) {
 	database := dispatchTestDB(t)
 	seedAPActor(t, database, dispatchNativeDID, "alice")
 	world := newTerminalWorld(t, database, true)
@@ -204,13 +212,13 @@ func TestUnconfirmedDeletionOfALiveAccountDoesNothingAndStillAdvances(t *testing
 }
 
 // ---------------------------------------------------------------------------
-// (3) CONFIRM FAILED — retryable, nothing sent, seq NOT advanced
+// (3) UNKNOWN (the confirm failed) — retryable, nothing sent, seq NOT advanced
 // ---------------------------------------------------------------------------
 
-// TestUnconfirmableDeletionIsRetryableAndAdvancesNothing is the case the seam
+// TestUnknownConfirmOutcomeIsRetryableAndAdvancesNothing is the case the seam
 // exists for. "We could not confirm" must not collapse into either verdict: the
 // event has to come back, which means it must NOT be closed.
-func TestUnconfirmableDeletionIsRetryableAndAdvancesNothing(t *testing.T) {
+func TestUnknownConfirmOutcomeIsRetryableAndAdvancesNothing(t *testing.T) {
 	database := dispatchTestDB(t)
 	seedAPActor(t, database, dispatchNativeDID, "alice")
 	world := newTerminalWorld(t, database, true)

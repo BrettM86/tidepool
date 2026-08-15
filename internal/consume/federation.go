@@ -77,13 +77,19 @@ func (d *Dispatcher) handleFederation(ctx context.Context, tx *sql.Tx, did strin
 	}
 
 	// STOP MEANS TWO FACTS AT ONCE: nothing new goes out, and nothing already
-	// queued goes out either. The cancellation answers the second, and it runs
-	// FIRST — before the destructive tier below — because that tier ENQUEUES
-	// the withdrawal, and a cancellation of "this actor's pending work" that ran
-	// afterwards would cancel the Delete{Person} it just queued. The order is
-	// not a preference: the two statements are the same predicate pointed at
-	// different moments.
-	cancelled, err := d.deliveries.CancelForActorTx(ctx, tx, did)
+	// queued goes out either. The cancellation answers the second — and it
+	// cancels only what PUBLISHES, never a retraction.
+	//
+	// That exemption is what makes this replay-safe. The destructive tier below
+	// enqueues its withdrawal (a Delete and some Undos) on its own transaction,
+	// which can commit while this one later rolls back; the record then replays
+	// and reaches this line again. A sweeping cancel here would cancel the
+	// erasure the previous attempt committed, and nothing would repair it — the
+	// delivery insert returns the standing row rather than reviving it, and the
+	// votes are already retracted, so the re-run finds nothing to enumerate. The
+	// user would be tombstoned, the log would say the purge applied, and no peer
+	// would ever have been told.
+	cancelled, err := d.deliveries.CancelOutwardForActorTx(ctx, tx, did)
 	if err != nil {
 		return fmt.Errorf("cancel queued deliveries for %s: %w", did, err)
 	}
@@ -134,9 +140,9 @@ func (d *Dispatcher) deleteRemoteContent(ctx context.Context, did string) error 
 			slog.String("did", did))
 		return nil
 	}
-	// Reached exactly once per applied record: the rev gate rejects a replay
-	// before this handler runs, and asking peers a second time to delete
-	// content the user may have since re-enabled is unrecoverable.
+	// NOT once per record, despite the gate: this call can run again on the
+	// replay its own doc describes, so the purge has to be idempotent rather
+	// than merely rare (it is — see outbound.Purger).
 	if err := d.remoteDeleter.DeleteRemoteContent(ctx, did); err != nil {
 		return fmt.Errorf("delete remote content for %s: %w", did, err)
 	}
@@ -151,11 +157,36 @@ func (d *Dispatcher) deleteRemoteContent(ctx context.Context, did string) error 
 // ability to federate from now on; the work they cancelled by asking us to stop
 // was withdrawn at their request, and re-sending it would publish on their
 // behalf something they had already taken back.
+// A WITHDRAWN IDENTITY IS NOT RESTORED BY EITHER. The destructive tier asked
+// every peer to delete this user's content and its actor document answers 410
+// forever; re-enabling afterwards would sign new posts, comments and votes as
+// somebody peers were explicitly told is gone. Both halves of the restore are
+// refused at their own store — SetEnabled cannot re-enable a tombstoned actor,
+// Delete cannot remove a purged preference — so this reads the outcome back
+// rather than deciding it, and says so once, loudly, where an operator can see
+// that a user tried to come back and could not.
 func (d *Dispatcher) restoreDefaultFederation(ctx context.Context, tx *sql.Tx, did string) error {
 	if err := d.prefs.Delete(ctx, did); err != nil {
 		return fmt.Errorf("clear federation preference for %s: %w", did, err)
 	}
-	return d.mirrorActorEnabled(ctx, tx, did, true)
+	if err := d.mirrorActorEnabled(ctx, tx, did, true); err != nil {
+		return err
+	}
+
+	// The read is the report. Nothing here can fail the event: the record was
+	// applied exactly as far as it is allowed to go, and retrying would re-ask a
+	// question whose answer is terminal.
+	pref, err := d.prefs.Get(ctx, did)
+	switch {
+	case errors.IsNotFound(err):
+		return nil // cleared: an ordinary re-enable
+	case err != nil:
+		return fmt.Errorf("read federation preference for %s: %w", did, err)
+	case pref.PurgedAt != nil:
+		d.logger.Warn("re-enable refused: this identity was withdrawn and the withdrawal is irreversible",
+			slog.String("did", did), slog.Time("purged_at", *pref.PurgedAt))
+	}
+	return nil
 }
 
 // mirrorActorEnabled updates the ap_actors mirror IF the actor exists. A

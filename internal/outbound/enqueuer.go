@@ -188,7 +188,7 @@ func (e *Enqueuer) EnqueueActivity(ctx context.Context, tx *sql.Tx, actorDID, or
 // Zero targets is NOT an error. An actor whose content never reached anyone has
 // nothing to withdraw, and failing here would turn "nothing to do" into an event
 // that retries forever.
-func (e *Enqueuer) EnqueueFanOut(ctx context.Context, tx *sql.Tx, actorDID string,
+func (e *Enqueuer) EnqueueFanOut(ctx context.Context, tx *sql.Tx, actorDID, parentATURI string,
 	intent consume.Intent, targets []store.DeliveryTarget) error {
 
 	if tx == nil {
@@ -206,10 +206,11 @@ func (e *Enqueuer) EnqueueFanOut(ctx context.Context, tx *sql.Tx, actorDID strin
 		return fmt.Errorf("translate intent %s: %w", intent.ActivityID(), err)
 	}
 	if _, err := e.activities.InsertTx(ctx, tx, store.OutboundActivity{
-		ActivityID: intent.ActivityID(),
-		ActorDID:   actorDID,
-		Kind:       translated.Kind,
-		Payload:    translated.Payload,
+		ActivityID:  intent.ActivityID(),
+		ActorDID:    actorDID,
+		Kind:        translated.Kind,
+		Payload:     translated.Payload,
+		ParentATURI: parentATURI,
 	}); err != nil {
 		return fmt.Errorf("insert outbound activity %s: %w", intent.ActivityID(), err)
 	}
@@ -224,6 +225,18 @@ func (e *Enqueuer) EnqueueFanOut(ctx context.Context, tx *sql.Tx, actorDID strin
 		}
 	}
 	return nil
+}
+
+// Inbox resolves a community's shared inbox through the same cached resolver
+// EnqueueActivity uses.
+//
+// It is exported for ONE caller with one reason: the destructive tier must
+// resolve every target BEFORE it opens its transaction. Resolving inside would
+// hold locks on outbound_deliveries for as long as N remote actor fetches take,
+// and everything else that touches those rows — the worker, another opt-out, a
+// test harness truncating between cases — waits behind a network call.
+func (e *Enqueuer) Inbox(ctx context.Context, communityAPID string) (string, error) {
+	return e.inboxes.ResolveInbox(ctx, communityAPID)
 }
 
 // objectMapping derives the bridge-origin ap_objects mapping for an intent that

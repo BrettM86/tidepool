@@ -175,10 +175,20 @@ func (g *RevGate) Advance(ctx context.Context, uri, rev string) error {
 // skips — so no check→write window exists for a stale copy to sneak through,
 // no matter how long apply takes.
 //
-// Deadlock note: apply's writes go through repository methods on their own
-// connections, which is deliberate and safe — the gate transaction touches
-// ONLY jetstream_record_revs, a table no repository write path ever touches,
-// so the gate row lock acts as a pure per-record mutex around apply.
+// DEADLOCK NOTE, and it is no longer as simple as it once was. The gate
+// transaction originally touched ONLY jetstream_record_revs, which made the
+// gate row lock a pure per-record mutex around apply. applyGatedTx now hands
+// that transaction to handlers so their durable state commits with the gate
+// advance, and they use it: the comment path writes outbound_objects on it, and
+// the federation path writes outbound_deliveries and ap_actors.
+//
+// The rule that replaces the old proof: A HANDLER WRITING ON THIS TRANSACTION
+// MUST NOT THEN CALL SOMETHING THAT OPENS A SECOND TRANSACTION TOUCHING THE
+// SAME ROWS. It cannot release what it holds without committing, and the
+// handler is synchronously waiting, so the two deadlock until a timeout. The
+// destructive opt-out tier is exactly that shape — the seam takes no
+// transaction and opens its own — which is why handleFederation defers its
+// ap_actors write until after that call.
 //
 // An apply error — or a panic, which the deferred rollback covers equally —
 // releases the claim WITHOUT advancing, so the connector's retry/redrive

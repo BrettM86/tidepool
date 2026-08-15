@@ -213,6 +213,11 @@ type APActors interface {
 	// SetEnabled toggles federation for an actor: disabling stamps
 	// disabled_at, re-enabling clears it and re-stamps enabled_at. A
 	// missing actor is an error satisfying errors.IsNotFound.
+	//
+	// A TOMBSTONED actor is never re-enabled: the destructive tier is terminal,
+	// and the refusal lives in the statement so no caller can undo a withdrawal
+	// by writing a preference. Disabling one is still honoured (it is already
+	// disabled, and the write is idempotent).
 	SetEnabled(ctx context.Context, did string, enabled bool) error
 
 	// SetEnabledTx is SetEnabled on an existing transaction — the seam the
@@ -516,11 +521,16 @@ type OutboundVotes interface {
 	// from the one activity id. A miss is an error satisfying errors.IsNotFound.
 	GetByActivityID(ctx context.Context, activityID string) (*OutboundVote, error)
 
-	// ListDeliveredForActor returns the actor's LIVE votes — the ones a peer
-	// still holds (delivered_state = 'delivered'). It is the destructive tier's
-	// input: a purged actor's standing votes are what the reseed keeps
-	// subtracting from a served score forever.
-	ListDeliveredForActor(ctx context.Context, actorDID string) ([]OutboundVote, error)
+	// ListStandingForActor returns the votes a PEER STILL HOLDS for this actor:
+	// those already settled as delivered, AND those whose delivery is held for
+	// settlement — accepted on the wire, with only our bookkeeping outstanding.
+	//
+	// The second half is what makes it correct as the destructive tier's input.
+	// A held vote reads 'pending' until the worker returns, and that return
+	// happens AFTER the withdrawal — so an enumeration of 'delivered' alone
+	// leaves a real vote standing on a real instance, attributed to an actor the
+	// bridge has told the world is gone, with nothing left that will notice.
+	ListStandingForActor(ctx context.Context, actorDID string) ([]OutboundVote, error)
 
 	// SetDeliveredState transitions the delivery state. An unknown state is
 	// an error satisfying errors.IsValidation; a missing vote is an error
@@ -551,8 +561,32 @@ type FederationPrefs interface {
 	Get(ctx context.Context, did string) (*FederationPref, error)
 
 	// Delete removes the preference — the record-delete path, which restores
-	// the default-on state. Deleting a missing preference is a no-op success.
+	// the default-on state. Deleting a missing preference is a no-op success,
+	// and so is deleting one whose purge COMMITTED: absence means default-on,
+	// and a user whose content peers were already told to delete has nothing to
+	// come back to. Callers that report an outcome read the row back.
 	Delete(ctx context.Context, did string) error
+
+	// MarkPurged records that the destructive tier actually asked peers to
+	// delete this user's content — the fact that makes the preference terminal.
+	// The FIRST commit wins; a retry never moves the date. A missing preference
+	// is an error satisfying errors.IsNotFound, because a purge that committed
+	// with no preference to mark is a hole in the ordering, not a no-op.
+	MarkPurged(ctx context.Context, did string) error
+
+	// MarkPurgedTx is MarkPurged on an existing transaction — the seam the
+	// purge itself uses so the marker lands atomically with the withdrawal it
+	// records. A nil tx is an error satisfying errors.IsValidation.
+	MarkPurgedTx(ctx context.Context, tx *sql.Tx, did string) error
+
+	// ClearRequestedPurge withdraws a preference this tier wrote for a deletion
+	// that never happened — an account reported deleted, the purge failed, and
+	// the account is confirmed live again. It reports whether one was cleared.
+	//
+	// It clears ONLY (source=account AND purged_at IS NULL): a user's own
+	// opt-out is theirs to keep, and a committed purge is not undoable. Both
+	// terms live in the statement so a caller cannot reach past either.
+	ClearRequestedPurge(ctx context.Context, did string) (cleared bool, err error)
 }
 
 // Tombstones remembers AP object ids whose Delete arrived before (or
@@ -689,10 +723,23 @@ type OutboundDeliveries interface {
 	// posted. (A community BAN is the other shape and has its own statement.)
 	CancelForActor(ctx context.Context, actorDID string) (int64, error)
 
-	// CancelForActorTx is CancelForActor on an existing transaction — the other
-	// half of the opt-out's atomic pair (see APActors.SetEnabledTx). A nil tx is
+	// CancelForActorTx is CancelForActor on an existing transaction. A nil tx is
 	// an error satisfying errors.IsValidation.
 	CancelForActorTx(ctx context.Context, tx *sql.Tx, actorDID string) (int64, error)
+
+	// CancelOutwardForActorTx is the CONSENT withdrawal, and the one an opt-out
+	// uses: it cancels everything that PUBLISHES for the actor and leaves their
+	// RETRACTIONS (Delete, Undo — see RetractionKinds) to go out.
+	//
+	// A user who deletes a post and then opts out must still have that delete
+	// delivered, or it stands on the peer forever; and the destructive tier's own
+	// Delete{Person} is a retraction too, so a sweeping cancel on a replay would
+	// silently cancel the erasure a previous attempt already committed. The
+	// worker draws the identical line at claim time — one list, so the two
+	// cannot disagree about what a stopped user is still owed.
+	//
+	// A nil tx is an error satisfying errors.IsValidation.
+	CancelOutwardForActorTx(ctx context.Context, tx *sql.Tx, actorDID string) (int64, error)
 
 	// CancelForCommunity moves every PENDING delivery on an ordering key (a
 	// community AP id) to cancelled — a community deleted or unfollowed out

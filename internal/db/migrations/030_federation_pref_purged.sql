@@ -1,0 +1,32 @@
+-- +goose Up
+-- Task 17d review (P1-b): telling a purge that was REQUESTED from one that
+-- actually HAPPENED.
+--
+-- The terminal tier records the preference BEFORE it asks peers to delete
+-- anything, deliberately: a Delete no peer can un-honour must not be sent from
+-- an intent that a crash could lose. But that leaves a window where the row says
+-- "this user is withdrawn" and nothing was withdrawn — and if the purge FAILS
+-- while the user REACTIVATES, the next confirmation returns live, the event is
+-- handled, and a live account is left permanently opted out by a decision that
+-- was never carried out. Nothing clears it, because nothing knows the difference.
+--
+-- purged_at is that difference, and it is on THIS row rather than inferred from
+-- the actor's tombstone because this is the row a later re-enable would clear:
+-- the check and the thing being checked belong together, and an actor may not
+-- exist at all (a DID that never federated anything has nothing to tombstone).
+--
+--   NULL     — requested. Nothing irreversible happened, so a confirmed-live
+--              verdict may clear it and the user carries on.
+--   set      — the withdrawal COMMITTED. Peers were asked to delete, and no
+--              later record, re-enable or reactivation may erase the evidence
+--              or resume federating: there is nothing to come back to.
+--
+-- Nothing clears this column. It is the same terminality as ap_actors
+-- .tombstoned_at, recorded where the opposite decision would be written.
+ALTER TABLE federation_prefs ADD COLUMN purged_at TIMESTAMPTZ;
+
+-- +goose Down
+-- The column goes; the rows STAY. Dropping the preference rows to satisfy a
+-- narrower schema would resume federating for accounts whose content peers were
+-- already told to delete — the one outcome this whole tier exists to prevent.
+ALTER TABLE federation_prefs DROP COLUMN IF EXISTS purged_at;

@@ -120,7 +120,7 @@ func (t *Terminator) TerminateAccount(ctx context.Context, did string) error {
 		// a confirm that is broken indistinguishable from one that is working.
 		t.logger.Info("account deletion not confirmed; taking no destructive action",
 			slog.String("did", did))
-		return nil
+		return t.clearStaleRequest(ctx, did)
 	}
 
 	// RECORDED BEFORE ANYTHING IS SENT. Peers that honour a Delete cannot
@@ -149,7 +149,40 @@ func (t *Terminator) TerminateAccount(ctx context.Context, did string) error {
 	if err := t.deleter.DeleteRemoteContent(ctx, did); err != nil {
 		return fmt.Errorf("delete remote content for %s: %w", did, err)
 	}
+	// STAMPED ONLY NOW. Everything above this line is a REQUEST — recorded first
+	// so a crash could not lose the user's intent — and a request is something a
+	// live account may still withdraw. This marks the moment it stopped being
+	// one: peers have been asked to delete, and nothing after this may clear the
+	// preference or bring the identity back.
+	if err := t.prefs.MarkPurged(ctx, did); err != nil {
+		return fmt.Errorf("mark account purge committed for %s: %w", did, err)
+	}
 	t.logger.Info("account confirmed deleted; remote content withdrawal requested",
 		slog.String("did", did))
+	return nil
+}
+
+// clearStaleRequest withdraws a preference THIS TIER wrote for a deletion that
+// never happened.
+//
+// The window it closes: an account is reported deleted, the preference is
+// recorded, the purge FAILS, and before the retry the user reactivates. The
+// confirmation now returns live, so the destructive path never runs again — and
+// without this the account-sourced "disabled" row would stand forever, blocking
+// a live user with no purge having committed and nothing left to clear it.
+//
+// It can only ever remove a request. The store refuses to clear a user's own
+// opt-out (theirs to keep) or a purge that committed (peers were already told),
+// so the narrow case is narrow by construction rather than by this caller
+// getting the predicate right.
+func (t *Terminator) clearStaleRequest(ctx context.Context, did string) error {
+	cleared, err := t.prefs.ClearRequestedPurge(ctx, did)
+	if err != nil {
+		return fmt.Errorf("clear stale deletion request for %s: %w", did, err)
+	}
+	if cleared {
+		t.logger.Info("account is live again; the recorded deletion request was withdrawn",
+			slog.String("did", did))
+	}
 	return nil
 }

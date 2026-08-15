@@ -19,10 +19,27 @@ import (
 //
 //  1. Delete{Person, removeData:true} to every inbox the actor's content
 //     reached. The instances it misses keep serving those posts forever.
+//
 //  2. An Undo for every vote a peer still holds. Tidepool's aggregate is the
 //     FEDIVERSE-ONLY tally and the reseed SUBTRACTS live delivered votes from
 //     the origin's API count (task 17b), so a standing vote from a withdrawn
 //     actor is a number the reseed keeps subtracting from a score readers see.
+//
+//     "Standing" is wider than delivered_state='delivered', deliberately: a vote
+//     whose delivery is HELD FOR SETTLEMENT is one the peer ALREADY ACCEPTED
+//     with only our bookkeeping outstanding, and its settlement lands after this
+//     withdrawal — so enumerating the settled rows alone would leave a real vote
+//     on a real instance with nothing left to notice (ListStandingForActor).
+//     The retraction is what makes that safe in both directions: `undone` is
+//     terminal in SetDeliveredState, so the late settlement cannot put the vote
+//     back.
+//
+//     RESIDUAL, and it is the one nothing here can close: a delivery CLAIMED and
+//     mid-POST at this moment is indistinguishable from one that will never be
+//     sent. If that POST lands after the purge, the peer holds a vote we never
+//     retracted. Detecting it needs the peer's own state, which is
+//     reconciliation — 17e's.
+//
 //  3. The actor document stops resolving — 410 Gone.
 //
 // IRREVERSIBLE, and reached only from an explicit enabled=false +
@@ -42,6 +59,7 @@ type Purger struct {
 	enqueuer    *Enqueuer
 	deliveries  store.OutboundDeliveries
 	votes       store.OutboundVotes
+	prefs       store.FederationPrefs
 	actors      store.APActors
 	communities store.Communities
 	logger      *slog.Logger
@@ -56,6 +74,7 @@ func NewPurger(db *sql.DB, userOrigin string, enqueuer *Enqueuer) *Purger {
 		enqueuer:    enqueuer,
 		deliveries:  store.NewOutboundDeliveries(db),
 		votes:       store.NewOutboundVotes(db),
+		prefs:       store.NewFederationPrefs(db),
 		actors:      store.NewAPActors(db),
 		communities: store.NewCommunities(db),
 		logger:      slog.Default(),
@@ -93,13 +112,20 @@ func (p *Purger) DeleteRemoteContent(ctx context.Context, did string) error {
 		return errors.NewValidationError("did", "must not be empty")
 	}
 
-	// Both reads happen BEFORE the transaction opens: they are the inputs, and
-	// holding a transaction open across them buys nothing.
+	// EVERY READ AND EVERY REMOTE LOOKUP HAPPENS BEFORE THE TRANSACTION OPENS.
+	// Resolving a vote's community can touch the network (the inbox resolver
+	// caches, but a cold entry fetches an actor document), and holding a
+	// transaction open across N remote fetches keeps locks for as long as the
+	// slowest peer takes to answer.
 	targets, err := p.deliveries.DistinctInboxesForActor(ctx, did)
 	if err != nil {
 		return err
 	}
-	liveVotes, err := p.votes.ListDeliveredForActor(ctx, did)
+	liveVotes, err := p.votes.ListStandingForActor(ctx, did)
+	if err != nil {
+		return err
+	}
+	retractable, err := p.addressableVotes(ctx, did, liveVotes)
 	if err != nil {
 		return err
 	}
@@ -110,7 +136,7 @@ func (p *Purger) DeleteRemoteContent(ctx context.Context, did string) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if err := p.enqueuer.EnqueueFanOut(ctx, tx, did, consume.PersonDeleteIntent{
+	if err := p.enqueuer.EnqueueFanOut(ctx, tx, did, "", consume.PersonDeleteIntent{
 		ActorDID: did,
 		// seq 0: a withdrawal happens once per identity, and the id must be the
 		// SAME string on every retry so a peer recognises the redelivery as the
@@ -120,8 +146,22 @@ func (p *Purger) DeleteRemoteContent(ctx context.Context, did string) error {
 		return err
 	}
 
-	if err := p.undoLiveVotes(ctx, tx, did, liveVotes); err != nil {
+	if err := p.undoLiveVotes(ctx, tx, did, retractable); err != nil {
 		return err
+	}
+
+	// The preference this withdrawal was asked for stops being a REQUEST here,
+	// inside the same transaction as the withdrawal itself. Both doors reach
+	// this code — an explicit deleteRemote record and a confirmed account
+	// deletion — and only the marked row is protected from being cleared by a
+	// later re-enable, so marking it anywhere but here would leave one door
+	// open. A missing preference does not fail the purge: it is a hole in the
+	// caller's ordering, not a reason to abandon a withdrawal already enqueued.
+	if err := p.prefs.MarkPurgedTx(ctx, tx, did); err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("mark purge committed for %s: %w", did, err)
+	} else if errors.IsNotFound(err) {
+		p.logger.Warn("purge committed with no federation preference to mark",
+			slog.String("did", did))
 	}
 
 	// LAST, because it is the step that stops the actor being servable and the
@@ -138,7 +178,8 @@ func (p *Purger) DeleteRemoteContent(ctx context.Context, did string) error {
 	p.logger.Info("destructive opt-out applied; the withdrawal is irreversible",
 		slog.String("did", did),
 		slog.Int("inboxes", len(targets)),
-		slog.Int("votes_retracted", len(liveVotes)))
+		slog.Int("votes_retracted", len(retractable)),
+		slog.Int("votes_unaddressable", len(liveVotes)-len(retractable)))
 	return nil
 }
 
@@ -153,17 +194,9 @@ func (p *Purger) DeleteRemoteContent(ctx context.Context, did string) error {
 // The cost is stated plainly — if the Undo never lands, we have stopped counting
 // a vote the peer may still hold — and it is the right side to err on, because
 // the alternative subtracts forever on behalf of somebody who is gone.
-func (p *Purger) undoLiveVotes(ctx context.Context, tx *sql.Tx, did string, votes []store.OutboundVote) error {
-	for i := range votes {
-		vote := votes[i]
-		// The community resolves BEFORE the row is bumped, so a failed lookup
-		// rolls back rather than leaving a bumped seq behind an Undo that was
-		// never enqueued (consume's vote delete draws the same line).
-		community, err := p.communities.GetByDID(ctx, vote.CommunityDID)
-		if err != nil {
-			return fmt.Errorf("resolve community %s for vote %s: %w",
-				vote.CommunityDID, vote.VoteATURI, err)
-		}
+func (p *Purger) undoLiveVotes(ctx context.Context, tx *sql.Tx, did string, votes []retractableVote) error {
+	for _, retractable := range votes {
+		vote := retractable.vote
 
 		// One statement bumps the seq — the Undo is the next activity and its id
 		// must not collide with the Like's — and flips the state. CurrentActivityID
@@ -175,7 +208,7 @@ func (p *Purger) undoLiveVotes(ctx context.Context, tx *sql.Tx, did string, vote
 			return fmt.Errorf("retract vote %s: %w", vote.VoteATURI, err)
 		}
 
-		if err := p.enqueuer.EnqueueActivity(ctx, tx, did, did, vote.SubjectATURI, consume.VoteIntent{
+		if err := p.enqueuer.EnqueueFanOut(ctx, tx, did, vote.SubjectATURI, consume.VoteIntent{
 			Op:          consume.OperationUndo,
 			VoteATURI:   vote.VoteATURI,
 			SubjectAPID: vote.SubjectAPID,
@@ -184,10 +217,66 @@ func (p *Purger) undoLiveVotes(ctx context.Context, tx *sql.Tx, did string, vote
 			Direction:       vote.Direction,
 			ID:              consume.ActivityID(p.userOrigin, vote.VoteATURI, consume.OperationUndo, bumped.ActivitySeq),
 			InnerActivityID: vote.CurrentActivityID,
-			CommunityAPID:   community.APGroupID,
-		}); err != nil {
+			CommunityAPID:   retractable.communityAPID,
+		}, []store.DeliveryTarget{{
+			Inbox:       retractable.inbox,
+			OrderingKey: retractable.communityAPID,
+		}}); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// retractableVote is a live vote paired with the community AP id its Undo is
+// addressed to — resolved before the transaction opens, so no remote lookup
+// happens under a lock.
+type retractableVote struct {
+	vote          store.OutboundVote
+	communityAPID string
+	inbox         string
+}
+
+// addressableVotes resolves the addressing for each live vote and DROPS the ones
+// that cannot be addressed at all.
+//
+// A community that has been deleted or unfollowed since the vote was cast has no
+// row, and there is no inbox to send its Undo to. Treating that as fatal would
+// hold the ENTIRE erasure hostage to one vote: the transaction rolls back, the
+// Delete{Person} fan-out with it, the event replays into the same missing row
+// and eventually dead-letters — a user's whole withdrawal lost to a community
+// that no longer exists.
+//
+// A genuine storage error is still fatal. "This community is gone" and "the
+// database did not answer" are different facts, and only the first one is an
+// answer.
+func (p *Purger) addressableVotes(ctx context.Context, did string, votes []store.OutboundVote) ([]retractableVote, error) {
+	out := make([]retractableVote, 0, len(votes))
+	for i := range votes {
+		vote := votes[i]
+		community, err := p.communities.GetByDID(ctx, vote.CommunityDID)
+		if errors.IsNotFound(err) {
+			p.logger.Warn("purge: a live vote's community is gone; its Undo cannot be addressed",
+				slog.String("did", did), slog.String("vote", vote.VoteATURI),
+				slog.String("community_did", vote.CommunityDID))
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("resolve community %s for vote %s: %w",
+				vote.CommunityDID, vote.VoteATURI, err)
+		}
+		// The INBOX is resolved here too, and that is the whole reason this
+		// function exists outside the transaction: resolving one can fetch a
+		// remote actor document, and doing that with locks held on
+		// outbound_deliveries stalls the worker — and anything else touching
+		// those rows — for as long as the slowest peer takes to answer.
+		inbox, err := p.enqueuer.Inbox(ctx, community.APGroupID)
+		if err != nil {
+			return nil, fmt.Errorf("resolve inbox for %s: %w", community.APGroupID, err)
+		}
+		out = append(out, retractableVote{
+			vote: vote, communityAPID: community.APGroupID, inbox: inbox,
+		})
+	}
+	return out, nil
 }

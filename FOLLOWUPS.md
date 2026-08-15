@@ -369,3 +369,38 @@ task documents and git history rather than this list.
   rejected as the design: its op list would not match the empty MST diff,
   which sync-v1.1-validating relays may refuse). Remaining follow-up: the
   e2e harness has no scenario covering it.
+
+## Opt-out lifecycle (17d)
+
+- **The withdrawal's 410 is observable before the withdrawal is delivered.**
+  The destructive tier commits the actor tombstone together with the
+  `Delete{Person}` enqueues, but the worker POSTs minutes later. A peer that
+  re-dereferences the actor to verify the signature on that Delete therefore
+  gets `410 Gone` — for the message announcing the very deletion it is trying
+  to authenticate. The tier can revoke its own precondition.
+
+  MITIGATED, not closed: both actor routes (and `handleOutbox`, which would
+  otherwise invite the re-fetch loop the 410 exists to end) now answer 410
+  with an AS2 `Tombstone` carrying `formerType: Person`, `deleted`, and **the
+  public key** — so a peer that reads the body can still verify.
+
+  RULED against the "complete" fix of keeping the actor document served until
+  every person-delete delivery is terminal. That keeps an erased user's
+  document published for as long as any peer is down — potentially forever —
+  which is a worse failure for an erasure tier than the one it fixes. The
+  Tombstone hands over verification material and none of the profile, which is
+  the better trade, and it is why the committed test pinning "410 immediately,
+  with no worker run" was deliberately left standing.
+
+  RESIDUAL, and it is genuinely not ours to close: a peer that branches on the
+  status code alone, without reading the body, still cannot verify the
+  withdrawal. Revisit only if a real implementation (Lemmy specifically) is
+  observed dropping our person-deletes for this reason — the fix would then be
+  peer-shaped (retry after the delete, cached-key acceptance), not a change to
+  when we serve the tombstone.
+
+- **A delivery claimed and mid-POST at purge time is indistinguishable from
+  one that will never be sent.** The purge enumerates what the peer holds
+  (delivered, plus held-for-settlement), but a delivery the worker has claimed
+  and is POSTing right now is neither. Detecting it needs the peer's state,
+  not ours. Belongs to 17e (reconciliation).

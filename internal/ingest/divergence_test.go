@@ -64,23 +64,8 @@ const (
 	dvGauge = "tidepool_divergence_acceptance_undelivered_cancelled"
 )
 
-// dvTables is every table the sweep could conceivably touch, plus the repo
-// tables underneath them. It is deliberately wider than the reconciler's
-// inputs: the assertion is not "it did not write the rows I expected it to
-// leave alone", it is "it did not write".
-var dvTables = []string{
-	// The outbound queue and ledger — the side an over-eager "fix" would
-	// re-drive, cancel or re-flip.
-	"outbound_deliveries", "outbound_activities", "outbound_votes", "outbound_objects",
-	// The atproto side. A reconciler that "restored" an acceptance would commit
-	// to a community repo, which lands here as new blocks, a moved head and a
-	// firehose frame — the loudest possible write, and the easiest to make by
-	// accident when the report has already computed exactly what is missing.
-	"blocks", "repo_state", "firehose_events",
-	// The bridge's own records of what it decided.
-	"admissions", "ap_objects", "ap_actors", "federation_prefs",
-	"community_bans", "object_moderation", "vote_events", "vote_aggregates",
-}
+// snapshotTables enumerates the tables from the database itself. See
+// allBaseTables for why the list is not written down here.
 
 // TestDivergenceReportNamesAnUndeliveredAcceptanceAndWritesNothing is the OUTER
 // acceptance test for 17e.
@@ -115,7 +100,7 @@ func TestDivergenceReportNamesAnUndeliveredAcceptanceAndWritesNothing(t *testing
 	acceptanceStands(t, h, world.communityADID, postURI)
 
 	// --- The state of the world, in full, immediately before the sweep.
-	before := snapshotTables(t, h.db, dvTables...)
+	before := snapshotTables(t, h.db)
 
 	// --- WHEN: the operator asks what diverges.
 	rec := h.adminRequest(http.MethodGet, "/admin/divergence", nil)
@@ -167,8 +152,11 @@ func TestDivergenceReportNamesAnUndeliveredAcceptanceAndWritesNothing(t *testing
 			"unchanging problem, and would never return to zero when it is resolved", dvGauge)
 
 	// --- AND, THE POINT: the sweep changed NOTHING.
-	after := snapshotTables(t, h.db, dvTables...)
-	for _, table := range dvTables {
+	after := snapshotTables(t, h.db)
+	require.Equal(t, len(before), len(after),
+		"the sweep must not CREATE or DROP a table either — the comparison is over whatever the "+
+			"schema holds, so a new one appearing is itself a write")
+	for table := range before {
 		assert.Equal(t, before[table], after[table],
 			"REPORTING IS THE WHOLE JOB: %s must be byte-identical across the sweep. A "+
 				"reconciler that writes has no witness — it is the only thing that reads both "+
@@ -392,6 +380,30 @@ func gaugeValue(t *testing.T, h *harness, name string) int {
 	return value
 }
 
+// floatGaugeValue is gaugeValue for a metric that is not a whole number.
+//
+// The age gauge is seconds as a float — an expvar.Func over a stored timestamp —
+// so reading it through gaugeValue would fail on the decimal rather than on
+// anything true about the sweep. It goes through the ENDPOINT for the same
+// reason gaugeValue does: the tidepool prefix filter in scopedMetrics is exactly
+// the kind of silent drop a direct expvar read cannot catch.
+func floatGaugeValue(t *testing.T, h *harness, name string) float64 {
+	t.Helper()
+	rec := h.adminRequest(http.MethodGet, "/admin/metrics", nil)
+	require.Equal(t, http.StatusOK, rec.Code)
+	var metrics map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &metrics),
+		"/admin/metrics must stay parseable JSON (body: %s)", rec.Body.String())
+	raw, ok := metrics[name]
+	require.True(t, ok,
+		"%s must be published on /admin/metrics. A metric whose name does not start with "+
+			"'tidepool' is filtered out by scopedMetrics and is invisible in exactly the way a "+
+			"check that never runs is invisible. Published keys: %v", name, keysOf(metrics))
+	var value float64
+	require.NoError(t, json.Unmarshal(raw, &value), "%s must be a number, got %s", name, raw)
+	return value
+}
+
 func keysOf(m map[string]json.RawMessage) []string {
 	keys := make([]string, 0, len(m))
 	for key := range m {
@@ -409,8 +421,13 @@ func keysOf(m map[string]json.RawMessage) []string {
 // comparison that carries every column can say so. row_to_json also survives a
 // migration adding a column, which a hand-listed projection would silently stop
 // covering on the day the schema grows.
-func snapshotTables(t *testing.T, db *sql.DB, tables ...string) map[string][]string {
+func snapshotTables(t *testing.T, db *sql.DB) map[string][]string {
 	t.Helper()
+	tables := allBaseTables(t, db)
+	require.Greater(t, len(tables), 15,
+		"the enumeration must actually find the schema: a query that returned a handful of "+
+			"tables would make this whole assertion a spot-check wearing the clothes of an "+
+			"exhaustive one")
 	snapshot := make(map[string][]string, len(tables))
 	for _, table := range tables {
 		rows, err := db.QueryContext(context.Background(),
@@ -673,4 +690,41 @@ func classesIn(report divergenceReport) []string {
 		classes = append(classes, class)
 	}
 	return classes
+}
+
+// allBaseTables lists every base table in the public schema, minus goose's
+// migration bookkeeping.
+//
+// ENUMERATED, NEVER LISTED. A hand-written list is a claim about the schema
+// made at the moment it was typed, and it stops being true the next time
+// anything is added — silently, in the direction that weakens the assertion.
+// The previous version of this file watched 15 of 24 tables, and the gaps were
+// exactly the ones that matter: ap_tombstones, which the admin endpoint
+// registered four lines above /divergence writes, and communities, which the
+// SIBLING reconciler converges by writing. "While we are here, tombstone what
+// the peer never got" is the most plausible accidental repair anyone would add
+// to this sweep, and the snapshot would not have seen it.
+//
+// goose_db_version is excluded because migrations are not the sweep's writes and
+// a test-run migration would make every comparison here fail for the wrong
+// reason.
+func allBaseTables(t *testing.T, db *sql.DB) []string {
+	t.Helper()
+	rows, err := db.QueryContext(context.Background(), `
+		SELECT table_name
+		  FROM information_schema.tables
+		 WHERE table_schema = 'public'
+		   AND table_type = 'BASE TABLE'
+		   AND table_name <> 'goose_db_version'
+		 ORDER BY table_name`)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, rows.Close()) }()
+	var tables []string
+	for rows.Next() {
+		var name string
+		require.NoError(t, rows.Scan(&name))
+		tables = append(tables, name)
+	}
+	require.NoError(t, rows.Err())
+	return tables
 }

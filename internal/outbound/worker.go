@@ -259,10 +259,19 @@ func (w *Worker) handle(ctx context.Context, delivery *store.OutboundDelivery) e
 		// instant its parent is accepted, and do not advance the poison budget
 		// (the causal wait is wall-clock-bounded in causalStatus).
 		return w.parkCausal(ctx, delivery, "parent_pending", "waiting for bridge-origin parent to be accepted")
+	// THE CLASS NAMES COME FROM store, and so do cross_authority and signer
+	// below. The reconciliation sweep excludes exactly these four from its
+	// unknown-outcome report (store.neverReachedTheWireClasses): they carry
+	// last_status_code 0 like a dial timeout does and mean the opposite — nothing
+	// was sent, so the peer's state is not unknown, they simply do not have it.
+	// Spelling them here as literals made that correspondence a comment; naming
+	// the constants makes it the compiler's problem.
 	case causalPoisonUnaccepted:
-		return w.poison(ctx, delivery, "parent_unaccepted", "causal wait budget exhausted; parent never accepted", 0)
+		return w.poison(ctx, delivery, store.PoisonClassParentUnaccepted,
+			"causal wait budget exhausted; parent never accepted", 0)
 	case causalPoisonParent:
-		return w.poison(ctx, delivery, "parent_poisoned", "parent delivery poisoned; descendant cannot land", 0)
+		return w.poison(ctx, delivery, store.PoisonClassParentPoisoned,
+			"parent delivery poisoned; descendant cannot land", 0)
 	}
 
 	// Consent recheck (retraction asymmetry): a Delete/Undo always goes out —
@@ -290,7 +299,7 @@ func (w *Worker) handle(ctx context.Context, delivery *store.OutboundDelivery) e
 	// with the target community. The resolver already refuses a cross-authority
 	// inbox at enqueue time; this catches a tampered or legacy stored target.
 	if !ap.SameAuthority(delivery.OrderingKey, delivery.TargetInbox) {
-		return w.poison(ctx, delivery, "cross_authority",
+		return w.poison(ctx, delivery, store.PoisonClassCrossAuthority,
 			"target inbox is not same-authority with the community; refusing to deliver", 0)
 	}
 
@@ -304,7 +313,7 @@ func (w *Worker) deliver(ctx context.Context, delivery *store.OutboundDelivery, 
 	if err != nil {
 		// A signer that cannot be resolved right now is transient (a KEK blip,
 		// a not-yet-replicated actor): retry rather than poison.
-		return w.releaseOrPoison(ctx, delivery, "signer", err.Error(), 0)
+		return w.releaseOrPoison(ctx, delivery, store.PoisonClassSigner, err.Error(), 0)
 	}
 
 	err = w.sender.SendActivityAs(ctx, signer, delivery.TargetInbox, json.RawMessage(activity.Payload))

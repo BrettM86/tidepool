@@ -481,27 +481,71 @@ and the comparisons it deliberately did not build.
   never act" should not ship a new drop site — on the highest-volume inbound
   path, which already carries a recorded perf concern.
 
-- **The re-cast divergence sweep drives off a sequential scan of
-  `outbound_activities`, the highest-volume table in the system.** Confirmed by
-  `EXPLAIN` on the real schema: every other leg is index-served (the Undo
-  subquery rides `idx_outbound_activities_actor`, the delivered-delivery joins
-  ride `idx_outbound_deliveries_activity`, the ledger exclusion rides
-  `outbound_votes_actor_delivered_idx`), but the outer driver is a full scan
-  filtered on `kind IN ('Like','Dislike') AND parent_at_uri <> ''`, on every
-  sweep. Deliberately NOT fixed in 17e — adding an index there is a migration
-  whose write cost lands on the delivery worker's hot path, and the sweep runs
-  every 15 minutes against a table that is currently small. The fix when it is
-  needed:
+- **TWO legs of the divergence sweep scan `outbound_activities` in full, not
+  one.** This entry previously said the re-cast driver was the only unindexed
+  leg and that "every other leg is index-served". THAT WAS WRONG, and wrong in
+  the direction that stops the next person looking: the undelivered-acceptance
+  leg joins `outbound_activities` on a JSONB EXPRESSION, and no index in
+  `internal/db/migrations/` can serve it. `outbound_activities` carries exactly
+  two indexes — `outbound_activities_pkey (activity_id)` and
+  `idx_outbound_activities_actor (actor_did)` — and neither is on
+  `payload -> 'object' ->> 'id'`.
 
+  Re-confirmed by `EXPLAIN` against the migrated test schema. The
+  acceptance leg:
+
+      ->  Hash Right Join
+            Hash Cond: (((a.payload -> 'object'::text) ->> 'id'::text) = o.ap_object_id)
+            ->  Seq Scan on outbound_activities a
+            ->  Hash
+                  ->  Seq Scan on outbound_objects o
+                        Filter: (accepted_at IS NULL)
+
+  and the proof that it is unindexed rather than merely cheap here: with
+  `SET enable_seqscan = off` — which prices a sequential scan at 1e10 — the
+  planner STILL chooses `Seq Scan on outbound_activities a` for that condition,
+  because there is nothing else it could use.
+
+  The re-cast leg's original finding stands: its three exclusion subqueries are
+  index-served (the Undo and superseding-vote subqueries ride
+  `idx_outbound_activities_actor`, the delivered-delivery joins ride
+  `idx_outbound_deliveries_activity`, the ledger exclusion rides
+  `outbound_votes_actor_delivered_idx`), while the outer driver is a full scan
+  filtered on `kind IN ('Like','Dislike') AND parent_at_uri <> ''`.
+
+  COST NOTE, so the next profile is not a surprise: bounding the sweep put an
+  exact `COUNT(*)` beside each limited read, so the acceptance leg's full scan
+  of `outbound_activities` now happens TWICE per sweep rather than once. That is
+  the price of a count an operator can size an incident from; it is also the
+  strongest argument for the expression index below, since indexing that join
+  fixes both statements at once.
+
+  Deliberately NOT fixed here — an index is a migration whose write cost lands
+  on the delivery worker's hot path, and the sweep runs every 15 minutes against
+  tables that are currently small. The two candidates, when it is needed:
+
+      -- serves the re-cast driver, and tightens the Undo subquery
       CREATE INDEX outbound_activities_vote_subject_idx
           ON outbound_activities (actor_did, parent_at_uri, created_at)
           WHERE kind IN ('Like','Dislike');
 
-  It serves the driver and tightens the Undo subquery, which today index-scans
-  by `actor_did` and applies kind/parent_at_uri/created_at as residuals; a
-  sibling partial index on `kind = 'Undo'` finishes that half. Row estimates
-  from a near-empty test database are meaningless — the plan SHAPE is the
-  finding, so re-profile against production volumes before choosing.
+      -- serves the undelivered-acceptance join, which has nothing today
+      CREATE INDEX outbound_activities_object_id_idx
+          ON outbound_activities ((payload -> 'object' ->> 'id'))
+          WHERE payload -> 'object' ->> 'id' IS NOT NULL;
+
+  The first also tightens the Undo subquery, which today index-scans by
+  `actor_did` and applies kind/parent_at_uri/created_at as residuals; a sibling
+  partial index on `kind = 'Undo'` finishes that half. The second is an
+  EXPRESSION index and must be spelled with exactly the operators the query uses
+  (`->` then `->>`) or the planner will not match it — and it is the one whose
+  write cost is least predictable, because every outbound activity has a payload
+  and the extraction runs on every insert.
+
+  ROW ESTIMATES FROM A NEAR-EMPTY TEST DATABASE ARE MEANINGLESS. Every cost and
+  row number in the plans above is noise; the plan SHAPE — a full scan of
+  `outbound_activities` per sweep leg, per statement — is the entire finding.
+  Re-profile against production volumes before choosing either index.
 
 - **An acceptance with NO delivery row at all is not reported by the
   acceptance-undelivered classes**, and this is stated in the query rather than
@@ -511,3 +555,21 @@ and the comparisons it deliberately did not build.
   `outbound_objects` row, the delivery enqueue and the `admissions` ledger row
   all land in ONE transaction — so a test asserting it today would be vacuous.
   If it is ever observed, it wants its own class, not a widened existing one.
+
+## Found while building 17e's fixtures (NOT a 17e defect)
+
+- **Re-using a deleted vote record's rkey silently never federates.** The
+  outbound activity id derives from (at-uri, "create", seq). Delete a vote row
+  and the seq restarts at 1, so a vote re-created under the SAME rkey
+  reproduces the FIRST vote's activity id. `InsertTx` then no-ops on the
+  existing id, `EnqueueTx` reads back the standing **delivered** row (correctly
+  — that is the idempotency that makes the fan-out safe), and nothing goes out.
+  Observed on the wire as `["Dislike","Undo"]` with the third vote simply
+  missing, no error anywhere.
+
+  Whether this is reachable depends on Coves' rkey policy for re-created votes.
+  If rkeys are ever reused after a delete, a user's vote silently does not
+  federate and no signal is produced. Worth confirming against Coves before
+  deciding whether it needs a fix here; the candidate fix is to derive the
+  activity id from something that does not restart (the row's create timestamp,
+  or a monotonic per-actor counter that survives deletion).

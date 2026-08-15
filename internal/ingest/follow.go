@@ -535,10 +535,6 @@ func (a *Admin) handleBackfill(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, communityJSON(community))
 }
 
-// handleReconcile runs one synchronous follow-list sweep on demand, so an
-// operator can converge right after editing the file instead of waiting for
-// the next tick. 501 when no follow list is configured (the handleBackfill
-// nil-dependency pattern).
 // handleDivergence serves the reconciliation report (task 17e, decision 19).
 //
 // GET, not POST, and that is a statement rather than a convention: this sweep
@@ -547,8 +543,16 @@ func (a *Admin) handleBackfill(w http.ResponseWriter, r *http.Request) {
 // still working out what is wrong. The moment it needed POST it would have
 // stopped being a report.
 //
-// A sweep failure is a 500 carrying the reason: a partial report would be a lie
-// about the classes it never reached, and this endpoint is operator-facing.
+// A sweep failure is a 500 and NO PARTIAL REPORT: a report missing one class
+// reads exactly like a class that found nothing, so the classes that happened to
+// succeed must not ride out with the error.
+//
+// The reason goes to the LOG, not to the body, like every other handler here.
+// This is admin-authenticated, so the exposure is small, but every read in the
+// sweep is raw SQL and a pq error carries table, column and constraint names
+// straight out of the schema — detail an operator can read in the log line one
+// scroll away, and the only party the body could ever tell is someone who should
+// not be reading it.
 func (a *Admin) handleDivergence(w http.ResponseWriter, r *http.Request) {
 	if a.divergence == nil {
 		http.Error(w, "divergence reconciliation is not configured", http.StatusNotImplemented)
@@ -557,13 +561,17 @@ func (a *Admin) handleDivergence(w http.ResponseWriter, r *http.Request) {
 	report, err := a.divergence.Sweep(r.Context())
 	if err != nil {
 		a.logger.Error("divergence sweep failed", "error", err)
-		http.Error(w, "divergence sweep failed: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "divergence sweep failed", http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	_ = json.NewEncoder(w).Encode(report)
 }
 
+// handleReconcile runs one synchronous follow-list sweep on demand, so an
+// operator can converge right after editing the file instead of waiting for
+// the next tick. 501 when no follow list is configured (the handleBackfill
+// nil-dependency pattern).
 func (a *Admin) handleReconcile(w http.ResponseWriter, r *http.Request) {
 	if a.reconciler == nil {
 		http.Error(w, "follow list reconciliation is not configured", http.StatusNotImplemented)

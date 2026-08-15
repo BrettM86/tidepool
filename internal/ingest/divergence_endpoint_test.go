@@ -422,3 +422,436 @@ func TestDivergenceRunSweepsImmediately(t *testing.T) {
 			"watching the gauges cannot tell a fresh start from a stalled sweep")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 17e review — a class with no gauge publishes health it never measured
+// ---------------------------------------------------------------------------
+
+// TestEveryDivergenceClassHasAGauge pins the two key sets against each other.
+//
+// publish() reads report.Counts[class] for each gauge, and a MISSING KEY yields
+// zero — so a class whose gauge was forgotten does not go unwatched, it
+// publishes 0: health, for a comparison nobody wired up. The reverse is as bad:
+// a gauge with no class in the report is set from a map miss on every sweep and
+// reads 0 forever, which is a number an operator can watch indefinitely while it
+// measures nothing.
+//
+// The old comment on divergenceGauges claimed a missing entry "fails to compile
+// at the map literal". IT DOES NOT — Go map literals are not exhaustive over any
+// key set, and nothing in the language checks these two against each other. That
+// claim is why nobody wrote this test, which is the failure mode worth naming:
+// a compile-time guarantee asserted in prose is a runtime hole with a comment
+// over it.
+func TestEveryDivergenceClassHasAGauge(t *testing.T) {
+	classes := make([]string, 0, len(newDivergenceReport().Counts))
+	for class := range newDivergenceReport().Counts {
+		classes = append(classes, class)
+	}
+	gauged := make([]string, 0, len(divergenceGauges))
+	for class := range divergenceGauges {
+		gauged = append(gauged, class)
+	}
+
+	assert.ElementsMatch(t, classes, gauged,
+		"every class the report counts must have a gauge, and every gauge must have a class. A "+
+			"class with no gauge is not merely unwatched: publish reads a missing key as 0 and "+
+			"broadcasts HEALTH for a comparison nobody wired. A gauge with no class is set from "+
+			"a map miss on every sweep and reads 0 forever while measuring nothing. Nothing in "+
+			"Go checks these two literals against each other — the map literal does NOT fail to "+
+			"compile, whatever the comment above it says")
+
+	for class, gauge := range divergenceGauges {
+		require.NotNil(t, gauge, "the gauge for %q must exist", class)
+	}
+}
+
+// TestDivergenceReportIsNotTruncatedWhenItFits is the negative control for the
+// cap, and it is cheap for a reason: an implementation that sets Truncated
+// unconditionally passes the bounded test, and then every report an operator
+// ever reads claims examples are missing. A flag that is always true carries no
+// information, and the one it should have carried is "the number you are looking
+// at is smaller than the problem".
+func TestDivergenceReportIsNotTruncatedWhenItFits(t *testing.T) {
+	h := newHarness(t)
+	world := newModerationWorld(t, h)
+	h.admin.SetDivergenceReconciler(newDivergenceReconciler(t, h))
+	deliverEverythingQueued(t, h.db)
+	_ = world
+
+	// A handful of real divergences — far below the cap.
+	personaActorID := actorIDOf(t, h.db, mtAuthorDID)
+	overflowPersonaVotes(t, h.db, personaActorID, 3)
+
+	report := fetchDivergence(t, h)
+	require.Len(t, report.Entries, 3, "precondition: a report well inside the cap")
+	assert.False(t, report.Truncated,
+		"a report that FITS must not claim it was cut short: a flag that is always set tells an "+
+			"operator nothing, and the thing it was supposed to tell them — that the list is "+
+			"smaller than the problem — is exactly what they would stop believing")
+}
+
+// TestDivergenceStaleAfterOptionIsHonored pins that the configured window is the
+// one actually applied.
+//
+// The reconciler takes AcceptanceStaleAfter and defaults it; replacing the field
+// with the default constant at the call site leaves every other test green,
+// because they all age their fixtures far past both values. An option nobody
+// reads is worse than no option: an operator tunes it, observes no change, and
+// concludes the report is broken in some deeper way.
+func TestDivergenceStaleAfterOptionIsHonored(t *testing.T) {
+	h := newHarness(t)
+	world := newModerationWorld(t, h)
+	deliverEverythingQueued(t, h.db)
+
+	// One accepted post whose delivery has been pending for two hours: stale
+	// under a one-minute window, in flight under a one-day one.
+	stale := admitDivergencePost(t, h, world, "3lzdvopt00001", "3lzdvopt00011", 1_775_000_090_000_001)
+	setDeliveryState(t, h.db, stale, "pending", "", 2*time.Hour)
+
+	tight, err := NewDivergenceReconciler(DivergenceOptions{
+		DB: h.db, AcceptanceStaleAfter: time.Minute,
+	})
+	require.NoError(t, err)
+	tightReport, err := tight.Sweep(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 1, tightReport.Counts[DivergenceAcceptanceStale],
+		"with a one-minute window a delivery pending for two hours is stale")
+
+	relaxed, err := NewDivergenceReconciler(DivergenceOptions{
+		DB: h.db, AcceptanceStaleAfter: 24 * time.Hour,
+	})
+	require.NoError(t, err)
+	relaxedReport, err := relaxed.Sweep(context.Background())
+	require.NoError(t, err)
+	assert.Zero(t, relaxedReport.Counts[DivergenceAcceptanceStale],
+		"and with a one-day window the SAME row is still in flight. If both sweeps agree, the "+
+			"option is not reaching the query — an operator who widens the window to quiet a "+
+			"noisy report would see nothing change and go looking for the fault somewhere else")
+}
+
+// ---------------------------------------------------------------------------
+// (d) WHO GETS THE PAGE when the budget runs out
+// ---------------------------------------------------------------------------
+
+// TestDivergenceExamplesAreDealtAcrossClassesRatherThanFirstComeFirstServed is
+// the only test in the suite that seeds TWO bulk classes, and that is why it
+// exists.
+//
+// Every other fixture here overflows ONE class, so first-come-first-served and
+// round-robin produce identical reports and neither is pinned. The failure the
+// staging exists to prevent needs a second class to be visible at all: with
+// entries appended in comparison order, the class swept FIRST spends the entire
+// budget and every later class arrives with a non-zero count and NOT ONE
+// EXAMPLE. That is the exact thing DivergenceEntry.Subject exists to prevent —
+// "a class and a count alone give an operator a number they cannot investigate"
+// — happening to the classes that need investigating most, at the moment they
+// need it, because a bulk class is precisely what an incident looks like.
+//
+// The fixture is built on the sweep's own order: persona vote events are the
+// FIRST comparison and the unknown-delivery classes are the LAST, so the small
+// class here is the one a first-come allocation would starve.
+func TestDivergenceExamplesAreDealtAcrossClassesRatherThanFirstComeFirstServed(t *testing.T) {
+	h := newHarness(t)
+	world := newModerationWorld(t, h)
+	h.admin.SetDivergenceReconciler(newDivergenceReconciler(t, h))
+	deliverEverythingQueued(t, h.db)
+	_ = world
+
+	// The BULK class, swept first: more persona vote events than the whole page.
+	personaActorID := actorIDOf(t, h.db, mtAuthorDID)
+	overflowPersonaVotes(t, h.db, personaActorID, MaxDivergenceEntries+1)
+
+	// The SMALL class, swept last: three deliveries nobody answered. Three is
+	// deliberately tiny — an operator can act on all of them, and a report that
+	// shows none of them is the regression.
+	late := []string{
+		seedPoisonedComment(t, h.db, "dv-fair-1", "transport", 0),
+		seedPoisonedComment(t, h.db, "dv-fair-2", "transport", 0),
+		seedPoisonedComment(t, h.db, "dv-fair-3", "transport", 0),
+	}
+
+	report := fetchDivergence(t, h)
+
+	require.Len(t, report.Entries, MaxDivergenceEntries,
+		"precondition: the budget really is exhausted — with room to spare every class gets "+
+			"everything and this test would pass without an allocation policy at all")
+	require.Equal(t, MaxDivergenceEntries+1, report.Counts[DivergencePersonaVoteEvent],
+		"precondition: the bulk class overflows the page")
+	require.Equal(t, len(late), report.Counts[DivergenceDeliveryUnknownUnanswered],
+		"precondition: the late class found exactly the rows this fixture seeded")
+
+	assert.ElementsMatch(t, late, subjectsOfClass(report, DivergenceDeliveryUnknownUnanswered),
+		"the class swept LAST still gets its examples. Appending entries in comparison order "+
+			"hands the whole budget to whoever read first, and every later class then arrives "+
+			"with a count an operator cannot investigate — no subject to look up, no inbox to "+
+			"ask, on the endpoint they opened BECAUSE something is wrong")
+
+	// Every class the sweep counted must be able to show its work.
+	for class, count := range report.Counts {
+		if count == 0 {
+			continue
+		}
+		assert.NotEmpty(t, subjectsOfClass(report, class),
+			"class %q has a count of %d and no example: a number with nothing to look at is the "+
+				"one thing this report promises never to serve", class, count)
+	}
+
+	// ...AND THE BUDGET IS NOT SHARED OUT EQUALLY, which is the other way to get
+	// this wrong. An equal share computed up front would cap the bulk class at a
+	// fraction of the page and leave most of it empty, so a single-class incident
+	// would come back with a quarter of the examples it could have had. Dealing a
+	// card at a time gives every class its rows first and spends everything left
+	// on whoever still has some.
+	bulk := subjectsOfClass(report, DivergencePersonaVoteEvent)
+	assert.Equal(t, MaxDivergenceEntries-len(late), len(bulk),
+		"the bulk class keeps every slot the small classes did not need: round-robin fills the "+
+			"page, an equal share wastes it, and the report's bound is only worth having if the "+
+			"page is actually full")
+
+	assert.True(t, report.Truncated,
+		"and the report still says it is smaller than the problem it describes")
+}
+
+// ---------------------------------------------------------------------------
+// (e) The sweep's own deadline, and what a failed pass leaves behind
+// ---------------------------------------------------------------------------
+
+// deadlineDivergences records the context the sweep hands its reads.
+type deadlineDivergences struct {
+	store.Divergences
+	mu          sync.Mutex
+	deadline    time.Time
+	hasDeadline bool
+}
+
+func (d *deadlineDivergences) PersonaVoteEvents(ctx context.Context) ([]store.PersonaVoteEvent, error) {
+	deadline, ok := ctx.Deadline()
+	d.mu.Lock()
+	d.deadline, d.hasDeadline = deadline, ok
+	d.mu.Unlock()
+	return d.Divergences.PersonaVoteEvents(ctx)
+}
+
+func (d *deadlineDivergences) Deadline() (time.Time, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.deadline, d.hasDeadline
+}
+
+// TestDivergenceSweepBoundsItsReadsWithADeadline pins divergenceSweepTimeout at
+// the only place it is observable: the context the reads actually run under.
+//
+// The bound exists because of the POOL, not the clock. Every comparison is a
+// multi-table join taken from the same 25 connections that serve inbound
+// ingestion and the delivery worker, there is no statement_timeout anywhere in
+// this codebase, and GET /admin/divergence makes a sweep reachable from outside
+// on an unrated GET — so an operator refreshing the report during an incident
+// can deepen the incident. A sweep with no deadline does not merely run late; it
+// holds pool connections for as long as the database will let it, and it is
+// slowest exactly when federation most needs them.
+//
+// THE CALLER HERE HAS NO DEADLINE OF ITS OWN, which is the production case: a
+// curl carries none, and the background Run loop's context carries none either.
+// If the sweep did not impose one, these reads would run unbounded.
+func TestDivergenceSweepBoundsItsReadsWithADeadline(t *testing.T) {
+	h := newHarness(t)
+
+	watched := &deadlineDivergences{Divergences: store.NewDivergences(h.db)}
+	reconciler, err := NewDivergenceReconciler(DivergenceOptions{DB: h.db, Divergences: watched})
+	require.NoError(t, err)
+
+	// context.Background(): no deadline, exactly like a curl and like Run.
+	_, err = reconciler.Sweep(context.Background())
+	require.NoError(t, err)
+
+	deadline, ok := watched.Deadline()
+	require.True(t, ok,
+		"the reads must run under a DEADLINE the sweep imposed. The caller supplied none — that "+
+			"is what a curl and the background loop both look like — so without one here a "+
+			"pathological pass pins pool connections indefinitely, on the endpoint an operator "+
+			"reaches for because the database is already struggling")
+	remaining := time.Until(deadline)
+	assert.LessOrEqual(t, remaining, divergenceSweepTimeout,
+		"and the budget is divergenceSweepTimeout (%s), never longer: it has to be well inside "+
+			"the sweep cadence or a slow pass queues behind its own predecessor", divergenceSweepTimeout)
+	assert.Greater(t, remaining, divergenceSweepTimeout-time.Minute,
+		"and generously long: a deadline that fired on a merely slow pass would report failures "+
+			"that are not divergences, which is the one thing a report like this cannot afford")
+}
+
+// blockingDivergences is the pathological read: it stops on the context and
+// never returns until that context is done.
+//
+// It is how a sweep is made to abort in a test without waiting out the real
+// two-minute budget. The mechanism under test is the same one either way — the
+// reads run under a context derived from the caller's, and they end when it ends
+// — and driving it by cancellation exercises the derivation, which the deadline
+// alone cannot.
+type blockingDivergences struct {
+	store.Divergences
+	entered chan struct{}
+}
+
+func (b *blockingDivergences) PersonaVoteEvents(ctx context.Context) ([]store.PersonaVoteEvent, error) {
+	select {
+	case b.entered <- struct{}{}:
+	default:
+	}
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// TestDivergenceSweepAbortsWhenItsContextEndsAndLeavesTheGaugesStanding drives a
+// sweep that would never finish on its own.
+//
+// TWO CLAIMS, and the second is the one an operator lives with. The pass ABORTS
+// rather than blocking forever — the reads run under the sweep's own context,
+// derived from the caller's, so cancelling the caller reaches a read that is
+// already inside the database. And the gauges KEEP THEIR PREVIOUS VALUES: a
+// sweep that could not read must never write a zero, because a zero written by a
+// pass that measured nothing is a claim of health made at the moment nobody
+// could check, and it overwrites the last real number the operator was watching.
+//
+// THE FAILURE COUNTER DELIBERATELY DOES NOT MOVE HERE. This sweep was cut short
+// by its CALLER, which is what shutdown looks like, and counting it would make
+// the number mean "restarts plus failures" — a number nobody can act on. The
+// counter's positive case is the failing-read test below.
+func TestDivergenceSweepAbortsWhenItsContextEndsAndLeavesTheGaugesStanding(t *testing.T) {
+	h := newHarness(t)
+	world := newModerationWorld(t, h)
+	deliverEverythingQueued(t, h.db)
+	_ = world
+
+	// A real divergence first, so the gauge carries a NON-ZERO value an aborted
+	// sweep could overwrite. A fixture whose healthy value is 0 cannot tell "left
+	// standing" from "written as zero".
+	insertVoteEvent(t, h.db, "https://lemmy.world/activities/like/dv-abort",
+		actorIDOf(t, h.db, mtAuthorDID), "up")
+	h.admin.SetDivergenceReconciler(newDivergenceReconciler(t, h))
+	require.Equal(t, http.StatusOK, h.adminRequest(http.MethodGet, "/admin/divergence", nil).Code)
+	require.Equal(t, 1, gaugeValue(t, h, MetricDivergencePersonaVoteEvents),
+		"precondition: a completed sweep published a real number")
+	failuresBefore := gaugeValue(t, h, MetricDivergenceSweepFailures)
+
+	blocking := &blockingDivergences{
+		Divergences: store.NewDivergences(h.db),
+		entered:     make(chan struct{}, 1),
+	}
+	stuck, err := NewDivergenceReconciler(DivergenceOptions{DB: h.db, Divergences: blocking})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	swept := make(chan error, 1)
+	go func() { _, sweepErr := stuck.Sweep(ctx); swept <- sweepErr }()
+
+	select {
+	case <-blocking.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("precondition: the sweep must reach the read this test blocks in")
+	}
+	cancel()
+
+	select {
+	case sweepErr := <-swept:
+		require.Error(t, sweepErr,
+			"a sweep whose reads were cut short is a FAILURE, not an empty report: returning the "+
+				"classes that happened to finish publishes a claim about state nobody read")
+		assert.ErrorIs(t, sweepErr, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the sweep must END when its context does. The reads run under a context DERIVED " +
+			"from the caller's precisely so that a shutdown — or the two-minute budget — reaches " +
+			"a query already inside the database; a sweep built on a fresh background context " +
+			"holds its pool connections for as long as the database will let it, which is the " +
+			"failure divergenceSweepTimeout exists to bound")
+	}
+
+	assert.Equal(t, 1, gaugeValue(t, h, MetricDivergencePersonaVoteEvents),
+		"THE PREVIOUS VALUE STANDS. An aborted pass measured nothing, and a zero written by a "+
+			"pass that measured nothing reads as health at exactly the moment nobody could check")
+	assert.Equal(t, failuresBefore, gaugeValue(t, h, MetricDivergenceSweepFailures),
+		"and the failure counter does NOT move for a sweep its own caller cancelled: that is "+
+			"shutdown, and a counter inflated on every restart means 'restarts plus failures', "+
+			"which is a number nobody can alert on")
+}
+
+// TestDivergenceSweepFailureAndAgeAreVisibleToAnOperator reads the two freshness
+// metrics through the surface an operator reads them through.
+//
+// THEY ARE READ FROM /admin/metrics, NOT FROM expvar. scopedMetrics serves only
+// keys carrying the tidepool prefix, so a metric named without it is published,
+// behaves perfectly, and appears nowhere — indistinguishable from a check that
+// never runs. A test that pokes the Var it just watched proves the sweep can
+// call Set; it proves nothing about whether anyone can see the result.
+//
+// WHY THESE TWO EXIST AT ALL: the seven class gauges are all SET by a successful
+// sweep, so a sweep that has stopped running leaves seven low, stable, entirely
+// healthy-looking numbers behind it. The age says when those numbers were
+// established and the failure count says whether the sweep has been trying and
+// losing. Read together they are the difference between "nothing is diverging"
+// and "nothing is measuring"; either one alone can be read as health.
+func TestDivergenceSweepFailureAndAgeAreVisibleToAnOperator(t *testing.T) {
+	h := newHarness(t)
+	world := newModerationWorld(t, h)
+	deliverEverythingQueued(t, h.db)
+	_ = world
+
+	insertVoteEvent(t, h.db, "https://lemmy.world/activities/like/dv-age",
+		actorIDOf(t, h.db, mtAuthorDID), "up")
+	h.admin.SetDivergenceReconciler(newDivergenceReconciler(t, h))
+	require.Equal(t, http.StatusOK, h.adminRequest(http.MethodGet, "/admin/divergence", nil).Code)
+	require.Equal(t, 1, gaugeValue(t, h, MetricDivergencePersonaVoteEvents),
+		"precondition: a completed sweep published a real number")
+
+	fresh := floatGaugeValue(t, h, MetricDivergenceSweepAgeSeconds)
+	assert.GreaterOrEqual(t, fresh, 0.0,
+		"a sweep has published, so the age is a real measurement rather than the unswept "+
+			"sentinel: %s reads negative only before the first successful publication, because a "+
+			"0 there would say 'swept just now' about a process that has never swept at all",
+		MetricDivergenceSweepAgeSeconds)
+	assert.Less(t, fresh, time.Minute.Seconds(),
+		"and it is SECONDS old, because the sweep it dates finished during this test")
+
+	// PULLED, NOT PUSHED, and this is the whole point of the age gauge. A value
+	// written at publication time would be the one number that stops updating at
+	// exactly the moment it starts to matter — a sweep that has stopped running
+	// would report the age it had when it last ran, forever.
+	climbing := floatGaugeValue(t, h, MetricDivergenceSweepAgeSeconds)
+	assert.Greater(t, climbing, fresh,
+		"%s must CLIMB between two reads of the same standing numbers. Pushed at publication it "+
+			"would freeze with the class gauges it is supposed to date, and seven frozen gauges "+
+			"beside a frozen age is exactly what a healthy bridge looks like",
+		MetricDivergenceSweepAgeSeconds)
+
+	// Now a sweep that fails on a read, with a live caller: this is a FAILING
+	// pass, not a shutdown.
+	failuresBefore := gaugeValue(t, h, MetricDivergenceSweepFailures)
+	faulty := &failingDivergences{
+		Divergences: store.NewDivergences(h.db),
+		err:         stderrors.New("connection reset by peer"),
+	}
+	failing, err := NewDivergenceReconciler(DivergenceOptions{DB: h.db, Divergences: faulty})
+	require.NoError(t, err)
+	h.admin.SetDivergenceReconciler(failing)
+	require.Equal(t, http.StatusInternalServerError,
+		h.adminRequest(http.MethodGet, "/admin/divergence", nil).Code,
+		"precondition: the sweep really did fail")
+	require.NotZero(t, faulty.Calls(), "precondition: the sweep really did try to read")
+
+	assert.Equal(t, failuresBefore+1, gaugeValue(t, h, MetricDivergenceSweepFailures),
+		"%s must move on a failed pass. Leaving the previous gauges standing is right, and on "+
+			"its own it is SILENT: a sweep that fails forever leaves seven plausible numbers "+
+			"frozen and a log line nobody is watching, and this counter plus the climbing age is "+
+			"the only thing that tells those apart from a healthy bridge",
+		MetricDivergenceSweepFailures)
+
+	afterFailure := floatGaugeValue(t, h, MetricDivergenceSweepAgeSeconds)
+	assert.Greater(t, afterFailure, climbing,
+		"and the age KEEPS CLIMBING through the failure: it dates the standing numbers, which a "+
+			"failed sweep did not refresh. An age reset by a pass that published nothing would "+
+			"report the stale gauges as fresh, which is the single reading that would hide a "+
+			"sweep that has stopped working")
+	assert.Equal(t, 1, gaugeValue(t, h, MetricDivergencePersonaVoteEvents),
+		"while the class gauge keeps its last real value: the counter and the age exist so that "+
+			"standing numbers can be told from measured ones, not so they can be overwritten")
+}

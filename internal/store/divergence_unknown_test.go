@@ -146,9 +146,8 @@ func TestUnknownDeliveryOutcomes_ATransportFailureIsUnansweredAsProductionWrites
 
 	// The two shapes the worker really produces.
 	timeoutID := "https://coves.social/ap/activity/dv-unknown-timeout"
-	signerID := "https://coves.social/ap/activity/dv-unknown-signer"
 	seedPoisonedDelivery(t, database, timeoutID, "Create", dvUnknownInboxA, "transport", 0)
-	seedPoisonedDelivery(t, database, signerID, "Create", dvUnknownInboxB, "signer", 0)
+	seedPoisonedDelivery(t, database, timeoutID+"-tls", "Create", dvUnknownInboxB, "transport", 0)
 	// And a genuine refusal beside them, so "everything is unanswered" cannot
 	// pass either: the two must come apart.
 	refusedID := "https://coves.social/ap/activity/dv-unknown-503"
@@ -168,10 +167,9 @@ func TestUnknownDeliveryOutcomes_ATransportFailureIsUnansweredAsProductionWrites
 			"passes, not NULL — and it means NO ANSWER CAME BACK. A predicate that tests for "+
 			"NULL instead of for a real status files every dial timeout on the network under "+
 			"the count that says the peer replied, which is precisely the answer nobody gave")
-	assert.False(t, byID[signerID].Refused,
-		"and so is a delivery that never reached the wire at all: an unresolvable signer is "+
-			"written with the same 0, and the peer certainly did not answer a request we never "+
-			"sent")
+	assert.False(t, byID[timeoutID+"-tls"].Refused,
+		"and so is a TLS failure mid-handshake: same literal 0, same silence about whether the "+
+			"peer ever saw the request")
 	assert.True(t, byID[refusedID].Refused,
 		"while a real 503 IS an answer: the two must come apart on the value, or the "+
 			"distinction the sub-counts exist for does not exist")
@@ -236,4 +234,149 @@ func TestUnknownDeliveryOutcomes_ACancelledDeliveryIsNotUnknown(t *testing.T) {
 		"a CANCELLED delivery never reached the wire, so its outcome is known: the peer does "+
 			"not have it. Counting it as unknown inflates the one number whose value is that "+
 			"it is small and honest")
+}
+
+// ---------------------------------------------------------------------------
+// "We do not know" requires that we SENT it
+// ---------------------------------------------------------------------------
+
+// TestUnknownDeliveryOutcomes_APoisonThatNeverReachedTheWireIsNotUnknown is the
+// completeness half of this class, and it is the same rule that excludes a
+// cancelled delivery — one step later in the worker.
+//
+// Four poison classes are decided BEFORE any POST is made (worker.go): a causal
+// wait that expired (parent_unaccepted), a parent that poisoned
+// (parent_poisoned), an inbox that is not same-authority with its community
+// (cross_authority), and a signer that would not resolve (signer). All four
+// record status 0, which is the same shape a dial timeout leaves behind — and
+// they mean the opposite. Nothing was ever sent, so the peer's state is not
+// unknown at all: they do not have it.
+//
+// The cost of getting this wrong is precise. The unanswered bucket's Detail
+// names an instance for the operator to go ASK, and its whole value is that the
+// number is small and every row in it is a real question. Filing decisions the
+// bridge made itself under "we do not know" both inflates that number and sends
+// someone to ask a stranger about a request that never left the building.
+func TestUnknownDeliveryOutcomes_APoisonThatNeverReachedTheWireIsNotUnknown(t *testing.T) {
+	database := acceptanceTestDB(t)
+
+	// The four never-wire classes, exactly as the worker writes them.
+	neverSent := []string{"parent_unaccepted", "parent_poisoned", "cross_authority", "signer"}
+	for _, class := range neverSent {
+		seedPoisonedDelivery(t, database,
+			"https://coves.social/ap/activity/dv-neverwire-"+class,
+			"Create", dvUnknownInboxA, class, 0)
+	}
+
+	// Two genuine unknowns beside them: one that got no answer, one refused.
+	// Without these the assertion would be satisfied by a query that returned
+	// nothing at all.
+	sentSilently := "https://coves.social/ap/activity/dv-neverwire-transport"
+	sentRefused := "https://coves.social/ap/activity/dv-neverwire-4xx"
+	seedPoisonedDelivery(t, database, sentSilently, "Create", dvUnknownInboxA, "transport", 0)
+	seedPoisonedDelivery(t, database, sentRefused, "Create", dvUnknownInboxB, "4xx", 422)
+
+	found, err := NewDivergences(database).UnknownDeliveryOutcomes(context.Background())
+	require.NoError(t, err)
+
+	ids := make([]string, 0, len(found))
+	for _, outcome := range found {
+		ids = append(ids, outcome.ActivityID)
+	}
+	assert.ElementsMatch(t, []string{sentSilently, sentRefused}, ids,
+		"only deliveries that REACHED THE WIRE are unknown. %v are all decided before any POST "+
+			"is made — a causal wait that expired, a poisoned parent, a cross-authority inbox, "+
+			"an unresolvable signer — so the peer does not have them and nothing about their "+
+			"outcome is uncertain. They carry status 0 like a dial timeout does, which is the "+
+			"whole trap: identical column, opposite meaning. Counting them inflates the one "+
+			"number whose value is that it is small, and the unanswered bucket's own detail "+
+			"sends an operator to ask an instance about a request that never left this process",
+		neverSent)
+}
+
+// ---------------------------------------------------------------------------
+// The counts are the measurement; the list is a page of it
+// ---------------------------------------------------------------------------
+
+// TestUnknownDeliveryOutcomeCounts_MeasureThePopulationTheExamplesOnlySampleFrom
+// pins the last of the four count/list pairs, and this class is where the
+// bounded read is least obvious and most needed.
+//
+// A peer that goes away poisons everything aimed at it, so this population
+// arrives in bulk by nature: one unreachable instance is thousands of rows, all
+// with the same target inbox and the same silence. The two sub-counts are the
+// numbers an operator judges that by, and their whole worth is that they are
+// small and honest — a count bounded at the page would read as five hundred
+// open questions no matter how many there were.
+//
+// THE SPLIT SURVIVES THE BULK, which is the second thing under test. The counts
+// are grouped by the same expression the list selects Refused with
+// (unknownDeliveryRefused), so five hundred silent transport failures cannot
+// tip into the sub-count that says the peer answered — the exact drift that
+// would happen if the two statements spelled "the peer spoke" differently.
+func TestUnknownDeliveryOutcomeCounts_MeasureThePopulationTheExamplesOnlySampleFrom(t *testing.T) {
+	database := acceptanceTestDB(t)
+	ctx := context.Background()
+
+	// One unreachable instance: more silent deliveries than the page holds.
+	const overflowing = MaxDivergenceExamples + 1
+	seedPoisonedDeliveriesInBulk(t, database, overflowing)
+	// And two that a peer really answered, so the split cannot be satisfied by a
+	// total and the refused bucket has something in it to be wrong about.
+	refusedA := "https://coves.social/ap/activity/dv-count-refused-a"
+	refusedB := "https://coves.social/ap/activity/dv-count-refused-b"
+	seedPoisonedDelivery(t, database, refusedA, "Create", dvUnknownInboxA, "4xx", 422)
+	seedPoisonedDelivery(t, database, refusedB, "Create", dvUnknownInboxB, "5xx", 503)
+	// The outcome we DO know, which belongs in neither number.
+	seedPoisonedSibling(t, database)
+
+	divergences := NewDivergences(database)
+
+	found, err := divergences.UnknownDeliveryOutcomes(ctx)
+	require.NoError(t, err)
+	require.Len(t, found, MaxDivergenceExamples,
+		"the examples are bounded at the database: an unreachable instance is thousands of rows, "+
+			"and a report that grows with the outage cannot be read during one")
+
+	counts, err := divergences.UnknownDeliveryOutcomeCounts(ctx)
+	require.NoError(t, err)
+
+	assert.Equal(t, overflowing, counts.Unanswered,
+		"the COUNT is the true measurement: every one of these got no answer at all, and the "+
+			"example budget bounds what an operator can read rather than what the sweep measured")
+	assert.Greater(t, counts.Unanswered, len(found),
+		"and it EXCEEDS the examples, which is the contract — a count capped at %d would report "+
+			"the size of a page while an instance was silently dropping everything we sent it",
+		MaxDivergenceExamples)
+	assert.Equal(t, 2, counts.Refused,
+		"while the peers that ANSWERED stay their own number. The split is the only information "+
+			"these rows carry, and it is computed by the same expression the list selects Refused "+
+			"with: two spellings of 'the peer spoke' is precisely how five hundred dial timeouts "+
+			"end up in the count that says they replied")
+}
+
+// seedPoisonedDeliveriesInBulk writes n poisoned deliveries that got no answer
+// at all — one unreachable instance, as the worker records it.
+//
+// The status is a literal 0 rather than NULL because that is what production
+// writes for a transport failure; a fixture that spelled it NULL here would let
+// a NULL-based discriminator file every one of these under REFUSED and still
+// pass.
+func seedPoisonedDeliveriesInBulk(t *testing.T, database *sql.DB, n int) {
+	t.Helper()
+	ctx := context.Background()
+	activityID := "'https://coves.social/ap/activity/dv-bulk-unknown-' || i"
+
+	_, err := database.ExecContext(ctx, `
+		INSERT INTO outbound_activities (activity_id, actor_did, kind, payload)
+		SELECT `+activityID+`, $1, 'Create', '{"type":"Create"}'::jsonb
+		  FROM generate_series(1, $2) AS i`, dvAuthorDID, n)
+	require.NoError(t, err, "seed %d activities", n)
+
+	_, err = database.ExecContext(ctx, `
+		INSERT INTO outbound_deliveries (activity_id, target_inbox, ordering_key, state,
+		                                 last_error_class, last_status_code, created_at)
+		SELECT `+activityID+`, $1, $2, 'poisoned', 'transport', 0, now() - interval '2 hours'
+		  FROM generate_series(1, $3) AS i`, dvUnknownInboxA, dvCommunityAPID, n)
+	require.NoError(t, err, "seed %d deliveries", n)
 }

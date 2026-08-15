@@ -234,3 +234,173 @@ func TestPersonaVoteEvents_ANonCanonicalSpellingIsNotMatched_KNOWNNARROW(t *test
 			"test ever fails because the join learned to normalize, that is an improvement: "+
 			"delete this test and say so in the report")
 }
+
+// ---------------------------------------------------------------------------
+// 17e review — the exclusion's SECOND conjunct, decided rather than inherited
+// ---------------------------------------------------------------------------
+
+// TestRecastDivergences_ALedgerThatNamesTheVoteButCallsItPendingIsReported
+// decides a state the query has an opinion about and nobody wrote down.
+//
+// The re-cast exclusion suppresses a finding only when the ledger BOTH names
+// this exact activity as the live vote AND calls it delivered. Drop the second
+// conjunct and every fixture in the suite stays green, because no fixture has
+// ever produced the in-between: current_activity_id pointing at an activity a
+// delivery row says was delivered, while delivered_state reads 'pending'.
+//
+// THE ANSWER IS THAT IT MUST BE REPORTED, and the reason is the same one that
+// makes this class worth having. The delivery is the durable fact — the peer
+// accepted that activity — and the ledger is the number the reseed reads. A row
+// saying 'pending' subtracts nothing, so the community's served score counts a
+// vote of ours as a stranger's, permanently, and the vote row that would
+// normally be corrected by voteCallback is the one thing that already failed to
+// be. "Our ledger half-claims it" is not an account of what the peer holds; only
+// a full claim is.
+//
+// NO WRITER PRODUCES THIS TODAY — voteCallback flips the row to delivered on the
+// same success that marks the delivery, and a re-cast moves the id rather than
+// resetting the state under it. That is exactly why it is written here: an
+// implementation that dropped the conjunct would look identical on every state
+// the system currently reaches, and would then swallow this one silently on the
+// day some future path leaves the pair half-written.
+func TestRecastDivergences_ALedgerThatNamesTheVoteButCallsItPendingIsReported(t *testing.T) {
+	database := divergenceTestDB(t)
+	ctx := context.Background()
+
+	subject := "at://" + dvPersonaDID + "/social.coves.community.postv2/3lzdvrcpost1"
+	activityID := "https://coves.social/ap/activity/dv-recast-halfclaimed"
+	seedDeliveredVoteActivity(t, database, activityID, dvPersonaDID, subject, "Like")
+
+	// The ledger names THIS activity as the live vote — and calls it pending.
+	_, err := database.ExecContext(ctx, `
+		INSERT INTO outbound_votes (vote_at_uri, actor_did, subject_at_uri, subject_ap_id,
+		                            community_did, direction, current_activity_id, delivered_state)
+		VALUES ($1, $2, $3, $4, $5, 'up', $6, 'pending')`,
+		"at://"+dvPersonaDID+"/social.coves.feed.vote/3lzdvrcvote1", dvPersonaDID, subject,
+		"https://lemmy.world/post/9002", dvCommunityDID, activityID)
+	require.NoError(t, err)
+
+	found, err := NewDivergences(database).RecastDivergences(ctx)
+	require.NoError(t, err)
+	require.Len(t, found, 1,
+		"a HALF-CLAIM is not a claim. The delivery row is durable proof the peer accepted this "+
+			"activity, while the ledger says 'pending' — which the reseed reads as 'subtract "+
+			"nothing', so the community's served score counts our own vote as a stranger's "+
+			"forever. The exclusion exists for the case where our accounting is COMPLETE; "+
+			"anything less is the divergence itself, and dropping the delivered_state conjunct "+
+			"makes this state silently disappear from a report that has no other way to see it")
+	assert.Equal(t, activityID, found[0].DeliveredActivityID)
+	assert.Equal(t, subject, found[0].SubjectATURI)
+}
+
+// TestRecastDivergenceCount_MeasuresThePopulationTheExamplesOnlySampleFrom is
+// this comparison's half of the same contract the acceptance counts carry:
+// Counts is the true measurement, Entries is a page of it.
+//
+// The bulk shape is not hypothetical for this class. Votes are the
+// highest-volume thing the bridge sends, and the population here is "a peer is
+// holding a vote we no longer claim" — which arrives in bulk exactly when it
+// matters: an instance that went away mid-flight poisons every re-cast and Undo
+// aimed at it, and the count is how an operator learns whether that is three
+// votes or fifty thousand. A count bounded with the examples would report the
+// size of a page and stop moving while the problem grew.
+//
+// THE COUNT WRAPS THE SAME DISTINCT SELECT the list runs, and the DISTINCT is
+// part of the definition rather than tidiness: one activity may have several
+// deliveries (the fan-out schema) and one delivered copy is ONE thing the peer
+// holds. Counting the un-deduplicated join would report a number larger than the
+// list it labels, on the rows an operator is sizing.
+func TestRecastDivergenceCount_MeasuresThePopulationTheExamplesOnlySampleFrom(t *testing.T) {
+	database := divergenceTestDB(t)
+	ctx := context.Background()
+
+	const overflowing = MaxDivergenceExamples + 1
+	seedRecastDivergencesInBulk(t, database, overflowing)
+
+	// THE EXCLUSION CONTROL, because a count is only worth pinning if the
+	// population it counts is a comparison. This vote is delivered AND our ledger
+	// still names it as the live, delivered vote — so we account for what the peer
+	// holds and there is nothing to reconcile. Without it, a query that reported
+	// every delivered vote would satisfy every assertion below while naming most
+	// of the highest-volume table in the system.
+	covered := "https://coves.social/ap/activity/dv-count-covered"
+	coveredSubject := "at://" + dvPersonaDID + "/social.coves.community.postv2/3lzdvcntkeep"
+	seedDeliveredVoteActivity(t, database, covered, dvPersonaDID, coveredSubject, "Like")
+	_, err := database.ExecContext(ctx, `
+		INSERT INTO outbound_votes (vote_at_uri, actor_did, subject_at_uri, subject_ap_id,
+		                            community_did, direction, current_activity_id, delivered_state)
+		VALUES ($1, $2, $3, $4, $5, 'up', $6, 'delivered')`,
+		"at://"+dvPersonaDID+"/social.coves.feed.vote/3lzdvcntkeep", dvPersonaDID, coveredSubject,
+		"https://lemmy.world/post/9003", dvCommunityDID, covered)
+	require.NoError(t, err)
+
+	divergences := NewDivergences(database)
+
+	found, err := divergences.RecastDivergences(ctx)
+	require.NoError(t, err)
+	require.Len(t, found, MaxDivergenceExamples,
+		"the examples are bounded at the database by the same budget the report spends")
+	for _, entry := range found {
+		assert.NotEqual(t, covered, entry.DeliveredActivityID,
+			"and the fully-accounted vote is not among them: our ledger names this exact activity "+
+				"as the live vote AND calls it delivered, which is the one state that says the "+
+				"peer holds nothing we have not accounted for")
+	}
+
+	total, err := divergences.RecastDivergenceCount(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, overflowing, total,
+		"the COUNT is exact and unbounded — the same comparison, with no LIMIT — so it counts the "+
+			"population rather than the page")
+	assert.Greater(t, total, len(found),
+		"and it EXCEEDS the examples. That is the contract these two statements exist to keep: "+
+			"the list is a sample an operator investigates, the count is the size they escalate "+
+			"on, and a count capped at %d would stop growing exactly when the incident does",
+		MaxDivergenceExamples)
+}
+
+// seedRecastDivergencesInBulk writes n delivered vote activities that NOTHING in
+// the ledger accounts for — the shape this class reports.
+//
+// Each carries its OWN subject, so no two supersede each other: the comparison
+// excludes an earlier delivered vote when a LATER delivered vote for the same
+// (actor, subject) pair follows it, which is how an ordinary vote flip stays out
+// of the report. Sharing one subject across the bulk would leave exactly one row
+// standing and quietly turn this into a fixture of size 1.
+func seedRecastDivergencesInBulk(t *testing.T, database *sql.DB, n int) {
+	t.Helper()
+	ctx := context.Background()
+	activityID := "'https://coves.social/ap/activity/dv-bulk-recast-' || i"
+	subject := "'at://" + dvPersonaDID + "/social.coves.community.postv2/3lzdvbulkrc' || i"
+
+	_, err := database.ExecContext(ctx, `
+		INSERT INTO outbound_activities (activity_id, actor_did, kind, payload, parent_at_uri)
+		SELECT `+activityID+`, $1, 'Like', '{"type":"Like"}'::jsonb, `+subject+`
+		  FROM generate_series(1, $2) AS i`, dvPersonaDID, n)
+	require.NoError(t, err, "seed %d vote activities", n)
+
+	_, err = database.ExecContext(ctx, `
+		INSERT INTO outbound_deliveries (activity_id, target_inbox, ordering_key, state,
+		                                 last_status_code, delivered_at)
+		SELECT `+activityID+`, $1, $2, 'delivered', 202, now()
+		  FROM generate_series(1, $3) AS i`,
+		"https://lemmy.world/inbox", "https://lemmy.world/c/technology", n)
+	require.NoError(t, err, "seed %d deliveries", n)
+}
+
+// seedDeliveredVoteActivity writes one vote activity with a delivered delivery —
+// the durable evidence a peer was told.
+func seedDeliveredVoteActivity(t *testing.T, database *sql.DB, activityID, actorDID, subject, kind string) {
+	t.Helper()
+	ctx := context.Background()
+	_, err := database.ExecContext(ctx, `
+		INSERT INTO outbound_activities (activity_id, actor_did, kind, payload, parent_at_uri)
+		VALUES ($1, $2, $3, '{"type":"Like"}'::jsonb, $4)`, activityID, actorDID, kind, subject)
+	require.NoError(t, err)
+	_, err = database.ExecContext(ctx, `
+		INSERT INTO outbound_deliveries (activity_id, target_inbox, ordering_key, state,
+		                                 last_status_code, delivered_at)
+		VALUES ($1, $2, $3, 'delivered', 202, now())`,
+		activityID, "https://lemmy.world/inbox", "https://lemmy.world/c/technology")
+	require.NoError(t, err)
+}

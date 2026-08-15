@@ -491,7 +491,13 @@ func run(logger *slog.Logger) error {
 	divergence, err := ingest.NewDivergenceReconciler(ingest.DivergenceOptions{
 		DB:       database,
 		Interval: cfg.DivergenceInterval,
-		Logger:   logger,
+		// The staleness window is CONFIGURED rather than left to default, because
+		// it is the knob that decides whether the acceptance classes cry wolf on
+		// a slow queue or stay quiet through a stopped one, and an operator who
+		// has to rebuild the binary to tune it will instead learn to ignore the
+		// report.
+		AcceptanceStaleAfter: cfg.DivergenceAcceptanceStaleAfter,
+		Logger:               logger,
 	})
 	if err != nil {
 		return err

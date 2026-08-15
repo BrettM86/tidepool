@@ -2,6 +2,7 @@ package votes
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"testing"
 
@@ -221,4 +222,146 @@ func TestRecastDivergence_ADeliveredThenUndoneVoteIsNotADivergence(t *testing.T)
 			"will be — the history is append-only — so a sweep that looks only for 'a delivered "+
 			"vote with no live row' reports this pair forever, about a withdrawal that worked")
 	assert.Empty(t, recastEntries(sweep(t, w)))
+}
+
+// ---------------------------------------------------------------------------
+// 17e review — the case that makes this class usable at all
+// ---------------------------------------------------------------------------
+
+// TestRecastDivergence_ASuccessfulRecastIsNotADivergence is the ORDINARY vote
+// flip, and it is most of what this table does.
+//
+// A flip is an in-place upsert: current_activity_id moves to the new id,
+// delivered_state resets to pending, and NO Undo is enqueued — Lemmy takes a
+// bare opposite vote as a replacement (17b measured this; a flip is not an Undo
+// followed by a vote). So once the new vote delivers, the OLD delivered activity
+// matches NEITHER exclusion: the ledger names the new id, and no Undo exists to
+// pair with it.
+//
+// Left unpinned, every vote change the bridge has ever federated becomes a
+// permanent entry, and the report grows monotonically with ordinary use. The
+// detail on each would claim the peer holds a vote whose delivery never landed —
+// both halves false — and an operator acting on it would retract the vote the
+// user currently holds.
+//
+// Driven through the real path for the same reason the poisoned case is: the
+// state that matters here is produced by the SECOND step of a two-step history,
+// and no hand-written row has a history.
+func TestRecastDivergence_ASuccessfulRecastIsNotADivergence(t *testing.T) {
+	w := newRecastWorld(t, 5)
+
+	// Down, delivered.
+	w.castVote(t, "3lztprev00001", directionDown)
+	w.deliver(t)
+	require.Equal(t, []string{"Dislike"}, w.sender.kinds())
+	require.Equal(t, string(store.DeliveredStateDelivered), w.state(t))
+
+	// Flipped to up — and this time it LANDS.
+	w.castVote(t, "3lztprev00002", directionUp)
+	w.deliver(t)
+	require.Equal(t, []string{"Dislike", "Like"}, w.sender.kinds(),
+		"precondition: the flip really went out as a bare opposite vote — Lemmy's replacement "+
+			"semantics, with no Undo between them")
+	require.Equal(t, string(store.DeliveredStateDelivered), w.state(t),
+		"precondition: and the ledger caught up, so our accounting names what the peer holds")
+
+	found, err := store.NewDivergences(w.db).RecastDivergences(context.Background())
+	require.NoError(t, err)
+	assert.Empty(t, found,
+		"a flip that DELIVERED is not a divergence — it is the system working. The old activity "+
+			"stays in the append-only history forever and no Undo will ever join it, because a "+
+			"flip does not produce one; only the ledger naming the NEW id says the account is "+
+			"settled. Reported, this class would grow with every vote change the bridge has "+
+			"ever federated, each entry claiming the peer holds a vote that never landed — "+
+			"both halves false — and acting on one would retract the vote the user has right now")
+	assert.Empty(t, recastEntries(sweep(t, w)))
+}
+
+// TestRecastDivergence_AnUndoOlderThanTheDeliveredVoteDoesNotSuppressIt pins the
+// TIME direction of the Undo exclusion.
+//
+// The exclusion asks whether a delivered Undo followed this vote. Drop the
+// `>=` and any Undo for the pair suppresses the finding — including one from an
+// earlier incarnation of the same (actor, subject), which the append-only
+// history keeps forever. The sequence below is reachable and its consequence is
+// permanent: the stale Undo from the FIRST vote silently hides a real divergence
+// created two votes later, and nothing else in the system reports it.
+//
+// The second incarnation is a NEW vote record with its own rkey, which is what a
+// client that deleted a vote and voted again produces. (Re-using the first
+// record's rkey does not work: the activity id derives from the at-uri and a seq
+// that restarts at 1 once the row is gone, so the re-created vote reproduces the
+// FIRST vote's activity id, finds the already-delivered delivery standing, and
+// never goes out. Recorded for the conductor — it is outside 17e.)
+func TestRecastDivergence_AnUndoOlderThanTheDeliveredVoteDoesNotSuppressIt(t *testing.T) {
+	w := newRecastWorld(t, 1) // the last delivery must poison
+	ctx := context.Background()
+
+	// 1) A vote, delivered. 2) Withdrawn, and the Undo delivers — so the
+	//    history now holds a delivered Undo for this pair, forever.
+	w.castVote(t, "3lztprev00001", directionDown)
+	w.deliver(t)
+	w.deleteVote(t, "3lztprev00002")
+	w.deliver(t)
+	require.Equal(t, []string{"Dislike", "Undo"}, w.sender.kinds())
+	require.Equal(t, "", w.state(t), "precondition: the withdrawal completed and cleared the row")
+
+	// 3) The user votes again — a new record — and it lands. This is the vote
+	//    the peer holds from here on.
+	const secondRKey = "3lztemporalvot2"
+	castVoteRecord(t, w, secondRKey, "3lztprev00003", directionUp)
+	w.deliver(t)
+	require.Equal(t, []string{"Dislike", "Undo", "Like"}, w.sender.kinds(),
+		"precondition: the second vote really went out")
+	require.Equal(t, string(store.DeliveredStateDelivered), voteRecordState(t, w, secondRKey))
+	held := deliveredVoteActivity(t, w)
+
+	// 4) And they change it once more — this time the delivery poisons.
+	w.sender.fail(fmt.Errorf("lemmy is unreachable"))
+	castVoteRecord(t, w, secondRKey, "3lztprev00004", directionDown)
+	w.deliver(t)
+	var poisoned int
+	require.NoError(t, w.db.QueryRow(
+		`SELECT COUNT(*) FROM outbound_deliveries WHERE state = 'poisoned'`).Scan(&poisoned))
+	require.Equal(t, 1, poisoned, "precondition: the last delivery poisoned")
+
+	found, err := store.NewDivergences(w.db).RecastDivergences(ctx)
+	require.NoError(t, err)
+	require.Len(t, found, 1,
+		"the peer is holding the Like from step 3, and the Undo in this history is OLDER than "+
+			"it — it withdrew a different incarnation of the same (actor, subject) pair. An "+
+			"exclusion that accepted any Undo at all would let that stale row suppress this "+
+			"finding forever: the history is append-only, so the old Undo never goes away, and "+
+			"the divergence it hides is permanent and reported nowhere else")
+	assert.Equal(t, held, found[0].DeliveredActivityID,
+		"and the entry cites the vote the peer actually holds — the one delivered AFTER the "+
+			"Undo, not the withdrawn one")
+}
+
+// castVoteRecord drives a vote COMMIT for an arbitrary record key, so a history
+// can contain more than one vote RECORD for the same subject — which is what a
+// client that deleted a vote and voted again produces.
+func castVoteRecord(t *testing.T, w *recastWorld, rkey, rev, direction string) {
+	t.Helper()
+	frame := fmt.Sprintf(
+		`{"did":%q,"time_us":9500,"kind":"commit","commit":{"rev":%q,"operation":"create",`+
+			`"collection":"social.coves.feed.vote","rkey":%q,"cid":%q,`+
+			`"record":{"$type":"social.coves.feed.vote","subject":{"uri":%q,"cid":%q},`+
+			`"direction":%q,"createdAt":"2026-08-14T10:00:00.000Z"}}}`,
+		tpNativeDID, rev, rkey, testCID, w.subject, testCID, direction)
+	w.handle(t, frame)
+}
+
+// voteRecordState reads one vote record's delivered_state, or "" when the row
+// is gone.
+func voteRecordState(t *testing.T, w *recastWorld, rkey string) string {
+	t.Helper()
+	var state string
+	err := w.db.QueryRow(`SELECT delivered_state FROM outbound_votes WHERE vote_at_uri = $1`,
+		"at://"+tpNativeDID+"/social.coves.feed.vote/"+rkey).Scan(&state)
+	if err == sql.ErrNoRows {
+		return ""
+	}
+	require.NoError(t, err)
+	return state
 }

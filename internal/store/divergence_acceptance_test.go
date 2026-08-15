@@ -359,3 +359,220 @@ func seedFollowUpDelivery(t *testing.T, database *sql.DB, post dvPost, kind stri
 		fmt.Sprintf("%d seconds", int(age.Seconds())))
 	require.NoError(t, err, "seed follow-up delivery for %s", post.rkey)
 }
+
+// ---------------------------------------------------------------------------
+// The ledger term: only an ACCEPTED post is an acceptance
+// ---------------------------------------------------------------------------
+
+// TestUndeliveredAcceptances_ARejectedPostIsNotAnUndeliveredAcceptance pins
+// `adm.status = 'accepted'`.
+//
+// Every other fixture in this file writes `accepted`, so the term deletes green
+// — and the state it excludes is not exotic. admissions.status has five values,
+// and a REJECTED post is the ordinary outcome of an opted-out author, a banned
+// author, a missing title or a locked parent. Its shape is exactly the reported
+// one: no acceptance record was written, so nothing stamped accepted_at, and any
+// delivery it had was cancelled.
+//
+// The difference is the whole meaning of the class. An accepted post that never
+// reached the peer is a DISAGREEMENT — Coves shows it in the community, Lemmy
+// does not. A rejected post is AGREEMENT: it is invisible in both places,
+// exactly as decided, and Coves' post.getStatus already tells its author why.
+// Reporting it turns every refusal the admission policy makes into a finding,
+// and the volume of refusals is not small.
+func TestUndeliveredAcceptances_ARejectedPostIsNotAnUndeliveredAcceptance(t *testing.T) {
+	database := acceptanceTestDB(t)
+
+	for _, status := range []string{"rejected", "removed", "pending", "pending_reacceptance"} {
+		t.Run(status, func(t *testing.T) {
+			database := acceptanceTestDB(t)
+
+			undecided := dvPost{rkey: "3lzdvstat0001", state: DeliveryStateCancelled, age: 2 * time.Hour}
+			seedAcceptedPost(t, database, undecided)
+			setAdmissionStatus(t, database, undecided, status)
+
+			// A genuinely accepted one beside it, so an empty result cannot pass
+			// for the right answer.
+			accepted := dvPost{rkey: "3lzdvstat0002", state: DeliveryStateCancelled, age: 2 * time.Hour}
+			seedAcceptedPost(t, database, accepted)
+
+			found, err := NewDivergences(database).UndeliveredAcceptances(context.Background(), dvStaleAfter)
+			require.NoError(t, err)
+			assert.Equal(t, []string{accepted.uri()}, urisOf(found),
+				"a post whose admission is %q is not an ACCEPTANCE that failed to reach the peer: "+
+					"no acceptance record was ever written, so the community view agrees with "+
+					"Lemmy's — both hide it, which is the decision working. Only 'accepted' means "+
+					"the two sides disagree, and without that term every refusal the admission "+
+					"policy makes becomes a finding", status)
+		})
+	}
+	_ = database
+}
+
+// setAdmissionStatus rewrites the ledger decision for one post.
+func setAdmissionStatus(t *testing.T, database *sql.DB, post dvPost, status string) {
+	t.Helper()
+	result, err := database.ExecContext(context.Background(),
+		`UPDATE admissions SET status = $2 WHERE post_uri = $1`, post.uri(), status)
+	require.NoError(t, err)
+	affected, err := result.RowsAffected()
+	require.NoError(t, err)
+	require.EqualValues(t, 1, affected, "there must be an admission row for %s to re-decide", post.rkey)
+}
+
+// ---------------------------------------------------------------------------
+// The newest attempt decides
+// ---------------------------------------------------------------------------
+
+// TestUndeliveredAcceptances_AFreshRetryAfterACancelledAttemptIsInFlight pins
+// the ORDER of the DISTINCT ON: newest delivery first.
+//
+// Flip it to oldest-first and every assertion in this file still passes, because
+// no other fixture gives one post two deliveries in different states. This one
+// does, and it is the ordinary shape of recovery: an attempt was cancelled, and
+// a newer one is on its way.
+//
+// Read oldest-first, the report describes a post as permanently undelivered
+// while the delivery that will carry it is in the queue right now — and the
+// operator's response to "cancelled" (accept it, or re-enqueue by hand) is
+// exactly wrong for a post that needs neither.
+func TestUndeliveredAcceptances_AFreshRetryAfterACancelledAttemptIsInFlight(t *testing.T) {
+	database := acceptanceTestDB(t)
+
+	retried := dvPost{rkey: "3lzdvordr0001", state: DeliveryStateCancelled, age: 3 * time.Hour}
+	seedAcceptedPost(t, database, retried)
+	// The newer attempt: pending, created NOW, so it is inside any staleness
+	// window the sweep could be configured with.
+	seedFollowUpDelivery(t, database, retried, "Create", DeliveryStatePending, "", 0)
+
+	// And a post with ONLY the cancelled attempt, so "reports nothing" cannot
+	// pass for the right answer.
+	abandoned := dvPost{rkey: "3lzdvordr0002", state: DeliveryStateCancelled, age: 3 * time.Hour}
+	seedAcceptedPost(t, database, abandoned)
+
+	found, err := NewDivergences(database).UndeliveredAcceptances(context.Background(), dvStaleAfter)
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{abandoned.uri()}, urisOf(found),
+		"the NEWEST delivery decides. This post has a cancelled attempt and a fresh one in "+
+			"flight, so it is not a divergence — it is a retry. Ordering the other way describes "+
+			"it as permanently undelivered while the delivery that will carry it sits in the "+
+			"queue, and sends an operator to re-enqueue a post that needs nothing")
+}
+
+// ---------------------------------------------------------------------------
+// The count is the MEASUREMENT; the list is a page of it
+// ---------------------------------------------------------------------------
+
+// TestUndeliveredAcceptanceCounts_MeasureThePopulationTheExamplesOnlySampleFrom
+// is the reason these are two statements rather than one truncated read.
+//
+// Every other fixture in this file is smaller than the page, so the list IS its
+// own count and the two queries are indistinguishable. The state that separates
+// them is the only one that matters: a broken community or a stopped queue,
+// which is what an outage looks like here. If the count were bounded with the
+// examples, "500" would mean both "500" and "a catastrophe" — and an operator
+// sizes an incident from exactly this number, then decides whether to page
+// anyone.
+//
+// IT ALSO PINS THAT THE TWO STATEMENTS DESCRIBE ONE POPULATION. They share the
+// CTE and the filter as constants (undeliveredAcceptanceLatest,
+// undeliveredAcceptanceFilter) precisely so a count cannot come to be taken over
+// a slightly different join than the list it labels — a drift that is silent in
+// the direction that matters, because nothing about the report would look wrong.
+// The three states are seeded at three different sizes so a grouped count cannot
+// be satisfied by a total, and the delivered sibling is here so the population
+// is a comparison rather than a listing.
+func TestUndeliveredAcceptanceCounts_MeasureThePopulationTheExamplesOnlySampleFrom(t *testing.T) {
+	database := acceptanceTestDB(t)
+	ctx := context.Background()
+
+	// One class far past the page, and two well inside it — three sizes, so a
+	// count that reported a total, or one class's number for another's, fails
+	// here rather than reading plausibly.
+	const overflowing = MaxDivergenceExamples + 1
+	seedAcceptedPostsInBulk(t, database, "cncl", overflowing, DeliveryStateCancelled, "", 2*time.Hour)
+	seedAcceptedPostsInBulk(t, database, "pois", 2, DeliveryStatePoisoned, "4xx", 2*time.Hour)
+	seedAcceptedPostsInBulk(t, database, "stal", 3, DeliveryStatePending, "", 2*time.Hour)
+	// THE FALSE-POSITIVE CONTROL, as everywhere else in this file: a post the
+	// peer really took. A count is the number an operator escalates on, so an
+	// inflated one is worse than a missing one.
+	landed := dvPost{rkey: "3lzdvbulk0000d", state: DeliveryStateDelivered, age: 2 * time.Hour, accepted: true}
+	seedAcceptedPost(t, database, landed)
+
+	divergences := NewDivergences(database)
+
+	found, err := divergences.UndeliveredAcceptances(ctx, dvStaleAfter)
+	require.NoError(t, err)
+	require.Len(t, found, MaxDivergenceExamples,
+		"the EXAMPLES are bounded at the database, not in Go: the sweep that reaches this limit "+
+			"is the sweep running against a stopped queue, and materialising every row before "+
+			"cutting it down would put the memory spike in the process an operator is trying to "+
+			"keep alive")
+
+	counts, err := divergences.UndeliveredAcceptanceCounts(ctx, dvStaleAfter)
+	require.NoError(t, err)
+
+	assert.Equal(t, overflowing, counts[DeliveryStateCancelled],
+		"the COUNT is the true measurement, unbounded by the example budget")
+	assert.Greater(t, counts[DeliveryStateCancelled], len(found),
+		"and it EXCEEDS the examples, which is the whole contract: a count capped at the size of "+
+			"a page makes %d mean both '%d' and 'a catastrophe', and the number an operator sizes "+
+			"the incident from would stop growing exactly when the incident does",
+		MaxDivergenceExamples, MaxDivergenceExamples)
+	assert.Equal(t, 2, counts[DeliveryStatePoisoned],
+		"while the small classes keep their own exact numbers: the count is GROUPED by delivery "+
+			"state because the three classes are three different jobs, and a single total could "+
+			"only ever be alerted on at the noise level of whichever kind is most common")
+	assert.Equal(t, 3, counts[DeliveryStatePending])
+	assert.NotContains(t, counts, DeliveryStateDelivered,
+		"and the post the peer TOOK is in no bucket at all: it is the healthy state, and a count "+
+			"that includes it is a count of every acceptance the bridge has ever made")
+}
+
+// seedAcceptedPostsInBulk writes n accepted posts sharing one delivery state.
+//
+// FOUR STATEMENTS, NOT n×4 ROUND TRIPS: the population that matters here is
+// larger than the example budget, and five hundred round trips is a slow way to
+// say "an outage". The rows are otherwise identical to seedAcceptedPost's —
+// including the payload's object id, which is the correspondence the sweep
+// joins on and the worker stamps accepted_at through.
+func seedAcceptedPostsInBulk(t *testing.T, database *sql.DB, tag string, n int,
+	state DeliveryState, errorClass string, age time.Duration) {
+	t.Helper()
+	ctx := context.Background()
+	uri := "'at://" + dvAuthorDID + "/social.coves.community.postv2/3lzdvbulk" + tag + "' || i"
+	objectID := "'" + dvUserOrigin + "/ap/object/" + dvAuthorDID +
+		"/social.coves.community.postv2/3lzdvbulk" + tag + "' || i"
+	activityID := "'" + dvUserOrigin + "/ap/activity/3lzdvbulk" + tag + "' || i"
+
+	_, err := database.ExecContext(ctx, `
+		INSERT INTO outbound_objects (at_uri, ap_object_id, community_did, community_ap_id,
+		                              translated_snapshot, accepted_at)
+		SELECT `+uri+`, `+objectID+`, $1, $2, '{"type":"Page"}'::jsonb, NULL
+		  FROM generate_series(1, $3) AS i`, dvCommunityDID, dvCommunityAPID, n)
+	require.NoError(t, err, "seed %d outbound_objects", n)
+
+	_, err = database.ExecContext(ctx, `
+		INSERT INTO admissions (community_did, post_uri, author_did, status, decision_code)
+		SELECT $1, `+uri+`, $2, 'accepted', ''
+		  FROM generate_series(1, $3) AS i`, dvCommunityDID, dvAuthorDID, n)
+	require.NoError(t, err, "seed %d admissions", n)
+
+	_, err = database.ExecContext(ctx, `
+		INSERT INTO outbound_activities (activity_id, actor_did, kind, payload)
+		SELECT `+activityID+`, $1, 'Create',
+		       jsonb_build_object('id', `+activityID+`, 'type', 'Create',
+		                          'object', jsonb_build_object('type', 'Page', 'id', `+objectID+`))
+		  FROM generate_series(1, $2) AS i`, dvAuthorDID, n)
+	require.NoError(t, err, "seed %d outbound_activities", n)
+
+	_, err = database.ExecContext(ctx, `
+		INSERT INTO outbound_deliveries (activity_id, target_inbox, ordering_key, state,
+		                                 last_error_class, created_at, updated_at)
+		SELECT `+activityID+`, $1, $2, $3, $4, now() - $5::interval, now() - $5::interval
+		  FROM generate_series(1, $6) AS i`,
+		dvCommunityInbox, dvCommunityAPID, string(state), errorClass,
+		fmt.Sprintf("%d seconds", int(age.Seconds())), n)
+	require.NoError(t, err, "seed %d outbound_deliveries", n)
+}

@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"tidepool/internal/ingest"
 	"tidepool/internal/personas"
 )
 
@@ -255,6 +256,18 @@ type Config struct {
 	// runs one on demand regardless. It never writes anything (decision 19),
 	// which is what makes an always-on schedule safe.
 	DivergenceInterval time.Duration
+	// DivergenceAcceptanceStaleAfter is how long a pending delivery may sit
+	// before the sweep reports its acceptance as STALE
+	// (DIVERGENCE_ACCEPTANCE_STALE_AFTER, a Go duration, must be positive).
+	//
+	// It is the report's one crying-wolf knob: too short and every ordinary
+	// in-flight post is a finding, too long and a queue that stopped this
+	// morning is not in the report tonight. The default is derived from the
+	// retry schedule and the causal wait budget — see
+	// ingest.DefaultAcceptanceStaleAfter, which is NAMED here rather than
+	// respelled as a number, so the reasoning and the value an operator
+	// actually gets cannot come apart.
+	DivergenceAcceptanceStaleAfter time.Duration
 }
 
 // Load reads configuration from the environment. logger must not be nil;
@@ -592,6 +605,11 @@ func Load(logger *slog.Logger) (*Config, error) {
 		return nil, err
 	}
 	cfg.DivergenceInterval, err = durationVar(logger, "DIVERGENCE_INTERVAL", 15*time.Minute)
+	if err != nil {
+		return nil, err
+	}
+	cfg.DivergenceAcceptanceStaleAfter, err = durationVar(logger,
+		"DIVERGENCE_ACCEPTANCE_STALE_AFTER", ingest.DefaultAcceptanceStaleAfter)
 	if err != nil {
 		return nil, err
 	}

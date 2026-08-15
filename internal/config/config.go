@@ -246,6 +246,15 @@ type Config struct {
 	// because the remote was down at startup; pending→accepted retries are
 	// the follow retrier's job, not the reconciler's.
 	FollowListInterval time.Duration
+	// DivergenceInterval is the reconciliation sweep's cadence
+	// (DIVERGENCE_INTERVAL, a Go duration, default 15m, must be positive).
+	//
+	// The sweep is always wired — both sides of every comparison are local, so
+	// it has nothing to be configured WITH — and this knob only decides how
+	// often the background pass refreshes the gauges. GET /admin/divergence
+	// runs one on demand regardless. It never writes anything (decision 19),
+	// which is what makes an always-on schedule safe.
+	DivergenceInterval time.Duration
 }
 
 // Load reads configuration from the environment. logger must not be nil;
@@ -579,6 +588,10 @@ func Load(logger *slog.Logger) (*Config, error) {
 	// only carries the knob.
 	cfg.FollowListPath = os.Getenv("FOLLOW_LIST_PATH")
 	cfg.FollowListInterval, err = durationVar(logger, "FOLLOW_LIST_INTERVAL", 15*time.Minute)
+	if err != nil {
+		return nil, err
+	}
+	cfg.DivergenceInterval, err = durationVar(logger, "DIVERGENCE_INTERVAL", 15*time.Minute)
 	if err != nil {
 		return nil, err
 	}

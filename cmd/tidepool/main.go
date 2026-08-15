@@ -482,6 +482,23 @@ func run(logger *slog.Logger) error {
 		go reconciler.Run(ctx)
 	}
 
+	// The reconciliation sweep (task 17e, decision 19). Unlike the follow
+	// reconciler there is nothing to gate it on: both sides of every comparison
+	// are local, so the database is the only dependency, and the sweep writes
+	// NOTHING — to peers or to our own tables — which is what makes running it
+	// on a schedule safe. The interval only sets how often the background pass
+	// refreshes the gauges; GET /admin/divergence runs one on demand.
+	divergence, err := ingest.NewDivergenceReconciler(ingest.DivergenceOptions{
+		DB:       database,
+		Interval: cfg.DivergenceInterval,
+		Logger:   logger,
+	})
+	if err != nil {
+		return err
+	}
+	admin.SetDivergenceReconciler(divergence)
+	go divergence.Run(ctx)
+
 	// The vote-aggregate XRPC (the AppView's side-channel read).
 	votesXRPC, err := votes.NewXRPC(votes.XRPCOptions{DB: database, Logger: logger})
 	if err != nil {

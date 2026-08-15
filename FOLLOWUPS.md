@@ -404,3 +404,110 @@ task documents and git history rather than this list.
   (delivered, plus held-for-settlement), but a delivery the worker has claimed
   and is POSTing right now is neither. Detecting it needs the peer's state,
   not ours. Belongs to 17e (reconciliation).
+
+## Deferred by 17e (reconciliation scoped to detect-only)
+
+17e reports divergence and never repairs it (decision 19). These are the repairs
+and the comparisons it deliberately did not build.
+
+- **The re-cast race, leg 1 — `upsert` clobbers a delivered vote.**
+  `internal/consume/votes.go` hardcodes `pending` on the vote write and
+  `internal/store/outbound_votes.go` `Upsert` sets
+  `delivered_state = EXCLUDED.delivered_state`, so re-casting a DELIVERED vote
+  resets the row to pending while Lemmy still holds the OLD vote in the OLD
+  direction: we subtract nothing and keep our stale vote. Transient normally,
+  PERMANENT if that delivery poisons. THE FIX, and it already has a model in
+  the tree: make the upsert refuse to write `pending` over `delivered` exactly
+  the way `SetDeliveredState` now refuses to write over `undone` (17d), so a
+  re-cast leaves a row that still owes an Undo. Vote-accounting change with its
+  own RED test — 17e's report is its regression oracle, which is why the report
+  ships first.
+
+- **The re-cast race, leg 2 — the settlement silently forgets the old vote.
+  Recorded nowhere before now.** `internal/outbound/worker.go` `voteCallback`
+  resolves via `GetByActivityID(activity.ActivityID)` and returns `nil` on
+  NotFound. After a re-cast the OLD Like's activity id no longer matches
+  `current_activity_id`, so when that in-flight old delivery lands the callback
+  no-ops and the delivery is marked delivered. The peer then demonstrably holds
+  a vote that NO `outbound_votes` column records at all. This is why 17e reads
+  divergence out of the delivery ledger (`outbound_activities` joined to
+  `outbound_deliveries`) rather than out of the vote row: the vote row is
+  exactly what the bug erases.
+
+- **REJECTED, with reasons, so it is not re-proposed: the "what the peer holds"
+  vs "what the user wants" column pair.** It changes the write path that feeds
+  a number users read — 17b's binding ruling pins `delivered_state = 'delivered'`
+  as a positive equality in `SeedAggregates`, and 17d made that correct only
+  because `undone` is terminal; a second pair forces the seeder, the purge's
+  `ListStandingForActor`, `voteCallback` and `CancelOutwardForActorTx` to each
+  re-decide which column they meant. It also relocates the uncertainty rather
+  than removing it: the pair's only honest maintainer is the delivery callback,
+  which is where leg 2 already lives — two things that can be wrong instead of
+  one, and then reconciliation has to reconcile *them*. Detection needs none of
+  it; `outbound_activities` is append-only and already durable.
+
+- **Instances that learned of an actor via search/WebFinger are unreachable by
+  any local comparison.** `DistinctInboxesForActor` is, in its own words, the
+  only record of which instances hold a user's content. Building the other side
+  would mean logging the requesting host of every WebFinger and actor-document
+  GET — a new surveillance log built to serve a deletion, which is the wrong
+  trade for an erasure feature. 17e's report states its own coverage bound
+  instead: the fan-out set is the delivery history. A reconciler reporting zero
+  here would be asserting completeness it cannot have.
+
+- **A delivery cancelled while mid-POST cannot be distinguished locally, and
+  the evidence is erased on purpose.** Every cancel statement writes
+  `claimed_until = NULL`, so after the cancel commits a row cancelled mid-flight
+  is byte-identical to one cancelled while idle. Recovering it needs a new
+  column plus edits to the five most safety-critical cancel statements in the
+  outbound package — to record a fact that still would not say whether the POST
+  landed. If ever wanted, the cheap version is `RETURNING` a count of rows with
+  `claimed_until > now()` at each cancel site, bumping a counter where the
+  decision is actually taken rather than reconstructing it later.
+
+- **A ban-caused cancellation is indistinguishable from a consent cancellation**
+  in `outbound_deliveries` — `cancelForActor`, the community cancel, the ban's
+  intersection cancel and the consent cancel all write the same `cancelled`
+  with no reason column. 17e reports the count rather than inventing the column.
+  `community_bans` is joinable on `(community_did, subject_did)` with
+  `expires_at IS NULL OR expires_at > now()`, so the reason is expressible
+  read-side today if an operator needs it.
+
+- **`bindFetch` own-id belt (noted in 17a, still unimplemented).** A typed
+  "refusing to fetch our own id" error in `internal/ingest/handler.go` would
+  cover the ancestor walk, bare-IRI announce, `resolveDelivered`, and
+  `handleUndoDelete`'s restore in ONE place. Explicitly NOT 17e's: it changes
+  what the inbound path processes, and a sub-run whose constraint is "report,
+  never act" should not ship a new drop site — on the highest-volume inbound
+  path, which already carries a recorded perf concern.
+
+- **The re-cast divergence sweep drives off a sequential scan of
+  `outbound_activities`, the highest-volume table in the system.** Confirmed by
+  `EXPLAIN` on the real schema: every other leg is index-served (the Undo
+  subquery rides `idx_outbound_activities_actor`, the delivered-delivery joins
+  ride `idx_outbound_deliveries_activity`, the ledger exclusion rides
+  `outbound_votes_actor_delivered_idx`), but the outer driver is a full scan
+  filtered on `kind IN ('Like','Dislike') AND parent_at_uri <> ''`, on every
+  sweep. Deliberately NOT fixed in 17e — adding an index there is a migration
+  whose write cost lands on the delivery worker's hot path, and the sweep runs
+  every 15 minutes against a table that is currently small. The fix when it is
+  needed:
+
+      CREATE INDEX outbound_activities_vote_subject_idx
+          ON outbound_activities (actor_did, parent_at_uri, created_at)
+          WHERE kind IN ('Like','Dislike');
+
+  It serves the driver and tightens the Undo subquery, which today index-scans
+  by `actor_did` and applies kind/parent_at_uri/created_at as residuals; a
+  sibling partial index on `kind = 'Undo'` finishes that half. Row estimates
+  from a near-empty test database are meaningless — the plan SHAPE is the
+  finding, so re-profile against production volumes before choosing.
+
+- **An acceptance with NO delivery row at all is not reported by the
+  acceptance-undelivered classes**, and this is stated in the query rather than
+  swallowed. All three classes are delivery states, and a row with no delivery
+  has none; folding it into the nearest class would misdescribe it. It should
+  not be reachable going forward — the acceptance record, the
+  `outbound_objects` row, the delivery enqueue and the `admissions` ledger row
+  all land in ONE transaction — so a test asserting it today would be vacuous.
+  If it is ever observed, it wants its own class, not a widened existing one.

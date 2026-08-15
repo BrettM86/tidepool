@@ -69,6 +69,7 @@ type AdminOptions struct {
 //	POST   /admin/communities/reconcile (follow list configured only)
 //	POST   /admin/reemit                {"did":"did:plc:..."} (or {} for all)
 //	POST   /admin/objects/sweep-deleted {"ap_ids":["https://..."]}
+//	GET    /admin/divergence            (reconciliation report; READ-ONLY)
 //	GET    /admin/metrics               (tidepool's own expvar counters)
 //
 // All endpoints require "Authorization: Bearer $ADMIN_TOKEN".
@@ -87,12 +88,20 @@ type Admin struct {
 	// endpoint answers 501) unless a follow list is configured. Set once
 	// during startup via SetFollowReconciler, before the server listens.
 	reconciler *FollowReconciler
+	// divergence serves GET /admin/divergence; nil (the endpoint answers
+	// 501) unless the reconciliation sweep is wired. Set once during
+	// startup via SetDivergenceReconciler, before the server listens.
+	divergence *DivergenceReconciler
 }
 
 // SetFollowReconciler wires the optional follow-list reconciler in after
 // construction (the reconciler itself needs the Admin's subscribe cores, so
 // it is necessarily built second).
 func (a *Admin) SetFollowReconciler(r *FollowReconciler) { a.reconciler = r }
+
+// SetDivergenceReconciler wires the optional reconciliation sweep in after
+// construction, as SetFollowReconciler does for the follow list.
+func (a *Admin) SetDivergenceReconciler(r *DivergenceReconciler) { a.divergence = r }
 
 // NewAdmin validates options and builds the Admin API.
 func NewAdmin(opts AdminOptions) (*Admin, error) {
@@ -145,6 +154,7 @@ func (a *Admin) Routes(r chi.Router) {
 		r.Post("/communities/reconcile", a.handleReconcile)
 		r.Post("/reemit", a.handleReemit)
 		r.Post("/objects/sweep-deleted", a.handleSweepDeleted)
+		r.Get("/divergence", a.handleDivergence)
 		r.Get("/outbound", a.handleOutboundInspect)
 		r.Post("/outbound/redrive", a.handleOutboundRedrive)
 		r.Post("/outbound/cancel", a.handleOutboundCancel)
@@ -529,6 +539,31 @@ func (a *Admin) handleBackfill(w http.ResponseWriter, r *http.Request) {
 // operator can converge right after editing the file instead of waiting for
 // the next tick. 501 when no follow list is configured (the handleBackfill
 // nil-dependency pattern).
+// handleDivergence serves the reconciliation report (task 17e, decision 19).
+//
+// GET, not POST, and that is a statement rather than a convention: this sweep
+// compares local state against local state and CHANGES NOTHING, so it is safe
+// to repeat, safe to cache-bust, and safe for an operator to hit while they are
+// still working out what is wrong. The moment it needed POST it would have
+// stopped being a report.
+//
+// A sweep failure is a 500 carrying the reason: a partial report would be a lie
+// about the classes it never reached, and this endpoint is operator-facing.
+func (a *Admin) handleDivergence(w http.ResponseWriter, r *http.Request) {
+	if a.divergence == nil {
+		http.Error(w, "divergence reconciliation is not configured", http.StatusNotImplemented)
+		return
+	}
+	report, err := a.divergence.Sweep(r.Context())
+	if err != nil {
+		a.logger.Error("divergence sweep failed", "error", err)
+		http.Error(w, "divergence sweep failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(report)
+}
+
 func (a *Admin) handleReconcile(w http.ResponseWriter, r *http.Request) {
 	if a.reconciler == nil {
 		http.Error(w, "follow list reconciliation is not configured", http.StatusNotImplemented)

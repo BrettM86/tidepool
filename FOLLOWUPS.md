@@ -279,17 +279,59 @@ task documents and git history rather than this list.
 
 ## Production rollout
 
-- Bluesky's public relay accepts new PDS hosts, but its documented default
-  allowance is only 100 accounts, 50 repo-stream events/second, 2,600/hour,
-  and 21,000/day. Tidepool mints one repo DID per bridged actor/community and
-  will exceed the account cap quickly. Arrange a relay limit increase before
-  broad subscriptions, or operate a suitably bootstrapped relay.
+RESOLVED — Bluesky's public-relay account cap (100 accounts, 50 ev/s) is no
+longer load-bearing: the self-hosted relay + Jetstream in
+`docker-compose.prod.yml` are the app's ingest path and carry only our two PDS
+hosts with an effectively unlimited account limit. `bsky.network` remains the
+wider-visibility path only. Runbook: `SELF_HOSTED_RELAY.md`.
+
+DOCUMENTED, not resolved — the v2 deploy gaps below now have a written home in
+`DEPLOY.md` (§6 "Not implemented") with their blast radius. Writing them down
+is not building them; they stay open here:
+
+- **No `BRIDGE_KEK` / per-actor RSA rotation path.** Nothing re-seals existing
+  ciphertext under a new KEK, and the binary's only subcommand is `migrate`
+  (no args = serve). Changing the KEK orphans every bridged identity's signing key
+  *and* the PLC escrow rotation key sealed under it (~950 identities, no
+  recovery). Would need a key-version selector on each sealed blob, a
+  dual-read custodian, an online re-seal pass, and a cutover.
+- **No backup or restore procedure.** `docker-compose.prod.yml` mounts
+  `./backups` into the Postgres container and nothing writes to it. Note
+  `BRIDGE_KEK` lives in `.env` and is not covered by any database backup at
+  all. Whatever is built needs a restore *drill* — an unverified backup is a
+  claim, not a capability.
+- **No divergence off switch.** The sweep is wired unconditionally, sweeps once
+  at startup, and `DIVERGENCE_INTERVAL=0` is refused by `durationVar`. The only
+  lever is a large interval. Defensible while the sweep stays read-only; revisit
+  if it is ever implicated in lock pressure.
+- **No outbound announcement rate limiter.** Decision 19 asks for "deliberate
+  throttling of initial actor announcements"; `internal/outbound` has no rate
+  limiter, and `MINT_RATE_PER_MINUTE`/`MINT_BURST` gate the **inbound** mint
+  path only (`ingest.NewMintGate`, materializer-only consumer). Today the
+  throttle is the canary itself: `OUTBOUND_WORKERS=1` plus a one-community
+  scope.
+- **Kill switches and every other knob are boot-time only.** Config is read once
+  at `cmd/tidepool/main.go:109` with no reload signal, so engaging a kill switch
+  during an incident requires a container recreate. A SIGHUP reload (or an
+  admin-write switch table) would cut that latency.
+- **Scoped kill switches are denylist-only.** There is no allowlist form, so a
+  one-community canary must enumerate every *other* subscribed community — and
+  adding a community to `communities.yaml` silently escapes an existing canary.
+
+Still open, unchanged:
+
 - `ENVIRONMENT=production` has not been exercised end-to-end. The harness uses
   development mode for migrations-on-start, HTTP/private fetching, and strict
   lexicon validation.
 - Production lexicon validation currently records a metric and writes the
   record instead of failing it. A strict-first rollout should happen only
   after `tidepool_lexicon_validation_failures` remains zero in production.
+- **Lemmy pin contradiction.** `e2e/lemmy/Dockerfile:35` pins
+  `LEMMY_VERSION=0.19.19`; PLAN decision 19 (`PLAN.md:430`) and
+  `tasks/18-e2e-deploy.md:21` name **0.19.20** as the pinned strictness ceiling
+  and e2e target, and the 0.19.20 source is cited as the authority for verified
+  behaviours across tasks 13/14/15/17. Either bump the Dockerfile or amend the
+  decision; until then, operator-facing docs say `0.19.x`.
 
 ## Sync surface
 
@@ -319,8 +361,11 @@ task documents and git history rather than this list.
   deadlock-avoidance property has no true concurrency test.
 - Vote subject resolution occurs outside the mutation transaction, leaving a
   narrow race with deletion.
-- Baseline-only voters can temporarily drift: a later flip or clear lacks a
-  per-voter baseline row to retract. A re-seed heals the aggregate.
+- Baseline-only voters can drift: a later flip or clear lacks a per-voter
+  baseline row to retract. A re-seed heals the aggregate — but nothing
+  re-seeds on a schedule (see "Nothing re-seeds periodically" above), so for a
+  quiet community that is never backfilled again the drift is permanent and
+  unreported. "Temporarily" was the wrong word.
 
 ## Materializer and storage
 

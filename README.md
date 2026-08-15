@@ -242,12 +242,24 @@ relays, or public Lemmy instances.
 
 ## Configuration
 
-Environment variables with logged dev defaults (see
-`internal/config/config.go`); everything below is **required in
-production**:
+All configuration is environment variables, read **once at process start**
+(`config.Load`) — there is no reload signal, so changing any value below means
+recreating the container.
+
+Two classes, and the difference matters at boot:
+
+- **Required in production** — `DATABASE_URL`, `LISTEN_ADDR`,
+  `BRIDGE_HOSTNAME`, `PLC_DIRECTORY_URL`, `BRIDGE_KEK`, `ADMIN_TOKEN`,
+  `AP_USER_ORIGIN`. These have *dev defaults only*; unset with
+  `ENVIRONMENT=production` the process refuses to start (`config: <NAME> is
+  required in production`). Fail-closed on purpose: every one of them is baked
+  into identities or authority, where a defaulted guess is worse than no boot.
+- **Tuning knobs** — everything else. Real defaults in every environment,
+  logged when applied.
 
 | Variable | Dev default | Meaning |
 |---|---|---|
+| `ENVIRONMENT` | `development` | `development` or `production`; any other value is refused at boot. Development enables migrations-on-start, dev defaults, and strict lexicon validation. Production additionally *refuses* `BRIDGE_SCHEME=http`, `ALLOW_PRIVATE_FETCH`, `ALLOW_DEV_REQUEST_CRAWL`, and `AP_HOST_FALLTHROUGH_DEV` |
 | `DATABASE_URL` | local dev postgres | bridge state |
 | `LISTEN_ADDR` | `:8091` | HTTP bind address |
 | `BRIDGE_HOSTNAME` | `localhost` | public domain of the bridge; anchors handles and the PDS endpoint in minted DID docs |
@@ -258,6 +270,8 @@ production**:
 | `USER_AGENT` | derived | outbound HTTP user agent |
 | `ALLOW_PRIVATE_FETCH` | off | dev-only: disables the SSRF egress guard (AP fetches **and** PLC directory requests) so localhost targets work |
 | `FIREHOSE_RETENTION` | `72h` | how long `firehose_events` rows are kept for `subscribeRepos` cursor replay (Go duration; a background pruner trims older events hourly) |
+| `MAX_BLOB_BYTES` | `5242880` (5 MiB) | outer transport budget for remote media (avatars, banners, post images) the materializer downloads per blob. Individual lexicon slots impose tighter caps (avatars 1 MB); this is the ceiling over all of them. Fails closed — oversized media is dropped, never truncated |
+| `PROFILE_REFRESH_TTL` | `24h` | how stale a bridged actor's materialized profile may get before the materializer re-fetches it. `Update{Person\|Group}` refreshes immediately regardless — this covers what Lemmy never federates (bio edits, and so the `#nobridge` marker) |
 | `RELAY_HOSTS` | *(optional)* | comma-separated relays to send `com.atproto.sync.requestCrawl` to on startup (each retried on a bounded budget — the relay calls back into `describeServer` before subscribing, which can race process start); in development the request is logged, never sent, unless `ALLOW_DEV_REQUEST_CRAWL` opts in |
 | `ALLOW_DEV_REQUEST_CRAWL` | off | dev-only: actually SEND `requestCrawl` to `RELAY_HOSTS` in development (exists for the e2e stack's local BigSky); refused in production, where sending is already the behavior |
 | `ADMIN_TOKEN` | `dev-admin-token` | bearer token protecting the `/admin` API |
@@ -280,13 +294,51 @@ production**:
 | `SYNC_MAX_SUBSCRIBERS` | `100` | concurrent `subscribeRepos` connection cap |
 | `FOLLOW_LIST_PATH` | *(optional)* | declarative follow list (see below); unset = the `/admin` API is the only subscription control |
 | `FOLLOW_LIST_INTERVAL` | `15m` | follow-list reconciler sweep cadence |
-| `CONSUMER_ENABLED` | **off** | turns on the task-14 Jetstream consumer (native users' opt-outs, profiles, posts, comments, votes → durable outbound state). Default off: it writes durable state and hands work to delivery seams that are still stubbed until tasks 15–17 land, so a deployment that has not been wired end to end should not silently start accumulating it. Enabling it now runs the pipeline with a logging-noop enqueuer (nothing is delivered), a nil acceptance engine (postv2 skipped), and nil destructive/terminal tiers (opt-out `deleteRemote` and account deletions recorded, not acted on) |
+| `DIVERGENCE_INTERVAL` | `15m` | cadence of the reconciliation sweep (task 17e) that compares atproto state against outbound state and publishes the `tidepool_divergence_*` gauges. **Not an on/off switch:** the sweep is wired unconditionally, runs once at startup before its first tick, and `0` is refused — it is read-only (it reports, never repairs), which is what makes an always-on schedule safe. `GET /admin/divergence` runs one on demand |
+| `DIVERGENCE_ACCEPTANCE_STALE_AFTER` | `12h` | how long a pending delivery may sit before the sweep reports its acceptance as **stale**. The report's one crying-wolf knob — shorter and every in-flight post is a finding, longer and a queue that stopped this morning is not in tonight's report. 12h is derived from the retry schedule (~2–3h to poison) plus the causal wait budget (6h), not picked |
+| `CONSUMER_ENABLED` | **off** | turns on the Jetstream consumer (task 14): native users' opt-outs, profiles, posts, comments and votes flowing outward. Default off because it writes durable outbound state, and because a deployment that has not been canaried should not start accumulating it — not because the seams behind it are stubbed. They are wired: with it on, the **real** enqueuer persists outbound intent, the acceptance engine admits postv2 and writes community-signed acceptances, and opt-out `deleteRemote` / confirmed account deletions actually purge at peers. It also gates two other things — the `OUTBOUND_WORKERS` AND, and whether `/admin/admissions*` exists at all |
 | `JETSTREAM_URL` | *(optional)* | the self-hosted Jetstream the consumer subscribes to (`ws://` or `wss://`); **required** when `CONSUMER_ENABLED`, and validated at boot whenever set so a typo fails fast instead of becoming a reconnect loop. May be staged ahead of the flag |
+| `OUTBOUND_WORKERS` | `0` (**off**) | how many delivery workers run. **There is no `OUTBOUND_ENABLED`:** delivery starts only when this is `>0` *and* `CONSUMER_ENABLED`. With the consumer on and this at `0`, outbound intent still accumulates durably and nothing is POSTed — which is the intended staging step, not a broken state. Raising it drains the accumulated backlog immediately |
+| `OUTBOUND_DISABLED` | off | global delivery kill switch. A blocked delivery is **parked** — it stays `pending` and resumes when the switch clears — never poisoned, never cancelled. Engaging it loses nothing; it stops the wire |
+| `OUTBOUND_DISABLED_HOSTS` | *(empty)* | comma-separated inbox **hosts** to park. Lowercased on load and compared case-insensitively — a kill switch must fail closed on case |
+| `OUTBOUND_DISABLED_COMMUNITIES` | *(empty)* | comma-separated community **AP ids** to park (`https://lemmy.world/c/comicstrips`), matched **exactly and case-sensitively** against the delivery's ordering key. There is no allowlist form: a one-community canary is spelled by disabling every other community |
+| `OUTBOUND_DISABLED_ACTORS` | *(empty)* | comma-separated actor **DIDs** to park, exact match |
+| `OUTBOUND_DRY_RUN` | off | translate and log every delivery, POST nothing. Parks like the kill switches, so nothing is lost — the difference is that the translation ran and is in the log |
+| `ADMISSION_MAX_PER_AUTHOR_PER_COMMUNITY` | `50` | acceptance-engine flood cap: how many posts one native author may have accepted into one bridged community. `0` = unlimited. Tidepool signs the community's acceptance, so this bounds what it vouches for |
 
-## Subscribing to communities (admin API)
+## The admin API
 
-Community subscriptions are operator-driven, over bearer-token-protected
-endpoints (`Authorization: Bearer $ADMIN_TOKEN`):
+Every route below is bearer-protected (`Authorization: Bearer $ADMIN_TOKEN`)
+and mounted on the bridge's own `Host`. Production publishes port
+`127.0.0.1:8091` on the box for exactly this — admin calls do not round-trip
+through Caddy.
+
+| Route | Purpose | Answers 501/404 when |
+|---|---|---|
+| `POST /admin/communities` | subscribe (WebFinger → Group → materialize → signed `Follow`) | — |
+| `DELETE /admin/communities` | unsubscribe (`Undo{Follow}`; records kept, content stops) | — |
+| `GET /admin/communities` | list subscriptions and their state | — |
+| `POST /admin/communities/backfill` | on-demand outbox backfill | backfill unconfigured (**501**) |
+| `POST /admin/communities/reconcile` | force one follow-list sweep | **501** — `FOLLOW_LIST_PATH` is unset. The reconciler is only built when the path is set, so this is "no follow list configured", not a broken endpoint |
+| `POST /admin/reemit` | re-emit a repo's records as delete+create pairs (relay cold-start gap) | repo manager unconfigured (**501**) |
+| `POST /admin/objects/sweep-deleted` | origin-verified cleanup of missed deletes | sweeper unconfigured (**501**) |
+| `GET /admin/divergence` | run one reconciliation sweep synchronously and return the report | always wired in a normal deployment |
+| `GET /admin/outbound` | delivery queue depth by state (`pending`/`poisoned`/`cancelled`/…) | — the store is always wired, so this answers even with the consumer off and workers at 0. An empty queue then is the truth, not a misconfiguration |
+| `POST /admin/outbound/redrive` | reset poisoned deliveries to pending | — |
+| `POST /admin/outbound/cancel` | park an actor's or a community's pending deliveries as cancelled | — |
+| `GET /admin/admissions` | list acceptance decisions with `status`, `decisionCode`, `evaluatedCid`; filter by `?status=`/`?community=` | **404** — these routes are registered **only** when `CONSUMER_ENABLED`. A 404 here means the consumer is off, not that the endpoint is broken |
+| `POST /admin/admissions/readmit` | force re-admit a rejected post | **404**, same reason |
+| `GET /admin/metrics` | expvar counters filtered to the `tidepool*` prefix (never Go's `cmdline`/`memstats`) | — |
+
+`POST /admin/outbound/redrive` **refuses an unscoped redrive**: send
+`{"activity":"…"}`, `{"community":"…"}`, or an explicit `{"all":true}`. A
+missing filter is a 400, never a silent fleet-wide replay of every poisoned
+delivery. `POST /admin/outbound/cancel` requires exactly one of
+`{"actor":"did:…"}` or `{"community":"https://…"}`.
+
+### Subscribing to communities
+
+Community subscriptions are operator-driven:
 
 ```sh
 # follow: WebFinger → fetch Group → materialize community → signed Follow
@@ -621,6 +673,35 @@ other bridged instance). The bridge then answers both resolution paths:
 Note TLS: a single wildcard certificate only covers one label level, while
 bridged handles sit two levels below `BRIDGE_HOSTNAME` — terminate TLS with
 on-demand certificate issuance (e.g. Caddy) or per-instance wildcard certs.
+
+## Production deploy
+
+The runbook is **[`DEPLOY.md`](DEPLOY.md)**: the boot-time config gate, the v2
+flag topology (`CONSUMER_ENABLED` → `OUTBOUND_WORKERS` → kill switches), the
+cross-repo Caddy change that puts the native-user AP surface on
+`coves.social`, the staged canary and its rollback order, and — explicitly —
+the things that have **no** mechanism today (KEK/RSA rotation, backup/restore,
+a divergence off switch, a periodic vote re-seed).
+[`SELF_HOSTED_RELAY.md`](SELF_HOSTED_RELAY.md) covers the relay + Jetstream
+ingest path.
+
+One thing to know before deploying HEAD onto an existing box: `AP_USER_ORIGIN`
+is required in production and was not in the pre-v2 env file, so the process
+fails at startup rather than coming up half-configured. That is the intended
+behaviour — see DEPLOY.md §1.
+
+### Support matrix
+
+| Peer | Status |
+|---|---|
+| **Lemmy 0.19.x** | targeted — the e2e target and strictness ceiling |
+| **PieFed** | best-effort, behind captured-wire conformance (votes arrive from anonymous per-user actors: fine for tallies, no per-voter identity) |
+| **Lemmy 1.0-beta** | tracked, not targeted (vote `FederationMode`, inbox collapsing, `NoteWrapper`) |
+| **Mastodon** | incidental — the `security/v1` context is published so its parser accepts our `publicKey`; not a target, not tested |
+
+The patch version is deliberately written as `0.19.x`: `e2e/lemmy/Dockerfile`
+pins `0.19.19` while decision 19 and the task docs name `0.19.20`. That
+contradiction is unresolved — see DEPLOY.md §7.
 
 ## License
 

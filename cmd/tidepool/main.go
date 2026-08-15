@@ -655,17 +655,19 @@ func run(logger *slog.Logger) error {
 //   - Enqueuer: the real persisting enqueuer is wired whenever CONSUMER_ENABLED
 //     (this function only runs then), so intents past the rev gate always
 //     persist to outbound_activities/deliveries. OUTBOUND_WORKERS>0 additionally
-//     starts the delivery workers that POST them; the noop enqueuer is used only
-//     when the consumer is disabled (this function does not run at all).
+//     starts the delivery workers that POST them. There is no "noop enqueuer"
+//     type — with the consumer off this function does not run at all.
 //
-// The task-16/17 seams are still nil ON PURPOSE, each a no-op the consumer
-// announces rather than a silent gap:
-//
-//   - Engine (task 16) nil means postv2 events are skipped at debug.
-//   - RemoteDeleter (task 17) nil means a deleteRemote opt-out is recorded and
-//     logged rather than acted on.
-//   - Terminator (task 17) nil means a deleted account is logged rather than
-//     withdrawn — never quietly downgraded to a delivery pause.
+// The task-16/17 seams are ALL WIRED as of tasks 16-17 (see below, where Engine,
+// Terminator and RemoteDeleter are constructed and passed). This comment
+// previously said they were "still nil ON PURPOSE" and described what each nil
+// would degrade to; that was true when it was written and became false without
+// anyone editing it, while the code 130 lines down did the opposite. It is
+// restated here rather than deleted because the degradation contract still
+// matters if a seam is ever unwired again: a nil seam ANNOUNCES its no-op
+// (postv2 skipped at debug, a deleteRemote opt-out recorded but not acted on, a
+// deleted account logged rather than withdrawn) and is never quietly downgraded
+// to a delivery pause.
 func startConsumer(
 	ctx context.Context,
 	cfg *config.Config,
@@ -697,8 +699,8 @@ func startConsumer(
 	// writes outbound_activities/deliveries inside the consumer's gate tx, so an
 	// intent past the gate is never dropped. OUTBOUND_WORKERS gates only whether
 	// the delivery WORKER goroutines run — with workers=0, state accumulates but
-	// nothing is POSTed. (The noop enqueuer is reserved for the consumer-disabled
-	// path, where nothing runs at all.)
+	// nothing is POSTed. (There is no noop enqueuer type: with the consumer
+	// disabled this function does not run at all.)
 	inboxes := outbound.NewInboxResolver(apClient, outboundInboxTTL)
 	enqueuer, err := outbound.NewEnqueuer(outbound.EnqueuerOptions{
 		DB:         database,

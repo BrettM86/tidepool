@@ -129,8 +129,10 @@ type Config struct {
 	JetstreamURL string
 	// OutboundWorkers is how many delivery workers to run (OUTBOUND_WORKERS,
 	// default 0 = OFF). Delivery starts ONLY when this is >0 AND
-	// ConsumerEnabled: until a deployment is wired end to end, the consumer
-	// still records outbound state but the noop enqueuer federates nothing.
+	// ConsumerEnabled. With the consumer on and workers at 0 the REAL enqueuer
+	// still persists every intent to outbound_activities/deliveries inside the
+	// gate transaction — state accumulates and nothing is POSTed, so raising
+	// workers later drains the backlog rather than starting from empty.
 	OutboundWorkers int
 	// AdmissionMaxPerAuthorPerCommunity caps how many posts one native author may
 	// have accepted into one bridged community — the acceptance engine's flood
@@ -496,8 +498,8 @@ func Load(logger *slog.Logger) (*Config, error) {
 	}
 
 	// Outbound delivery (task 15), default OFF: workers start only when
-	// OUTBOUND_WORKERS>0 AND the consumer is on, so a not-yet-wired deployment
-	// keeps the noop enqueuer and federates nothing.
+	// OUTBOUND_WORKERS>0 AND the consumer is on. At 0 the enqueuer still writes
+	// outbound state; only the POSTing stops.
 	cfg.OutboundWorkers, err = intVarNonNegative(logger, "OUTBOUND_WORKERS", 0)
 	if err != nil {
 		return nil, err

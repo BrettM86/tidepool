@@ -561,8 +561,23 @@ const parkDelay = 5 * time.Second
 
 // park holds a kill-switched or dry-run delivery: it stays pending, scheduled a
 // REAL delay into the future so it is not instantly re-claimable, and never
-// poisons. Release does not touch the attempt counter, so a park is not a
-// failure and does not itself advance the poison budget.
+// poisons — park does not call poison, and no state here is terminal.
+//
+// IT DOES, HOWEVER, ADVANCE THE POISON BUDGET, and this comment used to claim
+// the opposite. Release's SET clause does not touch `attempts` — but ClaimNext
+// already did `attempts = attempts + 1` to get here (store/outbound_deliveries.go),
+// and nothing ever puts it back. So a delivery parked for parkDelay is
+// re-claimed ~5s later, +1 again, and a kill switch held for ~40s exhausts
+// maxAttempts. The delivery does not poison while parked, but the first
+// retryable failure AFTER the switch clears sees Attempts >= maxAttempts in
+// releaseOrPoison and poisons instead of retrying.
+//
+// Only RedrivePoisoned resets attempts to 0, and only for rows already in
+// 'poisoned' — i.e. the repair exists but runs after the fall, not instead of
+// it. Fixing this means teaching the store to distinguish "retryable failure,
+// back off" (increment is correct) from "parked by a switch" (it is not);
+// see FOLLOWUPS.md, "Outbound delivery (task 15)". Documented deliberately
+// rather than patched here: it needs a failing test first.
 func (w *Worker) park(ctx context.Context, delivery *store.OutboundDelivery, class, reason string) error {
 	next := time.Now().Add(parkDelay)
 	_, _, err := w.deliveries.Release(ctx, delivery.ActivityID, delivery.TargetInbox, class, reason, 0, next, *delivery.ClaimedUntil)
@@ -576,8 +591,13 @@ func (w *Worker) park(ctx context.Context, delivery *store.OutboundDelivery, cla
 // parkCausal holds a causally-ineligible delivery WITHOUT a future delay: a held
 // child must become claimable the instant its bridge-origin parent is accepted
 // (in practice the parent, a lower-seq delivery on the same serial line, is
-// delivered first, so this rarely re-fires). Like park it never poisons and does
-// not advance the poison budget; the causal wait is bounded by wall clock.
+// delivered first, so this rarely re-fires). Like park it never poisons — but,
+// like park, it DOES advance the poison budget, because ClaimNext incremented
+// attempts and Release never puts it back (see park's doc above; this comment
+// previously asserted the opposite). What keeps that from mattering here is the
+// wall-clock bound: causalStatus poisons on the CausalWaitBudget deadline, not
+// on the attempt count, so a held child's outcome is decided by elapsed time
+// even after its retry budget is spent.
 func (w *Worker) parkCausal(ctx context.Context, delivery *store.OutboundDelivery, class, reason string) error {
 	_, _, err := w.deliveries.Release(ctx, delivery.ActivityID, delivery.TargetInbox, class, reason, 0, time.Now(), *delivery.ClaimedUntil)
 	if err != nil {

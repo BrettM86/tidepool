@@ -124,12 +124,38 @@ transaction, so intent past the gate is never dropped
 (`cmd/tidepool/main.go:695-713`). Raising `OUTBOUND_WORKERS` later drains
 whatever accumulated, immediately. Budget for that.
 
-**`OUTBOUND_DISABLED` parks, it does not fail.** A blocked delivery stays
-`pending` and resumes when the switch clears; it is never poisoned and never
-cancelled (`internal/outbound/worker.go:235-242`,
-`internal/outbound/switches.go:5-12`). Engaging a kill switch loses nothing.
-`OUTBOUND_DRY_RUN` parks the same way, after translating and logging
-(`worker.go:243-248`).
+**`OUTBOUND_DISABLED` parks, it does not fail — but parking is not free.** A
+blocked delivery stays `pending` and resumes when the switch clears; `park`
+itself never poisons and never cancels (`internal/outbound/worker.go:242-244`,
+`internal/outbound/switches.go:5-12`). `OUTBOUND_DRY_RUN` parks the same way,
+before any signing or POST (`worker.go:245-249`).
+
+⚠️ **A park still consumes the delivery's retry budget, and fast.** `ClaimNext`
+does `attempts = attempts + 1` on every claim
+(`internal/store/outbound_deliveries.go:143`), and `park` settles through
+`Release`, whose `SET` clause updates `claimed_until`, `next_attempt_at`,
+`last_error_class`, `response_excerpt`, `last_status_code` and `updated_at` —
+and **never resets `attempts`** (`outbound_deliveries.go:218-221`). A parked
+delivery is rescheduled `parkDelay = 5 * time.Second` out (`worker.go:560`), so
+with workers running, each ordering key's head delivery is re-claimed and
+re-parked roughly every five seconds and its
+`DefaultMaxDeliveryAttempts = 8` budget (`worker.go:78`) is exhausted in about
+**40 seconds**. Nothing poisons *while* parked — `park` never calls `poison` —
+but once the switch clears, the **first** retryable failure finds
+`Attempts >= maxAttempts` and poisons immediately instead of retrying
+(`worker.go:512-518`). An hour-long global kill switch leaves every head
+delivery with hundreds of attempts and zero retries left.
+
+It is also a continuous write load: one `UPDATE` per parked head roughly every
+five seconds, per ordering key, for as long as the switch is engaged.
+
+**The remedy is `POST /admin/outbound/redrive`.** `RedrivePoisoned` sets
+`attempts = 0` along with `state = 'pending'`
+(`internal/store/outbound_deliveries.go:613-617`), so a redrive restores a full
+budget. It only matches `state = 'poisoned'` (`:619`), so it repairs the damage
+after a delivery has already fallen over, rather than preventing it. **To park
+everything, prefer `OUTBOUND_WORKERS=0`** — see [Rollback](#rollback). The
+underlying defect is tracked in `FOLLOWUPS.md`.
 
 Scope matching, from `config.go:519-525`:
 
@@ -141,6 +167,43 @@ Scope matching, from `config.go:519-525`:
 
 There is no allowlist form of any of these. See
 [Staged rollout](#5-staged-rollout) for what that means for a canary.
+
+**Every switch in that table — and `OUTBOUND_DISABLED` and `OUTBOUND_DRY_RUN`
+with them — is INERT while `OUTBOUND_WORKERS=0`.** `ConfigSwitches` is only
+constructed inside `if cfg.OutboundWorkers > 0`
+(`cmd/tidepool/main.go:716-736`), so with no worker there is nothing holding a
+switch and nothing consulting one. Setting `OUTBOUND_DISABLED=true` while
+workers are 0 changes nothing and confirms nothing; it is not a second belt.
+Conversely, that is also why `OUTBOUND_WORKERS=0` costs nothing: no worker
+exists to claim, park, or spend attempts.
+
+### Confirming a switch actually engaged
+
+`internal/outbound/metrics.go:10-13` publishes four counters, all under
+`/admin/metrics`:
+
+| Metric | Bumped when |
+|---|---|
+| `tidepool_outbound_delivered` | a delivery reached the peer (incl. Lemmy's duplicate-ack) |
+| `tidepool_outbound_poisoned` | a delivery hit a terminal failure |
+| `tidepool_outbound_cancelled` | the **worker** cancelled a claimed delivery on consent state — its only call site (`worker.go:292`) |
+| `tidepool_outbound_parked` | a kill-switch, dry-run, **or causal-wait** deferral |
+
+`tidepool_outbound_parked` is the only **positive** confirmation that a kill
+switch engaged: `by_state` still reads `pending` for a parked delivery, exactly
+as it does for one merely waiting its turn, so the queue view cannot tell you.
+Read it as a rate, not a level — a parked head is re-parked every ~5s, so the
+counter climbs continuously while a switch is held. That climb *is* the budget
+being spent.
+
+Two caveats on it. It is shared with `parkCausal`, so a nonzero `parked` with no
+switch engaged means causal waits, not an operator action. And
+`tidepool_outbound_cancelled` rises **on its own** during rollout: the worker
+cancels a claimed delivery whenever the actor is disabled, delivery-paused, or
+opted out (`internal/outbound/worker.go:281-296`). That is the counter's only
+increment site, so a climbing `cancelled` is consent doing its job and is never
+evidence that somebody ran `POST /admin/outbound/cancel` — the admin cancel does
+not touch this metric, and shows up only in `by_state`.
 
 ---
 
@@ -179,6 +242,12 @@ of `actor` or `community` (`follow.go:236-239`).
 store is wired unconditionally (`cmd/tidepool/main.go:454`), so an empty
 `by_state` map is the truth about the queue, not a symptom of misconfiguration.
 
+**It is also the whole route.** `by_state` counts are *all* it returns
+(`internal/ingest/follow.go:172-183`) — no rows, no ids, no reasons. There is
+no admin endpoint that exposes `last_error_class` or `response_excerpt`, so
+"inspect, fix, then redrive" means psql on the box; the query is in
+[Step 3](#step-3--widen). Plan for that before the incident, not during it.
+
 ```sh
 T="Authorization: Bearer $ADMIN_TOKEN"
 curl -s -H "$T" localhost:8091/admin/outbound            # queue depth by state
@@ -203,8 +272,23 @@ the Coves side.
 on the **Coves** hostname, served by the Tidepool process. Tidepool's Host
 router sends requests whose `Host` is `coves.social` to the persona surface, and
 everything under `tdpl.io` to the bridge (`internal/personas/hostrouter.go:89-115`).
-Caddy currently proxies `coves.social` entirely to the AppView, so **none of
-those AP paths reach Tidepool today.**
+**None of those AP paths reach Tidepool today** — but not because Caddy sends
+the whole hostname to the AppView. The existing `coves.social` site block
+(`~/Code/coves/Caddyfile`, block opens at `:70`; routing runs `:72-117`)
+already splits the hostname four ways:
+
+| Path | Today's handler |
+|---|---|
+| `/.well-known/*` | static `file_server` over `/srv` (`Caddyfile:72`) |
+| `/client-metadata.json` | static `file_server` over `/srv` (`Caddyfile:79`) |
+| `/img/*` | 301 to `img.coves.social` (`Caddyfile:97`) |
+| everything else | catch-all `reverse_proxy appview:8080` (`Caddyfile:102`) |
+
+Only the catch-all reaches the AppView. That matters for the before/after diff:
+`GET /.well-known/webfinger` today returns a **static-file-server 404** from
+`/srv`, not an AppView response, and `GET /nodeinfo/2.0` and `/ap/*` fall to the
+AppView. So the signature to look for before the change is a bare 404 on
+webfinger — and after it, a Tidepool JRD.
 
 The apex needs a content-negotiated split, and Tidepool deliberately cannot do
 it itself: `internal/personas/instance.go:32-34` states in its own comment that
@@ -405,6 +489,17 @@ Two reading rules for those keys:
   for "storage could not be read" (`internal/consume/metrics.go:26-30`), chosen
   because a `0` would claim the backlog is empty at exactly the moment nobody
   can tell.
+- **The `tidepool_divergence_*` gauges use the same `-1` convention**, for the
+  same reason (`internal/ingest/divergence.go:166-175`, `divergenceUnswept`).
+  Because they are published at package init, they are present from process
+  start — reading `-1` until the startup sweep completes, and again for any
+  class a failed sweep never wrote. `-1` is "never measured", `0` is "measured,
+  nothing diverging"; do not alert on them as if both meant healthy.
+- **The four `tidepool_outbound_*` counters are absent until the first delivery
+  worker touches them** — they are `expvar.NewInt` at package init in
+  `internal/outbound/metrics.go:10-13`, so the keys exist once the package is
+  linked, but they sit at 0 while `OUTBOUND_WORKERS=0`. A flat 0 across all four
+  at this step is exactly right.
 
 Check the rejections before letting anything out. A misconfigured
 `ADMISSION_MAX_PER_AUTHOR_PER_COMMUNITY`, a stale community mapping, or a
@@ -436,10 +531,21 @@ denylist.** The reconciler will subscribe it and it will start federating on
 the next sweep. Whenever the follow list grows during a canary, extend
 `OUTBOUND_DISABLED_COMMUNITIES` in the same change.
 
-Optionally precede this with `OUTBOUND_DRY_RUN=true` for one cycle: every
-delivery is translated and logged, nothing is POSTed, and the parked deliveries
-resume when you clear it. That validates the translator against real records
-without touching a peer.
+**`OUTBOUND_DRY_RUN=true` is a weaker instrument than it sounds, and it is not
+free.** What it does: the worker claims a delivery, logs it, and parks before
+signing or POSTing (`internal/outbound/worker.go:245-249`). What it does **not**
+do is validate the translator. **Translation happens at ENQUEUE time**, inside
+the consumer's gate transaction (`cmd/tidepool/main.go:703-710`), and the worker
+POSTs the stored payload verbatim (`worker.go:309`, `:319`). By the time a
+delivery is claimable its payload has already been translated and persisted — so
+the moment `CONSUMER_ENABLED=true`, the translator has already run on everything,
+dry run or not. Step 1 is where you check its output (read
+`outbound_activities.payload` in psql), not here.
+
+And because dry-run parks, it carries the same budget cost as any other park:
+each head delivery is re-claimed every ~5s and burns its 8 attempts in ~40
+seconds (see [§2](#2-the-v2-flag-topology)). A "one cycle" dry run is measured
+in seconds, not hours, and wants a `redrive` after it.
 
 ### On announcement throttling — what actually exists
 
@@ -450,7 +556,7 @@ Decision 19 asks for "deliberate throttling of initial actor announcements".
 `docker-compose.prod.yml`, because the public `plc.directory` 429s mint bursts
 during community backfill) gate **inbound** DID minting only. They are wired
 into `ingest.NewMintGate`, whose sole consumer is the materializer's minter
-(`cmd/tidepool/main.go:271-276`, `:314`) — the path where an unseen *Lemmy*
+(`cmd/tidepool/main.go:271-276`, `:315`) — the path where an unseen *Lemmy*
 author gets an atproto DID.
 
 **There is no rate limiter on the outbound side.** `internal/outbound` contains
@@ -492,6 +598,27 @@ What each one means:
 
 - **`by_state.poisoned` climbing** — deliveries exhausting their retries.
   Inspect, fix, then `redrive` **scoped** to the affected community.
+
+  **There is no admin inspect surface for the "why".** `GET /admin/outbound`
+  returns `by_state` and nothing else (`internal/ingest/follow.go:172-183`) — a
+  count, no rows, no reasons. The columns that carry the diagnosis,
+  `last_error_class` and `response_excerpt`, are written by the worker but
+  exposed on no route; reading them means psql on the box:
+
+  ```sh
+  docker exec -i tidepool-prod-postgres psql -U tidepool -d tidepool -c "
+    SELECT ordering_key, last_error_class, last_status_code, attempts,
+           left(response_excerpt, 200) AS excerpt, updated_at
+      FROM outbound_deliveries
+     WHERE state = 'poisoned'
+     ORDER BY updated_at DESC LIMIT 50;"
+  ```
+
+  Check `attempts` in that output before concluding the peer rejected anything:
+  a delivery whose budget was spent by a held kill switch (see
+  [§2](#2-the-v2-flag-topology)) poisons on its first real failure with an
+  `attempts` far above 8 and an error class that describes one attempt, not
+  eight.
 - **echo drop counters rising steadily** — expected and healthy: our own
   content arriving back from Lemmy and being correctly refused. A counter at
   **zero** while native content is flowing is the alarming case; it means
@@ -514,13 +641,27 @@ step being one `.env` edit plus `up -d tidepool`:
 
 1. **`OUTBOUND_DISABLED_COMMUNITIES=<the bad one>`** — park one community.
    Everything else keeps flowing; the parked deliveries resume when you clear
-   it.
-2. **`OUTBOUND_DISABLED=true`** — park everything outbound. The consumer keeps
-   running and keeps recording intent; nothing reaches any peer. This is the
-   big red button and it is **lossless**.
-3. **`OUTBOUND_WORKERS=0`** — stop the workers entirely. Equivalent effect to
-   (2) for delivery; prefer (2), because a parked delivery carries a recorded
-   reason and a stopped worker does not.
+   it. First because it is the *narrowest*, not because it is free: it is a
+   park, so it spends that community's head delivery's retry budget at the same
+   ~5s cadence as (3). Redrive that community after clearing it.
+2. **`OUTBOUND_WORKERS=0`** — stop the workers entirely. This is the big red
+   button for delivery. The consumer keeps running and keeps recording intent;
+   nothing reaches any peer. `NewWorker` is only called inside
+   `if cfg.OutboundWorkers > 0` (`cmd/tidepool/main.go:716`), so at 0 there is
+   no worker to claim anything: nothing is re-claimed, no `attempts` are spent,
+   and no rows are written. It costs nothing and it is genuinely lossless.
+3. **`OUTBOUND_DISABLED=true`** — park everything outbound. Same *observable*
+   effect as (2) — nothing reaches any peer — but **it is not free, and it is
+   ranked below (2) for that reason.** The workers keep running, so every
+   ordering key's head delivery is re-claimed and re-parked every ~5s and burns
+   its 8-attempt budget in ~40 seconds (see [§2](#2-the-v2-flag-topology)). The
+   deliveries this switch exists to protect are exactly the ones left with no
+   retries. Reach for it only when you need the *scope* it gives you and a
+   whole-worker stop is too blunt — and expect to `redrive` afterwards, which
+   is the only thing that resets `attempts`
+   (`internal/store/outbound_deliveries.go:613-617`). The one thing (3) buys
+   over (2) is that each parked row carries a recorded `last_error_class` /
+   `response_excerpt`; a stopped worker records nothing.
 4. **`CONSUMER_ENABLED=false`** — stop consuming. Intent stops being recorded.
    The consumer resumes from its stored cursor when re-enabled, so this is
    recoverable, but it is the only step that stops *observing*, and
@@ -555,25 +696,60 @@ re-seals existing ciphertext under a new key: the binary has exactly two
 subcommands, `tidepool` and `tidepool migrate`
 (`cmd/tidepool/main.go:69-78`).
 
-Blast radius of losing or changing it: every per-actor RSA signing key for
-every bridged identity is sealed under it, plus the PLC **escrow rotation
-key** (`internal/identity/keys.go:140-144`). Change the KEK and every one of
-those ciphertexts becomes undecryptable — no bridged actor can sign, and the
-escrow key that could recover the DIDs is itself sealed under the key you just
-replaced. Approximately 950 identities. There is no recovery.
+Blast radius of losing or changing it — **three** tables, not two:
+
+1. **`bridged_actors.signing_key`** — the escrowed **secp256k1 atproto** repo
+   signing key of every bridged (Lemmy-origin) identity
+   (`internal/db/migrations/002_create_bridged_actors.sql:14`,
+   `internal/identity/keys.go:86-96`). Approximately 950 of them.
+2. **`service_keys.key_material`, row `plc-rotation`** — the PLC **escrow
+   rotation key** (`internal/identity/keys.go:140-144`), the one thing that
+   could recover the DIDs, itself sealed under the key you just replaced. Note
+   the column is `key_material`, not `private_key_pem`; migration 013 renamed
+   it precisely because only this row is ciphertext — the sibling
+   `service-actor` row is **plaintext** PKCS#8 PEM and is *not* KEK-sealed
+   (`internal/db/migrations/013_rename_service_key_column.sql`).
+3. **`ap_actors.rsa_key_sealed`** — **every NATIVE Coves user's ActivityPub RSA
+   signing key**, sealed under the same KEK under its own AAD prefix
+   (`internal/db/migrations/017_ap_actors.sql:46`,
+   `internal/identity/keys.go:39-53`). Written at mint time in
+   `internal/personas/personas.go:185`, through the same `identity.Custodian`
+   handed to `personas.New` at `cmd/tidepool/main.go:521-527`.
+
+**(3) is the v2 one, and it is the one a rotation plan will forget**, because
+it did not exist when this section was first written. A rotation built to
+handle only `bridged_actors` and `service_keys` would leave every native user
+unable to sign a single outbound activity — the exact population v2 exists to
+serve. Change the KEK and all three sets of ciphertext become undecryptable.
+There is no recovery.
 
 *Naming trap:* `LoadOrCreateRotationKey` is **not** KEK rotation. It loads or
 generates the did:plc escrow/recovery key — an atproto identity concept —
 which is itself sealed under the KEK. Do not read that symbol as evidence that
 rotation is implemented.
 
-What a real rotation would require, none of which exists: a key-version
-column or KEK-id alongside each sealed blob; a dual-read custodian that tries
-the new KEK then the old; an online re-seal pass over `bridged_actors` and
-`service_keys`; and a cutover that retires the old KEK only after the pass
-completes. The ciphertext does carry a one-byte version prefix
-(`internal/identity/keys.go:127`), which is a hook someone could build on, but
-nothing reads it as a key selector today.
+What a real rotation would require:
+
+- **A key-version column or KEK-id alongside each sealed blob.** *Partly
+  present, and this is worth knowing before anyone designs it from scratch.*
+  `ap_actors` **already has one**: `rsa_key_version INT NOT NULL`
+  (`internal/db/migrations/017_ap_actors.sql:47`), and that migration's own
+  comment says it is there so "rotation [is] definable without a schema change"
+  (`:23-24`). It is stamped from `currentRSAKeyVersion = 1`
+  (`internal/personas/personas.go:25`, applied at `:185`) and read back, but
+  **nothing uses it as a selector** — no code branches on it to choose a KEK.
+  So on `ap_actors` the schema work is done and only the logic is missing.
+  `bridged_actors.signing_key` and `service_keys.key_material` genuinely have
+  no version column; those two need the migration as well.
+- **A dual-read custodian** that tries the new KEK then the old.
+- **An online re-seal pass** over all three tables above — `ap_actors`
+  included, which is the one a v1-era plan omits.
+- **A cutover** that retires the old KEK only after the pass completes.
+
+The ciphertext also carries a one-byte version prefix
+(`internal/identity/keys.go:127`) — but that is the *envelope format* version,
+checked for equality and rejected otherwise, not a key id. Neither it nor
+`rsa_key_version` selects a key today.
 
 Per-actor **RSA** rotation is equally undefined: rotating an actor's key means
 republishing `publicKey` in its actor document and having every peer that
@@ -585,7 +761,7 @@ somewhere that survives the loss of the server.**
 
 ### Backup and restore
 
-**No procedure exists, and no tooling.** `docker-compose.prod.yml:46` mounts
+**No procedure exists, and no tooling.** `docker-compose.prod.yml:53` mounts
 `./backups:/backups` into the Postgres container. Nothing writes to it. There
 is no cron, no `pg_dump` wrapper, no restore drill, and no documented RPO/RTO.
 
@@ -593,8 +769,11 @@ What is at risk, in order of irreplaceability:
 
 1. **`BRIDGE_KEK`** — lives in `/opt/tidepool/.env`, not in Postgres, and is
    not covered by any database backup. Losing it is unrecoverable (above).
-2. **`bridged_actors` / `service_keys`** — the sealed signing keys. Losing
-   these loses the identities even if the KEK survives.
+2. **`bridged_actors` / `service_keys` / `ap_actors`** — the sealed signing
+   keys, for bridged identities, the PLC escrow key, **and every native Coves
+   user** respectively. Losing these loses the identities even if the KEK
+   survives. `ap_actors` is easy to omit from a v1-era backup scope; it is the
+   whole native-user population.
 3. **Repo blocks and commits** — the atproto repos themselves. Re-derivable
    from upstream only by re-bridging, which mints new DIDs; the old at-uris do
    not come back.

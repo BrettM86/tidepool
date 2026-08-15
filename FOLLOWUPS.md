@@ -63,6 +63,68 @@ task documents and git history rather than this list.
 
 ## Outbound delivery (task 15)
 
+- **DEFECT, NOT DONE — a PARK spends the poison budget, so the kill switch
+  destroys the retries of exactly the deliveries it exists to protect.**
+  Found 2026-08-14 while fact-checking `DEPLOY.md`; the docs and the two park
+  doc-comments have been corrected to describe it, and **nothing about the
+  behaviour was changed.** It needs its own test-first subtask.
+
+  *Mechanism.* `ClaimNext` does `attempts = attempts + 1` on every claim
+  (`internal/store/outbound_deliveries.go:143`). `park` and `parkCausal` settle
+  through `Release`, whose `SET` clause updates `claimed_until`,
+  `next_attempt_at`, `last_error_class`, `response_excerpt`, `last_status_code`
+  and `updated_at` — and never resets `attempts`
+  (`outbound_deliveries.go:218-221`). `parkDelay = 5 * time.Second`
+  (`internal/outbound/worker.go:560`) and `DefaultMaxDeliveryAttempts = 8`
+  (`worker.go:78`), so with `OUTBOUND_DISABLED=true` and workers running, each
+  ordering key's head delivery is re-claimed and re-parked about every five
+  seconds and its entire retry budget is gone in roughly **40 seconds**.
+
+  *Why it is not caught by "park never poisons".* It isn't — `park` genuinely
+  never calls `poison`, which is what made the old comments read as true. The
+  damage lands later: `releaseOrPoison` poisons on the FIRST retryable failure
+  once `Attempts >= maxAttempts` (`worker.go:512-518`). So an hour-long kill
+  switch leaves head deliveries with hundreds of attempts and zero retries, and
+  the next transient 5xx or dial timeout poisons them immediately. `parkCausal`
+  shares the mechanism but is materially safer: `causalStatus` bounds the causal
+  wait by WALL CLOCK from `delivery.CreatedAt`, never by attempt count, so a
+  held child's outcome is still decided by elapsed time. It is exposed only for
+  a genuine delivery failure after the parent lands.
+
+  *Remedy that exists today, and its limit.* `RedrivePoisoned` sets
+  `attempts = 0` (`outbound_deliveries.go:613-617`), but it matches
+  `state = 'poisoned'` only (`:619`) — it repairs after the fall, and cannot
+  pre-empt it. `OUTBOUND_WORKERS=0` avoids the whole problem (no worker is
+  constructed, `cmd/tidepool/main.go:716`) and `DEPLOY.md` §5 now ranks it above
+  `OUTBOUND_DISABLED` for that reason.
+
+  *Shape of a real fix — this is the design question, not a settled plan.*
+  `Release` is a single statement serving two callers that mean opposite
+  things, and it cannot tell them apart: a **retryable failure** (where holding
+  the incremented `attempts` is exactly right — that is the backoff working)
+  from a **park by an operator switch or a causal hold** (where it is not; the
+  delivery never reached the wire and nothing was learned about the peer). Two
+  candidate directions, with the trade to be argued in the subtask:
+  - a **park-specific release** — a sibling statement, or a flag on `Release`,
+    that writes `attempts = attempts - 1` / `attempts = $n` so a park is
+    attempt-neutral. Cheapest and most local, but adds a second write path
+    through the most fencing-sensitive statement in the package, and a park
+    that "un-counts" must not be able to underflow or to un-count a real
+    attempt on a re-claim race.
+  - **reset on unpark** — leave the increment and clear `attempts` when a
+    delivery next passes the switch gate. Keeps `Release` single-purpose, but
+    the reset then lives on the hot path and has to distinguish "was parked"
+    from "was retried", which today is only knowable from `last_error_class`
+    (`switch_parked` / `dry_run` / the causal classes) — i.e. it would make an
+    error-class string load-bearing for a correctness decision.
+
+  A RED test should pin the operator-visible fact rather than the column: with
+  the switch engaged, drive N claim/park cycles well past `maxAttempts`, clear
+  the switch, then fail the delivery once retryably and assert it is
+  **rescheduled, not poisoned**. Note that any fix must keep `parkCausal`'s
+  wall-clock poison reachable — a naive "parks never advance anything" change
+  must not also disarm the causal budget.
+
 - **outbound_deliveries.ClaimNext lacks a standalone `seq` index.** The
   loose-scan CTE builds the head set via the `(ordering_key, seq)` partial
   index, but the outer `c.seq = ANY(ARRAY(...)) FOR UPDATE` re-check has no
@@ -291,10 +353,19 @@ is not building them; they stay open here:
 
 - **No `BRIDGE_KEK` / per-actor RSA rotation path.** Nothing re-seals existing
   ciphertext under a new KEK, and the binary's only subcommand is `migrate`
-  (no args = serve). Changing the KEK orphans every bridged identity's signing key
-  *and* the PLC escrow rotation key sealed under it (~950 identities, no
-  recovery). Would need a key-version selector on each sealed blob, a
-  dual-read custodian, an online re-seal pass, and a cutover.
+  (no args = serve). Changing the KEK orphans sealed key material in **three**
+  tables, not two: `bridged_actors.signing_key` (~950 bridged identities'
+  escrowed secp256k1 repo keys), `service_keys.key_material` row `plc-rotation`
+  (the PLC escrow key, the only DID recovery path), and — added by v2, and the
+  one a pre-v2 plan omits — `ap_actors.rsa_key_sealed`, **every native Coves
+  user's AP signing key** (`internal/db/migrations/017_ap_actors.sql:46`). No
+  recovery for any of it. Would need a key-version selector on each sealed
+  blob, a dual-read custodian, an online re-seal pass over all three, and a
+  cutover. Partial credit on the first: `ap_actors.rsa_key_version` already
+  exists (`017_ap_actors.sql:47`, stamped from `currentRSAKeyVersion = 1` at
+  `internal/personas/personas.go:25`) and is deliberately there so rotation is
+  definable without a schema change — but nothing reads it as a selector, and
+  the other two tables have no version column at all.
 - **No backup or restore procedure.** `docker-compose.prod.yml` mounts
   `./backups` into the Postgres container and nothing writes to it. Note
   `BRIDGE_KEK` lives in `.env` and is not covered by any database backup at

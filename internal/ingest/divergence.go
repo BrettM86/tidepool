@@ -70,14 +70,22 @@ const divergenceSweepTimeout = 2 * time.Minute
 // or deciding whether the report is crying wolf, has to be able to find it.
 //
 // TWELVE HOURS, derived rather than picked. Two envelopes make a pending
-// delivery legitimately old: the retry schedule (DefaultMaxDeliveryAttempts=8
-// steps of DefaultBackoffBase=30s doubling to a one-hour cap, so roughly two to
-// three hours before a failing delivery poisons) and the causal wait
-// (DefaultCausalWaitBudget=6h, during which a reply sits pending for a parent
-// that has not been accepted). A window inside either one reports the system
-// working. Twelve hours clears both with room, and stays well inside "noticed
-// the same day" — a queue that stopped moving this morning is in the report
-// before the day ends.
+// delivery legitimately old, and the SECOND one dominates:
+//
+//   - The retry schedule: DefaultMaxDeliveryAttempts=8 with
+//     DefaultBackoffBase=30s doubling (capped at 1h). The waits between the 8
+//     attempts are 30s, 1m, 2m, 4m, 8m, 16m, 32m — the cap never binds — which
+//     sums to 3810s, so a continuously failing delivery poisons after roughly
+//     ONE HOUR, not the "two to three hours" this comment claimed until
+//     2026-08-14. (Recompute this if either constant moves; it is the
+//     derivation an operator re-checks.)
+//   - The causal wait: DefaultCausalWaitBudget=6h, during which a reply sits
+//     pending for a parent that has not been accepted.
+//
+// A window inside either one reports the system working, so the binding figure
+// is the 6h causal wait. Twelve hours clears it with 2x room, and stays well
+// inside "noticed the same day" — a queue that stopped moving this morning is
+// in the report before the day ends.
 const DefaultAcceptanceStaleAfter = 12 * time.Hour
 
 // Divergence classes. The class is what an operator triages on, so it names the

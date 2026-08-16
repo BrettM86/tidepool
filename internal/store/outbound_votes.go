@@ -51,6 +51,28 @@ func (r *postgresOutboundVotes) upsert(ctx context.Context, q execer, vote Outbo
 	// constraint is deliberately NOT an upsert target: a different vote record
 	// for a pair that already holds one must FAIL, because overwriting the row
 	// would strand the Undo still owed for the first vote.
+	//
+	// The CASE on delivered_state defends ONE transition: `delivered` must not
+	// be overwritten by `pending`. A re-cast REPLACES a vote the peer still
+	// holds — it does not withdraw it — and the consumer states `pending` on
+	// every write because it records intent and cannot know what the wire said.
+	// Letting that land would erase the only record that a delivery ever
+	// happened, unrecoverably: no event re-fires it, the vote drops out of the
+	// standing list the erasure purge enumerates, and it is left un-retractable
+	// on someone else's instance.
+	//
+	// Only that transition, because this is the INTENT writer and every other
+	// caller here is restating the row on purpose: the purge retracts THROUGH
+	// this upsert with `undone` (outbound.Purger.undoLiveVotes), in the same
+	// statement that bumps the seq for the Undo it enqueues, so a guard that
+	// defended `delivered` against everything would silently drop it. The
+	// asymmetry with SetDeliveredState — where undone IS terminal — is
+	// deliberate: that method fields late settlements, stale facts about an old
+	// message, while this one fields new writes by a live human.
+	//
+	// It lives in SQL, not Go: the consumer's state read is non-transactional,
+	// so a read-then-decide guard races the delivery worker's settlement. The
+	// CASE evaluates under the row lock ON CONFLICT already holds.
 	query := `
 		INSERT INTO outbound_votes (
 			vote_at_uri, actor_did, subject_at_uri, subject_ap_id, community_did,
@@ -63,7 +85,12 @@ func (r *postgresOutboundVotes) upsert(ctx context.Context, q execer, vote Outbo
 			community_did = EXCLUDED.community_did,
 			direction = EXCLUDED.direction,
 			current_activity_id = EXCLUDED.current_activity_id,
-			delivered_state = EXCLUDED.delivered_state,
+			delivered_state = CASE
+				WHEN outbound_votes.delivered_state = '` + string(DeliveredStateDelivered) + `'
+				 AND EXCLUDED.delivered_state = '` + string(DeliveredStatePending) + `'
+				THEN outbound_votes.delivered_state
+				ELSE EXCLUDED.delivered_state
+			END,
 			activity_seq = outbound_votes.activity_seq + 1,
 			updated_at = now()
 		RETURNING` + outboundVoteColumns

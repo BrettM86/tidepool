@@ -397,12 +397,6 @@ Still open, unchanged:
 - Production lexicon validation currently records a metric and writes the
   record instead of failing it. A strict-first rollout should happen only
   after `tidepool_lexicon_validation_failures` remains zero in production.
-- **Lemmy pin contradiction.** `e2e/lemmy/Dockerfile:35` pins
-  `LEMMY_VERSION=0.19.19`; PLAN decision 19 (`PLAN.md:430`) and
-  `tasks/18-e2e-deploy.md:21` name **0.19.20** as the pinned strictness ceiling
-  and e2e target, and the 0.19.20 source is cited as the authority for verified
-  behaviours across tasks 13/14/15/17. Either bump the Dockerfile or amend the
-  decision; until then, operator-facing docs say `0.19.x`.
 
 ## Sync surface
 

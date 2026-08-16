@@ -124,38 +124,38 @@ transaction, so intent past the gate is never dropped
 (`cmd/tidepool/main.go:695-713`). Raising `OUTBOUND_WORKERS` later drains
 whatever accumulated, immediately. Budget for that.
 
-**`OUTBOUND_DISABLED` parks, it does not fail — but parking is not free.** A
-blocked delivery stays `pending` and resumes when the switch clears; `park`
+**`OUTBOUND_DISABLED` parks, it does not fail — and a park costs writes, not
+retries.** A blocked delivery stays `pending` and resumes when the switch
+clears; `park`
 itself never poisons and never cancels (`internal/outbound/worker.go:242-244`,
 `internal/outbound/switches.go:5-12`). `OUTBOUND_DRY_RUN` parks the same way,
 before any signing or POST (`worker.go:245-249`).
 
-⚠️ **A park still consumes the delivery's retry budget, and fast.** `ClaimNext`
-does `attempts = attempts + 1` on every claim
-(`internal/store/outbound_deliveries.go:143`), and `park` settles through
-`Release`, whose `SET` clause updates `claimed_until`, `next_attempt_at`,
-`last_error_class`, `response_excerpt`, `last_status_code` and `updated_at` —
-and **never resets `attempts`** (`outbound_deliveries.go:218-221`). A parked
-delivery is rescheduled `parkDelay = 5 * time.Second` out (`worker.go:560`), so
-with workers running, each ordering key's head delivery is re-claimed and
-re-parked roughly every five seconds and its
-`DefaultMaxDeliveryAttempts = 8` budget (`worker.go:78`) is exhausted in about
-**40 seconds**. Nothing poisons *while* parked — `park` never calls `poison` —
-but once the switch clears, the **first** retryable failure finds
-`Attempts >= maxAttempts` and poisons immediately instead of retrying
-(`worker.go:512-518`). An hour-long global kill switch leaves every head
-delivery with hundreds of attempts and zero retries left.
+**A park costs the delivery no retries.** `ClaimNext` does
+`attempts = attempts + 1` on every claim
+(`internal/store/outbound_deliveries.go:143`), but `park` and `parkCausal`
+settle through `ReleaseParked`, not `Release` (`worker.go:572`, `:592`), whose
+one difference is `attempts = GREATEST(attempts - 1, 0)`
+(`outbound_deliveries.go:243-244`) applied under the same claim fence. A full
+claim/park cycle therefore leaves the ledger where it found it: an hour-long
+global kill switch spends nothing, and once it clears the **first** retryable
+failure is a retry, not a poison. `DefaultMaxDeliveryAttempts = 8`
+(`worker.go:78`) counts attempts a delivery actually made.
 
-It is also a continuous write load: one `UPDATE` per parked head roughly every
-five seconds, per ordering key, for as long as the switch is engaged.
+⚠️ **It is a continuous write load, though.** A parked head is re-claimed and
+re-parked every `parkDelay = 5 * time.Second` (`worker.go:560`), so a held
+switch costs one claim plus one `UPDATE` per parked ordering-key head per ~5s,
+for as long as it is engaged — indefinitely, since nothing ends the cycle on its
+own. That churn is the remaining argument for **preferring
+`OUTBOUND_WORKERS=0` to park everything** — see [Rollback](#rollback) — and it
+is a cost argument, not a safety one.
 
-**The remedy is `POST /admin/outbound/redrive`.** `RedrivePoisoned` sets
-`attempts = 0` along with `state = 'pending'`
-(`internal/store/outbound_deliveries.go:613-617`), so a redrive restores a full
-budget. It only matches `state = 'poisoned'` (`:619`), so it repairs the damage
-after a delivery has already fallen over, rather than preventing it. **To park
-everything, prefer `OUTBOUND_WORKERS=0`** — see [Rollback](#rollback). The
-underlying defect is tracked in `FOLLOWUPS.md`.
+`POST /admin/outbound/redrive` is the repair for **poisoned** deliveries, not
+for parked ones: `RedrivePoisoned` sets `attempts = 0` with `state = 'pending'`
+(`internal/store/outbound_deliveries.go:665-666`) and matches
+`state = 'poisoned'` only (`:667`). A parked delivery is still `pending`, so it
+is neither reached by a redrive nor in need of one — it resumes on its own when
+the switch clears.
 
 Scope matching, from `config.go:519-525`:
 
@@ -175,7 +175,7 @@ constructed inside `if cfg.OutboundWorkers > 0`
 switch and nothing consulting one. Setting `OUTBOUND_DISABLED=true` while
 workers are 0 changes nothing and confirms nothing; it is not a second belt.
 Conversely, that is also why `OUTBOUND_WORKERS=0` costs nothing: no worker
-exists to claim, park, or spend attempts.
+exists to claim, park, or write anything.
 
 ### Confirming a switch actually engaged
 
@@ -193,8 +193,8 @@ exists to claim, park, or spend attempts.
 switch engaged: `by_state` still reads `pending` for a parked delivery, exactly
 as it does for one merely waiting its turn, so the queue view cannot tell you.
 Read it as a rate, not a level — a parked head is re-parked every ~5s, so the
-counter climbs continuously while a switch is held. That climb *is* the budget
-being spent.
+counter climbs continuously while a switch is held. That climb is the write load
+of the hold, not retries being spent.
 
 Two caveats on it. It is shared with `parkCausal`, so a nonzero `parked` with no
 switch engaged means causal waits, not an operator action. And
@@ -542,10 +542,10 @@ the moment `CONSUMER_ENABLED=true`, the translator has already run on everything
 dry run or not. Step 1 is where you check its output (read
 `outbound_activities.payload` in psql), not here.
 
-And because dry-run parks, it carries the same budget cost as any other park:
-each head delivery is re-claimed every ~5s and burns its 8 attempts in ~40
-seconds (see [§2](#2-the-v2-flag-topology)). A "one cycle" dry run is measured
-in seconds, not hours, and wants a `redrive` after it.
+And because dry-run parks, it carries the same cost as any other park — which
+is write load, not retries: each head delivery is re-claimed and re-parked every
+~5s for as long as it is engaged, and the attempt it spends doing so is handed
+back (see [§2](#2-the-v2-flag-topology)). Nothing needs redriving afterwards.
 
 ### On announcement throttling — what actually exists
 
@@ -614,11 +614,11 @@ What each one means:
      ORDER BY updated_at DESC LIMIT 50;"
   ```
 
-  Check `attempts` in that output before concluding the peer rejected anything:
-  a delivery whose budget was spent by a held kill switch (see
-  [§2](#2-the-v2-flag-topology)) poisons on its first real failure with an
-  `attempts` far above 8 and an error class that describes one attempt, not
-  eight.
+  `attempts` in that output counts claims that were TRIED — a park hands its own
+  claim's increment back (see [§2](#2-the-v2-flag-topology)) — so a poisoned row
+  should read about 8. A materially higher number is not extra peer rejections:
+  it is claims that never settled, since a lapsed lease or a crashed worker
+  leaves its increment behind with nobody to return it.
 - **echo drop counters rising steadily** — expected and healthy: our own
   content arriving back from Lemmy and being correctly refused. A counter at
   **zero** while native content is flowing is the alarming case; it means
@@ -640,10 +640,10 @@ Rollback is a **kill switch, not an un-deploy**. In escalation order, each
 step being one `.env` edit plus `up -d tidepool`:
 
 1. **`OUTBOUND_DISABLED_COMMUNITIES=<the bad one>`** — park one community.
-   Everything else keeps flowing; the parked deliveries resume when you clear
-   it. First because it is the *narrowest*, not because it is free: it is a
-   park, so it spends that community's head delivery's retry budget at the same
-   ~5s cadence as (3). Redrive that community after clearing it.
+   Everything else keeps flowing; the parked deliveries resume with their retry
+   budget intact when you clear it, and want no redrive. First because it is the
+   *narrowest*. Its only cost is the same ~5s re-claim/re-park write cycle as
+   (3), on that community's head delivery alone.
 2. **`OUTBOUND_WORKERS=0`** — stop the workers entirely. This is the big red
    button for delivery. The consumer keeps running and keeps recording intent;
    nothing reaches any peer. `NewWorker` is only called inside
@@ -651,17 +651,17 @@ step being one `.env` edit plus `up -d tidepool`:
    no worker to claim anything: nothing is re-claimed, no `attempts` are spent,
    and no rows are written. It costs nothing and it is genuinely lossless.
 3. **`OUTBOUND_DISABLED=true`** — park everything outbound. Same *observable*
-   effect as (2) — nothing reaches any peer — but **it is not free, and it is
-   ranked below (2) for that reason.** The workers keep running, so every
-   ordering key's head delivery is re-claimed and re-parked every ~5s and burns
-   its 8-attempt budget in ~40 seconds (see [§2](#2-the-v2-flag-topology)). The
-   deliveries this switch exists to protect are exactly the ones left with no
-   retries. Reach for it only when you need the *scope* it gives you and a
-   whole-worker stop is too blunt — and expect to `redrive` afterwards, which
-   is the only thing that resets `attempts`
-   (`internal/store/outbound_deliveries.go:613-617`). The one thing (3) buys
-   over (2) is that each parked row carries a recorded `last_error_class` /
-   `response_excerpt`; a stopped worker records nothing.
+   effect as (2) — nothing reaches any peer — and the deliveries keep their
+   retries: a park hands its claim's increment back (see
+   [§2](#2-the-v2-flag-topology)), so this is safe to hold for as long as you
+   need. It is **ranked below (2) on cost, not on risk**: the workers keep
+   running, so every ordering key's head delivery is re-claimed and re-parked
+   every ~5s — a claim and an `UPDATE` per key per 5s, indefinitely, against a
+   database you may be trying to leave alone during an incident. Reach for it
+   when you need the *scope* it gives you and a whole-worker stop is too blunt.
+   What (3) buys over (2) is that each parked row carries a recorded
+   `last_error_class` / `response_excerpt` saying why it is held; a stopped
+   worker records nothing.
 4. **`CONSUMER_ENABLED=false`** — stop consuming. Intent stops being recorded.
    The consumer resumes from its stored cursor when re-enabled, so this is
    recoverable, but it is the only step that stops *observing*, and

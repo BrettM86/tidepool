@@ -63,67 +63,48 @@ task documents and git history rather than this list.
 
 ## Outbound delivery (task 15)
 
-- **DEFECT, NOT DONE — a PARK spends the poison budget, so the kill switch
-  destroys the retries of exactly the deliveries it exists to protect.**
-  Found 2026-08-14 while fact-checking `DEPLOY.md`; the docs and the two park
-  doc-comments have been corrected to describe it, and **nothing about the
-  behaviour was changed.** It needs its own test-first subtask.
+- **Parks are attempt-neutral — the design that was chosen, and the two limits
+  it leaves open.** `ClaimNext` charges an attempt to every claim
+  (`internal/store/outbound_deliveries.go:143`), which is right for a delivery
+  that was TRIED and wrong for one that was HELD. The fix is a SIBLING of
+  `Release`, not a flag on it: `ReleaseParked` (`:276`) runs the same fenced
+  statement from the same template (`releaseStatement`, `:224`) with one slot
+  filled, `attempts = GREATEST(attempts - 1, 0)` (`:243-244`), and `park` /
+  `parkCausal` settle through it (`internal/outbound/worker.go:572`, `:592`).
+  The fence — `state = 'pending' AND claimed_until = $token` — is what makes the
+  give-back safe: only the holder of the claim that added an increment can
+  subtract one, so a park can never un-count an attempt another claim spent.
 
-  *Mechanism.* `ClaimNext` does `attempts = attempts + 1` on every claim
-  (`internal/store/outbound_deliveries.go:143`). `park` and `parkCausal` settle
-  through `Release`, whose `SET` clause updates `claimed_until`,
-  `next_attempt_at`, `last_error_class`, `response_excerpt`, `last_status_code`
-  and `updated_at` — and never resets `attempts`
-  (`outbound_deliveries.go:218-221`). `parkDelay = 5 * time.Second`
-  (`internal/outbound/worker.go:560`) and `DefaultMaxDeliveryAttempts = 8`
-  (`worker.go:78`), so with `OUTBOUND_DISABLED=true` and workers running, each
-  ordering key's head delivery is re-claimed and re-parked about every five
-  seconds and its entire retry budget is gone in roughly **40 seconds**.
+  *The rejected candidate, recorded because it reads cheaper than it is.*
+  "Reset on unpark" — leave the increment, clear `attempts` when the delivery
+  next passes the switch gate — keeps `Release` single-purpose but cannot tell a
+  park's attempts from real failures that preceded the park, so it erases
+  genuine failure history instead of handing back a hold; the only signal
+  available to it is `last_error_class`, which would make an error-class string
+  load-bearing for a correctness decision; and it repairs late, so `attempts`
+  reads inflated on the admin surface for the whole duration of the park.
 
-  *Why it is not caught by "park never poisons".* It isn't — `park` genuinely
-  never calls `poison`, which is what made the old comments read as true. The
-  damage lands later: `releaseOrPoison` poisons on the FIRST retryable failure
-  once `Attempts >= maxAttempts` (`worker.go:512-518`). So an hour-long kill
-  switch leaves head deliveries with hundreds of attempts and zero retries, and
-  the next transient 5xx or dial timeout poisons them immediately. `parkCausal`
-  shares the mechanism but is materially safer: `causalStatus` bounds the causal
-  wait by WALL CLOCK from `delivery.CreatedAt`, never by attempt count, so a
-  held child's outcome is still decided by elapsed time. It is exposed only for
-  a genuine delivery failure after the parent lands.
-
-  *Remedy that exists today, and its limit.* `RedrivePoisoned` sets
-  `attempts = 0` (`outbound_deliveries.go:613-617`), but it matches
-  `state = 'poisoned'` only (`:619`) — it repairs after the fall, and cannot
-  pre-empt it. `OUTBOUND_WORKERS=0` avoids the whole problem (no worker is
-  constructed, `cmd/tidepool/main.go:716`) and `DEPLOY.md` §5 now ranks it above
-  `OUTBOUND_DISABLED` for that reason.
-
-  *Shape of a real fix — this is the design question, not a settled plan.*
-  `Release` is a single statement serving two callers that mean opposite
-  things, and it cannot tell them apart: a **retryable failure** (where holding
-  the incremented `attempts` is exactly right — that is the backoff working)
-  from a **park by an operator switch or a causal hold** (where it is not; the
-  delivery never reached the wire and nothing was learned about the peer). Two
-  candidate directions, with the trade to be argued in the subtask:
-  - a **park-specific release** — a sibling statement, or a flag on `Release`,
-    that writes `attempts = attempts - 1` / `attempts = $n` so a park is
-    attempt-neutral. Cheapest and most local, but adds a second write path
-    through the most fencing-sensitive statement in the package, and a park
-    that "un-counts" must not be able to underflow or to un-count a real
-    attempt on a re-claim race.
-  - **reset on unpark** — leave the increment and clear `attempts` when a
-    delivery next passes the switch gate. Keeps `Release` single-purpose, but
-    the reset then lives on the hot path and has to distinguish "was parked"
-    from "was retried", which today is only knowable from `last_error_class`
-    (`switch_parked` / `dry_run` / the causal classes) — i.e. it would make an
-    error-class string load-bearing for a correctness decision.
-
-  A RED test should pin the operator-visible fact rather than the column: with
-  the switch engaged, drive N claim/park cycles well past `maxAttempts`, clear
-  the switch, then fail the delivery once retryably and assert it is
-  **rescheduled, not poisoned**. Note that any fix must keep `parkCausal`'s
-  wall-clock poison reachable — a naive "parks never advance anything" change
-  must not also disarm the causal budget.
+  *Two residual limits, both pre-existing and neither closed by this.*
+  - **An abandoned claim still leaks its `+1` forever.** A lapsed lease, or a
+    crash between `ClaimNext` and any settle, leaves an increment with nobody
+    holding the fence to hand it back — so `attempts` counts claims CHARGED AND
+    NEVER HANDED BACK: deliveries genuinely tried, plus abandoned claims. Each
+    leak permanently costs the delivery one retry of real poison budget; the
+    lease bounds only how soon the row is re-claimable, not the loss. Rare and
+    bounded at **at most one lost retry per abandoned claim**, and shared with
+    the real-failure path, so it is not a park defect — but it is the reason a
+    poisoned row can read above `maxAttempts`. A park that the fence REFUSED now
+    logs at Warn (`park did not apply: claim lost or row terminal`,
+    `internal/outbound/worker.go`) and is not counted in
+    `tidepool_outbound_parked`, which is what makes such a leak diagnosable
+    rather than merely visible in the column.
+  - **A park writes `last_status_code = 0`,** clobbering a real status a PRIOR
+    failed attempt recorded. The divergence sweep reads that column as its
+    answered-or-silent discriminator (`COALESCE(d.last_status_code, 0) > 0`,
+    `internal/store/divergence.go:791`), where 0 means the peer never answered —
+    so a 502 overwritten by a later park leaves no trace of the peer having
+    spoken. Unchanged by this fix (a park has no status to write) and worth
+    revisiting only if the refused/unanswered split has to be trusted per-row.
 
 - **outbound_deliveries.ClaimNext lacks a standalone `seq` index.** The
   loose-scan CTE builds the head set via the `(ordering_key, seq)` partial

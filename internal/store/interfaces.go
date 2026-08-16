@@ -706,6 +706,18 @@ type OutboundDeliveries interface {
 	// Same (exists, applied) split as MarkDelivered.
 	Release(ctx context.Context, activityID, targetInbox, errorClass, excerpt string, lastStatusCode int, nextAttempt, claimToken time.Time) (exists, applied bool, err error)
 
+	// ReleaseParked is Release for a delivery that was HELD, not tried: an
+	// operator kill switch, dry-run, or a causal wait. It is identical in every
+	// respect but one — it is ATTEMPT-NEUTRAL, handing back the single increment
+	// its own claim took (ClaimNext does attempts = attempts + 1), so a hold
+	// costs the delivery none of the retry budget it will need when the hold
+	// lifts. Real failures still spend it; only park claims are given back.
+	//
+	// Same fence and non-terminal guard as Release (state = 'pending' AND
+	// claimed_until = claimToken), which is what stops a stale park from
+	// un-counting a newer claim's attempt. Same (exists, applied) split.
+	ReleaseParked(ctx context.Context, activityID, targetInbox, errorClass, excerpt string, lastStatusCode int, nextAttempt, claimToken time.Time) (exists, applied bool, err error)
+
 	// MarkPoisoned permanently fails the delivery (state=poisoned, lease
 	// cleared, error class/status/excerpt stored). Poisoned rows are skipped by
 	// ClaimNext and stop blocking their ordering key. claimToken must equal the

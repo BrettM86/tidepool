@@ -563,47 +563,60 @@ const parkDelay = 5 * time.Second
 // REAL delay into the future so it is not instantly re-claimable, and never
 // poisons — park does not call poison, and no state here is terminal.
 //
-// IT DOES, HOWEVER, ADVANCE THE POISON BUDGET, and this comment used to claim
-// the opposite. Release's SET clause does not touch `attempts` — but ClaimNext
-// already did `attempts = attempts + 1` to get here (store/outbound_deliveries.go),
-// and nothing ever puts it back. So a delivery parked for parkDelay is
-// re-claimed ~5s later, +1 again, and a kill switch held for ~40s exhausts
-// maxAttempts. The delivery does not poison while parked, but the first
-// retryable failure AFTER the switch clears sees Attempts >= maxAttempts in
-// releaseOrPoison and poisons instead of retrying.
-//
-// Only RedrivePoisoned resets attempts to 0, and only for rows already in
-// 'poisoned' — i.e. the repair exists but runs after the fall, not instead of
-// it. Fixing this means teaching the store to distinguish "retryable failure,
-// back off" (increment is correct) from "parked by a switch" (it is not);
-// see FOLLOWUPS.md, "Outbound delivery (task 15)". Documented deliberately
-// rather than patched here: it needs a failing test first.
+// It costs the delivery nothing either. ReleaseParked, not Release, is what
+// settles a hold: it hands back the increment this claim's own ClaimNext charged,
+// under the same fence, so a switch held for hours leaves the retry budget
+// exactly where the operator found it (store/outbound_deliveries.go states why
+// the fence is what makes that give-back safe). A held delivery reaches the
+// attempt cap only through attempts it actually made.
 func (w *Worker) park(ctx context.Context, delivery *store.OutboundDelivery, class, reason string) error {
 	next := time.Now().Add(parkDelay)
-	_, _, err := w.deliveries.Release(ctx, delivery.ActivityID, delivery.TargetInbox, class, reason, 0, next, *delivery.ClaimedUntil)
+	_, applied, err := w.deliveries.ReleaseParked(ctx, delivery.ActivityID, delivery.TargetInbox, class, reason, 0, next, *delivery.ClaimedUntil)
 	if err != nil {
 		return fmt.Errorf("park delivery %s: %w", delivery.ActivityID, err)
 	}
-	metricParked.Add(1)
+	w.countPark(delivery, class, applied)
 	return nil
+}
+
+// countPark records a park THE FENCE ACCEPTED, and only that one.
+//
+// tidepool_outbound_parked is how an operator sizes a held queue, and it is the
+// only signal that can: a parked row still reads `pending`, exactly like one
+// merely waiting its turn. A stale worker bouncing off a claim somebody else
+// owns held nothing, so counting it inflates the one number an incident is read
+// through.
+//
+// The bounce is logged rather than passed over in silence. The ROW is safe — the
+// fence saw to that — but the wedged claim's own +1 stays on the ledger with
+// nobody left to hand it back (the abandoned-claim leak in FOLLOWUPS.md), and
+// this line is the only thing that connects an operator's "attempts climbing
+// while the switch is held" to a lapsed lease rather than to the park path.
+func (w *Worker) countPark(delivery *store.OutboundDelivery, class string, applied bool) {
+	if !applied {
+		w.logger.Warn("park did not apply: claim lost or row terminal",
+			"activity", delivery.ActivityID, "inbox", delivery.TargetInbox, "class", class)
+		return
+	}
+	metricParked.Add(1)
 }
 
 // parkCausal holds a causally-ineligible delivery WITHOUT a future delay: a held
 // child must become claimable the instant its bridge-origin parent is accepted
 // (in practice the parent, a lower-seq delivery on the same serial line, is
-// delivered first, so this rarely re-fires). Like park it never poisons — but,
-// like park, it DOES advance the poison budget, because ClaimNext incremented
-// attempts and Release never puts it back (see park's doc above; this comment
-// previously asserted the opposite). What keeps that from mattering here is the
-// wall-clock bound: causalStatus poisons on the CausalWaitBudget deadline, not
-// on the attempt count, so a held child's outcome is decided by elapsed time
-// even after its retry budget is spent.
+// delivered first, so this rarely re-fires). Like park it never poisons, and
+// like park it is attempt-neutral — which matters most here, since a child that
+// re-claims immediately would otherwise spend its whole budget in seconds.
+//
+// The wait's OUTCOME is still decided by the wall clock and not by the ledger:
+// causalStatus poisons on the CausalWaitBudget deadline, so however many times a
+// child cycles through this hold, what ends the wait is elapsed time.
 func (w *Worker) parkCausal(ctx context.Context, delivery *store.OutboundDelivery, class, reason string) error {
-	_, _, err := w.deliveries.Release(ctx, delivery.ActivityID, delivery.TargetInbox, class, reason, 0, time.Now(), *delivery.ClaimedUntil)
+	_, applied, err := w.deliveries.ReleaseParked(ctx, delivery.ActivityID, delivery.TargetInbox, class, reason, 0, time.Now(), *delivery.ClaimedUntil)
 	if err != nil {
 		return fmt.Errorf("park (causal) delivery %s: %w", delivery.ActivityID, err)
 	}
-	metricParked.Add(1)
+	w.countPark(delivery, class, applied)
 	return nil
 }
 

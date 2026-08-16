@@ -20,13 +20,25 @@ import (
 // and outlives the record it describes.
 
 func voteFrame(did, rev, rkey, subjectATURI, direction string) []byte {
+	return voteWriteFrame(did, rev, rkey, subjectATURI, direction, "create")
+}
+
+// voteRecastFrame is a vote FLIPPED in place. An up→down change is an edit of
+// the existing record, not a delete plus a create, so it arrives as an update
+// commit on the same rkey — and therefore the same at-uri the outbound_votes
+// row is keyed by.
+func voteRecastFrame(did, rev, rkey, subjectATURI, direction string) []byte {
+	return voteWriteFrame(did, rev, rkey, subjectATURI, direction, "update")
+}
+
+func voteWriteFrame(did, rev, rkey, subjectATURI, direction, operation string) []byte {
 	return []byte(fmt.Sprintf(
-		`{"did":%q,"time_us":9500,"kind":"commit","commit":{"rev":%q,"operation":"create",`+
+		`{"did":%q,"time_us":9500,"kind":"commit","commit":{"rev":%q,"operation":%q,`+
 			`"collection":"social.coves.feed.vote","rkey":%q,`+
 			`"cid":"bafyreievgu2ty7qbiaaom5zhmkznsnajuzideek3lo7e65dwqlrvrxnmo4",`+
 			`"record":{"$type":"social.coves.feed.vote","subject":{"uri":%q,"cid":%q},`+
 			`"direction":%q,"createdAt":"2026-08-13T10:00:00.000Z"}}}`,
-		did, rev, rkey, subjectATURI, acceptRootCID, direction))
+		did, rev, operation, rkey, subjectATURI, acceptRootCID, direction))
 }
 
 func voteDeleteFrame(did, rev, rkey string) []byte {
@@ -358,4 +370,68 @@ func TestVoteDelete_ProcessesEvenForAnOptedOutAuthor(t *testing.T) {
 	intent, ok := calls[1].Intent.(VoteIntent)
 	require.True(t, ok)
 	assert.Equal(t, "undo", intent.Op)
+}
+
+// ---------------------------------------------------------------------------
+// I6 — the re-cast guard
+// ---------------------------------------------------------------------------
+
+func TestVoteRecast_DeliveredStateSurvivesTheFlip(t *testing.T) {
+	database := dispatchTestDB(t)
+	seedBridgedCommunity(t, database)
+	seedThreadRoot(t, database)
+	fixture := newDispatchFixture(t, database)
+	votes := store.NewOutboundVotes(database)
+	ctx := context.Background()
+
+	const rkey = "3lzvote000012"
+	voteATURI := voteATURIFor(dispatchNativeDID, rkey)
+
+	require.NoError(t, fixture.handle(t,
+		voteFrame(dispatchNativeDID, dispatchRev, rkey, acceptRootATURI, "up")))
+
+	// The Like reached the peer, and the delivery worker settled it — the same
+	// call task 15's settlement callback makes, from the wire, on success.
+	require.NoError(t, votes.SetDeliveredState(ctx, voteATURI, store.DeliveredStateDelivered),
+		"the vote must be genuinely delivered before the flip, or this test proves nothing")
+
+	// The user flips up→down by EDITING the vote record, so the commit is an
+	// update on the same rkey — the same at-uri the row above is keyed by.
+	require.NoError(t, fixture.handle(t,
+		voteRecastFrame(dispatchNativeDID, dispatchRevHigher, rkey, acceptRootATURI, "down")))
+
+	recast, err := votes.GetByATURI(ctx, voteATURI)
+	require.NoError(t, err)
+	require.NotNil(t, recast)
+	assert.Equal(t, "down", recast.Direction, "the flip itself is recorded")
+
+	assert.Equal(t, store.DeliveredStateDelivered, recast.DeliveredState,
+		"the peer STILL HOLDS a vote from this actor — the flip is a replacement, not a "+
+			"retraction, and nothing has come back off the wire to say otherwise. Resetting "+
+			"to pending erases the only record that a delivery ever happened, and the fact "+
+			"is unrecoverable: no event re-fires it")
+
+	// The guard is about the ledger, not the wire. The flip must still go out.
+	calls := fixture.enqueuer.Calls()
+	require.Len(t, calls, 2, "one Like, then the Dislike that replaces it")
+	intent, ok := calls[1].Intent.(VoteIntent)
+	require.True(t, ok, "want VoteIntent, got %T", calls[1].Intent)
+	assert.Equal(t, "down", intent.Direction,
+		"suppressing the outgoing flip would leave the peer counting the vote the user "+
+			"just changed away from")
+	assert.Equal(t, ActivityID(acceptUserOrigin, voteATURI, "create", 1), intent.ActivityID(),
+		"under a BUMPED seq: an id colliding with the delivered Like's would be swallowed "+
+			"as a duplicate by any peer that already has it")
+	assert.Equal(t, recast.CurrentActivityID, intent.ActivityID(),
+		"and the row carries that same id, because the Undo has to embed it")
+
+	// The operator-visible consequence, and the reason the ledger fact matters:
+	// this list is what the erasure purge enumerates.
+	standing, err := votes.ListStandingForActor(ctx, dispatchNativeDID)
+	require.NoError(t, err)
+	require.Len(t, standing, 1,
+		"a flipped vote must still be reachable by the purge — dropping out of this list "+
+			"strands it un-retractable on the peer, so erasing the actor would leave their "+
+			"vote standing on someone else's instance forever")
+	assert.Equal(t, voteATURI, standing[0].VoteATURI)
 }

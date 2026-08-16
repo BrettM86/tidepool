@@ -553,8 +553,10 @@ outstanding.
   the `ON CONFLICT` `SET` (`internal/store/outbound_votes.go`), defending
   exactly one transition — `pending` may not overwrite a stored `delivered`.
   Every other column still updates, `activity_seq` still bumps, `RETURNING`
-  reflects the kept state, and the purge's `undone` and the callback's
-  `delivered` still write straight through. It is SQL and not Go because the
+  reflects the kept state, and the purge's `undone` and `applyVoteDelete`'s
+  re-stated `delivered` still write straight through (the settlement callback
+  writes via `SetDeliveredState` and never touches the guard). It is SQL and
+  not Go because the
   consumer's state read is non-transactional and would race the delivery
   worker's settlement; the `CASE` evaluates under the row lock `ON CONFLICT`
   already holds.
@@ -576,11 +578,15 @@ outstanding.
     holds stays in the baseline, the direction it does not hold is subtracted
     from a total that never contained it. One directional error was traded for
     a different one — but the new one is SIGNALLED, where the old one was
-    silent: `SeedOursSubtracted` counts the row, and the negative baseline
-    trips `SeedBaselineClamped` and the clamp `Warn` naming direction,
-    `deficit_*` and `ours_*`. The two errors can cancel in the served number,
-    so those counters are the only place the window shows. Heals when the flip
-    delivers or the vote is undone; the arithmetic is pinned by
+    silent — but signalled ONLY when the mis-subtraction breaches the zero
+    floor: `SeedOursSubtracted` counts the row (and every healthy vote), and
+    the negative baseline trips `SeedBaselineClamped` and the sampled clamp
+    `Warn`; unrelated votes in the same direction can absorb the error with no
+    distinguishing signal, and the two errors can cancel in the served number.
+    Heals when the flip delivers or the vote is undone — and if the flip's
+    delivery POISONS, neither ever comes: the misread then recurs on every
+    re-seed until an undo, with the standing divergence reported by
+    `RecastDivergence`. The clamping arithmetic is pinned by
     `TestReseedDuringARecastWindowMisreadsBothDirections`
     (`internal/votes/reseed_recast_cost_test.go`).
   - **Delete then re-cast the same rkey before the Undo settles.** The late Undo
@@ -590,6 +596,38 @@ outstanding.
     pre-fix behaviour where that same sequence left the vote invisible to both
     the purge and the reseed rather than merely stale to one of them. This is
     leg 2's mechanism, below, reached from the opposite direction.
+
+- **Found by the guard's multi-model review — three PRE-EXISTING gaps, none
+  introduced or widened by the fix, all verified unchanged against the
+  pre-guard code:**
+  - *Subject mutation on a live vote is unaccounted.* An update commit
+    re-pointing the same vote rkey at a DIFFERENT subject overwrites
+    `subject_at_uri` in place; the peer keeps the old subject's vote while the
+    row describes the new one (pre-guard it went `pending` and the vote was
+    simply invisible). Coves never re-points vote records, and the 17e report
+    still names the stranded activity (its exclusion joins on subject + id).
+    Candidate fix: refuse a subject change for an existing live vote in
+    `applyVoteWrite`, with a same-rkey-different-subject regression test.
+  - *An ordinary delete after a poisoned re-cast sends an Undo naming the
+    never-delivered activity* (`applyVoteDelete` embeds
+    `stored.CurrentActivityID` — the NEW id). Identical pre-guard; it rides
+    the same unverified assumption the purge path documents (Lemmy matching
+    the inner object on `(actor, object)`), without the documentation. Covered
+    by the same verification below.
+  - *A purge racing a stale queued vote event can resurrect `undone`.* A vote
+    commit that passes `mayFederate` before a concurrent purge commits can
+    upsert `pending` over `undone` and enqueue outward work past the purge's
+    cancellation snapshot — the terminality invariant rests on an upstream
+    gate outside the state writer (same class as 17c-3's recorded ban race).
+    Unreachable in practice at current scale; before scale, the candidate fix
+    is making `undone` terminal in the upsert too (a purged actor never
+    legitimately votes again), as its own test-first subtask — it reverses a
+    recorded matrix decision, so it needs its own RED tests, not a quiet edit.
+  - *Shared verification for the first two:* an outbound-vote e2e against a
+    real Lemmy asserting an Undo whose inner id/direction mismatch the held
+    vote still retracts it — the `(actor, object)` assumption is now
+    load-bearing for the purge path. The production canary doubles as this
+    check at current scale.
 
 - **The re-cast race, leg 2 — the settlement silently forgets the old vote.
   Recorded nowhere before now.** `internal/outbound/worker.go` `voteCallback`

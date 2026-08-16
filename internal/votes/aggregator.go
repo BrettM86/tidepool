@@ -499,10 +499,15 @@ func (a *Aggregator) RetractVote(ctx context.Context, vote *ap.Object, community
 //     the row's direction is already the NEW one while the peer still holds
 //     the OLD, so the subtraction lands on the wrong side of the tally — the
 //     direction the peer holds is not subtracted, and the direction it does
-//     not hold is. It heals when the flip delivers or the vote is undone, and
-//     unlike its predecessor it is SIGNALLED while it lasts (see the ours.*
-//     binding in SeedAggregates for which counters, and why the served number
-//     alone will not show it). The "what the peer holds" vs "what the user
+//     not hold is. It heals when the flip delivers or the vote is undone — and
+//     if the flip's delivery POISONS, neither event ever comes: the wrong-side
+//     subtraction then recurs on every re-seed until an undo, and the standing
+//     divergence is RecastDivergence's finding. It is signalled while it lasts
+//     ONLY when the mis-subtraction breaches the zero floor (see the ours.*
+//     binding in SeedAggregates: SeedBaselineClamped fires on the breach, and
+//     unrelated votes in the same direction can absorb the error silently —
+//     the counters witness the clamping shape, not every window). The "what
+//     the peer holds" vs "what the user
 //     wants" column pair once proposed here was REJECTED with reasons; they
 //     are recorded in FOLLOWUPS.md so it is not re-proposed.
 //
@@ -573,23 +578,31 @@ func (a *Aggregator) SeedAggregates(ctx context.Context, subjectAPID string, upv
 		// is what the upsert guard bought — and per direction it is wrong
 		// until the flip delivers or the vote is undone.
 		//
-		// It is SIGNALLED rather than swallowed, and that is the whole reason
-		// this is tolerable: SeedOursSubtracted counts the row, the wrong-side
-		// subtraction drives that direction's baseline negative, and the
-		// GREATEST(0, …) floor trips SeedBaselineClamped plus the clamp Warn
-		// naming direction, deficit_* and ours_*. The two directional errors
-		// can CANCEL in the served number, so vote_aggregates alone shows a
-		// healthy subject and the counters are the only place the window is
-		// visible. The arithmetic is pinned exactly as it stands by
-		// TestReseedDuringARecastWindowMisreadsBothDirections.
+		// It is signalled ONLY when the wrong-side subtraction breaches the
+		// zero floor: SeedOursSubtracted counts the row (it also counts every
+		// healthy delivered vote, so it identifies routine work, not this
+		// window), and GREATEST(0, …) trips SeedBaselineClamped plus the
+		// sampled clamp Warn naming direction, deficit_* and ours_* — but
+		// unrelated votes in the subtracted direction can keep the raw
+		// baseline non-negative, in which case the misread is absorbed with
+		// NO distinguishing signal. The two directional errors can also
+		// CANCEL in the served number, so vote_aggregates alone shows a
+		// healthy subject either way. The clamping shape — the one that does
+		// signal — is pinned exactly as it stands by
+		// TestReseedDuringARecastWindowMisreadsBothDirections; the silent
+		// shape has no witness here, and a standing one is RecastDivergence's
+		// to report.
 		//
-		// A negation ("NOT undone", "<> 'pending'") reads identically TODAY only
-		// because nothing writes 'undone'. If a policy ever does, it will mean
-		// the peer ACCEPTED the withdrawal — not live — and every negation
-		// silently inverts while this equality stays correct. A poisoned Undo
-		// leaves a delivered row subtracting forever, which is the same hazard
-		// decision 16 cites for banning queue-history arithmetic: "delivered
-		// Likes minus delivered Undos" gets that row permanently wrong.
+		// A negation ("NOT undone", "<> 'pending'") would be WRONG TODAY, not
+		// merely future-hostile: 'undone' has a live writer — 17d's purge
+		// (outbound.Purger.undoLiveVotes) retracts a withdrawn actor's votes
+		// through the upsert — and it records OUR decision to stop counting
+		// at purge time, not the peer's acceptance (store.DeliveredStateUndone).
+		// A negation would resume subtracting a withdrawn actor's votes; this
+		// equality stays correct. A poisoned Undo leaves a delivered row
+		// subtracting forever, which is the same hazard decision 16 cites for
+		// banning queue-history arithmetic: "delivered Likes minus delivered
+		// Undos" gets that row permanently wrong.
 		//
 		// The read takes no row locks. The seed holds the aggregate lock and
 		// reads outbound_votes lock-free; the delivery worker locks

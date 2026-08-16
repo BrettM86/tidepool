@@ -546,8 +546,9 @@ func (r *postgresDivergences) UndeliveredAcceptanceCounts(ctx context.Context, s
 // can suppress a finding, never create one. If our ledger still names this
 // exact activity as the live vote AND still calls it delivered, then we
 // account for what the peer holds and there is nothing to reconcile. When
-// the row has been reset, retracted or deleted — every shape this bug takes
-// — the row cannot answer, and the history stands on its own.
+// the row has moved to a new activity id, been retracted, or been deleted —
+// every shape this bug takes — the row cannot answer, and the history stands
+// on its own.
 //
 // THREE INDEPENDENT EXCLUSIONS, because they answer different questions and
 // each is the whole defence against a different way of ruining this report:

@@ -93,8 +93,9 @@ func TestOutboundVotes_UpsertKeepsDeliveredThroughARecast(t *testing.T) {
 // B2 — everything the guard must NOT change
 // ---------------------------------------------------------------------------
 
-// TestOutboundVotes_UpsertDeliveredStateMatrix pins the five transitions that
-// already work, so the fix above cannot be bought by freezing the column.
+// TestOutboundVotes_UpsertDeliveredStateMatrix pins the six conflict
+// transitions that already work — plus the plain INSERT branch — so the fix
+// above cannot be bought by freezing the column.
 //
 // Each of these is a live production path, named in its own case. They pass
 // before the guard exists and must pass after it.
@@ -144,6 +145,16 @@ func TestOutboundVotes_UpsertDeliveredStateMatrix(t *testing.T) {
 				"an old message — not a new vote cast by a live human. Refusing it here is " +
 				"the shortcut that would break the purge case above, since both arrive as " +
 				"`pending`-shaped writes over a non-pending row",
+		},
+		{
+			name: "undone over pending applies",
+			seed: DeliveredStatePending, write: DeliveredStateUndone, want: DeliveredStateUndone, wantSeq: 1,
+			why: "a REAL production path, not a hypothetical: the purge retracts votes whose " +
+				"delivery is HELD FOR SETTLEMENT — the peer accepted the POST, only our " +
+				"bookkeeping lagged — and those rows still read `pending` " +
+				"(ListStandingForActor's second term). A guard shaped 'only a delivered row " +
+				"may take undone' would pass every other case here and break that purge at " +
+				"the store level",
 		},
 		{
 			name: "delivered over undone applies",

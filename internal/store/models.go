@@ -247,7 +247,9 @@ const (
 	DeliveredStateDelivered DeliveredState = "delivered"
 	// DeliveredStateUndone means the vote is NO LONGER LIVE on the peer as far as
 	// this bridge is concerned, so nothing may count it: the reseed subtracts
-	// only `delivered`, and the destructive tier enumerates only `delivered`.
+	// only `delivered`, and the destructive tier's standing list never includes
+	// `undone` (it enumerates `delivered` plus held-for-settlement pending rows
+	// — ListStandingForActor).
 	//
 	// IT IS NO LONGER RESERVED, and its meaning is narrower than the obvious
 	// reading. Task 15's worker still DELETES the row on a successful Undo, so

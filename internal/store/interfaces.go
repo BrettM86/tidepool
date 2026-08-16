@@ -545,7 +545,13 @@ type OutboundVotes interface {
 
 	// SetDeliveredState transitions the delivery state. An unknown state is
 	// an error satisfying errors.IsValidation; a missing vote is an error
-	// satisfying errors.IsNotFound.
+	// satisfying errors.IsNotFound. `undone` is TERMINAL here: any other
+	// write over an undone row is refused and reports SUCCESS (a decided
+	// no-op — failing it would leave a settlement retrying a write that can
+	// never apply), and re-setting `undone` stays allowed so the write is
+	// idempotent. This is the settlement writer's guard against late facts
+	// about old messages; the intent-writer's one refused transition lives
+	// on Upsert, deliberately different (see its doc).
 	SetDeliveredState(ctx context.Context, voteATURI string, state DeliveredState) error
 
 	// Delete removes the vote state once its Undo is delivered. Deleting a

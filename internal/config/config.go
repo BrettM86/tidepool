@@ -340,7 +340,7 @@ func Load(logger *slog.Logger) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	cfg.BridgeKEK, err = decodeKEK("BRIDGE_KEK", kekEncoded)
+	cfg.BridgeKEK, err = DecodeKEK("BRIDGE_KEK", kekEncoded)
 	if err != nil {
 		return nil, err
 	}
@@ -350,7 +350,7 @@ func Load(logger *slog.Logger) (*Config, error) {
 	// KEK would refuse to boot every bridge that has never rotated. A rotation
 	// is a temporary state; the absence of the variable is the normal one.
 	if previousEncoded := strings.TrimSpace(os.Getenv("BRIDGE_KEK_PREVIOUS")); previousEncoded != "" {
-		cfg.BridgeKEKPrevious, err = decodeKEK("BRIDGE_KEK_PREVIOUS", previousEncoded)
+		cfg.BridgeKEKPrevious, err = DecodeKEK("BRIDGE_KEK_PREVIOUS", previousEncoded)
 		if err != nil {
 			return nil, err
 		}
@@ -657,11 +657,17 @@ func (c *Config) IsDevelopment() bool {
 	return c.Environment == EnvironmentDevelopment
 }
 
-// decodeKEK parses a KEK-carrying variable: 64 hex chars or standard base64,
+// DecodeKEK parses a KEK-carrying variable: 64 hex chars or standard base64,
 // either way decoding to exactly 32 bytes. name is the environment variable
 // the value came from, so an operator holding two KEKs mid-rotation is told
 // which one they broke rather than being sent to check the good one.
-func decodeKEK(name, encoded string) ([]byte, error) {
+//
+// Exported for the rotate-kek one-shot, which reads BRIDGE_KEK and
+// BRIDGE_KEK_PREVIOUS without going through Load (an operational command must
+// not be blockable by config it does not use) and must still accept exactly
+// the encodings the server does — a second decoder would eventually drift and
+// reject the very key the running bridge is sealing under.
+func DecodeKEK(name, encoded string) ([]byte, error) {
 	encoded = strings.TrimSpace(encoded)
 	if raw, err := hex.DecodeString(encoded); err == nil {
 		if len(raw) != 32 {

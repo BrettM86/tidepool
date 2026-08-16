@@ -95,6 +95,13 @@ services:
       BRIDGE_HOSTNAME: ${BRIDGE_HOSTNAME:-tdpl.io}
       PLC_DIRECTORY_URL: https://plc.directory
       BRIDGE_KEK: ${BRIDGE_KEK}
+      # Empty in steady state (the bridge reads empty as unset). It is set for
+      # the length of a KEK rotation ONLY, and it must be forwarded here rather
+      # than only to a one-off container: the running bridge needs the old key
+      # to open pre-rotation material, and `docker compose run tidepool
+      # rotate-kek` inherits this same service environment. See DEPLOY.md §6,
+      # "Runbook: rotating BRIDGE_KEK".
+      BRIDGE_KEK_PREVIOUS: ${BRIDGE_KEK_PREVIOUS:-}
       ADMIN_TOKEN: ${ADMIN_TOKEN}
       # Gentler than the built-in 60/120: the public plc.directory 429s
       # mint bursts during community backfill (observed at launch), and a

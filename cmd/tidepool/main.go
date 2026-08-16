@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -75,18 +77,101 @@ func dispatch(logger *slog.Logger, args []string) error {
 	case len(args) == 1 && args[0] == "rotate-kek":
 		return runRotateKEK(logger)
 	default:
-		return fmt.Errorf("usage: tidepool [migrate]")
+		return fmt.Errorf("usage: tidepool [migrate|rotate-kek]")
 	}
 }
 
 // runRotateKEK re-seals every KEK-sealed blob under the current BRIDGE_KEK so
-// the operator can retire BRIDGE_KEK_PREVIOUS.
+// the operator can retire BRIDGE_KEK_PREVIOUS (the runbook is in DEPLOY.md).
 //
-// STUB: the dispatch wiring exists so the command's contract — which
-// variables it requires and which it must not — can be driven by tests. The
-// walk itself is identity.Reseal, already implemented.
+// Like runMigrations it reads a minimal environment — DATABASE_URL,
+// BRIDGE_KEK, BRIDGE_KEK_PREVIOUS — and deliberately never calls config.Load.
+// Here that is load-bearing rather than tidy: the operator running this is
+// mid-rotation, often from a one-off container or a maintenance shell that
+// carries the database URL and the two keys and nothing else, and a rotation
+// that refuses to start because some unrelated HTTP or relay variable is
+// unset strands every sealed blob under the key being retired.
 func runRotateKEK(logger *slog.Logger) error {
-	return fmt.Errorf("rotate-kek: not implemented")
+	// Every variable is checked BEFORE the database is dialled, and each is
+	// blamed strictly by its own name: an operator holding two 32-byte secrets
+	// who is sent to edit the one that is already correct will orphan the
+	// material still sealed under it.
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		return fmt.Errorf("rotate-kek: DATABASE_URL is required")
+	}
+	currentEncoded := strings.TrimSpace(os.Getenv("BRIDGE_KEK"))
+	if currentEncoded == "" {
+		return fmt.Errorf("rotate-kek: BRIDGE_KEK is required: it names the key every sealed blob is moved onto")
+	}
+	previousEncoded := strings.TrimSpace(os.Getenv("BRIDGE_KEK_PREVIOUS"))
+	if previousEncoded == "" {
+		return fmt.Errorf("rotate-kek: BRIDGE_KEK_PREVIOUS is required: it names the key the blobs are moved off, and without it there is nothing to re-seal")
+	}
+
+	current, err := config.DecodeKEK("BRIDGE_KEK", currentEncoded)
+	if err != nil {
+		return fmt.Errorf("rotate-kek: %w", err)
+	}
+	previous, err := config.DecodeKEK("BRIDGE_KEK_PREVIOUS", previousEncoded)
+	if err != nil {
+		return fmt.Errorf("rotate-kek: %w", err)
+	}
+	// Compared on the decoded bytes for the same reason config.Load does it:
+	// one key pasted into both variables is not a rotation, and a walk that
+	// reported every blob as already-current would be read as the zero-run
+	// that clears the operator to retire a key.
+	if bytes.Equal(current, previous) {
+		return fmt.Errorf("rotate-kek: the two KEKs decode to the same key; a rotation needs two different keys")
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	database, err := db.Open(ctx, databaseURL)
+	if err != nil {
+		return fmt.Errorf("rotate-kek: %w", err)
+	}
+	defer func() { _ = database.Close() }()
+
+	// The report comes back even on the error path, and it is the whole point
+	// of the command, so it is logged before the error is returned.
+	report, resealErr := identity.Reseal(ctx, database, current, previous)
+	if report != nil {
+		logResealReport(logger, report)
+	}
+	if resealErr != nil {
+		return fmt.Errorf("rotate-kek: %w", resealErr)
+	}
+	logger.Info("kek re-seal complete; re-run until every table reports resealed=0 and failed=0 before unsetting BRIDGE_KEK_PREVIOUS")
+	return nil
+}
+
+// logResealReport writes the inventory one line per table, then one line per
+// unmovable row. The operator's decision to retire a KEK is made from these
+// lines, so nothing is folded into a grand total: a table is where they look
+// for the zero-run, and a failure has to name its row and its class (wrong-key
+// sends them to key history, malformed to backups, contended to a re-run).
+func logResealReport(logger *slog.Logger, report *identity.ResealReport) {
+	for _, table := range []struct {
+		name   string
+		counts identity.ResealCounts
+	}{
+		{"bridged_actors", report.BridgedActors},
+		{"ap_actors", report.APActors},
+		{"service_keys", report.ServiceKeys},
+	} {
+		logger.Info("kek re-seal table",
+			"table", table.name,
+			"resealed", table.counts.Resealed,
+			"already_current", table.counts.AlreadyCurrent,
+			"skipped", table.counts.Skipped,
+			"failed", table.counts.Failed)
+	}
+	for _, failure := range report.Failures {
+		logger.Error("kek re-seal failure",
+			"table", failure.Table, "id", failure.ID, "reason", string(failure.Reason))
+	}
 }
 
 // runMigrations applies every pending embedded Goose migration and exits. It

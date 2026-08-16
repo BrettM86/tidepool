@@ -328,25 +328,41 @@ longer load-bearing: the self-hosted relay + Jetstream in
 hosts with an effectively unlimited account limit. `bsky.network` remains the
 wider-visibility path only. Runbook: `SELF_HOSTED_RELAY.md`.
 
+RESOLVED — **the `BRIDGE_KEK` rotation path is built.** A KEK can now be
+changed without orphaning the three sets of sealed material
+(`bridged_actors.signing_key`, `service_keys.key_material` row `plc-rotation`,
+`ap_actors.rsa_key_sealed`). Runbook: `DEPLOY.md` §6, "Runbook: rotating
+BRIDGE_KEK".
+
+- *Design chosen:* **dual-read by trial, plus an offline re-seal walk.**
+  `NewCustodianWithPrevious` opens under the current KEK then the previous one;
+  `identity.Reseal` (driven by `tidepool rotate-kek`) walks all three domains
+  and uses the same trial to classify every blob — opens under current (leave
+  the bytes alone), opens under previous (re-seal and write back under an
+  optimistic guard), opens under neither (report, never write). Re-run until it
+  reports zero re-seals and zero failures, then unset `BRIDGE_KEK_PREVIOUS`.
+- *Rejected candidate:* **a persisted key-version selector on each sealed
+  blob**, which this list previously called the first requirement. It buys
+  nothing here: GCM authentication already answers "which key sealed this?"
+  definitively (a wrong key fails the tag; ~2⁻¹²⁸), and unlike a column the
+  ciphertext cannot be *wrong* about it — a stored version can be left stale by
+  a half-finished rotation or a mismatched restore, and would then send the
+  reader to a key that does not open the bytes. Rejecting it also removed the
+  migration on `bridged_actors` and `service_keys` that the earlier plan
+  required. **`ap_actors.rsa_key_version` was never that selector**, though it
+  reads like one: it versions the *actor's RSA key* — an independent, still
+  unbuilt rotation — not the KEK the key is wrapped in.
+- *Residual limits, still open:* **per-actor RSA key rotation itself is
+  unbuilt** (republishing `publicKey` and getting peers to re-fetch, with no
+  two-key grace overlap in the code; `rsa_key_version` is stamped and never
+  read), and **the bridge's own service-actor RSA key is still plaintext PEM**
+  in `service_keys`, outside the KEK entirely — the walk deliberately refuses
+  to touch that row, so rotating it remains a separate unbuilt procedure.
+
 DOCUMENTED, not resolved — the v2 deploy gaps below now have a written home in
 `DEPLOY.md` (§6 "Not implemented") with their blast radius. Writing them down
 is not building them; they stay open here:
 
-- **No `BRIDGE_KEK` / per-actor RSA rotation path.** Nothing re-seals existing
-  ciphertext under a new KEK, and the binary's only subcommand is `migrate`
-  (no args = serve). Changing the KEK orphans sealed key material in **three**
-  tables, not two: `bridged_actors.signing_key` (~950 bridged identities'
-  escrowed secp256k1 repo keys), `service_keys.key_material` row `plc-rotation`
-  (the PLC escrow key, the only DID recovery path), and — added by v2, and the
-  one a pre-v2 plan omits — `ap_actors.rsa_key_sealed`, **every native Coves
-  user's AP signing key** (`internal/db/migrations/017_ap_actors.sql:46`). No
-  recovery for any of it. Would need a key-version selector on each sealed
-  blob, a dual-read custodian, an online re-seal pass over all three, and a
-  cutover. Partial credit on the first: `ap_actors.rsa_key_version` already
-  exists (`017_ap_actors.sql:47`, stamped from `currentRSAKeyVersion = 1` at
-  `internal/personas/personas.go:25`) and is deliberately there so rotation is
-  definable without a schema change — but nothing reads it as a selector, and
-  the other two tables have no version column at all.
 - **No backup or restore procedure.** `docker-compose.prod.yml` mounts
   `./backups` into the Postgres container and nothing writes to it. Note
   `BRIDGE_KEK` lives in `.env` and is not covered by any database backup at
@@ -369,6 +385,25 @@ is not building them; they stay open here:
 - **Scoped kill switches are denylist-only.** There is no allowlist form, so a
   one-community canary must enumerate every *other* subscribed community — and
   adding a community to `communities.yaml` silently escapes an existing canary.
+
+Found while planning the KEK re-seal drill (NOT a defect of that work):
+
+- **A MISSING `plc-rotation` row on a populated database boots clean and
+  silently orphans every bridged DID.** `LoadOrCreateRotationKey` is
+  create-on-absence by design — that is what makes first boot and the
+  bootstrap race safe — but it cannot tell "first boot" from "the row is gone".
+  Restore a backup taken before the row existed, restore `bridged_actors`
+  without `service_keys`, or point `DATABASE_URL` at the wrong database, and
+  the bridge mints a **fresh** escrow key, seals it, stores it, and comes up
+  green. Nothing is logged as unusual. Every already-minted did:plc document
+  still names the OLD rotation key, so the bridge now holds an authority over
+  nothing while the only key that could recover ~950 DIDs is the one that just
+  went missing — and the clean boot is exactly what stops anyone from looking.
+  The KEK drill sharpened this: `rotate-kek` reports `service_keys` counts, so
+  an operator can see the row is there, but only if they run it.
+  *Candidate guard:* refuse to create when `bridged_actors` is non-empty — a
+  populated bridge with no rotation key is never a legitimate first boot — and
+  fail startup with a message that says which restore went wrong.
 
 Still open, unchanged:
 

@@ -308,6 +308,7 @@ Two classes, and the difference matters at boot:
 | `BRIDGE_SCHEME` | `https` | scheme of the bridge's own AP URLs (actor id, inbox, activity ids). `http` is dev-only — the e2e harness federates with a debug-mode Lemmy over plain HTTP |
 | `PLC_DIRECTORY_URL` | `http://localhost:3002` (local, `make plc-up`) | did:plc directory; production uses `https://plc.directory` |
 | `BRIDGE_KEK` | fixed public dev key | 32-byte key-encryption key (64 hex chars or base64) sealing per-actor signing keys and the escrow rotation key at rest (AES-256-GCM) |
+| `BRIDGE_KEK_PREVIOUS` | *(unset)* | the KEK being rotated away from, same encodings. Set only during a rotation: sealed material opens under either key while it is set, nothing new is sealed under it, and `tidepool rotate-kek` moves every blob onto `BRIDGE_KEK` so it can be unset again (runbook: `DEPLOY.md` §6) |
 | `BRIDGE_SERVICE_DID` | *(optional)* | pre-provisioned service DID for the bridge's own actor |
 | `USER_AGENT` | derived | outbound HTTP user agent |
 | `ALLOW_PRIVATE_FETCH` | off | dev-only: disables the SSRF egress guard (AP fetches **and** PLC directory requests) so localhost targets work |
@@ -722,8 +723,9 @@ The runbook is **[`DEPLOY.md`](DEPLOY.md)**: the boot-time config gate, the v2
 flag topology (`CONSUMER_ENABLED` → `OUTBOUND_WORKERS` → kill switches), the
 cross-repo Caddy change that puts the native-user AP surface on
 `coves.social`, the staged canary and its rollback order, and — explicitly —
-the things that have **no** mechanism today (KEK/RSA rotation, backup/restore,
-a divergence off switch, a periodic vote re-seed).
+the things that have **no** mechanism today (per-actor RSA rotation,
+backup/restore, a divergence off switch, a periodic vote re-seed). `BRIDGE_KEK`
+rotation used to head that list and is now a runbook in the same section.
 [`SELF_HOSTED_RELAY.md`](SELF_HOSTED_RELAY.md) covers the relay + Jetstream
 ingest path.
 

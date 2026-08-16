@@ -2,11 +2,13 @@
 # did:plc directory backing DID minting, a real atproto relay (indigo
 # BigSky) crawling the bridge like a hostile consumer — DID resolution
 # against the local PLC, per-commit signature verification, getRepo crawls —
-# and a real Jetstream decoding the RELAY's firehose. `make e2e` builds it,
+# a real reference PDS (@atproto/pds) hosting a native account, and a real
+# Jetstream decoding the RELAY's firehose. `make e2e` builds it,
 # waits for health, runs tests/e2e (tagged `e2e`) from the host, and tears
 # it down. The tested pipeline is:
 #
 #   Lemmy ──AP──▶ tidepool ──subscribeRepos──▶ relay (BigSky) ──▶ jetstream
+#                      pds ──subscribeRepos──▶ ┘
 #
 # so every scenario's records transit relay validation for free. A direct
 # bridge→Jetstream tap exists behind the `direct` compose profile for
@@ -80,11 +82,17 @@
 #   127.0.0.1:8092  Tidepool HTTP (admin API, XRPC, healthz)
 #   127.0.0.1:8541  Lemmy HTTP API (8541 nods to lemmy_alpha in upstream's federation compose)
 #   127.0.0.1:2480  Relay (BigSky) XRPC + admin API
+#   127.0.0.1:3081  Reference PDS XRPC — PUBLISHED ON THE `relay` SERVICE (the
+#                   pds shares its network namespace and so cannot publish its
+#                   own ports); 3081 rather than the PDS's natural 3001
+#                   because the Coves dev stack already owns 3001 here
 #   127.0.0.1:6028  Jetstream WebSocket (/subscribe)
 #
 # LOCAL-ONLY: nothing here talks to plc.directory, public relays, or public
-# Lemmy instances. All egress stays on the compose network (image pulls and
-# build-time package/source downloads aside).
+# Lemmy instances — the reference PDS mints its DIDs against the compose PLC
+# (PDS_DID_PLC_URL) and announces itself only to the compose relay. All
+# egress stays on the compose network (image pulls and build-time
+# package/source downloads aside).
 
 name: tidepool-e2e
 
@@ -143,7 +151,7 @@ services:
       # bridgedStats field via a real UPDATE commit on the firehose. The
       # suite's zz-sweep lexicon-validates every create AND update, so the
       # synced #bridgedStats def must make those pass. Every emitted update is
-      # a post/comment in the four-collection whitelist, so no negative
+      # a post/comment in the suite's expectedCollections allowlist, so no negative
       # assertion is tripped (see votes_hammer_test.go: it awaits the vote XRPC
       # counts and never asserts "no further commits").
       STATS_REFRESH_INTERVAL: 2s
@@ -263,17 +271,33 @@ services:
       # bridge's own /.well-known/atproto-did (Host-header keyed) — bigsky's
       # trial-host resolver speaks exactly that. Without this, handle
       # verification fails non-fatally (repo kept, handle marked invalid).
-      HANDLE_RESOLVER_HOSTS: tidepool
+      # Comma-separated (a StringSliceFlag): the second host is the reference
+      # PDS, which serves the same well-known for its `.pds.test` handles and
+      # is reachable at localhost:3001 from THIS namespace (see the `pds`
+      # service). Nice-to-have, not a gate — the failure mode is non-fatal.
+      HANDLE_RESOLVER_HOSTS: tidepool,localhost:3001
       RELAY_ADMIN_KEY: e2e-relay-admin-key
       # Default is 100 repos per PDS — a long-lived stack under repeated
       # suite runs mints past that.
       RELAY_DEFAULT_REPO_LIMIT: "10000"
       # Disk persister gives real event playback (with TTL) for downstream
-      # cursor replay instead of the DB persister's unbounded table.
+      # cursor replay instead of the DB persister's unbounded table. Note
+      # that it keeps its log-file REFS in relay-postgres while the files
+      # themselves live in this container's writable layer, so recreating
+      # this container alone (any edit to this service does) makes bigsky
+      # exit at boot on "open /data/persister/evts-0: no such file or
+      # directory". Recreate the stack with `make e2e-down` first.
       RELAY_PERSISTER_DIR: /data/persister
       BSKYLOG_LOG_LEVEL: info
     ports:
       - "127.0.0.1:${RELAY_E2E_PORT:-2480}:2470"
+      # The reference PDS's port, published HERE because the `pds` service
+      # runs in this container's network namespace and docker refuses
+      # `ports` on a container-network-mode service — at container CREATE
+      # time, which `docker compose config` does not catch. Publishing it
+      # here is the same listener: in a shared namespace there is one
+      # loopback and one port space (see the `pds` service header).
+      - "127.0.0.1:${PDS_E2E_PORT:-3081}:3001"
     networks: [tidepool-e2e]
     depends_on:
       relay-postgres:
@@ -307,6 +331,180 @@ services:
     depends_on:
       relay:
         condition: service_healthy
+
+  # ── Reference PDS (@atproto/pds — a repo host we did NOT write) ─────────
+  #
+  # Every other repo on this firehose is the bridge's: our commits, read back
+  # by our own understanding of the spec at both ends, so a shared misreading
+  # is invisible. This is the third party that cannot share it — a record it
+  # commits crosses the same relay, the same firehose and the same Jetstream
+  # as a bridged one (tests/e2e/native_pds_test.go).
+  #
+  # WHY IT SHARES THE RELAY'S NETWORK NAMESPACE
+  # @atproto/pds derives its public URL from PDS_HOSTNAME and special-cases
+  # `localhost` → http://localhost:${PDS_PORT}; ANY other hostname becomes
+  # https://…, which this plain-HTTP harness cannot serve. So the DID
+  # documents this PDS writes name http://localhost:3001 — and that string
+  # has to be TRUE for the relay, because bigsky's createExternalUser takes
+  # the service endpoint out of the DID DOCUMENT, looks the PDS peering up
+  # by THAT host, and calls describeServer against THAT url from inside its
+  # own namespace — special-casing a `localhost:` prefix back to http,
+  # because indigo is built for exactly this topology — then refuses commits
+  # from a PDS that is not authoritative for the repo. (Line numbers as of
+  # indigo 8f2296e — 2025-10-10, ~11 days after the pinned image's commit:
+  # bgs/bgs.go:1013-1045 createExternalUser, :1035-1037 the localhost case,
+  # :823-836 the authority check. Neither the image's own commit nor the
+  # indigo in go.mod is that snapshot, so treat these as landmarks to search
+  # for, not addresses to trust.)
+  # `network_mode: "service:relay"` makes localhost:3001 the same listener
+  # for both containers, so the DID document tells the truth. The obvious
+  # alternative — a `pds` hostname of its own on the compose network — fails
+  # SILENTLY and expensively: the relay accepts the crawl, registers the
+  # host, then logs and advances its cursor forever (bgs/fedmgr.go:556-563 at
+  # the same snapshot) with RepoCount 0 and not one event delivered.
+  #
+  # Consequences encoded elsewhere in this file:
+  #   * The host port is published on the `relay` service, not here.
+  #   * `relay` must NOT depends_on this service — that is a cycle, since
+  #     this service's namespace IS the relay's.
+  #   * In-network callers reach this PDS at relay:3001; the crawl
+  #     announcement says `localhost:3001`, because the relay keys the
+  #     peering on the DID-doc host and that match IS the mechanism.
+  #   * Restarting or recreating the RELAY container tears this container's
+  #     networking down with it (docker cannot re-enter a namespace that
+  #     was replaced) — recreate `pds` alongside it. The suite's restart
+  #     scenario bounces only `tidepool`, so it is safe today.
+  #
+  # Unlike the relay image, this digest is multi-arch — arm64 hosts run it
+  # natively and it needs no `platform:` pin.
+  #
+  # Expected noise, not a fault: at account creation this PDS emits a #sync
+  # frame that the pinned bigsky predates, and the relay logs one
+  # `ERROR failed handling event … err="invalid fed event"` for it. The
+  # #identity and #account frames around it are consumed normally, the
+  # handle verifies, and every #commit that follows is indexed.
+  pds:
+    # Pinned by digest — the SAME digest Coves' CI stack pins
+    # (coves/docker-compose.ci.yml), so both repos exercise one PDS build.
+    # sha256:1fa8bbce… was resolved 2026-07-28 from ghcr.io/bluesky-social/pds:latest.
+    image: ghcr.io/bluesky-social/pds@sha256:1fa8bbceabb65d8e1710749b1ea92c1c20a7489ca38da4a0a5f64c0c10a70c29
+    network_mode: "service:relay"
+    environment:
+      # localhost:3001 is a claim about the relay's namespace, not a
+      # loopback-only bind — see the header. Changing either value without
+      # the other breaks peering.
+      PDS_HOSTNAME: localhost
+      PDS_PORT: 3001
+      PDS_DATA_DIRECTORY: /pds
+      PDS_BLOBSTORE_DISK_LOCATION: /pds/blocks
+      # LOCAL-ONLY: DIDs are minted in the compose PLC, not the public
+      # plc.directory (the default). Resolved through the relay's namespace,
+      # where the compose DNS name `plc` works exactly as it does elsewhere.
+      PDS_DID_PLC_URL: http://plc:3000
+      PDS_JWT_SECRET: e2e-pds-jwt-secret
+      PDS_ADMIN_PASSWORD: e2e-pds-admin-password
+      # Distinct from Coves' key: two hosts sharing a rotation key could
+      # rewrite each other's identities, which is not the topology modelled.
+      PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX: a65e9c570ef61d87f7a4404d3b6a4763ed537b7683d9848b9a73208689c14bda
+      # `.test` is RFC-6761 reserved and can never resolve on the public
+      # internet — the same reasoning as the `.invalid` fixtures in the unit
+      # suite. native-alice.pds.test (the bootstrap account, and a constant
+      # in tests/e2e/native_pds_test.go) lives under it.
+      PDS_SERVICE_HANDLE_DOMAINS: .pds.test
+      PDS_DEV_MODE: "true"
+      # No invite codes, so pds-bootstrap creates its account over the plain
+      # public createAccount endpoint rather than the admin API — the same
+      # call any client would make.
+      PDS_INVITE_REQUIRED: "false"
+      NODE_ENV: development
+      LOG_ENABLED: "true"
+      LOG_LEVEL: info
+    volumes:
+      # Not durability — EXISTENCE. The image ships no /pds, and @atproto/pds
+      # opens its sqlite files in PDS_DATA_DIRECTORY without creating the
+      # directory first ("Cannot open database because the directory does not
+      # exist", verified on this digest).
+      - pds-data:/pds
+    depends_on:
+      # Not an ordering preference: the namespace this container joins does
+      # not exist until the relay's container does.
+      relay:
+        condition: service_healthy
+      plc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3001/xrpc/_health"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  # One-shot: create the native test account on the reference PDS, prove its
+  # credentials work, and tell the relay to crawl it.
+  #
+  # NOT the admin API — PDS_INVITE_REQUIRED is false, so this is the same
+  # public com.atproto.server.createAccount any client would call, which is
+  # the point: nothing about the native account is privileged.
+  #
+  # IDEMPOTENT BY CONSTRUCTION, because `make e2e-up` starts (and therefore
+  # re-runs) exited one-shots, and the second run always finds the handle
+  # taken. createAccount's failure is tolerated and the GATE is createSession:
+  # "these credentials authenticate" is the claim worth failing the stack on,
+  # and it is exactly the claim tests/e2e/native_pds_test.go opens with. It is
+  # also the only claim BusyBox wget can check — it cannot read a 4xx body, so
+  # "handle already taken" is indistinguishable from "the PDS rejected our
+  # configuration" at the createAccount call alone.
+  #
+  # Then requestCrawl, which is the PUBLIC sync endpoint (no admin bearer):
+  # relay-bootstrap has already raised the new-PDS-per-day limit that would
+  # otherwise refuse it, and the hostname announced is `localhost:3001` —
+  # the host in the DID documents this PDS writes, which is what the relay
+  # keys its peering on. The relay validates it by calling describeServer
+  # back at that url; no race to lose here, since `pds` is healthy first.
+  # A 200 here means the relay ACCEPTED the request, which is not the same
+  # as crawling: the silent RepoCount-0 mode in the `pds` header above
+  # begins with exactly this 200. What proves the crawl is the smoke test's
+  # pre-write relay-head poll (tests/e2e/native_pds_test.go), which demands
+  # the relay already serve a head for the native repo before the scenario
+  # writes anything.
+  #
+  # Runs in its own namespace on the compose network, so the PDS is
+  # relay:3001 from here — the same listener, seen from outside.
+  pds-bootstrap:
+    image: ghcr.io/bluesky-social/pds@sha256:1fa8bbceabb65d8e1710749b1ea92c1c20a7489ca38da4a0a5f64c0c10a70c29
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        echo '▶ creating native-alice.pds.test on the reference PDS'
+        if ! wget -q -O- --header='Content-Type: application/json' \
+          --post-data='{"handle":"native-alice.pds.test","email":"native-alice@pds.test","password":"native-alice-e2e-pass"}' \
+          http://relay:3001/xrpc/com.atproto.server.createAccount; then
+          echo '  createAccount failed with the status above, and BusyBox wget cannot read the'
+          echo '  response body — this one-shot does not know why. Benign IF the account already'
+          echo '  exists, which is every re-run of the stack. If the createSession below fails'
+          echo '  too, THIS was the real failure: check the pds logs for PLC reachability and'
+          echo '  that the handle sits under PDS_SERVICE_HANDLE_DOMAINS.'
+        fi
+        echo
+        echo '▶ authenticating as native-alice.pds.test (the gate)'
+        wget -q -O- --header='Content-Type: application/json' \
+          --post-data='{"identifier":"native-alice.pds.test","password":"native-alice-e2e-pass"}' \
+          http://relay:3001/xrpc/com.atproto.server.createSession > /dev/null
+        echo '  ✓ credentials valid'
+        echo '▶ announcing localhost:3001 (the DID-doc host) to the relay'
+        wget -q -O- --header='Content-Type: application/json' \
+          --post-data='{"hostname":"localhost:3001"}' \
+          http://relay:2470/xrpc/com.atproto.sync.requestCrawl
+        echo '  ✓ relay accepted the crawl request'
+    restart: "no"
+    networks: [tidepool-e2e]
+    depends_on:
+      pds:
+        condition: service_healthy
+      # A fresh relay refuses every non-admin requestCrawl until this
+      # one-shot raises new_pds_per_day_limit off its default of 0.
+      relay-bootstrap:
+        condition: service_completed_successfully
 
   # ── Jetstream (consumes the RELAY's firehose — the tested pipeline) ─────
   jetstream:
@@ -427,3 +625,14 @@ networks:
   tidepool-e2e:
     driver: bridge
     name: tidepool-e2e-network
+
+volumes:
+  # The reference PDS's repos, blobs and account database (why it must exist
+  # at all: see the `pds` service's volumes). Named rather than anonymous so
+  # the native account survives a `docker compose up` that recreates the
+  # container — `pds-bootstrap` is idempotent either way. `make e2e` /
+  # `make e2e-down` remove it with -v, in the same breath as the PLC's
+  # database: the account's did:plc is minted there, so keeping one without
+  # the other leaves a repo whose DID nothing can resolve, and the relay
+  # rejects every commit it signs.
+  pds-data:

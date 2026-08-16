@@ -2,10 +2,17 @@
 
 // Package e2e drives the docker-compose.e2e.yml stack end to end: a real
 // Lemmy (debug build, plain-HTTP federation) federating with Tidepool, a
-// real did:plc directory backing DID minting, a real BigSky relay crawling
-// the bridge (DID resolution against the local PLC, per-commit signature
-// verification), and a real Jetstream decoding the RELAY's firehose — every
+// real did:plc directory backing DID minting, a real reference PDS
+// (ghcr.io/bluesky-social/pds) hosting a natively-registered test account, a
+// real BigSky relay crawling BOTH repo hosts — the bridge and that PDS —
+// with DID resolution against the local PLC and per-commit signature
+// verification, and a real Jetstream decoding the RELAY's firehose — every
 // event the suite consumes has therefore survived relay validation.
+//
+// The reference PDS is the one repo host in the stack this repo did not
+// write (see native_pds_test.go): without it, every commit the suite
+// validates was produced and consumed by a single reading of the atproto
+// spec, and a misreading shared by both ends is invisible.
 //
 // Coves-style: E2E tests test REAL infrastructure, not mocks. Run them with
 // `make e2e` (compose up --build → wait for health → go test -tags e2e →
@@ -269,6 +276,9 @@ func waitForStack() error {
 		}},
 		{"relay /xrpc/_health", func() error {
 			return probeHTTP(client, relayURL()+"/xrpc/_health")
+		}},
+		{"reference pds /xrpc/_health", func() error {
+			return probeHTTP(client, pdsURL()+"/xrpc/_health")
 		}},
 		{"jetstream /subscribe", func() error {
 			u := jetstreamURL() + "/subscribe?cursor=" + fmt.Sprint(time.Now().UnixMicro())
@@ -1374,8 +1384,13 @@ func (h *harness) relayGetLatestCommit(did string) (cid, rev string, err error) 
 
 // ── Jetstream WebSocket listener ───────────────────────────────────────────
 
-// jsEvent is Jetstream's JSON event shape (kind "commit" only — the bridge
-// emits no identity/account frames yet).
+// jsEvent is Jetstream's JSON event shape. Only the "commit" kind is
+// decoded in full: the bridge still emits no identity/account frames, but
+// the reference PDS does — registering the native account puts #identity and
+// #account on the firehose (plus a #sync frame Jetstream does not surface as
+// a kind of its own) — so a listener can no longer assume every frame is a
+// commit. Commit is a POINTER for exactly that reason: it is nil on those
+// kinds, vetEvent returns early on them, and await skips them.
 type jsEvent struct {
 	Did    string    `json:"did"`
 	TimeUs int64     `json:"time_us"`

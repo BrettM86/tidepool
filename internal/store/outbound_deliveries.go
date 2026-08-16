@@ -207,18 +207,26 @@ func (r *postgresOutboundDeliveries) MarkDelivered(ctx context.Context, activity
 		activityID, targetInbox, lastStatusCode, claimToken.UTC())
 }
 
-func (r *postgresOutboundDeliveries) Release(ctx context.Context, activityID, targetInbox, errorClass, excerpt string, lastStatusCode int, nextAttempt, claimToken time.Time) (bool, bool, error) {
-	// Fencing + non-terminal guard: only the current claim holder reschedules
-	// (claimed_until == claimToken, state = 'pending'), so a stale worker's late
-	// release cannot resurrect a delivery a newer attempt already drove to a
-	// terminal state. The row stays pending with the lease cleared so a retry
-	// can re-claim after the backoff.
-	query := `
+// releaseStatement is the fenced reschedule BOTH releases run, with exactly one
+// slot: what the attempt ledger does. Release leaves it alone; ReleaseParked
+// hands the claim's increment back.
+//
+// It is one template rather than two statements because the FENCE is what makes
+// the give-back safe. `state = 'pending' AND claimed_until = $7` admits only the
+// worker still holding the claim, so the only increment a park can subtract is
+// the one its own claim just added. A second copy of this statement is a copy of
+// that fence, and the day the two drift is the day a stale worker's late park
+// un-counts an attempt the CURRENT claim genuinely spent — a delivery quietly
+// gaining retries it already used, visible nowhere until a poison budget that
+// should have stopped never does.
+//
+// The slot is filled from a CONSTANT below and never from input.
+const releaseStatement = `
 		WITH updated AS (
 			UPDATE outbound_deliveries
 			SET claimed_until = NULL, next_attempt_at = $3,
 			    last_error_class = $4, response_excerpt = $5,
-			    last_status_code = $6, updated_at = now()
+			    last_status_code = $6, updated_at = now()%s
 			WHERE activity_id = $1 AND target_inbox = $2
 			  AND state = 'pending'
 			  AND claimed_until = $7
@@ -228,7 +236,47 @@ func (r *postgresOutboundDeliveries) Release(ctx context.Context, activityID, ta
 			EXISTS (SELECT 1 FROM outbound_deliveries WHERE activity_id = $1 AND target_inbox = $2),
 			EXISTS (SELECT 1 FROM updated)`
 
+// handBackClaimAttempt is ReleaseParked's ONE difference from Release. GREATEST
+// floors the ledger at zero so an unmatched arithmetic edge can never write a
+// negative attempt count (attempts is INT NOT NULL DEFAULT 0, so there is no
+// NULL to guard).
+const handBackClaimAttempt = `,
+			    attempts = GREATEST(attempts - 1, 0)`
+
+func (r *postgresOutboundDeliveries) Release(ctx context.Context, activityID, targetInbox, errorClass, excerpt string, lastStatusCode int, nextAttempt, claimToken time.Time) (bool, bool, error) {
+	// Fencing + non-terminal guard: only the current claim holder reschedules
+	// (claimed_until == claimToken, state = 'pending'), so a stale worker's late
+	// release cannot resurrect a delivery a newer attempt already drove to a
+	// terminal state. The row stays pending with the lease cleared so a retry
+	// can re-claim after the backoff. The attempt ClaimNext charged stays
+	// charged: this delivery was TRIED.
+	query := fmt.Sprintf(releaseStatement, "")
+
 	return r.markResult(ctx, "release", query,
+		activityID, targetInbox, nextAttempt.UTC(), errorClass, excerpt, lastStatusCode, claimToken.UTC())
+}
+
+// ReleaseParked is the ATTEMPT-NEUTRAL release: the same fenced reschedule as
+// Release, with the claim's own increment handed back.
+//
+// THE INVARIANT IS "a park hands back exactly its own claim's increment". A
+// delivery that was HELD — by the kill switch, a dry run, a causal wait — was
+// never tried, but ClaimNext charges an attempt to every claim alike, so without
+// the give-back a hold spends retry budget the delivery no longer has when the
+// hold lifts, and a long enough hold poisons a delivery nothing ever attempted.
+// The fence is what makes the decrement safe rather than merely convenient: only
+// the worker whose claim added the increment can subtract one, so no park can
+// reach an attempt another claim spent. A park is therefore net-zero and a real
+// failure still costs exactly one.
+//
+// settleLater's Release deliberately keeps its increment instead of parking: a
+// held-for-settlement delivery is already accepted by the peer and handle()
+// short-circuits before re-POSTing it, so it can never re-poison and its growing
+// attempt count only widens the backoff between bookkeeping retries.
+func (r *postgresOutboundDeliveries) ReleaseParked(ctx context.Context, activityID, targetInbox, errorClass, excerpt string, lastStatusCode int, nextAttempt, claimToken time.Time) (bool, bool, error) {
+	query := fmt.Sprintf(releaseStatement, handBackClaimAttempt)
+
+	return r.markResult(ctx, "release parked", query,
 		activityID, targetInbox, nextAttempt.UTC(), errorClass, excerpt, lastStatusCode, claimToken.UTC())
 }
 

@@ -63,6 +63,11 @@ type Custodian struct {
 	// on every commit's hot path, and cipher.AEAD is safe for concurrent
 	// use.
 	aead cipher.AEAD
+	// previous is the KEK being rotated away from, nil outside a rotation.
+	// It only ever opens: seal uses aead unconditionally, so material written
+	// during the rotation window is readable by the current key alone and the
+	// operator can eventually drop the old one.
+	previous cipher.AEAD
 }
 
 // NewCustodian validates the KEK and returns a Custodian.
@@ -87,9 +92,31 @@ func NewCustodian(kek []byte) (*Custodian, error) {
 // without orphaning key material sealed under the old one. previous may be
 // nil, in which case the result behaves exactly like NewCustodian(current).
 //
-// STUB (TDD red): ignores previous entirely and delegates to NewCustodian.
+// A wrong-length previous key is rejected here rather than at first use: the
+// alternative is discovering it only when some pre-rotation key fails to open,
+// long after the deploy that introduced it.
 func NewCustodianWithPrevious(current, previous []byte) (*Custodian, error) {
-	return NewCustodian(current)
+	custodian, err := NewCustodian(current)
+	if err != nil {
+		return nil, err
+	}
+	if len(previous) == 0 {
+		return custodian, nil
+	}
+	if len(previous) != KEKSize {
+		return nil, errors.NewValidationError("bridge_kek_previous",
+			fmt.Sprintf("must be %d bytes, got %d", KEKSize, len(previous)))
+	}
+	block, err := aes.NewCipher(previous)
+	if err != nil {
+		return nil, fmt.Errorf("identity: init AES for previous KEK: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("identity: init GCM for previous KEK: %w", err)
+	}
+	custodian.previous = gcm
+	return custodian, nil
 }
 
 // EncryptActorKey seals an actor's signing key for storage in
@@ -141,10 +168,24 @@ func (c *Custodian) open(ciphertext, aad []byte) ([]byte, error) {
 	nonce := ciphertext[1 : 1+c.aead.NonceSize()]
 	sealed := ciphertext[1+c.aead.NonceSize():]
 	plaintext, err := c.aead.Open(nil, nonce, sealed, aad)
-	if err != nil {
-		return nil, fmt.Errorf("identity: open sealed key: %w", err)
+	if err == nil {
+		return plaintext, nil
 	}
-	return plaintext, nil
+	// The format checks above ran first, so reaching here means the blob is
+	// well-formed and merely failed GCM authentication — the one condition a
+	// second KEK can fix. A truncated or wrong-version blob never gets here,
+	// and so is never misreported as a key problem.
+	if c.previous != nil {
+		// Same aad: the retry re-tries the KEK, never the domain binding, so
+		// a ciphertext that wandered between AAD domains stays rejected.
+		if plaintext, prevErr := c.previous.Open(nil, nonce, sealed, aad); prevErr == nil {
+			return plaintext, nil
+		}
+	}
+	// One unreadable blob is one incident. Reporting only the current key's
+	// failure keeps the message byte-identical to the single-KEK case, so log
+	// lines and alerts written before a rotation still match during it.
+	return nil, fmt.Errorf("identity: open sealed key: %w", err)
 }
 
 // LoadOrCreateRotationKey returns the bridge's escrow rotation key,

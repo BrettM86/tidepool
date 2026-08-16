@@ -170,7 +170,7 @@ func run(logger *slog.Logger) error {
 	// The sync surface (task 04): com.atproto.sync.* + subscribeRepos,
 	// describeServer, _health — everything a relay or Jetstream needs to
 	// treat Tidepool as a subscribeRepos upstream.
-	custodian, err := identity.NewCustodian(cfg.BridgeKEK)
+	custodian, err := identity.NewCustodianWithPrevious(cfg.BridgeKEK, cfg.BridgeKEKPrevious)
 	if err != nil {
 		return err
 	}
@@ -250,6 +250,10 @@ func run(logger *slog.Logger) error {
 		AllowPrivateAddresses: cfg.AllowPrivateAddresses,
 	})
 
+	// The boot canary for BRIDGE_KEK: the rotation key is sealed under the KEK
+	// and opened here, so a wrong or half-rotated key fails startup before any
+	// traffic is served, rather than surfacing later as per-actor decrypt
+	// failures scattered across the commit path.
 	rotationKey, err := identity.LoadOrCreateRotationKey(ctx, serviceKeys, custodian)
 	if err != nil {
 		return err

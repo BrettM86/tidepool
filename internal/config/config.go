@@ -4,6 +4,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
@@ -54,10 +55,9 @@ type Config struct {
 	BridgeKEK []byte
 	// BridgeKEKPrevious is the KEK the bridge is rotating away from: key
 	// material sealed under it must still open, but nothing new is sealed
-	// under it. Nil when BRIDGE_KEK_PREVIOUS is unset.
-	//
-	// STUB (TDD red): nothing parses BRIDGE_KEK_PREVIOUS yet, so this is
-	// always nil.
+	// under it. Nil when BRIDGE_KEK_PREVIOUS is unset — which is the steady
+	// state, so the variable is optional in every environment and has no
+	// development default.
 	BridgeKEKPrevious []byte
 	// BridgeServiceDID optionally pins a pre-provisioned service DID for the
 	// bridge's own actor. Service-DID bootstrap is deferred: task 06 wires
@@ -340,9 +340,27 @@ func Load(logger *slog.Logger) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	cfg.BridgeKEK, err = decodeKEK(kekEncoded)
+	cfg.BridgeKEK, err = decodeKEK("BRIDGE_KEK", kekEncoded)
 	if err != nil {
 		return nil, err
+	}
+
+	// Optional everywhere, deliberately NOT routed through stringVar: that
+	// helper makes a variable required in production, and requiring a previous
+	// KEK would refuse to boot every bridge that has never rotated. A rotation
+	// is a temporary state; the absence of the variable is the normal one.
+	if previousEncoded := strings.TrimSpace(os.Getenv("BRIDGE_KEK_PREVIOUS")); previousEncoded != "" {
+		cfg.BridgeKEKPrevious, err = decodeKEK("BRIDGE_KEK_PREVIOUS", previousEncoded)
+		if err != nil {
+			return nil, err
+		}
+		// Compared on the decoded bytes, not the strings: the same key pasted
+		// as hex in one variable and base64 in the other is still one key, and
+		// an operator who believes that is a rotation would retire the only
+		// key every escrowed signing key is sealed under.
+		if bytes.Equal(cfg.BridgeKEKPrevious, cfg.BridgeKEK) {
+			return nil, fmt.Errorf("config: BRIDGE_KEK_PREVIOUS must decode to a different key than the current one; a rotation needs two different keys")
+		}
 	}
 
 	// Optional in every environment: an operator may pre-provision the
@@ -639,22 +657,24 @@ func (c *Config) IsDevelopment() bool {
 	return c.Environment == EnvironmentDevelopment
 }
 
-// decodeKEK parses the BRIDGE_KEK value: 64 hex chars or standard base64,
-// either way decoding to exactly 32 bytes.
-func decodeKEK(encoded string) ([]byte, error) {
+// decodeKEK parses a KEK-carrying variable: 64 hex chars or standard base64,
+// either way decoding to exactly 32 bytes. name is the environment variable
+// the value came from, so an operator holding two KEKs mid-rotation is told
+// which one they broke rather than being sent to check the good one.
+func decodeKEK(name, encoded string) ([]byte, error) {
 	encoded = strings.TrimSpace(encoded)
 	if raw, err := hex.DecodeString(encoded); err == nil {
 		if len(raw) != 32 {
-			return nil, fmt.Errorf("config: BRIDGE_KEK must decode to 32 bytes, got %d", len(raw))
+			return nil, fmt.Errorf("config: %s must decode to 32 bytes, got %d", name, len(raw))
 		}
 		return raw, nil
 	}
 	raw, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
-		return nil, fmt.Errorf("config: BRIDGE_KEK must be 64 hex chars or base64 of 32 bytes: %w", err)
+		return nil, fmt.Errorf("config: %s must be 64 hex chars or base64 of 32 bytes: %w", name, err)
 	}
 	if len(raw) != 32 {
-		return nil, fmt.Errorf("config: BRIDGE_KEK must decode to 32 bytes, got %d", len(raw))
+		return nil, fmt.Errorf("config: %s must decode to 32 bytes, got %d", name, len(raw))
 	}
 	return raw, nil
 }

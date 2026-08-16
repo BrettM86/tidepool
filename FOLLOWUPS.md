@@ -537,20 +537,59 @@ Still open, unchanged:
 ## Deferred by 17e (reconciliation scoped to detect-only)
 
 17e reports divergence and never repairs it (decision 19). These are the repairs
-and the comparisons it deliberately did not build.
+and the comparisons it deliberately did not build. Leg 1 has since been built
+and is kept here, marked CLOSED, for the design record rather than as work
+outstanding.
 
-- **The re-cast race, leg 1 — `upsert` clobbers a delivered vote.**
-  `internal/consume/votes.go` hardcodes `pending` on the vote write and
-  `internal/store/outbound_votes.go` `Upsert` sets
+- **CLOSED — the re-cast race, leg 1: the upsert no longer clobbers a delivered
+  vote.** The write path hardcoded `pending`
+  (`internal/consume/votes.go`) over an `ON CONFLICT` that took
   `delivered_state = EXCLUDED.delivered_state`, so re-casting a DELIVERED vote
-  resets the row to pending while Lemmy still holds the OLD vote in the OLD
-  direction: we subtract nothing and keep our stale vote. Transient normally,
-  PERMANENT if that delivery poisons. THE FIX, and it already has a model in
-  the tree: make the upsert refuse to write `pending` over `delivered` exactly
-  the way `SetDeliveredState` now refuses to write over `undone` (17d), so a
-  re-cast leaves a row that still owes an Undo. Vote-accounting change with its
-  own RED test — 17e's report is its regression oracle, which is why the report
-  ships first.
+  reset the row to pending while Lemmy still held the OLD vote in the OLD
+  direction — the vote was then invisible to the reseed (which subtracts only
+  `delivered`) and to the erasure purge (which enumerates only standing votes),
+  permanently if the new delivery poisoned. The chosen design is the model 17d
+  already set: a guard in the STATEMENT rather than in Go, as a `CASE` inside
+  the `ON CONFLICT` `SET` (`internal/store/outbound_votes.go`), defending
+  exactly one transition — `pending` may not overwrite a stored `delivered`.
+  Every other column still updates, `activity_seq` still bumps, `RETURNING`
+  reflects the kept state, and the purge's `undone` and the callback's
+  `delivered` still write straight through. It is SQL and not Go because the
+  consumer's state read is non-transactional and would race the delivery
+  worker's settlement; the `CASE` evaluates under the row lock `ON CONFLICT`
+  already holds.
+
+  *The rejected candidate, recorded so it is not re-proposed.* Freezing
+  `direction` alongside `delivered_state` — keeping every fact about the
+  delivered vote together — is wrong in the same way the "what the peer holds"
+  vs "what the user wants" column pair below is wrong, and for a sharper
+  reason: `consume.applyVoteWrite` builds the OUTGOING intent from the row the
+  upsert RETURNS, so a frozen direction would federate the flip in the
+  direction the user just abandoned, leaving the peer counting the vote they
+  changed away from. The row states the newest intent and the older delivery
+  together, deliberately.
+
+  *Two residual limits, both accepted.*
+  - **Direction incoherence inside the re-cast window.** `delivered_state` now
+    survives the flip while `direction` is already the new one, so a reseed
+    landing in the window subtracts the wrong side: the direction the peer
+    holds stays in the baseline, the direction it does not hold is subtracted
+    from a total that never contained it. One directional error was traded for
+    a different one — but the new one is SIGNALLED, where the old one was
+    silent: `SeedOursSubtracted` counts the row, and the negative baseline
+    trips `SeedBaselineClamped` and the clamp `Warn` naming direction,
+    `deficit_*` and `ours_*`. The two errors can cancel in the served number,
+    so those counters are the only place the window shows. Heals when the flip
+    delivers or the vote is undone; the arithmetic is pinned by
+    `TestReseedDuringARecastWindowMisreadsBothDirections`
+    (`internal/votes/reseed_recast_cost_test.go`).
+  - **Delete then re-cast the same rkey before the Undo settles.** The late Undo
+    callback resolves the OLD activity id, misses (`GetByActivityID` → NotFound
+    → no-op), and the row keeps `delivered` for a vote the peer no longer holds
+    until the next flip delivery or undo. Narrow and known, and chosen over the
+    pre-fix behaviour where that same sequence left the vote invisible to both
+    the purge and the reseed rather than merely stale to one of them. This is
+    leg 2's mechanism, below, reached from the opposite direction.
 
 - **The re-cast race, leg 2 — the settlement silently forgets the old vote.
   Recorded nowhere before now.** `internal/outbound/worker.go` `voteCallback`

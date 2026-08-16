@@ -40,6 +40,12 @@ func (r *postgresOutboundVotes) upsert(ctx context.Context, q execer, vote Outbo
 	// the wire. Defaulting the zero value the other way would silently mark a
 	// vote as delivered that no peer ever saw, and its Undo would then look
 	// unnecessary.
+	//
+	// This decides only what the caller ASKED FOR, not what the row ends up
+	// holding: on a re-cast the ON CONFLICT below may keep a stored
+	// `delivered` over the `pending` defaulted here. The two rules do not
+	// disagree — this one refuses to INVENT a delivery nobody witnessed, that
+	// one refuses to DISCARD one that was.
 	if vote.DeliveredState == "" {
 		vote.DeliveredState = DeliveredStatePending
 	}
@@ -73,6 +79,26 @@ func (r *postgresOutboundVotes) upsert(ctx context.Context, q execer, vote Outbo
 	// It lives in SQL, not Go: the consumer's state read is non-transactional,
 	// so a read-then-decide guard races the delivery worker's settlement. The
 	// CASE evaluates under the row lock ON CONFLICT already holds.
+	//
+	// FREEZING `direction` ALONGSIDE IT WAS REJECTED. It looks like the
+	// consistent move — keep every fact about the delivered vote together —
+	// but consume.applyVoteWrite builds the OUTGOING intent from the row this
+	// statement RETURNS, so a frozen direction would federate the flip in the
+	// direction the user just abandoned, and the peer would keep counting the
+	// vote they changed away from. It is also the rejected "what the peer
+	// holds" vs "what the user wants" column pair collapsed into one column,
+	// carrying the same defect: two facts in one place with no way to tell
+	// which a reader meant. The row therefore states the newest intent and the
+	// older delivery TOGETHER, on purpose (store.DeliveredStateDelivered).
+	//
+	// THE ACCEPTED COST, so it is not rediscovered as a fresh bug: delete a
+	// vote and re-cast the SAME rkey before the Undo settles, and the late
+	// callback resolves the OLD activity id, misses (GetByActivityID →
+	// NotFound → no-op), and this row keeps `delivered` for a vote the peer no
+	// longer holds — until the next flip delivers or an undo lands. Narrow and
+	// known, and chosen over the pre-fix behaviour, where the same sequence
+	// left the vote invisible to BOTH the erasure purge and the reseed rather
+	// than merely stale to one of them.
 	query := `
 		INSERT INTO outbound_votes (
 			vote_at_uri, actor_did, subject_at_uri, subject_ap_id, community_did,

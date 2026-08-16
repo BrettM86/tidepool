@@ -203,16 +203,21 @@ type UnknownDeliveryOutcome struct {
 // RecastDivergence is a vote a peer HOLDS that our own state does not claim.
 //
 // It is produced by the re-cast race 17b recorded and deferred: re-casting a
-// delivered vote re-upserts the SAME row back to pending under a new activity
-// id, while the peer still holds the old vote in the old direction. Transient
-// while the new delivery is in flight — and PERMANENT the moment it poisons.
+// delivered vote rewrites the SAME row to the new direction under a NEW
+// activity id, while the peer still holds the old vote in the old direction.
+// Transient while the new delivery is in flight — and PERMANENT the moment it
+// poisons.
 //
 // IT CANNOT BE READ FROM THE VOTE ROW, which is what makes it a reconciliation
-// item rather than a query. worker.voteCallback resolves its row through
-// GetByActivityID and returns nil on NotFound, so when a delivery that was
-// already in flight lands AFTER a re-cast, its id no longer matches
-// current_activity_id and the settlement silently no-ops. The row is precisely
-// the evidence the bug erases. outbound_activities is append-only and its
+// item rather than a query. The row keeps `delivered` through the flip (the
+// upsert guard defends that state), so it still says a vote of ours stands
+// here — but current_activity_id has moved to the new activity, so it can no
+// longer say WHICH one, and which one is the entire content of this finding.
+// worker.voteCallback resolves its row through GetByActivityID and returns nil
+// on NotFound, so when a delivery that was already in flight lands AFTER a
+// re-cast, its id no longer matches current_activity_id and the settlement
+// silently no-ops — nothing writes the old activity back into the row, ever.
+// outbound_activities is append-only and its
 // parent_at_uri carries the subject at-uri from both vote enqueue sites, so the
 // activity/delivery history is the durable record of what each peer was
 // actually told.
@@ -557,14 +562,14 @@ func (r *postgresDivergences) UndeliveredAcceptanceCounts(ctx context.Context, s
 //	a LATER DELIVERED VOTE followed it — without this, every successful vote
 //	  FLIP is a finding, forever. A flip is an in-place upsert
 //	  (consume.applyVoteWrite): current_activity_id moves to the new
-//	  activity, delivered_state resets to pending, and NO Undo is enqueued,
-//	  because Lemmy holds one vote per (person, object) and REPLACES it on a
-//	  bare opposite vote. So once the new vote delivers, the old delivered
-//	  activity satisfies neither exclusion above — the ledger names the new
-//	  id and no Undo will ever join it — and the append-only history keeps it
-//	  forever. A later delivered Like/Dislike for the same pair supersedes an
-//	  earlier one EXACTLY as a delivered Undo does, and that is the only
-//	  reason this is correct rather than merely convenient.
+//	  activity, and NO Undo is enqueued, because Lemmy holds one vote per
+//	  (person, object) and REPLACES it on a bare opposite vote. So once the
+//	  new vote delivers, the old delivered activity satisfies neither
+//	  exclusion above — the ledger names the new id and no Undo will ever
+//	  join it — and the append-only history keeps it forever. A later
+//	  delivered Like/Dislike for the same pair supersedes an earlier one
+//	  EXACTLY as a delivered Undo does, and that is the only reason this is
+//	  correct rather than merely convenient.
 //
 // Both time exclusions compare by TIME rather than by id on purpose: an Undo
 // names the activity it withdraws in its payload, but a re-cast mints new

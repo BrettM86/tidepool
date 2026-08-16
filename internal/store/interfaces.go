@@ -498,6 +498,17 @@ type OutboundVotes interface {
 	// satisfying errors.IsAlreadyExists: one actor holds at most one live
 	// vote per subject, and silently clobbering the old row would strand its
 	// Undo.
+	//
+	// ONE STATE TRANSITION IS REFUSED: `pending` over a stored `delivered`
+	// keeps `delivered`. A re-cast replaces a vote the peer still holds rather
+	// than withdrawing it, and the caller states `pending` on every write
+	// because it records intent and cannot know what the wire said — so
+	// letting it land would erase the only record that a delivery happened.
+	// Every other column still updates and ActivitySeq still bumps, and the
+	// RETURNED row reflects the KEPT state: callers build their outgoing
+	// intent from what comes back, so the struct and the stored row cannot
+	// disagree. No other transition is defended — `undone` (the purge's
+	// retraction) and `delivered` both write straight through.
 	Upsert(ctx context.Context, vote OutboundVote) (*OutboundVote, error)
 
 	// UpsertTx is Upsert on an existing transaction. A nil tx is an error

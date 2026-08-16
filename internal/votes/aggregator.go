@@ -478,9 +478,11 @@ func (a *Aggregator) RetractVote(ctx context.Context, vote *ap.Object, community
 // on the next re-seed" can mean "heals when an admin forces a backfill", and
 // may mean never.
 //
-// Three residual races span the origin API fetch and this transaction. All are
-// transient and self-healing on the next re-seed, with the caveat above (the
-// pre-fix over-count race was PERMANENT and compounding):
+// Three residual races span the origin API fetch and this transaction. The
+// first two are transient and self-healing on the next re-seed, with the caveat
+// above (the pre-fix over-count race was PERMANENT and compounding); the third
+// heals on the FLIP'S DELIVERY rather than on a re-seed, so re-seeding inside
+// its window reproduces it rather than converging it:
 //   - under-count by one: a vote federates AFTER the fetch but is live here, so
 //     it is net-subtracted from the baseline yet not present in the fetched
 //     total;
@@ -488,15 +490,21 @@ func (a *Aggregator) RetractVote(ctx context.Context, vote *ap.Object, community
 //     federated activity arrives AFTER this seed tx — the net-of-live
 //     subtraction cannot yet see it as a live row, so the baseline keeps it AND
 //     the later live event adds it again, until the next re-seed reconciles;
-//   - over-count by one, outbound side: a native user RE-CASTS a vote they had
-//     already delivered. consume's applyVoteWrite re-upserts the row and
-//     OutboundVotes.Upsert resets delivered_state to 'pending', while Lemmy
-//     still holds the OLD vote in the OLD direction — so this seed subtracts
-//     nothing for it and the stale vote stays in the served tally. Transient
-//     (the redelivery flips the row back to 'delivered') but PERMANENT if that
-//     delivery poisons. Fixing it needs a second column pair modelling "what
-//     the peer holds" against "what the user wants", which is task 17e's, not
-//     this one's.
+//   - direction incoherence during a re-cast window, outbound side: a native
+//     user RE-CASTS a vote they had already delivered. The CLOBBER this bullet
+//     used to describe is closed — OutboundVotes.Upsert now keeps 'delivered'
+//     through a flip, so the row stays in the `ours` term instead of dropping
+//     out of it entirely, and the vote is no longer invisible to this seed.
+//     What remains is narrower and is a DIFFERENT error, not the same one:
+//     the row's direction is already the NEW one while the peer still holds
+//     the OLD, so the subtraction lands on the wrong side of the tally — the
+//     direction the peer holds is not subtracted, and the direction it does
+//     not hold is. It heals when the flip delivers or the vote is undone, and
+//     unlike its predecessor it is SIGNALLED while it lasts (see the ours.*
+//     binding in SeedAggregates for which counters, and why the served number
+//     alone will not show it). The "what the peer holds" vs "what the user
+//     wants" column pair once proposed here was REJECTED with reasons; they
+//     are recorded in FOLLOWUPS.md so it is not re-proposed.
 //
 // Subjects not present in ap_objects are dropped and logged at debug, like
 // ApplyVote.
@@ -540,8 +548,9 @@ func (a *Aggregator) SeedAggregates(ctx context.Context, subjectAPID string, upv
 		// isolation), so the two counts could come from different moments —
 		// creating exactly the torn read the aggregate lock exists to prevent.
 		//
-		// ours.* is the votes LEMMY CURRENTLY HOLDS for our personas, and the
-		// predicate is the POSITIVE EQUALITY delivered_state = 'delivered':
+		// ours.* is the votes LEMMY CURRENTLY HOLDS for our personas — exactly
+		// per ROW, only APPROXIMATELY per DIRECTION — and the predicate is the
+		// POSITIVE EQUALITY delivered_state = 'delivered':
 		//
 		//	pending (first try, retrying, poisoned) → the peer does not hold it
 		//	delivered                               → it does: subtract
@@ -551,6 +560,28 @@ func (a *Aggregator) SeedAggregates(ctx context.Context, subjectAPID string, upv
 		//	                                          peer has not yet processed the
 		//	                                          withdrawal
 		//	row gone (Undo delivered)               → nothing to subtract
+		//
+		// THE DIRECTION IS THE APPROXIMATE HALF, and only inside a re-cast
+		// window. The row's `direction` tracks the newest INTENT while
+		// `delivered_state` describes a delivery that already happened, so
+		// after a flip the two come from different moments (see
+		// store.DeliveredStateDelivered). This subtracts the flip's direction
+		// from an origin total that still contains the old one: the direction
+		// the peer really holds is left in the baseline, and the direction it
+		// does not hold is subtracted from a total that never contained it.
+		// Per row the term is RIGHT — the vote is counted among `ours`, which
+		// is what the upsert guard bought — and per direction it is wrong
+		// until the flip delivers or the vote is undone.
+		//
+		// It is SIGNALLED rather than swallowed, and that is the whole reason
+		// this is tolerable: SeedOursSubtracted counts the row, the wrong-side
+		// subtraction drives that direction's baseline negative, and the
+		// GREATEST(0, …) floor trips SeedBaselineClamped plus the clamp Warn
+		// naming direction, deficit_* and ours_*. The two directional errors
+		// can CANCEL in the served number, so vote_aggregates alone shows a
+		// healthy subject and the counters are the only place the window is
+		// visible. The arithmetic is pinned exactly as it stands by
+		// TestReseedDuringARecastWindowMisreadsBothDirections.
 		//
 		// A negation ("NOT undone", "<> 'pending'") reads identically TODAY only
 		// because nothing writes 'undone'. If a policy ever does, it will mean

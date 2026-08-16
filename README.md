@@ -259,10 +259,13 @@ suite authenticates as the bootstrap account on the reference PDS, writes
 one `community.postv2` into that account's own repo, and follows it through
 the relay to Jetstream and into the relay's own `getLatestCommit` state.
 Deliberately a smoke test, not a feature test — what it buys is the wire,
-not the record. Note before extending it: `vetEvent`'s collection whitelist
-is global, so a second scenario writing any other collection into the native
-repo fails the whole suite until that whitelist is rescoped by repo class
-(see FOLLOWUPS.md).
+not the record. Note before extending it: `vetEvent`'s `expectedCollections`
+allowlist knows nothing about which repo a record came from, so it fails
+**closed** on a collection outside the list (a vote record in the native repo
+fails its own test and the `zz_sweep` replay) and **open** on one inside it
+(an `actor.profile` in the native repo passes silently, indistinguishable
+from the bridge writing its own). That second half is why the allowlist wants
+rescoping by repo class — task 18's sweep item, see FOLLOWUPS.md.
 
 Every
 create/update the tests consume from Jetstream has passed the relay's

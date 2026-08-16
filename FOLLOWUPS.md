@@ -455,7 +455,7 @@ Still open, unchanged:
 - The PLC directory image is pinned by commit in `e2e/plc/Dockerfile`; bump it
   deliberately when upstream fixes are needed.
 - **The stack now carries a reference PDS** (`ghcr.io/bluesky-social/pds`,
-  digest-pinned to the build Coves' CI pins; host port 127.0.0.1:3081,
+  digest-pinned to the same build Coves' CI pins; host port 127.0.0.1:3081,
   published on the `relay` service because the PDS shares its network
   namespace). One smoke scenario uses it —
   `tests/e2e/native_pds_test.go` writes a `community.postv2` into the native
@@ -465,18 +465,21 @@ Still open, unchanged:
   our commit reader can no longer stay invisible. The task-18 scenarios
   (native posts, acceptance records, votes both ways, Lemmy-side visibility)
   are still open; this is deliverable 1 only.
-- **TRIPWIRE — the collection whitelist is global.** `vetEvent`
-  (`tests/e2e/helpers.go`) checks every event on the firehose against a
-  single `expectedCollections` allowlist, whatever repo it came from, and a
-  violation fails the WHOLE suite (including the end-of-run sweep, which
-  re-vets the replay). `community.postv2` is already on that list, which is
-  the only reason the native repo passes today. **The first scenario that
-  writes any other collection into the reference PDS's repo takes every other
-  scenario down with it** — `bridge.federation`, `feed.vote`,
-  `actor.profile` on a native DID, anything. Rescoping the whitelist by repo class (bridge-hosted
-  author DIDs / bridge-hosted community DIDs / native-PDS DIDs, each with
-  independent rev tracking) is task 18's sweep item and was deliberately left
-  out of the reference-PDS landing. Related: the e2e stack leaves
+- **TRIPWIRE — the collection whitelist is repo-class-blind, and it cuts both
+  ways.** `vetEvent` (`tests/e2e/helpers.go`) checks every event on the
+  firehose against a single `expectedCollections` allowlist with no notion of
+  which repo the record came from. It therefore fails CLOSED on a collection
+  outside the list — a scenario writing, say, a vote record into the native
+  repo fails its own test and, deterministically, the `zz_sweep` replay that
+  re-vets every retained event — and fails OPEN on one inside it: a
+  `social.coves.actor.profile` written into the native repo is
+  indistinguishable, to the whitelist, from the bridge writing that same
+  collection into a repo it owns. `community.postv2` being allowlisted is the
+  only reason the native repo passes today; the fails-open half is the real
+  argument for rescoping by repo CLASS (bridge-hosted author DIDs /
+  bridge-hosted community DIDs / native-PDS DIDs, each with its own allowlist
+  and independent rev tracking) — task 18's sweep item, deliberately left out
+  of the reference-PDS landing. Related: the e2e stack leaves
   `CONSUMER_ENABLED` at its default of false, so the acceptance engine never
   reacts to native records — a scenario that needs an acceptance record must
   turn the consumer on and point `JETSTREAM_URL` at the compose Jetstream

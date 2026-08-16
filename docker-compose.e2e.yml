@@ -151,7 +151,7 @@ services:
       # bridgedStats field via a real UPDATE commit on the firehose. The
       # suite's zz-sweep lexicon-validates every create AND update, so the
       # synced #bridgedStats def must make those pass. Every emitted update is
-      # a post/comment in the four-collection whitelist, so no negative
+      # a post/comment in the suite's expectedCollections allowlist, so no negative
       # assertion is tripped (see votes_hammer_test.go: it awaits the vote XRPC
       # counts and never asserts "no further commits").
       STATS_REFRESH_INTERVAL: 2s
@@ -345,19 +345,23 @@ services:
   # `localhost` → http://localhost:${PDS_PORT}; ANY other hostname becomes
   # https://…, which this plain-HTTP harness cannot serve. So the DID
   # documents this PDS writes name http://localhost:3001 — and that string
-  # has to be TRUE for the relay, because bigsky's createExternalUser
-  # (indigo bgs/bgs.go:1013-1045) takes the service endpoint out of the DID
-  # DOCUMENT, looks the PDS peering up by THAT host, and calls
-  # describeServer against THAT url from inside its own namespace
-  # (bgs.go:1035-1037 special-cases a `localhost:` prefix back to http —
-  # indigo is built for exactly this topology), then refuses commits from a
-  # PDS that is not authoritative for the repo (bgs.go:823-836).
+  # has to be TRUE for the relay, because bigsky's createExternalUser takes
+  # the service endpoint out of the DID DOCUMENT, looks the PDS peering up
+  # by THAT host, and calls describeServer against THAT url from inside its
+  # own namespace — special-casing a `localhost:` prefix back to http,
+  # because indigo is built for exactly this topology — then refuses commits
+  # from a PDS that is not authoritative for the repo. (Line numbers as of
+  # indigo 8f2296e — 2025-10-10, ~11 days after the pinned image's commit:
+  # bgs/bgs.go:1013-1045 createExternalUser, :1035-1037 the localhost case,
+  # :823-836 the authority check. Neither the image's own commit nor the
+  # indigo in go.mod is that snapshot, so treat these as landmarks to search
+  # for, not addresses to trust.)
   # `network_mode: "service:relay"` makes localhost:3001 the same listener
   # for both containers, so the DID document tells the truth. The obvious
   # alternative — a `pds` hostname of its own on the compose network — fails
   # SILENTLY and expensively: the relay accepts the crawl, registers the
-  # host, then logs and advances its cursor forever (fedmgr.go:556-563) with
-  # RepoCount 0 and not one event delivered.
+  # host, then logs and advances its cursor forever (bgs/fedmgr.go:556-563 at
+  # the same snapshot) with RepoCount 0 and not one event delivered.
   #
   # Consequences encoded elsewhere in this file:
   #   * The host port is published on the `relay` service, not here.
@@ -457,6 +461,12 @@ services:
   # the host in the DID documents this PDS writes, which is what the relay
   # keys its peering on. The relay validates it by calling describeServer
   # back at that url; no race to lose here, since `pds` is healthy first.
+  # A 200 here means the relay ACCEPTED the request, which is not the same
+  # as crawling: the silent RepoCount-0 mode in the `pds` header above
+  # begins with exactly this 200. What proves the crawl is the smoke test's
+  # pre-write relay-head poll (tests/e2e/native_pds_test.go), which demands
+  # the relay already serve a head for the native repo before the scenario
+  # writes anything.
   #
   # Runs in its own namespace on the compose network, so the PDS is
   # relay:3001 from here — the same listener, seen from outside.
@@ -466,10 +476,15 @@ services:
     command:
       - |
         echo '▶ creating native-alice.pds.test on the reference PDS'
-        wget -q -O- --header='Content-Type: application/json' \
+        if ! wget -q -O- --header='Content-Type: application/json' \
           --post-data='{"handle":"native-alice.pds.test","email":"native-alice@pds.test","password":"native-alice-e2e-pass"}' \
-          http://relay:3001/xrpc/com.atproto.server.createAccount \
-          || echo '  createAccount failed — expected when the account already exists; createSession below is the real gate'
+          http://relay:3001/xrpc/com.atproto.server.createAccount; then
+          echo '  createAccount failed with the status above, and BusyBox wget cannot read the'
+          echo '  response body — this one-shot does not know why. Benign IF the account already'
+          echo '  exists, which is every re-run of the stack. If the createSession below fails'
+          echo '  too, THIS was the real failure: check the pds logs for PLC reachability and'
+          echo '  that the handle sits under PDS_SERVICE_HANDLE_DOMAINS.'
+        fi
         echo
         echo '▶ authenticating as native-alice.pds.test (the gate)'
         wget -q -O- --header='Content-Type: application/json' \
@@ -480,7 +495,7 @@ services:
         wget -q -O- --header='Content-Type: application/json' \
           --post-data='{"hostname":"localhost:3001"}' \
           http://relay:2470/xrpc/com.atproto.sync.requestCrawl
-        echo '  ✓ relay is crawling the reference PDS'
+        echo '  ✓ relay accepted the crawl request'
     restart: "no"
     networks: [tidepool-e2e]
     depends_on:

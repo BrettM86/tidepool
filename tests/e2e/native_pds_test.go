@@ -18,11 +18,16 @@ package e2e
 // one postv2 into a native repo and watches for it downstream. What it
 // buys is the wire, not the record.
 //
-// TRIPWIRE for anyone extending this file: vetEvent (helpers.go) fails the
-// WHOLE suite on any collection outside expectedCollections, globally. A
-// second scenario writing some other collection into the native repo takes
-// every other scenario down with it — rescoping that whitelist is task 18's
-// sweep item and is out of scope here.
+// TRIPWIRE for anyone extending this file, in both directions. vetEvent
+// (helpers.go) checks collections against expectedCollections globally, with
+// no notion of which repo a record came from, so it fails CLOSED on a
+// collection outside the whitelist — a scenario writing, say, a vote record
+// into the native repo takes every other scenario down with it — and fails
+// OPEN on one inside it: a social.coves.actor.profile written into the
+// native repo is indistinguishable, to the whitelist, from the bridge
+// writing the same collection into a repo it owns. That second half is why
+// the whitelist wants rescoping by repo CLASS rather than by collection
+// alone; it is task 18's sweep item and out of scope here.
 
 import (
 	"bytes"
@@ -170,14 +175,18 @@ func (c *pdsClient) createRecord(collection, rkey string, record map[string]any)
 // reaches the suite's Jetstream through the same relay every bridged commit
 // crosses.
 //
-// The chain each assertion pins, in order: the reference PDS is reachable
-// and the bootstrap account exists (createSession); the PDS accepts and
-// commits our record (createRecord); the relay had already crawled the PDS
-// and validated the commit's signature against the DID it resolved from the
-// local PLC, and Jetstream decoded the relay's firehose (the awaited event —
-// Jetstream's upstream IS the relay, so arrival there is the whole transit
-// proven at once); and the relay built repo state from it rather than merely
-// forwarding frames (getLatestCommit).
+// The chain each assertion pins, in causal order — which is also the order
+// they run in, so a break is reported by the hop that broke rather than by
+// the last hop to time out. The reference PDS is reachable and the bootstrap
+// account exists (createSession); the relay has crawled the PDS and built
+// repo state for the account (a pre-write getLatestCommit — the
+// account-creation commit is already a head, so this isolates "peering
+// works" from "our record transits"); the PDS accepts and commits our record
+// (createRecord); the relay validated the commit's signature against the DID
+// it resolved from the local PLC and Jetstream decoded the relay's firehose
+// (the awaited event — Jetstream's upstream IS the relay, so arrival there
+// is the transit proven at once), carrying the exact CID the PDS assigned;
+// and the relay advanced its own repo state to the commit it emitted.
 func TestNativePDS_RecordTransitsRelayToJetstream(t *testing.T) {
 	h := newHarness(t)
 
@@ -190,6 +199,19 @@ func TestNativePDS_RecordTransitsRelayToJetstream(t *testing.T) {
 			nativeHandle, pdsURL(), err)
 	}
 	t.Logf("native account: handle=%s did=%s (minted by the reference PDS against the local PLC)", pds.handle, pds.did)
+
+	// Peering first, BEFORE anything is written. The account-creation commit
+	// already gave this repo a head, so a head served here means the relay
+	// crawled the PDS, resolved the DID at the local PLC, and verified a
+	// commit signature — all the machinery our record will need, checked
+	// while nothing about our record is in question yet. Without this hop a
+	// broken requestCrawl surfaces only as a generic Jetstream timeout two
+	// steps later, pointing at the wrong service.
+	preRev := h.awaitRelayHead(t, pds.did, "",
+		"the reference PDS was never crawled — check that pds-bootstrap's requestCrawl reached the relay "+
+			"(`docker compose -f docker-compose.e2e.yml logs pds-bootstrap`) and that it announced the same "+
+			"host string the PDS's DID document names; that match IS the peering mechanism")
+	t.Logf("relay already tracks the native repo at rev %s (the account-creation commit) — peering is live", preRev)
 
 	// One rkey per run, time-derived: the PDS's repo outlives a single
 	// `make e2e-test` (the stack is brought up separately and re-tested),
@@ -221,30 +243,55 @@ func TestNativePDS_RecordTransitsRelayToJetstream(t *testing.T) {
 		return e.Did == pds.did && e.Commit.Collection == colPostV2 &&
 			e.Commit.RKey == rkey && e.Commit.Operation == opCreate
 	})
-	if got := recordField(t, ev.Commit.Record, "community"); got != nativeCommunityDID {
-		t.Errorf("jetstream delivered community %q, want %q — the record changed shape in transit", got, nativeCommunityDID)
+
+	// Content addressing checks the whole record at once, and checks it the
+	// way atproto itself does: the CID is the hash of the DAG-CBOR the PDS
+	// committed, so an identical CID at the far end means the bytes Jetstream
+	// re-encoded to JSON are the bytes the PDS signed. A field-by-field
+	// comparison would only cover the fields someone thought to list.
+	if ev.Commit.CID != cid {
+		t.Errorf("jetstream delivered %s at cid %q, but the PDS committed cid %q — "+
+			"the record did not survive the PDS → relay → jetstream re-encoding intact",
+			uri, ev.Commit.CID, cid)
 	}
 
-	// Relay-side state, not just passthrough: the relay indexes
-	// asynchronously, so poll it out — only the deadline is fatal.
+	// The relay must also ADVANCE its own repo state to the commit it just
+	// emitted, not merely forward the frame. Its indexing is asynchronous, so
+	// a rev still behind the emitted one is lag to wait out, never an
+	// immediate failure — the deadline is the only verdict.
+	postRev := h.awaitRelayHead(t, pds.did, ev.Commit.Rev,
+		"the commit reached Jetstream, so the relay forwarded it without ever building repo state from it")
+	t.Logf("relay head advanced %s → %s across the write", preRev, postRev)
+}
+
+// awaitRelayHead polls the relay's view of a repo head until it serves a
+// non-empty cid/rev at or after minRev ("" for any head), returning that
+// rev. Every non-answer — a transport error, a 200 carrying an empty head,
+// a rev still behind minRev — is transient by default and recorded as the
+// reason to report if the deadline arrives; nothing here fails early,
+// because every one of those states is a normal moment in the relay's
+// asynchronous indexing. hint says what a real timeout would MEAN at this
+// call site, which is the part a reader chasing the failure needs.
+func (h *harness) awaitRelayHead(t *testing.T, did, minRev, hint string) string {
+	t.Helper()
 	deadline := time.Now().Add(eventTimeout)
-	var lastErr error
+	lastErr := "the poll never completed an attempt"
 	for {
-		headCID, rev, err := h.relayGetLatestCommit(pds.did)
-		if err != nil {
-			lastErr = err
-			t.Logf("relay getLatestCommit(%s): %v (retrying)", pds.did, err)
-		} else if headCID != "" && rev != "" {
-			if rev < ev.Commit.Rev {
-				t.Errorf("relay head rev %q is OLDER than the rev %q it already emitted for this repo — relay state lagging its own firehose", rev, ev.Commit.Rev)
-			}
-			t.Logf("relay serves the native repo: head=%s rev=%s", headCID, rev)
-			return
+		headCID, rev, err := h.relayGetLatestCommit(did)
+		switch {
+		case err != nil:
+			lastErr = err.Error()
+			t.Logf("relay getLatestCommit(%s): %v (retrying)", did, err)
+		case headCID == "" || rev == "":
+			lastErr = fmt.Sprintf("getLatestCommit returned 200 with empty cid/rev (%q/%q)", headCID, rev)
+		case rev < minRev:
+			lastErr = fmt.Sprintf("relay head rev %q is still older than rev %q, which it had already emitted for this repo", rev, minRev)
+		default:
+			return rev
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("the relay never served a commit for the native repo %s within %s (last error: %v) — "+
-				"the event reached Jetstream, so the relay forwarded it without building repo state from it",
-				pds.did, eventTimeout, lastErr)
+			t.Fatalf("the relay never served a usable head for repo %s within %s: %s — %s",
+				did, eventTimeout, lastErr, hint)
 		}
 		time.Sleep(time.Second)
 	}

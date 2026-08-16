@@ -873,9 +873,42 @@ no previous key to fall back to — is still unrecoverable.
 
 ### Backup and restore
 
-**No procedure exists, and no tooling.** `docker-compose.prod.yml:53` mounts
-`./backups:/backups` into the Postgres container. Nothing writes to it. There
-is no cron, no `pg_dump` wrapper, no restore drill, and no documented RPO/RTO.
+**BUILT: nightly `pg_dump` + a throwaway-container restore drill.** Two
+scripts, both exercised end-to-end before landing (backup → archive
+verification → restore → inventory gates):
+
+- `scripts/pg-backup.sh` — run from host cron. Dumps custom-format into the
+  `./backups` mount the compose file already provides, verifies the archive
+  with `pg_restore --list` **before** it gets its final name (a dump that
+  cannot be listed is not a backup), then ages out dumps older than
+  `RETENTION_DAYS` (default 14). Install:
+
+      17 2 * * * /opt/tidepool/scripts/pg-backup.sh >> /opt/tidepool/backups/backup.log 2>&1
+
+- `scripts/pg-restore-drill.sh` — restores the newest dump (or `$1`) into a
+  **throwaway** `postgres:16` container, asserts the goose migration state and
+  the irreplaceable tables below, prints the row inventory, exits nonzero on
+  any gap, and removes the container. It never touches the production
+  container, volume, or network. **Run it after the first backup and then
+  quarterly** — an unverified backup is a claim, not a capability, and the
+  drill is cheap enough that there is no excuse.
+
+RPO with the default schedule is 24 hours of database state. The drill
+validates data presence, not KEK correctness: sealed blobs are checked
+non-empty, never opened (a restore drill must not need to read the KEK). The
+full proof is drill + boot canary: restore, point a bridge at it with the real
+`BRIDGE_KEK`, and a wrong pairing fails at startup (§ boot canary).
+
+**`BRIDGE_KEK` and `.env` are NOT in any database backup.** Keep an offsite
+copy of `.env` (password manager or sealed storage, not this server), and
+`touch backups/.env-backed-up` after each copy — `pg-backup.sh` warns on every
+run where `.env` is newer than that marker, so a rotated or edited KEK that
+was never re-escrowed shows up in the backup log instead of in an incident.
+
+Residual limits, stated rather than implied: dumps live on the same host they
+protect (no offsite replication of `./backups` yet — copying them into the
+same offsite routine as `.env` is the obvious next step), and WAL archiving /
+point-in-time recovery is deliberately not built at this scale.
 
 What is at risk, in order of irreplaceability:
 
@@ -891,9 +924,6 @@ What is at risk, in order of irreplaceability:
    not come back.
 4. **`outbound_*`, `admissions`** — in-flight federation state. Losing it
    double-sends or drops deliveries.
-
-Anything actually built here should be a separate task with a **restore
-drill**, since an unverified backup is a claim, not a capability.
 
 ### A divergence off switch
 

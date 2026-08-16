@@ -363,11 +363,18 @@ DOCUMENTED, not resolved — the v2 deploy gaps below now have a written home in
 `DEPLOY.md` (§6 "Not implemented") with their blast radius. Writing them down
 is not building them; they stay open here:
 
-- **No backup or restore procedure.** `docker-compose.prod.yml` mounts
-  `./backups` into the Postgres container and nothing writes to it. Note
-  `BRIDGE_KEK` lives in `.env` and is not covered by any database backup at
-  all. Whatever is built needs a restore *drill* — an unverified backup is a
-  claim, not a capability.
+- RESOLVED — **backup and restore**: `scripts/pg-backup.sh` (host cron,
+  custom-format dump into the existing `./backups` mount, archive verified
+  with `pg_restore --list` before rename, retention) plus
+  `scripts/pg-restore-drill.sh` (restore into a throwaway container, goose
+  version + irreplaceable-table inventory gates, nonzero on any gap). Both
+  were run end-to-end before landing — the drill's first run caught its own
+  wrong table name, which is the drill working. `BRIDGE_KEK`/`.env` remain
+  outside any database backup by nature; the backup script warns whenever
+  `.env` is newer than its recorded offsite copy (`backups/.env-backed-up`
+  marker). Residual limits: dumps stay on the host they protect (no offsite
+  replication yet), no WAL/PITR at this scale, RPO 24h on the default
+  schedule. Runbook: `DEPLOY.md` § "Backup and restore".
 - **No divergence off switch.** The sweep is wired unconditionally, sweeps once
   at startup, and `DIVERGENCE_INTERVAL=0` is refused by `durationVar`. The only
   lever is a large interval. Defensible while the sweep stays read-only; revisit

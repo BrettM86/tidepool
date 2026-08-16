@@ -454,6 +454,41 @@ Still open, unchanged:
 
 - The PLC directory image is pinned by commit in `e2e/plc/Dockerfile`; bump it
   deliberately when upstream fixes are needed.
+- **The stack now carries a reference PDS** (`ghcr.io/bluesky-social/pds`,
+  digest-pinned to the build Coves' CI pins; host port 127.0.0.1:3081,
+  published on the `relay` service because the PDS shares its network
+  namespace). One smoke scenario uses it —
+  `tests/e2e/native_pds_test.go` writes a `community.postv2` into the native
+  account's own repo and follows it through relay → Jetstream — which buys
+  the wire, not the record: a repo host we did not write, crossing the same
+  infrastructure, so a misreading of the spec shared by our commit writer and
+  our commit reader can no longer stay invisible. The task-18 scenarios
+  (native posts, acceptance records, votes both ways, Lemmy-side visibility)
+  are still open; this is deliverable 1 only.
+- **TRIPWIRE — the collection whitelist is global.** `vetEvent`
+  (`tests/e2e/helpers.go`) checks every event on the firehose against a
+  single `expectedCollections` allowlist, whatever repo it came from, and a
+  violation fails the WHOLE suite (including the end-of-run sweep, which
+  re-vets the replay). `community.postv2` is already on that list, which is
+  the only reason the native repo passes today. **The first scenario that
+  writes any other collection into the reference PDS's repo takes every other
+  scenario down with it** — `bridge.federation`, `feed.vote`,
+  `actor.profile` on a native DID, anything. Rescoping the whitelist by repo class (bridge-hosted
+  author DIDs / bridge-hosted community DIDs / native-PDS DIDs, each with
+  independent rev tracking) is task 18's sweep item and was deliberately left
+  out of the reference-PDS landing. Related: the e2e stack leaves
+  `CONSUMER_ENABLED` at its default of false, so the acceptance engine never
+  reacts to native records — a scenario that needs an acceptance record must
+  turn the consumer on and point `JETSTREAM_URL` at the compose Jetstream
+  first.
+- The relay does not survive being recreated on its own: its disk persister
+  records log-file refs in `relay-postgres` (which persists) while the files
+  live in the container's writable layer (which does not), so bigsky exits at
+  boot with `open /data/persister/evts-0: no such file or directory`. Any
+  edit to the `relay` service in `docker-compose.e2e.yml` triggers exactly
+  that on the next `up`; `make e2e-down` and start clean. A named volume for
+  the relay's `/data` would remove the trap, at the cost of one more thing
+  `down -v` has to take away in lockstep with the databases.
 - Jetstream exits when its upstream disconnects; compose's
   `restart: unless-stopped` supplies recovery. Remove the workaround if
   Jetstream gains reconnect support.

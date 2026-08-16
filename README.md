@@ -87,8 +87,8 @@ your directory is on a different port.
 The end-to-end harness runs the whole read path against **real
 infrastructure** — a real Lemmy federating with the bridge, a real did:plc
 directory backing DID minting, a real atproto relay (indigo **BigSky**)
-crawling the bridge, and a real Jetstream decoding the **relay's** firehose
-— in one compose network:
+crawling the bridge, a real reference PDS hosting a native account, and a
+real Jetstream decoding the **relay's** firehose — in one compose network:
 
 ```
                         docker-compose.e2e.yml
@@ -103,9 +103,13 @@ crawling the bridge, and a real Jetstream decoding the **relay's** firehose
  │                              ┌─────────────▼──┐           │ │request  │
  │                              │ plc (did:plc   │◀────┐     │ │Crawl    │
  │                              │ + plc-postgres)│     │  ┌──▼─┴───────┐ │
- │                              └────────────────┘ DID │  │ relay      │ │
- │                                          resolution └──│ (BigSky)   │ │
- │                                                        │ + postgres │ │
+ │                              └──┬─────────────┘ DID │  │ relay      │ │
+ │                                 ▲        resolution └──│ (BigSky)   │ │
+ │                                 │                      │ + postgres │ │
+ │                              ┌──┴─────────────┐        │ + the      │ │
+ │                              │ pds (reference │  CBOR  │ reference  │ │
+ │                              │  @atproto/pds) ├───────▶│ pds, in    │ │
+ │                              └────────────────┘ frames │ this netns │ │
  │                                                        └──────┬─────┘ │
  │                                                    CBOR frames│       │
  │                                                       ┌───────▼─────┐ │
@@ -114,7 +118,7 @@ crawling the bridge, and a real Jetstream decoding the **relay's** firehose
  │                                                       └───────┬─────┘ │
  └───────────────────────────────────────────────────────────────┼───────┘
       host (127.0.0.1 only): tidepool :8092, lemmy :8541,        │
-                             relay :2480, jetstream :6028 ◀──────┘
+                  relay :2480, pds :3081, jetstream :6028 ◀──────┘
                     tests/e2e (go test -tags e2e)
 ```
 
@@ -130,13 +134,36 @@ relay's new-PDS-per-day limit is 0 (refuses all non-admin `requestCrawl`),
 so a one-shot `relay-bootstrap` service raises the limit over the admin API
 before the bridge starts — the announcement itself is still
 bridge-originated, and the suite asserts it landed (`relay_test.go`).
-Bridged handles verify for real too: `HANDLE_RESOLVER_HOSTS=tidepool`
-points bigsky's trial-host resolver at the bridge's Host-header-keyed
-`/.well-known/atproto-did` (compose-DNS-invisible names like
-`alice.lemmy.tidepool` would otherwise fail handle verification, which
-bigsky treats as non-fatal). For debugging, a direct bridge→Jetstream tap
+Bridged handles verify for real too:
+`HANDLE_RESOLVER_HOSTS=tidepool,localhost:3001` points bigsky's trial-host
+resolver at the bridge's Host-header-keyed `/.well-known/atproto-did`, and
+at the reference PDS's (below) for its own handles (compose-DNS-invisible
+names like `alice.lemmy.tidepool` would otherwise fail handle verification,
+which bigsky treats as non-fatal). For debugging, a direct bridge→Jetstream tap
 exists behind the `direct` compose profile (`jetstream-direct`, host port
 6038) — it is not the tested path.
+
+The relay also crawls a **reference PDS** — `ghcr.io/bluesky-social/pds`,
+pinned by digest — hosting a native account (`native-alice.pds.test`) whose
+DID is minted in the same local PLC. It is there because every other repo on
+this firehose is the bridge's: our commits, read back by our own
+understanding of the spec at both ends, so a misreading shared by the writer
+and the reader is invisible and the suite goes green on the agreement. A
+repo host we did not write cannot share it. The `pds` container runs in the
+**relay's network namespace** (`network_mode: "service:relay"`), which is
+not a convenience: `@atproto/pds` derives its public URL from
+`PDS_HOSTNAME`, special-casing `localhost` to `http://localhost:$PDS_PORT`
+and turning every other hostname into `https://`, which this plain-HTTP
+harness cannot serve — and bigsky peers a PDS by the host in its DID
+*documents*, calling `describeServer` at that url from inside its own
+namespace. Sharing the namespace is what makes `http://localhost:3001` true
+for both. Consequences: the PDS's host port is published on the `relay`
+service (a container-network-mode service cannot publish its own), and it is
+3081 rather than 3001 because the Coves dev stack already owns 3001. A
+one-shot `pds-bootstrap` creates the account over the plain public
+`createAccount` (no admin API — the PDS runs with invites off), treats an
+already-taken handle as success, gates on `createSession` returning 200, and
+then `requestCrawl`s `localhost:3001` at the relay.
 
 One ordering consequence worth knowing: bigsky indexes its inbound firehose
 with a parallel scheduler keyed by repo DID, so **per-repo event order
@@ -152,7 +179,7 @@ proves the rule: they sat in the community's repo with no separate
 attestation, so there was no cross-repo pair to reorder — those records still
 exist and are not migrated.
 
-The host ports bind **loopback-only** (`127.0.0.1:8092/8541/2480/6028`):
+The host ports bind **loopback-only** (`127.0.0.1:8092/8541/2480/3081/6028`):
 the stack carries admin tokens and runs with `ALLOW_PRIVATE_FETCH=1`, so it
 must not be reachable from the local network.
 
@@ -176,7 +203,7 @@ plain-HTTP AP ids to match. See the header comments in
 `docker-compose.e2e.yml` and `e2e/lemmy/Dockerfile` for the full story.
 
 The suite (`tests/e2e/`, build tag `e2e`: `bridge_test.go`,
-`lifecycle_test.go`, `media_test.go`, `relay_test.go`,
+`lifecycle_test.go`, `media_test.go`, `native_pds_test.go`, `relay_test.go`,
 `votes_hammer_test.go`, `zz_sweep_test.go`)
 covers: subscribe → `community.profile` on the firehose; a link post →
 `actor.profile` and `community.post` (presence + author linkage; arrival
@@ -227,11 +254,22 @@ sentinel alone. Every negative
 assertion ("nothing bridged") is bounded by a positive control in the same
 window — never a bare sleep-and-assert-nothing.
 
+Task 18 adds the **native-PDS smoke scenario** (`native_pds_test.go`): the
+suite authenticates as the bootstrap account on the reference PDS, writes
+one `community.postv2` into that account's own repo, and follows it through
+the relay to Jetstream and into the relay's own `getLatestCommit` state.
+Deliberately a smoke test, not a feature test — what it buys is the wire,
+not the record. Note before extending it: `vetEvent`'s collection whitelist
+is global, so a second scenario writing any other collection into the native
+repo fails the whole suite until that whitelist is rescoped by repo class
+(see FOLLOWUPS.md).
+
 Every
 create/update the tests consume from Jetstream has passed the relay's
 signature verification AND is validated against the vendored Coves lexicons
-on the consumer side of the wire, and any collection outside the four the
-bridge emits fails the suite immediately (votes must never become records). Two scripts keep the vendored
+on the consumer side of the wire, and any collection outside the
+`expectedCollections` allowlist fails the suite immediately, in any repo
+(votes must never become records). Two scripts keep the vendored
 lexicons honest: `scripts/sync-lexicons.sh` copies them from a Coves
 checkout; `scripts/check-lexicons.sh` verifies the committed manifest and
 byte-compares against the current Coves checkout. CI clones the canonical Coves

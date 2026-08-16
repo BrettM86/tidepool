@@ -16,12 +16,13 @@ import (
 // TASK 17e — THE RE-CAST DIVERGENCE: THE PEER HOLDS A VOTE WE DO NOT CLAIM.
 //
 // 17b found this and deferred it here. Re-casting a delivered vote re-upserts
-// the SAME outbound_votes row back to 'pending' under a new activity id, while
-// the peer goes on holding the old vote in the old direction. Transient while
-// the new delivery is in flight; PERMANENT the moment it poisons — nothing
-// re-drives a poisoned delivery on its own, and the reseed subtracts only
-// 'delivered' rows, so the community's score keeps counting a vote we have
-// stopped accounting for and will never correct.
+// the SAME outbound_votes row under a NEW activity id, while the peer goes on
+// holding the old vote in the old direction. The row keeps its delivered state
+// — the re-cast guard sees to that — but it no longer NAMES the activity the
+// peer accepted, and the ledger's claim is that PAIR, not the flag alone.
+// Transient while the new delivery is in flight; PERMANENT the moment it
+// poisons — nothing re-drives a poisoned delivery on its own, so the row goes
+// on standing for a vote in a direction the peer never received.
 //
 // THE FIXTURE IS THE ENTIRE TEST, and it must be DRIVEN, not assembled. This is
 // 17b's own blind spot by name: "the fixture nobody writes is the one where the
@@ -30,8 +31,8 @@ import (
 //
 //	consume.Dispatcher.HandleEvent (vote commit)  → outbound_votes + a Dislike
 //	outbound.Worker.DeliverNext                   → delivered, ledger flipped
-//	consume.Dispatcher.HandleEvent (the re-cast)  → SAME row reset to pending,
-//	                                                new activity id, a Like
+//	consume.Dispatcher.HandleEvent (the re-cast)  → SAME row, NEW activity id,
+//	                                                delivered_state KEPT, a Like
 //	outbound.Worker.DeliverNext (failing sender)  → that Like POISONS
 //
 // — because a hand-inserted row would be some steady state a fixture author
@@ -41,7 +42,8 @@ import (
 // AND IT MUST NOT BE READ FROM THE VOTE ROW. worker.voteCallback resolves via
 // GetByActivityID and returns nil on NotFound, so a delivery already in flight
 // when the re-cast lands settles into silence: its id no longer matches
-// current_activity_id and the callback no-ops. The row is what the bug erases.
+// current_activity_id and the callback no-ops. The row survives the re-cast;
+// what does not survive is its link to the activity the peer accepted.
 // outbound_activities is append-only and carries the subject in parent_at_uri
 // from both vote enqueue sites, so the activity/delivery history is the only
 // durable record of what the peer was actually told.
@@ -74,6 +76,29 @@ func deliveredVoteActivity(t *testing.T, w *recastWorld) string {
 		 ORDER BY d.seq DESC
 		 LIMIT 1`).Scan(&id),
 		"precondition: a vote really was delivered to the peer")
+	return id
+}
+
+// recastRowFacts reads the two columns of the live vote row whose meaning this
+// cycle changed: the activity the ledger currently names, and the direction it
+// currently claims.
+func recastRowFacts(t *testing.T, w *recastWorld) (currentActivityID, direction string) {
+	t.Helper()
+	require.NoError(t, w.db.QueryRow(`
+		SELECT current_activity_id, direction
+		  FROM outbound_votes WHERE vote_at_uri = $1`,
+		"at://"+tpNativeDID+"/social.coves.feed.vote/"+tpVoteRKey).
+		Scan(&currentActivityID, &direction))
+	return currentActivityID, direction
+}
+
+// poisonedVoteActivity is the activity id of the delivery that failed for good.
+// One row, because the callers assert there is exactly one.
+func poisonedVoteActivity(t *testing.T, w *recastWorld) string {
+	t.Helper()
+	var id string
+	require.NoError(t, w.db.QueryRow(
+		`SELECT activity_id FROM outbound_deliveries WHERE state = 'poisoned'`).Scan(&id))
 	return id
 }
 
@@ -116,13 +141,32 @@ func TestRecastDivergence_APoisonedRecastLeavesThePeerHoldingTheOldVote(t *testi
 	held := deliveredVoteActivity(t, w)
 
 	// --- STEP 2: the user changes their mind. The SAME record is rewritten, so
-	//     the row resets to pending under a new activity id while the peer's
-	//     copy of the old vote is untouched.
+	//     the row moves to a new activity id while the peer's copy of the old
+	//     vote is untouched.
 	w.sender.fail(fmt.Errorf("lemmy is unreachable"))
 	w.castVote(t, "3lztprev00002", directionUp)
-	require.Equal(t, string(store.DeliveredStatePending), w.state(t),
-		"precondition: the re-cast reset the row — this is the step that erases our record "+
-			"of what the peer holds")
+	require.Equal(t, string(store.DeliveredStateDelivered), w.state(t),
+		"precondition: the re-cast KEEPS the delivered state. A flip REPLACES a vote the peer "+
+			"still holds rather than withdrawing it, so the record that a delivery happened "+
+			"survives it — what erases our accounting of the OLD activity is the id below "+
+			"moving, which is exactly why the class still fires")
+
+	// The two residuals, pinned here so they are recorded rather than
+	// rediscovered: they are what the flip still moves, and the class is built
+	// on the first of them.
+	currentID, direction := recastRowFacts(t, w)
+	require.NotEqual(t, held, currentID,
+		"precondition: current_activity_id has MOVED off the activity the peer accepted. The "+
+			"ledger's claim is the PAIR (id, delivered) — the divergence query's first "+
+			"exclusion matches on both — so a delivered flag pointing at a different "+
+			"activity accounts for nothing about the old one")
+	require.Equal(t, directionUp, direction,
+		"and the row already reads the NEW direction while the peer demonstrably holds the "+
+			"OLD one (a Dislike, above). KNOWN AND ACCEPTED for the poison window: this "+
+			"column answers 'does the peer hold a vote of ours', not 'which way did it go'. "+
+			"The reseed subtracts by direction, so while this window is open it subtracts an "+
+			"up-vote the peer never received — which is the condition the divergence below "+
+			"exists to surface, not one the row itself can express")
 
 	// --- STEP 3: and the new vote never lands.
 	w.deliver(t)
@@ -132,16 +176,20 @@ func TestRecastDivergence_APoisonedRecastLeavesThePeerHoldingTheOldVote(t *testi
 	require.Equal(t, 1, poisoned,
 		"precondition: the re-cast's delivery POISONED, which is what makes this permanent "+
 			"rather than a moment in flight")
+	require.Equal(t, currentID, poisonedVoteActivity(t, w),
+		"and the id the row moved to is the POISONED one: our accounting now names a vote "+
+			"nobody received, and nothing re-drives a poisoned delivery to correct it")
 
 	// --- THEN: the store names the pair, citing what the peer is holding.
 	found, err := store.NewDivergences(w.db).RecastDivergences(ctx)
 	require.NoError(t, err)
 	require.Len(t, found, 1,
 		"exactly one divergence: the peer is counting a Dislike this bridge no longer claims. "+
-			"Our vote row says 'pending' — it was reset by the re-cast — so nothing in the "+
-			"ledger records that a vote of ours stands on that instance, and the reseed "+
-			"subtracts only 'delivered' rows. Read from the vote row this condition is "+
-			"invisible by construction; only the append-only activity history still knows")
+			"Our vote row says 'delivered' — but under the NEW id and the NEW direction, so "+
+			"the OLD delivered activity matches no exclusion, and the reseed subtracts a "+
+			"vote in a direction the peer never received. Read from the vote row this "+
+			"condition is invisible by construction: the row is self-consistent and looks "+
+			"settled. Only the append-only activity history still knows what was sent")
 	assert.Equal(t, tpNativeDID, found[0].ActorDID)
 	assert.Equal(t, w.subject, found[0].SubjectATURI,
 		"the pair (actor, subject) IS the identity of a vote — only one may be live at a time — "+
@@ -232,7 +280,8 @@ func TestRecastDivergence_ADeliveredThenUndoneVoteIsNotADivergence(t *testing.T)
 // flip, and it is most of what this table does.
 //
 // A flip is an in-place upsert: current_activity_id moves to the new id,
-// delivered_state resets to pending, and NO Undo is enqueued — Lemmy takes a
+// delivered_state is KEPT — the flip replaces a vote the peer still holds
+// rather than withdrawing it — and NO Undo is enqueued: Lemmy takes a
 // bare opposite vote as a replacement (17b measured this; a flip is not an Undo
 // followed by a vote). So once the new vote delivers, the OLD delivered activity
 // matches NEITHER exclusion: the ledger names the new id, and no Undo exists to

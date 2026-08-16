@@ -214,6 +214,23 @@ func (p *Purger) undoLiveVotes(ctx context.Context, tx *sql.Tx, did string, vote
 			SubjectAPID: vote.SubjectAPID,
 			// Read back from state, never guessed: an Undo{Like} withdrawing a
 			// Dislike would move the peer's count the wrong way.
+			//
+			// AND THE MISMATCH IS NOW REACHABLE, where it used to be
+			// hypothetical. Since the upsert began keeping `delivered` through
+			// a flip, a vote that was flipped but whose flip never delivered is
+			// STANDING — ListStandingForActor returns it — so this Undo goes
+			// out carrying the NEW direction and an InnerActivityID the peer
+			// never saw, to retract the OLD vote they actually hold.
+			//
+			// What is expected to save it is that the translator spells the
+			// inner object out in full — {type, id, actor, object} with actor
+			// and object as real ids (outbound/translator.go) — so a peer
+			// matching the retraction on (actor, object) drops the right vote
+			// whatever the wrapped type and id say. WHETHER LEMMY MATCHES ON
+			// THAT PAIR IS NOT ESTABLISHED IN THIS TREE: there is no
+			// outbound-vote e2e, so nothing here has ever watched a real
+			// instance answer this request. Treat it as an assumption carried
+			// by the erasure path, not as a verified guarantee.
 			Direction:       vote.Direction,
 			ID:              consume.ActivityID(p.userOrigin, vote.VoteATURI, consume.OperationUndo, bumped.ActivitySeq),
 			InnerActivityID: vote.CurrentActivityID,

@@ -498,6 +498,17 @@ type OutboundVotes interface {
 	// satisfying errors.IsAlreadyExists: one actor holds at most one live
 	// vote per subject, and silently clobbering the old row would strand its
 	// Undo.
+	//
+	// ONE STATE TRANSITION IS REFUSED: `pending` over a stored `delivered`
+	// keeps `delivered`. A re-cast replaces a vote the peer still holds rather
+	// than withdrawing it, and the caller states `pending` on every write
+	// because it records intent and cannot know what the wire said — so
+	// letting it land would erase the only record that a delivery happened.
+	// Every other column still updates and ActivitySeq still bumps, and the
+	// RETURNED row reflects the KEPT state: callers build their outgoing
+	// intent from what comes back, so the struct and the stored row cannot
+	// disagree. No other transition is defended — `undone` (the purge's
+	// retraction) and `delivered` both write straight through.
 	Upsert(ctx context.Context, vote OutboundVote) (*OutboundVote, error)
 
 	// UpsertTx is Upsert on an existing transaction. A nil tx is an error
@@ -534,7 +545,13 @@ type OutboundVotes interface {
 
 	// SetDeliveredState transitions the delivery state. An unknown state is
 	// an error satisfying errors.IsValidation; a missing vote is an error
-	// satisfying errors.IsNotFound.
+	// satisfying errors.IsNotFound. `undone` is TERMINAL here: any other
+	// write over an undone row is refused and reports SUCCESS (a decided
+	// no-op — failing it would leave a settlement retrying a write that can
+	// never apply), and re-setting `undone` stays allowed so the write is
+	// idempotent. This is the settlement writer's guard against late facts
+	// about old messages; the intent-writer's one refused transition lives
+	// on Upsert, deliberately different (see its doc).
 	SetDeliveredState(ctx context.Context, voteATURI string, state DeliveredState) error
 
 	// Delete removes the vote state once its Undo is delivered. Deleting a

@@ -229,11 +229,27 @@ type DeliveredState string
 const (
 	// DeliveredStatePending means the intent is recorded but unconfirmed.
 	DeliveredStatePending DeliveredState = "pending"
-	// DeliveredStateDelivered means a peer accepted the Like/Dislike.
+	// DeliveredStateDelivered means a peer accepted A VOTE from this actor for
+	// this subject — NOT necessarily the activity this row currently names.
+	//
+	// After a re-cast the row carries two facts from different moments:
+	// `direction` and `current_activity_id` describe the NEWEST intent, while
+	// this state describes a delivery that already happened. The upsert keeps
+	// `delivered` through a flip on purpose (outbound_votes.go), because the
+	// alternative erases the only record that any delivery occurred. So the
+	// question this column answers is exactly "does the peer hold a vote of
+	// ours here", and no more than that.
+	//
+	// WHICH activity the peer accepted is therefore not readable from this row
+	// after a flip. Only the append-only delivery ledger still knows, which is
+	// why RecastDivergence is reconciled out of outbound_activities joined to
+	// outbound_deliveries rather than queried from here (divergence.go).
 	DeliveredStateDelivered DeliveredState = "delivered"
 	// DeliveredStateUndone means the vote is NO LONGER LIVE on the peer as far as
 	// this bridge is concerned, so nothing may count it: the reseed subtracts
-	// only `delivered`, and the destructive tier enumerates only `delivered`.
+	// only `delivered`, and the destructive tier's standing list never includes
+	// `undone` (it enumerates `delivered` plus held-for-settlement pending rows
+	// — ListStandingForActor).
 	//
 	// IT IS NO LONGER RESERVED, and its meaning is narrower than the obvious
 	// reading. Task 15's worker still DELETES the row on a successful Undo, so

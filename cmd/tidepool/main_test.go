@@ -56,6 +56,11 @@ func TestRunMigrationsRequiresDatabaseURL(t *testing.T) {
 const (
 	rotateTestKEK         = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
 	rotateTestPreviousKEK = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+	// rotateTestKEKBase64 is rotateTestKEK's 32 bytes in the other accepted
+	// spelling. Both variables take either encoding, so the same key can wear
+	// two different strings — which is exactly what a string comparison would
+	// wave through.
+	rotateTestKEKBase64 = "qrvM3e7/ABEiM0RVZneImaq7zN3u/wARIjNEVWZ3iJk="
 	// A syntactically valid URL pointing at a port nothing listens on. The
 	// env-var checks must all happen BEFORE the database is dialled: an
 	// operator who forgot BRIDGE_KEK_PREVIOUS deserves to be told that, not a
@@ -117,4 +122,55 @@ func TestRunRotateKEKRequiresPreviousKEK(t *testing.T) {
 	// before checking that the current key was not also blamed.
 	assert.NotContains(t, strings.ReplaceAll(msg, "BRIDGE_KEK_PREVIOUS", ""), "BRIDGE_KEK",
 		"the message must not also blame BRIDGE_KEK: it is set and correct, and an operator who 'fixes' it will orphan every blob still sealed under the previous key")
+}
+
+// TestRunRotateKEKRefusesEqualKeys pins the guard against the rotation that
+// is not one.
+//
+// One key pasted into both variables — the copy-paste an operator makes when
+// they mean to set BRIDGE_KEK_PREVIOUS and reach for the wrong line of their
+// secret store — is not a rotation. Left unchecked, the walk would run, find
+// every blob already opening under "the current KEK", and report a clean
+// zero-run with nothing re-sealed. That report is precisely the signal the
+// runbook says clears an operator to unset BRIDGE_KEK_PREVIOUS, so the
+// failure mode is not a wasted run: it is a confident retirement of a key
+// that everything is still sealed under.
+//
+// The refusal must also come BEFORE the database is dialled, which is what
+// gives this test teeth: without the guard the command reaches db.Open and
+// fails against the dead port with an entirely different message.
+func TestRunRotateKEKRefusesEqualKeys(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		current  string
+		previous string
+	}{
+		// The plain copy-paste.
+		{name: "the same string in both variables", current: rotateTestKEK, previous: rotateTestKEK},
+		// The same key wearing two spellings. Both variables accept hex or
+		// base64, so this pair is byte-identical while comparing unequal as
+		// strings — an operator who re-encoded the key they already had gets
+		// no warning at all unless the check runs on the DECODED bytes, the
+		// same rule config.Load applies at startup.
+		{name: "the same key, one hex and one base64", current: rotateTestKEK, previous: rotateTestKEKBase64},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", rotateTestDatabaseURL)
+			t.Setenv("BRIDGE_KEK", tt.current)
+			t.Setenv("BRIDGE_KEK_PREVIOUS", tt.previous)
+
+			err := runRotateKEK(testLogger())
+			require.Error(t, err,
+				"re-sealing a key onto itself must be refused: the walk would touch nothing and report the zero-run that tells the operator it is safe to retire BRIDGE_KEK_PREVIOUS — while every blob is still sealed under it")
+
+			msg := strings.ToLower(err.Error())
+			assert.Contains(t, msg, "same",
+				"the operator must be told the two keys are the SAME key; anything vaguer and they will re-run the command rather than fix the variable")
+			assert.Contains(t, msg, "different",
+				"and told what is needed instead — two different keys — so the fix is obvious without opening the runbook")
+
+			assert.NotContains(t, err.Error(), "127.0.0.1",
+				"the refusal must happen before the database is dialled: a rotation aborted for a bad key pair must never surface as a connection problem, or the operator goes to look at postgres while their KEK variables stay wrong")
+		})
+	}
 }

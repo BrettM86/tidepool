@@ -209,8 +209,9 @@ func LoadOrCreateRotationKey(ctx context.Context, keys store.ServiceKeys, custod
 	if err != nil {
 		return nil, fmt.Errorf("identity: seal rotation key: %w", err)
 	}
-	// NOTE: the column is named private_key_pem for the RSA service-actor
-	// key; for the rotation key it holds the sealed ciphertext instead.
+	// NOTE: key_material holds plaintext PEM for the RSA service-actor row
+	// but sealed ciphertext for this one; the per-row encoding is documented
+	// on the column (migration 013).
 	if _, err := keys.Create(ctx, RotationKeyName, sealed); err != nil {
 		if errors.IsAlreadyExists(err) {
 			// Lost the bootstrap race: use the winner's key.

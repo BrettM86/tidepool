@@ -356,6 +356,12 @@ type Communities interface {
 // actor's AP-side RSA private key). Keys are create-once: there is no update
 // or delete, so a stored key can never be silently rotated out from under
 // signatures already in flight.
+//
+// The KEK re-seal drill (identity.Reseal) is the one writer that updates a
+// stored row, with its own SQL rather than a method here, and it is not an
+// exception to that rule: it re-WRAPS the same key material under a new KEK,
+// and its UPDATE is guarded on the exact old bytes, so the key any signature
+// was made with is never replaced — only the envelope around it.
 type ServiceKeys interface {
 	// Create inserts a new named key and returns the stored row. An existing
 	// name returns an error satisfying errors.IsAlreadyExists — callers that

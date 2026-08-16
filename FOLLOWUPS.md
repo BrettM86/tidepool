@@ -328,30 +328,61 @@ longer load-bearing: the self-hosted relay + Jetstream in
 hosts with an effectively unlimited account limit. `bsky.network` remains the
 wider-visibility path only. Runbook: `SELF_HOSTED_RELAY.md`.
 
+RESOLVED — **the `BRIDGE_KEK` rotation path is built.** A KEK can now be
+changed without orphaning the three sets of sealed material
+(`bridged_actors.signing_key`, `service_keys.key_material` row `plc-rotation`,
+`ap_actors.rsa_key_sealed`). Runbook: `DEPLOY.md` §6, "Runbook: rotating
+BRIDGE_KEK".
+
+- *Design chosen:* **dual-read by trial, plus an offline re-seal walk.**
+  `NewCustodianWithPrevious` opens under the current KEK then the previous one;
+  `identity.Reseal` (driven by `tidepool rotate-kek`) walks all three domains
+  and uses the same trial to classify every blob — opens under current (leave
+  the bytes alone), opens under previous (re-seal and write back under an
+  optimistic guard), opens under neither (report, never write). Re-run until it
+  reports zero re-seals and zero failures, then unset `BRIDGE_KEK_PREVIOUS`.
+- *Rejected candidate:* **a persisted key-version selector on each sealed
+  blob**, which this list previously called the first requirement. It buys
+  nothing here: GCM authentication already answers "which key sealed this?"
+  definitively (a wrong key fails the tag; ~2⁻¹²⁸), and unlike a column the
+  ciphertext cannot be *wrong* about it — a stored version can be left stale by
+  a half-finished rotation or a mismatched restore, and would then send the
+  reader to a key that does not open the bytes. Rejecting it also removed the
+  migration on `bridged_actors` and `service_keys` that the earlier plan
+  required. **`ap_actors.rsa_key_version` was never that selector**, though it
+  reads like one: it versions the *actor's RSA key* — an independent, still
+  unbuilt rotation — not the KEK the key is wrapped in.
+- *Residual limits, still open:* **per-actor RSA key rotation itself is
+  unbuilt** (republishing `publicKey` and getting peers to re-fetch, with no
+  two-key grace overlap in the code; `rsa_key_version` is stamped and never
+  read), and **the bridge's own service-actor RSA key is still plaintext PEM**
+  in `service_keys`, outside the KEK entirely — the walk deliberately refuses
+  to touch that row, so rotating it remains a separate unbuilt procedure.
+
+RESOLVED — **backup and restore is built.** `scripts/pg-backup.sh` (host cron,
+custom-format dump into the existing `./backups` mount, archive verified with
+`pg_restore --list` before rename, `chmod 600` on the dump, retention) plus
+`scripts/pg-restore-drill.sh` (restore into a throwaway `--network none`
+container, then gates: goose version derived from `internal/db/migrations/`,
+the irreplaceable-table inventory including the `outbound_*`/`admissions` set,
+the **existence** of exactly one non-empty `plc-rotation` row whenever
+`bridged_actors` is populated, and zero-length sealed blobs in
+`bridged_actors.signing_key` / `ap_actors.rsa_key_sealed`; nonzero on any gap).
+Both were run end-to-end before landing and again after each review wave — the
+drill's first run caught its own wrong table name, and the zero-length check
+caught a real zero-length `signing_key` row in the local test corpus on its
+first run, which is the drill working twice. `BRIDGE_KEK`/`.env` remain outside
+any database backup by nature; the backup script warns whenever `.env` is newer
+than its recorded offsite copy (`backups/.env-backed-up` marker), deliberately
+on ANY `.env` change rather than only a KEK change. Residual limits: dumps stay
+on the host they protect (no offsite replication yet), no WAL/PITR at this
+scale, RPO 24h on the default schedule, and nothing runs the drill
+automatically. Runbook: `DEPLOY.md` § "Backup and restore".
+
 DOCUMENTED, not resolved — the v2 deploy gaps below now have a written home in
 `DEPLOY.md` (§6 "Not implemented") with their blast radius. Writing them down
 is not building them; they stay open here:
 
-- **No `BRIDGE_KEK` / per-actor RSA rotation path.** Nothing re-seals existing
-  ciphertext under a new KEK, and the binary's only subcommand is `migrate`
-  (no args = serve). Changing the KEK orphans sealed key material in **three**
-  tables, not two: `bridged_actors.signing_key` (~950 bridged identities'
-  escrowed secp256k1 repo keys), `service_keys.key_material` row `plc-rotation`
-  (the PLC escrow key, the only DID recovery path), and — added by v2, and the
-  one a pre-v2 plan omits — `ap_actors.rsa_key_sealed`, **every native Coves
-  user's AP signing key** (`internal/db/migrations/017_ap_actors.sql:46`). No
-  recovery for any of it. Would need a key-version selector on each sealed
-  blob, a dual-read custodian, an online re-seal pass over all three, and a
-  cutover. Partial credit on the first: `ap_actors.rsa_key_version` already
-  exists (`017_ap_actors.sql:47`, stamped from `currentRSAKeyVersion = 1` at
-  `internal/personas/personas.go:25`) and is deliberately there so rotation is
-  definable without a schema change — but nothing reads it as a selector, and
-  the other two tables have no version column at all.
-- **No backup or restore procedure.** `docker-compose.prod.yml` mounts
-  `./backups` into the Postgres container and nothing writes to it. Note
-  `BRIDGE_KEK` lives in `.env` and is not covered by any database backup at
-  all. Whatever is built needs a restore *drill* — an unverified backup is a
-  claim, not a capability.
 - **No divergence off switch.** The sweep is wired unconditionally, sweeps once
   at startup, and `DIVERGENCE_INTERVAL=0` is refused by `durationVar`. The only
   lever is a large interval. Defensible while the sweep stays read-only; revisit
@@ -369,6 +400,63 @@ is not building them; they stay open here:
 - **Scoped kill switches are denylist-only.** There is no allowlist form, so a
   one-community canary must enumerate every *other* subscribed community — and
   adding a community to `communities.yaml` silently escapes an existing canary.
+
+Found while planning the KEK re-seal drill (NOT a defect of that work):
+
+- **A MISSING `plc-rotation` row on a populated database boots clean and
+  silently orphans every bridged DID.** `LoadOrCreateRotationKey` is
+  create-on-absence by design — that is what makes first boot and the
+  bootstrap race safe — but it cannot tell "first boot" from "the row is gone".
+  Restore a backup taken before the row existed, restore `bridged_actors`
+  without `service_keys`, or point `DATABASE_URL` at the wrong database, and
+  the bridge mints a **fresh** escrow key, seals it, stores it, and comes up
+  green. Nothing is logged as unusual. Every already-minted did:plc document
+  still names the OLD rotation key, so the bridge now holds an authority over
+  nothing while the only key that could recover ~950 DIDs is the one that just
+  went missing — and the clean boot is exactly what stops anyone from looking.
+  The KEK drill sharpened this: `rotate-kek` reports `service_keys` counts, so
+  an operator can see the row is there, but only if they run it.
+  *Candidate guard:* refuse to create when `bridged_actors` is non-empty — a
+  populated bridge with no rotation key is never a legitimate first boot — and
+  fail startup with a message that says which restore went wrong.
+
+Left open by the KEK / backup review waves (small, none of them urgent):
+
+- **Two near-duplicate keyset pagination loops in `internal/identity/reseal.go`**
+  — the `bridged_actors` walk and the `ap_actors` walk differ only in table,
+  key column and the AAD the blob is opened under. Not deduped when written,
+  because the shared shape was not yet proven by a second caller and a
+  premature walker abstraction would have been harder to review than the copy.
+  It is proven now: dedupe them into one parameterised walker **the next time
+  either is touched**, rather than as a standalone refactor of code that is
+  working and covered.
+- **`rotate-kek` needs a `Quiescent()` (or a distinct exit code) BEFORE anyone
+  automates the runbook.** Today the runbook is manual and the operator reads
+  the per-table counts, which is why exit codes alone are sufficient in
+  practice. The moment a script drives it, that stops being true: run one exits
+  **0** having re-sealed 948 rows, and a script keying on the exit code alone
+  would read that as clearance to unset `BRIDGE_KEK_PREVIOUS` — retiring the
+  old key while the second run has not yet proven nothing was written under it.
+  The fix is to make "zero run" machine-readable rather than an inference:
+  either a `Quiescent()` predicate on the report (`resealed == 0 && failed == 0`
+  across all tables) or a distinct exit code for "moved things, not yet
+  quiescent". `DEPLOY.md` §6 states the contract in prose in the meantime.
+- **No CI smoke harness for `scripts/pg-backup.sh` and
+  `scripts/pg-restore-drill.sh`.** Both are verified by hand against the local
+  test postgres each time they change, which leaves a drift window as wide as
+  the quarterly drill cadence: a migration that renames or drops a table the
+  drill checks by name turns the drill into a permanent red (or, worse, its
+  table-missing branch into noise) and nobody learns until the next manual run.
+  A CI job that dumps the migrated test database, runs both scripts, and asserts
+  PASS — plus one induced failure — closes it, and is the natural home for the
+  induced-failure cases the manual verification does today.
+- **`DEPLOY.md`'s `file.go:NNN` references drift, and the KEK stack proved it**
+  — inserting ~100 lines into `cmd/tidepool/main.go` falsified every later
+  `main.go` line number in the file at once. The KEK section's own references
+  were converted to symbol names; the rest were deliberately NOT re-indexed,
+  because re-indexing buys one correct snapshot and no durability. **Symbol
+  names are the fix** (`personas.New in run()`, `durationVar`, a constant's
+  name) — apply them section by section as those sections are next edited.
 
 Still open, unchanged:
 

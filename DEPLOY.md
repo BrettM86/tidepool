@@ -680,90 +680,312 @@ schema-version question.
 
 ## 6. Not implemented
 
-Everything in this section is a real operational gap. None of it has a
-mechanism in the code today. It is written down because an operator who
-assumes one of these exists will look for it during the exact incident where
-looking costs the most.
+Everything in this section is a real operational gap, with **two** exceptions
+kept here on purpose: **`BRIDGE_KEK` rotation** and **backup and restore** were
+both headline gaps and are both now built, so their entries have become
+runbooks rather than being deleted — an operator who comes here looking for
+either gap finds the procedure instead of a stale warning. Both are marked
+BUILT in their headings. Everything else below has no mechanism in the code
+today. It is written down because an operator who assumes one of these exists
+will look for it during the exact incident where looking costs the most.
 
-### Key rotation — `BRIDGE_KEK` and per-actor RSA keys
+### Key rotation — `BRIDGE_KEK` (BUILT) and per-actor RSA keys (not)
 
-**No rotation path exists. Not partial, not manual, not scripted.**
+**`BRIDGE_KEK` rotation exists: a dual-read custodian plus a `rotate-kek`
+re-seal walk, runbook below.** Per-actor **RSA** key rotation still does not
+exist, and neither does a rotation for the plaintext service-actor key; both
+are at the end of this entry.
 
-Every mention of `BRIDGE_KEK` in this repository is a warning, never a
-procedure. `internal/config/config.go:49-53` documents the value; the sealing
-itself is AES-256-GCM in `internal/identity/keys.go`. There is nothing that
-re-seals existing ciphertext under a new key: the binary has exactly two
-subcommands, `tidepool` and `tidepool migrate`
-(`cmd/tidepool/main.go:69-78`).
-
-Blast radius of losing or changing it — **three** tables, not two:
+What the KEK seals — **three** places, not two, and the walk covers all three:
 
 1. **`bridged_actors.signing_key`** — the escrowed **secp256k1 atproto** repo
    signing key of every bridged (Lemmy-origin) identity
-   (`internal/db/migrations/002_create_bridged_actors.sql:14`,
-   `internal/identity/keys.go:86-96`). Approximately 950 of them.
+   (`internal/db/migrations/002_create_bridged_actors.sql:14`; sealed and
+   opened by `Custodian.EncryptActorKey`/`DecryptActorKey` in
+   `internal/identity/keys.go`). Approximately 950 of them.
 2. **`service_keys.key_material`, row `plc-rotation`** — the PLC **escrow
-   rotation key** (`internal/identity/keys.go:140-144`), the one thing that
-   could recover the DIDs, itself sealed under the key you just replaced. Note
+   rotation key** (`RotationKeyName` / `LoadOrCreateRotationKey` in
+   `internal/identity/keys.go`), the one thing that
+   could recover the DIDs, and itself sealed under the KEK — which is why the
+   boot canary in step 2 of the runbook is a real test of the rotation. Note
    the column is `key_material`, not `private_key_pem`; migration 013 renamed
    it precisely because only this row is ciphertext — the sibling
    `service-actor` row is **plaintext** PKCS#8 PEM and is *not* KEK-sealed
    (`internal/db/migrations/013_rename_service_key_column.sql`).
 3. **`ap_actors.rsa_key_sealed`** — **every NATIVE Coves user's ActivityPub RSA
    signing key**, sealed under the same KEK under its own AAD prefix
-   (`internal/db/migrations/017_ap_actors.sql:46`,
-   `internal/identity/keys.go:39-53`). Written at mint time in
-   `internal/personas/personas.go:185`, through the same `identity.Custodian`
-   handed to `personas.New` at `cmd/tidepool/main.go:521-527`.
+   (`internal/db/migrations/017_ap_actors.sql:46`; `actorRSAKeyAADPrefix` in
+   `internal/identity/keys.go`, used by `EncryptActorRSAKey` in
+   `internal/identity/actor_rsa.go`). Written at mint time by the persona
+   create path, through the same `identity.Custodian` handed to `personas.New`
+   in `run()` (`cmd/tidepool/main.go`).
 
 **(3) is the v2 one, and it is the one a rotation plan will forget**, because
-it did not exist when this section was first written. A rotation built to
-handle only `bridged_actors` and `service_keys` would leave every native user
-unable to sign a single outbound activity — the exact population v2 exists to
-serve. Change the KEK and all three sets of ciphertext become undecryptable.
-There is no recovery.
+it did not exist when this section was first written. A rotation that handled
+only `bridged_actors` and `service_keys` would leave every native user unable
+to sign a single outbound activity — the exact population v2 exists to serve.
+The walk covers it; anything hand-rolled must too.
 
 *Naming trap:* `LoadOrCreateRotationKey` is **not** KEK rotation. It loads or
 generates the did:plc escrow/recovery key — an atproto identity concept —
 which is itself sealed under the KEK. Do not read that symbol as evidence that
-rotation is implemented.
+KEK rotation lives there; it lives in `internal/identity/reseal.go`.
 
-What a real rotation would require:
+#### Why there is no key-version column
 
-- **A key-version column or KEK-id alongside each sealed blob.** *Partly
-  present, and this is worth knowing before anyone designs it from scratch.*
-  `ap_actors` **already has one**: `rsa_key_version INT NOT NULL`
-  (`internal/db/migrations/017_ap_actors.sql:47`), and that migration's own
-  comment says it is there so "rotation [is] definable without a schema change"
-  (`:23-24`). It is stamped from `currentRSAKeyVersion = 1`
-  (`internal/personas/personas.go:25`, applied at `:185`) and read back, but
-  **nothing uses it as a selector** — no code branches on it to choose a KEK.
-  So on `ap_actors` the schema work is done and only the logic is missing.
-  `bridged_actors.signing_key` and `service_keys.key_material` genuinely have
-  no version column; those two need the migration as well.
-- **A dual-read custodian** that tries the new KEK then the old.
-- **An online re-seal pass** over all three tables above — `ap_actors`
-  included, which is the one a v1-era plan omits.
-- **A cutover** that retires the old KEK only after the pass completes.
+This section used to say a rotation would need "a key-version column or KEK-id
+alongside each sealed blob", and a migration for the two tables that lack one.
+**That claim is retired. The shipped design needs no schema change and no
+stored selector**, and anyone designing an extension should know why before
+re-proposing one.
 
-The ciphertext also carries a one-byte version prefix
-(`internal/identity/keys.go:127`) — but that is the *envelope format* version,
-checked for equality and rejected otherwise, not a key id. Neither it nor
-`rsa_key_version` selects a key today.
+GCM authentication is a *definitive* discriminator. Opening a blob under the
+wrong key does not return plausible garbage — it fails the tag check, and the
+odds of a wrong key authenticating are about 2⁻¹²⁸. So the KEK a blob is
+sealed under can simply be **tried**, and the answer is as trustworthy as any
+column would have been — while a column can be wrong (written by a crashed
+half-rotation, restored from a mismatched backup) in a way the ciphertext
+cannot. `NewCustodianWithPrevious` (`internal/identity/keys.go`) is that trial
+on the read path; `identity.Reseal` (`internal/identity/reseal.go`) is the same
+trial used to classify: opens under current → already moved, leave the bytes
+alone; opens under previous → re-seal and write back; opens under neither →
+report it and **never** write.
 
-Per-actor **RSA** rotation is equally undefined: rotating an actor's key means
-republishing `publicKey` in its actor document and having every peer that
-cached it re-fetch, with no grace-overlap mechanism in the code to publish two
-keys at once.
+`ap_actors.rsa_key_version` was never the missing selector, despite looking
+like one. It versions **the actor's RSA key** — a different, still-unbuilt
+rotation (below) — not the KEK the key is wrapped in. Reading it as a KEK
+selector is the trap this paragraph exists to close. Likewise the one-byte
+prefix on every ciphertext (`internal/identity/keys.go`) is the *envelope
+format* version, checked for equality and rejected otherwise; it is not a key
+id either.
 
-**Until this is built, treat `BRIDGE_KEK` as immutable, and back it up
-somewhere that survives the loss of the server.**
+#### Runbook: rotating `BRIDGE_KEK`
+
+The old key stays load-bearing for the whole of this procedure. Do not delete
+it from anywhere until step 6.
+
+1. **Put both keys in `/opt/tidepool/.env`** — the new one current, the old one
+   previous. Generate the new one with `openssl rand -hex 32`.
+
+   ```sh
+   BRIDGE_KEK=<new key>
+   BRIDGE_KEK_PREVIOUS=<the key that is in there right now>
+   ```
+
+   Both are forwarded to the `tidepool` service in
+   `docker-compose.prod.yml`; `BRIDGE_KEK_PREVIOUS` is empty in steady state
+   and the bridge treats empty as unset.
+
+2. **Restart the bridge.**
+
+   ```sh
+   docker compose -f docker-compose.prod.yml up -d tidepool
+   ```
+
+   It must come up clean. The boot canary opens the `plc-rotation` key under
+   the KEK before serving traffic, and at this point it only opens under the
+   *previous* one — so a clean boot is proof the dual read is working, and a
+   failed boot means one of the two values is wrong. Fix it here, where
+   nothing has been rewritten yet.
+
+3. **Run the walk.**
+
+   ```sh
+   docker compose -f docker-compose.prod.yml run --rm tidepool rotate-kek
+   ```
+
+   Not the `tidepool-migrate` one-shot: that service is deliberately wired
+   with `DATABASE_URL` alone, so it has no KEKs at all and `rotate-kek` there
+   would fail naming a variable that container is never meant to carry.
+
+4. **Read the inventory.** One line per table, plus one line per row that
+   could not be moved:
+
+   ```
+   level=INFO msg="kek re-seal table" table=bridged_actors resealed=948 already_current=0 skipped=3 failed=0
+   level=INFO msg="kek re-seal table" table=ap_actors resealed=112 already_current=0 skipped=0 failed=0
+   level=INFO msg="kek re-seal table" table=service_keys resealed=1 already_current=0 skipped=0 failed=0
+   ```
+
+   A row that could not be moved gets its own line, at ERROR, naming the table,
+   the row, and the class:
+
+   ```
+   level=ERROR msg="kek re-seal failure" table=ap_actors id=did:plc:7iza… reason=malformed
+   ```
+
+   `skipped` is most often a bridged actor with no escrowed key (`signing_key
+   IS NULL`) — normal, not a problem. It is not only that, and not only
+   `bridged_actors`: on **any** table a row that vanishes between the walk's
+   read and its write-back is skipped too, because the guarded update matches
+   nothing. That is also normal (a deleted actor), but it means a nonzero
+   `skipped` on `ap_actors` or `service_keys` is a row that disappeared
+   mid-walk rather than a NULL key. The plaintext `service-actor` row is not
+   counted anywhere, by design: the walk selects `plc-rotation` by name and
+   never reads its plaintext sibling.
+
+5. **Re-run until the zero-run gate opens**, i.e. every table reports
+   `resealed=0 failed=0` and the command exits 0. That re-run is the only
+   evidence that nothing is still sealed under the old key — the first run's
+   own counts are not, because a row written between its read and its finish
+   would not be in them.
+
+6. **Only then remove `BRIDGE_KEK_PREVIOUS`** from `/opt/tidepool/.env` and
+   restart:
+
+   ```sh
+   docker compose -f docker-compose.prod.yml up -d tidepool
+   ```
+
+   The boot canary now runs on the new key alone. If it fails, put the old key
+   back immediately and go to step 3 — the material is still intact at that
+   point, because the walk never overwrites what it cannot open.
+
+**Warnings.**
+
+- **Never start a second rotation before the first has shown its zero run.**
+  This tool moves blobs from *one* previous key to *one* current key. Introduce
+  a third key while blobs are still under the first and those blobs open under
+  neither: `rotate-kek` reports them `wrong-key` and exits non-zero (the walk
+  completes its inventory first), and nothing in this repository can recover
+  them without the missing key itself.
+- **`failed=... reason=wrong-key` is a key-history question first.** The blob
+  is well formed and simply not sealed under either key you supplied. The class
+  means the blob failed authentication under **both** keys, which is almost
+  always a key-history answer — but not only: rare ciphertext corruption that
+  preserves the envelope (version byte and length intact, bytes altered), or a
+  blob copied into a row under a different AAD, lands in this class too,
+  because GCM cannot distinguish "wrong key" from "right key, wrong bytes".
+  Check key history first (an older `.env`, a restored volume, another
+  deployment), integrity second. **Do not rotate again**, which only adds a key
+  to the search.
+- **`reason=malformed` is data corruption, not a key problem.** The blob is
+  truncated or carries an unknown version byte; it was never decrypted under
+  either key, so no KEK is implicated. Restore that single row from backup.
+  Rotating again cannot help and buries the evidence.
+- **`reason=missing` on `service_keys`/`plc-rotation` is the restore-went-wrong
+  hazard, and it outranks everything else here.** The row is not unreadable —
+  it is *gone*, on a database that still holds bridged identities, so the key
+  every one of those DIDs names as its rotation authority is absent. Almost
+  always a restore that missed `service_keys`. **Stop. Do not restart the
+  bridge**: `LoadOrCreateRotationKey` is create-on-absence and the next boot
+  mints a *replacement*, after which those DIDs are permanently beyond
+  recovery. Restore `service_keys` from a backup that has the row (the restore
+  drill's plc-rotation gate exists to catch exactly this before it is deployed)
+  and only then continue.
+- **`reason=contended` means only that another writer kept touching the row.**
+  Nothing is wrong. Re-run `rotate-kek`.
+- **A failed walk exits non-zero and finishes the inventory anyway.** Both are
+  deliberate: the full inventory means one pass tells the operator how much is
+  affected rather than stopping at the first bad row, and the exit code is the
+  gate on retiring the old key. Read it in one direction only:
+
+  - **Non-zero forbids unsetting `BRIDGE_KEK_PREVIOUS`.** Something is still
+    unmoved or unreadable; retiring the old key now is what makes it
+    unrecoverable.
+  - **Zero permits it only on the ZERO run** — the run where every table
+    reported `resealed=0 failed=0`. A first run that exits zero with
+    `resealed=948` is *progress, not clearance*: it says the walk moved
+    everything it saw, not that nothing was written under the old key while it
+    was looking. That is the whole reason step 5 asks for a second run.
+  - **An aborted walk still logs an inventory, and that inventory is
+    PARTIAL.** Counts from a run that ended early describe the rows it reached,
+    not the table; never read a `resealed=0` out of one as a zero run. The
+    error line is the discriminator, not the counts.
+
+  So a script may key on the exit code to *refuse*, but nothing may key on the
+  exit code alone to *permit* — permission needs the zero-run counts as well.
+
+#### Still not implemented: per-actor RSA rotation
+
+Rotating an individual actor's **RSA** key is undefined. It means republishing
+`publicKey` in that actor's document and having every peer that cached it
+re-fetch, with no grace-overlap mechanism in the code to publish two keys at
+once. `ap_actors.rsa_key_version` exists for exactly this rotation
+(`internal/db/migrations/017_ap_actors.sql`) and nothing reads it yet.
+
+The bridge's own **service-actor** RSA key is also still stored as plaintext
+PKCS#8 PEM (`service_keys`, row `service-actor`), so it is outside the KEK
+entirely — rotating it is a separate, unbuilt procedure, and the KEK walk
+correctly refuses to touch it.
+
+**Back up `BRIDGE_KEK` somewhere that survives the loss of the server.**
+Rotation is no longer a reason to treat it as immutable, but losing it — with
+no previous key to fall back to — is still unrecoverable.
 
 ### Backup and restore
 
-**No procedure exists, and no tooling.** `docker-compose.prod.yml:53` mounts
-`./backups:/backups` into the Postgres container. Nothing writes to it. There
-is no cron, no `pg_dump` wrapper, no restore drill, and no documented RPO/RTO.
+**BUILT: nightly `pg_dump` + a throwaway-container restore drill.** Two
+scripts, both exercised end-to-end before landing (backup → archive
+verification → restore → inventory gates):
+
+- `scripts/pg-backup.sh` — run from host cron. Dumps custom-format into the
+  `./backups` mount the compose file already provides, verifies the archive
+  with `pg_restore --list` **before** it gets its final name (a dump that
+  cannot be listed is not a backup), `chmod 600`s it, then ages out completed
+  dumps older than `RETENTION_DAYS` (default 14). Partials are never deleted at
+  any age; ones older than a day are warned about, because a partial is the
+  corpse of a failed run and worth seeing. Install:
+
+      17 2 * * * /opt/tidepool/scripts/pg-backup.sh >> /opt/tidepool/backups/backup.log 2>&1
+
+  **Provisioning: `chmod 700 /opt/tidepool/backups` once, by hand.** The script
+  can only fix the files it creates. Every dump in that directory contains the
+  plaintext service-actor PEM and every sealed blob in the database; the
+  directory's own mode is the operator's to set.
+
+- `scripts/pg-restore-drill.sh` — restores the newest dump (or `$1`) into a
+  **throwaway** `postgres:16` container (no published ports, `--network none`,
+  reached only by `docker exec`), prints the row inventory, exits nonzero on
+  any gap, and removes the container. It never touches the production
+  container, volume, or network. What it gates on:
+
+  - **The migration version**, against the `internal/db/migrations/*.sql` in
+    the checkout the script sits in — so a dump that restores cleanly but
+    predates migrations the running code needs fails as a stale dump instead of
+    passing. Copied out of the repo, the gate degrades to a warning plus the
+    old any-nonzero check.
+  - **The irreplaceable tables below**, present and (for `service_keys`)
+    non-empty: `bridged_actors`, `service_keys`, `ap_actors`, `blocks`,
+    `repo_state`, `blobs`, and the in-flight federation set —
+    `outbound_deliveries`, `outbound_activities`, `outbound_objects`,
+    `outbound_votes`, `admissions`.
+  - **The `plc-rotation` row must EXIST**, exactly once and non-empty, whenever
+    `bridged_actors` restored non-empty. An *absent* row is the dangerous case,
+    not a present-but-empty one: it boots clean and mints a replacement key
+    (see `reason=missing` above). When `bridged_actors` is empty too, absence
+    is tolerated with a printed note — that is a fresh-install dump.
+  - **Zero-length sealed blobs**, in `bridged_actors.signing_key` and
+    `ap_actors.rsa_key_sealed`. A column that can only hold ciphertext holding
+    nothing is corruption, distinct from NULL (which is a legitimately
+    key-less actor).
+
+RPO with the default schedule is 24 hours of database state. The drill
+validates data presence, not KEK correctness: sealed columns are checked
+**present and non-zero-length — never opened, and never checked row by row for
+plausibility** (a restore drill must not need to read the KEK). The full proof
+is drill + boot canary: restore, point a bridge at it with the real
+`BRIDGE_KEK`, and a wrong pairing fails at startup — the same canary as step 2
+of the KEK runbook above.
+
+**Retention and drill cadence interact, and not in your favour.** Retention
+ages dumps out on `pg-backup.sh`'s own criteria, which is `pg_restore --list`
+succeeding; a dump that lists but would fail the drill therefore keeps
+refreshing the retention window for up to `RETENTION_DAYS` while the last
+*drilled* dump ages out from under it. The drill is the deeper check and
+nothing runs it automatically: **run it after the first backup, after any
+restore, and quarterly.**
+
+**`BRIDGE_KEK` and `.env` are NOT in any database backup.** Keep an offsite
+copy of `.env` (password manager or sealed storage, not this server), and
+`touch backups/.env-backed-up` after each copy — `pg-backup.sh` warns on every
+run where `.env` is newer than that marker, so a rotated or edited KEK that
+was never re-escrowed shows up in the backup log instead of in an incident.
+
+Residual limits, stated rather than implied: dumps live on the same host they
+protect (no offsite replication of `./backups` yet — copying them into the
+same offsite routine as `.env` is the obvious next step), and WAL archiving /
+point-in-time recovery is deliberately not built at this scale.
 
 What is at risk, in order of irreplaceability:
 
@@ -779,9 +1001,6 @@ What is at risk, in order of irreplaceability:
    not come back.
 4. **`outbound_*`, `admissions`** — in-flight federation state. Losing it
    double-sends or drops deliveries.
-
-Anything actually built here should be a separate task with a **restore
-drill**, since an unverified backup is a claim, not a capability.
 
 ### A divergence off switch
 

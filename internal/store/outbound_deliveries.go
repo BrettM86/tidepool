@@ -220,7 +220,11 @@ func (r *postgresOutboundDeliveries) MarkDelivered(ctx context.Context, activity
 // gaining retries it already used, visible nowhere until a poison budget that
 // should have stopped never does.
 //
-// The slot is filled from a CONSTANT below and never from input.
+// The slot is filled from a CONSTANT below and never from input, and both
+// expansions happen ONCE at package init (releaseQuery / releaseParkedQuery
+// under it) rather than per call — so there are exactly two finished statements
+// in this package, neither of which can be handed a runtime string, and no
+// future `%` written into this SQL can be mangled by a formatting pass.
 const releaseStatement = `
 		WITH updated AS (
 			UPDATE outbound_deliveries
@@ -243,6 +247,13 @@ const releaseStatement = `
 const handBackClaimAttempt = `,
 			    attempts = GREATEST(attempts - 1, 0)`
 
+// The two finished statements, expanded once at init: a failure keeps its
+// attempt, a park hands its own back.
+var (
+	releaseQuery       = fmt.Sprintf(releaseStatement, "")
+	releaseParkedQuery = fmt.Sprintf(releaseStatement, handBackClaimAttempt)
+)
+
 func (r *postgresOutboundDeliveries) Release(ctx context.Context, activityID, targetInbox, errorClass, excerpt string, lastStatusCode int, nextAttempt, claimToken time.Time) (bool, bool, error) {
 	// Fencing + non-terminal guard: only the current claim holder reschedules
 	// (claimed_until == claimToken, state = 'pending'), so a stale worker's late
@@ -250,9 +261,7 @@ func (r *postgresOutboundDeliveries) Release(ctx context.Context, activityID, ta
 	// terminal state. The row stays pending with the lease cleared so a retry
 	// can re-claim after the backoff. The attempt ClaimNext charged stays
 	// charged: this delivery was TRIED.
-	query := fmt.Sprintf(releaseStatement, "")
-
-	return r.markResult(ctx, "release", query,
+	return r.markResult(ctx, "release", releaseQuery,
 		activityID, targetInbox, nextAttempt.UTC(), errorClass, excerpt, lastStatusCode, claimToken.UTC())
 }
 
@@ -274,9 +283,7 @@ func (r *postgresOutboundDeliveries) Release(ctx context.Context, activityID, ta
 // short-circuits before re-POSTing it, so it can never re-poison and its growing
 // attempt count only widens the backoff between bookkeeping retries.
 func (r *postgresOutboundDeliveries) ReleaseParked(ctx context.Context, activityID, targetInbox, errorClass, excerpt string, lastStatusCode int, nextAttempt, claimToken time.Time) (bool, bool, error) {
-	query := fmt.Sprintf(releaseStatement, handBackClaimAttempt)
-
-	return r.markResult(ctx, "release parked", query,
+	return r.markResult(ctx, "release parked", releaseParkedQuery,
 		activityID, targetInbox, nextAttempt.UTC(), errorClass, excerpt, lastStatusCode, claimToken.UTC())
 }
 

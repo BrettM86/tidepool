@@ -120,6 +120,11 @@ func newHeldVoteWorld(t *testing.T) *heldVoteWorld {
 	require.Equal(t, store.DeliveryStatePending, held.State)
 	require.Equal(t, store.DeliveryHeldForSettlement, held.LastErrorClass,
 		"precondition: the delivery is held for settlement, so the worker WILL come back to it")
+	require.Equal(t, 1, held.Attempts,
+		"a settlement hold KEEPS its attempt, unlike a park. The asymmetry is deliberate: a park "+
+			"is a hold nobody tried, while this one already POSTed and its retries are spaced by a "+
+			"backoff computed from this very counter — hand the attempt back and a persistently "+
+			"failing local write spins at the base delay forever")
 	stored, err := votes.GetByATURI(ctx, pvVoteATURI)
 	require.NoError(t, err)
 	require.Equal(t, store.DeliveredStatePending, stored.DeliveredState,
@@ -149,9 +154,13 @@ func (w *heldVoteWorld) settle(t *testing.T) {
 	w.faulty.failSet = false
 	_, err := w.worker.DeliverNext(context.Background())
 	require.NoError(t, err)
-	require.Equal(t, store.DeliveryStateDelivered, getDelivery(t, w.conn, w.likeID).State,
+	settled := getDelivery(t, w.conn, w.likeID)
+	require.Equal(t, store.DeliveryStateDelivered, settled.State,
 		"precondition: the held settlement completed and the delivery reached its terminal "+
 			"state — this is the recovery working, not a fault")
+	require.Equal(t, 2, settled.Attempts,
+		"and the ledger counted BOTH claims: settlement retries accumulate, so each one waits "+
+			"longer than the last")
 }
 
 func TestPurge_DoesNotLeaveAHeldVoteStandingOnAPeer(t *testing.T) {

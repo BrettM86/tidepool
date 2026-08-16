@@ -571,12 +571,34 @@ const parkDelay = 5 * time.Second
 // attempt cap only through attempts it actually made.
 func (w *Worker) park(ctx context.Context, delivery *store.OutboundDelivery, class, reason string) error {
 	next := time.Now().Add(parkDelay)
-	_, _, err := w.deliveries.ReleaseParked(ctx, delivery.ActivityID, delivery.TargetInbox, class, reason, 0, next, *delivery.ClaimedUntil)
+	_, applied, err := w.deliveries.ReleaseParked(ctx, delivery.ActivityID, delivery.TargetInbox, class, reason, 0, next, *delivery.ClaimedUntil)
 	if err != nil {
 		return fmt.Errorf("park delivery %s: %w", delivery.ActivityID, err)
 	}
-	metricParked.Add(1)
+	w.countPark(delivery, class, applied)
 	return nil
+}
+
+// countPark records a park THE FENCE ACCEPTED, and only that one.
+//
+// tidepool_outbound_parked is how an operator sizes a held queue, and it is the
+// only signal that can: a parked row still reads `pending`, exactly like one
+// merely waiting its turn. A stale worker bouncing off a claim somebody else
+// owns held nothing, so counting it inflates the one number an incident is read
+// through.
+//
+// The bounce is logged rather than passed over in silence. The ROW is safe — the
+// fence saw to that — but the wedged claim's own +1 stays on the ledger with
+// nobody left to hand it back (the abandoned-claim leak in FOLLOWUPS.md), and
+// this line is the only thing that connects an operator's "attempts climbing
+// while the switch is held" to a lapsed lease rather than to the park path.
+func (w *Worker) countPark(delivery *store.OutboundDelivery, class string, applied bool) {
+	if !applied {
+		w.logger.Warn("park did not apply: claim lost or row terminal",
+			"activity", delivery.ActivityID, "inbox", delivery.TargetInbox, "class", class)
+		return
+	}
+	metricParked.Add(1)
 }
 
 // parkCausal holds a causally-ineligible delivery WITHOUT a future delay: a held
@@ -590,11 +612,11 @@ func (w *Worker) park(ctx context.Context, delivery *store.OutboundDelivery, cla
 // causalStatus poisons on the CausalWaitBudget deadline, so however many times a
 // child cycles through this hold, what ends the wait is elapsed time.
 func (w *Worker) parkCausal(ctx context.Context, delivery *store.OutboundDelivery, class, reason string) error {
-	_, _, err := w.deliveries.ReleaseParked(ctx, delivery.ActivityID, delivery.TargetInbox, class, reason, 0, time.Now(), *delivery.ClaimedUntil)
+	_, applied, err := w.deliveries.ReleaseParked(ctx, delivery.ActivityID, delivery.TargetInbox, class, reason, 0, time.Now(), *delivery.ClaimedUntil)
 	if err != nil {
 		return fmt.Errorf("park (causal) delivery %s: %w", delivery.ActivityID, err)
 	}
-	metricParked.Add(1)
+	w.countPark(delivery, class, applied)
 	return nil
 }
 

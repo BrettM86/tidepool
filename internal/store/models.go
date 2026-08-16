@@ -479,7 +479,12 @@ type OutboundDelivery struct {
 	OrderingKey string
 	// State is the delivery's fate (pending until terminal).
 	State DeliveryState
-	// Attempts counts how many times a worker claimed this delivery.
+	// Attempts is a REFUNDED counter, not a claim count: ClaimNext charges one
+	// on every claim, and a park that the fence applied hands its own charge
+	// back (ReleaseParked). What is left standing is claims charged and never
+	// handed back — deliveries genuinely TRIED, plus abandoned claims whose
+	// worker died or lost its lease before settling. The attempt cap counts
+	// this, so it counts attempts made rather than holds endured.
 	Attempts int
 	// NextAttemptAt is the retry-backoff schedule; claimable when <= now.
 	NextAttemptAt time.Time

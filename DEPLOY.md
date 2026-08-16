@@ -145,8 +145,8 @@ failure is a retry, not a poison. `DefaultMaxDeliveryAttempts = 8`
 ⚠️ **It is a continuous write load, though.** A parked head is re-claimed and
 re-parked every `parkDelay = 5 * time.Second` (`worker.go:560`), so a held
 switch costs one claim plus one `UPDATE` per parked ordering-key head per ~5s,
-for as long as it is engaged — indefinitely, since nothing now ends the cycle on
-its own. That churn is the remaining argument for **preferring
+for as long as it is engaged — indefinitely, since nothing ends the cycle on its
+own. That churn is the remaining argument for **preferring
 `OUTBOUND_WORKERS=0` to park everything** — see [Rollback](#rollback) — and it
 is a cost argument, not a safety one.
 

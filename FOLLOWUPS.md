@@ -87,9 +87,17 @@ task documents and git history rather than this list.
   *Two residual limits, both pre-existing and neither closed by this.*
   - **An abandoned claim still leaks its `+1` forever.** A lapsed lease, or a
     crash between `ClaimNext` and any settle, leaves an increment with nobody
-    holding the fence to hand it back. Shared with the real-failure path and
-    bounded by the lease, so it is cosmetic — but it is why `attempts` is a
-    count of claims that settled, not of POSTs.
+    holding the fence to hand it back — so `attempts` counts claims CHARGED AND
+    NEVER HANDED BACK: deliveries genuinely tried, plus abandoned claims. Each
+    leak permanently costs the delivery one retry of real poison budget; the
+    lease bounds only how soon the row is re-claimable, not the loss. Rare and
+    bounded at **at most one lost retry per abandoned claim**, and shared with
+    the real-failure path, so it is not a park defect — but it is the reason a
+    poisoned row can read above `maxAttempts`. A park that the fence REFUSED now
+    logs at Warn (`park did not apply: claim lost or row terminal`,
+    `internal/outbound/worker.go`) and is not counted in
+    `tidepool_outbound_parked`, which is what makes such a leak diagnosable
+    rather than merely visible in the column.
   - **A park writes `last_status_code = 0`,** clobbering a real status a PRIOR
     failed attempt recorded. The divergence sweep reads that column as its
     answered-or-silent discriminator (`COALESCE(d.last_status_code, 0) > 0`,

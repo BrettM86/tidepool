@@ -117,6 +117,48 @@ func TestOutboundDeliveries_ReleaseParkedFencing(t *testing.T) {
 			"the holder's park hands back its OWN claim only: the earlier, genuinely-spent attempt remains")
 	})
 
+	// The fence is two predicates, and the case above only exercises one of
+	// them: every real terminal writer nulls claimed_until on its way out, so a
+	// terminal row and a live token never coexist in production and the
+	// state='pending' half is unreachable by ordinary means. Raw SQL is the only
+	// way to hold that half up on its own — without it, deleting `state =
+	// 'pending'` from ReleaseParked's WHERE clause would leave every test green
+	// while the method happily un-poisoned a decided delivery.
+	t.Run("poisoned row with a live token is untouched", func(t *testing.T) {
+		database := deliveryTestDB(t)
+		activities := NewOutboundActivities(database)
+		repo := NewOutboundDeliveries(database)
+		ctx := context.Background()
+
+		seedActivity(t, activities, testActivity())
+		_, err := repo.Enqueue(ctx, testDelivery())
+		require.NoError(t, err)
+
+		claimed, err := repo.ClaimNext(ctx, time.Minute)
+		require.NoError(t, err)
+		require.NotNil(t, claimed.ClaimedUntil)
+		token := *claimed.ClaimedUntil
+
+		// state only — the lease is left exactly as the claim stamped it, so
+		// the token below is genuinely CURRENT and only terminality can refuse.
+		_, err = database.ExecContext(ctx,
+			`UPDATE outbound_deliveries SET state = 'poisoned' WHERE activity_id = $1`, delActivityID)
+		require.NoError(t, err)
+
+		_, applied, err := repo.ReleaseParked(ctx, delActivityID, delTargetInbox,
+			"switch_parked", "kill switch", 0, time.Now().Add(5*time.Second), token)
+		require.NoError(t, err)
+		assert.False(t, applied,
+			"a park must not apply to a POISONED row even when its token is current — terminal is terminal")
+
+		got, err := repo.Get(ctx, delActivityID, delTargetInbox)
+		require.NoError(t, err)
+		assert.Equal(t, DeliveryStatePoisoned, got.State,
+			"the park must never lift a delivery back out of poisoned and into the live queue")
+		assert.Equal(t, 1, got.Attempts,
+			"nor rewind the ledger of a row whose outcome is already decided")
+	})
+
 	t.Run("terminal row is untouched", func(t *testing.T) {
 		database := deliveryTestDB(t)
 		activities := NewOutboundActivities(database)

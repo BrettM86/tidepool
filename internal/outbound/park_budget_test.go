@@ -32,9 +32,15 @@ import (
 // failure this test is here to catch.
 func clearParkDelay(t *testing.T, conn *sql.DB, activityID string) {
 	t.Helper()
-	_, err := conn.ExecContext(context.Background(),
+	result, err := conn.ExecContext(context.Background(),
 		`UPDATE outbound_deliveries SET next_attempt_at = now() WHERE activity_id = $1`, activityID)
 	require.NoError(t, err)
+	// A helper that silently matches no row would turn every caller's loop into
+	// a claim that never happens, failing somewhere far from the drift that
+	// caused it.
+	affected, err := result.RowsAffected()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), affected, "clearParkDelay must rewind exactly the delivery under test")
 }
 
 func TestWorker_KillSwitchDoesNotSpendPoisonBudget(t *testing.T) {
@@ -52,9 +58,11 @@ func TestWorker_KillSwitchDoesNotSpendPoisonBudget(t *testing.T) {
 		}
 		return nil
 	}}
-	// MaxAttempts 3 is the package default; BackoffBase must be REAL time here
-	// (the helper's 1ms default would put next_attempt_at in the past by the
-	// time we read it, making the reschedule assertion vacuous).
+	// Both of these are spelled out rather than inherited: MaxAttempts 3 is the
+	// TEST HELPER's default (the package default is 8), and a helper default is
+	// not a contract this test should silently depend on. BackoffBase must be
+	// REAL time here — the helper's 1ms would put next_attempt_at in the past by
+	// the time we read it, making the reschedule assertion vacuous.
 	w := newWorker(t, conn, sender, func(o *WorkerOptions) {
 		o.Switches = switches
 		o.MaxAttempts = 3

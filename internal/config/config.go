@@ -52,6 +52,13 @@ type Config struct {
 	// development default is a fixed, publicly known key — never usable in
 	// production, where BRIDGE_KEK is required.
 	BridgeKEK []byte
+	// BridgeKEKPrevious is the KEK the bridge is rotating away from: key
+	// material sealed under it must still open, but nothing new is sealed
+	// under it. Nil when BRIDGE_KEK_PREVIOUS is unset.
+	//
+	// STUB (TDD red): nothing parses BRIDGE_KEK_PREVIOUS yet, so this is
+	// always nil.
+	BridgeKEKPrevious []byte
 	// BridgeServiceDID optionally pins a pre-provisioned service DID for the
 	// bridge's own actor. Service-DID bootstrap is deferred: task 06 wires
 	// the service actor; until then an empty value is handled gracefully

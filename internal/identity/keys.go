@@ -82,6 +82,16 @@ func NewCustodian(kek []byte) (*Custodian, error) {
 	return &Custodian{aead: gcm}, nil
 }
 
+// NewCustodianWithPrevious returns a Custodian that SEALS under current and
+// OPENS under current or previous, so an operator can rotate the bridge KEK
+// without orphaning key material sealed under the old one. previous may be
+// nil, in which case the result behaves exactly like NewCustodian(current).
+//
+// STUB (TDD red): ignores previous entirely and delegates to NewCustodian.
+func NewCustodianWithPrevious(current, previous []byte) (*Custodian, error) {
+	return NewCustodian(current)
+}
+
 // EncryptActorKey seals an actor's signing key for storage in
 // bridged_actors.signing_key. The ciphertext is bound to the actor's DID:
 // decrypting it under any other DID fails authentication.

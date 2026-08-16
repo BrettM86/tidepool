@@ -203,8 +203,9 @@ plain-HTTP AP ids to match. See the header comments in
 `docker-compose.e2e.yml` and `e2e/lemmy/Dockerfile` for the full story.
 
 The suite (`tests/e2e/`, build tag `e2e`: `bridge_test.go`,
-`lifecycle_test.go`, `media_test.go`, `native_pds_test.go`, `relay_test.go`,
-`votes_hammer_test.go`, `zz_sweep_test.go`)
+`lifecycle_test.go`, `media_test.go`, `moderation_test.go`,
+`native_pds_test.go`, `relay_test.go`, `votes_hammer_test.go`,
+`zz_sweep_test.go`)
 covers: subscribe → `community.profile` on the firehose; a link post →
 `actor.profile` and `community.post` (presence + author linkage; arrival
 order across the two repos is relay-dependent, see above), with the shared

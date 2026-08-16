@@ -72,9 +72,21 @@ func dispatch(logger *slog.Logger, args []string) error {
 		return run(logger)
 	case len(args) == 1 && args[0] == "migrate":
 		return runMigrations(logger)
+	case len(args) == 1 && args[0] == "rotate-kek":
+		return runRotateKEK(logger)
 	default:
 		return fmt.Errorf("usage: tidepool [migrate]")
 	}
+}
+
+// runRotateKEK re-seals every KEK-sealed blob under the current BRIDGE_KEK so
+// the operator can retire BRIDGE_KEK_PREVIOUS.
+//
+// STUB: the dispatch wiring exists so the command's contract — which
+// variables it requires and which it must not — can be driven by tests. The
+// walk itself is identity.Reseal, already implemented.
+func runRotateKEK(logger *slog.Logger) error {
+	return fmt.Errorf("rotate-kek: not implemented")
 }
 
 // runMigrations applies every pending embedded Goose migration and exits. It

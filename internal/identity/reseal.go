@@ -1,6 +1,7 @@
 package identity
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	stderrors "errors"
@@ -26,25 +27,46 @@ type ResealCounts struct {
 	// second run reports everything here — that is the operator's zero-run
 	// gate for unsetting BRIDGE_KEK_PREVIOUS.
 	AlreadyCurrent int
-	// Skipped had no sealed material to move (a NULL signing_key).
+	// Skipped had nothing to move, with nothing wrong: a NULL signing_key
+	// (an actor minted before escrow, or one that opted out before a key was
+	// cut), or — in any table — a row that was deleted out from under the
+	// walk between its read and its write. A ZERO-LENGTH but non-NULL blob is
+	// NOT this: no writer here emits one, so it is damage, and it is counted
+	// Failed.
 	Skipped int
-	// Failed opened under neither KEK.
+	// Failed could not be moved onto the current KEK, for any of the reasons
+	// in ResealFailureReason — most of them a blob that opened under neither
+	// key, but also a row that should exist and does not. Every one of them
+	// also appears by name in ResealReport.Failures.
 	Failed int
 }
 
-// ResealFailureReason classifies why a blob could not be re-sealed, because
-// the two classes send an operator to different places: a wrong-key blob is a
-// key-history question, a malformed one is storage corruption.
+// ResealFailureReason classifies why a row could not be re-sealed, because
+// the classes send an operator somewhere different: wrong-key is a
+// key-history question, malformed is storage corruption, missing is a restore
+// to redo, and contended is simply a re-run.
 type ResealFailureReason string
 
 const (
-	// ResealFailureWrongKey means the blob is well formed but authenticates
-	// under neither the current nor the previous KEK.
+	// ResealFailureWrongKey means the blob is well formed — right length,
+	// known version byte — but FAILED AUTHENTICATION UNDER BOTH KEYS. A
+	// third KEK the bridge no longer holds is the headline cause, but it is
+	// not the only one: a single flipped bit anywhere in the ciphertext or
+	// the GCM tag lands here, and so does a blob copied from another row or
+	// another column, because the AAD binds each ciphertext to its DID and
+	// its domain. So this class means "the AEAD said no", not "a KEK is
+	// missing" — key history is where to look FIRST, not the only place.
 	ResealFailureWrongKey ResealFailureReason = "wrong-key"
 	// ResealFailureMalformed means the blob is truncated or carries an
 	// unknown version byte: it was never decrypted under either key, so
 	// nothing about the KEKs is in question.
 	ResealFailureMalformed ResealFailureReason = "malformed"
+	// ResealFailureMissing means the row the walk expected is not there at
+	// all. Only service_keys 'plc-rotation' can report it, and only on a
+	// database that already holds bridged identities: the next boot mints a
+	// replacement rotation key, and every DID that names the old one loses
+	// its recovery path for good.
+	ResealFailureMissing ResealFailureReason = "missing"
 	// ResealFailureContended means the row was rewritten by someone else
 	// between every read and every guarded write this walk attempted, so the
 	// walk never had a safe moment to swap the bytes. Nothing is wrong with
@@ -83,6 +105,18 @@ const resealBatchSize = 100
 // in practice; the cap is what keeps a pathological row from spinning forever.
 const maxResealWriteAttempts = 3
 
+// ErrResealIncomplete is the one error class that means the walk RAN TO
+// COMPLETION: every table was paged to the end, and the report beside it is
+// the whole inventory. Rows in it could not be moved, so the run still exits
+// nonzero, but the counts are complete.
+//
+// Every OTHER error Reseal returns aborts the walk mid-table, which makes the
+// accompanying report a prefix rather than an inventory. Callers that print
+// the counts need to tell the two apart before they let an operator read the
+// numbers as coverage, so the distinction is an errors.Is target rather than
+// a string match on the message.
+var ErrResealIncomplete = stderrors.New("identity: reseal: sealed blob(s) could not be moved onto the current KEK")
+
 // Reseal walks every KEK-sealed blob and re-seals it under current, so the
 // previous KEK can be retired. It returns the report even when it also
 // returns an error: an operator running the drill needs the full inventory
@@ -99,6 +133,20 @@ func Reseal(ctx context.Context, db *sql.DB, current, previous []byte) (*ResealR
 	if len(previous) == 0 {
 		return nil, errors.NewValidationError("bridge_kek_previous",
 			"must be set to re-seal: with no previous KEK there is nothing to move onto the current one")
+	}
+	// One key in both roles is not a rotation, and the walk's output would be
+	// the most dangerous report it can produce: every blob AlreadyCurrent,
+	// nothing re-sealed, zero failures — the exact shape of the clean zero-run
+	// that clears an operator to unset BRIDGE_KEK_PREVIOUS, over a database
+	// where every blob is still sealed under it.
+	//
+	// The guard lives HERE, not only in the callers that happen to have one
+	// today (config.Load at boot, runRotateKEK before it dials), because the
+	// two keys arrive as adjacent []byte parameters of an exported function:
+	// whoever calls it next inherits the check instead of re-deriving it.
+	if bytes.Equal(current, previous) {
+		return nil, errors.NewValidationError("bridge_kek_previous",
+			"decodes to the same key as BRIDGE_KEK; a rotation needs two different keys, and re-sealing a key onto itself would report a clean zero-run over a database nothing had moved off")
 	}
 	underPrevious, err := NewCustodian(previous)
 	if err != nil {
@@ -121,13 +169,18 @@ func Reseal(ctx context.Context, db *sql.DB, current, previous []byte) (*ResealR
 		}
 	}
 
-	failed := walk.report.BridgedActors.Failed + walk.report.APActors.Failed + walk.report.ServiceKeys.Failed
-	if failed > 0 {
+	// The gate reads the failure LIST, not a hand-rolled sum of the per-table
+	// Failed counters. Both are written by the same fail() choke point, so
+	// they agree today — but a fourth sealed domain added to the loop above
+	// would arrive with a fourth ResealCounts that a sum has to be taught
+	// about by hand, and forgetting to would let its failures exit zero. The
+	// list needs no such maintenance.
+	if len(walk.report.Failures) > 0 {
 		// The report alone is not enough: a zero exit is what a deploy script
 		// reads as permission to unset BRIDGE_KEK_PREVIOUS, and doing that
 		// with unmoved blobs destroys them.
-		return walk.report, fmt.Errorf(
-			"identity: reseal: %d sealed blob(s) could not be moved onto the current KEK; BRIDGE_KEK_PREVIOUS must stay set", failed)
+		return walk.report, fmt.Errorf("%w: %d row(s); BRIDGE_KEK_PREVIOUS must stay set",
+			ErrResealIncomplete, len(walk.report.Failures))
 	}
 	return walk.report, nil
 }
@@ -138,6 +191,13 @@ type resealer struct {
 	underCurrent  *Custodian
 	underPrevious *Custodian
 	report        *ResealReport
+	// sawIdentities records that the walk found at least one bridged_actors
+	// or ap_actors row. It is what lets rotationKey tell a fresh install
+	// (no identities, no rotation key, nothing wrong) from a restore that
+	// dropped the rotation key out from under identities that name it. The
+	// domain loop runs the two actor tables before rotationKey, so this is
+	// always settled by the time it is read.
+	sawIdentities bool
 }
 
 // resealOutcome is what the walk decided to do with one blob.
@@ -236,9 +296,12 @@ func (r *resealer) move(ctx context.Context, counts *ResealCounts, row blobRow) 
 		if err != nil {
 			return fmt.Errorf("identity: reseal: re-read %s %s: %w", row.table, row.id, err)
 		}
-		if len(blob) == 0 {
-			// The row was deleted or its key cleared while the walk ran;
-			// there is no longer anything to move.
+		if blob == nil {
+			// The row was deleted, or its nullable key column was cleared,
+			// while the walk ran: there is no longer anything to move. Only
+			// a NIL blob means that. A non-nil EMPTY one is a row that is
+			// still there holding zero bytes, which no writer here produces
+			// — so it goes back around the loop and decide() classifies it.
 			counts.Skipped++
 			return nil
 		}
@@ -291,11 +354,21 @@ func (r *resealer) bridgedActors(ctx context.Context) error {
 			return nil
 		}
 
+		r.sawIdentities = true
 		for _, row := range page {
 			lastID = row.id
-			if len(row.blob) == 0 {
+			if row.blob == nil {
 				// NULL signing_key: minted before escrow, or opted out before
 				// a key was cut. Nothing to move, and nothing wrong.
+				//
+				// NIL, not zero-length. A NULL column scans as a nil slice; a
+				// zero-length bytea scans as a non-nil empty one, and that is
+				// a row someone or something damaged — seal() never emits
+				// fewer than a version byte, a nonce and a tag. Letting it
+				// fall through to move() sends it to decide(), whose length
+				// check classifies it malformed, so the operator hears about
+				// it instead of finding it in the bucket labelled "nothing
+				// wrong".
 				r.report.BridgedActors.Skipped++
 				continue
 			}
@@ -361,6 +434,7 @@ func (r *resealer) apActors(ctx context.Context) error {
 			return nil
 		}
 
+		r.sawIdentities = true
 		for _, row := range page {
 			lastDID = row.did
 			did := row.did
@@ -399,7 +473,28 @@ func (r *resealer) rotationKey(ctx context.Context) error {
 	err := r.db.QueryRowContext(ctx,
 		`SELECT key_material FROM service_keys WHERE name = $1`, RotationKeyName).Scan(&blob)
 	if stderrors.Is(err, sql.ErrNoRows) {
-		// No rotation key yet: the next boot mints one under the current KEK.
+		if !r.sawIdentities {
+			// A fresh install: no identities, and therefore no boot has ever
+			// needed a rotation key. The next one mints it under the current
+			// KEK, which is exactly right. Nothing to move, nothing wrong,
+			// and no bucket to put it in.
+			return nil
+		}
+		// A POPULATED database missing its rotation key is the opposite
+		// story. Those bridged identities each name this key as their
+		// rotation authority in their DID document, so the row existed when
+		// they were minted and something — almost always a restore that
+		// missed service_keys — has since lost it. LoadOrCreateRotationKey
+		// cannot tell: the next boot mints a REPLACEMENT, and every one of
+		// those DIDs is left naming a key nobody holds, permanently beyond
+		// recovery.
+		//
+		// The walk cannot fix it (the bytes are gone), so it does the one
+		// thing that helps: counts it Failed, which makes the run exit
+		// nonzero and stops the deploy script before that boot happens, and
+		// puts it in the report by name so the operator restores the row
+		// rather than restarting the service.
+		r.fail(&r.report.ServiceKeys, "service_keys", RotationKeyName, ResealFailureMissing)
 		return nil
 	}
 	if err != nil {

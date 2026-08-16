@@ -12,6 +12,13 @@
 # KEK copy must live. This script only refuses to let that be forgotten
 # silently: it warns (to stderr and the log) if .env has no offsite marker.
 #
+# That warning fires on ANY change to .env, not only a KEK change, and that is
+# deliberate — do not "fix" it into comparing KEK values. The script cannot
+# read the old KEK to compare against (it is not stored anywhere it can see),
+# and a mtime is the only evidence available. A few false alarms after an
+# unrelated env edit is the correct price for never missing the one edit that
+# makes every dump on this host unopenable.
+#
 # Cron example (02:17 daily, as the user that owns /opt/tidepool):
 #   17 2 * * * /opt/tidepool/scripts/pg-backup.sh >> /opt/tidepool/backups/backup.log 2>&1
 
@@ -38,14 +45,22 @@ docker exec "${CONTAINER}" pg_dump -Fc --no-owner --no-acl \
 # incident is the failure mode this file exists to prevent.
 docker exec "${CONTAINER}" pg_restore --list "/backups/${DUMP}.partial" > /dev/null
 docker exec "${CONTAINER}" mv "/backups/${DUMP}.partial" "/backups/${DUMP}"
+# 600 inside the container, which is 600 on the host mount: this file holds
+# the plaintext service-actor PEM plus every sealed blob in the database, and
+# pg_dump's default leaves it world-readable. The directory wants 700 as a
+# provisioning step (DEPLOY.md "Backup and restore"); this covers the file.
+docker exec "${CONTAINER}" chmod 600 "/backups/${DUMP}"
 
 SIZE="$(du -h "${COMPOSE_DIR}/backups/${DUMP}" | cut -f1)"
 echo "[$(date -u +%FT%TZ)] backup verified: ${DUMP} (${SIZE})"
 
-# Retention: age out old dumps, never the log, never partials younger than a
-# day (a partial that old is a failed run worth seeing, not rotating).
+# Retention: age out completed dumps only, never the log. Partials are NEVER
+# deleted at any age — a partial is the corpse of a failed run, and the second
+# find only warns about the ones old enough (>24h, so not this run's) to be
+# certainly dead. -mmin +1440 rather than -mtime +1, which rounds down to whole
+# days and would not fire until the partial was nearly two days old.
 find "${COMPOSE_DIR}/backups" -name 'tidepool-*.dump' -mtime "+${RETENTION_DAYS}" -delete
-find "${COMPOSE_DIR}/backups" -name 'tidepool-*.dump.partial' -mtime +1 -print | while read -r stale; do
+find "${COMPOSE_DIR}/backups" -name 'tidepool-*.dump.partial' -mmin +1440 -print | while read -r stale; do
     echo "[$(date -u +%FT%TZ)] WARNING: stale partial from a failed run: ${stale}" >&2
 done
 

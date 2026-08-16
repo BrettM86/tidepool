@@ -141,6 +141,23 @@ func runRotateKEK(logger *slog.Logger) error {
 		logResealReport(logger, report)
 	}
 	if resealErr != nil {
+		// Two very different errors reach here, and the counts just printed
+		// mean different things under each.
+		//
+		// identity.ErrResealIncomplete means the walk finished every table and
+		// some rows would not move: the inventory above is complete, and its
+		// failure lines say which rows.
+		//
+		// Anything else aborted the walk partway — a dropped connection, a
+		// revoked permission, a cancelled context. The counts then describe
+		// only the rows reached before it, and every table after the failure
+		// printed clean zeros that were never measured. Those zeros are
+		// identical to what a healthy empty table prints, so without this line
+		// an operator can read an aborted run as a covered one.
+		if !errors.Is(resealErr, identity.ErrResealIncomplete) {
+			logger.Error("the inventory above is PARTIAL: the re-seal walk aborted mid-table, so the counts describe only the rows it reached and every table after the failure shows zeros it never measured; re-run the drill and do not treat any table above as covered",
+				"error", resealErr)
+		}
 		return fmt.Errorf("rotate-kek: %w", resealErr)
 	}
 	logger.Info("kek re-seal complete; re-run until every table reports resealed=0 and failed=0 before unsetting BRIDGE_KEK_PREVIOUS")

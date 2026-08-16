@@ -723,9 +723,10 @@ The runbook is **[`DEPLOY.md`](DEPLOY.md)**: the boot-time config gate, the v2
 flag topology (`CONSUMER_ENABLED` → `OUTBOUND_WORKERS` → kill switches), the
 cross-repo Caddy change that puts the native-user AP surface on
 `coves.social`, the staged canary and its rollback order, and — explicitly —
-the things that have **no** mechanism today (per-actor RSA rotation,
-backup/restore, a divergence off switch, a periodic vote re-seed). `BRIDGE_KEK`
-rotation used to head that list and is now a runbook in the same section.
+the things that have **no** mechanism today (per-actor RSA rotation, a
+divergence off switch, a periodic vote re-seed). `BRIDGE_KEK` rotation and
+backup/restore both used to head that list; each is now a runbook in the same
+section (nightly `pg_dump` plus a throwaway-container restore drill).
 [`SELF_HOSTED_RELAY.md`](SELF_HOSTED_RELAY.md) covers the relay + Jetstream
 ingest path.
 

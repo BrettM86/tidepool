@@ -33,10 +33,10 @@ func storedRotationMaterial(t *testing.T, ctx context.Context, keys store.Servic
 // TestLoadOrCreateRotationKey_WrongKEKIsTheBootCanary is a CHARACTERIZATION
 // test: it passes at birth and exists so the behavior cannot regress quietly.
 //
-// What it pins is a boot-time property with no test seam of its own.
-// cmd/tidepool/main.go builds the custodian at line 173 and calls
-// LoadOrCreateRotationKey at line 257 — unconditionally, and some 350 lines
-// before ListenAndServe at line 604. So a bridge started under the wrong
+// What it pins is a boot-time property with no test seam of its own. run() in
+// cmd/tidepool/main.go constructs the custodian (NewCustodianWithPrevious) and
+// then calls LoadOrCreateRotationKey — unconditionally, and well before it
+// reaches server.ListenAndServe. So a bridge started under the wrong
 // BRIDGE_KEK dies during startup rather than serving traffic with key
 // material it cannot read. That ordering is deliberate and there is no
 // injectable boot seam to assert it through; this test is the tier where the

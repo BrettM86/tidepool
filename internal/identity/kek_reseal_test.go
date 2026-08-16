@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rsa"
 	"database/sql"
+	"strings"
 	"testing"
 
 	"github.com/bluesky-social/indigo/atproto/atcrypto"
@@ -340,6 +341,182 @@ func TestReseal_RotationDrill(t *testing.T) {
 	assert.True(t, bytes.Equal(afterFirst.rotation, storedServiceKeyMaterial(t, fixture.database, RotationKeyName)))
 	assert.True(t, bytes.Equal(fixture.serviceActorPEM, storedServiceKeyMaterial(t, fixture.database, ap.ServiceKeyName)),
 		"the plaintext service-actor row must survive every re-run untouched")
+}
+
+// TestReseal_RefusesOneKeyInBothRoles pins the fake-zero-run guard ON THE
+// OPERATION rather than on its callers.
+//
+// Handed the same key twice, the walk would open every blob under "current",
+// re-seal nothing, and hand back the all-AlreadyCurrent report that the
+// runbook treats as the operator's clearance to unset BRIDGE_KEK_PREVIOUS —
+// while every blob is still sealed under the key they are about to delete.
+// That is the most expensive lie the report can tell.
+//
+// runRotateKEK checks this, and config.Load checks it at boot. Both are
+// CALLERS. Reseal is exported, takes the two keys as adjacent []byte
+// parameters, and is the thing that would produce the lie — so the guard
+// belongs where the arguments arrive. A future caller (a maintenance HTTP
+// handler, a test harness, an ops tool that reads the keys from a different
+// secret store) inherits it instead of having to re-derive it.
+//
+// The refusal must also arrive as a validation error naming the variable, not
+// a bare fmt.Errorf: that is how the callers above already spell an operator's
+// misconfiguration, and it is what lets one be told which line to edit.
+func TestReseal_RefusesOneKeyInBothRoles(t *testing.T) {
+	fixture := seedRotationDrill(t)
+	ctx := t.Context()
+	kekA := previousTestKEK()
+
+	before := storedSigningKey(t, fixture.database, resealLiveDID)
+
+	report, err := Reseal(ctx, fixture.database, kekA, kekA)
+
+	require.Error(t, err,
+		"re-sealing a key onto ITSELF must be refused inside Reseal: the walk would report every blob AlreadyCurrent, which is exactly the clean zero-run an operator reads as permission to retire BRIDGE_KEK_PREVIOUS — with every blob still sealed under it")
+	assert.True(t, errors.IsValidation(err),
+		"one key in both roles is an operator's misconfiguration, not an infrastructure fault; it must carry the validation class the callers already use for a bad KEK, got %v", err)
+
+	msg := strings.ToLower(err.Error())
+	assert.Contains(t, msg, "same",
+		"the operator must be told the two keys are the SAME key, or they will re-run the command instead of fixing the variable")
+	assert.Contains(t, msg, "different",
+		"and told what is needed instead — two different keys")
+
+	assert.Nil(t, report,
+		"a refused rotation must hand back NO inventory: a report is a statement about work the walk did, and a walk that never started has made none. Returning an empty-but-non-nil report invites a caller to log a table of zeros that reads like a completed clean run")
+
+	assert.True(t, bytes.Equal(before, storedSigningKey(t, fixture.database, resealLiveDID)),
+		"a refused rotation must not have touched a single byte")
+}
+
+// TestReseal_MissingRotationKeyOnAPopulatedDatabase is the restore-gone-wrong
+// alarm.
+//
+// service_keys 'plc-rotation' is the escrow rotation key: the authority named
+// in EVERY bridged DID document. LoadOrCreateRotationKey mints a fresh one
+// when the row is absent, which is correct exactly once — on a fresh install.
+// On a database that already holds bridged actors, an absent row means the
+// restore dropped it, and the next boot will silently mint a REPLACEMENT: the
+// DIDs keep naming a rotation key nobody holds any more, and every one of
+// those identities loses its recovery path permanently.
+//
+// The re-seal walk is the one moment an operator is looking straight at this
+// table, so it is where the alarm has to sound. The walk cannot re-seal a row
+// that is not there — so it counts it Failed with its own reason class and
+// exits nonzero, which is the only signal that stops the deploy script.
+func TestReseal_MissingRotationKeyOnAPopulatedDatabase(t *testing.T) {
+	fixture := seedRotationDrill(t)
+	ctx := t.Context()
+	kekA, kekB := previousTestKEK(), currentTestKEK()
+
+	// The restore that dropped the row. Everything else — the actors whose
+	// DIDs name that rotation key — survived.
+	_, err := fixture.database.ExecContext(ctx,
+		`DELETE FROM service_keys WHERE name = $1`, RotationKeyName)
+	require.NoError(t, err)
+
+	report, err := Reseal(ctx, fixture.database, kekB, kekA)
+
+	require.Error(t, err,
+		"a populated database missing its rotation key MUST exit nonzero: the operator's next step after a clean run is unsetting BRIDGE_KEK_PREVIOUS and restarting, and that restart mints a replacement rotation key that orphans every bridged DID's recovery path")
+	require.NotNil(t, report, "the inventory must come back with the error")
+
+	assert.Equal(t, ResealCounts{Resealed: 0, AlreadyCurrent: 0, Skipped: 0, Failed: 1}, report.ServiceKeys,
+		"the absent rotation key must land in Failed, not Skipped: Skipped means 'nothing to move and nothing wrong', and there is a great deal wrong here")
+	assert.Contains(t, report.Failures, ResealFailure{
+		Table: "service_keys", ID: RotationKeyName, Reason: ResealFailureMissing,
+	},
+		"the failure must name the row and carry its own reason class: this is neither a key-history question (wrong-key) nor storage corruption of a blob that exists (malformed) — it is an absent row, and the operator's move is to restore it from backup BEFORE the next boot mints a new one")
+
+	// The rest of the walk still had to finish: the operator needs one pass to
+	// see both the missing key AND how much else is in flight.
+	assert.Equal(t, ResealCounts{Resealed: 2, AlreadyCurrent: 0, Skipped: 1, Failed: 0}, report.BridgedActors,
+		"a missing rotation key must not abort the actor tables; the operator needs the whole inventory from one pass")
+	assert.Equal(t, ResealCounts{Resealed: 1, AlreadyCurrent: 0, Skipped: 0, Failed: 0}, report.APActors)
+
+	// And nothing was invented to paper over the gap.
+	assert.Equal(t, 1, countServiceKeys(t, fixture.database),
+		"the walk must not mint a rotation key to fill the hole: only the untouched plaintext service-actor row may remain. Minting here would do precisely the damage the alarm exists to prevent, and do it while the operator believes the drill is read-mostly")
+}
+
+// TestReseal_MissingRotationKeyOnAnEmptyDatabaseIsBenign is the other side of
+// the alarm above, and the reason it is conditioned on population at all.
+//
+// A fresh install has no rotation key and no actors: the row is absent because
+// nothing has booted yet, not because a restore lost it. Failing here would
+// make `rotate-kek` exit nonzero on a brand-new deployment, and an alarm that
+// cries on a healthy database is one an operator learns to wave through —
+// including on the day it is real.
+func TestReseal_MissingRotationKeyOnAnEmptyDatabaseIsBenign(t *testing.T) {
+	database := testutil.DB(t)
+	testutil.Truncate(t, database, "bridged_actors", "ap_actors", "service_keys")
+	ctx := t.Context()
+
+	report, err := Reseal(ctx, database, currentTestKEK(), previousTestKEK())
+
+	require.NoError(t, err,
+		"an empty database has no rotation key because nothing has booted yet; failing here would teach operators to ignore the one signal that catches a restore which dropped the key")
+	require.NotNil(t, report)
+	assert.Equal(t, ResealCounts{}, report.ServiceKeys,
+		"a fresh install's absent rotation key belongs in NO bucket: there is no row to reseal, skip, or fail")
+	assert.Empty(t, report.Failures)
+}
+
+// TestReseal_EmptyBlobIsCorruptionNotAKeylessActor separates two states that
+// len(blob)==0 folds into one.
+//
+// A NULL signing_key is a legitimate actor with no escrowed key — minted
+// before escrow, or opted out before a key was cut. Nothing to move, nothing
+// wrong: Skipped. A ZERO-LENGTH bytea is a different animal entirely. No code
+// path in the bridge writes one; seal() always emits a version byte, a nonce
+// and a tag. A row holding one has been damaged, and damage to an actor's
+// escrow key is precisely what the drill exists to surface while the previous
+// KEK is still around to help.
+//
+// Counting it as Skipped hides it in the bucket labelled "nothing wrong", the
+// run exits zero, and the operator retires the previous KEK over a broken row.
+func TestReseal_EmptyBlobIsCorruptionNotAKeylessActor(t *testing.T) {
+	fixture := seedRotationDrill(t)
+	ctx := t.Context()
+	kekA, kekB := previousTestKEK(), currentTestKEK()
+
+	// A zero-length, NON-NULL signing_key on the live actor.
+	_, err := fixture.database.ExecContext(ctx,
+		`UPDATE bridged_actors SET signing_key = ''::bytea WHERE did = $1`, resealLiveDID)
+	require.NoError(t, err)
+	// The fixture must really be the state under test: non-NULL and empty. If
+	// postgres or the driver collapsed one into the other this test would be
+	// pinning the NULL case twice over.
+	var isNull bool
+	require.NoError(t, fixture.database.QueryRowContext(ctx,
+		`SELECT signing_key IS NULL FROM bridged_actors WHERE did = $1`, resealLiveDID).Scan(&isNull))
+	require.False(t, isNull,
+		"the fixture row must be a NON-NULL empty bytea; if it is NULL this test is a duplicate of the keyless-actor skip and proves nothing")
+
+	report, err := Reseal(ctx, fixture.database, kekB, kekA)
+
+	require.Error(t, err,
+		"a zero-length sealed key is damage, and the run must exit nonzero so the operator does not retire the previous KEK over it")
+	require.NotNil(t, report)
+
+	assert.Equal(t, ResealCounts{Resealed: 1, AlreadyCurrent: 0, Skipped: 1, Failed: 1}, report.BridgedActors,
+		"the empty-bytea row must count as Failed while the genuinely NULL row still counts as Skipped: these are different states with different operator responses, and folding them together buries the broken one in the bucket that means 'nothing wrong'")
+	assert.Contains(t, report.Failures, ResealFailure{
+		Table: "bridged_actors", ID: resealLiveDID, Reason: ResealFailureMalformed,
+	},
+		"zero bytes were never sealed by this bridge and cannot have been: no KEK is in question, so this classifies as malformed and sends the operator to backups rather than to key history")
+
+	// Untouched, like every other blob the walk could not open — a single-row
+	// restore has to remain a repair.
+	var raw []byte
+	require.NoError(t, fixture.database.QueryRowContext(ctx,
+		`SELECT signing_key FROM bridged_actors WHERE did = $1`, resealLiveDID).Scan(&raw))
+	assert.Empty(t, raw, "a row the walk could not open must be left exactly as it was")
+
+	// The keyless actor's NULL is still NULL: the fix must not have gone the
+	// other way and started treating NULLs as corruption.
+	assert.Nil(t, storedSigningKey(t, fixture.database, resealKeylessDID),
+		"a NULL signing_key must still be a benign skip; turning legitimate keyless actors into failures would stop every rotation on a healthy database")
 }
 
 // TestReseal_UnreadableBlobsFailLoudlyAndInPlace covers the case that decides

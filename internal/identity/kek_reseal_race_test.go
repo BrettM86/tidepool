@@ -4,9 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/bluesky-social/indigo/atproto/atcrypto"
@@ -20,15 +22,23 @@ import (
 // The optimistic guard on the re-seal walk's write-back.
 //
 // IMPORTANT, and the reason the concurrent writer here is INJECTED BY THE
-// TEST: no production code path currently rewrites bridged_actors.signing_key,
-// ap_actors.rsa_key_sealed, or the plc-rotation key_material after they are
-// first written. There is no live racer to reproduce. The guard is therefore
-// safe BY CONSTRUCTION, not safe by audit — it must hold for a writer that
-// does not exist yet, because the day one is added (key claiming, a per-actor
-// rotation, a second operator running the drill from another shell) is
-// precisely the day nobody will re-derive whether the walk can clobber. These
-// tests inject the writer the codebase does not have, so the property is
-// pinned before it is load-bearing.
+// TEST: production has no writer that DELIBERATELY rewrites an existing
+// bridged_actors.signing_key, ap_actors.rsa_key_sealed, or the plc-rotation
+// key_material, so there is no racer to reproduce by simply running the real
+// code. That is weaker than "no writer can reach that column". UpsertActor's
+// DO UPDATE carries `signing_key = COALESCE(EXCLUDED.signing_key, ...)`
+// (store/bridged_actors.go:50) and materialize's re-mint retry does supply a
+// freshly sealed key on the conflicting insert (materialize/actors.go:175), so
+// a re-mint that lands mid-walk is a plausible live racer today — a slim path,
+// but not an impossible one.
+//
+// Either way the conclusion is the same, and it is why these tests exist: the
+// guard is safe BY CONSTRUCTION, not safe by audit. It must hold for writers
+// nobody has enumerated, because the day one is added (key claiming, a
+// per-actor rotation, a second operator running the drill from another shell)
+// is precisely the day nobody will re-derive whether the walk can clobber.
+// These tests inject a writer on demand, so the property is pinned before it
+// is load-bearing.
 //
 // What the guard must give: the walk NEVER writes bytes it did not read. Its
 // UPDATE is conditioned on the exact blob it decided about, and a lost guard
@@ -71,6 +81,14 @@ func (c *hookConn) QueryContext(ctx context.Context, query string, args []driver
 	return rows, err
 }
 
+// racingDriverSeq numbers registered driver names. sql.Register PANICS on a
+// duplicate name and offers no way to unregister, so the name cannot be
+// derived from anything that repeats — and t.Name() repeats on the very first
+// thing anyone reaches for when a concurrency test looks flaky: `-count=2`.
+// A monotonic counter is unique for the life of the process, which is exactly
+// the lifetime of the registry it guards.
+var racingDriverSeq atomic.Uint64
+
 // racingDB returns a second pool onto the test database whose queries fire
 // hook exactly once — on the first query carrying marker.
 func racingDB(t *testing.T, marker string, hook func()) *sql.DB {
@@ -80,11 +98,14 @@ func racingDB(t *testing.T, marker string, hook func()) *sql.DB {
 		"the racing pool needs the same database the harness migrated")
 
 	var once sync.Once
-	sql.Register("tidepool-reseal-race-"+t.Name(), &hookDriver{
+	// t.Name() stays in the name for readability in a panic or a pq log line;
+	// the counter is what makes it unique.
+	name := fmt.Sprintf("tidepool-reseal-race-%s-%d", t.Name(), racingDriverSeq.Add(1))
+	sql.Register(name, &hookDriver{
 		marker: marker,
 		fire:   func() { once.Do(hook) },
 	})
-	database, err := sql.Open("tidepool-reseal-race-"+t.Name(), databaseURL)
+	database, err := sql.Open(name, databaseURL)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = database.Close() })
 	return database

@@ -24,10 +24,18 @@ const (
 // debug surface, NOT the correctness path (Coves reads state from the
 // firehose-visible acceptance/removal records).
 type Admission struct {
-	CommunityDID   string
-	PostURI        string
-	AuthorDID      string
-	Status         string
+	CommunityDID string
+	PostURI      string
+	AuthorDID    string
+	Status       string
+	// DecisionCode is the machine-readable WHY of the row's current state.
+	// Migration 021 phrases it as "'' for a clean accept, else the
+	// rejection/removal reason", and that is still the rule for how a post came to
+	// be accepted — but accepted + a code is a LEGAL pair, not a contradiction: a
+	// standing acceptance can carry the cause of a LATER refusal that deliberately
+	// left it alone (the ban carve-out — see RecordRefusal). Reading a non-empty
+	// code as "this post is not live" is therefore wrong; status is the only thing
+	// that answers that.
 	DecisionCode   string
 	EvaluatedCID   string
 	AcceptanceRKey string
@@ -100,6 +108,77 @@ func (a *Admissions) record(ctx context.Context, ex execer, adm Admission) error
 		adm.AcceptanceRKey, adm.AcceptedCID, adm.Redrivable, snapshot)
 	if err != nil {
 		return fmt.Errorf("accept: record admission %s/%s: %w", adm.CommunityDID, adm.PostURI, err)
+	}
+	return nil
+}
+
+// RecordRefusal records WHY an event was refused WITHOUT destroying what the
+// post already stands as. It is the upsert sibling of Record for the decisions
+// Record cannot express: a refusal that deliberately LEAVES THE ACCEPTANCE
+// STANDING, and one that removes the post but must keep naming the version that
+// was accepted.
+//
+// acceptance_rkey and accepted_cid are ALWAYS preserved (a refused edit writes no
+// acceptance, so it has none of its own to pin), and status moves only when the
+// caller says so:
+//
+//   - adm.Status EMPTY means keep the status the row already has. This is the ban
+//     carve-out: a ban is author-state, not a judgement of a post, so a banned
+//     author's edit is refused while the post the moderators chose to leave up
+//     stays ACCEPTED. Recording that through Record would flip the row to
+//     'rejected' — and ListAccepted, the removeData purge's ONLY input, selects
+//     exactly status='accepted'. The sequence ban → the author fixes a typo →
+//     re-ban with removeData=true would then purge every post of theirs EXCEPT
+//     the edited one: Lemmy erases it, Coves keeps serving it under the
+//     community's name. CountAccepted would likewise free a live post's quota.
+//   - adm.Status SET moves it (an edit refused against a standing moderator
+//     removal is 'removed'), on top of the same preserved pins.
+//
+// A post with no ledger row has nothing standing to preserve, so the INSERT path
+// records the refusal on its own terms — defaulting to 'rejected' when the caller
+// named no status.
+//
+// evaluated_cid and evaluated_snapshot move to THIS event, because a refusal is
+// still a decision about a specific version — but an ABSENT cid or snapshot
+// leaves the stored one alone rather than blanking it: losing the snapshot would
+// make the post permanently unreadmittable, which is the same trap that keeps
+// RecordRemoval off the full upsert.
+func (a *Admissions) RecordRefusal(ctx context.Context, adm Admission) error {
+	if adm.CommunityDID == "" || adm.PostURI == "" {
+		return errors.NewValidationError("admission", "community_did and post_uri are required")
+	}
+	if adm.DecisionCode == "" {
+		// This method exists to record a WHY; without one it would be a silent
+		// touch of a row whose status it deliberately does not change.
+		return errors.NewValidationError("admission.decision_code", "must be set on a refusal")
+	}
+	// The status the row is CREATED with when the engine has decided nothing about
+	// this post before. Never used on the update path.
+	insertStatus := adm.Status
+	if insertStatus == "" {
+		insertStatus = StatusRejected
+	}
+	snapshot := adm.EvaluatedSnapshot
+	if len(snapshot) == 0 {
+		snapshot = []byte("{}") // the JSONB NOT NULL default; see record()
+	}
+	_, err := a.db.ExecContext(ctx, `
+		INSERT INTO admissions
+		    (community_did, post_uri, author_did, status, decision_code, evaluated_cid,
+		     evaluated_snapshot)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (community_did, post_uri) DO UPDATE SET
+		    author_did = COALESCE(NULLIF(EXCLUDED.author_did, ''), admissions.author_did),
+		    status = COALESCE(NULLIF($8, ''), admissions.status),
+		    decision_code = EXCLUDED.decision_code,
+		    evaluated_cid = COALESCE(NULLIF(EXCLUDED.evaluated_cid, ''), admissions.evaluated_cid),
+		    evaluated_snapshot = CASE WHEN $9 THEN EXCLUDED.evaluated_snapshot
+		                              ELSE admissions.evaluated_snapshot END,
+		    updated_at = now()`,
+		adm.CommunityDID, adm.PostURI, adm.AuthorDID, insertStatus, adm.DecisionCode,
+		adm.EvaluatedCID, snapshot, adm.Status, len(adm.EvaluatedSnapshot) > 0)
+	if err != nil {
+		return fmt.Errorf("accept: record refusal %s/%s: %w", adm.CommunityDID, adm.PostURI, err)
 	}
 	return nil
 }

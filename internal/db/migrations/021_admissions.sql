@@ -30,6 +30,13 @@ CREATE TABLE admissions (
     -- title-required, banned, community-gone, parent-locked, rate-limited,
     -- lexicon-invalid, …). Distinct codes are what the admin surface needs and
     -- the firehose records cannot carry.
+    --
+    -- 'accepted' WITH a code is legal, not a contradiction: a post accepted
+    -- cleanly can later carry the cause of a refusal that deliberately left the
+    -- acceptance standing — a banned author's edit is refused while the post the
+    -- moderators chose not to remove stays up, and author-banned is recorded
+    -- against a row that is still accepted (accept.RecordRefusal). status alone
+    -- says whether the post is live; the code says what last happened to it.
     decision_code TEXT NOT NULL DEFAULT '',
     -- evaluated_cid is the post CID this decision was made AGAINST (decision 5.5:
     -- admission runs against the EVENT's CID). A later event with a different CID

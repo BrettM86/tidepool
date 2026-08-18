@@ -354,11 +354,17 @@ func (e *Engine) AdmitPost(ctx context.Context, did string, commit *consume.Comm
 		return e.annotateCommunityImmutable(ctx, postURI)
 	}
 
+	// Whether the post is LIVE right now: it federated once (the engine writes
+	// outbound_objects only on accept) and has not been withdrawn since. Read
+	// before any decision branch, because both the refusal branches below turn on
+	// it — a refusal that leaves a standing acceptance alone must not record the
+	// post as though nothing of it were live.
+	priorAccepted := priorBound && !prior.IsTombstoned()
+
 	if code != "" {
 		// A post that WAS accepted and now fails re-admission is REMOVED (it
 		// federated once, so leaving it alone would strand it live on Lemmy); one
 		// that was never accepted is simply a recorded rejection.
-		priorAccepted := priorBound && !prior.IsTombstoned()
 		if priorAccepted && code == DecisionAuthorBanned {
 			// EXCEPT for a ban, which is not a judgement of this post. Removing
 			// here would do two things the ban itself deliberately did not:
@@ -373,14 +379,24 @@ func (e *Engine) AdmitPost(ctx context.Context, did string, commit *consume.Comm
 			//
 			// The ban already stopped everything new and cancelled everything
 			// queued. The edit is simply refused, and the ledger says why.
+			//
+			// Recorded through RecordRefusal, NOT Record: the post is still
+			// accepted, and the full upsert would say otherwise — status
+			// 'rejected' with the acceptance pins blanked. ListAccepted (the
+			// removeData purge's only input) selects status='accepted', so the
+			// ordinary sequence ban → typo fix → re-ban with removeData=true
+			// would purge everything of this author's EXCEPT the post they
+			// edited: erased on Lemmy, still served here under the community's
+			// name.
 			e.logger.Info("refusing a banned author's edit; the standing acceptance is left alone",
 				slog.String("did", did), slog.String("post", postURI),
 				slog.String("community", communityDID))
-			return e.admissions.Record(ctx, Admission{
-				AuthorDID:         did,
-				CommunityDID:      communityDID,
-				PostURI:           postURI,
-				Status:            StatusRejected,
+			return e.admissions.RecordRefusal(ctx, Admission{
+				AuthorDID:    did,
+				CommunityDID: communityDID,
+				PostURI:      postURI,
+				// No status: the post stands exactly as it did, and the ledger
+				// must keep saying so.
 				DecisionCode:      code,
 				EvaluatedCID:      commit.CID,
 				EvaluatedSnapshot: e.evaluatedSnapshot(commit),
@@ -408,12 +424,28 @@ func (e *Engine) AdmitPost(ctx context.Context, did string, commit *consume.Comm
 	if err := e.accept(ctx, did, communityDID, postURI, commit); err != nil {
 		if stderrors.Is(err, ErrAuthorBanned) {
 			// The ban landed between the gate and the commit. The transaction
-			// rolled back, so nothing of this post exists outward; all that is
+			// rolled back, so nothing NEW of this post exists outward; all that is
 			// owed is the ledger row an operator reads when the moderators ask
 			// why a banned author's post appeared — which it now will not.
 			e.logger.Info("a ban landed mid-admission; the post was not accepted",
 				slog.String("did", did), slog.String("post", postURI),
 				slog.String("community", communityDID))
+			if priorAccepted {
+				// This was an EDIT of a live post, and the rollback left its
+				// PRIOR acceptance standing — the same state the carve-out above
+				// protects, reached one door over. The refusal is recorded
+				// without disturbing it: a 'rejected' row here would take the
+				// post out of ListAccepted, and a later removeData ban would skip
+				// the one post its author had edited.
+				return e.admissions.RecordRefusal(ctx, Admission{
+					AuthorDID:         did,
+					CommunityDID:      communityDID,
+					PostURI:           postURI,
+					DecisionCode:      DecisionAuthorBanned,
+					EvaluatedCID:      commit.CID,
+					EvaluatedSnapshot: e.evaluatedSnapshot(commit),
+				})
+			}
 			return e.admissions.Record(ctx, Admission{
 				AuthorDID:         did,
 				CommunityDID:      communityDID,
@@ -744,6 +776,14 @@ func (e *Engine) editAgainstRemoval(ctx context.Context, did, communityDID, post
 	if code != RemovalCodeAdmissionRevoked {
 		e.logger.Info("edit against a standing moderator removal: acceptance refused, nothing enqueued",
 			"community_did", communityDID, "post", postURI, "removal_code", code)
+		// Status MOVES to removed (the community's removal is what stands), but
+		// through RecordRefusal rather than the full upsert, so accepted_cid /
+		// acceptance_rkey survive: they name the version that was accepted when it
+		// was removed — the same pin the removal record carries, and the pin
+		// RecordRemoval (this decision's sibling on the inbound moderation path)
+		// deliberately preserves. evaluated_cid still moves to this edit, because
+		// LastEvaluatedCID is the ONLY record of the current version for a post
+		// whose latest decision wrote nothing outward.
 		terminal := Admission{
 			AuthorDID:         did,
 			CommunityDID:      communityDID,
@@ -765,7 +805,7 @@ func (e *Engine) editAgainstRemoval(ctx context.Context, did, communityDID, post
 		if currentCID != removalCID || current != code {
 			return errRemovalChanged
 		}
-		if rerr := e.admissions.Record(ctx, terminal); rerr != nil {
+		if rerr := e.admissions.RecordRefusal(ctx, terminal); rerr != nil {
 			return rerr
 		}
 		// The decision is complete; the sentinel only tells the CALLER what was

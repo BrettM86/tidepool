@@ -55,6 +55,13 @@ var (
 	// do not understand" — which, unlike most parse failures, would otherwise
 	// have become a permanent ban.
 	BlockExpiryUnreadable = expvar.NewInt("tidepool_block_expiry_unreadable")
+	// BlockUndoStaleRefused counts announced Undo{Block}s that were NOT applied
+	// because the ban standing for that pair outlives the one they reverse — an
+	// old unban replayed after the moderators banned the author again. It is its
+	// own number because it is the one refusal on this path that leaves a user
+	// EXCLUDED: if it ever moves for a community's genuine unbans, an author is
+	// serving a ban nobody is enforcing on the far side.
+	BlockUndoStaleRefused = expvar.NewInt("tidepool_block_undo_stale_refused")
 )
 
 // timeNow is the clock the ban path weighs an expiry against. A package
@@ -217,9 +224,11 @@ func (h *Handler) applyBan(ctx context.Context, block *ap.Object, announcer *sto
 				"store it as a permanent ban")
 	}
 	// ALREADY OVER when it arrived — delayed in a queue, redelivered after an
-	// outage, replayed from a backfill. The ROW is still written below: it is a
-	// faithful account of what the moderator sent, it makes a redelivery
-	// idempotent, and Standing() reads the expiry so it excludes nobody.
+	// outage, replayed from a backfill. The ROW is still written below UNLESS a
+	// ban that IS in force stands for this pair: an account of a ban that ended
+	// is faithful and idempotent, but written over a live exclusion it ENDS one
+	// the moderators never lifted (Ban() holds that guard, beside the statement,
+	// because it is the same predicate Standing() reads).
 	//
 	// What a lapsed ban must NOT do is ACT. Every consequence here is one no
 	// later activity can undo — a cancelled delivery is never re-queued, and a
@@ -259,9 +268,10 @@ func (h *Handler) applyBan(ctx context.Context, block *ap.Object, announcer *sto
 	if lapsed {
 		BlockLapsedIgnored.Add(1)
 		return skip(block.ID,
-			"announced Block expired before it arrived: the ban is recorded as sent, but it "+
-				"is not in force — nothing was cancelled and nothing was removed, because both "+
-				"are irreversible and this exclusion is already over")
+			"announced Block expired before it arrived: the ban is recorded as sent (unless a "+
+				"ban that IS in force stands for this author here, which a lapsed replay may not "+
+				"weaken), but it is not in force — nothing was cancelled and nothing was removed, "+
+				"because both are irreversible and this exclusion is already over")
 	}
 	if !ban.RemoveData {
 		return nil
@@ -288,6 +298,15 @@ func (h *Handler) applyBan(ctx context.Context, block *ap.Object, announcer *sto
 
 // liftBan is Undo{Block}: the exclusion goes, and NOTHING ELSE does.
 //
+// UNLESS THE UNDO IS STALE. An Undo can reach us twice — redriven from the
+// dead-letter queue, replayed from a backfill — under an activity id the inbox
+// has never seen, and by then the ban it reverses may have been replaced by a
+// stronger one. Deleting the row on the strength of an old unban leaves the
+// author unbanned here for good: Lemmy sends its Block once, and sends nothing
+// afterwards that would say the ban is still on. The expiry the undone Block
+// names is the guard (see store.CommunityBans.Lift), and it is a partial one —
+// an Undo of a PERMANENT ban carries nothing to compare.
+//
 // Content removed under removeData STAYS REMOVED. Lemmy models restoration as a
 // separate restore_data flag, so republishing here would reverse a decision
 // nobody reversed and push the author's posts back at the community that removed
@@ -297,9 +316,39 @@ func (h *Handler) liftBan(ctx context.Context, block *ap.Object, announcer *stor
 	if h.bans == nil {
 		return fmt.Errorf("ingest: no community-ban store is wired, so this ban cannot be lifted")
 	}
-	lifted, err := h.bans.Lift(ctx, announcer.DID, subjectDID)
+	// The expiry the UNDONE Block names, which is the only description of the
+	// reversed ban an Undo carries — and therefore the only thing that can tell a
+	// current unban from an old one redriven under a new activity id. An expiry
+	// that is present but UNREADABLE is passed as absent rather than refused:
+	// applyBan poisons on that shape because reading it wrong makes a permanent
+	// ban nobody asked for, while here the worst case is the pre-existing
+	// behaviour (an unconditional lift), and refusing would leave an author
+	// excluded by a ban the moderators have already reversed.
+	var undoneExpiry *time.Time
+	if expiry := block.BanExpiry(); expiry != nil && expiry.Valid {
+		when := expiry.Time
+		undoneExpiry = &when
+	}
+	lifted, retained, err := h.bans.Lift(ctx, announcer.DID, subjectDID, undoneExpiry)
 	if err != nil {
 		return fmt.Errorf("ingest: lift ban on %s in %s: %w", subjectDID, announcer.APGroupID, err)
+	}
+	if retained {
+		// A ban IS standing and it outlives the one this Undo reverses, so this
+		// Undo is not about it: an old unban, redriven or replayed after the
+		// moderators banned this author again. Lifting it would be irreversible
+		// (Lemmy sends no second Block), so it is refused — LOUDLY, because the
+		// other reading is that a community's genuine unban did not take effect,
+		// and only an operator can tell those apart.
+		BlockUndoStaleRefused.Add(1)
+		h.logger.Warn("announced Undo{Block} reverses a ban that is no longer the one in force",
+			"community", announcer.APGroupID, "subject_did", subjectDID,
+			"undone_expiry", undoneExpiry, "activity", block.ID)
+		return skip(block.ID, fmt.Sprintf(
+			"announced Undo{Block} for %s in %s undoes a ban expiring %s, but the ban standing "+
+				"there outlives it: the exclusion is KEPT, because an Undo replayed after a "+
+				"re-ban would lift it permanently and Lemmy will send no second Block",
+			subjectDID, announcer.APGroupID, undoneExpiry))
 	}
 	if !lifted {
 		return skip(block.ID, fmt.Sprintf(

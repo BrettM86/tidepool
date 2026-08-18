@@ -283,12 +283,31 @@ type CommunityBans interface {
 	// account of what the moderator sent, and a redelivery must find the same row
 	// — but it cancels nothing, because it is not in force and a cancelled
 	// delivery is never re-queued.
+	//
+	// AND IT NEVER WEAKENS A BAN THAT IS IN FORCE. An old Block redriven from the
+	// dead-letter queue or replayed from a backfill arrives under a new activity
+	// id that inbox dedup cannot recognize; written last-writer-wins over the
+	// permanent ban the moderators escalated to, its past expiry reads as
+	// unbanned forever after, and no activity exists that could correct it. So a
+	// write that is already expired on arrival is dropped when a standing ban
+	// would lose by it — expiry, reason and removeData together.
 	Ban(ctx context.Context, ban CommunityBan) (cancelled int64, err error)
 
-	// Lift removes the ban (Undo{Block}), reporting whether one was standing.
+	// Lift removes the ban (Undo{Block}). lifted says a ban was removed;
+	// retained says one was there and was DELIBERATELY LEFT — the two are
+	// different answers and both are false only when there was nothing at all.
+	//
 	// It lifts ONLY the exclusion: content removed under removeData stays
 	// removed, because Lemmy models restoration as a separate restore_data flag.
-	Lift(ctx context.Context, communityDID, subjectDID string) (lifted bool, err error)
+	//
+	// undoneExpiry is the expiry the UNDONE Block named (nil when it named none),
+	// and it is the replay guard: an Undo can be redriven under a new activity id
+	// after the ban it reversed has been replaced, and an unconditional delete
+	// then lifts the newer ban forever. An Undo of a ban ending at T therefore
+	// cannot remove a ban that outlives T. An Undo naming NO expiry still lifts
+	// unconditionally — nothing in the row can distinguish it from its own
+	// replay.
+	Lift(ctx context.Context, communityDID, subjectDID string, undoneExpiry *time.Time) (lifted, retained bool, err error)
 
 	// Standing reports whether the author is CURRENTLY banned from the
 	// community — expiry included, because a lapsed ban must read exactly like

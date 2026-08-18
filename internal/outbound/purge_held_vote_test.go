@@ -223,6 +223,43 @@ func TestPurge_ARetractedVoteIsNotResurrectedByALateSettlement(t *testing.T) {
 			"left to re-run and no reseed that corrects it")
 }
 
+// TestPurge_AReplayedPurgeDoesNotMintASecondUndo replays the purge — the step
+// the two tests above stop short of, and the step both opt-out doors document
+// as ORDINARY: the purge commits on its own transaction while the rev gate
+// commits later, so a failure between the two re-runs the whole request.
+//
+// At the replay, the retracted vote's Like delivery still sits held for
+// settlement — pending + ledger_unsettled, waiting on the worker — which is the
+// exact shape the standing enumeration's EXISTS arm matches. If that arm does
+// not also read the VOTE's own state, the replay re-enumerates a vote whose
+// retraction is already on the record: undoLiveVotes runs again, activity_seq
+// bumps, and a SECOND Undo goes out under a FRESH activity id. The peer already
+// applied (or holds) the first, so the duplicate is typically refused, retried,
+// and poisoned — permanently inflating the delivery-unknown-refused divergence
+// count 17e says must stay small.
+//
+// The purge's idempotency claim is "reaches inboxes the first attempt missed
+// without re-sending anything to the ones it reached" — deterministic ids make
+// that true for the Delete{Person}, and only the vote's `undone` state can make
+// it true for the Undo, because the Undo's id is seq-derived and the seq moves
+// on every re-run.
+func TestPurge_AReplayedPurgeDoesNotMintASecondUndo(t *testing.T) {
+	world := newHeldVoteWorld(t)
+	ctx := context.Background()
+
+	require.NoError(t, world.purger.DeleteRemoteContent(ctx, wActorDID))
+	// The replay, BEFORE the held settlement completes — so the Like delivery
+	// still reads pending + held, and only the vote row remembers the
+	// retraction already enqueued.
+	require.NoError(t, world.purger.DeleteRemoteContent(ctx, wActorDID))
+
+	assert.Equal(t, 1, activitiesOfKind(t, world.conn, "Undo"),
+		"one retraction was decided, so one Undo may exist. A replayed purge that "+
+			"re-enumerates the undone vote mints a NEW seq-derived activity id and enqueues a "+
+			"duplicate Undo the peer will refuse — and a refused delivery retries into poison, "+
+			"a permanent divergence for a withdrawal that actually succeeded the first time")
+}
+
 // activitiesOfKind counts enqueued activities of one kind.
 func activitiesOfKind(t *testing.T, conn *sql.DB, kind string) int {
 	t.Helper()

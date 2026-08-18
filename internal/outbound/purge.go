@@ -38,7 +38,11 @@ import (
 //     mid-POST at this moment is indistinguishable from one that will never be
 //     sent. If that POST lands after the purge, the peer holds a vote we never
 //     retracted. Detecting it needs the peer's own state, which is
-//     reconciliation — 17e's.
+//     reconciliation — 17e's. A vote whose community row is GONE is the other
+//     peer-side residual: its Undo has no address, so the peer is never told —
+//     but the LOCAL retraction still lands (retractUnaddressableVotes), because
+//     "stop counting this actor's votes" is this tier's own decision and needs
+//     no inbox.
 //
 //  3. The actor document stops resolving — 410 Gone.
 //
@@ -125,7 +129,7 @@ func (p *Purger) DeleteRemoteContent(ctx context.Context, did string) error {
 	if err != nil {
 		return err
 	}
-	retractable, err := p.addressableVotes(ctx, did, liveVotes)
+	retractable, unaddressable, err := p.addressableVotes(ctx, did, liveVotes)
 	if err != nil {
 		return err
 	}
@@ -147,6 +151,10 @@ func (p *Purger) DeleteRemoteContent(ctx context.Context, did string) error {
 	}
 
 	if err := p.undoLiveVotes(ctx, tx, did, retractable); err != nil {
+		return err
+	}
+
+	if err := p.retractUnaddressableVotes(ctx, tx, unaddressable); err != nil {
 		return err
 	}
 
@@ -179,7 +187,7 @@ func (p *Purger) DeleteRemoteContent(ctx context.Context, did string) error {
 		slog.String("did", did),
 		slog.Int("inboxes", len(targets)),
 		slog.Int("votes_retracted", len(retractable)),
-		slog.Int("votes_unaddressable", len(liveVotes)-len(retractable)))
+		slog.Int("votes_unaddressable", len(unaddressable)))
 	return nil
 }
 
@@ -245,6 +253,28 @@ func (p *Purger) undoLiveVotes(ctx context.Context, tx *sql.Tx, did string, vote
 	return nil
 }
 
+// retractUnaddressableVotes records the retraction for votes whose Undo has
+// nowhere to go — same transaction as everything else, and the same flip
+// undoLiveVotes writes, minus the enqueue.
+//
+// "Stop counting this actor's votes" is the purge's OWN decision, and it does
+// not need a peer: leaving the row `delivered` keeps 17b's reseed subtracting a
+// tombstoned actor's vote from served scores forever, and the 17e recast sweep
+// excludes retraction-shaped rows by design, so nothing downstream would ever
+// correct it. The peer-side residual — an instance that still counts the vote —
+// joins the other documented residuals; the log line in addressableVotes is its
+// record. The upsert's seq bump is harmless here: no activity id is ever minted
+// from it.
+func (p *Purger) retractUnaddressableVotes(ctx context.Context, tx *sql.Tx, votes []store.OutboundVote) error {
+	for _, vote := range votes {
+		vote.DeliveredState = store.DeliveredStateUndone
+		if _, err := p.votes.UpsertTx(ctx, tx, vote); err != nil {
+			return fmt.Errorf("retract unaddressable vote %s: %w", vote.VoteATURI, err)
+		}
+	}
+	return nil
+}
+
 // retractableVote is a live vote paired with the community AP id its Undo is
 // addressed to — resolved before the transaction opens, so no remote lookup
 // happens under a lock.
@@ -254,32 +284,36 @@ type retractableVote struct {
 	inbox         string
 }
 
-// addressableVotes resolves the addressing for each live vote and DROPS the ones
-// that cannot be addressed at all.
+// addressableVotes resolves the addressing for each live vote and SPLITS OFF
+// the ones that cannot be addressed at all, returned second.
 //
 // A community that has been deleted or unfollowed since the vote was cast has no
 // row, and there is no inbox to send its Undo to. Treating that as fatal would
 // hold the ENTIRE erasure hostage to one vote: the transaction rolls back, the
 // Delete{Person} fan-out with it, the event replays into the same missing row
 // and eventually dead-letters — a user's whole withdrawal lost to a community
-// that no longer exists.
+// that no longer exists. But unaddressable is a fact about the DELIVERY only —
+// the vote still gets its local retraction (retractUnaddressableVotes), so it
+// is handed back rather than dropped.
 //
 // A genuine storage error is still fatal. "This community is gone" and "the
 // database did not answer" are different facts, and only the first one is an
 // answer.
-func (p *Purger) addressableVotes(ctx context.Context, did string, votes []store.OutboundVote) ([]retractableVote, error) {
+func (p *Purger) addressableVotes(ctx context.Context, did string, votes []store.OutboundVote) ([]retractableVote, []store.OutboundVote, error) {
 	out := make([]retractableVote, 0, len(votes))
+	var unaddressable []store.OutboundVote
 	for i := range votes {
 		vote := votes[i]
 		community, err := p.communities.GetByDID(ctx, vote.CommunityDID)
 		if errors.IsNotFound(err) {
-			p.logger.Warn("purge: a live vote's community is gone; its Undo cannot be addressed",
+			p.logger.Warn("purge: a live vote's community is gone; retracting locally, the peer-side retraction cannot be sent",
 				slog.String("did", did), slog.String("vote", vote.VoteATURI),
 				slog.String("community_did", vote.CommunityDID))
+			unaddressable = append(unaddressable, vote)
 			continue
 		}
 		if err != nil {
-			return nil, fmt.Errorf("resolve community %s for vote %s: %w",
+			return nil, nil, fmt.Errorf("resolve community %s for vote %s: %w",
 				vote.CommunityDID, vote.VoteATURI, err)
 		}
 		// The INBOX is resolved here too, and that is the whole reason this
@@ -289,11 +323,11 @@ func (p *Purger) addressableVotes(ctx context.Context, did string, votes []store
 		// those rows — for as long as the slowest peer takes to answer.
 		inbox, err := p.enqueuer.Inbox(ctx, community.APGroupID)
 		if err != nil {
-			return nil, fmt.Errorf("resolve inbox for %s: %w", community.APGroupID, err)
+			return nil, nil, fmt.Errorf("resolve inbox for %s: %w", community.APGroupID, err)
 		}
 		out = append(out, retractableVote{
 			vote: vote, communityAPID: community.APGroupID, inbox: inbox,
 		})
 	}
-	return out, nil
+	return out, unaddressable, nil
 }

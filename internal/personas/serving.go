@@ -143,6 +143,24 @@ func (s *Service) handleObject(w http.ResponseWriter, r *http.Request, rest stri
 		http.Error(w, "gone", http.StatusGone)
 		return
 	}
+	// THE AUTHOR'S TOMBSTONE GATES THIS SURFACE TOO. The destructive tier
+	// answers 410 on the actor document, but the object URL is its own stable,
+	// previously-published, discoverable id — a 200 here would keep serving the
+	// erased user's full content to anyone, forever, which is the bridge itself
+	// breaking the erasure promise (and hands a re-fetching peer the bytes to
+	// resurrect what the withdrawal just asked it to drop). The row stays in the
+	// database: the 17e sweep reads tables, not HTTP. A plain 410 (matching the
+	// per-object tombstone above) is deliberate — the AS2 Tombstone body ruling
+	// was about the ACTOR document, where a peer still needs the public key.
+	withdrawn, err := s.authorWithdrawn(r.Context(), parts[0])
+	if err != nil {
+		s.writeStoreError(w, r, err)
+		return
+	}
+	if withdrawn {
+		http.Error(w, "gone", http.StatusGone)
+		return
+	}
 
 	doc, err := apobject.RenderObject(s.userOrigin, object.TranslatedSnapshot)
 	if err != nil {
@@ -172,8 +190,42 @@ func (s *Service) handleActivity(w http.ResponseWriter, r *http.Request, hash st
 		s.writeStoreError(w, r, err)
 		return
 	}
+	// Same erasure gate as handleObject: an activity is served by hash, so the
+	// author is resolved from the stored row's actor_did. Immutability does not
+	// survive the author's withdrawal — the payload embeds the user's content,
+	// and serving it past the purge would republish what every peer was just
+	// asked to delete.
+	withdrawn, err := s.authorWithdrawn(r.Context(), activity.ActorDID)
+	if err != nil {
+		s.writeStoreError(w, r, err)
+		return
+	}
+	if withdrawn {
+		http.Error(w, "gone", http.StatusGone)
+		return
+	}
 	w.Header().Set("Content-Type", ap.ContentTypeActivityJSON)
 	_, _ = w.Write(activity.Payload)
+}
+
+// authorWithdrawn reports whether the actor owning a served object or activity
+// was withdrawn by the destructive tier (task 17d). It is the read behind the
+// content-surface 410s: a tombstoned author's objects and activities must stop
+// serving with the actor document, or the erasure is only skin-deep.
+//
+// A MISSING actor row is NOT a withdrawal. The purge tombstones the ap_actors
+// row rather than deleting it, so a purged author always has one; an absent row
+// means the content predates or bypassed actor minting, and failing closed on
+// it would 410 content nobody asked to erase.
+func (s *Service) authorWithdrawn(ctx context.Context, did string) (bool, error) {
+	actor, err := s.actors.GetByDID(ctx, did)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return actor.IsTombstoned(), nil
 }
 
 func isGET(w http.ResponseWriter, r *http.Request) bool {

@@ -194,17 +194,28 @@ func (r *postgresOutboundVotes) ListStandingForActor(ctx context.Context, actorD
 	// reseed then subtracts it from a served score forever, for somebody who no
 	// longer exists.
 	//
+	// BUT NOT WIDER THAN THE RETRACTION LEDGER: the held arm must still read the
+	// VOTE's own state, because a vote flipped `undone` by a previous purge
+	// keeps its Like delivery held until the worker settles it — pending, held,
+	// and matching the EXISTS below. A purge replay is ordinary (its
+	// transaction commits before the rev gate's), and re-enumerating that vote
+	// re-runs the retraction: activity_seq bumps, a NEW seq-derived Undo id is
+	// minted, and a duplicate Undo goes out that the peer refuses into poison.
+	// `undone` records that the retraction is already on the books — the
+	// replay's job for it is done, however the delivery's bookkeeping stands.
+	//
 	// The first term is served by the partial index (migration 029); the second
 	// is an EXISTS against the delivery whose id the vote already carries.
 	query := `SELECT` + outboundVoteColumns + `
 		FROM outbound_votes v
 		WHERE v.actor_did = $1
 		  AND (v.delivered_state = 'delivered'
-		       OR EXISTS (
-		            SELECT 1 FROM outbound_deliveries d
-		             WHERE d.activity_id = v.current_activity_id
-		               AND d.state = 'pending'
-		               AND d.last_error_class = '` + DeliveryHeldForSettlement + `'))
+		       OR (v.delivered_state <> '` + string(DeliveredStateUndone) + `'
+		           AND EXISTS (
+		                SELECT 1 FROM outbound_deliveries d
+		                 WHERE d.activity_id = v.current_activity_id
+		                   AND d.state = 'pending'
+		                   AND d.last_error_class = '` + DeliveryHeldForSettlement + `')))
 		ORDER BY v.vote_at_uri`
 
 	rows, err := r.db.QueryContext(ctx, query, actorDID)

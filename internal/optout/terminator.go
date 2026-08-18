@@ -127,13 +127,39 @@ func (t *Terminator) TerminateAccount(ctx context.Context, did string) error {
 	// restore what they dropped, so the user's terminal state has to survive a
 	// crash between deciding and sending — and it is what stops the bridge
 	// federating for them again in the meantime.
-	if _, err := t.prefs.Upsert(ctx, store.FederationPref{
-		DID:          did,
-		Enabled:      false,
-		DeleteRemote: true,
-		Source:       store.FederationPrefSourceAccount,
-	}); err != nil {
-		return fmt.Errorf("record account deletion for %s: %w", did, err)
+	//
+	// BUT READ FIRST: a STANDING NON-ACCOUNT OPT-OUT IS NOT REPAINTED. If the
+	// user already holds enabled=false from their own record (or a probe of
+	// it), upserting source='account' over it would rewrite their preference
+	// as this tier's own request — erasing the provenance migration 028 exists
+	// to preserve, and arming the worst sequence 17d names: the purge fails on
+	// transport, the user reactivates, the confirmed-live path withdraws
+	// "the request this tier wrote" — and deletes a row the USER wrote.
+	// Absence is default-on, so the bridge would resume publishing for someone
+	// whose opt-out record still stands. The row is left untouched instead:
+	// it already says enabled=false, the purge below proceeds regardless, and
+	// MarkPurged is source-agnostic, so the committed purge still lands on it.
+	//
+	// A non-account row with enabled=TRUE is NOT preserved. Enabled is the
+	// default, so recording the account request over it loses nothing the user
+	// said: if the deletion later proves stale, clearStaleRequest removes the
+	// account row and absence restores exactly the default-on state their
+	// record asked for.
+	existing, err := t.prefs.Get(ctx, did)
+	if err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("read federation preference for %s: %w", did, err)
+	}
+	standingOptOut := err == nil &&
+		existing.Source != store.FederationPrefSourceAccount && !existing.Enabled
+	if !standingOptOut {
+		if _, err := t.prefs.Upsert(ctx, store.FederationPref{
+			DID:          did,
+			Enabled:      false,
+			DeleteRemote: true,
+			Source:       store.FederationPrefSourceAccount,
+		}); err != nil {
+			return fmt.Errorf("record account deletion for %s: %w", did, err)
+		}
 	}
 
 	if t.deleter == nil {
@@ -174,7 +200,10 @@ func (t *Terminator) TerminateAccount(ctx context.Context, did string) error {
 // It can only ever remove a request. The store refuses to clear a user's own
 // opt-out (theirs to keep) or a purge that committed (peers were already told),
 // so the narrow case is narrow by construction rather than by this caller
-// getting the predicate right.
+// getting the predicate right. The store's source='account' predicate is only
+// half of that guarantee: the other half is TerminateAccount above, which
+// leaves a standing non-account opt-out untouched instead of repainting it —
+// a row can only carry source='account' because THIS tier wrote its content.
 func (t *Terminator) clearStaleRequest(ctx context.Context, did string) error {
 	cleared, err := t.prefs.ClearRequestedPurge(ctx, did)
 	if err != nil {

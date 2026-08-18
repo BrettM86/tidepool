@@ -320,7 +320,13 @@ func (b *Backfill) materializeOutboxItem(ctx context.Context, item *ap.Object, c
 			return false, err
 		}
 		b.seedCounts(ctx, obj.ID)
-		b.backfillReplies(ctx, obj, communityIRI)
+		if err := b.backfillReplies(ctx, obj, communityIRI); err != nil {
+			// The post itself landed (and a retry's re-materialization is
+			// free), but an aborted reply pass fails the ITEM: that feeds the
+			// run's failures counter, which is what keeps last_backfill_at
+			// unset and the run resumable.
+			return false, err
+		}
 		return true, nil
 	case ap.TypeNote:
 		if _, err := b.mat.MaterializeComment(ctx, obj); err != nil {
@@ -375,17 +381,24 @@ func (b *Backfill) seedCounts(ctx context.Context, postAPID string) {
 	}
 }
 
-// backfillReplies pages a post's advertised replies collection. Failures
-// are logged, never fatal — replies are best-effort garnish on backfill.
-// communityIRI is the community being backfilled, carried for the scoped
-// tombstone lookup below.
-func (b *Backfill) backfillReplies(ctx context.Context, post *ap.Object, communityIRI string) {
+// backfillReplies pages a post's advertised replies collection.
+// Content-shaped problems — a tombstoned reply, a non-Note, an unresolvable
+// body — are logged, never fatal: replies are best-effort garnish on backfill.
+// An echo classification that cannot be MADE is the one exception: per
+// suppressEcho's contract the error propagates, aborting the reply pass so the
+// caller counts a failure the way an outbox-item failure is counted and the
+// run leaves last_backfill_at unset. A skip here would be silent and
+// permanent: the "clean" completion stamps the freshness window that blocks
+// the re-walk, and the genuine reply never lands. communityIRI is the
+// community being backfilled, carried for the scoped tombstone lookup below.
+func (b *Backfill) backfillReplies(ctx context.Context, post *ap.Object, communityIRI string) error {
 	if post.Replies == nil || post.Replies.ID == "" {
 		// Not advertised (or inline-only, which Lemmy never emits).
-		return
+		return nil
 	}
 	repliesIRI := post.Replies.ID
 	count := 0
+	var classifyErr error
 	err := b.fetcher.FetchCollection(ctx, repliesIRI, func(item *ap.Object) error {
 		if count >= maxRepliesPerPost {
 			return ap.ErrStop
@@ -397,9 +410,11 @@ func (b *Backfill) backfillReplies(ctx context.Context, post *ap.Object, communi
 		// native comment in a Lemmy thread is exactly what this collection
 		// holds once a Coves user replies.
 		if ours, err := b.suppressEcho(ctx, &note); err != nil {
-			b.logger.Warn("backfill reply echo check failed",
-				"post", post.ID, "reply", note.ID, "error", err)
-			return nil
+			// Propagated, never resolved into a skip: suppressEcho's contract.
+			// Remembered so the abort below is distinguishable from the walk's
+			// own best-effort fetch failures.
+			classifyErr = err
+			return err
 		} else if ours {
 			return nil
 		}
@@ -432,9 +447,16 @@ func (b *Backfill) backfillReplies(ctx context.Context, post *ap.Object, communi
 		}
 		return nil
 	})
+	if classifyErr != nil {
+		// The classifier error came back out through FetchCollection; return
+		// the unwrapped cause so the run's failure names the check, not the
+		// walk.
+		return classifyErr
+	}
 	if err != nil && !stderrors.Is(err, ap.ErrCollectionTruncated) {
 		b.logger.Warn("backfill replies walk failed", "post", post.ID, "error", err)
 	}
+	return nil
 }
 
 // resolveEmbedded applies the embedded-object trust rule to collection

@@ -547,6 +547,11 @@ type OutboundVotes interface {
 	// happens AFTER the withdrawal — so an enumeration of 'delivered' alone
 	// leaves a real vote standing on a real instance, attributed to an actor the
 	// bridge has told the world is gone, with nothing left that will notice.
+	//
+	// A vote already flipped `undone` is NEVER standing, even while its Like
+	// delivery still sits held: `undone` records a retraction already on the
+	// books, and re-enumerating it hands a replayed purge a fresh seq — a
+	// duplicate Undo under a new id, refused by the peer into poison.
 	ListStandingForActor(ctx context.Context, actorDID string) ([]OutboundVote, error)
 
 	// SetDeliveredState transitions the delivery state. An unknown state is

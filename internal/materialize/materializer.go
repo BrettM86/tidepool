@@ -116,6 +116,28 @@ func IsSkip(err error) bool { return stderrors.Is(err, ErrSkipped) }
 
 func skip(apID, reason string) error { return &SkipError{APID: apID, Reason: reason} }
 
+// requireSameAuthorityAuthor refuses content that attributes itself to an actor
+// on a DIFFERENT authority than the object's own id.
+//
+// Since the postv2 flip, the repo a record lands in IS its authorship claim:
+// the commit is signed by that repo's key, and a postv2 carries no `author`
+// field for a consumer to disagree with. attributedTo is therefore the field
+// that decides whose signature ends up on delivered content, and it is written
+// by whoever served the object. Without this check any instance can hand the
+// bridge a Page or Note naming any bridged user and have it signed into that
+// user's repo.
+//
+// Lemmy binds the two itself on ITS inbound path (verify_domains_match over an
+// object's id and its creator), so genuine Lemmy traffic — including a
+// lemmy.zip user's post announced by a lemmy.world community — never fails
+// this; only the id's own host may speak for its users.
+func requireSameAuthorityAuthor(obj, authorRef *ap.Object) error {
+	if !ap.SameAuthority(obj.ID, authorRef.ID) {
+		return skip(obj.ID, "attributedTo "+authorRef.ID+" is on another authority")
+	}
+	return nil
+}
+
 // Fetcher is the slice of the AP client the materializer uses. *ap.Client
 // implements it; tests may substitute failures.
 type Fetcher interface {

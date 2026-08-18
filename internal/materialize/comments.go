@@ -178,9 +178,36 @@ func (m *Materializer) materializeCommentLeaf(ctx context.Context, note *ap.Obje
 	if authorRef == nil || authorRef.ID == "" {
 		return nil, skip(note.ID, "comment has no attributedTo author")
 	}
+	// Before anything is minted: a forged attribution must not cost the actor
+	// it names a DID.
+	if err := requireSameAuthorityAuthor(note, authorRef); err != nil {
+		return nil, err
+	}
 	author, err := m.EnsureActor(ctx, authorRef)
 	if err != nil {
 		return nil, err
+	}
+
+	did, authorDID := author.DID, author.DID
+	if existing, err := m.objects.GetByAPID(ctx, note.ID); err == nil {
+		// The repo a comment lives in IS its authorship claim, so authorship —
+		// and with it the record's coordinates — is fixed at first
+		// materialization, exactly as MaterializePost pins a post's. attributedTo
+		// on an updated Note is proposed by whoever delivered the update:
+		// honouring a changed value would sign the record with an unrelated
+		// bridged user's repo key and strand the real author's copy live at its
+		// old at-uri. rkey is pinned with it because it is derived from
+		// `published`, which an edit can also restate.
+		//
+		// The collection is NOT pinned: unlike posts, comments never moved
+		// between collections, so CollectionComment is the only answer in either
+		// era and re-deriving it cannot relocate anything.
+		did, rkey = existing.DID, existing.RKey
+		if existing.AuthorDID != "" {
+			authorDID = existing.AuthorDID
+		}
+	} else if !errors.IsNotFound(err) {
+		return nil, fmt.Errorf("materialize: check mapping for %s: %w", note.ID, err)
 	}
 
 	reply, communityDID, err := m.resolveReplyRefs(ctx, note)
@@ -214,7 +241,7 @@ func (m *Materializer) materializeCommentLeaf(ctx context.Context, note *ap.Obje
 	if note.Sensitive != nil && *note.Sensitive {
 		record["labels"] = selfLabels("nsfw")
 	}
-	return m.commitRecord(ctx, author.DID, CollectionComment, rkey, record, note, author.DID, communityDID)
+	return m.commitRecord(ctx, did, CollectionComment, rkey, record, note, authorDID, communityDID)
 }
 
 // resolveReplyRefs builds the reply {root, parent} strongRefs for a

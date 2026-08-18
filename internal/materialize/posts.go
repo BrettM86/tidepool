@@ -36,6 +36,16 @@ func (m *Materializer) MaterializePost(ctx context.Context, page *ap.Object) (*R
 		return nil, err
 	}
 
+	authorRef := page.AttributedTo.First()
+	if authorRef == nil || authorRef.ID == "" {
+		return nil, skip(page.ID, "post has no attributedTo author")
+	}
+	// Before anything is minted: a forged attribution must not cost the actor
+	// it names a DID, nor the community it claims a repo.
+	if err := requireSameAuthorityAuthor(page, authorRef); err != nil {
+		return nil, err
+	}
+
 	groupRef := communityRef(page)
 	if groupRef == nil {
 		return nil, skip(page.ID, "post names no community (no audience/to group IRI)")
@@ -43,10 +53,6 @@ func (m *Materializer) MaterializePost(ctx context.Context, page *ap.Object) (*R
 	community, err := m.EnsureCommunity(ctx, groupRef)
 	if err != nil {
 		return nil, err
-	}
-	authorRef := page.AttributedTo.First()
-	if authorRef == nil || authorRef.ID == "" {
-		return nil, skip(page.ID, "post has no attributedTo author")
 	}
 	author, err := m.EnsureActor(ctx, authorRef)
 	if err != nil {

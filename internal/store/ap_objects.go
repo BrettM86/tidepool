@@ -64,18 +64,23 @@ func (r *postgresAPObjects) putMapping(ctx context.Context, q queryRower, mappin
 			ap_type = EXCLUDED.ap_type,
 			origin = EXCLUDED.origin,
 			did = EXCLUDED.did,
-			-- author_did gets the same COALESCE treatment, and for a sharper
-			-- reason than tidiness: deleteIsByAuthor decides SELF-DELETE vs
-			-- MODERATOR REMOVAL from this column, and a re-put that omitted it
-			-- would silently turn every later author delete into "not provably
-			-- the author" — the branch that writes a moderation record.
-			author_did = COALESCE(EXCLUDED.author_did, ap_objects.author_did),
-			-- COALESCE, never a bare overwrite: community_did is the binding
-			-- that authorizes announced moderation of this object, and a
-			-- re-put that simply omits it (a re-materialization, a legacy
-			-- write path) would NULL a good binding and make moderation refuse
-			-- forever, silently. A write that HAS the value still wins.
-			community_did = COALESCE(EXCLUDED.community_did, ap_objects.community_did),
+			-- The STORED value first: author_did is immutable once known. Since
+			-- the postv2 flip it records whose repo signed the record — the
+			-- strongest authorship statement atproto has — and it is also how
+			-- deleteIsByAuthor decides SELF-DELETE vs MODERATOR REMOVAL. A re-put
+			-- that omitted it would silently turn every later author delete into
+			-- "not provably the author", and one that restated it differently
+			-- would re-attribute bridged content to somebody who never wrote it.
+			-- A NULL is still filled by the first write that knows the answer.
+			author_did = COALESCE(ap_objects.author_did, EXCLUDED.author_did),
+			-- Same rule, same reason: community_did is the binding that
+			-- authorizes announced moderation of this object, so an object's
+			-- community is decided once. A re-put that omits it (a
+			-- re-materialization, a legacy write path) must not NULL a good
+			-- binding and make moderation refuse forever, and a re-put that names
+			-- a DIFFERENT community must not hand that community moderation
+			-- authority over content posted somewhere else.
+			community_did = COALESCE(ap_objects.community_did, EXCLUDED.community_did),
 			-- COALESCE for the same reason, with one difference worth stating:
 			-- the materializer re-derives this from the record it is committing,
 			-- so a re-put normally re-supplies it and a row written before

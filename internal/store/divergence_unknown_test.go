@@ -244,10 +244,11 @@ func TestUnknownDeliveryOutcomes_ACancelledDeliveryIsNotUnknown(t *testing.T) {
 // completeness half of this class, and it is the same rule that excludes a
 // cancelled delivery — one step later in the worker.
 //
-// Four poison classes are decided BEFORE any POST is made (worker.go): a causal
-// wait that expired (parent_unaccepted), a parent that poisoned
-// (parent_poisoned), an inbox that is not same-authority with its community
-// (cross_authority), and a signer that would not resolve (signer). All four
+// Several poison classes are decided BEFORE any POST is made (worker.go): a
+// causal wait that expired (parent_unaccepted), a parent that poisoned
+// (parent_poisoned), a parent whose every delivery was cancelled
+// (parent_cancelled), an inbox that is not same-authority with its community
+// (cross_authority), and a signer that would not resolve (signer). All of them
 // record status 0, which is the same shape a dial timeout leaves behind — and
 // they mean the opposite. Nothing was ever sent, so the peer's state is not
 // unknown at all: they do not have it.
@@ -260,8 +261,10 @@ func TestUnknownDeliveryOutcomes_ACancelledDeliveryIsNotUnknown(t *testing.T) {
 func TestUnknownDeliveryOutcomes_APoisonThatNeverReachedTheWireIsNotUnknown(t *testing.T) {
 	database := acceptanceTestDB(t)
 
-	// The four never-wire classes, exactly as the worker writes them.
-	neverSent := []string{"parent_unaccepted", "parent_poisoned", "cross_authority", "signer"}
+	// Every never-wire class, exactly as the worker writes them.
+	neverSent := []string{
+		"parent_unaccepted", "parent_poisoned", "parent_cancelled", "cross_authority", "signer",
+	}
 	for _, class := range neverSent {
 		seedPoisonedDelivery(t, database,
 			"https://coves.social/ap/activity/dv-neverwire-"+class,
@@ -285,7 +288,8 @@ func TestUnknownDeliveryOutcomes_APoisonThatNeverReachedTheWireIsNotUnknown(t *t
 	}
 	assert.ElementsMatch(t, []string{sentSilently, sentRefused}, ids,
 		"only deliveries that REACHED THE WIRE are unknown. %v are all decided before any POST "+
-			"is made — a causal wait that expired, a poisoned parent, a cross-authority inbox, "+
+			"is made — a causal wait that expired, a poisoned or wholly cancelled parent, a "+
+			"cross-authority inbox, "+
 			"an unresolvable signer — so the peer does not have them and nothing about their "+
 			"outcome is uncertain. They carry status 0 like a dial timeout does, which is the "+
 			"whole trap: identical column, opposite meaning. Counting them inflates the one "+

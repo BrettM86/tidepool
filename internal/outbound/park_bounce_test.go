@@ -39,7 +39,8 @@ func TestWorker_BouncedParkIsNotCounted(t *testing.T) {
 			name:  "causal park",
 			class: "parent_pending",
 			park: func(w *Worker, ctx context.Context, d *store.OutboundDelivery) error {
-				return w.parkCausal(ctx, d, "parent_pending", "waiting for bridge-origin parent")
+				return w.parkCausal(ctx, d, "parent_pending", "waiting for bridge-origin parent",
+					causalParkDelay)
 			},
 		},
 	} {

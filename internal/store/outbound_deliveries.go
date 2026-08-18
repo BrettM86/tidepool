@@ -595,27 +595,76 @@ func (r *postgresOutboundDeliveries) Get(ctx context.Context, activityID, target
 	return delivery, nil
 }
 
-func (r *postgresOutboundDeliveries) ParentDeliveryPoisoned(ctx context.Context, parentATURI, targetInbox string) (bool, error) {
+// ParentDeliveryDisposition is what has become of the deliveries carrying a
+// child's ACTUAL parent to one inbox — the causal gate's read on whether the
+// parent can still land.
+//
+// THREE VALUES BECAUSE THE PARENT HAS THREE ENDINGS, and the third is the one a
+// boolean could not express. A delivery goes terminal three ways, and the gate
+// used to ask only "is it poisoned?": a CANCELLED parent — the consent recheck
+// at claim time, an operator cancel, an actor or community sweep — answered
+// false, left the pending index, and never got accepted_at, so its child waited
+// on something that was never coming.
+type ParentDeliveryDisposition string
+
+const (
+	// ParentDeliveryOpen means nothing has decided against the parent: it is
+	// still pending, already delivered, or has no delivery row at all. The child
+	// waits.
+	ParentDeliveryOpen ParentDeliveryDisposition = "open"
+	// ParentDeliveryPoisoned means a delivery of the parent poisoned. It
+	// outranks every other reading — a poisoned parent is the loudest verdict
+	// available and the one that predates this type.
+	ParentDeliveryPoisoned ParentDeliveryDisposition = "poisoned"
+	// ParentDeliveryCancelled means the parent HAS deliveries and every one of
+	// them was cancelled: nothing is left that could make it land.
+	ParentDeliveryCancelled ParentDeliveryDisposition = "cancelled"
+)
+
+func (r *postgresOutboundDeliveries) ParentDeliveryDisposition(ctx context.Context, parentATURI, targetInbox string) (ParentDeliveryDisposition, error) {
 	// The parent's delivery is the one whose activity federated parentATURI as
 	// its object: the activity payload's object.id is the served object URL,
 	// which ends in "/ap/object/<did>/<collection>/<rkey>" — exactly the
 	// at-uri's three parts. Match on that suffix so we need no origin here (and
 	// DIDs/NSIDs/TIDs carry no LIKE metacharacters).
+	//
+	// ONE OBJECT CAN HAVE SEVERAL DELIVERIES to the same inbox — a Create and
+	// every later Update carry the same object.id — so both readings are
+	// aggregates over the whole set, and they are deliberately asymmetric:
+	//
+	//	poisoned  — ANY row. A poisoned delivery is a failure the peer may
+	//	            already have half-seen, and the pre-existing contract is that
+	//	            it condemns the descendant.
+	//	cancelled — EVERY row, and at least one. A cancel is a decision about one
+	//	            activity, not about the object: while a sibling is still
+	//	            pending, something can yet make the parent land, and poisoning
+	//	            the child out from under it would be a wrong answer arrived at
+	//	            early. The "at least one" guard is what keeps the vacuous
+	//	            all-of-nothing from reading as cancelled — a parent with NO
+	//	            deliveries is a fediverse-origin object, whose children are
+	//	            always eligible.
 	suffix := strings.TrimPrefix(parentATURI, "at://")
-	var exists bool
+	var poisoned, allCancelled bool
 	err := r.db.QueryRowContext(ctx, `
-		SELECT EXISTS (
-			SELECT 1
-			FROM outbound_deliveries d
-			JOIN outbound_activities a ON a.activity_id = d.activity_id
-			WHERE d.state = 'poisoned'
-			  AND d.target_inbox = $2
-			  AND a.payload -> 'object' ->> 'id' LIKE '%/ap/object/' || $1)`,
-		suffix, targetInbox).Scan(&exists)
+		SELECT
+			COUNT(*) FILTER (WHERE d.state = 'poisoned') > 0,
+			COUNT(*) > 0 AND COUNT(*) FILTER (WHERE d.state <> 'cancelled') = 0
+		FROM outbound_deliveries d
+		JOIN outbound_activities a ON a.activity_id = d.activity_id
+		WHERE d.target_inbox = $2
+		  AND a.payload -> 'object' ->> 'id' LIKE '%/ap/object/' || $1`,
+		suffix, targetInbox).Scan(&poisoned, &allCancelled)
 	if err != nil {
-		return false, fmt.Errorf("check parent delivery poisoned for %q: %w", parentATURI, err)
+		return "", fmt.Errorf("read parent delivery disposition for %q: %w", parentATURI, err)
 	}
-	return exists, nil
+	switch {
+	case poisoned:
+		return ParentDeliveryPoisoned, nil
+	case allCancelled:
+		return ParentDeliveryCancelled, nil
+	default:
+		return ParentDeliveryOpen, nil
+	}
 }
 
 func (r *postgresOutboundDeliveries) CancelClaimed(ctx context.Context, activityID, targetInbox string, claimToken time.Time) (bool, bool, error) {

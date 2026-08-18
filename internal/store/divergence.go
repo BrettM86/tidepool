@@ -700,13 +700,13 @@ func (r *postgresDivergences) RecastDivergenceCount(ctx context.Context) (int, e
 // THE DECLARATION IS SHARED SO THE TWO SIDES CANNOT DRIFT IN SPELLING. The
 // worker used to write these as string literals at its own call sites while the
 // denylist below repeated them, and nothing compiled the two lists against each
-// other: a respelling on either side would have silently moved four known
+// other: a respelling on either side would have silently moved the known
 // non-deliveries into the unknown-outcome report, whose entire worth is that its
 // numbers stay small enough to trust. The compiler now refuses that. What it
-// still cannot catch is a FIFTH never-wire class introduced as a fresh literal
+// still cannot catch is a FURTHER never-wire class introduced as a fresh literal
 // — the worker's wire classes (transport, 4xx, 5xx …) are literals, so the
 // surrounding style invites one — which is why a new class belongs in this block
-// and in neverReachedTheWireClasses, and why the store test that seeds all four
+// and in neverReachedTheWireClasses, and why the store test that seeds them all
 // by name (divergence_unknown_test.go) is the pin on the set.
 const (
 	// PoisonClassParentUnaccepted: the causal wait budget expired and the parent
@@ -715,6 +715,12 @@ const (
 	// PoisonClassParentPoisoned: the parent delivery poisoned; a descendant
 	// cannot land, so it is not attempted.
 	PoisonClassParentPoisoned = "parent_poisoned"
+	// PoisonClassParentCancelled: every delivery of the parent was CANCELLED —
+	// a consent recheck, an operator cancel, an actor or community sweep — so
+	// the parent is terminal, was never accepted, and nothing is left that could
+	// make it land. The descendant is decided here rather than left waiting out
+	// the causal budget against a parent that is never coming.
+	PoisonClassParentCancelled = "parent_cancelled"
 	// PoisonClassCrossAuthority: the stored target inbox is not same-authority
 	// with its community, and the worker refuses to sign a POST to it.
 	PoisonClassCrossAuthority = "cross_authority"
@@ -725,10 +731,10 @@ const (
 	PoisonClassSigner = "signer"
 )
 
-// neverReachedTheWireClasses are those four classes as the divergence sweep
+// neverReachedTheWireClasses are those classes as the divergence sweep
 // reads them.
 //
-// All four are written with last_status_code 0 — the same shape a dial timeout
+// All of them are written with last_status_code 0 — the same shape a dial timeout
 // leaves behind, and the opposite meaning. Nothing was sent, so the peer's
 // state is not unknown at all: they do not have it. That is the rule that
 // already excludes a cancelled delivery, one step later in the worker.
@@ -743,7 +749,7 @@ const (
 // runs the other way — a new never-wire poison class must be added to the block
 // above AND to this list, or it inflates these counts.
 var neverReachedTheWireClasses = []string{
-	PoisonClassParentUnaccepted, PoisonClassParentPoisoned,
+	PoisonClassParentUnaccepted, PoisonClassParentPoisoned, PoisonClassParentCancelled,
 	PoisonClassCrossAuthority, PoisonClassSigner,
 }
 
@@ -777,7 +783,7 @@ var neverReachedTheWireClasses = []string{
 // selected as a boolean rather than left to the caller to infer, so that no
 // reader downstream can rediscover the wrong rule from LastStatusCode.
 //
-// AND IT MUST HAVE BEEN SENT. Four poison classes are decided before any
+// AND IT MUST HAVE BEEN SENT. Several poison classes are decided before any
 // POST — see neverReachedTheWireClasses — and they carry status 0 exactly
 // like a transport failure does. Filing them here would put a KNOWN
 // non-delivery in the bucket whose whole meaning is that the answer is

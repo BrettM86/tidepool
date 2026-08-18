@@ -255,12 +255,21 @@ func (w *Worker) handle(ctx context.Context, delivery *store.OutboundDelivery) e
 	case causalEligible:
 		// fall through to consent + delivery
 	case causalWait:
-		// Held, NOT failed: keep it immediately re-eligible so it delivers the
-		// instant its parent is accepted, and do not advance the poison budget
-		// (the causal wait is wall-clock-bounded in causalStatus).
-		return w.parkCausal(ctx, delivery, "parent_pending", "waiting for bridge-origin parent to be accepted")
+		// Held, NOT failed: it becomes re-eligible one short interval from now,
+		// so it delivers within a beat of its parent being accepted, and the
+		// poison budget does not advance (the causal wait is wall-clock-bounded
+		// in causalStatus).
+		return w.parkCausal(ctx, delivery, "parent_pending",
+			"waiting for bridge-origin parent to be accepted", causalParkDelay)
+	case causalLookupFailed:
+		// The gate could not be READ. Holding is right — a store blip must not
+		// poison somebody's reply — but on the worker's real backoff, not the
+		// causal cadence: re-asking a database that just failed as fast as the
+		// round trip allows is how a blip becomes an outage.
+		return w.parkCausal(ctx, delivery, "parent_lookup_failed",
+			"causal parent lookup failed; holding for retry", w.backoff(delivery.Attempts))
 	// THE CLASS NAMES COME FROM store, and so do cross_authority and signer
-	// below. The reconciliation sweep excludes exactly these four from its
+	// below. The reconciliation sweep excludes exactly these from its
 	// unknown-outcome report (store.neverReachedTheWireClasses): they carry
 	// last_status_code 0 like a dial timeout does and mean the opposite — nothing
 	// was sent, so the peer's state is not unknown, they simply do not have it.
@@ -272,6 +281,9 @@ func (w *Worker) handle(ctx context.Context, delivery *store.OutboundDelivery) e
 	case causalPoisonParent:
 		return w.poison(ctx, delivery, store.PoisonClassParentPoisoned,
 			"parent delivery poisoned; descendant cannot land", 0)
+	case causalPoisonParentCancelled:
+		return w.poison(ctx, delivery, store.PoisonClassParentCancelled,
+			"every delivery of the parent was cancelled; descendant cannot land", 0)
 	}
 
 	// Consent recheck (retraction asymmetry): a Delete/Undo always goes out —
@@ -330,9 +342,7 @@ func (w *Worker) classify(ctx context.Context, delivery *store.OutboundDelivery,
 	if stderrors.As(err, &he) {
 		switch {
 		case isDuplicate(he):
-			// Lemmy's received_activity dedupe (400 + "already received") is a
-			// SUCCESS by our stable id: a redelivery after a crash is expected.
-			return w.deliverSuccess(ctx, delivery, activity, he.StatusCode)
+			return w.duplicateDelivered(ctx, delivery, activity, he)
 		case he.StatusCode == http.StatusNotFound ||
 			he.StatusCode == http.StatusGone:
 			// 404/410 is an endpoint-GONE signal: re-resolve the inbox once
@@ -355,6 +365,23 @@ func (w *Worker) classify(ctx context.Context, delivery *store.OutboundDelivery,
 	return w.releaseOrPoison(ctx, delivery, "transport", err.Error(), 0)
 }
 
+// duplicateDelivered records the received-activity dedupe as the success it is:
+// Lemmy already holds this activity under our stable id, which is exactly what a
+// redelivery after a crash is meant to discover.
+//
+// THE BODY IS LOGGED because this is the one branch that turns a 400 into a
+// delivered row, and the delivered path stores no excerpt — so if the match ever
+// fires on a rejection that merely resembles the dedupe, this line is the only
+// record of what the peer actually said. Debug level: on a healthy bridge it
+// fires only behind a crash-redelivery, and an operator chasing a wrong
+// `delivered` is already turning the level up.
+func (w *Worker) duplicateDelivered(ctx context.Context, delivery *store.OutboundDelivery, activity *store.OutboundActivity, he ap.HTTPError) error {
+	w.logger.Debug("peer reports the activity was already received; classifying as delivered",
+		"activity", delivery.ActivityID, "inbox", delivery.TargetInbox,
+		"status", he.StatusCode, "body", he.Body)
+	return w.deliverSuccess(ctx, delivery, activity, he.StatusCode)
+}
+
 // rotateInbox handles a 401/404/410: re-resolve the community's inbox ONCE
 // bypassing the cache (an endpoint rotation must not become a poison), retry,
 // then deliver-or-poison.
@@ -374,7 +401,7 @@ func (w *Worker) rotateInbox(ctx context.Context, delivery *store.OutboundDelive
 	}
 	var he ap.HTTPError
 	if stderrors.As(err, &he) && isDuplicate(he) {
-		return w.deliverSuccess(ctx, delivery, activity, he.StatusCode)
+		return w.duplicateDelivered(ctx, delivery, activity, he)
 	}
 	// Still bad after the single re-resolve: the endpoint is genuinely gone.
 	status := first.StatusCode
@@ -523,11 +550,26 @@ func (w *Worker) releaseOrPoison(ctx context.Context, delivery *store.OutboundDe
 	return nil
 }
 
-// poison marks the delivery permanently failed under its fencing token.
+// poison marks the delivery permanently failed under its fencing token, and
+// counts THE POISON THE FENCE ACCEPTED — the same rule countPark states for the
+// park counter, one state over.
+//
+// MarkPoisoned carries the same (exists, applied) fence every other terminal
+// mark does, and tidepool_outbound_poisoned is the number DEPLOY.md sends an
+// operator to read as the queue's verdict (a redrive is decided off it). A stale
+// worker whose lease lapsed poisons nothing — the fence says so — so counting
+// its bounce puts a dead letter on the dashboard that does not exist anywhere in
+// the table. The row is safe either way, which is precisely why the miscount
+// would be the bounce's only trace, and why it is logged rather than passed over.
 func (w *Worker) poison(ctx context.Context, delivery *store.OutboundDelivery, class, excerpt string, status int) error {
-	_, _, err := w.deliveries.MarkPoisoned(ctx, delivery.ActivityID, delivery.TargetInbox, class, excerpt, status, *delivery.ClaimedUntil)
+	_, applied, err := w.deliveries.MarkPoisoned(ctx, delivery.ActivityID, delivery.TargetInbox, class, excerpt, status, *delivery.ClaimedUntil)
 	if err != nil {
 		return fmt.Errorf("poison delivery %s: %w", delivery.ActivityID, err)
+	}
+	if !applied {
+		w.logger.Warn("poison did not apply: claim lost or row terminal",
+			"activity", delivery.ActivityID, "inbox", delivery.TargetInbox, "class", class)
+		return nil
 	}
 	metricPoisoned.Add(1)
 	return nil
@@ -601,18 +643,36 @@ func (w *Worker) countPark(delivery *store.OutboundDelivery, class string, appli
 	metricParked.Add(1)
 }
 
-// parkCausal holds a causally-ineligible delivery WITHOUT a future delay: a held
-// child must become claimable the instant its bridge-origin parent is accepted
-// (in practice the parent, a lower-seq delivery on the same serial line, is
-// delivered first, so this rarely re-fires). Like park it never poisons, and
-// like park it is attempt-neutral — which matters most here, since a child that
-// re-claims immediately would otherwise spend its whole budget in seconds.
+// causalParkDelay is how long a causally-held child waits before it can be
+// re-claimed.
+//
+// SHORT, BECAUSE THE POINT OF THE HOLD IS TO END. In practice the parent is a
+// lower-seq delivery on the same serial line and goes out first, so a child
+// rarely cycles here at all; a second is small enough that a reply lands within
+// a beat of its parent being accepted.
+//
+// NONZERO, BECAUSE now() IS A SPIN. ReleaseParked leaves the row pending, and a
+// row scheduled at now() is claimable by the very next ClaimNext — while
+// DeliverNext returns worked=true, so Run never sleeps. Any wait the parent does
+// not promptly end therefore becomes a claim/park loop running at whatever rate
+// the round trip allows, for as long as the wait lasts: two UPDATEs and two or
+// three SELECTs per iteration, against the database the rest of the bridge is
+// sharing. The cancelled-parent verdict above removes the case that could run
+// that loop for the full six-hour budget; this delay is what keeps any FUTURE
+// wait path from reintroducing it.
+const causalParkDelay = time.Second
+
+// parkCausal holds a causally-ineligible delivery for delay. Like park it never
+// poisons, and like park it is attempt-neutral — which matters most here, since
+// a child cycling through the hold would otherwise spend its whole retry budget
+// waiting rather than trying.
 //
 // The wait's OUTCOME is still decided by the wall clock and not by the ledger:
 // causalStatus poisons on the CausalWaitBudget deadline, so however many times a
 // child cycles through this hold, what ends the wait is elapsed time.
-func (w *Worker) parkCausal(ctx context.Context, delivery *store.OutboundDelivery, class, reason string) error {
-	_, applied, err := w.deliveries.ReleaseParked(ctx, delivery.ActivityID, delivery.TargetInbox, class, reason, 0, time.Now(), *delivery.ClaimedUntil)
+func (w *Worker) parkCausal(ctx context.Context, delivery *store.OutboundDelivery, class, reason string, delay time.Duration) error {
+	next := time.Now().Add(delay)
+	_, applied, err := w.deliveries.ReleaseParked(ctx, delivery.ActivityID, delivery.TargetInbox, class, reason, 0, next, *delivery.ClaimedUntil)
 	if err != nil {
 		return fmt.Errorf("park (causal) delivery %s: %w", delivery.ActivityID, err)
 	}
@@ -626,8 +686,17 @@ type causalStatus int
 const (
 	causalEligible causalStatus = iota
 	causalWait
+	// causalLookupFailed is a WAIT the store could not answer, kept apart from
+	// causalWait because the two want different cadences: an ordinary wait is
+	// ended by the parent landing (so it re-checks briskly), while a failed
+	// lookup is ended by the database recovering (so it backs off).
+	causalLookupFailed
 	causalPoisonUnaccepted
 	causalPoisonParent
+	// causalPoisonParentCancelled is the THIRD way a parent goes terminal, and
+	// the one the gate used to have no verdict for: cancelled. See
+	// store.PoisonClassParentCancelled.
+	causalPoisonParentCancelled
 )
 
 func (w *Worker) causalStatus(ctx context.Context, delivery *store.OutboundDelivery, activity *store.OutboundActivity) causalStatus {
@@ -643,22 +712,30 @@ func (w *Worker) causalStatus(ctx context.Context, delivery *store.OutboundDeliv
 	}
 	if err != nil {
 		w.logger.Error("causal parent lookup failed", "parent", activity.ParentATURI, "error", err)
-		return causalWait // transient: hold rather than poison on a lookup blip
+		return causalLookupFailed // transient: hold rather than poison on a lookup blip
 	}
 	if parent.IsAccepted() {
 		return causalEligible
 	}
-	// Bridge-origin parent, not yet accepted. Poison ONLY if the child's ACTUAL
-	// parent delivery is poisoned (it will never land) — keyed on parent_at_uri,
-	// not seq-ancestry, so an unrelated poisoned row on the same line does not
+	// Bridge-origin parent, not yet accepted. Decide against the child ONLY on
+	// the child's ACTUAL parent deliveries — keyed on parent_at_uri, not
+	// seq-ancestry, so an unrelated poisoned row on the same line does not
 	// poison this child.
-	poisoned, err := w.deliveries.ParentDeliveryPoisoned(ctx, activity.ParentATURI, delivery.TargetInbox)
+	//
+	// TWO TERMINAL PARENTS, NOT ONE. A poisoned parent will never land; so will
+	// one whose every delivery was CANCELLED, and that second case is what used
+	// to fall through to the wait below — a wait for something already decided
+	// against, which the delivery then spent its whole causal budget on.
+	disposition, err := w.deliveries.ParentDeliveryDisposition(ctx, activity.ParentATURI, delivery.TargetInbox)
 	if err != nil {
-		w.logger.Error("parent-delivery poisoned check failed", "error", err)
-		return causalWait
+		w.logger.Error("parent-delivery disposition check failed", "error", err)
+		return causalLookupFailed
 	}
-	if poisoned {
+	switch disposition {
+	case store.ParentDeliveryPoisoned:
 		return causalPoisonParent
+	case store.ParentDeliveryCancelled:
+		return causalPoisonParentCancelled
 	}
 	// Otherwise the parent is merely pending: WAIT, bounded by WALL CLOCK from
 	// the delivery's creation — never by the attempt count, so a parent that
@@ -717,10 +794,37 @@ func (w *Worker) backoff(attempts int) time.Duration {
 // it — or the reverse.
 func isRetraction(kind string) bool { return slices.Contains(store.RetractionKinds, kind) }
 
-// isDuplicate reports whether an HTTPError is Lemmy's duplicate-activity
-// response (a 400 whose body reports the activity was already received).
+// duplicateActivityPhrase is the received-activity dedupe, and it is the WHOLE
+// phrase on purpose.
+//
+// This is the one classification that turns a rejection into a success, so it
+// has to name the single rejection that IS one. Lemmy answers 400 with a family
+// of slugs carrying the bare word "already" — banned_from_community,
+// already_invalid, duplicate_title, "you have already been blocked" — and
+// matching on that word alone read every one of them as a delivery:
+//
+//   - a Like the peer refused flipped outbound_votes.delivered_state, which is
+//     an input to the score users are served and which nothing reconciles;
+//   - stampAccepted opened the causal gate for an object that never landed, so
+//     every child behind it was delivered into a rejection of its own;
+//   - and the delivered path stores no excerpt, so the body that would have
+//     shown an operator what happened was discarded.
+//
+// The phrase is what the peer actually says — the fake Lemmy in the outer
+// acceptance test answers `{"error":"activity was already received"}`, which is
+// the shape worker_test.go pins — and matching is done on a body lowercased with
+// underscores folded to spaces, so a serialized enum (`already_received`) and
+// the prose sentence are the same string here while none of the slugs above come
+// near it.
+const duplicateActivityPhrase = "already received"
+
+// isDuplicate reports whether an HTTPError is that dedupe response.
 func isDuplicate(he ap.HTTPError) bool {
-	return he.StatusCode == http.StatusBadRequest && strings.Contains(strings.ToLower(he.Body), "already")
+	if he.StatusCode != http.StatusBadRequest {
+		return false
+	}
+	normalized := strings.ReplaceAll(strings.ToLower(he.Body), "_", " ")
+	return strings.Contains(normalized, duplicateActivityPhrase)
 }
 
 // classForStatus labels a retryable HTTP status for the retry taxonomy.

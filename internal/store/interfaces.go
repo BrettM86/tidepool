@@ -817,14 +817,19 @@ type OutboundDeliveries interface {
 	// implementation for why, and for the instances it cannot reach).
 	DistinctInboxesForActor(ctx context.Context, actorDID string) ([]DeliveryTarget, error)
 
-	// ParentDeliveryPoisoned reports whether the delivery of the child's ACTUAL
-	// parent (the activity that federated parentATURI as its object, to the same
-	// inbox) is poisoned — the causal signal task 15's worker reads to poison a
-	// child whose bridge-origin parent will NEVER land (parent_poisoned), as
-	// distinct from one merely waiting for a pending parent (parent_unaccepted).
+	// ParentDeliveryDisposition reports what has become of the deliveries of the
+	// child's ACTUAL parent (the activities that federated parentATURI as their
+	// object, to the same inbox) — the causal signal task 15's worker reads to
+	// decide a child whose bridge-origin parent will NEVER land, as distinct
+	// from one merely waiting for a pending parent (parent_unaccepted).
+	//
 	// Keyed on the parent's object id, NOT on seq-ancestry, so an unrelated
-	// poisoned row on the same serial line does not poison the child.
-	ParentDeliveryPoisoned(ctx context.Context, parentATURI, targetInbox string) (bool, error)
+	// poisoned row on the same serial line does not poison the child. Poisoned
+	// is reported if ANY delivery poisoned; cancelled only if EVERY delivery was
+	// cancelled and there is at least one, so a pending sibling keeps the parent
+	// open and a parent with no deliveries at all (fediverse-origin) never reads
+	// as decided against.
+	ParentDeliveryDisposition(ctx context.Context, parentATURI, targetInbox string) (ParentDeliveryDisposition, error)
 
 	// CancelClaimed cancels a SINGLE claimed delivery under its fencing token
 	// (the consent-block outcome for one create/update), leaving the actor's

@@ -56,6 +56,11 @@ func TestCausalGating_BridgeParentUnacceptedIsIneligible(t *testing.T) {
 	// Flip the parent to accepted: the SAME delivery must now go out. This is
 	// what keeps the negative non-vacuous — the gate opens, it delivers.
 	require.NoError(t, store.NewOutboundObjects(conn).SetAccepted(context.Background(), gParentATURI))
+	// A causal park schedules the child a real interval out (causalParkDelay),
+	// so the re-claim is rewound rather than slept out — the house idiom, cf.
+	// park_budget_test.go. The interval is what keeps the hold from spinning;
+	// TestCausalGating_ParkedChildIsNotInstantlyReclaimable pins it directly.
+	clearParkDelay(t, conn, id)
 	worked, err := w.DeliverNext(context.Background())
 	require.NoError(t, err)
 	assert.True(t, worked)

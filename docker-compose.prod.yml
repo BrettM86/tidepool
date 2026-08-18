@@ -135,7 +135,7 @@ services:
       # Serving derives every URL from the stored actor_id, never from this
       # value — so changing it later does NOT migrate existing actors, it only
       # changes where NEW ones are minted.
-      AP_USER_ORIGIN: ${AP_USER_ORIGIN:-https://coves.social}
+      AP_USER_ORIGIN: ${AP_USER_ORIGIN:?AP_USER_ORIGIN must be set in .env — see DEPLOY.md §1; a defaulted origin mints permanent wrong identities}
 
       # The Jetstream consumer: native Coves users' records flowing OUTWARD.
       # Default off. Staged here ahead of the flag on purpose — JETSTREAM_URL is

@@ -45,10 +45,13 @@ bridged-handle namespace (`config.go:786-790`).
 (`internal/personas/origin.go:42-46`), and `https://coves.social/` has a path
 of `/`. That is a boot failure, not a normalization.
 
-`docker-compose.prod.yml` now supplies `AP_USER_ORIGIN` with a
-`${AP_USER_ORIGIN:-https://coves.social}` default, so a `git pull` plus the
-normal deploy command is sufficient. Set it explicitly in `.env` anyway if this
-deployment is not tdpl.io/coves.social.
+`docker-compose.prod.yml` enforces this at the edge too: it interpolates
+`${AP_USER_ORIGIN:?…}`, so with the variable unset or empty the deploy fails
+at `docker compose` time — before any container starts — with a message
+pointing here. There is deliberately **no compose default**: a defaulted
+origin on a fork of this compose file would silently mint permanent
+identities under someone else's domain. Add the line to `.env` (below) as
+part of the deploy.
 
 ### Minimum `.env` delta
 
@@ -372,23 +375,21 @@ coves.social {
     # the catch-all used to serve. Same-name directives run in Caddyfile
     # order, so the matched reverse_proxy is tried before the fallback.
     #
-    # Two Accept lines, not one substring: Lemmy and Mastodon send
-    # application/activity+json, but the AS2 spec form is
-    # application/ld+json;profile="…activitystreams", which shares no
-    # useful substring with the first. Values for the SAME header field
-    # are OR'ed.
+    # The split is inverted on purpose: EXPLICIT text/html goes to the web
+    # app; everything else — activity+json, ld+json, AND a request with no
+    # Accept header at all — falls through to Tidepool. instance.go:32-34
+    # requires that a peer sending no Accept still gets the instance
+    # actor, and a positive @ap matcher can never satisfy that (an absent
+    # header matches nothing). Browsers always send text/html at the
+    # apex, so they are unaffected; the one visible consequence is that a
+    # bare `curl /` (Accept: */*) now gets the actor JSON, which is the
+    # AS2-conventional answer for a non-browser client.
     handle / {
-        @ap {
-            header Accept *application/activity+json*
-            header Accept *application/ld+json*
-        }
-        reverse_proxy @ap tidepool:80 {
-            header_up X-Real-IP {remote_host}
-        }
-        # Fallback: the web app, with the SAME upstream options as the
-        # catch-all below — copy them verbatim, header_up Host included
-        # (DPoP htu matching depends on it).
-        reverse_proxy appview:8080 {
+        @html header Accept *text/html*
+        # The web app, with the SAME upstream options as the catch-all
+        # below — copy them verbatim, header_up Host included (DPoP htu
+        # matching depends on it).
+        reverse_proxy @html appview:8080 {
             health_uri /xrpc/_health
             health_interval 30s
             health_timeout 5s
@@ -397,6 +398,10 @@ coves.social {
             header_up X-Forwarded-For {remote_host}
             header_up X-Forwarded-Proto {scheme}
             header_up X-Forwarded-Host {host}
+        }
+        # Fallback: the instance actor (peers, absent-Accept fetchers).
+        reverse_proxy tidepool:80 {
+            header_up X-Real-IP {remote_host}
         }
     }
 
@@ -418,6 +423,12 @@ curl -s -H 'Accept: application/ld+json; profile="https://www.w3.org/ns/activity
 
 # a browser must still get the web app
 curl -sI -H 'Accept: text/html' https://coves.social/ | head -1
+
+# a peer sending NO Accept header must still get the instance actor
+# (instance.go's stated requirement; this is why the split routes
+# explicit-HTML to the AppView and falls through to Tidepool)
+curl -s -H 'Accept:' https://coves.social/ | jq '.type'
+# expect: "Application"
 
 curl -s 'https://coves.social/.well-known/webfinger?resource=acct:alice@coves.social' | jq .
 curl -s https://coves.social/.well-known/nodeinfo | jq .
@@ -1046,37 +1057,21 @@ a workaround, not a scheduled heal, and it does other work besides.
 
 | Peer | Status | Notes |
 |---|---|---|
-| **Lemmy 0.19.x** | **Targeted.** Strictness ceiling and e2e target | See the version discrepancy below |
+| **Lemmy 0.19.20** | **Targeted.** Strictness ceiling and e2e target | Pinned in `e2e/lemmy/Dockerfile:35`, matching decision 19 |
 | **PieFed** | Best-effort | No pinned instance in the harness; conformance is held by captured-wire fixtures. Its votes arrive from anonymous per-user actors, which is fine for tallies but means no per-voter identity |
 | **Lemmy 1.0-beta** | Tracked, **not targeted** | Vote `FederationMode`, inbox collapsing, and `NoteWrapper` all change behaviour we depend on. No harness coverage |
 | **Mastodon** | Incidental | The `security/v1` context is published so its parser accepts our `publicKey`, and its hosts appear in production handle subdomains. Not a target; not tested |
 
-### ⚠️ Version discrepancy — unresolved, needs a decision
+### Version pin — resolved
 
-The tree contradicts itself about which Lemmy version is pinned:
-
-- `e2e/lemmy/Dockerfile:35` pins **`ARG LEMMY_VERSION=0.19.19`**. This is what
-  `make e2e` actually builds and tests against.
-- `PLAN.md:430` (decision 19) says "**Lemmy 0.19.20** is the pinned strictness
-  ceiling and e2e target". `tasks/18-e2e-deploy.md:21` repeats it, and the
-  0.19.20 source is cited as the authority for specific verified behaviours
-  across `tasks/13`, `14`, `15`, `17` — the `Delete`-summary convention, the
-  `check_bot_account` rule, `Instance`-enum strictness.
-
-**The matrix above says "0.19.x" deliberately, because writing either number
-alone would be a claim the tree does not support.** The behaviours we verified
-were read from 0.19.20 source; the behaviours we *test* are 0.19.19's.
-
-This is not resolvable from the docs — it needs a call:
-
-1. bump `e2e/lemmy/Dockerfile` to `0.19.20` so the tested version matches the
-   decided one (preferred; the e2e stack is owned by a separate task and this
-   file is out of scope for this change), **or**
-2. amend decision 19 to name 0.19.19 as the pin and re-verify the source
-   claims against that tag.
-
-Until one of those happens, do not cite a specific patch version as "the
-supported one" in operator-facing material.
+`e2e/lemmy/Dockerfile:35` pins **`ARG LEMMY_VERSION=0.19.20`**, matching
+PLAN.md decision 19 ("Lemmy 0.19.20 is the pinned strictness ceiling and e2e
+target") and the task docs. The behaviours verified against 0.19.20 source
+across `tasks/13`, `14`, `15`, `17` — the `Delete`-summary convention, the
+`check_bot_account` rule, `Instance`-enum strictness — are the behaviours
+`make e2e` actually builds and tests against. (An earlier draft of this
+section described a 0.19.19/0.19.20 discrepancy; it was resolved by bumping
+the Dockerfile to 0.19.20.)
 
 ---
 

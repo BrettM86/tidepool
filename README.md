@@ -346,7 +346,7 @@ Two classes, and the difference matters at boot:
 | `OUTBOUND_DISABLED_HOSTS` | *(empty)* | comma-separated inbox **hosts** to park. Lowercased on load and compared case-insensitively — a kill switch must fail closed on case |
 | `OUTBOUND_DISABLED_COMMUNITIES` | *(empty)* | comma-separated community **AP ids** to park (`https://lemmy.world/c/comicstrips`), matched **exactly and case-sensitively** against the delivery's ordering key. There is no allowlist form: a one-community canary is spelled by disabling every other community |
 | `OUTBOUND_DISABLED_ACTORS` | *(empty)* | comma-separated actor **DIDs** to park, exact match |
-| `OUTBOUND_DRY_RUN` | off | log every claimed delivery and POST nothing; the worker parks **before** signing. It does **not** validate the translator — translation happens at *enqueue* time inside the consumer's gate transaction and the worker POSTs the stored payload verbatim, so the translator has already run on everything the moment `CONSUMER_ENABLED=true`. Parks like the kill switches, and carries the same `attempts` cost (above): keep a dry run to seconds, then `redrive` |
+| `OUTBOUND_DRY_RUN` | off | log every claimed delivery and POST nothing; the worker parks **before** signing. It does **not** validate the translator — translation happens at *enqueue* time inside the consumer's gate transaction and the worker POSTs the stored payload verbatim, so the translator has already run on everything the moment `CONSUMER_ENABLED=true`. Parks like the kill switches: attempt-neutral, and parked rows stay `pending`, so deliveries **resume on their own** when the flag clears — no `redrive` (which matches only `poisoned` rows and would be a no-op here; an unscoped `{"all":true}` redrive would instead replay unrelated poisoned deliveries). The cost of a long dry run is the ~5s re-claim write cycle per ordering key, not retries |
 | `ADMISSION_MAX_PER_AUTHOR_PER_COMMUNITY` | `50` | acceptance-engine flood cap: how many posts one native author may have accepted into one bridged community. `0` = unlimited. Tidepool signs the community's acceptance, so this bounds what it vouches for |
 
 ## The admin API
@@ -739,14 +739,13 @@ behaviour — see DEPLOY.md §1.
 
 | Peer | Status |
 |---|---|
-| **Lemmy 0.19.x** | targeted — the e2e target and strictness ceiling |
+| **Lemmy 0.19.20** | targeted — the e2e target and strictness ceiling |
 | **PieFed** | best-effort, behind captured-wire conformance (votes arrive from anonymous per-user actors: fine for tallies, no per-voter identity) |
 | **Lemmy 1.0-beta** | tracked, not targeted (vote `FederationMode`, inbox collapsing, `NoteWrapper`) |
 | **Mastodon** | incidental — the `security/v1` context is published so its parser accepts our `publicKey`; not a target, not tested |
 
-The patch version is deliberately written as `0.19.x`: `e2e/lemmy/Dockerfile`
-pins `0.19.19` while decision 19 and the task docs name `0.19.20`. That
-contradiction is unresolved — see DEPLOY.md §7.
+`e2e/lemmy/Dockerfile` pins `0.19.20`, matching decision 19 and the task
+docs — see DEPLOY.md §7.
 
 ## License
 

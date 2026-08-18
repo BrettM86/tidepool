@@ -197,9 +197,14 @@ func (a *Admissions) Get(ctx context.Context, communityDID, postURI string) (*Ad
 }
 
 // GetByPostURI returns the admission for a post at-uri alone — the readmit and
-// admin-list path, which knows the post but not necessarily its community. The
-// post_uri is globally unique (it embeds the author repo), so at most one row
-// matches. A miss satisfies errors.IsNotFound.
+// admin-list path, which knows the post but not necessarily its community.
+//
+// At most one row matches, and that is a SCHEMA guarantee, not an assumption
+// about at-uris: migration 031's unique index on post_uri. It has to be, because
+// this query has no ORDER BY — if two communities could hold one post_uri,
+// postgres would pick the winner, and boundCommunityOf (which reads the post's
+// community binding through this call) would be asking a question with two
+// answers. A miss satisfies errors.IsNotFound.
 func (a *Admissions) GetByPostURI(ctx context.Context, postURI string) (*Admission, error) {
 	var adm Admission
 	err := a.db.QueryRowContext(ctx, `

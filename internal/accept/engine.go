@@ -333,11 +333,13 @@ func (e *Engine) AdmitPost(ctx context.Context, did string, commit *consume.Comm
 		return err
 	}
 
-	// Decide admission. The order is deliberate (fail closed first, cheap policy
-	// last): lexicon-validate → community-immutable → community-followed → opt-out
-	// → paused → title → rate cap. A discard means the whole event is dropped
-	// (nothing written to either community); a non-empty code is a rejection/
-	// removal cause.
+	// Decide admission. The order is deliberate (jurisdiction first, then fail
+	// closed, then cheap policy): community-immutable → lexicon-validate →
+	// community-followed → ban → opt-out → paused → title → rate cap. A discard
+	// means the whole event is dropped (nothing written to either community); a
+	// non-empty code is a rejection/removal cause, and because immutability is
+	// settled first, a non-empty code is always ABOUT the community this post is
+	// already bound to (or a post with no binding yet).
 	code, discard, err := e.decide(ctx, did, commit, communityDID, boundCommunity)
 	if err != nil {
 		return err
@@ -451,7 +453,26 @@ const (
 func (e *Engine) decide(ctx context.Context, did string, commit *consume.CommitEvent,
 	communityDID, boundCommunity string) (code string, discard bool, err error) {
 
-	// 1. Strict lexicon validation of the native input, bound to the postv2
+	// 1. Community immutability, FIRST. The lexicon marks `community` immutable:
+	// an UPDATE that names a different community than the post was bound to is a
+	// retarget, which means writing a NEW post — so the whole event is discarded,
+	// not partially applied.
+	//
+	// It runs before every merit check, INCLUDING lexicon validation, because it
+	// is the only check that decides WHERE a verdict may be written rather than
+	// what the verdict is. Every other check returns a code, and AdmitPost records
+	// that code under the EVENT's community — so a merit check that fires first on
+	// a moving edit files its rejection under the very community the move is about
+	// to be refused into: a second admissions row for one post_uri (never-accepted
+	// post), or a removal record signed with the TARGET community's key for a post
+	// it never accepted (accepted post), while the original community's outbound
+	// row is tombstoned and a Delete enqueued at it. Refusing a community move
+	// needs no valid record: the two DIDs disagree, and that is the whole finding.
+	if boundCommunity != "" && boundCommunity != communityDID {
+		return "", true, nil
+	}
+
+	// 2. Strict lexicon validation of the native input, bound to the postv2
 	// schema — fail closed. A marshal/unmarshal fault is an INTERNAL error
 	// (retryable), NOT a permanent lexicon-invalid verdict.
 	valid, err := e.lexiconValid(commit.Record)
@@ -460,14 +481,6 @@ func (e *Engine) decide(ctx context.Context, did string, commit *consume.CommitE
 	}
 	if !valid {
 		return DecisionLexiconInvalid, false, nil
-	}
-
-	// 2. Community immutability. The lexicon marks `community` immutable: an
-	// UPDATE that names a different community than the post was bound to is a
-	// retarget, which means writing a NEW post — so the whole event is discarded,
-	// not partially applied.
-	if boundCommunity != "" && boundCommunity != communityDID {
-		return "", true, nil
 	}
 
 	// 3. Community follow gate (SECURITY): a communities row's mere existence is

@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/bluesky-social/indigo/atproto/syntax"
@@ -271,7 +272,10 @@ func (r *HandleResolver) verifyHandleClaimsDID(ctx context.Context, handle, did 
 				return nil
 			}
 			// DNS itself named a different DID: authoritative impersonation.
-			return fmt.Errorf("%w: handle %s DNS claims %s, not %s", ErrPermanentEvent, handle, claimed, did)
+			// The TXT value is written by whoever runs the handle's zone, so it
+			// is quoted and capped like any other remote claim.
+			return fmt.Errorf("%w: handle %s DNS claims %s, not %s",
+				ErrPermanentEvent, handle, quoteRemoteClaim(claimed), did)
 		}
 		dnsAuthoritative = authoritative
 	}
@@ -357,9 +361,37 @@ func (r *HandleResolver) verifyWellKnown(ctx context.Context, handle, did string
 		// DNS was unreachable, so we never learned the owner's authoritative
 		// claim; a mismatched well-known cannot be trusted as impersonation.
 		// Transient, so the redrive re-checks once DNS recovers.
-		return fmt.Errorf("handle %s well-known claims %s, not %s, but DNS was unreachable", handle, claimed, did)
+		return fmt.Errorf("handle %s well-known claims %s, not %s, but DNS was unreachable",
+			handle, quoteRemoteClaim(claimed), did)
 	}
-	return fmt.Errorf("%w: handle %s claims %s, not %s", ErrPermanentEvent, handle, claimed, did)
+	return fmt.Errorf("%w: handle %s claims %s, not %s",
+		ErrPermanentEvent, handle, quoteRemoteClaim(claimed), did)
+}
+
+// maxQuotedClaimBytes bounds how much of a remote claim an error message
+// repeats. A did:plc is 32 characters; anything past this is not a claim being
+// reported, it is a body being transcribed.
+const maxQuotedClaimBytes = 128
+
+// quoteRemoteClaim renders a DID claimed by a REMOTE party — a well-known body
+// from a host named in a stranger's DID document, or a TXT record from that
+// handle's zone — as operator-facing evidence rather than a transcript.
+//
+// Two properties, both load-bearing rather than cosmetic. It QUOTES
+// (strconv.Quote escapes a NUL to the four printable characters `\x00` and
+// coerces invalid UTF-8 to escapes), because these errors become a dead
+// letter's last_error, a postgres TEXT column that rejects a NUL outright — an
+// echoed raw body would let a stranger's server fail the write meant to capture
+// its own failure. And it CAPS the length, because the read is bounded at 1 KiB
+// but the error is rewritten into that column on every redrive pass.
+func quoteRemoteClaim(claimed string) string {
+	if len(claimed) > maxQuotedClaimBytes {
+		// Cut on the byte, then let Quote escape whatever partial rune the cut
+		// left behind; the marker is outside the quotes so it cannot be read as
+		// part of what the remote actually said.
+		return strconv.Quote(claimed[:maxQuotedClaimBytes]) + "…"
+	}
+	return strconv.Quote(claimed)
 }
 
 // validatePLCDID rejects everything this task cannot resolve, and does it

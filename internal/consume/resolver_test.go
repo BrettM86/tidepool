@@ -4,7 +4,9 @@ import (
 	"context"
 	"net"
 	"net/http"
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -365,4 +367,82 @@ func TestHandleResolver_WellKnown404IsTransient(t *testing.T) {
 		"a 404 well-known is NOT a disavowal: the handle may be mid-setup, or publish "+
 			"its claim only over DNS. Treating it as permanent would strand a user who "+
 			"finishes configuring their PDS a minute later")
+}
+
+// ---------------------------------------------------------------------------
+// The remote claim is EVIDENCE, not a transcript
+// ---------------------------------------------------------------------------
+//
+// verifyWellKnown embeds the body served by https://{handle}/... — a host named
+// in a stranger's DID document — into its error. That error is not just read by
+// an operator: it becomes a dead letter's last_error, a postgres TEXT column
+// that rejects NUL outright. Echoing the body verbatim hands an attacker a
+// string that can fail the very write meant to capture the failure. The claim
+// must be quoted (control bytes become printable escapes) and length-capped
+// before it goes anywhere near an error message.
+
+// poisonWellKnownBody is what a hostile — or merely broken — server can return:
+// NULs, invalid UTF-8, and far more bytes than a DID could ever need.
+var poisonWellKnownBody = "did:plc:\x00\x00evil\xff\xfe" + strings.Repeat("A", 4096)
+
+func TestHandleResolver_PoisonWellKnownClaimIsQuotedAndBounded(t *testing.T) {
+	assertSafeEvidence := func(t *testing.T, err error) {
+		t.Helper()
+		message := err.Error()
+		assert.False(t, strings.ContainsRune(message, 0),
+			"the error must carry no NUL: it lands in the last_error TEXT column, and a "+
+				"NUL there fails the dead-letter write — the fallback that must never "+
+				"itself fail")
+		assert.True(t, utf8.ValidString(message),
+			"and must be valid UTF-8, so the operator triaging the DLQ can read it")
+		assert.LessOrEqual(t, len(message), 512,
+			"and must be BOUNDED: the well-known read is capped at 1 KiB, but none of "+
+				"that belongs in an error message verbatim — the claim is evidence, not "+
+				"a transcript")
+		assert.Contains(t, message, resolveHandle,
+			"while still naming the handle whose claim disagreed")
+	}
+
+	t.Run("transient, DNS unreachable", func(t *testing.T) {
+		fake := newFakeIdentity(t)
+		fake.claimOneWay(resolveDID, resolveHandle)
+		fake.txtFails(resolveHandle, &net.DNSError{
+			Err: "server misbehaving", Name: atprotoTXTPrefix + resolveHandle, IsTemporary: true})
+		fake.wellKnownReturns(resolveHandle, poisonWellKnownBody)
+
+		_, err := fake.resolver(t).ResolveDIDHandle(context.Background(), resolveDID)
+
+		require.Error(t, err)
+		assert.NotErrorIs(t, err, ErrPermanentEvent,
+			"DNS was unreachable, so this stays redrivable — which is exactly why the "+
+				"error string matters: it will be written to last_error again on every "+
+				"redrive pass")
+		assertSafeEvidence(t, err)
+	})
+
+	t.Run("permanent, NXDOMAIN", func(t *testing.T) {
+		fake := newFakeIdentity(t)
+		fake.claimOneWay(resolveDID, resolveHandle) // no TXT registered → NXDOMAIN
+		fake.wellKnownReturns(resolveHandle, poisonWellKnownBody)
+
+		_, err := fake.resolver(t).ResolveDIDHandle(context.Background(), resolveDID)
+
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrPermanentEvent)
+		assertSafeEvidence(t, err)
+	})
+
+	t.Run("permanent, contradicting DNS TXT", func(t *testing.T) {
+		// DNS TXT is remote-supplied too: whoever runs the handle's zone writes
+		// those bytes, and the resolver echoes them the same way.
+		fake := newFakeIdentity(t)
+		fake.claimOneWay(resolveDID, resolveHandle)
+		fake.txtRecords(resolveHandle, "did="+poisonWellKnownBody)
+
+		_, err := fake.resolver(t).ResolveDIDHandle(context.Background(), resolveDID)
+
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrPermanentEvent)
+		assertSafeEvidence(t, err)
+	})
 }

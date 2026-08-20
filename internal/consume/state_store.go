@@ -86,20 +86,17 @@ func (s *PostgresStateStore) SaveCursor(ctx context.Context, consumerName string
 // the cursor may advance past a poison frame.
 func (s *PostgresStateStore) AddDeadLetter(ctx context.Context, consumerName string, eventTimeUS int64, eventData []byte, handleErr string, redriveAttempts int) error {
 	// event_data is written as raw bytes so byte-corrupt frames are capturable.
-	// last_error is TEXT, so it is SANITIZED first: a malformed frame's error
-	// can carry the very bytes that made it malformed (a NUL, invalid UTF-8),
-	// and postgres TEXT rejects a NUL outright. An unsanitized error would fail
-	// the dead-letter write, the connector would tear the connection down
-	// without advancing the cursor, and the same poison frame would replay
-	// forever — this is the fallback that must never itself fail.
+	// last_error is TEXT, so the write goes through execDeadLetterWrite, which
+	// sanitizes it at the last point before the SQL — see the comment there for
+	// why every writer of this column must.
 	//
 	// redriveAttempts seeds the budget: 0 for transient failures, and
 	// MaxRedriveAttempts for permanent ones, which are kept for forensics only.
-	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO jetstream_dead_letters (consumer_name, event_time_us, event_data, last_error, attempts)
+	err := s.execDeadLetterWrite(ctx, `
+		INSERT INTO jetstream_dead_letters (consumer_name, event_time_us, event_data, attempts, last_error)
 		VALUES ($1, $2, $3, $4, $5)
 		ON CONFLICT DO NOTHING`,
-		consumerName, eventTimeUS, eventData, sanitizeErrorText(handleErr), redriveAttempts,
+		consumerName, eventTimeUS, eventData, redriveAttempts, handleErr,
 	)
 	if err != nil {
 		return fmt.Errorf("add dead letter for %s: %w", consumerName, err)
@@ -107,17 +104,69 @@ func (s *PostgresStateStore) AddDeadLetter(ctx context.Context, consumerName str
 	return nil
 }
 
+// execDeadLetterWrite runs a statement against jetstream_dead_letters whose
+// LAST positional argument is the last_error value, and sanitizes that value
+// here — one funnel, at the last point before the SQL.
+//
+// The funnel exists because sanitizing at the CALL SITES did not hold. Three
+// statements write this column and only the INSERT was scrubbed; the two
+// UPDATEs on the redrive path passed the string straight through. A NUL there
+// does not merely lose a diagnostic — it fails the UPDATE, so `attempts` never
+// increments, the row can never reach MaxRedriveAttempts, and it is re-selected
+// and fully re-handled on every redrive pass forever while redriveAll's
+// forward-progress guard parks the rest of the drain behind it. A fourth writer
+// reaching for s.db.ExecContext directly would reopen exactly that hole, so
+// last_error is written through here and nowhere else.
+func (s *PostgresStateStore) execDeadLetterWrite(ctx context.Context, query string, args ...any) error {
+	last := len(args) - 1
+	if last < 0 {
+		return fmt.Errorf("dead letter write: no arguments, so no last_error to sanitize")
+	}
+	errorText, ok := args[last].(string)
+	if !ok {
+		// A mistake in this file, not a runtime condition: the convention the
+		// funnel enforces is "the last argument is last_error".
+		return fmt.Errorf("dead letter write: last argument must be the last_error string, got %T", args[last])
+	}
+	args[last] = sanitizeErrorText(errorText)
+	_, err := s.db.ExecContext(ctx, query, args...)
+	return err
+}
+
+// Bounds on what one dead letter's diagnostic may cost. last_error is
+// operator-facing EVIDENCE, not a transcript: the errors that reach it can
+// quote a body fetched from a host a stranger named, and a redriven row
+// rewrites the column once per pass.
+const (
+	maxLastErrorBytes         = 4096
+	lastErrorTruncationMarker = " …(truncated)"
+)
+
 // sanitizeErrorText makes an error string safe for a postgres TEXT column
 // while keeping it readable. NUL bytes are stripped (postgres rejects them
 // outright) and any remaining invalid UTF-8 is coerced to the replacement
 // rune, so an operator can still read the diagnostic out of the DLQ. Scrubbing
 // the bad bytes, not discarding the message.
+//
+// The result is also capped, keeping the HEAD: what identifies a failure is the
+// front of its message, and the tail is where an echoed remote body would sit.
 func sanitizeErrorText(s string) string {
 	if s == "" {
 		return s
 	}
 	s = strings.ReplaceAll(s, "\x00", "")
-	return strings.ToValidUTF8(s, "�")
+	truncated := len(s) > maxLastErrorBytes
+	if truncated {
+		// Cut first, validate second: the cut can land mid-rune, and
+		// ToValidUTF8 then turns that trailing fragment into the replacement
+		// rune rather than leaving bytes postgres would reject.
+		s = s[:maxLastErrorBytes]
+	}
+	s = strings.ToValidUTF8(s, "�")
+	if truncated {
+		s += lastErrorTruncationMarker
+	}
+	return s
 }
 
 // ListRetryable returns up to limit dead letters for the consumer that have
@@ -174,7 +223,11 @@ func (s *PostgresStateStore) DeleteDeadLetter(ctx context.Context, id int64) err
 
 // MarkRedriveAttempt increments the attempt counter after a failed redrive.
 func (s *PostgresStateStore) MarkRedriveAttempt(ctx context.Context, id int64, handleErr string) error {
-	_, err := s.db.ExecContext(ctx, `
+	// The counter and the error ride ONE statement, through the sanitizing
+	// funnel: this write is what makes a row's budget finite, so a diagnostic
+	// the column cannot hold must never be able to take the increment down
+	// with it.
+	err := s.execDeadLetterWrite(ctx, `
 		UPDATE jetstream_dead_letters
 		SET attempts = attempts + 1, last_error = $2, updated_at = now()
 		WHERE id = $1`,
@@ -193,7 +246,11 @@ func (s *PostgresStateStore) RetireDeadLetter(ctx context.Context, id int64, rea
 	// costing redrive passes after ONE call, not after the whole budget is
 	// burnt down one attempt at a time. The row STAYS — retiring is about the
 	// redriver, not about forgetting.
-	_, err := s.db.ExecContext(ctx, `
+	//
+	// Through the same funnel, and for the same reason: the reason string
+	// carries the parse error of a frame that would not parse, which is exactly
+	// the frame whose bytes the TEXT column cannot hold.
+	err := s.execDeadLetterWrite(ctx, `
 		UPDATE jetstream_dead_letters
 		SET attempts = GREATEST(attempts, $2), last_error = $3, updated_at = now()
 		WHERE id = $1`,

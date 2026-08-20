@@ -340,3 +340,100 @@ func TestDeadLetters_NULInErrorStringIsSanitizedNotRejected(t *testing.T) {
 	assert.Equal(t, []byte(`{"kind":"commit"}`), dead[0].EventData,
 		"the raw frame is preserved verbatim in the BYTEA column for a faithful redrive")
 }
+
+// ---------------------------------------------------------------------------
+// The OTHER two last_error writers
+// ---------------------------------------------------------------------------
+//
+// AddDeadLetter is only the first of three statements that write the same
+// last_error TEXT column. MarkRedriveAttempt and RetireDeadLetter write it too,
+// and a poison error reaches them by the most ordinary route there is: the
+// handler that first failed fails again on redrive with the same bytes. If
+// either UPDATE passes the string through, postgres rejects the write, the
+// attempt counter never increments, and the row is re-selected and fully
+// re-executed on every redrive pass FOREVER — invisible to the attempts and
+// backlog counters that are supposed to show exactly this.
+
+// poisonErrorText is what a handler failing on a malformed frame — or on a
+// remote body it echoed — hands the DLQ: a NUL postgres TEXT rejects outright,
+// plus invalid UTF-8.
+const poisonErrorText = "still failing: rkey \x00\x00 is invalid \xff\xfe"
+
+func TestDeadLetters_MarkRedriveAttemptSanitizesPoisonError(t *testing.T) {
+	database := consumeStateTestDB(t)
+	store := NewPostgresStateStore(database, CursorSchemaVersion)
+	ctx := context.Background()
+
+	require.NoError(t, store.AddDeadLetter(ctx, ConsumerNative, 1, []byte(`{"time_us":1}`), "first", 0))
+	listed, err := store.ListRetryable(ctx, ConsumerNative, MaxRedriveAttempts, 10)
+	require.NoError(t, err)
+	require.Len(t, listed, 1)
+
+	require.NoError(t, store.MarkRedriveAttempt(ctx, listed[0].ID, poisonErrorText),
+		"a NUL in the redrive failure must NOT fail the UPDATE: the attempt counter is "+
+			"what retires a row, so a failed mark means the row can never reach "+
+			"MaxRedriveAttempts and is re-handled on every pass forever")
+
+	listed, err = store.ListRetryable(ctx, ConsumerNative, MaxRedriveAttempts, 10)
+	require.NoError(t, err)
+	require.Len(t, listed, 1)
+	assert.Equal(t, 1, listed[0].Attempts,
+		"the attempt was actually burnt — the row is one pass closer to retirement")
+	assert.False(t, strings.ContainsRune(listed[0].LastError, 0),
+		"the stored last_error carries no NUL")
+	assert.True(t, utf8.ValidString(listed[0].LastError),
+		"and is valid UTF-8, so an operator can read it out of the queue")
+	assert.Contains(t, listed[0].LastError, "rkey",
+		"while keeping the readable part: sanitizing scrubs bad bytes, it does not "+
+			"discard the diagnostic")
+}
+
+func TestDeadLetters_RetireSanitizesPoisonReason(t *testing.T) {
+	database := consumeStateTestDB(t)
+	store := NewPostgresStateStore(database, CursorSchemaVersion)
+	ctx := context.Background()
+
+	require.NoError(t, store.AddDeadLetter(ctx, ConsumerNative, 1, []byte(`not json`), "parse", 0))
+	listed, err := store.ListRetryable(ctx, ConsumerNative, MaxRedriveAttempts, 10)
+	require.NoError(t, err)
+	require.Len(t, listed, 1)
+
+	// The retirement reason embeds the parse error, which for a byte-corrupt
+	// frame quotes the offending bytes.
+	require.NoError(t, store.RetireDeadLetter(ctx, listed[0].ID, "unparseable event: "+poisonErrorText),
+		"retiring is the escape hatch for a row that can never succeed — it must not "+
+			"itself be defeated by the bytes that made the row unsucceedable")
+
+	retryable, err := store.ListRetryable(ctx, ConsumerNative, MaxRedriveAttempts, 10)
+	require.NoError(t, err)
+	assert.Empty(t, retryable, "the row is exhausted after exactly one call")
+
+	var stored string
+	require.NoError(t, database.QueryRowContext(ctx,
+		`SELECT last_error FROM jetstream_dead_letters`).Scan(&stored))
+	assert.False(t, strings.ContainsRune(stored, 0), "the retirement reason carries no NUL")
+	assert.True(t, utf8.ValidString(stored), "and is valid UTF-8")
+	assert.Contains(t, stored, "unparseable event",
+		"the reason still explains why the row was retired")
+}
+
+// TestDeadLetters_LastErrorIsBounded keeps one unbounded remote string from
+// becoming an unbounded row. last_error is operator-facing EVIDENCE, not a
+// transcript of whatever a stranger's server returned.
+func TestDeadLetters_LastErrorIsBounded(t *testing.T) {
+	database := consumeStateTestDB(t)
+	store := NewPostgresStateStore(database, CursorSchemaVersion)
+	ctx := context.Background()
+
+	huge := "verify handle alice.example: " + strings.Repeat("A", 200_000)
+	require.NoError(t, store.AddDeadLetter(ctx, ConsumerNative, 1, []byte(`{"time_us":1}`), huge, 0))
+	listed, err := store.ListRetryable(ctx, ConsumerNative, MaxRedriveAttempts, 10)
+	require.NoError(t, err)
+	require.Len(t, listed, 1)
+
+	assert.LessOrEqual(t, len(listed[0].LastError), maxLastErrorBytes+len(lastErrorTruncationMarker),
+		"a dead letter's error is capped: an attacker-supplied body must not be able to "+
+			"write an arbitrarily large row on every redrive pass")
+	assert.Contains(t, listed[0].LastError, "verify handle alice.example",
+		"the HEAD of the message is what identifies the failure, so that is what survives")
+}

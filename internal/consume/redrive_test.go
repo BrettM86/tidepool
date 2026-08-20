@@ -4,8 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
+	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -213,4 +216,117 @@ func TestRedriver_DrainsABacklogLargerThanOneBatch(t *testing.T) {
 		return countRows(t, database, "jetstream_dead_letters") == 0
 	})
 	assert.Equal(t, backlog, handler.Calls())
+}
+
+// ---------------------------------------------------------------------------
+// A row whose failure carries poison bytes must still burn its budget
+// ---------------------------------------------------------------------------
+
+// poisonHandler fails for ONE event time with an error carrying the bytes a
+// remote body can plant — a NUL and invalid UTF-8 — and succeeds for every
+// other. This is not exotic: resolver.go echoes a stranger's
+// /.well-known/atproto-did body into a transient error, and that error is what
+// MarkRedriveAttempt writes back into the last_error TEXT column.
+type poisonHandler struct {
+	mu           sync.Mutex
+	poisonTimeUS int64
+	calls        int
+	poisonCalls  int
+}
+
+func (h *poisonHandler) HandleEvent(_ context.Context, event *JetstreamEvent) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.calls++
+	if event.TimeUS == h.poisonTimeUS {
+		h.poisonCalls++
+		return fmt.Errorf("verify handle alice.coves.social: well-known claims \x00\xff\xfe, not did:plc:x")
+	}
+	return nil
+}
+
+func (h *poisonHandler) counts() (calls, poisonCalls int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.calls, h.poisonCalls
+}
+
+// TestRedriver_PoisonFailureStillBurnsItsBudgetAndUnblocksTheDrain is the
+// redriver half of the NUL defense, and the reason it is CRITICAL rather than
+// cosmetic.
+//
+// If MarkRedriveAttempt's UPDATE is rejected by postgres, `attempts` never
+// increments. The row can therefore never reach MaxRedriveAttempts, so
+// ListRetryable returns it again on the very next pass and the handler — DNS
+// lookup, two outbound fetches and all — is fully re-executed FOREVER, with
+// nothing in the attempts or backlog counters to show for it. And because it is
+// always the OLDEST row, redriveAll's forward-progress guard (redriven+retired
+// == 0 → break) parks the whole consumer's drain behind it: the good row
+// queued after it is never reached.
+//
+// The passes are driven directly, one per call, so the assertion is about the
+// redriver's pass semantics rather than about wall-clock time.
+func TestRedriver_PoisonFailureStillBurnsItsBudgetAndUnblocksTheDrain(t *testing.T) {
+	database := redriveTestDB(t)
+	state := NewPostgresStateStore(database, CursorSchemaVersion)
+	ctx := context.Background()
+
+	const poisonTimeUS, healthyTimeUS = 6_000, 6_001
+	// The poison row is OLDEST, so it is claimed first every pass and stands in
+	// front of the healthy one.
+	require.NoError(t, state.AddDeadLetter(ctx, ConsumerNative, poisonTimeUS,
+		connFrame(poisonTimeUS, "3lzrev0000001", "aaa"), "first failure", 0))
+	require.NoError(t, state.AddDeadLetter(ctx, ConsumerNative, healthyTimeUS,
+		connFrame(healthyTimeUS, "3lzrev0000002", "bbb"), "postgres blip", 0))
+
+	handler := &poisonHandler{poisonTimeUS: poisonTimeUS}
+	// Batch size 1: one row per claim, so each pass is exactly one attempt on
+	// the oldest retryable row.
+	redriver := NewDeadLetterRedriver(state,
+		map[string]EventHandler{ConsumerNative: handler},
+		WithRedriveInterval(time.Hour), WithRedriveBatchSize(1))
+
+	for pass := 1; pass <= MaxRedriveAttempts; pass++ {
+		redriver.redriveAll(ctx)
+
+		var attempts int
+		require.NoError(t, database.QueryRowContext(ctx,
+			`SELECT attempts FROM jetstream_dead_letters WHERE event_time_us = $1`,
+			int64(poisonTimeUS)).Scan(&attempts))
+		require.Equal(t, pass, attempts,
+			"pass %d must have burnt an attempt on the poison row: a failed last_error "+
+				"UPDATE leaves attempts at 0, and a row that cannot count its attempts "+
+				"can never retire — it is re-handled on every pass forever", pass)
+	}
+
+	retryable, err := state.ListRetryable(ctx, ConsumerNative, MaxRedriveAttempts, 10)
+	require.NoError(t, err)
+	require.Len(t, retryable, 1,
+		"the poison row has exhausted its budget and left the retryable set; only the "+
+			"healthy row behind it is still queued")
+	assert.Equal(t, int64(healthyTimeUS), retryable[0].EventTimeUS)
+
+	// And the drain is no longer parked behind it.
+	redriver.redriveAll(ctx)
+
+	remaining, err := state.ListRetryable(ctx, ConsumerNative, MaxRedriveAttempts, 10)
+	require.NoError(t, err)
+	assert.Empty(t, remaining,
+		"the row queued BEHIND the poison one is finally redriven — a row that can never "+
+			"retire stalls the whole consumer's dead letter drain")
+
+	_, poisonCalls := handler.counts()
+	assert.Equal(t, MaxRedriveAttempts, poisonCalls,
+		"the poison row costs exactly its budget of handler executions, not an unbounded "+
+			"number: each replay re-runs the full handler, DNS and outbound fetches included")
+
+	var stored string
+	require.NoError(t, database.QueryRowContext(ctx,
+		`SELECT last_error FROM jetstream_dead_letters WHERE event_time_us = $1`,
+		int64(poisonTimeUS)).Scan(&stored))
+	assert.False(t, strings.ContainsRune(stored, 0),
+		"and the stored diagnostic carries no NUL")
+	assert.True(t, utf8.ValidString(stored), "and is valid UTF-8 for the operator triaging it")
+	assert.Contains(t, stored, "verify handle alice.coves.social",
+		"while still saying why the row is STILL failing")
 }

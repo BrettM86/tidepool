@@ -379,8 +379,11 @@ func schemeOf(actorID string) string {
 // normalizeHost reduces a URL authority to the authority it names — lowercase,
 // no trailing dot, no default port — so it can be compared with the
 // normalized_origin an actor was minted under. It is the read-side twin of
-// personas' own normalizeHost; a NON-default port still carries meaning,
-// because the dev origin runs on :8091 and that is a different origin.
+// personas.NormalizeHost — the exported name of the rule the Host router, the
+// serving surface, and config's shadow check all key on — and must stay
+// behaviourally identical to it; TestNormalizeHostMatchesPersonas pins that. A
+// NON-default port still carries meaning, because the dev origin runs on :8091
+// and that is a different origin.
 func normalizeHost(host string) string {
 	normalized := strings.ToLower(strings.TrimSpace(host))
 	for _, defaultPort := range []string{":443", ":80"} {

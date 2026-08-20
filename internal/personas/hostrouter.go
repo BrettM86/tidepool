@@ -207,8 +207,15 @@ func (b *bufferedResponse) flushTo(w http.ResponseWriter) {
 	_, _ = w.Write(b.body.Bytes())
 }
 
-// normalizeHost reduces a Host header to the authority it names: lowercase,
-// no trailing dot, and no default port for either scheme.
+// NormalizeHost reduces an authority to the ONE string this bridge compares:
+// lowercase, no trailing dot, and no default port for either scheme.
+//
+// It is THE definition of "the same authority" for the whole process. The Host
+// router keys on it, serving binds each actor to it, CanonicalizeOrigin
+// reduces the minted normalized_origin through it, and config's shadow check
+// compares BOTH sides with it — the last one matters because a check that
+// reduces differently from the router can pass a pair the router then collapses
+// into composed mode. One rule, one place, no site allowed to disagree.
 //
 // Both default ports are stripped unconditionally, without consulting r.TLS.
 // In production TLS terminates at the proxy and the Go server sees plain HTTP
@@ -216,7 +223,10 @@ func (b *bufferedResponse) flushTo(w http.ResponseWriter) {
 // "coves.social:443" as an unknown authority precisely where it matters. A
 // NON-default port still carries meaning — the dev origin runs on :8091 and
 // coves.social:8443 is a different origin, not a sloppy spelling of one.
-func normalizeHost(host string) string {
+//
+// internal/echo carries a byte-identical private twin for read-side actor
+// classification; the two are documented as one rule and must move together.
+func NormalizeHost(host string) string {
 	normalized := strings.ToLower(strings.TrimSpace(host))
 	for _, defaultPort := range []string{":443", ":80"} {
 		if trimmed, found := strings.CutSuffix(normalized, defaultPort); found {
@@ -226,6 +236,9 @@ func normalizeHost(host string) string {
 	}
 	return strings.TrimSuffix(normalized, ".")
 }
+
+// normalizeHost is the package-internal spelling of NormalizeHost.
+func normalizeHost(host string) string { return NormalizeHost(host) }
 
 // hostnameOnly strips a port and IPv6 brackets, leaving the name or address.
 func hostnameOnly(host string) string {

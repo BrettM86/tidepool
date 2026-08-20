@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"tidepool/internal/errors"
+	"tidepool/internal/personas"
 	"tidepool/internal/store"
 	"tidepool/internal/testutil"
 )
@@ -398,6 +399,26 @@ func TestIdentifyRefusesWhatWeDoNotServe(t *testing.T) {
 			assert.Empty(t, identity.DID, "a non-identity carries no entity")
 			assert.Empty(t, identity.ATURI, "a non-identity carries no record")
 		})
+	}
+}
+
+// TestNormalizeHostMatchesPersonas pins the hand-copy to its original
+// DIRECTLY, not just through classification outcomes. echo's normalizeHost is a
+// duplicate of personas.NormalizeHost, and the two are the read side and the
+// write side of one question — "is this authority ours?" — asked about rows
+// whose normalized_origin was frozen at mint. If they ever disagree, echo
+// either fails to recognize our own actor ids (duplicating content) or claims
+// ids that are not ours (dropping genuine content), and no test in either
+// package would otherwise notice.
+func TestNormalizeHostMatchesPersonas(t *testing.T) {
+	for _, host := range []string{
+		"", "coves.social", "COVES.SOCIAL", "coves.social.", " coves.social ",
+		"coves.social:443", "coves.social:80", "coves.social:8091",
+		"COVES.SOCIAL:443", "coves.social:443.", "localhost", "localhost:8091",
+		"[::1]", "[::1]:443", "[::1]:8091", "127.0.0.1:80", "tdpl.io:8443",
+	} {
+		assert.Equal(t, personas.NormalizeHost(host), normalizeHost(host),
+			"echo and personas must reduce %q to the same authority", host)
 	}
 }
 

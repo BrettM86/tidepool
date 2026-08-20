@@ -271,8 +271,12 @@ func (s *Service) handleActorDocument(w http.ResponseWriter, r *http.Request, di
 		s.writeStoreError(w, r, err)
 		return
 	}
-	if !s.servesActor(actor, r) {
-		http.NotFound(w, r)
+	// The gate runs BEFORE the tombstone branch: the Tombstone body publishes
+	// the same actor_id (as its id, and inside publicKey), so a row this
+	// refuses to serve as a Person must not slip out as a Gone document either.
+	origin, err := s.servedActor(actor, normalizeHost(r.Host))
+	if err != nil {
+		s.writeServedActorError(w, r, actor, err)
 		return
 	}
 	// WITHDRAWN (task 17d's destructive tier): 410 Gone, and specifically not
@@ -310,13 +314,6 @@ func (s *Service) handleActorDocument(w http.ResponseWriter, r *http.Request, di
 		return
 	}
 
-	origin, err := actorOrigin(actor)
-	if err != nil {
-		s.logger.Error("stored actor_id is not an absolute URL",
-			"did", actor.DID, "actor_id", actor.ActorID, "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
 	inbox := origin + inboxPath
 	// The display name falls back to the local part: Lemmy renders `name`,
 	// and an empty one shows as a blank user until task 14's profile sync
@@ -370,8 +367,11 @@ func (s *Service) handleOutbox(w http.ResponseWriter, r *http.Request, did strin
 		s.writeStoreError(w, r, err)
 		return
 	}
-	if !s.servesActor(actor, r) {
-		http.NotFound(w, r)
+	// Same gate as the actor document, and for the same reason: this collection's
+	// id IS the actor_id with a suffix, so an id the actor document refuses to
+	// publish must not reach a peer through the outbox instead.
+	if _, err := s.servedActor(actor, normalizeHost(r.Host)); err != nil {
+		s.writeServedActorError(w, r, actor, err)
 		return
 	}
 	// The outbox answers the same way the actor does. An actor that is Gone with
@@ -468,7 +468,11 @@ func (s *Service) lookupResource(ctx context.Context, resource, host string) (*s
 		if normalizeHost(acctHost) != host {
 			return nil, errors.NewNotFoundError("ap_actor", resource)
 		}
-		return s.actors.GetByOriginLocalPart(ctx, host, strings.ToLower(local))
+		actor, err := s.actors.GetByOriginLocalPart(ctx, host, strings.ToLower(local))
+		if err != nil {
+			return nil, err
+		}
+		return s.servedActorOrError(actor, host)
 	}
 
 	parsed, err := url.Parse(resource)
@@ -487,28 +491,93 @@ func (s *Service) lookupResource(ctx context.Context, resource, host string) (*s
 		return nil, err
 	}
 	// The DID is global but this answer must not be: an actor minted on
-	// another origin does not resolve here.
-	if actor.NormalizedOrigin != host {
-		return nil, errors.NewNotFoundError("ap_actor", resource)
+	// another origin does not resolve here. servedActor is what enforces that,
+	// together with the actor_id check WebFinger needs most — its href is the
+	// value every remote resolver caches.
+	return s.servedActorOrError(actor, host)
+}
+
+// servedActorOrError runs the served-actor gate and hands back the actor, so
+// lookupResource's two spellings both return a row that has already been
+// checked. WebFinger never sees an actor the other two handlers would refuse.
+func (s *Service) servedActorOrError(actor *store.APActor, host string) (*store.APActor, error) {
+	if _, err := s.servedActor(actor, host); err != nil {
+		s.logUnusableActor(actor, err)
+		return nil, err
 	}
 	return actor, nil
 }
 
-// servesActor reports whether the routed Host is the actor's OWN origin. The
-// DID is global but the actor is not: serving a vanity-origin actor's
-// document under another Host would publish a document whose id sits on a
-// different authority — the cross-authority claim ap.Client's key resolution
-// refuses, and the mirror image of the binding webfinger already enforces.
-func (s *Service) servesActor(actor *store.APActor, r *http.Request) bool {
-	return actor.NormalizedOrigin == normalizeHost(r.Host)
+// writeServedActorError reports a refused actor. A host miss is an ordinary
+// 404 — this origin simply does not host that account. A corrupt actor_id is
+// OUR bug: 500, never 404, because a resolver caches a 404 as "no such account"
+// and would stop asking about a row an operator can still repair.
+func (s *Service) writeServedActorError(w http.ResponseWriter, r *http.Request, actor *store.APActor, err error) {
+	if errors.IsNotFound(err) {
+		http.NotFound(w, r)
+		return
+	}
+	s.logUnusableActor(actor, err)
+	http.Error(w, "internal error", http.StatusInternalServerError)
+}
+
+// logUnusableActor records the offending row. Nothing else in the system would
+// ever mention it: the response body says "internal error", and a row that
+// cannot state its own identity is not something to discover from a traffic
+// graph.
+func (s *Service) logUnusableActor(actor *store.APActor, err error) {
+	if errors.IsNotFound(err) {
+		return
+	}
+	s.logger.Error("refusing to publish an actor whose stored actor_id is unusable",
+		"did", actor.DID, "actor_id", actor.ActorID,
+		"normalized_origin", actor.NormalizedOrigin, "error", err)
+}
+
+// servedActor is THE gate every surface that publishes an actor_id passes
+// through: the actor document, the outbox, and WebFinger. It answers "is this
+// row safe to publish under the routed Host", and returns the origin the row's
+// ids sit on so the caller does not re-derive it.
+//
+// It exists as ONE function because the guard is only worth what its narrowest
+// coverage is. The fail-closed actor_id check used to live inside
+// handleActorDocument alone, so a row it refused to serve as a Person document
+// still went out as an outbox collection and — worse — as WebFinger's alias and
+// both rel=self hrefs, which is the value every remote resolver caches and
+// re-fetches. Three handlers publishing one field cannot each carry their own
+// idea of when that field is trustworthy.
+//
+// Two conditions, both fail-closed:
+//
+//   - HOST BINDING. The DID is global but the actor is not: serving a
+//     vanity-origin actor under another Host would publish a document whose id
+//     sits on a different authority — the cross-authority claim ap.Client's key
+//     resolution refuses, and the mirror image of the binding webfinger already
+//     enforces. A miss here is NotFound, so it reads as "no such account".
+//
+//   - ID INTEGRITY. The stored actor_id must be an absolute URL on the SAME
+//     authority the row is bound to. A row failing that is corrupt, and every
+//     document built from it would pair this origin's inbox and key with an id
+//     that belongs to someone else — quietly, and cached by every peer that
+//     fetched it. This is not a miss and must not be cached as one: it surfaces
+//     as a plain error, which the callers log and answer 500 for.
+func (s *Service) servedActor(actor *store.APActor, host string) (string, error) {
+	if actor.NormalizedOrigin != host {
+		return "", errors.NewNotFoundError("ap_actor", actor.DID)
+	}
+	origin, err := actorOrigin(actor)
+	if err != nil {
+		return "", err
+	}
+	return origin, nil
 }
 
 // actorOrigin recovers the scheme+host an actor was minted under from its
 // stored actor_id, so a vanity-origin actor advertises its own inbox rather
-// than the configured one. It FAILS CLOSED: an actor_id that will not parse
-// means the row is corrupt, and falling back to the configured origin would
-// publish a document whose inbox and key belong to a different authority than
-// its id — quietly, and cached by every peer that fetched it.
+// than the configured one. It FAILS CLOSED: an actor_id that will not parse,
+// or that names an authority other than the one the row is bound to, means the
+// row is corrupt, and publishing it would put this origin's inbox and key on a
+// document whose id belongs to a different authority.
 func actorOrigin(actor *store.APActor) (string, error) {
 	parsed, err := url.Parse(actor.ActorID)
 	if err != nil {
@@ -516,6 +585,13 @@ func actorOrigin(actor *store.APActor) (string, error) {
 	}
 	if parsed.Scheme == "" || parsed.Host == "" {
 		return "", fmt.Errorf("actor_id %q is not an absolute URL", actor.ActorID)
+	}
+	// normalized_origin is derived from actor_id at mint, so the two can only
+	// disagree if the row was written by something other than the mint path or
+	// edited afterwards. Either way the row no longer states one identity.
+	if host := normalizeHost(parsed.Host); host != actor.NormalizedOrigin {
+		return "", fmt.Errorf("actor_id %q names authority %q but the row is bound to %q",
+			actor.ActorID, host, actor.NormalizedOrigin)
 	}
 	return parsed.Scheme + "://" + parsed.Host, nil
 }

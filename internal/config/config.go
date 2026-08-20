@@ -798,9 +798,18 @@ func boolVarDefault(logger *slog.Logger, name string, fallback bool) (bool, erro
 //
 // Bridged handles are subdomains of BRIDGE_HOSTNAME resolved off r.Host, so a
 // user origin AT that name or UNDER it would swallow them — and the Host
-// router could not tell the two surfaces apart in the first place. The
-// comparison runs on canonical forms in both directions, or a second spelling
-// of BRIDGE_HOSTNAME ("https://TDPL.IO:443") walks straight past the check.
+// router could not tell the two surfaces apart in the first place.
+//
+// BOTH SIDES REDUCE THROUGH personas.NormalizeHost — the very function the Host
+// router applies to every request. That is the point: a check that reduces
+// differently from the router can pass a pair the router then collapses. It
+// used to canonicalize only the ORIGIN side, so the spelling its own comment
+// named ("https://TDPL.IO:443") walked straight past whenever it appeared on
+// the BRIDGE_HOSTNAME side instead — and BRIDGE_HOSTNAME "tdpl.io:443" with
+// AP_USER_ORIGIN "https://tdpl.io" passed boot, whereupon normalizeHost folded
+// both to "tdpl.io" and the router quietly entered COMPOSED mode in production,
+// a shape only the dev default was ever meant to reach.
+//
 // Matching is on a label boundary, so "nottidepool.example" is not under
 // "tidepool.example", and a different port is a different authority (the dev
 // defaults are exactly that shape: BRIDGE_HOSTNAME localhost, origin on
@@ -818,12 +827,30 @@ func validateUserOrigin(origin, bridgeHostname string, isDevelopment bool) (stri
 		return "", fmt.Errorf("config: AP_USER_ORIGIN must be https in production, got %q", canonical)
 	}
 
-	bridge := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(bridgeHostname)), ".")
+	bridge := canonicalBridgeHost(bridgeHostname)
 	if host == bridge || strings.HasSuffix(host, "."+bridge) {
 		return "", fmt.Errorf("config: AP_USER_ORIGIN host %q must not be BRIDGE_HOSTNAME %q "+
 			"or a subdomain of it: the bridged handle namespace lives there", host, bridge)
 	}
 	return canonical, nil
+}
+
+// canonicalBridgeHost reduces BRIDGE_HOSTNAME to the authority the Host router
+// will compare it as. It is a HOSTNAME, not a URL, but operators write it as
+// one often enough that a pasted "https://tdpl.io" must not read as a different
+// authority than "tdpl.io" — the whole value of this check is that it agrees
+// with the router, and the router only ever sees the authority.
+func canonicalBridgeHost(raw string) string {
+	host := strings.TrimSpace(raw)
+	if _, after, found := strings.Cut(host, "://"); found {
+		host = after
+	}
+	// A path, query, or fragment is not part of the authority; cutting at the
+	// first delimiter leaves the part the router would key on.
+	host, _, _ = strings.Cut(host, "/")
+	host, _, _ = strings.Cut(host, "?")
+	host, _, _ = strings.Cut(host, "#")
+	return personas.NormalizeHost(host)
 }
 
 // stringVar returns the value of an environment variable. When unset it

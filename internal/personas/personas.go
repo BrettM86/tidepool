@@ -13,6 +13,9 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
+
+	"github.com/bluesky-social/indigo/atproto/syntax"
 
 	"tidepool/internal/ap"
 	"tidepool/internal/errors"
@@ -146,6 +149,9 @@ func New(opts Options) (*Service, error) {
 // The actor is Person, not Service: Lemmy classifies Service actors as bots
 // and drops their votes.
 func (s *Service) CreateActorForDID(ctx context.Context, did, handle string) (*store.APActor, error) {
+	if err := validateActorDID(did); err != nil {
+		return nil, err
+	}
 	existing, err := s.actors.GetByDID(ctx, did)
 	if err == nil {
 		return existing, nil
@@ -218,6 +224,40 @@ func (s *Service) CreateActorForDID(ctx context.Context, did, handle string) (*s
 	s.logger.Error("local part namespace exhausted: no free suffix left for a derived name",
 		"local_part", base, "attempts", maxLocalPartAttempts, "did", did)
 	return nil, fmt.Errorf("%w: %q after %d attempts", ErrLocalPartExhausted, base, maxLocalPartAttempts)
+}
+
+// validateActorDID gates the OTHER frozen identity input. DeriveLocalPart runs
+// the handle through atproto handle syntax before freezing it; the DID is
+// frozen just as hard — it is concatenated into actor_id, and from there into
+// keyId, the WebFinger href, and the signing identity — and used to arrive with
+// no gate at all.
+//
+// Two rules, both about SERVABILITY, since a minted actor that cannot answer
+// its own URL can never be repaired (actor_id is frozen and re-minting would
+// orphan every signature the published key has already made):
+//
+//   - atproto DID syntax, the same library gate the handle gets. It rejects the
+//     empty string, a missing "did:" prefix, whitespace, and — the one that
+//     matters here — any "/", which ServeHTTP treats as a 404 on /ap/actor/,
+//     so such an actor could never serve its own document.
+//
+//   - no "%". DID syntax permits percent-encoding, but the row stores the DID
+//     VERBATIM while r.URL.Path arrives percent-DECODED, so a peer fetching the
+//     exact actor_id we published looks up "did:web:example.com:8080" against a
+//     row keyed "did:web:example.com%3A8080" and misses forever.
+//
+// Failure is a ValidationError: permanent, never retryable. A caller that
+// re-queued this DID would re-fail on every attempt until something upstream
+// stopped handing it a malformed identifier.
+func validateActorDID(did string) error {
+	if _, err := syntax.ParseDID(did); err != nil {
+		return errors.NewValidationError("did", fmt.Sprintf("%q is not a valid DID: %v", did, err))
+	}
+	if strings.Contains(did, "%") {
+		return errors.NewValidationError("did", fmt.Sprintf(
+			"%q is percent-encoded: the served path arrives decoded, so this actor could never be looked up again", did))
+	}
+	return nil
 }
 
 // suffixedLocalPart names the attempt'th claimant of base: the first keeps

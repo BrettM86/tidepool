@@ -440,6 +440,44 @@ func TestLoad_APUserOriginShadowCheckIsCanonical(t *testing.T) {
 	}
 }
 
+// TestLoad_APUserOriginShadowCheckCanonicalizesTheBridgeSide: the check
+// canonicalized only the ORIGIN side, so its own cited defence
+// ("https://TDPL.IO:443") walked past it whenever the second spelling was on
+// the BRIDGE_HOSTNAME side instead. Both sides must reduce with the SAME rule
+// the Host router uses, or the check and the router disagree about what "the
+// same authority" means — and the router is the one production listens to.
+func TestLoad_APUserOriginShadowCheckCanonicalizesTheBridgeSide(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		hostname string
+		origin   string
+	}{
+		{"bridge side carries the default port", "tdpl.io:443", "https://tdpl.io"},
+		{"bridge side is uppercase", "TDPL.IO", "https://tdpl.io"},
+		{"bridge side is fully qualified", "tdpl.io.", "https://tdpl.io"},
+		{"bridge side spells the port and the case", "TDPL.IO:443", "https://tdpl.io"},
+		{"bridge side carries a scheme", "https://tdpl.io", "https://tdpl.io"},
+		{"both sides wear a different spelling", "TDPL.IO:443", "https://tdpl.io."},
+		// The composed-mode trap: neither string equals the other, the check
+		// passes, and then normalizeHost collapses BOTH to "tdpl.io" so the
+		// router silently serves the two surfaces off one authority — in
+		// production, where composition was never meant to happen.
+		{"subdomain under a differently spelled bridge host", "TDPL.IO:443", "https://users.tdpl.io"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearConfigEnv(t)
+			t.Setenv("BRIDGE_HOSTNAME", tc.hostname)
+			t.Setenv("AP_USER_ORIGIN", tc.origin)
+
+			_, err := Load(discardLogger())
+			require.Error(t, err,
+				"BRIDGE_HOSTNAME %q and AP_USER_ORIGIN %q name one authority to the Host router",
+				tc.hostname, tc.origin)
+			assert.Contains(t, err.Error(), "AP_USER_ORIGIN")
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Task 14 cycle K1: the Jetstream consumer's configuration.
 //

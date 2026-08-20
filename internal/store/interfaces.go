@@ -499,6 +499,16 @@ type OutboundObjects interface {
 	// error satisfying errors.IsValidation.
 	TombstoneTx(ctx context.Context, tx *sql.Tx, atURI string) (*OutboundObject, error)
 
+	// UntombstoneTx clears tombstoned_at on an existing transaction: the
+	// object is live outward again because a caller re-published it. It is
+	// the ONLY way the flag comes off — Upsert deliberately preserves it —
+	// so re-publishing and un-tombstoning commit together or not at all.
+	// LastActivitySeq is untouched (the upsert on the same transaction owns
+	// the activity-id counter). Clearing an already-live row is a no-op
+	// success; a missing row is an error satisfying errors.IsNotFound, and a
+	// nil tx one satisfying errors.IsValidation.
+	UntombstoneTx(ctx context.Context, tx *sql.Tx, atURI string) (*OutboundObject, error)
+
 	// SetAccepted stamps accepted_at — the causal-gating marker (task 15,
 	// decision 15). Delivery SUCCESS sets it; a NULL accepted_at means the
 	// object has not yet been delivered to its community, which is what keeps a

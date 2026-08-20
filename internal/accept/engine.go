@@ -378,29 +378,10 @@ func (e *Engine) AdmitPost(ctx context.Context, did string, commit *consume.Comm
 			// reversals, depending on which door the author knocked on.
 			//
 			// The ban already stopped everything new and cancelled everything
-			// queued. The edit is simply refused, and the ledger says why.
-			//
-			// Recorded through RecordRefusal, NOT Record: the post is still
-			// accepted, and the full upsert would say otherwise — status
-			// 'rejected' with the acceptance pins blanked. ListAccepted (the
-			// removeData purge's only input) selects status='accepted', so the
-			// ordinary sequence ban → typo fix → re-ban with removeData=true
-			// would purge everything of this author's EXCEPT the post they
-			// edited: erased on Lemmy, still served here under the community's
-			// name.
-			e.logger.Info("refusing a banned author's edit; the standing acceptance is left alone",
-				slog.String("did", did), slog.String("post", postURI),
-				slog.String("community", communityDID))
-			return e.admissions.RecordRefusal(ctx, Admission{
-				AuthorDID:    did,
-				CommunityDID: communityDID,
-				PostURI:      postURI,
-				// No status: the post stands exactly as it did, and the ledger
-				// must keep saying so.
-				DecisionCode:      code,
-				EvaluatedCID:      commit.CID,
-				EvaluatedSnapshot: e.evaluatedSnapshot(commit),
-			})
+			// queued. The edit is simply refused, and the ledger says why —
+			// WITHOUT disturbing the standing acceptance (see recordBanRefusal
+			// for why the status must not move).
+			return e.recordBanRefusal(ctx, did, communityDID, postURI, commit, priorAccepted)
 		}
 		if priorAccepted {
 			return e.removeAccepted(ctx, did, communityDID, postURI, commit, prior, code)
@@ -430,31 +411,10 @@ func (e *Engine) AdmitPost(ctx context.Context, did string, commit *consume.Comm
 			e.logger.Info("a ban landed mid-admission; the post was not accepted",
 				slog.String("did", did), slog.String("post", postURI),
 				slog.String("community", communityDID))
-			if priorAccepted {
-				// This was an EDIT of a live post, and the rollback left its
-				// PRIOR acceptance standing — the same state the carve-out above
-				// protects, reached one door over. The refusal is recorded
-				// without disturbing it: a 'rejected' row here would take the
-				// post out of ListAccepted, and a later removeData ban would skip
-				// the one post its author had edited.
-				return e.admissions.RecordRefusal(ctx, Admission{
-					AuthorDID:         did,
-					CommunityDID:      communityDID,
-					PostURI:           postURI,
-					DecisionCode:      DecisionAuthorBanned,
-					EvaluatedCID:      commit.CID,
-					EvaluatedSnapshot: e.evaluatedSnapshot(commit),
-				})
-			}
-			return e.admissions.Record(ctx, Admission{
-				AuthorDID:         did,
-				CommunityDID:      communityDID,
-				PostURI:           postURI,
-				Status:            StatusRejected,
-				DecisionCode:      DecisionAuthorBanned,
-				EvaluatedCID:      commit.CID,
-				EvaluatedSnapshot: e.evaluatedSnapshot(commit),
-			})
+			// When this was an EDIT of a live post the rollback left its PRIOR
+			// acceptance standing — the same state the carve-out above protects,
+			// reached one door over — so recordBanRefusal keeps the status.
+			return e.recordBanRefusal(ctx, did, communityDID, postURI, commit, priorAccepted)
 		}
 		if stderrors.Is(err, ErrModeratorRemovalStands) {
 			// Decided and recorded inside accept(): the community removed this
@@ -466,6 +426,51 @@ func (e *Engine) AdmitPost(ctx context.Context, did string, commit *consume.Comm
 		return err
 	}
 	return nil
+}
+
+// recordBanRefusal records an event refused because the community has BANNED the
+// author, and NOTHING else: no acceptance, no removal, no enqueue. It is the one
+// transition every door into the engine has to make the same way — the live
+// AdmitPost gate, the mid-admission ErrAuthorBanned rollback, and the admin
+// Readmit — because the harm of getting it wrong is on the wire and is the same
+// through all three.
+//
+// priorAccepted decides ONLY how the ledger row moves:
+//
+//   - TRUE: the post is still live and its acceptance still stands, so the status
+//     is KEPT (RecordRefusal with no status). Flipping it to 'rejected' would take
+//     the post out of ListAccepted — the removeData purge's only input — so a
+//     later re-ban with removeData=true would purge everything of this author's
+//     EXCEPT this post: erased on Lemmy, still served here under the community's
+//     name. CountAccepted would likewise free a live post's quota.
+//   - FALSE: nothing of this post is live, so the row records the rejection
+//     outright.
+//
+// A ban is author-state, not a judgement of the post. Removing here would strip
+// content Lemmy KEPT (a ban without removeData leaves it standing) and enqueue a
+// Delete{Page} at the community that just banned the author — the outbound echo
+// every other moderation path exists to avoid.
+func (e *Engine) recordBanRefusal(ctx context.Context, did, communityDID, postURI string,
+	commit *consume.CommitEvent, priorAccepted bool) error {
+
+	e.logger.Info("refusing a banned author's post",
+		slog.String("did", did), slog.String("post", postURI),
+		slog.String("community", communityDID), slog.Bool("acceptance_stands", priorAccepted))
+
+	adm := Admission{
+		AuthorDID:         did,
+		CommunityDID:      communityDID,
+		PostURI:           postURI,
+		DecisionCode:      DecisionAuthorBanned,
+		EvaluatedCID:      commit.CID,
+		EvaluatedSnapshot: e.evaluatedSnapshot(commit),
+	}
+	if priorAccepted {
+		// No Status: RecordRefusal keeps the one the row already has.
+		return e.admissions.RecordRefusal(ctx, adm)
+	}
+	adm.Status = StatusRejected
+	return e.admissions.Record(ctx, adm)
 }
 
 // The AP op strings the deterministic activity id and the Page translation key
@@ -686,6 +691,29 @@ func (e *Engine) accept(ctx context.Context, did, communityDID, postURI string, 
 		})
 		if err != nil {
 			return fmt.Errorf("accept: write outbound state for %s: %w", postURI, err)
+		}
+		// THE POST IS LIVE OUTWARD AGAIN, so the row must stop saying it is dead.
+		// Reaching here means an acceptance is being written and a Create/Update
+		// {Page} enqueued on this very transaction, which is the definition of
+		// live — and this is the one path that re-publishes a TOMBSTONED post: the
+		// engine's own auto-restore (editAgainstRemoval reversing an
+		// admission-revoked removal) and a Readmit of a withdrawn post both land
+		// here, and UpsertTx deliberately preserves the tombstone.
+		//
+		// Leaving it set would corrupt BOTH facts the engine reads off it. The
+		// next edit would federate as a Create for an object Lemmy already holds
+		// (wasLive is exactly this flag), and — worse — a later failing edit would
+		// be recorded as a plain rejection instead of a REMOVAL, leaving the
+		// restore's acceptance signed and its Lemmy copy standing while the ledger
+		// says the post was refused: the repo-vs-ledger divergence removeAccepted
+		// exists to prevent.
+		//
+		// It rides this transaction, so the acceptance record, the enqueue and the
+		// live-ness fact commit together or roll back together. wasLive was read
+		// BEFORE the transaction, so clearing it here cannot change the op chosen
+		// for THIS publication.
+		if _, err := e.objects.UntombstoneTx(sctx, tx, postURI); err != nil {
+			return fmt.Errorf("accept: clear outbound tombstone for %s: %w", postURI, err)
 		}
 		// Create unless Lemmy already holds a live copy AND this is a later
 		// activity (seq bumped past the initial 0). The seq is guarded on CID
@@ -922,10 +950,28 @@ func (e *Engine) removeAccepted(ctx context.Context, did, communityDID, postURI 
 func (e *Engine) authorDelete(ctx context.Context, did, postURI string) error {
 	stored, err := e.objects.GetByATURI(ctx, postURI)
 	if errors.IsNotFound(err) {
-		// A post this bridge never accepted: nothing to withdraw.
-		e.logger.Debug("author delete for a post with no outbound state",
-			slog.String("did", did), slog.String("post", postURI))
-		return nil
+		// A post this bridge never accepted: nothing to withdraw OUTWARD — but
+		// its LEDGER row is still here, and that is not an edge case. The engine
+		// writes outbound_objects only on accept, so "no outbound state" is the
+		// NORMAL state of every rejected post, and every rejection stores the
+		// evaluated_snapshot a readmit re-runs admission from.
+		//
+		// Walking away leaves that snapshot outliving the record it describes.
+		// /admin/admissions/readmit then re-decides from it — and when the
+		// rejection's cause has since cleared (the author re-enabled federation,
+		// the community's follow was accepted), it signs a fresh acceptance whose
+		// strongRef pins a postv2 that no longer exists and federates content the
+		// author erased. A deletion the bridge cannot see is the one input a
+		// re-decision from stored state can never be corrected by.
+		//
+		// THE TRADE-OFF, stated: the row is HARD-DELETED, so the audit trail of
+		// "we once rejected this, and why" is lost. That is the same ruling the
+		// accepted branch below already made (DeleteTx), for the same reason — the
+		// decided post is gone and no removal record stands to explain a status —
+		// and the ledger is documented as the admin/debug surface, NOT the
+		// correctness path (Coves reads state from the acceptance/removal records).
+		// Losing a debug row is strictly better than resurrecting deleted content.
+		return e.forgetDecision(ctx, did, postURI)
 	}
 	if err != nil {
 		return fmt.Errorf("accept: read outbound state for %s: %w", postURI, err)
@@ -954,6 +1000,28 @@ func (e *Engine) authorDelete(ctx context.Context, did, postURI string) error {
 		return fmt.Errorf("accept: author-delete %s from %s: %w", postURI, communityDID, err)
 	}
 	return nil
+}
+
+// forgetDecision drops the ledger row for a post the author deleted before it
+// was ever accepted. GetByPostURI is unambiguous here: migration 031's unique
+// index makes one post_uri hold at most one admissions row, so the community it
+// names is THE community that decided on this post. A post the engine never
+// decided on is a no-op success (a redelivered delete, or a post for a community
+// this bridge does not federate).
+func (e *Engine) forgetDecision(ctx context.Context, did, postURI string) error {
+	adm, err := e.admissions.GetByPostURI(ctx, postURI)
+	if errors.IsNotFound(err) {
+		e.logger.Debug("author delete for a post with no outbound state and no ledger row",
+			slog.String("did", did), slog.String("post", postURI))
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	e.logger.Info("author deleted a post that was never accepted; dropping its ledger row",
+		slog.String("did", did), slog.String("post", postURI),
+		slog.String("community", adm.CommunityDID), slog.String("status", adm.Status))
+	return e.admissions.Delete(ctx, adm.CommunityDID, postURI)
 }
 
 // priorBinding reads the post's outbound state — present only after an accept —
@@ -1162,8 +1230,26 @@ func (e *Engine) Readmit(ctx context.Context, postATURI string) (*ReadmitResult,
 		// reported as still-failing with the immutability cause.
 		return &ReadmitResult{PostURI: postATURI, Status: adm.Status, DecisionCode: DecisionCommunityImmutable}, nil
 	}
+	// Whether the post is LIVE right now, read exactly as AdmitPost reads it: it
+	// federated once and has not been withdrawn since.
+	priorAccepted := priorBound && !prior.IsTombstoned()
+
 	if code != "" {
-		priorAccepted := priorBound && !prior.IsTombstoned()
+		if priorAccepted && code == DecisionAuthorBanned {
+			// AdmitPost's ban carve-out, reached through the ADMIN door. Without
+			// it, an operator's readmit of a post whose author was banned
+			// withdraws content the moderators deliberately kept, writes a
+			// removal nobody decided on, and enqueues a Delete{Page} at the very
+			// community that banned the author — the one shape the carve-out
+			// exists to prevent, with an admin's name on it.
+			if err := e.recordBanRefusal(ctx, did, communityDID, postATURI, commit, true); err != nil {
+				return nil, err
+			}
+			// The acceptance STANDS, so that is what the result reports; the code
+			// says what this call decided. Reporting 'removed' would describe a
+			// withdrawal that deliberately did not happen.
+			return &ReadmitResult{PostURI: postATURI, Status: StatusAccepted, DecisionCode: code}, nil
+		}
 		if priorAccepted {
 			// Was accepted, now fails: this is a removal, exactly as AdmitPost would.
 			if err := e.removeAccepted(ctx, did, communityDID, postATURI, commit, prior, code); err != nil {
@@ -1189,6 +1275,22 @@ func (e *Engine) Readmit(ctx context.Context, postATURI string) (*ReadmitResult,
 
 	// Passes now: write/repin the acceptance and enqueue the Page (reusing accept()).
 	if err := e.accept(ctx, did, communityDID, postATURI, commit); err != nil {
+		if stderrors.Is(err, ErrAuthorBanned) {
+			// A ban landed between this call's gate and its commit. The
+			// transaction rolled back, so nothing new of this post exists
+			// outward; all that is owed is the ledger row — the same outcome
+			// AdmitPost records, reported instead of raised. Surfacing the
+			// sentinel raw would answer the admin a 500 with no row written for
+			// a decision the engine actually made.
+			if rerr := e.recordBanRefusal(ctx, did, communityDID, postATURI, commit, priorAccepted); rerr != nil {
+				return nil, rerr
+			}
+			status := StatusRejected
+			if priorAccepted {
+				status = StatusAccepted // the rollback left the prior acceptance standing
+			}
+			return &ReadmitResult{PostURI: postATURI, Status: status, DecisionCode: DecisionAuthorBanned}, nil
+		}
 		if stderrors.Is(err, ErrModeratorRemovalStands) {
 			// Admission passes, but the COMMUNITY removed this post: accept()
 			// wrote the removed ledger row and refused the acceptance. Reporting

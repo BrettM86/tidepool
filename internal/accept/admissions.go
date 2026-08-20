@@ -397,7 +397,19 @@ func (a *Admissions) DeleteTx(ctx context.Context, tx *sql.Tx, communityDID, pos
 	if tx == nil {
 		return errors.NewValidationError("tx", "must not be nil")
 	}
-	if _, err := tx.ExecContext(ctx,
+	return a.delete(ctx, tx, communityDID, postURI)
+}
+
+// Delete is DeleteTx on its own connection — the author-delete of a post that
+// was never ACCEPTED, which rides no acceptance-delete commit because there is no
+// acceptance to delete (and no outbound state, and nothing to enqueue). The row
+// still has to go: it carries the evaluated_snapshot a readmit re-decides from.
+func (a *Admissions) Delete(ctx context.Context, communityDID, postURI string) error {
+	return a.delete(ctx, a.db, communityDID, postURI)
+}
+
+func (a *Admissions) delete(ctx context.Context, ex execer, communityDID, postURI string) error {
+	if _, err := ex.ExecContext(ctx,
 		`DELETE FROM admissions WHERE community_did = $1 AND post_uri = $2`,
 		communityDID, postURI); err != nil {
 		return fmt.Errorf("accept: delete admission %s/%s: %w", communityDID, postURI, err)

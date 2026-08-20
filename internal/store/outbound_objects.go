@@ -51,7 +51,9 @@ func (r *postgresOutboundObjects) upsert(ctx context.Context, q execer, object O
 	// tombstoned_at is likewise untouched here. A tombstoned row that receives
 	// a later write keeps its tombstone: clearing it is an explicit decision,
 	// never a side effect of an upsert. (Task 17's echo-moderation restore is a
-	// fresh acceptance, not an un-tombstone of this row.)
+	// fresh acceptance, not an un-tombstone of this row.) The acceptance
+	// engine's OWN auto-restore does re-publish the object, and it says so
+	// explicitly by calling UntombstoneTx on the same transaction.
 	query := `
 		INSERT INTO outbound_objects (
 			at_uri, ap_object_id, last_cid, last_rev,
@@ -142,6 +144,40 @@ func (r *postgresOutboundObjects) tombstone(ctx context.Context, q execer, atURI
 			return nil, errors.NewNotFoundError("outbound_object", atURI)
 		}
 		return nil, fmt.Errorf("tombstone outbound_object %q: %w", atURI, err)
+	}
+	return object, nil
+}
+
+// UntombstoneTx clears tombstoned_at: the object is LIVE outward again, because
+// something re-published it. It is the deliberate counterpart to the upsert's
+// refusal to clear the flag as a side effect, and the acceptance engine calls it
+// on the same transaction that writes a restore's acceptance and enqueues the
+// Create — so "the repo says accepted" and "the outbound row says live" can never
+// be committed apart.
+//
+// last_activity_seq is NOT touched. The seq is the activity-id counter and the
+// upsert riding the same transaction already decided whether this write is a new
+// activity; bumping it here would mint a second id for one publication.
+// updated_at moves only when a tombstone was actually cleared, so a re-run over
+// an already-live row is a true no-op. A missing row is NotFound: clearing the
+// tombstone of an object we hold no state for is a bug, not an idempotent skip.
+func (r *postgresOutboundObjects) UntombstoneTx(ctx context.Context, tx *sql.Tx, atURI string) (*OutboundObject, error) {
+	if tx == nil {
+		return nil, errors.NewValidationError("tx", "must not be nil")
+	}
+	query := `
+		UPDATE outbound_objects SET
+			tombstoned_at = NULL,
+			updated_at = CASE WHEN tombstoned_at IS NOT NULL THEN now() ELSE updated_at END
+		WHERE at_uri = $1
+		RETURNING` + outboundObjectColumns
+
+	object, err := scanOutboundObject(tx.QueryRowContext(ctx, query, atURI))
+	if err != nil {
+		if stderrors.Is(err, sql.ErrNoRows) {
+			return nil, errors.NewNotFoundError("outbound_object", atURI)
+		}
+		return nil, fmt.Errorf("untombstone outbound_object %q: %w", atURI, err)
 	}
 	return object, nil
 }

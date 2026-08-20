@@ -603,12 +603,14 @@ ABSENCE means enabled and it only ever exists to turn federation down. When
 enforces it: `enabled: false` is a **soft disable** — the actor stops resolving
 via WebFinger and stops delivering, while its actor document and
 already-federated references stay intact. Adding `deleteRemote: true` escalates
-to the destructive tier (ask peers to delete the user's federated content —
-irreversible on their side); the consumer **records** that intent in
-`federation_prefs` but does not act on it until task 17's destructive tier is
-wired, so the request survives a crash and is honored once that seam lands.
-Deleting the record, or writing `enabled: true`, restores the default under the
-SAME actor identity: the local part is frozen at creation and never re-derived.
+to the destructive tier, which **is wired** (task 17d): the bridge sends
+`Delete{Person, removeData: true}` to every inbox that ever received the
+user's content, tombstones the actor (410), and stamps the identity purged —
+irreversible on both sides. For a **soft** opt-out, deleting the record or
+writing `enabled: true` restores the default under the SAME actor identity
+(the local part is frozen at creation and never re-derived); after a
+destructive purge, re-enablement is **refused** — the tombstoned identity
+never federates again.
 With `CONSUMER_ENABLED` off (the default), nothing reads the record and
 federation stays on for every minted actor — the lexicon is still published so
 Coves' settings UI can write against a stable shape ahead of the switch.
@@ -638,10 +640,11 @@ Lemmy edit that rebuilds a record carries an existing `bridgedStats` forward.
 Coves users get ActivityPub identities of their own, served on
 `AP_USER_ORIGIN` — a **second origin on the same listener**, distinct from the
 bridge's `BRIDGE_HOSTNAME` surface. A `Host` router splits the two: the bridge
-hostname and its bridged-handle subdomains (plus `localhost`, bare IPs, and an
-absent `Host` — container healthchecks) reach the bridge; the user origin's own
-`Host` reaches the user surface; anything else is refused with **421 Misdirected
-Request** unless `AP_HOST_FALLTHROUGH_DEV` is on. When both names resolve to one
+hostname and its bridged-handle subdomains (plus `localhost`, **loopback** IPs,
+and an absent `Host` — container healthchecks) reach the bridge; the user
+origin's own `Host` reaches the user surface; anything else — including a
+public bare-IP `Host`, which names no configured surface — is refused with
+**421 Misdirected Request** unless `AP_HOST_FALLTHROUGH_DEV` is on. When both names resolve to one
 authority (the dev default, `localhost:8091`), the split falls back to the path:
 the user surface answers first and its 404s fall through to the bridge.
 

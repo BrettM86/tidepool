@@ -594,6 +594,20 @@ func (d *Dispatcher) handleAccount(ctx context.Context, event *JetstreamEvent) e
 	}
 	did := event.DID
 
+	// seq is the ORDERING position, and it is validated here for the same
+	// reason time_us is validated for every kind above. last_account_seq
+	// defaults to 0 and the gate below skips anything at or below it, so a
+	// frame carrying seq 0 — or none at all, which decodes to the same zero —
+	// is indistinguishable from a stale replay ON THE VERY FIRST EVENT: a
+	// Jetstream build or proxy that stopped emitting seq would take the whole
+	// account tier dark, every frame logged as "stale or duplicate", metrics
+	// clean. No retry adds a seq to a frame that has none, so it is dead-
+	// lettered where an operator can see it instead of being skipped in silence.
+	if account.Seq <= 0 {
+		return fmt.Errorf("%w: account event for %s carries no positive seq, got %d",
+			ErrPermanentEvent, strconv.Quote(did), account.Seq)
+	}
+
 	// The actor check comes first for EVERY status. Nothing was ever federated
 	// under a DID with no AP identity, so there is no delivery to pause and
 	// nothing for the terminal tier to withdraw — and minting an actor in
@@ -614,16 +628,25 @@ func (d *Dispatcher) handleAccount(ctx context.Context, event *JetstreamEvent) e
 	// reconnect rewind (a pause at seq N redelivered after a reactivation at
 	// N+1) must not flip a recovered user back. A seq at or below the last
 	// applied one is a duplicate or a stale copy and is a no-op.
-	lastSeq, err := d.lastAccountSeq(ctx, did)
-	if err != nil {
-		return err
-	}
-	if account.Seq <= lastSeq {
-		d.logger.Debug("skipping stale or duplicate #account",
-			slog.String("did", did), slog.Int64("seq", account.Seq), slog.Int64("last_seq", lastSeq))
-		return nil
-	}
+	//
+	// The gate is CLAIMED rather than read (see applyAccountClaimed): the
+	// redriver and the live connector share this dispatcher, so a read-then-act
+	// gate lets both racers through — and on the deleted path both then reach a
+	// seam that no peer can undo.
+	return d.applyAccountClaimed(ctx, did, account.Seq, func(tx *sql.Tx) error {
+		return d.applyAccountStatus(ctx, tx, did, account)
+	})
+}
 
+// applyAccountStatus performs the transition for one #account frame. It runs
+// under the claim, so it may assume this is the newest frame seen for the DID
+// and that no other #account handler is running for it.
+//
+// ORDERING RULE, and it is the same one rev_gate.go's DEADLOCK NOTE states for
+// commit handlers: the terminal tier opens its OWN transaction and writes the
+// ap_actors row, so nothing here may write that row BEFORE the seam returns.
+// Every write below happens after it.
+func (d *Dispatcher) applyAccountStatus(ctx context.Context, tx *sql.Tx, did string, account *AccountEvent) error {
 	if account.Status == accountStatusDeleted {
 		// The ONE status that means gone. It goes to the tier that re-verifies
 		// against PLC and the PDS before sending Delete{Person}, because
@@ -632,28 +655,72 @@ func (d *Dispatcher) handleAccount(ctx context.Context, event *JetstreamEvent) e
 			// Announced, and deliberately NOT degraded into a pause: a
 			// deletion half-handled as a pause looks handled in the database
 			// and is not.
-			d.logger.Warn("account reported deleted but no terminal tier is wired",
-				slog.String("did", did))
-			return d.advanceAccountSeq(ctx, did, account.Seq)
+			//
+			// THE SEQ DOES NOT ADVANCE. Nothing was recorded and nothing was
+			// sent, so advancing it would CONSUME the user's deletion: every
+			// redelivery is then rejected as stale and a build that wires the
+			// tier tomorrow can never act on the event that arrived today. The
+			// sibling deleteRemote path can advance because it persists the
+			// preference before reaching its seam; here the un-advanced seq is
+			// the only record that the deletion is still owed.
+			d.logger.Warn("account reported deleted but no terminal tier is wired; "+
+				"the event is left unapplied so a build with the tier can still act on it",
+				slog.String("did", did), slog.Int64("seq", account.Seq))
+			return errAccountUnapplied
 		}
 		if err := d.terminator.TerminateAccount(ctx, did); err != nil {
 			return fmt.Errorf("terminate account %s: %w", did, err)
 		}
-		return d.advanceAccountSeq(ctx, did, account.Seq)
+		return d.mirrorTerminalPreference(ctx, tx, did)
 	}
 
 	// Everything else is transient — deactivated, suspended, takendown,
 	// throttled are all states a user comes back from. Delivery stops; the
 	// identity, and every federated reference to it, survives.
-	if err := d.apActors.SetPaused(ctx, did, !account.Active); err != nil {
-		if errors.IsNotFound(err) {
-			return nil // the actor vanished between the check and the write
-		}
-		return err
+	//
+	// Note what this does NOT do: it never re-ENABLES an actor. Unpausing
+	// restores delivery for an identity that still exists, while `enabled`
+	// carries the terminal decisions — an opt-out, a confirmed deletion, a
+	// withdrawal — and an active=true frame is not evidence that any of those
+	// were reversed. A tombstoned actor's store refuses re-enabling outright;
+	// this path simply never asks.
+	return setActorPausedTx(ctx, tx, did, !account.Active)
+}
+
+// mirrorTerminalPreference brings the ap_actors mirror into agreement with
+// federation_prefs after the terminal tier has run — the SAME invariant the
+// opt-out door maintains (handleFederation writes the preference, then mirrors
+// it onto the actor), applied at the deletion door, which never did.
+//
+// IT READS RATHER THAN DECIDES, because TerminateAccount returns nil for two
+// opposite outcomes: a CONFIRMED deletion (which records enabled=false and, if
+// the destructive seam is wired, tombstones the actor) and a confirmed LIVE
+// account (which withdraws the tier's own stale request, leaving absence, which
+// means default-on). The preference is the tier's own statement of which
+// happened, so reading it is what keeps this from re-deciding a question that
+// was answered against PLC.
+//
+// It COMPOSES with the purge rather than duplicating it: a wired destructive
+// tier has already stamped tombstoned_at — terminal, and cleared by nothing —
+// and this write agrees with it. An UNWIRED one leaves the preference as the
+// only record, and without this the actor row went on saying the identity is
+// live: still resolving through webfinger, still admissible, and a later
+// active=true frame arriving at a row that never learned anything happened.
+func (d *Dispatcher) mirrorTerminalPreference(ctx context.Context, tx *sql.Tx, did string) error {
+	pref, err := d.prefs.Get(ctx, did)
+	if errors.IsNotFound(err) {
+		// Confirmed live: the tier withdrew its request and absence is
+		// default-on. Disabling here would strand a user the confirm just
+		// proved is still there.
+		return nil
 	}
-	// Record the applied seq only AFTER the state change succeeds, so a failed
-	// write replays instead of being locked out by an advanced seq.
-	return d.advanceAccountSeq(ctx, did, account.Seq)
+	if err != nil {
+		return fmt.Errorf("read federation preference for %s: %w", did, err)
+	}
+	if pref.Enabled {
+		return nil
+	}
+	return d.mirrorActorEnabled(ctx, tx, did, false)
 }
 
 // accountStatusDeleted is the ONLY #account status that means deletion.

@@ -126,14 +126,14 @@ func TestCustodian_CrossContextAADRejected(t *testing.T) {
 
 func TestLoadOrCreateRotationKey_PersistsAcrossLoads(t *testing.T) {
 	database := testutil.DB(t)
-	testutil.Truncate(t, database, "service_keys")
+	testutil.Truncate(t, database, "bridged_actors", "ap_actors", "service_keys")
 	keys := store.NewServiceKeys(database)
 	custodian := testCustodian(t)
 	ctx := t.Context()
 
-	first, err := LoadOrCreateRotationKey(ctx, keys, custodian)
+	first, err := LoadOrCreateRotationKey(ctx, database, keys, custodian)
 	require.NoError(t, err)
-	second, err := LoadOrCreateRotationKey(ctx, keys, custodian)
+	second, err := LoadOrCreateRotationKey(ctx, database, keys, custodian)
 	require.NoError(t, err)
 
 	assert.True(t, bytes.Equal(first.Bytes(), second.Bytes()),

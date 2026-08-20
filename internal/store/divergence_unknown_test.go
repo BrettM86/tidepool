@@ -264,6 +264,10 @@ func TestUnknownDeliveryOutcomes_APoisonThatNeverReachedTheWireIsNotUnknown(t *t
 	// Every never-wire class, exactly as the worker writes them.
 	neverSent := []string{
 		"parent_unaccepted", "parent_poisoned", "parent_cancelled", "cross_authority", "signer",
+		// A key that will not open under the configured BRIDGE_KEK is decided
+		// before any POST too — earlier than the generic signer class, since it
+		// poisons on the first attempt rather than after the budget.
+		"kek_misconfigured",
 	}
 	for _, class := range neverSent {
 		seedPoisonedDelivery(t, database,

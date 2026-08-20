@@ -141,7 +141,7 @@ func seedRotationKeyForPagination(t *testing.T, ctx context.Context, database *s
 	t.Helper()
 	custodian, err := NewCustodian(kek)
 	require.NoError(t, err)
-	_, err = LoadOrCreateRotationKey(ctx, store.NewServiceKeys(database), custodian)
+	_, err = LoadOrCreateRotationKey(ctx, database, store.NewServiceKeys(database), custodian)
 	require.NoError(t, err)
 }
 

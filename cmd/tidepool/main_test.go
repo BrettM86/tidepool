@@ -315,7 +315,7 @@ func TestRunRotateKEKResealsARealDatabase(t *testing.T) {
 	// has. Without it the walk would (rightly) fail the run as a restore that
 	// lost the key, and this test would be measuring that alarm instead of the
 	// happy path.
-	rotationKey, err := identity.LoadOrCreateRotationKey(ctx, store.NewServiceKeys(database), underPrevious)
+	rotationKey, err := identity.LoadOrCreateRotationKey(ctx, database, store.NewServiceKeys(database), underPrevious)
 	require.NoError(t, err)
 
 	// NEGATIVE CONTROL: under BRIDGE_KEK alone the seeded world is unreadable.
@@ -347,7 +347,7 @@ func TestRunRotateKEKResealsARealDatabase(t *testing.T) {
 	assert.True(t, bytes.Equal(original.Bytes(), reopened.Bytes()),
 		"the re-sealed key must be the ORIGINAL key material; a different one means the actor's repo can never be signed for again")
 
-	rescued, err := identity.LoadOrCreateRotationKey(ctx, store.NewServiceKeys(database), underCurrent)
+	rescued, err := identity.LoadOrCreateRotationKey(ctx, database, store.NewServiceKeys(database), underCurrent)
 	require.NoError(t, err,
 		"the escrow rotation key must open under BRIDGE_KEK alone after the rotation, or the bridge cannot boot once BRIDGE_KEK_PREVIOUS is unset")
 	assert.True(t, bytes.Equal(rotationKey.Bytes(), rescued.Bytes()),
@@ -463,6 +463,15 @@ func TestRunRotateKEKDoesNotDisownACompleteInventory(t *testing.T) {
 	underPrevious, err := identity.NewCustodian(previous)
 	require.NoError(t, err)
 
+	// The escrow rotation key first, on the empty database — the order the real
+	// world has it in: the key predates the actor whose blob later goes bad.
+	// (LoadOrCreateRotationKey is also the boot canary, and it refuses to mint
+	// over a populated database whose sealed material cannot be read at all.
+	// Seeding the damage first would be asking it to bless exactly the state it
+	// exists to stop, which says nothing about the walk this test is measuring.)
+	_, err = identity.LoadOrCreateRotationKey(ctx, database, store.NewServiceKeys(database), underPrevious)
+	require.NoError(t, err)
+
 	key, err := atcrypto.GeneratePrivateKeyK256()
 	require.NoError(t, err)
 	sealed, err := underPrevious.EncryptActorKey(rotateIntegrationDID, key)
@@ -477,8 +486,6 @@ func TestRunRotateKEKDoesNotDisownACompleteInventory(t *testing.T) {
 		rotateIntegrationDID,
 		"rotate-integration.lemmy-world.tidepool.example",
 		sealed)
-	require.NoError(t, err)
-	_, err = identity.LoadOrCreateRotationKey(ctx, store.NewServiceKeys(database), underPrevious)
 	require.NoError(t, err)
 
 	t.Setenv("DATABASE_URL", databaseURL)

@@ -368,7 +368,13 @@ func run(logger *slog.Logger) error {
 	// and opened here, so a wrong or half-rotated key fails startup before any
 	// traffic is served, rather than surfacing later as per-actor decrypt
 	// failures scattered across the commit path.
-	rotationKey, err := identity.LoadOrCreateRotationKey(ctx, serviceKeys, custodian)
+	//
+	// The database goes in beside the store because the canary has a second job
+	// on the path where there is nothing to open — a restore that lost the
+	// plc-rotation row. There it proves the KEK against the actor keys already
+	// at rest instead of minting a fresh rotation key under an unproven one and
+	// calling that a pass (identity.LoadOrCreateRotationKey says why).
+	rotationKey, err := identity.LoadOrCreateRotationKey(ctx, database, serviceKeys, custodian)
 	if err != nil {
 		return err
 	}

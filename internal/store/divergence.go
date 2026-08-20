@@ -729,6 +729,18 @@ const (
 	// budget is exhausted (releaseOrPoison), which makes it LOOK like a retried
 	// wire failure on every column; it is not one.
 	PoisonClassSigner = "signer"
+	// PoisonClassKEKMisconfigured: the actor's signing key is well-formed
+	// ciphertext that opened under NO configured KEK — the material at rest was
+	// sealed under a different BRIDGE_KEK than this process holds. Split out of
+	// PoisonClassSigner because the two need OPPOSITE handling and send an
+	// operator to opposite places: a missing actor row resolves itself and is
+	// retried, while a wrong KEK gives the same answer on every attempt and
+	// poisons on the FIRST one (worker.go says why that is safe mid-rotation).
+	// Under the generic signer class this arrives as a retried wire-ish failure
+	// whose excerpt reads "message authentication failed", which looks like data
+	// corruption; the class is the only place the word KEK appears in the
+	// dead-letter table.
+	PoisonClassKEKMisconfigured = "kek_misconfigured"
 )
 
 // neverReachedTheWireClasses are those classes as the divergence sweep
@@ -750,7 +762,7 @@ const (
 // above AND to this list, or it inflates these counts.
 var neverReachedTheWireClasses = []string{
 	PoisonClassParentUnaccepted, PoisonClassParentPoisoned, PoisonClassParentCancelled,
-	PoisonClassCrossAuthority, PoisonClassSigner,
+	PoisonClassCrossAuthority, PoisonClassSigner, PoisonClassKEKMisconfigured,
 }
 
 // unknownDeliveryOutcomeRows is the population, shared by the example list and

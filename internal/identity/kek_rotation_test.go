@@ -101,10 +101,22 @@ func TestCustodianWithPrevious_BothKeysFailReportsOneError(t *testing.T) {
 	require.Error(t, dualErr,
 		"a blob under an unknown KEK must not open just because two keys were tried")
 
-	assert.Equal(t, 1, strings.Count(dualErr.Error(), "open sealed key"),
+	assert.Equal(t, 1, strings.Count(dualErr.Error(), "does not open under"),
 		"a failed retry must not stack a second open error onto the first; one unreadable blob is one incident to the operator reading the log")
-	assert.Equal(t, singleErr.Error(), dualErr.Error(),
-		"an unreadable blob must look identical whether or not a previous KEK is configured, so log lines and alerts written before rotation still match after it")
+
+	// ONE INCIDENT, ONE CLASS — but not one sentence. This assertion used to
+	// require the two messages to be byte-identical, so that alerts written
+	// before a rotation still matched during it. Matching on the message is now
+	// the wrong seam: ErrKeyUnsealable is the stable thing to key on, and it is
+	// identical in both cases, while the TEXT has a job the identical version
+	// could not do. "BRIDGE_KEK failed", read mid-rotation, tells an operator to
+	// supply the previous key — which is already set, and already failing.
+	assert.True(t, IsKeyUnsealable(singleErr), "one KEK, refused: unsealable")
+	assert.True(t, IsKeyUnsealable(dualErr), "two KEKs, both refused: the same class")
+	assert.Contains(t, singleErr.Error(), "does not open under BRIDGE_KEK:",
+		"with a single key configured the message must name that one key and stop there")
+	assert.Contains(t, dualErr.Error(), "does not open under BRIDGE_KEK or BRIDGE_KEK_PREVIOUS",
+		"with both configured it must say both were tried, or the operator's next move is the one they already made")
 }
 
 func TestCustodianWithPrevious_MalformedBlobIsNotAKEKProblem(t *testing.T) {

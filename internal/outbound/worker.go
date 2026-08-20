@@ -15,6 +15,7 @@ import (
 
 	"tidepool/internal/ap"
 	"tidepool/internal/errors"
+	"tidepool/internal/identity"
 	"tidepool/internal/store"
 )
 
@@ -323,8 +324,40 @@ func (w *Worker) handle(ctx context.Context, delivery *store.OutboundDelivery) e
 func (w *Worker) deliver(ctx context.Context, delivery *store.OutboundDelivery, activity *store.OutboundActivity) error {
 	signer, err := w.signers.SignerFor(ctx, activity.ActorDID)
 	if err != nil {
-		// A signer that cannot be resolved right now is transient (a KEK blip,
-		// a not-yet-replicated actor): retry rather than poison.
+		if identity.IsKeyUnsealable(err) {
+			// The actor's key is well-formed ciphertext that opened under NO
+			// configured KEK. Retrying re-reads the same bytes with the same
+			// BRIDGE_KEK and gets the same answer, so the retry budget buys
+			// nothing but hours of delay before poisoning under an excerpt that
+			// says "message authentication failed" — which reads as corrupted
+			// data and sends the operator to the database instead of the config.
+			//
+			// WHY THIS CANNOT FIRE DURING A SANCTIONED KEK ROTATION. The
+			// rotation runbook has the bridge run with BRIDGE_KEK_PREVIOUS set
+			// (NewCustodianWithPrevious opens under either key, so nothing is
+			// unsealable), then re-seal every blob (identity.Reseal), and only
+			// then unset the previous key. Reseal walks the two actor tables
+			// FIRST and the plc-rotation row LAST, and refuses to exit zero
+			// while any row is unmoved — so a worker that starts with the new
+			// KEK alone can only have got past LoadOrCreateRotationKey (the
+			// boot canary) on a database whose actor keys were already moved.
+			// A process that reaches this line with an unsealable key is
+			// therefore not mid-rotation: it is misconfigured, or the blob is
+			// damaged. Both are terminal for this delivery.
+			//
+			// Terminal, not lost: a poisoned delivery is a dead-letter row an
+			// operator redrives after fixing BRIDGE_KEK, which is the whole
+			// point of failing loudly on the first attempt instead of quietly
+			// on the last.
+			w.logger.Error("actor signing key does not open under the configured BRIDGE_KEK; poisoning without retry",
+				"activity", delivery.ActivityID, "actor", activity.ActorDID,
+				"inbox", delivery.TargetInbox, "error", err)
+			return w.poison(ctx, delivery, store.PoisonClassKEKMisconfigured, err.Error(), 0)
+		}
+		// Everything else a signer can fail with IS transient in the way the
+		// retry budget assumes: an actor row that has not replicated yet, a
+		// database blip. Those resolve on their own, and poisoning them would
+		// turn seconds of lag into a permanent non-delivery.
 		return w.releaseOrPoison(ctx, delivery, store.PoisonClassSigner, err.Error(), 0)
 	}
 

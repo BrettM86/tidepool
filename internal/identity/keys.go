@@ -9,6 +9,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"database/sql"
 	"fmt"
 
 	"github.com/bluesky-social/indigo/atproto/atcrypto"
@@ -182,23 +183,54 @@ func (c *Custodian) open(ciphertext, aad []byte) ([]byte, error) {
 			return plaintext, nil
 		}
 	}
-	// One unreadable blob is one incident. Reporting only the current key's
-	// failure keeps the message byte-identical to the single-KEK case, so log
-	// lines and alerts written before a rotation still match during it.
-	return nil, fmt.Errorf("identity: open sealed key: %w", err)
+	// EVERY configured key has now refused well-formed bytes, which is a
+	// CLASS, not a message: no caller can fix it by trying again, and the
+	// operator's move is to look at BRIDGE_KEK. Returning it typed is what lets
+	// the delivery worker poison immediately instead of spending a retry budget
+	// on an answer that cannot change (worker.go, the SignerFor branch).
+	//
+	// The text deliberately differs between the single-KEK and mid-rotation
+	// cases — it used to be byte-identical so that pre-rotation alerts still
+	// matched — because "BRIDGE_KEK failed" during a rotation reads as an
+	// instruction to supply the previous key that is already configured and
+	// already failing. Anything matching on the old wording should match on
+	// ErrKeyUnsealable instead, which is exactly why it exists.
+	return nil, KeyUnsealableError{AAD: string(aad), TriedPrevious: c.previous != nil}
 }
 
 // LoadOrCreateRotationKey returns the bridge's escrow rotation key,
 // generating and persisting it (sealed with the KEK) on first run. The
 // service_keys create-once semantics make the bootstrap race safe: a loser
 // re-reads the winner's key.
-func LoadOrCreateRotationKey(ctx context.Context, keys store.ServiceKeys, custodian *Custodian) (*atcrypto.PrivateKeyK256, error) {
+//
+// It is also the bridge's BOOT CANARY for BRIDGE_KEK, which is why it takes the
+// database and not just the service_keys store. On the load path the canary is
+// the load itself: a row that will not open fails the boot. On the CREATE path
+// there is nothing to open, so the KEK is proven against the actor keys already
+// at rest instead (VerifyKEKAgainstSealedMaterial) — without that step the
+// create branch seals a fresh rotation key under whatever key it was handed and
+// reports success, which is a canary satisfying itself with a row it just wrote.
+//
+// db must not be nil. The alternative — treating a nil database as "skip the
+// check" — puts the hole back one caller at a time.
+func LoadOrCreateRotationKey(ctx context.Context, db *sql.DB, keys store.ServiceKeys, custodian *Custodian) (*atcrypto.PrivateKeyK256, error) {
+	if db == nil {
+		return nil, errors.NewValidationError("db",
+			"must not be nil: LoadOrCreateRotationKey is the boot canary for BRIDGE_KEK and needs the material at rest to check it against")
+	}
 	stored, err := keys.Get(ctx, RotationKeyName)
 	if err == nil {
 		return decryptRotationKey(custodian, stored.KeyMaterial)
 	}
 	if !errors.IsNotFound(err) {
 		return nil, fmt.Errorf("identity: load rotation key: %w", err)
+	}
+
+	// The create branch, and the one place a wrong KEK could otherwise pass
+	// unnoticed. On a populated database this refuses; on an empty one it is a
+	// no-op and the first boot mints as it always did.
+	if err := VerifyKEKAgainstSealedMaterial(ctx, db, custodian); err != nil {
+		return nil, fmt.Errorf("identity: refusing to mint an escrow rotation key: %w", err)
 	}
 
 	fresh, err := atcrypto.GeneratePrivateKeyK256()

@@ -630,6 +630,16 @@ What each one means:
   should read about 8. A materially higher number is not extra peer rejections:
   it is claims that never settled, since a lapsed lease or a crashed worker
   leaves its increment behind with nobody to return it.
+
+  **`last_error_class = 'kek_misconfigured'` with `attempts = 1` is a
+  configuration incident, not a peer one.** The actor's sealed signing key did
+  not open under the configured `BRIDGE_KEK`, so the worker poisons on the first
+  attempt instead of spending eight (`internal/outbound/worker.go`): retrying
+  cannot change the answer, and the fast poison is what puts the cause in front
+  of an operator in minutes rather than hours. Expect it in bulk and expect it
+  to spare newly minted actors — anything sealed *since* the wrong key was
+  configured opens fine, which is why half the bridge keeps working. Fix
+  `BRIDGE_KEK` (§6 runbook), restart, then `redrive`.
 - **echo drop counters rising steadily** — expected and healthy: our own
   content arriving back from Lemmy and being correctly refused. A counter at
   **zero** while native content is flowing is the alarming case; it means
@@ -977,7 +987,13 @@ validates data presence, not KEK correctness: sealed columns are checked
 plausibility** (a restore drill must not need to read the KEK). The full proof
 is drill + boot canary: restore, point a bridge at it with the real
 `BRIDGE_KEK`, and a wrong pairing fails at startup — the same canary as step 2
-of the KEK runbook above.
+of the KEK runbook above. That holds **even when the restore lost the
+`plc-rotation` row itself**: with nothing sealed to read back, the canary proves
+the KEK against the actor keys that *are* there (`ap_actors.rsa_key_sealed`,
+`bridged_actors.signing_key`) and refuses to mint a replacement rotation key
+over a populated database it cannot read. Only a database with no sealed
+material anywhere — a genuinely fresh install — is allowed to mint on an
+unproven key.
 
 **Retention and drill cadence interact, and not in your favour.** Retention
 ages dumps out on `pg-backup.sh`'s own criteria, which is `pg_restore --list`

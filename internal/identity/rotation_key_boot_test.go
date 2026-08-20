@@ -58,7 +58,7 @@ func storedRotationMaterial(t *testing.T, ctx context.Context, keys store.Servic
 // the legitimate way past the canary for an operator mid-rotation.
 func TestLoadOrCreateRotationKey_WrongKEKIsTheBootCanary(t *testing.T) {
 	database := testutil.DB(t)
-	testutil.Truncate(t, database, "service_keys")
+	testutil.Truncate(t, database, "bridged_actors", "ap_actors", "service_keys")
 	keys := store.NewServiceKeys(database)
 	ctx := t.Context()
 
@@ -69,7 +69,7 @@ func TestLoadOrCreateRotationKey_WrongKEKIsTheBootCanary(t *testing.T) {
 	// rotation key sealed under it.
 	custodianA, err := NewCustodian(kekA)
 	require.NoError(t, err)
-	original, err := LoadOrCreateRotationKey(ctx, keys, custodianA)
+	original, err := LoadOrCreateRotationKey(ctx, database, keys, custodianA)
 	require.NoError(t, err)
 
 	sealedUnderA := storedRotationMaterial(t, ctx, keys)
@@ -80,7 +80,7 @@ func TestLoadOrCreateRotationKey_WrongKEKIsTheBootCanary(t *testing.T) {
 	// else — the fat-fingered rotation, or a config rollback.
 	custodianB, err := NewCustodian(kekB)
 	require.NoError(t, err)
-	_, err = LoadOrCreateRotationKey(ctx, keys, custodianB)
+	_, err = LoadOrCreateRotationKey(ctx, database, keys, custodianB)
 
 	// THEN: boot fails. This error is what keeps the process from reaching
 	// ListenAndServe.
@@ -100,7 +100,7 @@ func TestLoadOrCreateRotationKey_WrongKEKIsTheBootCanary(t *testing.T) {
 	// the rotation done properly.
 	rotating, err := NewCustodianWithPrevious(kekB, kekA)
 	require.NoError(t, err)
-	rescued, err := LoadOrCreateRotationKey(ctx, keys, rotating)
+	rescued, err := LoadOrCreateRotationKey(ctx, database, keys, rotating)
 
 	// THEN: boot proceeds, on the ORIGINAL key. This is the whole point of
 	// run 1: the canary is not weakened, it is given a legitimate way past.

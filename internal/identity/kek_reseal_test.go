@@ -135,7 +135,7 @@ func seedRotationDrill(t *testing.T) *resealFixture {
 	require.NoError(t, err)
 
 	// The escrow rotation key, through its real boot path.
-	fixture.rotationKey, err = LoadOrCreateRotationKey(ctx, fixture.serviceKeys, custodianA)
+	fixture.rotationKey, err = LoadOrCreateRotationKey(ctx, fixture.database, fixture.serviceKeys, custodianA)
 	require.NoError(t, err)
 
 	// And the row that shares that table and must never be re-sealed: the
@@ -245,7 +245,7 @@ func TestReseal_RotationDrill(t *testing.T) {
 	_, err = currentOnly(t).DecryptActorRSAKey(resealAPActorDID, storedRSAKeySealed(t, fixture.database, resealAPActorDID))
 	require.Error(t, err,
 		"before the drill the AP RSA key must NOT open under the new KEK alone")
-	_, err = LoadOrCreateRotationKey(ctx, fixture.serviceKeys, currentOnly(t))
+	_, err = LoadOrCreateRotationKey(ctx, fixture.database, fixture.serviceKeys, currentOnly(t))
 	require.Error(t, err,
 		"before the drill the escrow rotation key must NOT open under the new KEK alone — this is the boot canary that stops the process")
 
@@ -301,7 +301,7 @@ func TestReseal_RotationDrill(t *testing.T) {
 		"the re-sealed AP RSA key must be the ORIGINAL key; a different one silently breaks every HTTP signature this user sends, and peers reject them without telling us")
 
 	// The escrow rotation key — the one that controls every bridged DID.
-	rescued, err := LoadOrCreateRotationKey(ctx, fixture.serviceKeys, currentOnly(t))
+	rescued, err := LoadOrCreateRotationKey(ctx, fixture.database, fixture.serviceKeys, currentOnly(t))
 	require.NoError(t, err,
 		"after the drill the bridge must boot on the current KEK alone; if this fails the operator can never unset BRIDGE_KEK_PREVIOUS")
 	assert.True(t, bytes.Equal(fixture.rotationKey.Bytes(), rescued.Bytes()),
@@ -589,7 +589,7 @@ func TestReseal_UnreadableBlobsFailLoudlyAndInPlace(t *testing.T) {
 	afterKeys := NewActorKeys(fixture.actors, currentOnly(t))
 	requireSigningKeyEquals(t, ctx, afterKeys, resealTombstonedDID, repo.KeyUseDelete, fixture.tombstonedKey,
 		"a row reported as Resealed must actually open under the current KEK alone; a report that counts work it did not do is what an operator trusts when they unset BRIDGE_KEK_PREVIOUS")
-	rescued, err := LoadOrCreateRotationKey(ctx, fixture.serviceKeys, currentOnly(t))
+	rescued, err := LoadOrCreateRotationKey(ctx, fixture.database, fixture.serviceKeys, currentOnly(t))
 	require.NoError(t, err,
 		"the rotation key was reported Resealed, so it must open under the current KEK alone")
 	assert.True(t, bytes.Equal(fixture.rotationKey.Bytes(), rescued.Bytes()),

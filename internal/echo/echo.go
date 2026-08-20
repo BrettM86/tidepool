@@ -442,7 +442,7 @@ const MaxDepth = 8
 // that flipped between local-activity and local-actor depending on whether the
 // peer happened to preserve an id would make the per-class split unreadable on
 // exactly the path where double-counting hides. The voter is the stable handle
-// (LOOP_STATE's decision-16 amendment: voter identity supersedes the id probe).
+// (the amended decision 16: voter identity supersedes the id probe).
 //
 // Everything is answered from stored state — the Classifier holds no fetcher on
 // purpose. A bare IRI must be recognized as ours BEFORE anything dereferences

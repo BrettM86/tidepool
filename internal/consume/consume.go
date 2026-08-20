@@ -6,7 +6,7 @@
 //
 // The connector, rev gate, cursor/dead-letter store and redriver are a PORT
 // of the Coves AppView's own Jetstream consumer
-// (~/Code/coves/internal/atproto/jetstream): same discipline, same failure
+// (github.com/BrettM86/coves, internal/atproto/jetstream): same discipline, same failure
 // taxonomy, same "a dead-letter write failure blocks cursor advance" rule.
 // Where the two diverge it is stated in a comment, not left to be inferred.
 package consume

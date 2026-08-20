@@ -266,7 +266,7 @@ curl -s -H "$T" 'localhost:8091/admin/admissions?status=rejected'
 **There is no Caddyfile in this repository.** TLS for both `tdpl.io` and
 `coves.social` terminates in the **Coves** Caddy (`coves-prod-caddy`), which
 reaches this stack over the shared external `coves-prod-network`. The work
-below is an edit to `~/Code/coves/Caddyfile` — a Coves-repo change, deployed on
+below is an edit to the Coves repo's `Caddyfile` — a Coves-repo change, deployed on
 the Coves side.
 
 ### Why Caddy has to do this at all
@@ -277,7 +277,7 @@ router sends requests whose `Host` is `coves.social` to the persona surface, and
 everything under `tdpl.io` to the bridge (`internal/personas/hostrouter.go:89-115`).
 **None of those AP paths reach Tidepool today** — but not because Caddy sends
 the whole hostname to the AppView. The existing `coves.social` site block
-(`~/Code/coves/Caddyfile`, block opens at `:70`; routing runs `:72-117`)
+(the Coves repo's `Caddyfile`, block opens at `:70`; routing runs `:72-117`)
 already splits the hostname four ways:
 
 | Path | Today's handler |
@@ -1082,10 +1082,9 @@ a workaround, not a scheduled heal, and it does other work besides.
 
 `e2e/lemmy/Dockerfile:35` pins **`ARG LEMMY_VERSION=0.19.20`**, matching
 PLAN.md decision 19 ("Lemmy 0.19.20 is the pinned strictness ceiling and e2e
-target") and the task docs. The behaviours verified against 0.19.20 source
-across `tasks/13`, `14`, `15`, `17` — the `Delete`-summary convention, the
-`check_bot_account` rule, `Instance`-enum strictness — are the behaviours
-`make e2e` actually builds and tests against. (An earlier draft of this
+target"). The behaviours verified against 0.19.20 source during the v2 build —
+the `Delete`-summary convention, the `check_bot_account` rule, `Instance`-enum
+strictness — are the behaviours `make e2e` actually builds and tests against. (An earlier draft of this
 section described a 0.19.19/0.19.20 discrepancy; it was resolved by bumping
 the Dockerfile to 0.19.20.)
 

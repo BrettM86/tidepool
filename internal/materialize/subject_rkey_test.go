@@ -15,7 +15,7 @@ import (
 // record — a silent partition of acceptance identity, not a crash.
 //
 // THE GOLDEN VALUES ARE HARD-CODED, NOT RECOMPUTED, and are copied verbatim
-// from ~/Code/coves/internal/core/posts/rkey_test.go (which produced them
+// from the Coves repo's internal/core/posts/rkey_test.go (which produced them
 // OUTSIDE Go, with:
 //
 //	python3 -c 'import hashlib,base64;print(base64.b32encode(

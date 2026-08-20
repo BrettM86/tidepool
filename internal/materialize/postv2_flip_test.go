@@ -28,7 +28,7 @@ const (
 // call into any production helper: a test that used the helper could not
 // detect a bug in it, because both sides of the comparison would move
 // together. This mirrors Coves' own contract tier
-// (~/Code/coves/tests/e2e/author_post_contract_test.go), which re-derives for
+// (github.com/BrettM86/coves, tests/e2e/author_post_contract_test.go), which re-derives for
 // exactly this reason; a silent fork here forks acceptance identity between
 // the two systems.
 var testSubjectRkeyEncoding = base32.StdEncoding.WithPadding(base32.NoPadding)

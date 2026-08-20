@@ -33,3 +33,7 @@ communities:
   # Person (the materializer correctly refused it — want Group). The /c/
   # URL is unambiguous.
   - "https://lemmy.ml/c/linux"
+  # added 2026-08-19 on request: third instance. Active (2.3k posts, last
+  # activity this week), 3 named mods with posted rules, not NSFW.
+  # acct: resolution is unambiguous here — WebFinger returns the Group.
+  - "!startrek@startrek.website"

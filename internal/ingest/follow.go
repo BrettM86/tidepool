@@ -51,7 +51,12 @@ type AdminOptions struct {
 	// Sweeper serves POST /admin/objects/sweep-deleted (optional; the
 	// endpoint answers 501 when nil). See sweep.go.
 	Sweeper DeleteSweeper
-	Logger  *slog.Logger
+	// Deliveries serves the task-15 outbound queue endpoints (optional; those
+	// endpoints answer 501 when nil): GET /admin/outbound inspects the queue,
+	// POST /admin/outbound/redrive resets poisoned rows, POST
+	// /admin/outbound/cancel parks an actor's or community's pending work.
+	Deliveries store.OutboundDeliveries
+	Logger     *slog.Logger
 }
 
 // Admin is the operator API driving the community subscription lifecycle,
@@ -64,6 +69,7 @@ type AdminOptions struct {
 //	POST   /admin/communities/reconcile (follow list configured only)
 //	POST   /admin/reemit                {"did":"did:plc:..."} (or {} for all)
 //	POST   /admin/objects/sweep-deleted {"ap_ids":["https://..."]}
+//	GET    /admin/divergence            (reconciliation report; READ-ONLY)
 //	GET    /admin/metrics               (tidepool's own expvar counters)
 //
 // All endpoints require "Authorization: Bearer $ADMIN_TOKEN".
@@ -76,17 +82,26 @@ type Admin struct {
 	backfill    Backfiller
 	repos       RepoReemitter
 	sweeper     DeleteSweeper
+	deliveries  store.OutboundDeliveries
 	logger      *slog.Logger
 	// reconciler serves POST /admin/communities/reconcile; nil (the
 	// endpoint answers 501) unless a follow list is configured. Set once
 	// during startup via SetFollowReconciler, before the server listens.
 	reconciler *FollowReconciler
+	// divergence serves GET /admin/divergence; nil (the endpoint answers
+	// 501) unless the reconciliation sweep is wired. Set once during
+	// startup via SetDivergenceReconciler, before the server listens.
+	divergence *DivergenceReconciler
 }
 
 // SetFollowReconciler wires the optional follow-list reconciler in after
 // construction (the reconciler itself needs the Admin's subscribe cores, so
 // it is necessarily built second).
 func (a *Admin) SetFollowReconciler(r *FollowReconciler) { a.reconciler = r }
+
+// SetDivergenceReconciler wires the optional reconciliation sweep in after
+// construction, as SetFollowReconciler does for the follow list.
+func (a *Admin) SetDivergenceReconciler(r *DivergenceReconciler) { a.divergence = r }
 
 // NewAdmin validates options and builds the Admin API.
 func NewAdmin(opts AdminOptions) (*Admin, error) {
@@ -118,6 +133,7 @@ func NewAdmin(opts AdminOptions) (*Admin, error) {
 		backfill:    opts.Backfill,
 		repos:       opts.Repos,
 		sweeper:     opts.Sweeper,
+		deliveries:  opts.Deliveries,
 		logger:      logger,
 	}, nil
 }
@@ -138,8 +154,103 @@ func (a *Admin) Routes(r chi.Router) {
 		r.Post("/communities/reconcile", a.handleReconcile)
 		r.Post("/reemit", a.handleReemit)
 		r.Post("/objects/sweep-deleted", a.handleSweepDeleted)
+		r.Get("/divergence", a.handleDivergence)
+		r.Get("/outbound", a.handleOutboundInspect)
+		r.Post("/outbound/redrive", a.handleOutboundRedrive)
+		r.Post("/outbound/cancel", a.handleOutboundCancel)
 		r.Method(http.MethodGet, "/metrics", http.HandlerFunc(scopedMetrics))
 	})
+}
+
+// handleOutboundInspect reports the delivery queue depth by state — the
+// operator's window on pending/poisoned/cancelled backlog (task 15).
+func (a *Admin) handleOutboundInspect(w http.ResponseWriter, r *http.Request) {
+	if a.deliveries == nil {
+		http.Error(w, "outbound delivery is not configured", http.StatusNotImplemented)
+		return
+	}
+	counts, err := a.deliveries.CountsByState(r.Context())
+	if err != nil {
+		a.logger.Error("outbound inspect failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	byState := map[string]int{}
+	for state, n := range counts {
+		byState[string(state)] = n
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(map[string]any{"by_state": byState})
+}
+
+// outboundMutateRequest is the shared body for redrive/cancel: any subset of
+// the optional filters.
+type outboundMutateRequest struct {
+	Activity  string `json:"activity"`
+	Community string `json:"community"`
+	Actor     string `json:"actor"`
+	All       bool   `json:"all"`
+}
+
+// handleOutboundRedrive resets poisoned deliveries back to pending, scoped to
+// one activity or community. An unscoped redrive (no filter) would re-attempt
+// EVERY poisoned delivery at once, so it is refused unless the caller opts in
+// explicitly with {"all":true} — a malformed body is a 400, never a silent
+// fleet-wide redrive.
+func (a *Admin) handleOutboundRedrive(w http.ResponseWriter, r *http.Request) {
+	if a.deliveries == nil {
+		http.Error(w, "outbound delivery is not configured", http.StatusNotImplemented)
+		return
+	}
+	var req outboundMutateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `body must be JSON: {"activity":"..."} | {"community":"..."} | {"all":true}`, http.StatusBadRequest)
+		return
+	}
+	if req.Activity == "" && req.Community == "" && !req.All {
+		http.Error(w, `refusing an unscoped redrive: set {"activity":"..."}, {"community":"..."}, or {"all":true}`, http.StatusBadRequest)
+		return
+	}
+	redriven, err := a.deliveries.RedrivePoisoned(r.Context(), req.Activity, req.Community)
+	if err != nil {
+		a.logger.Error("outbound redrive failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(map[string]any{"redriven": redriven})
+}
+
+// handleOutboundCancel parks an actor's or a community's PENDING deliveries as
+// cancelled (consent withdrawal / community removal). Exactly one of actor or
+// community must be given.
+func (a *Admin) handleOutboundCancel(w http.ResponseWriter, r *http.Request) {
+	if a.deliveries == nil {
+		http.Error(w, "outbound delivery is not configured", http.StatusNotImplemented)
+		return
+	}
+	var req outboundMutateRequest
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+	if (req.Actor == "") == (req.Community == "") {
+		http.Error(w, `body must set exactly one of {"actor":"did:..."} or {"community":"https://..."}`, http.StatusBadRequest)
+		return
+	}
+	var cancelled int64
+	var err error
+	if req.Actor != "" {
+		cancelled, err = a.deliveries.CancelForActor(r.Context(), req.Actor)
+	} else {
+		cancelled, err = a.deliveries.CancelForCommunity(r.Context(), req.Community)
+	}
+	if err != nil {
+		a.logger.Error("outbound cancel failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(map[string]any{"cancelled": cancelled})
 }
 
 // scopedMetrics writes the JSON expvar map filtered to tidepool's own
@@ -422,6 +533,39 @@ func (a *Admin) handleBackfill(w http.ResponseWriter, r *http.Request) {
 	}
 	a.backfill.TriggerAsync(community, true)
 	writeJSON(w, http.StatusAccepted, communityJSON(community))
+}
+
+// handleDivergence serves the reconciliation report (task 17e, decision 19).
+//
+// GET, not POST, and that is a statement rather than a convention: this sweep
+// compares local state against local state and CHANGES NOTHING, so it is safe
+// to repeat, safe to cache-bust, and safe for an operator to hit while they are
+// still working out what is wrong. The moment it needed POST it would have
+// stopped being a report.
+//
+// A sweep failure is a 500 and NO PARTIAL REPORT: a report missing one class
+// reads exactly like a class that found nothing, so the classes that happened to
+// succeed must not ride out with the error.
+//
+// The reason goes to the LOG, not to the body, like every other handler here.
+// This is admin-authenticated, so the exposure is small, but every read in the
+// sweep is raw SQL and a pq error carries table, column and constraint names
+// straight out of the schema — detail an operator can read in the log line one
+// scroll away, and the only party the body could ever tell is someone who should
+// not be reading it.
+func (a *Admin) handleDivergence(w http.ResponseWriter, r *http.Request) {
+	if a.divergence == nil {
+		http.Error(w, "divergence reconciliation is not configured", http.StatusNotImplemented)
+		return
+	}
+	report, err := a.divergence.Sweep(r.Context())
+	if err != nil {
+		a.logger.Error("divergence sweep failed", "error", err)
+		http.Error(w, "divergence sweep failed", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(report)
 }
 
 // handleReconcile runs one synchronous follow-list sweep on demand, so an

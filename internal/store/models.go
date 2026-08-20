@@ -87,23 +87,58 @@ func (o Origin) Valid() bool {
 // mapping between an AP object and the atproto record it materialized as.
 type APObjectMapping struct {
 	ID             int64
-	APID           string     // canonical AP object id (URL)
-	APType         string     // AP type: Page, Note, Group, Person, ...
-	OriginInstance string     // host the object originated from, e.g. lemmy.world
-	Origin         Origin     // which side authored the object; defaults to fediverse
-	DID            string     // repo the record was written into
-	AuthorDID      string     // bridged actor who authored the record; differs from DID for posts (community repo). Optional.
-	Collection     string     // record NSID, e.g. social.coves.community.post
-	RKey           string     // deterministic TID rkey
-	ATURI          string     // at://did/collection/rkey (derived; set by PutMapping)
-	CID            string     // CID of the current record version
-	PublishedAt    *time.Time // AP `published` time (may be absent upstream)
-	IndexedAt      time.Time
-	DeletedAt      *time.Time
+	APID           string // canonical AP object id (URL)
+	APType         string // AP type: Page, Note, Group, Person, ...
+	OriginInstance string // host the object originated from, e.g. lemmy.world
+	Origin         Origin // which side authored the object; defaults to fediverse
+	DID            string // repo the record was written into
+	// AuthorDID is the bridged actor who authored the record. It differs from
+	// DID only in the LEGACY post era, whose posts were written into the
+	// community's repo; for a postv2 and for comments the author's repo IS
+	// DID, so the two are equal. Optional.
+	AuthorDID string
+	// CommunityDID is the community whose content this is — the membership
+	// answer announced deletes and announced votes authorize against. Since
+	// the author-owned flip it can no longer be read off DID (a postv2 lives
+	// in the author's repo), so it is recorded at materialization time.
+	// Optional: "" means unset, and readers fall back to deriving it from the
+	// record (migration 016 says which rows that covers and why). Read it
+	// through materialize.CommunityDIDOf, never compared directly — a direct
+	// comparison silently treats every pre-016 row as belonging to nobody.
+	CommunityDID string
+	// ThreadRootATURI is the at-uri of the thread a materialized COMMENT hangs
+	// in — its record's reply.root, recorded at materialization time because
+	// that is the only moment the bridge knows it without re-reading the
+	// record. Empty for posts (a post IS its own thread root) and for comments
+	// materialized before migration 026.
+	//
+	// It is thread STRUCTURE, not moderation state: immutable for the life of
+	// the record, and the answer to "which thread is this in?" that a lock on
+	// the post above a Lemmy comment is read against.
+	ThreadRootATURI string
+	Collection      string     // record NSID, e.g. social.coves.community.post
+	RKey            string     // deterministic TID rkey
+	ATURI           string     // at://did/collection/rkey (derived; set by PutMapping)
+	CID             string     // CID of the current record version
+	PublishedAt     *time.Time // AP `published` time (may be absent upstream)
+	IndexedAt       time.Time
+	DeletedAt       *time.Time
 }
 
 // IsDeleted reports whether the mapping has been soft-deleted.
 func (m *APObjectMapping) IsDeleted() bool { return m.DeletedAt != nil }
+
+// ModeratedObject identifies the object a moderation decision applies to and
+// the community that made it. All three fields travel together because none of
+// them is derivable from another here: the at-uri is what the comment consumer
+// reads back, the AP id is what the announcing community named, and the
+// community DID is the binding without which any co-hosted community could
+// lift the decision.
+type ModeratedObject struct {
+	ATURI        string
+	APID         string
+	CommunityDID string
+}
 
 // BridgedActor is a fediverse actor (person or group) that Tidepool has
 // minted an atproto identity for.
@@ -140,6 +175,37 @@ type Community struct {
 	FollowAttempts    int
 }
 
+// CommunityBan is one community's exclusion of one native author.
+//
+// Every field is part of the decision, and two of them are the ones an
+// implementation naturally drops: CommunityAPID, without which the delivery
+// queue cannot scope a cancellation to this community, and ExpiresAt, without
+// which every timed ban becomes permanent.
+type CommunityBan struct {
+	CommunityDID  string
+	SubjectDID    string
+	CommunityAPID string
+	// ExpiresAt is nil for a permanent ban. Lemmy sends no activity when a
+	// timed one lapses, so this is the only thing that ever lifts it.
+	ExpiresAt *time.Time
+	Reason    string
+	// RemoveData records what the moderator asked for — that the author's
+	// content in this community go too. It is acted on ONCE, when the ban lands;
+	// the stored flag is the audit answer to "was their content purged?", never
+	// an input to the Undo.
+	RemoveData bool
+}
+
+// DeliveryTarget is one place an actor's content has already been delivered:
+// the inbox that received it, and an ordering key that inbox's traffic is
+// already serialized on. It is what a fan-out addresses — one activity, many
+// targets — and it comes from the delivery history rather than from the
+// communities table, because the question is where the content WENT.
+type DeliveryTarget struct {
+	Inbox       string
+	OrderingKey string
+}
+
 // ServiceKey is one of the bridge's own long-lived keys, keyed by purpose
 // name. KeyMaterial's encoding is per-row: plaintext PKCS#8 PEM for
 // "service-actor" (the AP-side RSA signing key — the bridge's own service
@@ -152,6 +218,179 @@ type ServiceKey struct {
 	Name        string
 	KeyMaterial []byte
 	CreatedAt   time.Time
+}
+
+// DeliveredState tracks how far an outbound vote has travelled. The consumer
+// (task 14) only ever writes pending; task 15 flips it on DELIVERY SUCCESS,
+// never on enqueue — a state that claimed delivery before the wire confirmed
+// it would make an Undo unsendable.
+type DeliveredState string
+
+const (
+	// DeliveredStatePending means the intent is recorded but unconfirmed.
+	DeliveredStatePending DeliveredState = "pending"
+	// DeliveredStateDelivered means a peer accepted A VOTE from this actor for
+	// this subject — NOT necessarily the activity this row currently names.
+	//
+	// After a re-cast the row carries two facts from different moments:
+	// `direction` and `current_activity_id` describe the NEWEST intent, while
+	// this state describes a delivery that already happened. The upsert keeps
+	// `delivered` through a flip on purpose (outbound_votes.go), because the
+	// alternative erases the only record that any delivery occurred. So the
+	// question this column answers is exactly "does the peer hold a vote of
+	// ours here", and no more than that.
+	//
+	// WHICH activity the peer accepted is therefore not readable from this row
+	// after a flip. Only the append-only delivery ledger still knows, which is
+	// why RecastDivergence is reconciled out of outbound_activities joined to
+	// outbound_deliveries rather than queried from here (divergence.go).
+	DeliveredStateDelivered DeliveredState = "delivered"
+	// DeliveredStateUndone means the vote is NO LONGER LIVE on the peer as far as
+	// this bridge is concerned, so nothing may count it: the reseed subtracts
+	// only `delivered`, and the destructive tier's standing list never includes
+	// `undone` (it enumerates `delivered` plus held-for-settlement pending rows
+	// — ListStandingForActor).
+	//
+	// IT IS NO LONGER RESERVED, and its meaning is narrower than the obvious
+	// reading. Task 15's worker still DELETES the row on a successful Undo, so
+	// the ordinary retraction never passes through this state. ONE writer exists
+	// (task 17d's outbound.Purger): when an actor is withdrawn, their live votes
+	// are marked undone AT DECISION TIME, together with the Undo being enqueued
+	// — not when a peer confirms it.
+	//
+	// That distinction matters to anyone reasoning about the ledger: this value
+	// records OUR decision to stop counting a vote, not the peer's acceptance of
+	// the withdrawal. The two coincide for every path except a purge whose Undo
+	// never lands, where the peer may still hold a vote we have stopped counting
+	// — deliberately, because the alternative is subtracting forever on behalf
+	// of an identity that no longer exists.
+	DeliveredStateUndone DeliveredState = "undone"
+)
+
+// Valid reports whether the value is a known delivered state.
+func (s DeliveredState) Valid() bool {
+	switch s {
+	case DeliveredStatePending, DeliveredStateDelivered, DeliveredStateUndone:
+		return true
+	}
+	return false
+}
+
+// FederationPrefSource records where a federation preference came from: a
+// social.coves.bridge.federation record the consumer saw, or a direct probe of
+// the user's repo. It is stated explicitly — the zero value is invalid —
+// because "we read this from a record" and "we went and asked" have different
+// staleness, and a defaulted source hides which one applied.
+type FederationPrefSource string
+
+const (
+	// FederationPrefSourceRecord means a Jetstream commit carried the record.
+	FederationPrefSourceRecord FederationPrefSource = "record"
+	// FederationPrefSourceProbe means the bridge fetched the record itself.
+	FederationPrefSourceProbe FederationPrefSource = "probe"
+	// FederationPrefSourceAccount means the preference was not expressed by the
+	// user at all: their ACCOUNT is gone, confirmed against PLC and the PDS by
+	// the terminal tier (decision 19). It is the one value that distinguishes a
+	// user who opted out — a decision they can reverse — from one who was
+	// deleted, which they cannot.
+	FederationPrefSourceAccount FederationPrefSource = "account"
+)
+
+// Valid reports whether the value is a known source.
+func (s FederationPrefSource) Valid() bool {
+	switch s {
+	case FederationPrefSourceRecord, FederationPrefSourceProbe, FederationPrefSourceAccount:
+		return true
+	}
+	return false
+}
+
+// OutboundObject is the durable outbound state for one native record Tidepool
+// federates outward (task 14, decision 14). It exists because a Jetstream
+// DELETE commit carries the DID, collection and rkey and NOTHING else — no
+// record body, no CID — so every fact a Delete{Note} needs must already be at
+// rest here before the delete arrives.
+type OutboundObject struct {
+	// ATURI is the record's at-uri and the row's primary key.
+	ATURI string
+	// APObjectID is the AP id this record federates as.
+	APObjectID string
+	// LastCID and LastRev are PROVENANCE ONLY — what the last applied commit
+	// looked like. The ordering gate is jetstream_record_revs, never this
+	// column: a rev read from here is a check→write race by construction.
+	LastCID string
+	LastRev string
+	// CommunityDID and CommunityAPID are the target community on both sides
+	// of the bridge.
+	CommunityDID  string
+	CommunityAPID string
+	// TranslatedSnapshot is the JSONB state task 15 renders the object and its
+	// Delete from. (Task 17's restore is a delete-removal plus a fresh
+	// acceptance, not a replay of these bytes — the snapshot is task 15's.)
+	TranslatedSnapshot []byte
+	// LastActivitySeq feeds ActivityID: create is 0, every applied
+	// update/delete bumps it, so each operation gets its own stable id.
+	LastActivitySeq int
+	// Depth is the reply depth. Lemmy caps comment depth at 50.
+	Depth        int
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+	TombstonedAt *time.Time
+	// AcceptedAt is the causal-gating marker (task 15, migration 020): stamped
+	// on delivery success. NULL means "not yet accepted by its community", which
+	// gates a bridge-origin child from delivering before its parent.
+	AcceptedAt *time.Time
+}
+
+// IsTombstoned reports whether the record was deleted upstream. Tombstoned
+// rows are KEPT: they are what a late replay is rejected against.
+func (o *OutboundObject) IsTombstoned() bool { return o.TombstonedAt != nil }
+
+// IsAccepted reports whether the object has been accepted by its community (its
+// AP delivery succeeded). A bridge-origin parent gates its children until it is.
+func (o *OutboundObject) IsAccepted() bool { return o.AcceptedAt != nil }
+
+// OutboundVote is the durable outbound state for one native vote (decision
+// 16). A vote DELETE commit names only the vote record, so direction and the
+// activity id it was delivered under have to be readable back from here to
+// build the Undo.
+type OutboundVote struct {
+	// VoteATURI is the vote record's at-uri and the row's primary key — the
+	// delete path's only lookup key.
+	VoteATURI string
+	// ActorDID and SubjectATURI are UNIQUE TOGETHER: one actor holds at most
+	// one live vote per subject.
+	ActorDID     string
+	SubjectATURI string
+	SubjectAPID  string
+	CommunityDID string
+	// Direction is up or down.
+	Direction string
+	// CurrentActivityID is the id the Like/Dislike went out under; the Undo
+	// must embed it.
+	CurrentActivityID string
+	DeliveredState    DeliveredState
+	// ActivitySeq feeds ActivityID for this vote's operations.
+	ActivitySeq int
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
+// FederationPref is a Coves user's federation preference (decision 11). The
+// record is an OPT-OUT and federation is DEFAULT-ON, so an ABSENT row means
+// enabled: this table only ever holds rows for users who said something.
+type FederationPref struct {
+	DID          string
+	Enabled      bool
+	DeleteRemote bool
+	Source       FederationPrefSource
+	// PurgedAt is set once the destructive tier has actually asked peers to
+	// delete this user's content. It separates a withdrawal that was REQUESTED
+	// (nil — nothing irreversible has happened, so a live account may still be
+	// restored) from one that COMMITTED (set — there is nothing to come back
+	// to). Only MarkPurged writes it, and nothing clears it.
+	PurgedAt  *time.Time
+	UpdatedAt time.Time
 }
 
 // InboxEvent is a received AP activity: the dedupe record AND the durable
@@ -184,4 +423,100 @@ type InboxEvent struct {
 	ReceivedAt  time.Time
 	ProcessedAt *time.Time
 	Error       string // last processing error; empty if none
+}
+
+// DeliveryState tracks a single per-inbox delivery attempt through its
+// terminal fates (task 15, decision 15). pending is the only non-terminal
+// state; delivered/poisoned/cancelled are all final. cancelled (not poisoned)
+// is the kill-switch/consent outcome — a delivery parked because the actor
+// opted out or a community was unfollowed, never a failure the operator must
+// triage.
+type DeliveryState string
+
+const (
+	// DeliveryStatePending means the delivery is queued or backing off.
+	DeliveryStatePending DeliveryState = "pending"
+	// DeliveryStateDelivered means a peer accepted the activity (including
+	// Lemmy's duplicate-activity response, which is a success by our stable
+	// id).
+	DeliveryStateDelivered DeliveryState = "delivered"
+	// DeliveryStatePoisoned means the delivery permanently failed (a 4xx, an
+	// attempt-cap breach, an unaccepted or poisoned parent).
+	DeliveryStatePoisoned DeliveryState = "poisoned"
+	// DeliveryStateCancelled means a consent/kill-switch withdrawal parked the
+	// delivery: create/update for a disabled or paused actor, or a community
+	// unfollowed out from under pending work. Never a failure.
+	DeliveryStateCancelled DeliveryState = "cancelled"
+)
+
+// Valid reports whether the value is a known delivery state.
+func (s DeliveryState) Valid() bool {
+	switch s {
+	case DeliveryStatePending, DeliveryStateDelivered, DeliveryStatePoisoned, DeliveryStateCancelled:
+		return true
+	}
+	return false
+}
+
+// OutboundActivity is the canonical, IMMUTABLE wire payload for one activity id
+// (task 15, decision 15). One row fans out to many outbound_deliveries; GET
+// /ap/activity/{hash} serves Payload verbatim, and a redelivery re-sends it
+// byte-for-byte so a peer dedupes on the stable id. Its payload never changes
+// once written — a later edit is a NEW activity, not a rewrite of this one.
+type OutboundActivity struct {
+	// ActivityID is the deterministic AP activity id (consume.ActivityID) and
+	// the row's primary key.
+	ActivityID string
+	// ActorDID is the persona whose key signs every delivery of this activity.
+	ActorDID string
+	// Kind is the AP activity type: Create, Update, Delete, Like, Dislike, Undo.
+	Kind string
+	// Payload is the canonical wire activity JSON, byte-stable after first write.
+	Payload []byte
+	// ParentATURI is the causal dependency (decision 15): a delivery for this
+	// activity is ineligible until the parent's mapping is accepted. "" = none.
+	ParentATURI string
+	CreatedAt   time.Time
+}
+
+// OutboundDelivery is one delivery attempt of an activity to one inbox (task
+// 15). It generalizes the inbox_events queue: ClaimedUntil is the same fencing
+// token, OrderingKey (the community AP id) serializes deliveries per community,
+// and the loose-index-scan head is the min-Seq pending row of a key.
+type OutboundDelivery struct {
+	// Seq is the monotonic ordering column the per-key serialization descends.
+	Seq int64
+	// ActivityID + TargetInbox are the composite primary key: one activity
+	// fans out to many inboxes.
+	ActivityID  string
+	TargetInbox string
+	// OrderingKey is the community AP id — deliveries sharing it are handled
+	// strictly in Seq order.
+	OrderingKey string
+	// State is the delivery's fate (pending until terminal).
+	State DeliveryState
+	// Attempts is a REFUNDED counter, not a claim count: ClaimNext charges one
+	// on every claim, and a park that the fence applied hands its own charge
+	// back (ReleaseParked). What is left standing is claims charged and never
+	// handed back — deliveries genuinely TRIED, plus abandoned claims whose
+	// worker died or lost its lease before settling. The attempt cap counts
+	// this, so it counts attempts made rather than holds endured.
+	Attempts int
+	// NextAttemptAt is the retry-backoff schedule; claimable when <= now.
+	NextAttemptAt time.Time
+	// ClaimedUntil is the current worker lease AND the fencing/claim token;
+	// nil/past means unclaimed. MarkDelivered/Release/MarkPoisoned require it.
+	ClaimedUntil *time.Time
+	// DeliveredAt stamps the successful delivery.
+	DeliveredAt *time.Time
+	// LastStatusCode is the last HTTP status seen (nil before any attempt
+	// produced one).
+	LastStatusCode *int
+	// LastErrorClass is a coarse retry-taxonomy label (transport, 4xx, 5xx,
+	// duplicate, attempt_cap, parent_unaccepted, parent_poisoned).
+	LastErrorClass string
+	// ResponseExcerpt is a bounded sample of the peer's response body.
+	ResponseExcerpt string
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }

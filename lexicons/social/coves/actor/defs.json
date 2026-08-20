@@ -5,7 +5,9 @@
     "profileView": {
       "type": "object",
       "description": "Basic profile view with essential information",
-      "required": ["did"],
+      "required": [
+        "did"
+      ],
       "properties": {
         "did": {
           "type": "string",
@@ -31,7 +33,9 @@
     "profileViewDetailed": {
       "type": "object",
       "description": "Detailed profile view with stats and viewer state",
-      "required": ["did"],
+      "required": [
+        "did"
+      ],
       "properties": {
         "did": {
           "type": "string",
@@ -46,19 +50,6 @@
           "type": "string",
           "maxGraphemes": 64,
           "maxLength": 640
-        },
-        "bio": {
-          "type": "string",
-          "maxGraphemes": 256,
-          "maxLength": 2560
-        },
-        "bioFacets": {
-          "type": "array",
-          "description": "Rich text annotations for bio",
-          "items": {
-            "type": "ref",
-            "ref": "social.coves.richtext.facet"
-          }
         },
         "avatar": {
           "type": "string",
@@ -83,6 +74,20 @@
           "type": "ref",
           "ref": "#viewerState",
           "description": "Viewer's relationship to this profile"
+        },
+        "description": {
+          "type": "string",
+          "maxGraphemes": 256,
+          "maxLength": 2560
+        },
+        "descriptionFacets": {
+          "type": "array",
+          "description": "Rich text annotations for the description",
+          "items": {
+            "type": "ref",
+            "ref": "social.coves.richtext.facet"
+          },
+          "maxLength": 50
         }
       }
     },
@@ -128,10 +133,10 @@
           "type": "boolean",
           "description": "Whether the viewer is blocked by this user"
         },
-        "blockUri": {
+        "blocking": {
           "type": "string",
           "format": "at-uri",
-          "description": "AT-URI of the block record if viewer blocked this user"
+          "description": "AT-URI of the block record if the viewer has blocked this user"
         }
       }
     }

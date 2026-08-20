@@ -14,16 +14,24 @@ import (
 
 type postgresAPObjects struct {
 	db *sql.DB
+	// The object_moderation repository is EMBEDDED, and only so that a holder of
+	// the concrete mapping store can be type-asserted to store.ObjectModeration
+	// (ingest.NewHandler defaults its moderation store that way). It is
+	// deliberately NOT part of the APObjects interface: five callers hold that
+	// interface to resolve strongRefs, and none of them may reach a moderation
+	// mutator.
+	postgresObjectModeration
 }
 
 // NewAPObjects creates the postgres-backed ap_objects repository.
 func NewAPObjects(db *sql.DB) APObjects {
-	return &postgresAPObjects{db: db}
+	return &postgresAPObjects{db: db, postgresObjectModeration: postgresObjectModeration{db: db}}
 }
 
 const apObjectColumns = `
-	id, ap_id, ap_type, origin_instance, origin, did, author_did, collection,
-	rkey, at_uri, cid, ap_published_at, indexed_at, deleted_at`
+	id, ap_id, ap_type, origin_instance, origin, did, author_did, community_did,
+	thread_root_at_uri, collection, rkey, at_uri, cid, ap_published_at, indexed_at,
+	deleted_at`
 
 func (r *postgresAPObjects) PutMapping(ctx context.Context, mapping APObjectMapping) (*APObjectMapping, error) {
 	return r.putMapping(ctx, r.db, mapping)
@@ -49,13 +57,37 @@ func (r *postgresAPObjects) putMapping(ctx context.Context, q queryRower, mappin
 	query := `
 		INSERT INTO ap_objects (
 			ap_id, ap_type, origin_instance, origin, did, author_did,
-			collection, rkey, at_uri, cid, ap_published_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+			community_did, thread_root_at_uri, collection, rkey, at_uri, cid,
+			ap_published_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		ON CONFLICT (ap_id) DO UPDATE SET
 			ap_type = EXCLUDED.ap_type,
 			origin = EXCLUDED.origin,
 			did = EXCLUDED.did,
-			author_did = EXCLUDED.author_did,
+			-- The STORED value first: author_did is immutable once known. Since
+			-- the postv2 flip it records whose repo signed the record — the
+			-- strongest authorship statement atproto has — and it is also how
+			-- deleteIsByAuthor decides SELF-DELETE vs MODERATOR REMOVAL. A re-put
+			-- that omitted it would silently turn every later author delete into
+			-- "not provably the author", and one that restated it differently
+			-- would re-attribute bridged content to somebody who never wrote it.
+			-- A NULL is still filled by the first write that knows the answer.
+			author_did = COALESCE(ap_objects.author_did, EXCLUDED.author_did),
+			-- Same rule, same reason: community_did is the binding that
+			-- authorizes announced moderation of this object, so an object's
+			-- community is decided once. A re-put that omits it (a
+			-- re-materialization, a legacy write path) must not NULL a good
+			-- binding and make moderation refuse forever, and a re-put that names
+			-- a DIFFERENT community must not hand that community moderation
+			-- authority over content posted somewhere else.
+			community_did = COALESCE(ap_objects.community_did, EXCLUDED.community_did),
+			-- COALESCE for the same reason, with one difference worth stating:
+			-- the materializer re-derives this from the record it is committing,
+			-- so a re-put normally re-supplies it and a row written before
+			-- migration 026 heals itself. The COALESCE is what stops a write path
+			-- that does NOT know the thread (any non-materializer mapping write)
+			-- from blanking one that does.
+			thread_root_at_uri = COALESCE(EXCLUDED.thread_root_at_uri, ap_objects.thread_root_at_uri),
 			collection = EXCLUDED.collection,
 			rkey = EXCLUDED.rkey,
 			at_uri = EXCLUDED.at_uri,
@@ -67,8 +99,9 @@ func (r *postgresAPObjects) putMapping(ctx context.Context, q queryRower, mappin
 
 	row := q.QueryRowContext(ctx, query,
 		mapping.APID, mapping.APType, mapping.OriginInstance, string(mapping.Origin),
-		mapping.DID, nullIfEmpty(mapping.AuthorDID), mapping.Collection, mapping.RKey,
-		mapping.ATURI, mapping.CID, mapping.PublishedAt,
+		mapping.DID, nullIfEmpty(mapping.AuthorDID), nullIfEmpty(mapping.CommunityDID),
+		nullIfEmpty(mapping.ThreadRootATURI),
+		mapping.Collection, mapping.RKey, mapping.ATURI, mapping.CID, mapping.PublishedAt,
 	)
 	stored, err := scanAPObject(row)
 	if err != nil {
@@ -247,6 +280,11 @@ func validateMapping(mapping *APObjectMapping) error {
 			return errors.NewValidationError("author_did", err.Error())
 		}
 	}
+	if mapping.CommunityDID != "" {
+		if _, err := syntax.ParseDID(mapping.CommunityDID); err != nil {
+			return errors.NewValidationError("community_did", err.Error())
+		}
+	}
 	collection, err := syntax.ParseNSID(mapping.Collection)
 	if err != nil {
 		return errors.NewValidationError("collection", err.Error())
@@ -267,11 +305,11 @@ type rowScanner interface {
 func scanAPObject(row rowScanner) (*APObjectMapping, error) {
 	var mapping APObjectMapping
 	var origin string
-	var authorDID sql.NullString
+	var authorDID, communityDID, threadRootATURI sql.NullString
 	err := row.Scan(
 		&mapping.ID, &mapping.APID, &mapping.APType, &mapping.OriginInstance,
-		&origin, &mapping.DID, &authorDID, &mapping.Collection, &mapping.RKey,
-		&mapping.ATURI, &mapping.CID,
+		&origin, &mapping.DID, &authorDID, &communityDID, &threadRootATURI,
+		&mapping.Collection, &mapping.RKey, &mapping.ATURI, &mapping.CID,
 		&mapping.PublishedAt, &mapping.IndexedAt, &mapping.DeletedAt,
 	)
 	if err != nil {
@@ -279,6 +317,8 @@ func scanAPObject(row rowScanner) (*APObjectMapping, error) {
 	}
 	mapping.Origin = Origin(origin)
 	mapping.AuthorDID = authorDID.String
+	mapping.CommunityDID = communityDID.String
+	mapping.ThreadRootATURI = threadRootATURI.String
 	return &mapping, nil
 }
 

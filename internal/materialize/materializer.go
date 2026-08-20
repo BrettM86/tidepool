@@ -49,10 +49,38 @@ var ValidationFailures = expvar.NewInt("tidepool_lexicon_validation_failures")
 
 // Record collections the materializer produces.
 const (
+	// CollectionActorProfile and CollectionCommunityProfile are the identity
+	// records, each at the fixed rkey "self" in its own subject's repo. They
+	// are committed before any content that references them, so an AppView
+	// never indexes a post or comment whose author or community is unknown.
 	CollectionActorProfile     = "social.coves.actor.profile"
 	CollectionCommunityProfile = "social.coves.community.profile"
-	CollectionPost             = "social.coves.community.post"
-	CollectionComment          = "social.coves.community.comment"
+	// CollectionPost is the DEPRECATED post collection: a post in the
+	// COMMUNITY's repo carrying an in-record `author`. Nothing is created
+	// under it any more (PLAN.md decision 20 flipped new posts to postv2),
+	// but it stays because the records already written under it do not
+	// migrate — Coves indexes both collections indefinitely — so update,
+	// delete, stats and comment-parent dispatch still meet it.
+	CollectionPost = "social.coves.community.post"
+	// CollectionPostV2 is the post collection after the author-owned flip:
+	// the record lives in the AUTHOR's repo, authorship IS that repo (no
+	// in-record author), and `community` names the community it was
+	// submitted to.
+	CollectionPostV2 = "social.coves.community.postv2"
+	// CollectionAcceptance is the community's attestation that it accepts a
+	// post. It lives in the COMMUNITY's repo at a digest of the subject's
+	// at-uri (SubjectRKey), and it is what makes a postv2 visible in the
+	// community at all.
+	CollectionAcceptance = "social.coves.community.acceptance"
+	// CollectionRemoval is the community's record that a post was removed
+	// from it. It shares the acceptance's digest rkey (one derivation per
+	// subject) and replaces the acceptance in one atomic commit.
+	CollectionRemoval = "social.coves.community.removal"
+	// CollectionComment is a reply, in its AUTHOR's repo in both eras — the
+	// flip changed where posts live, never comments. Its community is not a
+	// field on the record but a property of the thread it hangs from
+	// (reply.root), which is why comment mappings carry community_did.
+	CollectionComment = "social.coves.community.comment"
 )
 
 // ProfileRKey is the fixed record key of actor and community profiles.
@@ -88,6 +116,28 @@ func IsSkip(err error) bool { return stderrors.Is(err, ErrSkipped) }
 
 func skip(apID, reason string) error { return &SkipError{APID: apID, Reason: reason} }
 
+// requireSameAuthorityAuthor refuses content that attributes itself to an actor
+// on a DIFFERENT authority than the object's own id.
+//
+// Since the postv2 flip, the repo a record lands in IS its authorship claim:
+// the commit is signed by that repo's key, and a postv2 carries no `author`
+// field for a consumer to disagree with. attributedTo is therefore the field
+// that decides whose signature ends up on delivered content, and it is written
+// by whoever served the object. Without this check any instance can hand the
+// bridge a Page or Note naming any bridged user and have it signed into that
+// user's repo.
+//
+// Lemmy binds the two itself on ITS inbound path (verify_domains_match over an
+// object's id and its creator), so genuine Lemmy traffic — including a
+// lemmy.zip user's post announced by a lemmy.world community — never fails
+// this; only the id's own host may speak for its users.
+func requireSameAuthorityAuthor(obj, authorRef *ap.Object) error {
+	if !ap.SameAuthority(obj.ID, authorRef.ID) {
+		return skip(obj.ID, "attributedTo "+authorRef.ID+" is on another authority")
+	}
+	return nil
+}
+
 // Fetcher is the slice of the AP client the materializer uses. *ap.Client
 // implements it; tests may substitute failures.
 type Fetcher interface {
@@ -110,6 +160,36 @@ type VoteScrubber interface {
 	ScrubVoter(ctx context.Context, voterAPID string) error
 }
 
+// ModerationLedger records a community moderation decision against a NATIVE
+// post in the admissions ledger — the operator surface that answers "why is
+// this post not in the community?".
+//
+// It is an INTERFACE rather than an *accept.Admissions so this package keeps no
+// dependency on the acceptance engine (which already depends on the stores this
+// one writes through); main adapts the concrete type.
+type ModerationLedger interface {
+	// RecordRemoval marks the post removed by its community, with the removal
+	// record's own code. authorDID is the repo the post lives in.
+	RecordRemoval(ctx context.Context, communityDID, postURI, authorDID, code string) error
+	// RecordRestore marks the post accepted again, pinning the CID the fresh
+	// acceptance was written against.
+	RecordRestore(ctx context.Context, communityDID, postURI, authorDID, cid string) error
+	// LastEvaluatedCID is the CID of the most recent version of the post the
+	// acceptance engine DECIDED on — including a decision that wrote nothing
+	// outward, which is exactly the case a restore has to pin. "" means the
+	// ledger knows of no decision for this (community, post).
+	LastEvaluatedCID(ctx context.Context, communityDID, postURI string) (string, error)
+	// ListAccepted returns the at-uris of the posts this author currently has
+	// ACCEPTED in this community — the input to a ban's removeData purge.
+	//
+	// The ledger is the only table that knows this. ap_objects knows what was
+	// materialized and outbound_objects knows what was federated, but neither
+	// records which community ADMITTED a post, which is precisely the scope a
+	// ban is entitled to act on: "their content HERE", never everything they
+	// ever wrote.
+	ListAccepted(ctx context.Context, communityDID, authorDID string) ([]string, error)
+}
+
 // Options configures New. Fetcher, Objects, Actors, Communities, Repos,
 // Minter, and ServiceDID are required.
 type Options struct {
@@ -122,6 +202,21 @@ type Options struct {
 	// Votes scrubs a deleted actor's vote_events rows alongside the record
 	// scrub (optional; nil skips it).
 	Votes VoteScrubber
+	// Ledger records inbound moderation decisions against NATIVE posts in the
+	// admissions ledger, so a moderator's removal is visible there when the
+	// MODERATOR acts rather than only if the author later edits (which is the
+	// only thing that writes a row otherwise). It also frees the author's
+	// per-community rate quota, which counts accepted rows.
+	//
+	// OPTIONAL: nil skips the ledger write and changes nothing else — the
+	// community repo records remain the source of truth for removal state.
+	Ledger ModerationLedger
+	// OutboundObjects is the bridge's own outbound state for NATIVE records.
+	// RestorePost needs it: a native post lives in the AUTHOR's repo, which
+	// this bridge does not host, so its CID cannot be read back through Repos.
+	// OPTIONAL: nil leaves a bridge-origin restore refusing (it logs and leaves
+	// the removal standing) exactly as it did before this seam existed.
+	OutboundObjects store.OutboundObjects
 	// ServiceDID is the bridge's own DID: community.profile createdBy and
 	// hostedBy (PLAN.md locked decision 6).
 	ServiceDID string
@@ -145,6 +240,8 @@ type Options struct {
 type Materializer struct {
 	fetcher     Fetcher
 	objects     store.APObjects
+	outbound    store.OutboundObjects
+	ledger      ModerationLedger
 	actors      store.BridgedActors
 	communities store.Communities
 	repos       *repo.Manager
@@ -161,6 +258,12 @@ type Materializer struct {
 	// A test seam so the scrub's retryable-error path can be exercised
 	// without a real storage failure.
 	deleteBlob func(ctx context.Context, did, cid string) error
+	// removalCheck reports whether a removal stands for a subject; defaults to
+	// removalStands. A test seam so acceptPost's check-then-act window can be
+	// opened deterministically — the commit-time refusal has to hold even when
+	// this read answers stale, and a timing test could only prove that by
+	// accident.
+	removalCheck func(ctx context.Context, communityDID, rkey string) (bool, error)
 }
 
 // New validates options and builds a Materializer. The vendored lexicon
@@ -198,6 +301,8 @@ func New(opts Options) (*Materializer, error) {
 	m := &Materializer{
 		fetcher:     opts.Fetcher,
 		objects:     opts.Objects,
+		outbound:    opts.OutboundObjects,
+		ledger:      opts.Ledger,
 		actors:      opts.Actors,
 		communities: opts.Communities,
 		repos:       opts.Repos,
@@ -212,6 +317,7 @@ func New(opts Options) (*Materializer, error) {
 		now:         time.Now,
 	}
 	m.deleteBlob = m.repos.DeleteBlob
+	m.removalCheck = m.removalStands
 	if m.profileTTL <= 0 {
 		m.profileTTL = defaultProfileRefreshTTL
 	}
@@ -238,8 +344,11 @@ type Result struct {
 // mapping in ONE transaction (repo.PutRecordTx + PutMappingTx — task 11
 // closed the crash window where a record could land on the firehose with
 // no mapping). authorDID records who authored the record (differs from did
-// for posts).
-func (m *Materializer) commitRecord(ctx context.Context, did, collection, rkey string, record map[string]any, obj *ap.Object, authorDID string) (*Result, error) {
+// only for LEGACY posts, which sit in the community's repo; for a postv2 and
+// for comments the author's repo IS did); communityDID records which
+// community's content it is, for the
+// membership binding announced deletes and announced votes authorize against.
+func (m *Materializer) commitRecord(ctx context.Context, did, collection, rkey string, record map[string]any, obj *ap.Object, authorDID, communityDID string) (*Result, error) {
 	// Don't resurrect deleted content. AP delivery is unordered, so a Create
 	// or Update can arrive (or be re-delivered) after a Delete already
 	// tombstoned this object's mapping. Re-materializing would un-tombstone it
@@ -250,14 +359,34 @@ func (m *Materializer) commitRecord(ctx context.Context, did, collection, rkey s
 	//
 	// carryForward marks the update path for a live post/comment mapping: only
 	// there does the rebuild carry fields it cannot reconstruct forward
-	// (bridgedStats, and comments' reply refs), and only there does the commit
-	// need the optimistic-concurrency guard against a racing stats stamp.
+	// (bridgedStats, postv2's immutable community, and comments' reply refs),
+	// and only there does the commit need the optimistic-concurrency guard
+	// against a racing stats stamp. postv2 is gated exactly as the collection
+	// it replaced: an edit that skipped the carry would drop the vote counts
+	// the refresher stamped and mint a needless firehose event.
 	carryForward := false
+	// storedCommunityDID is the binding a previous materialization already
+	// made. It is preferred over anything derived from THIS delivery: the
+	// community a comment belongs to authorizes announced deletes and binds
+	// announced votes, so re-deriving it from an edited (attacker-influenced)
+	// inReplyTo would hand another community moderation authority over content
+	// posted somewhere else.
+	var storedCommunityDID string
+	// storedThreadRoot is the thread a previous materialization recorded. A
+	// comment cannot change threads, so a binding already made wins — exactly
+	// like the community above, and for the same reason: it is read back on the
+	// moderation path, and re-deriving it from an edited delivery would let an
+	// edit move a comment out from under its thread's lock.
+	var storedThreadRoot string
 	if existing, err := m.objects.GetByAPID(ctx, obj.ID); err == nil {
 		if existing.IsDeleted() {
 			return nil, skip(obj.ID, "object was deleted upstream; not resurrecting")
 		}
-		carryForward = collection == CollectionPost || collection == CollectionComment
+		carryForward = collection == CollectionPost ||
+			collection == CollectionPostV2 ||
+			collection == CollectionComment
+		storedCommunityDID = existing.CommunityDID
+		storedThreadRoot = existing.ThreadRootATURI
 	} else if !errors.IsNotFound(err) {
 		return nil, fmt.Errorf("materialize: check mapping for %s: %w", obj.ID, err)
 	}
@@ -280,6 +409,17 @@ func (m *Materializer) commitRecord(ctx context.Context, did, collection, rkey s
 	var stored *store.APObjectMapping
 	putMapping := func(ctx context.Context, tx *sql.Tx, res *repo.CommitResult) error {
 		mapping.CID = res.RecordCID
+		// Derived HERE, not above, because carryForwardFields may have
+		// rewritten the record between the two points: an update whose
+		// audience was retargeted has had the stored (immutable) community
+		// restored by then, and the mapping must agree with the record it
+		// maps or the two would authorize different communities.
+		mapping.CommunityDID = mappingCommunityDID(collection, did, record, communityDID, storedCommunityDID)
+		// Same rule, same moment, for the same reason: the thread a comment
+		// hangs in is decided once and read off the RECORD being committed, so
+		// an update whose reply refs were carried forward maps the thread the
+		// record actually names rather than one this delivery asserted.
+		mapping.ThreadRootATURI = mappingThreadRootATURI(collection, record, storedThreadRoot)
 		var mapErr error
 		stored, mapErr = m.objects.PutMappingTx(ctx, tx, mapping)
 		if mapErr != nil {
@@ -351,6 +491,11 @@ func (m *Materializer) commitRecord(ctx context.Context, did, collection, rkey s
 //     rejects as thread hijacking. Carrying the stored refs verbatim keeps the
 //     thread anchoring stable across edits. The CREATE path still resolves
 //     fresh refs (this runs only for a live existing mapping).
+//   - community (postv2 only): the lexicon makes it IMMUTABLE, and Coves'
+//     consumers discard the WHOLE update event that changes it — so a rebuild
+//     that re-derived it from an edited (or hostile) `audience` would not
+//     retarget the post, it would freeze the post at its pre-edit version
+//     while every later edit was thrown away too. The stored value wins.
 //
 // A record absent on the FIRST attempt is the crash window between a delete
 // commit and its soft-delete: let the rebuild stand as a guarded create
@@ -368,6 +513,19 @@ func (m *Materializer) carryForwardFields(ctx context.Context, did, collection, 
 		if collection == CollectionComment {
 			if reply, ok := stored["reply"]; ok {
 				record["reply"] = reply
+			}
+		}
+		if collection == CollectionPostV2 {
+			if community, ok := stored["community"]; ok {
+				record["community"] = community
+			}
+			// originalAuthor is provenance about who wrote the post UPSTREAM,
+			// and an edit is not a claim about that. attributedTo on an updated
+			// Page is proposed by whoever delivered the update, so rebuilding
+			// provenance from it would let one delivery reattribute a post to
+			// somebody who never wrote it.
+			if author, ok := stored["originalAuthor"]; ok {
+				record["originalAuthor"] = author
 			}
 		}
 		return storedCID, nil

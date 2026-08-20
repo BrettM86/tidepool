@@ -28,7 +28,12 @@ func newBackfill(t *testing.T, h *harness, maxPosts int) *Backfill {
 		Materializer: h.mat,
 		Communities:  h.communities,
 		Tombstones:   h.tombstones,
-		MaxPosts:     maxPosts,
+		// The same guard the dispatcher runs, and required for the same reason:
+		// a community's outbox carries OUR federated content once native users
+		// participate, and this path reaches the materializer with no envelope
+		// in front of it.
+		Echo:     h.classifier,
+		MaxPosts: maxPosts,
 	})
 	require.NoError(t, err)
 	return b
@@ -81,7 +86,7 @@ func TestBackfillProducesMappedHistory(t *testing.T) {
 	for _, id := range []string{pageID, secondPageID} {
 		mapping, err := h.objects.GetByAPID(ctx, id)
 		require.NoError(t, err, "outbox post %s must be materialized", id)
-		assert.Equal(t, materialize.CollectionPost, mapping.Collection)
+		assert.Equal(t, materialize.CollectionPostV2, mapping.Collection)
 	}
 	// The advertised reply landed too.
 	replyMapping, err := h.objects.GetByAPID(ctx, "https://lemmy.world/comment/3001")
@@ -134,6 +139,7 @@ func TestBackfillSeedsVoteCounts(t *testing.T) {
 			Communities:  h.communities,
 			Tombstones:   h.tombstones,
 			Seeder:       seeder,
+			Echo:         h.classifier,
 			MaxPosts:     10,
 		})
 		require.NoError(t, err)

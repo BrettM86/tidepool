@@ -93,7 +93,22 @@ func (m *Materializer) SetBridgedStats(ctx context.Context, mapping *store.APObj
 		// Counts unchanged? Re-emitting would only move asOf, minting a new CID
 		// and a firehose event for nothing. Skip the commit entirely (the caller
 		// still advances its watermark).
+		//
+		// The ACCEPTANCE is still reconciled first, against prevCID — the CID
+		// this read just proved the record has, never mapping.CID, which is a
+		// row read before the commit that produced it and can name a version
+		// that no longer exists. The repin has to be driven by the pin, not by
+		// whether this stamp committed: a crash between a stats commit and its
+		// repin leaves an acceptance pinning a dead CID, and every later sweep
+		// carries the same counts and lands here. Returning early would make
+		// this the one branch that can SEE the stale pin and the only one that
+		// never fixes it, so the post stays out of its community until somebody
+		// edits it upstream. An already-correct pin costs one record read and
+		// commits nothing.
 		if up, down, ok := bridgedStatsCounts(record); ok && up == upvotes && down == downvotes {
+			if err := m.repinAcceptance(ctx, mapping, prevCID); err != nil {
+				return nil, err
+			}
 			return &Result{DID: mapping.DID, ATURI: mapping.ATURI, CID: mapping.CID, NoOp: true}, nil
 		}
 
@@ -145,8 +160,76 @@ func (m *Materializer) SetBridgedStats(ctx context.Context, mapping *store.APObj
 		if err != nil {
 			return nil, fmt.Errorf("materialize: put stats for %s: %w", mapping.ATURI, err)
 		}
+		if err := m.repinAcceptance(ctx, &updated, res.RecordCID); err != nil {
+			return nil, err
+		}
 		return &Result{DID: mapping.DID, ATURI: mapping.ATURI, CID: res.RecordCID, NoOp: res.NoOp}, nil
 	}
+}
+
+// repinAcceptance re-points a postv2's acceptance at the version this stamp
+// just produced. A stats stamp rewrites the record, so its CID moves — and an
+// acceptance pinning the OLD CID is, to Coves' consumers, an acceptance of a
+// version that no longer exists: the lexicon tells them not to render the new
+// CID under it, so a post would fall out of its community every time the vote
+// sweep touched it. Nothing about the community's decision changed, so the
+// stored createdAt is carried forward and only the pin moves.
+//
+// A repin cannot join the stats commit — that lands in the AUTHOR's repo and
+// this in the COMMUNITY's — so it is a second commit with the same heal
+// property as the create path: redelivery re-runs it. It is skipped, rather
+// than guessed at, when the mapping cannot say where or when to write; the
+// next materialization of the post heals it.
+//
+// It runs on EVERY stats pass, the no-op ones included, because it reconciles
+// a pin rather than announcing a commit: recordCID is whatever the caller has
+// just proved the record holds, and an acceptance already naming it re-puts
+// byte-identically and reaches the repo layer's no-op path. Gating this on
+// "did the stamp commit?" would leave a crash-window pin permanently stale,
+// since the sweep that follows such a crash carries unchanged counts.
+func (m *Materializer) repinAcceptance(ctx context.Context, mapping *store.APObjectMapping, recordCID string) error {
+	if mapping.Collection != CollectionPostV2 {
+		return nil
+	}
+	// Resolved rather than read straight off the column: a mapping written
+	// before migration 016 carries no community_did, and bailing on that
+	// would leave exactly the oldest posts — the ones most likely to be
+	// stats-swept — pinned to a dead CID forever.
+	communityDID, err := CommunityDIDOf(ctx, m.repos, mapping)
+	if err != nil {
+		return err
+	}
+	if communityDID == "" || mapping.PublishedAt == nil {
+		m.logger.Debug("cannot repin acceptance; leaving it to the next materialization",
+			"ap_id", mapping.APID, "at_uri", mapping.ATURI,
+			"community_did", communityDID, "has_published", mapping.PublishedAt != nil)
+		return nil
+	}
+	if err := m.acceptPost(ctx, communityDID, mapping.ATURI, recordCID, *mapping.PublishedAt); err != nil {
+		return err
+	}
+
+	// ORPHAN GUARD. The stats commit and this repin are separate commits in
+	// separate repos, so a delete can land between them: deleteMapping removes
+	// the acceptance and the post, and this write then re-creates an acceptance
+	// for a record that no longer exists — a community attesting to nothing,
+	// which no later delete will revisit because the mapping is already
+	// tombstoned. Re-read the mapping and compensate if that happened.
+	current, err := m.objects.GetByAPID(ctx, mapping.APID)
+	switch {
+	case err == nil && !current.IsDeleted():
+		return nil
+	case err != nil && !errors.IsNotFound(err):
+		return fmt.Errorf("materialize: re-check mapping after repin %s: %w", mapping.APID, err)
+	}
+	m.logger.Warn("post was deleted while its acceptance was being repinned; withdrawing the acceptance",
+		"ap_id", mapping.APID, "at_uri", mapping.ATURI)
+	rkey := SubjectRKey(mapping.ATURI)
+	if _, derr := m.repos.DeleteRecord(ctx, communityDID, CollectionAcceptance, rkey); derr != nil && !errors.IsNotFound(derr) {
+		return fmt.Errorf("materialize: withdraw orphaned acceptance %s/%s/%s: %w",
+			communityDID, CollectionAcceptance, rkey, derr)
+	}
+	return nil
 }
 
 // bridgedStatsCounts reads the upvotes/downvotes a record's bridgedStats field

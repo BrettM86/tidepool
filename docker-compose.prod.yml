@@ -23,6 +23,13 @@
 # plain `git pull` is enough; the reconciler picks the new file up on its
 # next sweep (FOLLOW_LIST_INTERVAL, default 15m) — no container restart.
 #
+# v2 env: the `tidepool` service below gained the task-13/14/15/16/17 knobs
+# (AP_USER_ORIGIN, CONSUMER_ENABLED, JETSTREAM_URL, OUTBOUND_*, the admission
+# quota, DIVERGENCE_*). AP_USER_ORIGIN is REQUIRED in production, so deploying
+# HEAD onto a pre-v2 /opt/tidepool/.env fails at boot rather than coming up
+# half-configured. The staged-rollout order, the kill switches and the
+# coves.social Caddy changes are in DEPLOY.md.
+#
 # Ops note (README "Sync surface"): the bridge's per-IP rate limiters key on
 # RemoteAddr and see only Caddy's container IP from behind the proxy —
 # per-IP limits degrade to global ones until rate limiting exists at the
@@ -88,6 +95,13 @@ services:
       BRIDGE_HOSTNAME: ${BRIDGE_HOSTNAME:-tdpl.io}
       PLC_DIRECTORY_URL: https://plc.directory
       BRIDGE_KEK: ${BRIDGE_KEK}
+      # Empty in steady state (the bridge reads empty as unset). It is set for
+      # the length of a KEK rotation ONLY, and it must be forwarded here rather
+      # than only to a one-off container: the running bridge needs the old key
+      # to open pre-rotation material, and `docker compose run tidepool
+      # rotate-kek` inherits this same service environment. See DEPLOY.md §6,
+      # "Runbook: rotating BRIDGE_KEK".
+      BRIDGE_KEK_PREVIOUS: ${BRIDGE_KEK_PREVIOUS:-}
       ADMIN_TOKEN: ${ADMIN_TOKEN}
       # Gentler than the built-in 60/120: the public plc.directory 429s
       # mint bursts during community backfill (observed at launch), and a
@@ -104,6 +118,84 @@ services:
       # instead (SELF_HOSTED_RELAY.md).
       RELAY_HOSTS: ${RELAY_HOSTS:-https://bsky.network}
       FOLLOW_LIST_PATH: /repo/communities.yaml
+
+      # --- v2 (tasks 13-17): the native-user surface and the outbound half ---
+      #
+      # REQUIRED IN PRODUCTION. config.stringVar refuses an unset value outside
+      # development (internal/config/config.go:797-806), so a HEAD deploy onto
+      # an env file without this dies at boot with
+      #   config: AP_USER_ORIGIN is required in production
+      # — fail-closed, and deliberately so: this origin is baked into every
+      # actor_id this deployment mints, so a wrong value is not a restart away
+      # from fixed, it is a set of federated identities pointing at the wrong
+      # place forever. Must be https in production (config.go:782-784) and must
+      # not be BRIDGE_HOSTNAME or a subdomain of it (config.go:786-790), which
+      # would shadow the bridged-handle namespace.
+      #
+      # Serving derives every URL from the stored actor_id, never from this
+      # value — so changing it later does NOT migrate existing actors, it only
+      # changes where NEW ones are minted.
+      AP_USER_ORIGIN: ${AP_USER_ORIGIN:?AP_USER_ORIGIN must be set in .env — see DEPLOY.md §1; a defaulted origin mints permanent wrong identities}
+
+      # The Jetstream consumer: native Coves users' records flowing OUTWARD.
+      # Default off. Staged here ahead of the flag on purpose — JETSTREAM_URL is
+      # validated whenever it is set (config.go:481-489), not only when the
+      # consumer is on, so a typo is a boot failure with a clear message today
+      # rather than a silent reconnect loop on the day someone flips the switch.
+      #
+      # Container NAME, not the `jetstream` service alias, for the same reason
+      # DATABASE_URL uses tidepool-prod-postgres: this service also joins
+      # coves-prod-network, and a bare alias is only unambiguous until the Coves
+      # stack grows a service by the same name. :8080 is JETSTREAM_ADDR below;
+      # :6060 is its debug listener and serves no /subscribe.
+      CONSUMER_ENABLED: ${CONSUMER_ENABLED:-false}
+      JETSTREAM_URL: ${JETSTREAM_URL:-ws://tidepool-prod-jetstream:8080/subscribe}
+
+      # Delivery workers. 0 = OFF, and it is AND-gated on CONSUMER_ENABLED
+      # (cmd/tidepool/main.go:716, 843) — there is no OUTBOUND_ENABLED. With the
+      # consumer on and workers at 0 the real enqueuer still writes
+      # outbound_activities/deliveries, so intent accumulates durably and starts
+      # draining the moment workers are raised. That is the intended staging
+      # order: consumer first, watch the queue, then workers.
+      OUTBOUND_WORKERS: ${OUTBOUND_WORKERS:-0}
+
+      # Kill switches (decision 19). A blocked delivery is PARKED — it stays
+      # pending and resumes when the switch clears (internal/outbound/worker.go
+      # :236-242) — never poisoned, never cancelled, so engaging one loses
+      # nothing. DRY_RUN parks too, after translating and logging.
+      #
+      # ALL OF THESE ARE READ ONCE AT BOOT (config.Load, main.go:109); there is
+      # no reload signal. Changing one means editing /opt/tidepool/.env and
+      # recreating the service.
+      #
+      # HOSTS is lowercased on load; COMMUNITIES and ACTORS are matched EXACTLY
+      # and case-sensitively (config.go:519-525). Communities are AP ids
+      # ("https://lemmy.world/c/comicstrips"), matched against the delivery's
+      # ordering key; actors are DIDs. There is no allowlist form — a canary is
+      # expressed by disabling every community except the one under test.
+      OUTBOUND_DRY_RUN: ${OUTBOUND_DRY_RUN:-false}
+      OUTBOUND_DISABLED: ${OUTBOUND_DISABLED:-false}
+      OUTBOUND_DISABLED_HOSTS: ${OUTBOUND_DISABLED_HOSTS:-}
+      OUTBOUND_DISABLED_COMMUNITIES: ${OUTBOUND_DISABLED_COMMUNITIES:-}
+      OUTBOUND_DISABLED_ACTORS: ${OUTBOUND_DISABLED_ACTORS:-}
+
+      # The acceptance engine's per-author-per-community flood cap (0 =
+      # unlimited). Tidepool SIGNS the community's acceptance, so it must not
+      # let one native account flood a community it vouches for.
+      ADMISSION_MAX_PER_AUTHOR_PER_COMMUNITY: ${ADMISSION_MAX_PER_AUTHOR_PER_COMMUNITY:-50}
+
+      # The reconciliation sweep (task 17e). It is wired UNCONDITIONALLY
+      # (main.go:491-506) and sweeps once at startup before its first tick, so
+      # this interval is not an on/off switch — durationVar refuses 0 or
+      # negative (config.go:666-668). It writes nothing, to peers or to our own
+      # tables, which is what makes an always-on schedule safe. The only way to
+      # quiet it is a large interval; see DEPLOY.md "Not implemented".
+      DIVERGENCE_INTERVAL: ${DIVERGENCE_INTERVAL:-15m}
+      # How long a pending delivery may sit before the sweep calls its
+      # acceptance stale. The report's one crying-wolf knob; 12h is derived from
+      # the retry schedule plus the causal wait budget (internal/ingest/
+      # divergence.go:72-81), not picked.
+      DIVERGENCE_ACCEPTANCE_STALE_AFTER: ${DIVERGENCE_ACCEPTANCE_STALE_AFTER:-12h}
     volumes:
       - ./:/repo:ro
     networks:

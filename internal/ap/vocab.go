@@ -51,6 +51,30 @@ const (
 	TypeLike     = "Like"
 	TypeDislike  = "Dislike"
 
+	// TypeLock is Lemmy's thread lock (activities/community/lock_page.rs),
+	// announced by the community as Announce{Lock} and lifted with
+	// Announce{Undo{Lock}}.
+	//
+	// Its `object` is the TARGET — the post being locked — never a payload the
+	// activity carries. That is why it must stay OUT of echo.carriesPayload:
+	// the target of every inbound moderation action against native content is,
+	// by definition, one of OUR ids, so descending into it would classify each
+	// one as our own echo and drop inbound moderation entirely while the drop
+	// counter reported it working.
+	TypeLock = "Lock"
+
+	// TypeBlock is Lemmy's community ban (activities/block/block_user.rs),
+	// announced by the community as Announce{Block} and lifted with
+	// Announce{Undo{Block}}.
+	//
+	// Its `object` is the BANNED ACTOR and its `target` is the community the ban
+	// applies to — neither is a payload. Like Lock it must stay OUT of
+	// echo.carriesPayload, and here the consequence is sharper: the banned actor
+	// of a native author IS one of our own personas by definition, so descending
+	// would classify every inbound ban as our own echo and disable community
+	// bans entirely while the drop counter reported success.
+	TypeBlock = "Block"
+
 	TypeTombstone = "Tombstone"
 	TypeImage     = "Image"
 	TypeLink      = "Link"
@@ -92,19 +116,28 @@ type Object struct {
 	Target *Object `json:"target,omitempty"`
 
 	// Content.
-	Name      string  `json:"name,omitempty"`
-	Content   string  `json:"content,omitempty"`
-	Summary   string  `json:"summary,omitempty"`
-	MediaType string  `json:"mediaType,omitempty"`
-	Source    *Source `json:"source,omitempty"`
-	URL       Links   `json:"url,omitempty"`
-	InReplyTo *Object `json:"inReplyTo,omitempty"`
-	Tag       Tags    `json:"tag,omitempty"`
-	Attach    Tags    `json:"attachment,omitempty"`
-	Icon      *Object `json:"icon,omitempty"`
-	Image     *Object `json:"image,omitempty"`
-	Published *Time   `json:"published,omitempty"`
-	Updated   *Time   `json:"updated,omitempty"`
+	Name    string `json:"name,omitempty"`
+	Content string `json:"content,omitempty"`
+	// Summary is the summary TEXT. Ask HasSummary whether the key was there
+	// at all: "" and absent are the same string but not the same activity
+	// (PLAN.md decision 18 — a Delete carrying a summary is a moderator
+	// removal, one without it is the author deleting their own content, and
+	// a moderator who typed no reason sends `"summary": ""`).
+	Summary string `json:"summary,omitempty"`
+	// summaryPresent records whether the wire object carried the key. It is
+	// unexported so encoding/json cannot see it: presence is an observation
+	// about received bytes, never a field the bridge emits.
+	summaryPresent bool
+	MediaType      string  `json:"mediaType,omitempty"`
+	Source         *Source `json:"source,omitempty"`
+	URL            Links   `json:"url,omitempty"`
+	InReplyTo      *Object `json:"inReplyTo,omitempty"`
+	Tag            Tags    `json:"tag,omitempty"`
+	Attach         Tags    `json:"attachment,omitempty"`
+	Icon           *Object `json:"icon,omitempty"`
+	Image          *Object `json:"image,omitempty"`
+	Published      *Time   `json:"published,omitempty"`
+	Updated        *Time   `json:"updated,omitempty"`
 	// Replies, when advertised, is the object's replies collection (a bare
 	// IRI or an inline collection). Task 06's backfill pages through it.
 	Replies *Object `json:"replies,omitempty"`
@@ -113,7 +146,24 @@ type Object struct {
 	// of language objects on Group actors; Languages accepts both.
 	Language Languages `json:"language,omitempty"`
 
+	// Expires and EndTime are the two spellings of a Block's ban expiry. Lemmy
+	// 0.19 sends `expires`; newer versions send AS2's `endTime` for the same
+	// fact. Both are kept as they arrived rather than merged at parse time —
+	// the wire said what it said — and BanExpiry answers which one applies.
+	//
+	// The field is LOAD-BEARING and not decoration: Lemmy sends NO Undo when a
+	// temporary ban lapses (it simply stops applying on their side), so an
+	// implementation that misses it turns every timed ban into a permanent one
+	// with no activity that could ever clear it. Reading only one spelling is
+	// exactly that bug, arriving on a version upgrade.
+	Expires *Time `json:"expires,omitempty"`
+	EndTime *Time `json:"endTime,omitempty"`
+
 	// Lemmy extensions.
+	// RemoveData is Block's purge flag: the moderator also removed that author's
+	// content in the community they were banned from. A *bool because absent and
+	// false are the same decision here but only one of them is a statement.
+	RemoveData              *bool `json:"removeData,omitempty"`
 	Sensitive               *bool `json:"sensitive,omitempty"`
 	CommentsEnabled         *bool `json:"commentsEnabled,omitempty"`
 	PostingRestrictedToMods *bool `json:"postingRestrictedToMods,omitempty"`
@@ -187,16 +237,60 @@ func (o *Object) UnmarshalJSON(data []byte) error {
 		*o = Object{}
 		return nil
 	}
-	var alias objectAlias
-	if err := json.Unmarshal(data, &alias); err != nil {
+	// objectWire shadows `summary` with RAW BYTES so one pass answers both
+	// questions: the text, and whether the key was on the wire at all. The
+	// outer field sits at depth 0 and the embedded alias's at depth 1, so
+	// encoding/json fills this one and leaves the alias's empty — which is why
+	// the text is copied across below rather than read off the alias.
+	//
+	// Raw bytes rather than a *string because the two must be decided
+	// SEPARATELY. `"summary": null` unmarshals a *string to nil, making an
+	// explicit null indistinguishable from a missing key — and those select
+	// opposite paths: present means a moderator removal (the author's record
+	// survives), absent means a self-delete (it does not). A RawMessage is
+	// empty only when the key was genuinely absent, so presence is decided on
+	// the KEY and the text is read only when there is a JSON string to read.
+	var wire struct {
+		objectAlias
+		Summary json.RawMessage `json:"summary"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
 		return err
 	}
-	*o = Object(alias)
+	*o = Object(wire.objectAlias)
+	if len(wire.Summary) > 0 {
+		o.summaryPresent = true
+		// Anything that is not a JSON string (null, and any wrong-typed value
+		// a sender emits) leaves the text empty rather than failing the parse:
+		// tolerant parsing, and "present with no text" is a shape the wire
+		// really uses.
+		var text string
+		if err := json.Unmarshal(wire.Summary, &text); err == nil {
+			o.Summary = text
+		}
+	}
 	return nil
 }
 
+// HasSummary reports whether the wire object carried a `summary` key at all,
+// which is a different question from whether Summary is non-empty. Lemmy marks
+// a moderator removal by putting the key on the Delete and an author's own
+// delete by omitting it (PLAN.md decision 18), and a moderator who gave no
+// reason sends the key with an empty string — so collapsing "" into "absent"
+// reads every reasonless mod removal as a self-delete.
+//
+// Nil-safe, like Time.OK: callers ask the question of whatever they hold
+// without first proving it is there.
+func (o *Object) HasSummary() bool { return o != nil && o.summaryPresent }
+
 // MarshalJSON emits a bare IRI string when only the ID is set (the compact
 // wire form of a reference), otherwise the full object.
+//
+// LOSSY FOR SUMMARY PRESENCE. `summary` is omitempty over a plain string, so
+// a present-but-empty key marshals away and HasSummary answers false on the
+// far side. Never round-trip an inbound activity through Marshal and back
+// where that distinction matters — a moderator removal would re-read as a
+// self-delete. Store the raw bytes and re-parse those instead.
 func (o Object) MarshalJSON() ([]byte, error) {
 	if o.ID != "" && o.isIDOnly() {
 		return json.Marshal(o.ID)
@@ -212,6 +306,23 @@ func (o Object) isIDOnly() bool {
 	clone := o
 	clone.ID = ""
 	return reflect.DeepEqual(clone, Object{})
+}
+
+// BanExpiry is the expiry a Block carries, under whichever spelling the sender
+// used (`expires`, or AS2's `endTime` from newer Lemmy). nil means the activity
+// carried NO expiry — a permanent ban — which is a different fact from an
+// expiry that was present and could not be parsed: that one comes back non-nil
+// with Valid false, and callers MUST tell the two apart. Collapsing them maps
+// "we could not read how long" onto "forever", on the one field where forever
+// is unrecoverable.
+func (o *Object) BanExpiry() *Time {
+	if o == nil {
+		return nil
+	}
+	if o.Expires != nil {
+		return o.Expires
+	}
+	return o.EndTime
 }
 
 // IsActor reports whether the object's type is an AP actor type.

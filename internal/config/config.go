@@ -4,14 +4,19 @@
 package config
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"tidepool/internal/ingest"
+	"tidepool/internal/personas"
 )
 
 const (
@@ -48,6 +53,12 @@ type Config struct {
 	// development default is a fixed, publicly known key — never usable in
 	// production, where BRIDGE_KEK is required.
 	BridgeKEK []byte
+	// BridgeKEKPrevious is the KEK the bridge is rotating away from: key
+	// material sealed under it must still open, but nothing new is sealed
+	// under it. Nil when BRIDGE_KEK_PREVIOUS is unset — which is the steady
+	// state, so the variable is optional in every environment and has no
+	// development default.
+	BridgeKEKPrevious []byte
 	// BridgeServiceDID optionally pins a pre-provisioned service DID for the
 	// bridge's own actor. Service-DID bootstrap is deferred: task 06 wires
 	// the service actor; until then an empty value is handled gracefully
@@ -98,6 +109,58 @@ type Config struct {
 	// mislead (the ALLOW_PRIVATE_FETCH pattern). Set
 	// ALLOW_DEV_REQUEST_CRAWL=1 to enable.
 	AllowDevRequestCrawl bool
+	// APUserOrigin is the origin Coves users' ActivityPub actors live under
+	// (AP_USER_ORIGIN, e.g. "https://coves.social"); dev defaults to
+	// http://localhost:8091. It seeds NEW actor rows only — serving derives
+	// every URL from the stored actor_id — and its host must not be
+	// BRIDGE_HOSTNAME or a subdomain of it, which would shadow the bridged
+	// handle namespace.
+	APUserOrigin string
+	// APHostFallthroughDev routes unknown Hosts to the service surface
+	// instead of refusing them (AP_HOST_FALLTHROUGH_DEV). Unlike the other
+	// dev flags this one defaults to TRUE in development — a laptop is
+	// reached by IP or tunnel hostname — and setting it in production is
+	// refused: an authenticated write surface must not answer under a Host
+	// an attacker chose.
+	APHostFallthroughDev bool
+
+	// ConsumerEnabled turns on the Jetstream consumer (task 14). Default OFF:
+	// the consumer writes durable outbound state and hands work to delivery,
+	// so a deployment that has not been wired end to end should not start
+	// silently accumulating it.
+	ConsumerEnabled bool
+	// JetstreamURL is the self-hosted Jetstream the consumer subscribes to
+	// (ws:// or wss://). REQUIRED when ConsumerEnabled — a consumer with
+	// nowhere to dial would come up "healthy" and consume nothing, which is
+	// the failure mode cursors and lag metrics exist to make impossible.
+	JetstreamURL string
+	// OutboundWorkers is how many delivery workers to run (OUTBOUND_WORKERS,
+	// default 0 = OFF). Delivery starts ONLY when this is >0 AND
+	// ConsumerEnabled. With the consumer on and workers at 0 the REAL enqueuer
+	// still persists every intent to outbound_activities/deliveries inside the
+	// gate transaction — state accumulates and nothing is POSTed, so raising
+	// workers later drains the backlog rather than starting from empty.
+	OutboundWorkers int
+	// AdmissionMaxPerAuthorPerCommunity caps how many posts one native author may
+	// have accepted into one bridged community — the acceptance engine's flood
+	// guard (ADMISSION_MAX_PER_AUTHOR_PER_COMMUNITY, generous default 50). 0 means
+	// UNLIMITED. Tidepool signs the community's acceptance, so it must not let one
+	// account flood a Lemmy community it vouches for.
+	AdmissionMaxPerAuthorPerCommunity int
+	// OutboundDryRun makes workers translate + log but POST nothing, leaving
+	// deliveries pending (OUTBOUND_DRY_RUN, default false).
+	OutboundDryRun bool
+	// OutboundDisabled is the global kill switch: every delivery is PARKED
+	// (stays pending, resumes when cleared), nothing federates
+	// (OUTBOUND_DISABLED, default false).
+	OutboundDisabled bool
+	// OutboundDisabledHosts / Communities / Actors are the scoped kill
+	// switches: any delivery whose inbox host, community AP id, or actor DID is
+	// in the set is parked (comma-separated OUTBOUND_DISABLED_HOSTS /
+	// OUTBOUND_DISABLED_COMMUNITIES / OUTBOUND_DISABLED_ACTORS). Empty = allow.
+	OutboundDisabledHosts       map[string]struct{}
+	OutboundDisabledCommunities map[string]struct{}
+	OutboundDisabledActors      map[string]struct{}
 	// AdminToken is the bearer token protecting the /admin API (community
 	// subscribe/unsubscribe/backfill). ADMIN_TOKEN; required in production,
 	// dev default is a fixed, publicly known value.
@@ -193,6 +256,27 @@ type Config struct {
 	// because the remote was down at startup; pending→accepted retries are
 	// the follow retrier's job, not the reconciler's.
 	FollowListInterval time.Duration
+	// DivergenceInterval is the reconciliation sweep's cadence
+	// (DIVERGENCE_INTERVAL, a Go duration, default 15m, must be positive).
+	//
+	// The sweep is always wired — both sides of every comparison are local, so
+	// it has nothing to be configured WITH — and this knob only decides how
+	// often the background pass refreshes the gauges. GET /admin/divergence
+	// runs one on demand regardless. It never writes anything (decision 19),
+	// which is what makes an always-on schedule safe.
+	DivergenceInterval time.Duration
+	// DivergenceAcceptanceStaleAfter is how long a pending delivery may sit
+	// before the sweep reports its acceptance as STALE
+	// (DIVERGENCE_ACCEPTANCE_STALE_AFTER, a Go duration, must be positive).
+	//
+	// It is the report's one crying-wolf knob: too short and every ordinary
+	// in-flight post is a finding, too long and a queue that stopped this
+	// morning is not in the report tonight. The default is derived from the
+	// retry schedule and the causal wait budget — see
+	// ingest.DefaultAcceptanceStaleAfter, which is NAMED here rather than
+	// respelled as a number, so the reasoning and the value an operator
+	// actually gets cannot come apart.
+	DivergenceAcceptanceStaleAfter time.Duration
 }
 
 // Load reads configuration from the environment. logger must not be nil;
@@ -256,9 +340,27 @@ func Load(logger *slog.Logger) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	cfg.BridgeKEK, err = decodeKEK(kekEncoded)
+	cfg.BridgeKEK, err = DecodeKEK("BRIDGE_KEK", kekEncoded)
 	if err != nil {
 		return nil, err
+	}
+
+	// Optional everywhere, deliberately NOT routed through stringVar: that
+	// helper makes a variable required in production, and requiring a previous
+	// KEK would refuse to boot every bridge that has never rotated. A rotation
+	// is a temporary state; the absence of the variable is the normal one.
+	if previousEncoded := strings.TrimSpace(os.Getenv("BRIDGE_KEK_PREVIOUS")); previousEncoded != "" {
+		cfg.BridgeKEKPrevious, err = DecodeKEK("BRIDGE_KEK_PREVIOUS", previousEncoded)
+		if err != nil {
+			return nil, err
+		}
+		// Compared on the decoded bytes, not the strings: the same key pasted
+		// as hex in one variable and base64 in the other is still one key, and
+		// an operator who believes that is a rotation would retire the only
+		// key every escrowed signing key is sealed under.
+		if bytes.Equal(cfg.BridgeKEKPrevious, cfg.BridgeKEK) {
+			return nil, fmt.Errorf("config: BRIDGE_KEK_PREVIOUS must decode to a different key than the current one; a rotation needs two different keys")
+		}
 	}
 
 	// Optional in every environment: an operator may pre-provision the
@@ -332,6 +434,34 @@ func Load(logger *slog.Logger) (*Config, error) {
 		return nil, fmt.Errorf("config: ALLOW_DEV_REQUEST_CRAWL must not be set in production (production always sends requestCrawl)")
 	}
 
+	// The Coves user origin. Required in production: it is baked into every
+	// actor_id this deployment mints, so a wrong or missing value is not a
+	// runtime inconvenience but a set of federated identities pointing at
+	// the wrong place, forever.
+	rawUserOrigin, err := stringVar(logger, isDevelopment, "AP_USER_ORIGIN", "http://localhost:8091")
+	if err != nil {
+		return nil, err
+	}
+	cfg.APUserOrigin, err = validateUserOrigin(rawUserOrigin, cfg.BridgeHostname, isDevelopment)
+	if err != nil {
+		return nil, err
+	}
+
+	// Unlike every other dev flag this one defaults ON in development: a
+	// laptop is reached by IP, tunnel hostname, or whatever the tunnel
+	// minted this morning, and a default-off flag would 421 every local
+	// request. Production defaults it off and REFUSES it set — an
+	// authenticated write surface must not answer under a Host an attacker
+	// chose.
+	cfg.APHostFallthroughDev, err = boolVarDefault(logger, "AP_HOST_FALLTHROUGH_DEV", isDevelopment)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.APHostFallthroughDev && !isDevelopment {
+		return nil, fmt.Errorf("config: AP_HOST_FALLTHROUGH_DEV must not be set in production " +
+			"(unknown Hosts are refused there)")
+	}
+
 	// Admin API auth: like the KEK, the dev default is fixed and public —
 	// required in production.
 	cfg.AdminToken, err = stringVar(logger, isDevelopment, "ADMIN_TOKEN", "dev-admin-token")
@@ -361,6 +491,65 @@ func Load(logger *slog.Logger) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// The Jetstream consumer (task 14), default OFF until task 18 wires the
+	// e2e path: it writes durable outbound state and hands work to delivery,
+	// so a deployment that has not been wired end to end should not quietly
+	// start accumulating it.
+	cfg.ConsumerEnabled, err = boolVarDefault(logger, "CONSUMER_ENABLED", false)
+	if err != nil {
+		return nil, err
+	}
+	cfg.JetstreamURL = strings.TrimSpace(os.Getenv("JETSTREAM_URL"))
+	// Validated whenever it is SET, not only when the consumer is on: staging
+	// a URL ahead of the flag is how a deployment is prepared, and a typo
+	// caught then is a boot failure with a clear message instead of a
+	// reconnect loop on the day someone flips the switch.
+	if cfg.JetstreamURL != "" {
+		parsed, err := url.Parse(cfg.JetstreamURL)
+		if err != nil {
+			return nil, fmt.Errorf("config: JETSTREAM_URL is not a valid URL: %w", err)
+		}
+		if parsed.Scheme != "ws" && parsed.Scheme != "wss" || parsed.Host == "" {
+			return nil, fmt.Errorf("config: JETSTREAM_URL must be an absolute ws:// or wss:// URL, got %q", cfg.JetstreamURL)
+		}
+	}
+	if cfg.ConsumerEnabled && cfg.JetstreamURL == "" {
+		// A consumer with nowhere to dial comes up looking healthy and
+		// consumes NOTHING, and silence is indistinguishable from a quiet
+		// stream — the exact failure the cursor and lag metrics exist to
+		// expose. Refuse at boot instead.
+		return nil, fmt.Errorf("config: JETSTREAM_URL is required when CONSUMER_ENABLED is set")
+	}
+
+	// Outbound delivery (task 15), default OFF: workers start only when
+	// OUTBOUND_WORKERS>0 AND the consumer is on. At 0 the enqueuer still writes
+	// outbound state; only the POSTing stops.
+	cfg.OutboundWorkers, err = intVarNonNegative(logger, "OUTBOUND_WORKERS", 0)
+	if err != nil {
+		return nil, err
+	}
+	// The acceptance engine's per-author-per-community flood cap. Generous by
+	// default so a legitimate poster is never throttled; 0 disables it entirely.
+	cfg.AdmissionMaxPerAuthorPerCommunity, err = intVarNonNegative(logger, "ADMISSION_MAX_PER_AUTHOR_PER_COMMUNITY", 50)
+	if err != nil {
+		return nil, err
+	}
+	cfg.OutboundDryRun, err = boolVarDefault(logger, "OUTBOUND_DRY_RUN", false)
+	if err != nil {
+		return nil, err
+	}
+	cfg.OutboundDisabled, err = boolVarDefault(logger, "OUTBOUND_DISABLED", false)
+	if err != nil {
+		return nil, err
+	}
+	// Hosts are lowercased (the worker's scope host comes from hostOf, which
+	// lowercases): a kill switch must fail CLOSED, so a mixed-case entry has to
+	// still block the normalized host. Communities and actors are exact ids and
+	// keep their case.
+	cfg.OutboundDisabledHosts = parseHostSet(os.Getenv("OUTBOUND_DISABLED_HOSTS"))
+	cfg.OutboundDisabledCommunities = parseSet(os.Getenv("OUTBOUND_DISABLED_COMMUNITIES"))
+	cfg.OutboundDisabledActors = parseSet(os.Getenv("OUTBOUND_DISABLED_ACTORS"))
 
 	// Retention knobs for the task-11 pruners: same semantics as
 	// FIREHOSE_RETENTION (real defaults everywhere, must be positive).
@@ -442,6 +631,15 @@ func Load(logger *slog.Logger) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	cfg.DivergenceInterval, err = durationVar(logger, "DIVERGENCE_INTERVAL", 15*time.Minute)
+	if err != nil {
+		return nil, err
+	}
+	cfg.DivergenceAcceptanceStaleAfter, err = durationVar(logger,
+		"DIVERGENCE_ACCEPTANCE_STALE_AFTER", ingest.DefaultAcceptanceStaleAfter)
+	if err != nil {
+		return nil, err
+	}
 
 	defaultUserAgent := fmt.Sprintf("tidepool/0.1 (+https://%s)", cfg.BridgeHostname)
 	cfg.UserAgent = os.Getenv("USER_AGENT")
@@ -459,22 +657,30 @@ func (c *Config) IsDevelopment() bool {
 	return c.Environment == EnvironmentDevelopment
 }
 
-// decodeKEK parses the BRIDGE_KEK value: 64 hex chars or standard base64,
-// either way decoding to exactly 32 bytes.
-func decodeKEK(encoded string) ([]byte, error) {
+// DecodeKEK parses a KEK-carrying variable: 64 hex chars or standard base64,
+// either way decoding to exactly 32 bytes. name is the environment variable
+// the value came from, so an operator holding two KEKs mid-rotation is told
+// which one they broke rather than being sent to check the good one.
+//
+// Exported for the rotate-kek one-shot, which reads BRIDGE_KEK and
+// BRIDGE_KEK_PREVIOUS without going through Load (an operational command must
+// not be blockable by config it does not use) and must still accept exactly
+// the encodings the server does — a second decoder would eventually drift and
+// reject the very key the running bridge is sealing under.
+func DecodeKEK(name, encoded string) ([]byte, error) {
 	encoded = strings.TrimSpace(encoded)
 	if raw, err := hex.DecodeString(encoded); err == nil {
 		if len(raw) != 32 {
-			return nil, fmt.Errorf("config: BRIDGE_KEK must decode to 32 bytes, got %d", len(raw))
+			return nil, fmt.Errorf("config: %s must decode to 32 bytes, got %d", name, len(raw))
 		}
 		return raw, nil
 	}
 	raw, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
-		return nil, fmt.Errorf("config: BRIDGE_KEK must be 64 hex chars or base64 of 32 bytes: %w", err)
+		return nil, fmt.Errorf("config: %s must be 64 hex chars or base64 of 32 bytes: %w", name, err)
 	}
 	if len(raw) != 32 {
-		return nil, fmt.Errorf("config: BRIDGE_KEK must decode to 32 bytes, got %d", len(raw))
+		return nil, fmt.Errorf("config: %s must decode to 32 bytes, got %d", name, len(raw))
 	}
 	return raw, nil
 }
@@ -514,6 +720,47 @@ func intVar(logger *slog.Logger, name string, fallback int) (int, error) {
 	return parsed, nil
 }
 
+// intVarNonNegative is intVar for a knob whose OFF value is 0: it accepts 0 (and
+// any positive int), unlike intVar which treats 0 as invalid. Used for
+// OUTBOUND_WORKERS, where 0 means "no delivery workers".
+func intVarNonNegative(logger *slog.Logger, name string, fallback int) (int, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		logger.Info(name+" not set, using default", "value", fallback)
+		return fallback, nil
+	}
+	parsed, err := strconv.Atoi(raw)
+	if err != nil || parsed < 0 {
+		return 0, fmt.Errorf("config: %s must be a non-negative integer, got %q", name, raw)
+	}
+	return parsed, nil
+}
+
+// parseSet splits a comma-separated environment value into a set, dropping
+// blanks. An empty or unset value yields an empty (but non-nil) set, which every
+// membership test reads as "nothing disabled".
+func parseSet(raw string) map[string]struct{} {
+	set := make(map[string]struct{})
+	for _, item := range strings.Split(raw, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			set[item] = struct{}{}
+		}
+	}
+	return set
+}
+
+// parseHostSet is parseSet with each entry lowercased — for the host kill
+// switch, whose scope host arrives already lowercased.
+func parseHostSet(raw string) map[string]struct{} {
+	set := make(map[string]struct{})
+	for _, item := range strings.Split(raw, ",") {
+		if item = strings.ToLower(strings.TrimSpace(item)); item != "" {
+			set[item] = struct{}{}
+		}
+	}
+	return set
+}
+
 // boolVar reports whether an environment variable is set to a truthy value
 // ("1", "true", "yes", case-insensitive).
 func boolVar(name string) bool {
@@ -542,6 +789,68 @@ func boolVarDefault(logger *slog.Logger, name string, fallback bool) (bool, erro
 		return false, nil
 	}
 	return false, fmt.Errorf("config: %s must be a boolean (1/0, true/false, yes/no, on/off), got %q", name, raw)
+}
+
+// validateUserOrigin canonicalizes the user origin and refuses one that would
+// shadow the bridge's own handle namespace, returning the CANONICAL origin —
+// the value every minted actor_id is built from, so the canonicalization has
+// to happen once, here, rather than at each use site.
+//
+// Bridged handles are subdomains of BRIDGE_HOSTNAME resolved off r.Host, so a
+// user origin AT that name or UNDER it would swallow them — and the Host
+// router could not tell the two surfaces apart in the first place.
+//
+// BOTH SIDES REDUCE THROUGH personas.NormalizeHost — the very function the Host
+// router applies to every request. That is the point: a check that reduces
+// differently from the router can pass a pair the router then collapses. It
+// used to canonicalize only the ORIGIN side, so the spelling its own comment
+// named ("https://TDPL.IO:443") walked straight past whenever it appeared on
+// the BRIDGE_HOSTNAME side instead — and BRIDGE_HOSTNAME "tdpl.io:443" with
+// AP_USER_ORIGIN "https://tdpl.io" passed boot, whereupon normalizeHost folded
+// both to "tdpl.io" and the router quietly entered COMPOSED mode in production,
+// a shape only the dev default was ever meant to reach.
+//
+// Matching is on a label boundary, so "nottidepool.example" is not under
+// "tidepool.example", and a different port is a different authority (the dev
+// defaults are exactly that shape: BRIDGE_HOSTNAME localhost, origin on
+// :8091).
+func validateUserOrigin(origin, bridgeHostname string, isDevelopment bool) (string, error) {
+	canonical, host, err := personas.CanonicalizeOrigin(origin)
+	if err != nil {
+		return "", fmt.Errorf("config: AP_USER_ORIGIN: %w", err)
+	}
+	// http publishes actor ids peers fetch in plaintext, carrying signature
+	// verification over an unauthenticated channel. It exists for the same
+	// reason BRIDGE_SCHEME=http does — the local e2e harness — and is
+	// refused outside development for the same reason.
+	if !isDevelopment && !strings.HasPrefix(canonical, "https://") {
+		return "", fmt.Errorf("config: AP_USER_ORIGIN must be https in production, got %q", canonical)
+	}
+
+	bridge := canonicalBridgeHost(bridgeHostname)
+	if host == bridge || strings.HasSuffix(host, "."+bridge) {
+		return "", fmt.Errorf("config: AP_USER_ORIGIN host %q must not be BRIDGE_HOSTNAME %q "+
+			"or a subdomain of it: the bridged handle namespace lives there", host, bridge)
+	}
+	return canonical, nil
+}
+
+// canonicalBridgeHost reduces BRIDGE_HOSTNAME to the authority the Host router
+// will compare it as. It is a HOSTNAME, not a URL, but operators write it as
+// one often enough that a pasted "https://tdpl.io" must not read as a different
+// authority than "tdpl.io" — the whole value of this check is that it agrees
+// with the router, and the router only ever sees the authority.
+func canonicalBridgeHost(raw string) string {
+	host := strings.TrimSpace(raw)
+	if _, after, found := strings.Cut(host, "://"); found {
+		host = after
+	}
+	// A path, query, or fragment is not part of the authority; cutting at the
+	// first delimiter leaves the part the router would key on.
+	host, _, _ = strings.Cut(host, "/")
+	host, _, _ = strings.Cut(host, "?")
+	host, _, _ = strings.Cut(host, "#")
+	return personas.NormalizeHost(host)
 }
 
 // stringVar returns the value of an environment variable. When unset it

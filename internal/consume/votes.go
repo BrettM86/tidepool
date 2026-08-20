@@ -1,0 +1,273 @@
+package consume
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"log/slog"
+	"strconv"
+
+	"tidepool/internal/errors"
+	"tidepool/internal/store"
+)
+
+// The native-vote path: a social.coves.feed.vote record in a Coves user's own
+// repo, cast on something this bridge federates.
+//
+// A vote DELETE commit names the vote record and NOTHING else — not the
+// subject, not the direction, not the id the Like went out under. But an Undo
+// has to EMBED the activity it withdraws. That gap is the whole reason
+// outbound_votes exists, and it is why the row is written before the intent
+// and outlives the record it describes.
+
+// The vote directions this build understands. `direction` is an OPEN enum in
+// the lexicon, so an unrecognised value is a forward-compatible record rather
+// than a malformed one.
+const (
+	directionUp   = "up"
+	directionDown = "down"
+)
+
+// handleVote applies one vote commit. tx is the rev-gate's transaction: the
+// outbound_votes write rides it, so the state write, the gate advance and the
+// enqueue commit together — a failed enqueue rolls all three back.
+func (d *Dispatcher) handleVote(ctx context.Context, tx *sql.Tx, did string, commit *CommitEvent) error {
+	switch commit.Operation {
+	case operationCreate, operationUpdate:
+		return d.applyVoteWrite(ctx, tx, did, commit)
+	case operationDelete:
+		return d.applyVoteDelete(ctx, tx, did, commit)
+	default:
+		// Unreachable: validateCommitEnvelope rejects any other operation as
+		// permanent before the gate. Kept as a claimed skip because an operation
+		// this build cannot name is not something a replay improves.
+		d.logger.Debug("unknown vote operation",
+			slog.String("operation", commit.Operation), slog.String("did", did))
+		return nil
+	}
+}
+
+// applyVoteWrite records a cast vote and enqueues the Like/Dislike.
+//
+// The step order mirrors the comment path, and for the same reasons: the
+// opt-out gate first (a vote IS a federating interaction, so it mints — an
+// earlier draft of this task missed that gate), then everything that decides
+// whether the vote can federate at all, and only then the identity and the
+// state.
+func (d *Dispatcher) applyVoteWrite(ctx context.Context, tx *sql.Tx, did string, commit *CommitEvent) error {
+	federating, err := d.mayFederate(ctx, did)
+	if err != nil {
+		return err
+	}
+	if !federating {
+		// PERMANENT, and it CLAIMS the gate. The author asked us to stop, which
+		// is not a fact that changes underneath this frame: a later re-enable
+		// federates what they write next, not what they wrote while opted out.
+		d.logger.Debug("skipping vote from an opted-out author",
+			slog.String("did", did), slog.String("rkey", commit.RKey))
+		return nil
+	}
+
+	direction := stringField(commit.Record, "direction")
+	if direction != directionUp && direction != directionDown {
+		// Nothing is stored: guessing a direction would push a vote the user
+		// never cast, and dead-lettering would turn a lexicon rollout into a
+		// queue full of rows nobody can redrive.
+		//
+		// UNCLAIMED, because `direction` is an OPEN enum: this record is
+		// forward-compatible rather than malformed, and the recovery path is a
+		// LATER BUILD replaying it (see errSkipUnclaimed). A claimed gate row
+		// would make that replay a silent no-op, which is the one outcome a
+		// forward-compatible field must not produce.
+		return fmt.Errorf("%w: vote %s has direction %s, which this build does not understand",
+			errSkipUnclaimed, commitRecordURI(did, commit), strconv.Quote(direction))
+	}
+
+	subjectATURI := refURI(commit.Record, "subject")
+	if subjectATURI == "" {
+		// PERMANENT: the lexicon requires subject, and no later state makes an
+		// absent field appear. The claim commits.
+		d.logger.Debug("skipping vote with no subject", slog.String("did", did))
+		return nil
+	}
+	subject, err := d.resolveSubject(ctx, subjectATURI)
+	if err != nil {
+		return err
+	}
+	if subject == nil {
+		// Native users vote in native communities constantly; dead-lettering
+		// that would bury the queue.
+		//
+		// UNCLAIMED. This is the finding's headline case: a vote cast a few
+		// hundred milliseconds before its subject was materialized resolves to
+		// nothing, and a claimed gate row would swallow the reconnect rewind
+		// that exists to recover it — the vote would silently never federate.
+		return fmt.Errorf("%w: vote %s names subject %s, which this bridge does not federate (yet)",
+			errSkipUnclaimed, commitRecordURI(did, commit), strconv.Quote(subjectATURI))
+	}
+
+	if err := d.refuseBannedAuthor(ctx, did, subject.CommunityDID, "vote "+commitRecordURI(did, commit)); err != nil {
+		return err
+	}
+
+	if err := d.ensureActor(ctx, did); err != nil {
+		return err
+	}
+
+	voteATURI := commitRecordURI(did, commit)
+	// The seq is derived BEFORE the write so the stored id and the intent's id
+	// are the same string: they must agree, or the Undo would withdraw an
+	// activity the peer never saw. Upsert bumps from the same base — 0 for a
+	// new row, +1 for a re-cast — so the two stay in step.
+	seq := 0
+	if existing, err := d.votes.GetByATURI(ctx, voteATURI); err == nil {
+		seq = existing.ActivitySeq + 1
+	} else if !errors.IsNotFound(err) {
+		return fmt.Errorf("read vote state for %s: %w", voteATURI, err)
+	}
+
+	stored, err := d.votes.UpsertTx(ctx, tx, store.OutboundVote{
+		VoteATURI:    voteATURI,
+		ActorDID:     did,
+		SubjectATURI: subjectATURI,
+		SubjectAPID:  subject.APID,
+		CommunityDID: subject.CommunityDID,
+		Direction:    direction,
+		// Stored, not recomputed at delete time: by then the vote record is
+		// gone and this id is the only handle on the activity the Undo has to
+		// name.
+		CurrentActivityID: ActivityID(d.userOrigin, voteATURI, operationCreate, seq),
+		DeliveredState:    store.DeliveredStatePending,
+	})
+	if errors.IsAlreadyExists(err) {
+		// A SECOND vote record for a subject this actor already has a live
+		// vote on. The existing row is left exactly as it is — clobbering it
+		// would strand the Undo still owed for the Like already delivered.
+		//
+		// TRANSIENT, not a skip: the newer record retries until the older
+		// one's delete lands. A vote change reaching this consumer out of
+		// order (the delete behind the re-cast) resolves itself on redrive,
+		// where a skip would drop the user's new vote for good. If the delete
+		// never comes the budget exhausts and the row is visible in the DLQ,
+		// which is the right place for two sides disagreeing about what the
+		// user's vote is.
+		d.logger.Warn("a second live vote for one subject; retrying until the first is deleted",
+			slog.String("did", did),
+			slog.String("vote", voteATURI),
+			slog.String("subject", subjectATURI))
+		return err
+	}
+	if err != nil {
+		return fmt.Errorf("write vote state for %s: %w", voteATURI, err)
+	}
+
+	return d.enqueuer.EnqueueActivity(ctx, tx, did, did, subjectATURI, VoteIntent{
+		Op:            operationCreate,
+		VoteATURI:     voteATURI,
+		SubjectAPID:   stored.SubjectAPID,
+		Direction:     stored.Direction,
+		ID:            stored.CurrentActivityID,
+		CommunityAPID: subject.CommunityAPID,
+	})
+}
+
+// applyVoteDelete withdraws a vote, using ONLY state.
+//
+// Like a comment delete, this is NOT gated on the opt-out: an Undo only ever
+// removes something, and blocking it would leave the user's vote standing on
+// the peer forever — the opposite of what asking to stop federating means.
+func (d *Dispatcher) applyVoteDelete(ctx context.Context, tx *sql.Tx, did string, commit *CommitEvent) error {
+	voteATURI := commitRecordURI(did, commit)
+
+	stored, err := d.votes.GetByATURI(ctx, voteATURI)
+	if errors.IsNotFound(err) {
+		// No Undo may be sent for a Like no peer ever received.
+		//
+		// PERMANENT, and the claim is LOAD-BEARING rather than merely harmless:
+		// the gate row a delete leaves IS the tombstone that rejects a stale
+		// create for the same URI. Releasing it would let a replay past the
+		// delete re-cast a vote the user withdrew.
+		d.logger.Debug("skipping delete for a vote with no outbound state",
+			slog.String("did", did), slog.String("vote", voteATURI))
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read vote state for %s: %w", voteATURI, err)
+	}
+
+	// The community must resolve BEFORE the row is bumped, so a failed lookup
+	// rolls back on the gate transaction rather than leaving a bumped seq
+	// behind an Undo that was never enqueued.
+	communityAPID, err := d.communityAPID(ctx, stored.CommunityDID)
+	if err != nil {
+		return err
+	}
+
+	// Re-upserting the row bumps the seq — the Undo is the next activity, and
+	// its id must not collide with the Like's — while keeping every other
+	// column, CurrentActivityID above all: that is the id the Like was
+	// delivered under, and the Undo has to embed it. The row SURVIVES: task 15
+	// needs it to retry the Undo and clears it only once delivery succeeds. It
+	// rides the gate transaction so the bump and the enqueue commit together.
+	undone, err := d.votes.UpsertTx(ctx, tx, *stored)
+	if err != nil {
+		return fmt.Errorf("bump vote state for %s: %w", voteATURI, err)
+	}
+
+	return d.enqueuer.EnqueueActivity(ctx, tx, did, did, stored.SubjectATURI, VoteIntent{
+		Op:          operationUndo,
+		VoteATURI:   voteATURI,
+		SubjectAPID: stored.SubjectAPID,
+		// Read back from state: the delete commit carries neither, and an
+		// Undo{Like} withdrawing a Dislike would move the peer's count the
+		// wrong way.
+		Direction:       stored.Direction,
+		ID:              ActivityID(d.userOrigin, voteATURI, operationUndo, undone.ActivitySeq),
+		InnerActivityID: stored.CurrentActivityID,
+		CommunityAPID:   communityAPID,
+	})
+}
+
+// operationUndo is not a commit operation: it is the outbound op a vote delete
+// becomes, kept distinct from "delete" because an Undo names the activity it
+// withdraws rather than an object.
+//
+// It is EXPORTED as OperationUndo because the activity id derives from it, and
+// a second producer of vote Undos now exists: the destructive opt-out tier
+// retracts a withdrawn actor's live votes (outbound.Purger). Two copies of the
+// string would mint two different ids for the same operation.
+const operationUndo = OperationUndo
+
+// OperationUndo is the outbound op a vote retraction is derived under. See
+// operationUndo.
+const OperationUndo = "undo"
+
+// communityAPID resolves a community's AP Group id for addressing.
+//
+// An empty community DID, or a community with no row (NotFound), yields "":
+// the withdrawal still has to go out, and task 15 can address it from the
+// subject. But a real error PROPAGATES — addressing an Undo to nobody off a
+// statement timeout would drop the withdrawal into the void and never retry.
+func (d *Dispatcher) communityAPID(ctx context.Context, communityDID string) (string, error) {
+	if communityDID == "" {
+		return "", nil
+	}
+	community, err := d.communities.GetByDID(ctx, communityDID)
+	if errors.IsNotFound(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("resolve community %s: %w", communityDID, err)
+	}
+	return community.APGroupID, nil
+}
+
+// refURI reads a strong-ref's uri out of a decoded record.
+func refURI(record map[string]any, name string) string {
+	ref, ok := record[name].(map[string]any)
+	if !ok {
+		return ""
+	}
+	uri, _ := ref["uri"].(string)
+	return uri
+}

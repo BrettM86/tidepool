@@ -17,8 +17,8 @@
           },
           "content": {
             "type": "string",
-            "maxGraphemes": 3000,
-            "maxLength": 30000,
+            "maxGraphemes": 10000,
+            "maxLength": 100000,
             "description": "Comment text content"
           },
           "facets": {

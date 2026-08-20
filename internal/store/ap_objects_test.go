@@ -191,6 +191,56 @@ func TestAPObjects_PutMapping_Validation(t *testing.T) {
 	}
 }
 
+// TestAPObjects_PutMapping_AuthorAndCommunityAreImmutable: once a mapping
+// names an author and a community, a later upsert may not move either. Both
+// columns are authorization inputs — author_did is how deleteIsByAuthor tells a
+// self-delete from a moderator removal, community_did is what authorizes
+// announced moderation — and since the postv2 flip author_did also records
+// whose repo signed the record. Making that structural in SQL is what stops a
+// single careless (or forged) write path from re-attributing bridged content;
+// per-caller discipline only holds until the next caller.
+func TestAPObjects_PutMapping_AuthorAndCommunityAreImmutable(t *testing.T) {
+	repo := NewAPObjects(testDB(t))
+	ctx := context.Background()
+
+	first := testMapping()
+	first.AuthorDID = testDID
+	first.CommunityDID = testDID
+	stored, err := repo.PutMapping(ctx, first)
+	require.NoError(t, err)
+	require.Equal(t, testDID, stored.AuthorDID)
+	require.Equal(t, testDID, stored.CommunityDID)
+
+	reattributed := testMapping()
+	reattributed.AuthorDID = testSecondDID
+	reattributed.CommunityDID = testSecondDID
+	stored, err = repo.PutMapping(ctx, reattributed)
+	require.NoError(t, err)
+	assert.Equal(t, testDID, stored.AuthorDID, "a re-put must not re-attribute an object to another author")
+	assert.Equal(t, testDID, stored.CommunityDID, "a re-put must not move an object into another community")
+
+	// An omitted value still cannot blank a stored one, and a first value
+	// still lands: immutability is "the first non-empty write wins", not
+	// "writes after the insert are ignored".
+	blanked := testMapping()
+	stored, err = repo.PutMapping(ctx, blanked)
+	require.NoError(t, err)
+	assert.Equal(t, testDID, stored.AuthorDID)
+	assert.Equal(t, testDID, stored.CommunityDID)
+
+	late := testMapping()
+	late.APID = "https://lemmy.world/post/54321"
+	late.RKey = "3jzfcijpj2z2b"
+	_, err = repo.PutMapping(ctx, late)
+	require.NoError(t, err)
+	late.AuthorDID = testSecondDID
+	late.CommunityDID = testSecondDID
+	stored, err = repo.PutMapping(ctx, late)
+	require.NoError(t, err)
+	assert.Equal(t, testSecondDID, stored.AuthorDID, "a NULL author is still filled by the first write that knows it")
+	assert.Equal(t, testSecondDID, stored.CommunityDID, "a NULL community is still filled by the first write that knows it")
+}
+
 func TestAPObjects_PutMapping_ATURICollisionIsConflict(t *testing.T) {
 	repo := NewAPObjects(testDB(t))
 	ctx := context.Background()

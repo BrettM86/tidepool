@@ -74,13 +74,6 @@ const (
 	defaultTombstoneConfirmBurst         = 10
 )
 
-// softwareName is what nodeinfo reports; Lemmy admins allowlist by this
-// name.
-const (
-	softwareName    = "tidepool"
-	softwareVersion = "0.1.0"
-)
-
 // ActorFetcher fetches an AP actor document by IRI — the slice of
 // *ap.Client the inbox needs to confirm an actor tombstone (see
 // tombstonedSelfDelete). The same-authority variant is required because that
@@ -199,6 +192,15 @@ func (ib *Inbox) Routes(r chi.Router) {
 	r.Get("/nodeinfo/2.0", ib.handleNodeInfo)
 }
 
+// InboxHandler is the delivery handler mounted at /inbox, exported so a
+// SECOND origin can serve the same pipeline without duplicating it. The Coves
+// user origin's POST /ap/inbox dispatches straight here: signature
+// verification, actor binding, dedupe, admission control, and the refusal
+// taxonomy are one implementation, and a second copy would drift.
+func (ib *Inbox) InboxHandler() http.Handler {
+	return http.HandlerFunc(ib.handleInbox)
+}
+
 // handleInbox receives one AP delivery: verify the HTTP signature, bind the
 // activity's actor to the signer, dedupe by activity id, enqueue for the
 // worker pool, 202. Everything heavier happens async — remote instances
@@ -296,22 +298,35 @@ func (ib *Inbox) handleInbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Bind the activity's claimed actor to the verified signer. Exact
-	// equality is the common case (Lemmy signs as the acting actor); same
-	// authority tolerates instance-actor signing (Mastodon secure-mode
-	// relays) without letting host A speak for host B. The QUEUED actor id
-	// is the activity's actor — downstream authorization (followed
-	// community, delete authority) keys off it.
-	boundActor := actorID
-	if claimed := refID(activity.Actor); claimed != "" {
-		if !ap.SameAuthority(claimed, actorID) {
-			ib.logger.Warn("inbox delivery rejected: actor/signer authority mismatch",
-				"activity_actor", claimed, "signer", actorID)
-			http.Error(w, "activity actor does not match signature", http.StatusForbidden)
-			return
-		}
-		boundActor = claimed
+	// THE QUEUED ACTOR IS THE VERIFIED SIGNER, NEVER THE ACTIVITY'S CLAIM.
+	//
+	// Downstream authorization keys off this id, and several decisions turn on
+	// WHICH IDENTITY it is rather than which host it belongs to: the announcing
+	// community that may moderate its own content, and handleAccept/handleReject
+	// (which set communityID = signer and then compare communityID against
+	// signer — a comparison that cannot fail once the claim is trusted). Queuing
+	// the claim let any account on a host speak AS any other actor on that host:
+	// an ordinary user could remove a native post from a community it has
+	// nothing to do with, drive a pending follow to accepted, or unsubscribe us
+	// from a community outright.
+	//
+	// The previous tolerance existed for instance-actor signing (Mastodon
+	// secure-mode), but that applies to signed FETCHES, not delivery POSTs —
+	// Lemmy signs as the acting actor, and no fixture or live path we receive
+	// has an outer actor differing from its signer. So there is nothing to
+	// tolerate, and the identity has to be the unforgeable one.
+	//
+	// A CROSS-AUTHORITY claim is still refused outright rather than silently
+	// ignored: a delivery whose body claims another host's actor is malformed or
+	// hostile whichever id we end up keying on, and the sender should learn that
+	// at the door.
+	if claimed := refID(activity.Actor); claimed != "" && !ap.SameAuthority(claimed, actorID) {
+		ib.logger.Warn("inbox delivery rejected: actor/signer authority mismatch",
+			"activity_actor", claimed, "signer", actorID)
+		http.Error(w, "activity actor does not match signature", http.StatusForbidden)
+		return
 	}
+	boundActor := actorID
 
 	isNew, err := ib.events.Enqueue(r.Context(), store.InboxEvent{
 		ActivityID:  activity.ID,
@@ -523,8 +538,8 @@ func (ib *Inbox) handleNodeInfo(w http.ResponseWriter, _ *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"version": "2.0",
 		"software": map[string]any{
-			"name":    softwareName,
-			"version": softwareVersion,
+			"name":    ap.SoftwareName,
+			"version": ap.SoftwareVersion,
 		},
 		"protocols":         []any{"activitypub"},
 		"services":          map[string]any{"inbound": []any{}, "outbound": []any{}},

@@ -109,7 +109,7 @@ func TestImagePost_EmbedImagesAndNSFWLabel(t *testing.T) {
 	t.Logf("uploaded image: %s", imageURL)
 
 	cursor := cursorNow()
-	l := h.newListener(t, cursor, colPost)
+	l := h.newListener(t, cursor, colPostV2)
 
 	title := "Image post " + h.suffix
 	const altText = "tiny e2e gradient"
@@ -117,7 +117,7 @@ func TestImagePost_EmbedImagesAndNSFWLabel(t *testing.T) {
 
 	ev := l.await("image post create", func(e *jsEvent) bool {
 		got, _ := fieldOf(e.Commit.Record, "title")
-		return e.Commit.Collection == colPost && e.Did == sub.DID &&
+		return e.Commit.Collection == colPostV2 &&
 			e.Commit.Operation == opCreate && got == title
 	})
 	rec := decodeRecord(t, ev.Commit.Record)
@@ -162,12 +162,19 @@ func TestImagePost_EmbedImagesAndNSFWLabel(t *testing.T) {
 	}
 
 	// The blob is stored and served through the bridge's getBlob (the
-	// AppView's media path): posts live in the community repo, so the blob
-	// does too. Byte length must match the record's size claim; the bytes
-	// must decode as the image we uploaded (pict-rs 0.5 serves the original
-	// alias unmodified, but dimensions — not byte identity — are the
-	// contract worth pinning against a future pict-rs that re-encodes).
-	data, contentType := h.bridgeGetBlob(t, sub.DID, blobCID)
+	// AppView's media path). It lives in the repo holding the RECORD — the
+	// author's, since the flip — because a blob ref resolves against that
+	// repo and nowhere else; a blob left in the community's repo would be
+	// unresolvable for every consumer. Byte length must match the record's
+	// size claim; the bytes must decode as the image we uploaded (pict-rs
+	// 0.5 serves the original alias unmodified, but dimensions — not byte
+	// identity — are the contract worth pinning against a future pict-rs
+	// that re-encodes).
+	data, contentType := h.bridgeGetBlob(t, ev.Did, blobCID)
+	if _, found := h.bridgeGetRecord(t, sub.DID, colPostV2, ev.Commit.RKey); found {
+		t.Errorf("the image post also exists in the community repo %s — postv2 records live in "+
+			"the author's repo only", sub.DID)
+	}
 	if int64(len(data)) != int64(size) {
 		t.Errorf("getBlob returned %d bytes, record claims size %d", len(data), int64(size))
 	}

@@ -225,7 +225,7 @@ func (m *Materializer) rematerializeProfile(ctx context.Context, stored *store.B
 	default:
 		record = m.buildActorProfile(doc, stored.CreatedAt, avatar, banner)
 	}
-	if _, err := m.commitRecord(ctx, stored.DID, collection, ProfileRKey, record, doc, stored.DID); err != nil {
+	if _, err := m.commitRecord(ctx, stored.DID, collection, ProfileRKey, record, doc, stored.DID, ""); err != nil {
 		return nil, err
 	}
 	if err := m.actors.MarkProfileSynced(ctx, stored.APActorID, m.now()); err != nil {

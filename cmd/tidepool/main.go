@@ -4,25 +4,36 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"tidepool/internal/accept"
 	"tidepool/internal/ap"
 	"tidepool/internal/config"
+	"tidepool/internal/consume"
 	"tidepool/internal/db"
+	"tidepool/internal/echo"
 	"tidepool/internal/identity"
 	"tidepool/internal/ingest"
 	"tidepool/internal/materialize"
+	"tidepool/internal/optout"
+	"tidepool/internal/outbound"
+	"tidepool/internal/personas"
 	"tidepool/internal/prune"
 	"tidepool/internal/repo"
 	"tidepool/internal/store"
@@ -35,6 +46,13 @@ const (
 	writeTimeout      = 30 * time.Second
 	idleTimeout       = 2 * time.Minute
 	shutdownTimeout   = 15 * time.Second
+
+	// outboundInboxTTL memoizes a community's resolved delivery inbox; a
+	// rotation is caught by the worker's cache-bypassing re-resolve on a 4xx.
+	outboundInboxTTL = time.Hour
+	// outboundWorkerIdle is how long a delivery worker sleeps when the queue is
+	// empty before polling ClaimNext again.
+	outboundWorkerIdle = time.Second
 )
 
 func main() {
@@ -56,8 +74,120 @@ func dispatch(logger *slog.Logger, args []string) error {
 		return run(logger)
 	case len(args) == 1 && args[0] == "migrate":
 		return runMigrations(logger)
+	case len(args) == 1 && args[0] == "rotate-kek":
+		return runRotateKEK(logger)
 	default:
-		return fmt.Errorf("usage: tidepool [migrate]")
+		return fmt.Errorf("usage: tidepool [migrate|rotate-kek]")
+	}
+}
+
+// runRotateKEK re-seals every KEK-sealed blob under the current BRIDGE_KEK so
+// the operator can retire BRIDGE_KEK_PREVIOUS (the runbook is in DEPLOY.md).
+//
+// Like runMigrations it reads a minimal environment — DATABASE_URL,
+// BRIDGE_KEK, BRIDGE_KEK_PREVIOUS — and deliberately never calls config.Load.
+// Here that is load-bearing rather than tidy: the operator running this is
+// mid-rotation, often from a one-off container or a maintenance shell that
+// carries the database URL and the two keys and nothing else, and a rotation
+// that refuses to start because some unrelated HTTP or relay variable is
+// unset strands every sealed blob under the key being retired.
+func runRotateKEK(logger *slog.Logger) error {
+	// Every variable is checked BEFORE the database is dialled, and each is
+	// blamed strictly by its own name: an operator holding two 32-byte secrets
+	// who is sent to edit the one that is already correct will orphan the
+	// material still sealed under it.
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		return fmt.Errorf("rotate-kek: DATABASE_URL is required")
+	}
+	currentEncoded := strings.TrimSpace(os.Getenv("BRIDGE_KEK"))
+	if currentEncoded == "" {
+		return fmt.Errorf("rotate-kek: BRIDGE_KEK is required: it names the key every sealed blob is moved onto")
+	}
+	previousEncoded := strings.TrimSpace(os.Getenv("BRIDGE_KEK_PREVIOUS"))
+	if previousEncoded == "" {
+		return fmt.Errorf("rotate-kek: BRIDGE_KEK_PREVIOUS is required: it names the key the blobs are moved off, and without it there is nothing to re-seal")
+	}
+
+	current, err := config.DecodeKEK("BRIDGE_KEK", currentEncoded)
+	if err != nil {
+		return fmt.Errorf("rotate-kek: %w", err)
+	}
+	previous, err := config.DecodeKEK("BRIDGE_KEK_PREVIOUS", previousEncoded)
+	if err != nil {
+		return fmt.Errorf("rotate-kek: %w", err)
+	}
+	// Compared on the decoded bytes for the same reason config.Load does it:
+	// one key pasted into both variables is not a rotation, and a walk that
+	// reported every blob as already-current would be read as the zero-run
+	// that clears the operator to retire a key.
+	if bytes.Equal(current, previous) {
+		return fmt.Errorf("rotate-kek: the two KEKs decode to the same key; a rotation needs two different keys")
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	database, err := db.Open(ctx, databaseURL)
+	if err != nil {
+		return fmt.Errorf("rotate-kek: %w", err)
+	}
+	defer func() { _ = database.Close() }()
+
+	// The report comes back even on the error path, and it is the whole point
+	// of the command, so it is logged before the error is returned.
+	report, resealErr := identity.Reseal(ctx, database, current, previous)
+	if report != nil {
+		logResealReport(logger, report)
+	}
+	if resealErr != nil {
+		// Two very different errors reach here, and the counts just printed
+		// mean different things under each.
+		//
+		// identity.ErrResealIncomplete means the walk finished every table and
+		// some rows would not move: the inventory above is complete, and its
+		// failure lines say which rows.
+		//
+		// Anything else aborted the walk partway — a dropped connection, a
+		// revoked permission, a cancelled context. The counts then describe
+		// only the rows reached before it, and every table after the failure
+		// printed clean zeros that were never measured. Those zeros are
+		// identical to what a healthy empty table prints, so without this line
+		// an operator can read an aborted run as a covered one.
+		if !errors.Is(resealErr, identity.ErrResealIncomplete) {
+			logger.Error("the inventory above is PARTIAL: the re-seal walk aborted mid-table, so the counts describe only the rows it reached and every table after the failure shows zeros it never measured; re-run the drill and do not treat any table above as covered",
+				"error", resealErr)
+		}
+		return fmt.Errorf("rotate-kek: %w", resealErr)
+	}
+	logger.Info("kek re-seal complete; re-run until every table reports resealed=0 and failed=0 before unsetting BRIDGE_KEK_PREVIOUS")
+	return nil
+}
+
+// logResealReport writes the inventory one line per table, then one line per
+// unmovable row. The operator's decision to retire a KEK is made from these
+// lines, so nothing is folded into a grand total: a table is where they look
+// for the zero-run, and a failure has to name its row and its class (wrong-key
+// sends them to key history, malformed to backups, contended to a re-run).
+func logResealReport(logger *slog.Logger, report *identity.ResealReport) {
+	for _, table := range []struct {
+		name   string
+		counts identity.ResealCounts
+	}{
+		{"bridged_actors", report.BridgedActors},
+		{"ap_actors", report.APActors},
+		{"service_keys", report.ServiceKeys},
+	} {
+		logger.Info("kek re-seal table",
+			"table", table.name,
+			"resealed", table.counts.Resealed,
+			"already_current", table.counts.AlreadyCurrent,
+			"skipped", table.counts.Skipped,
+			"failed", table.counts.Failed)
+	}
+	for _, failure := range report.Failures {
+		logger.Error("kek re-seal failure",
+			"table", failure.Table, "id", failure.ID, "reason", string(failure.Reason))
 	}
 }
 
@@ -154,7 +284,7 @@ func run(logger *slog.Logger) error {
 	// The sync surface (task 04): com.atproto.sync.* + subscribeRepos,
 	// describeServer, _health — everything a relay or Jetstream needs to
 	// treat Tidepool as a subscribeRepos upstream.
-	custodian, err := identity.NewCustodian(cfg.BridgeKEK)
+	custodian, err := identity.NewCustodianWithPrevious(cfg.BridgeKEK, cfg.BridgeKEKPrevious)
 	if err != nil {
 		return err
 	}
@@ -234,7 +364,17 @@ func run(logger *slog.Logger) error {
 		AllowPrivateAddresses: cfg.AllowPrivateAddresses,
 	})
 
-	rotationKey, err := identity.LoadOrCreateRotationKey(ctx, serviceKeys, custodian)
+	// The boot canary for BRIDGE_KEK: the rotation key is sealed under the KEK
+	// and opened here, so a wrong or half-rotated key fails startup before any
+	// traffic is served, rather than surfacing later as per-actor decrypt
+	// failures scattered across the commit path.
+	//
+	// The database goes in beside the store because the canary has a second job
+	// on the path where there is nothing to open — a restore that lost the
+	// plc-rotation row. There it proves the KEK against the actor keys already
+	// at rest instead of minting a fresh rotation key under an unproven one and
+	// calling that a pass (identity.LoadOrCreateRotationKey says why).
+	rotationKey, err := identity.LoadOrCreateRotationKey(ctx, database, serviceKeys, custodian)
 	if err != nil {
 		return err
 	}
@@ -264,24 +404,46 @@ func run(logger *slog.Logger) error {
 	tombstones := store.NewTombstones(database)
 	inboxEvents := store.NewInboxEvents(database)
 
+	// The echo classifier reads the four tables the user origin serves from, so
+	// "is this ours?" is answered against the ids this process actually minted
+	// and actually serves. It is built HERE, before its first consumer: both
+	// the vote aggregator's voter probe and the ingest dispatcher's envelope
+	// suppression are the same classifier over the same state.
+	echoClassifier, err := echo.New(echo.Options{
+		Objects:         objects,
+		OutboundObjects: store.NewOutboundObjects(database),
+		Activities:      store.NewOutboundActivities(database),
+		Actors:          store.NewAPActors(database),
+	})
+	if err != nil {
+		return err
+	}
+
 	// The vote aggregation side channel (task 07): Like/Dislike activities
 	// maintain bridge-side counts (never records), served over
 	// social.coves.bridge.getVoteAggregates. Built before the materializer
 	// because the materializer's actor scrub erases a deleted voter's
 	// vote_events rows through it.
-	voteAggregator, err := votes.NewAggregator(database, objects, communities, repoManager, logger)
+	voteAggregator, err := votes.NewAggregator(database, objects, communities, repoManager,
+		echoClassifier, logger)
 	if err != nil {
 		return err
 	}
 
 	materializer, err := materialize.New(materialize.Options{
-		Fetcher:           apClient,
-		Objects:           objects,
-		Actors:            actors,
-		Communities:       communities,
-		Repos:             repoManager,
-		Minter:            mintGate,
-		Votes:             voteAggregator,
+		Fetcher:     apClient,
+		Objects:     objects,
+		Actors:      actors,
+		Communities: communities,
+		Repos:       repoManager,
+		Minter:      mintGate,
+		Votes:       voteAggregator,
+		// Restoring a NATIVE post reads its pinned CID from here: the author's
+		// repo is not one this bridge hosts.
+		OutboundObjects: store.NewOutboundObjects(database),
+		// An inbound moderation decision updates the admissions ledger too, so
+		// the operator surface reflects it when the MODERATOR acts.
+		Ledger:            accept.NewAdmissions(database),
 		ServiceDID:        serviceDID,
 		ProfileRefreshTTL: cfg.ProfileRefreshTTL,
 		MaxBlobBytes:      cfg.MaxBlobBytes,
@@ -328,6 +490,7 @@ func run(logger *slog.Logger) error {
 		Communities:  communities,
 		Tombstones:   tombstones,
 		Seeder:       seeder,
+		Echo:         echoClassifier,
 		MaxPosts:     cfg.BackfillMaxPosts,
 		// Async runs derive from the run context so a mid-run backfill stops
 		// pulling remote pages once shutdown starts; the drain below waits for
@@ -339,15 +502,21 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 	handler, err := ingest.NewHandler(ingest.HandlerOptions{
-		Materializer:   materializer,
-		Fetcher:        apClient,
-		Objects:        objects,
-		Actors:         actors,
-		Communities:    communities,
-		Tombstones:     tombstones,
-		Records:        repoManager,
-		Votes:          voteAggregator,
-		Backfill:       backfill,
+		Materializer: materializer,
+		Fetcher:      apClient,
+		Objects:      objects,
+		Actors:       actors,
+		Communities:  communities,
+		Tombstones:   tombstones,
+		Records:      repoManager,
+		Votes:        voteAggregator,
+		Backfill:     backfill,
+		Echo:         echoClassifier,
+		// Passed explicitly rather than left to NewHandler's default: this is the
+		// store every inbound moderation decision is RECORDED in, and production
+		// should not depend on a type assertion to have one.
+		Moderation:     store.NewObjectModeration(database),
+		Bans:           store.NewCommunityBans(database),
 		ServiceActorID: serviceActor.ID,
 		Logger:         logger,
 	})
@@ -406,6 +575,7 @@ func run(logger *slog.Logger) error {
 		Backfill:     backfill,
 		Repos:        repoManager,
 		Sweeper:      handler,
+		Deliveries:   store.NewOutboundDeliveries(database),
 		Logger:       logger,
 	})
 	if err != nil {
@@ -436,6 +606,29 @@ func run(logger *slog.Logger) error {
 		go reconciler.Run(ctx)
 	}
 
+	// The reconciliation sweep (task 17e, decision 19). Unlike the follow
+	// reconciler there is nothing to gate it on: both sides of every comparison
+	// are local, so the database is the only dependency, and the sweep writes
+	// NOTHING — to peers or to our own tables — which is what makes running it
+	// on a schedule safe. The interval only sets how often the background pass
+	// refreshes the gauges; GET /admin/divergence runs one on demand.
+	divergence, err := ingest.NewDivergenceReconciler(ingest.DivergenceOptions{
+		DB:       database,
+		Interval: cfg.DivergenceInterval,
+		// The staleness window is CONFIGURED rather than left to default, because
+		// it is the knob that decides whether the acceptance classes cry wolf on
+		// a slow queue or stay quiet through a stopped one, and an operator who
+		// has to rebuild the binary to tune it will instead learn to ignore the
+		// report.
+		AcceptanceStaleAfter: cfg.DivergenceAcceptanceStaleAfter,
+		Logger:               logger,
+	})
+	if err != nil {
+		return err
+	}
+	admin.SetDivergenceReconciler(divergence)
+	go divergence.Run(ctx)
+
 	// The vote-aggregate XRPC (the AppView's side-channel read).
 	votesXRPC, err := votes.NewXRPC(votes.XRPCOptions{DB: database, Logger: logger})
 	if err != nil {
@@ -443,9 +636,79 @@ func run(logger *slog.Logger) error {
 	}
 	votesXRPC.Routes(router)
 
+	// The Coves user origin (task 13): AP Person actors for Coves users,
+	// served on AP_USER_ORIGIN's Host. It shares this listener with the
+	// bridge's own surface, and the Host router below decides which one a
+	// request belongs to. The inbox is handed the EXISTING ingest handler —
+	// the user origin publishes a shared inbox but never a second verify
+	// pipeline.
+	personasService, err := personas.New(personas.Options{
+		DB:           database,
+		Custodian:    custodian,
+		UserOrigin:   cfg.APUserOrigin,
+		ServiceActor: serviceActor,
+		InboxHandler: inbox.InboxHandler(),
+	})
+	if err != nil {
+		return fmt.Errorf("user origin: %w", err)
+	}
+
+	// The Jetstream consumer (task 14): the atproto half of the world this
+	// bridge does not host. Default OFF until task 18 wires the e2e path —
+	// it writes durable outbound state, so a deployment that has not been
+	// wired end to end must not start accumulating it.
+	var consumerDone <-chan struct{}
+	if cfg.ConsumerEnabled {
+		var acceptEngine *accept.Engine
+		consumerDone, acceptEngine, err = startConsumer(ctx, cfg, database, repoManager, personasService, apClient, personasService, logger)
+		if err != nil {
+			return err
+		}
+		// The acceptance-engine admin surface (task 16): list admissions with
+		// their reasons + force re-admit. It shares the /admin bearer and mounts
+		// only WITH the consumer, because a force re-admit needs the engine. A
+		// deployment with the consumer off has no admissions to inspect.
+		acceptAdmin, err := accept.NewAdmin(accept.AdminOptions{
+			Token:      cfg.AdminToken,
+			Admissions: accept.NewAdmissions(database),
+			Engine:     acceptEngine,
+			Logger:     logger,
+		})
+		if err != nil {
+			return err
+		}
+		acceptAdmin.Routes(router)
+	}
+
+	// Host routing wraps everything: the chi router keeps answering for the
+	// bridge hostname and its bridged-handle subdomains, the user origin
+	// answers for its own Host, and an unrecognized Host is refused with 421
+	// unless AP_HOST_FALLTHROUGH_DEV is on. Both hosts naming one authority
+	// (the dev default) composes by path instead.
+	userHost, err := url.Parse(cfg.APUserOrigin)
+	if err != nil || userHost.Host == "" {
+		return fmt.Errorf("user origin: AP_USER_ORIGIN %q is not an absolute origin URL", cfg.APUserOrigin)
+	}
+	hostRouter, err := personas.NewHostRouter(personas.HostRouterOptions{
+		ServiceHost:    cfg.BridgeHostname,
+		ServiceHandler: router,
+		UserHost:       userHost.Host,
+		UserHandler:    personasService,
+		DevFallthrough: cfg.APHostFallthroughDev,
+	})
+	if err != nil {
+		return fmt.Errorf("host router: %w", err)
+	}
+
+	// The host router runs OUTSIDE the chi router, so chi's middleware no
+	// longer covers the user origin's requests. The two that must apply to
+	// every request on this listener are re-applied here in the same order
+	// chi chains them (RequestID first, so a panic recovered below is logged
+	// with one): without Recoverer a panic in the user surface would kill the
+	// whole process, taking the bridge down with it.
 	server := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           router,
+		Handler:           middleware.RequestID(middleware.Recoverer(hostRouter)),
 		ReadHeaderTimeout: readHeaderTimeout,
 		WriteTimeout:      writeTimeout,
 		IdleTimeout:       idleTimeout,
@@ -485,6 +748,17 @@ func run(logger *slog.Logger) error {
 		case <-shutdownCtx.Done():
 			logger.Warn("backfill drain timed out; abandoning in-flight run (resumable on restart)")
 		}
+		// Wait for the consumer's read loop to exit. Its shutdown path flushes
+		// the cursor on a fresh context, so cutting the process short here
+		// would lose the progress since the last periodic flush and replay it
+		// on the next boot.
+		if consumerDone != nil {
+			select {
+			case <-consumerDone:
+			case <-shutdownCtx.Done():
+				logger.Warn("jetstream consumer did not stop in time; its cursor may replay on restart")
+			}
+		}
 		// ListenAndServe has returned by now (Shutdown guarantees it);
 		// drain its error so a bind failure racing the signal still exits
 		// non-zero instead of being lost in the buffered channel.
@@ -494,4 +768,223 @@ func run(logger *slog.Logger) error {
 		logger.Info("shutdown complete")
 		return nil
 	}
+}
+
+// startConsumer wires the Jetstream consumer (task 14) and starts its read
+// loop. The returned channel closes when the connector's loop has exited, so
+// shutdown can wait for the final cursor flush instead of racing it.
+//
+// Outbound delivery (task 15) is fully wired here:
+//
+//   - Enqueuer: the real persisting enqueuer is wired whenever CONSUMER_ENABLED
+//     (this function only runs then), so intents past the rev gate always
+//     persist to outbound_activities/deliveries. OUTBOUND_WORKERS>0 additionally
+//     starts the delivery workers that POST them. There is no "noop enqueuer"
+//     type — with the consumer off this function does not run at all.
+//
+// The task-16/17 seams are ALL WIRED as of tasks 16-17 (see below, where Engine,
+// Terminator and RemoteDeleter are constructed and passed). This comment
+// previously said they were "still nil ON PURPOSE" and described what each nil
+// would degrade to; that was true when it was written and became false without
+// anyone editing it, while the code 130 lines down did the opposite. It is
+// restated here rather than deleted because the degradation contract still
+// matters if a seam is ever unwired again: a nil seam ANNOUNCES its no-op
+// (postv2 skipped at debug, a deleteRemote opt-out recorded but not acted on, a
+// deleted account logged rather than withdrawn) and is never quietly downgraded
+// to a delivery pause.
+func startConsumer(
+	ctx context.Context,
+	cfg *config.Config,
+	database *sql.DB,
+	repoManager *repo.Manager,
+	minter consume.ActorMinter,
+	apClient *ap.Client,
+	signers outbound.SignerProvider,
+	logger *slog.Logger,
+) (<-chan struct{}, *accept.Engine, error) {
+	// The most SSRF-exposed egress in the bridge: the well-known host comes
+	// from a DID document a stranger controls, so it shares the AP client's
+	// guard rather than using a bare http.Client.
+	resolver, err := consume.NewHandleResolver(consume.ResolverOptions{
+		PLCDirectoryURL: cfg.PLCDirectoryURL,
+		HTTPClient:      ap.NewGuardedHTTPClient(cfg.AllowPrivateAddresses, 30*time.Second),
+		UserAgent:       cfg.UserAgent,
+		// DNS is the first half of handle verification and covers every
+		// self-hosted handle that publishes no well-known.
+		LookupTXT: consume.DefaultLookupTXT,
+		Logger:    logger,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("consumer: handle resolver: %w", err)
+	}
+
+	// The outbound delivery pipe (task 15). Because this function runs ONLY when
+	// the consumer is enabled, the REAL persisting enqueuer is always wired: it
+	// writes outbound_activities/deliveries inside the consumer's gate tx, so an
+	// intent past the gate is never dropped. OUTBOUND_WORKERS gates only whether
+	// the delivery WORKER goroutines run — with workers=0, state accumulates but
+	// nothing is POSTed. (There is no noop enqueuer type: with the consumer
+	// disabled this function does not run at all.)
+	inboxes := outbound.NewInboxResolver(apClient, outboundInboxTTL)
+	enqueuer, err := outbound.NewEnqueuer(outbound.EnqueuerOptions{
+		DB:         database,
+		Translator: outbound.NewTranslator(cfg.APUserOrigin),
+		Inboxes:    inboxes,
+		Actors:     store.NewAPActors(database),
+		UserOrigin: cfg.APUserOrigin,
+		Logger:     logger,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("consumer: outbound enqueuer: %w", err)
+	}
+
+	var worker *outbound.Worker
+	if cfg.OutboundWorkers > 0 {
+		worker, err = outbound.NewWorker(outbound.WorkerOptions{
+			DB:      database,
+			Actors:  store.NewAPActors(database),
+			Prefs:   store.NewFederationPrefs(database),
+			Signers: signers,
+			Inboxes: inboxes,
+			Sender:  apClient,
+			Switches: outbound.ConfigSwitches{
+				Disabled:            cfg.OutboundDisabled,
+				Dry:                 cfg.OutboundDryRun,
+				DisabledHosts:       cfg.OutboundDisabledHosts,
+				DisabledCommunities: cfg.OutboundDisabledCommunities,
+				DisabledActors:      cfg.OutboundDisabledActors,
+			},
+			Logger: logger,
+		})
+		if err != nil {
+			return nil, nil, fmt.Errorf("consumer: outbound worker: %w", err)
+		}
+	}
+
+	// The acceptance engine (task 16): a native postv2 targeting a bridged
+	// community is admitted here, the community-signed acceptance is written, and
+	// the Create{Page} enqueued atomically with it. Wired whenever the consumer
+	// runs, so postv2 events are admitted rather than skipped at debug.
+	engine, err := accept.NewEngine(accept.Options{
+		Repos:       repoManager,
+		Enqueuer:    enqueuer,
+		Actors:      minter,
+		Resolver:    resolver,
+		Communities: store.NewCommunities(database),
+		Objects:     store.NewOutboundObjects(database),
+		Prefs:       store.NewFederationPrefs(database),
+		Admissions:  accept.NewAdmissions(database),
+		// Passed explicitly rather than left to NewEngine's default: the ban gate
+		// is what keeps a banned author's posts out of a community, and
+		// production should not depend on a type assertion to have one.
+		Bans:                     store.NewCommunityBans(database),
+		APActors:                 store.NewAPActors(database),
+		MaxPerAuthorPerCommunity: cfg.AdmissionMaxPerAuthorPerCommunity,
+		UserOrigin:               cfg.APUserOrigin,
+		Logger:                   logger,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("consumer: acceptance engine: %w", err)
+	}
+
+	// The DESTRUCTIVE tier (decision 11's second tier): one Delete{Person,
+	// removeData:true} to every inbox this actor's content reached, an Undo for
+	// every vote peers still hold, and a 410 on the actor document. Reached from
+	// TWO doors — an explicit deleteRemote=true record, and a CONFIRMED account
+	// deletion — and never inferred from either.
+	purger := outbound.NewPurger(database, cfg.APUserOrigin, enqueuer).WithLogger(logger)
+
+	// The TERMINAL tier (decision 19): a #account status of deleted is a claim
+	// about a moment that may have passed, so this confirms it against PLC and
+	// the PDS before anything irreversible is sent. The resolver is the
+	// confirmer — it already holds the guarded egress and the directory URL —
+	// and the purger only runs once that confirm comes back true.
+	terminator, err := optout.NewTerminator(optout.Options{
+		Confirmer: resolver,
+		Prefs:     store.NewFederationPrefs(database),
+		Deleter:   purger,
+		Logger:    logger,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("consumer: account terminator: %w", err)
+	}
+
+	dispatcher, err := consume.NewDispatcher(consume.Options{
+		DB:         database,
+		Actors:     minter,
+		Resolver:   resolver,
+		Enqueuer:   enqueuer,
+		Engine:     engine,
+		Terminator: terminator,
+		// The record door: enabled=false + deleteRemote=true, written by the
+		// user themselves, so no confirmation is owed — the record IS the
+		// instruction.
+		RemoteDeleter: purger,
+		// Reads committed records so a subject's community resolves for
+		// mappings written before migration 016 filled community_did.
+		Records:    repoManager,
+		UserOrigin: cfg.APUserOrigin,
+		Logger:     logger,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("consumer: dispatcher: %w", err)
+	}
+
+	// The collection filter is load-bearing: without wantedCollections this
+	// would subscribe to the entire network's firehose and discard it record
+	// by record.
+	subscribeURL, err := consume.SubscribeURL(cfg.JetstreamURL, consume.WantedCollections())
+	if err != nil {
+		return nil, nil, fmt.Errorf("consumer: %w", err)
+	}
+
+	state := consume.NewPostgresStateStore(database, consume.CursorSchemaVersion)
+	connector := consume.NewConnector(consume.ConsumerNative, subscribeURL, dispatcher,
+		consume.WithCursorStore(state),
+		consume.WithDeadLetterWriter(state),
+		consume.WithConnectorLogger(logger))
+
+	// The redriver makes transient failures self-healing: an event captured
+	// during a postgres blip is replayed once the blip clears, without anyone
+	// being paged.
+	go consume.NewDeadLetterRedriver(state,
+		map[string]consume.EventHandler{consume.ConsumerNative: dispatcher}).Run(ctx)
+
+	// Cursor age and dead-letter depth are what make a STALLED consumer
+	// visible: the process stays up and the health check stays green while
+	// events quietly stop arriving.
+	consume.PublishMetrics(context.Background(), connector, state)
+
+	// The connector loop and every delivery worker share one WaitGroup, so the
+	// returned done channel closes only after ALL of them have drained on ctx
+	// cancellation — shutdown joins delivery the same way it joins the consumer.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := connector.Start(ctx); err != nil {
+			logger.Error("jetstream consumer stopped", "error", err)
+		}
+	}()
+	if worker != nil {
+		for i := 0; i < cfg.OutboundWorkers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := worker.Run(ctx, outboundWorkerIdle); err != nil && !errors.Is(err, context.Canceled) {
+					logger.Error("outbound worker stopped", "error", err)
+				}
+			}()
+		}
+		logger.Info("outbound delivery workers started",
+			"count", cfg.OutboundWorkers, "dry_run", cfg.OutboundDryRun, "global_disabled", cfg.OutboundDisabled)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	logger.Info("jetstream consumer started", "url", subscribeURL)
+	return done, engine, nil
 }

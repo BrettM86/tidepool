@@ -4,12 +4,22 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"tidepool/internal/ap"
+	"tidepool/internal/echo"
 	"tidepool/internal/errors"
 	"tidepool/internal/materialize"
+	"tidepool/internal/ratelimit"
 	"tidepool/internal/store"
 )
+
+// echoDropLogInterval throttles the echo-drop log (hostrouter's refusal log is
+// the precedent). Echoes are rare by construction, so the sampler costs
+// nothing in steady state — but a classifier that started matching genuine
+// community traffic would emit one line per announced activity and bury the
+// evidence that this log exists to preserve.
+const echoDropLogInterval = time.Second
 
 // Materializer is the slice of *materialize.Materializer the dispatcher
 // drives (task 05's entry points).
@@ -23,6 +33,18 @@ type Materializer interface {
 	// latter — see materialize.HandleDeleteRecord for the TOCTOU it closes.
 	HandleDelete(ctx context.Context, apID string) error
 	HandleDeleteRecord(ctx context.Context, apID string) error
+	// RemovePost/RestorePost are the community-scoped moderation transitions:
+	// they rewrite the community's acceptance and removal records and leave
+	// the author's post where it is. Deleting content is a different verb, so
+	// these are not reachable through the delete entry points above.
+	//
+	// reason may be EMPTY — Lemmy spells "removed, no reason given" as an
+	// empty summary, and a summary-less delete from a non-author is treated as
+	// a removal with none. Implementations omit the field from the record
+	// rather than writing it blank: a blank reason renders in a moderation log
+	// as an empty explanation instead of as no explanation.
+	RemovePost(ctx context.Context, mapping *store.APObjectMapping, reason string) error
+	RestorePost(ctx context.Context, mapping *store.APObjectMapping) error
 	RefreshActor(ctx context.Context, actorRef *ap.Object) (*store.BridgedActor, error)
 	RefreshCommunity(ctx context.Context, groupRef *ap.Object) (*store.Community, error)
 	EnsureCommunity(ctx context.Context, groupRef *ap.Object) (*store.Community, error)
@@ -37,6 +59,17 @@ type Materializer interface {
 type Fetcher interface {
 	FetchObject(ctx context.Context, iri string) (*ap.Object, error)
 	FetchObjectSameAuthority(ctx context.Context, iri string) (*ap.Object, error)
+}
+
+// EchoClassifier answers whether an inbound envelope is the bridge's own
+// traffic coming home (task 17a). *echo.Classifier satisfies it.
+//
+// It is an INTERFACE, like votes.VoterProbe, for one reason: the fail-safe this
+// dispatcher owes — a classification that CANNOT be made must retry, never
+// poison the event and never materialize — is only exercisable by injecting a
+// classifier that fails, and a concrete type leaves that contract untestable.
+type EchoClassifier interface {
+	Classify(ctx context.Context, envelope *ap.Object) (echo.Identity, error)
 }
 
 // Backfiller is notified when a community's Follow is accepted (the
@@ -66,6 +99,20 @@ type HandlerOptions struct {
 	Records      RecordGetter
 	Votes        VoteAggregator
 	Backfill     Backfiller
+	// Bans is the community-ban store an announced Block is recorded in (task
+	// 17c-3). Optional in the same wiring sense as Moderation: nil takes the ban
+	// view of Communities, which the postgres communities store provides.
+	Bans store.CommunityBans
+	// Moderation is the bridge-owned moderation state announced Locks and
+	// native-comment removals are recorded in (task 17c-2). Optional ONLY in the
+	// wiring sense: when it is nil, NewHandler takes the moderation view of
+	// Objects, which the postgres mapping store provides. A dispatcher that ends
+	// up with neither refuses to moderate rather than silently dropping the
+	// decision — see moderationState.
+	Moderation store.ObjectModeration
+	// Echo classifies inbound ids against the bridge's own serving surface so
+	// an activity we sent never re-enters as content (task 17a).
+	Echo EchoClassifier
 	// ServiceActorID is the bridge's own AP actor id; Accepts must wrap a
 	// Follow issued by it.
 	ServiceActorID string
@@ -86,6 +133,11 @@ type Handler struct {
 	records     RecordGetter
 	votes       VoteAggregator
 	backfill    Backfiller
+	moderation  store.ObjectModeration
+	bans        store.CommunityBans
+	authorMod   AuthorModerator
+	classifier  EchoClassifier
+	echoLog     *ratelimit.Sampler
 	serviceID   string
 	logger      *slog.Logger
 }
@@ -116,6 +168,15 @@ func NewHandler(opts HandlerOptions) (*Handler, error) {
 	if opts.Votes == nil {
 		return nil, errors.NewValidationError("votes", "must not be nil")
 	}
+	// REQUIRED, exactly as votes.NewAggregator requires its voter probe. The
+	// same guard cannot be mandatory on one path and optional on another: a
+	// dispatcher without it re-materializes our own content, mints bridged
+	// actors for our own personas and self-moderates, silently, in whichever
+	// binary forgot to pass it — which is how it was left out of production the
+	// first time.
+	if opts.Echo == nil {
+		return nil, errors.NewValidationError("echo", "must not be nil")
+	}
 	if opts.ServiceActorID == "" {
 		return nil, errors.NewValidationError("service_actor_id", "must not be empty")
 	}
@@ -123,6 +184,35 @@ func NewHandler(opts HandlerOptions) (*Handler, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	// The moderation state and the mapping store are two repositories over two
+	// tables, and only the moderation paths may hold the first — so it is a
+	// separate option rather than methods on APObjects, which the echo
+	// classifier, the vote aggregator, the stats refresher, the materializer and
+	// the enqueuer all hold to resolve strongRefs. The default keeps every
+	// existing call site working: the postgres mapping store IS also that
+	// repository, so callers that pass one and no moderation store get the
+	// matching view of the same database rather than a nil.
+	moderation := opts.Moderation
+	if moderation == nil {
+		if fromObjects, ok := opts.Objects.(store.ObjectModeration); ok {
+			moderation = fromObjects
+		}
+	}
+	// Same escape, same reason: a ban is a different table from the communities
+	// row, and the follow-state readers that hold store.Communities must not
+	// gain the power to exclude anyone.
+	bans := opts.Bans
+	if bans == nil {
+		if fromCommunities, ok := opts.Communities.(store.CommunityBans); ok {
+			bans = fromCommunities
+		}
+	}
+	// The materializer is the only thing that can act on removeData — it owns
+	// the one-commit removal AND holds the admissions ledger that says which
+	// posts this community admitted. It is read off the SAME value the
+	// dispatcher already drives rather than a second option, because a
+	// deployment cannot coherently have one and not the other.
+	authorMod, _ := opts.Materializer.(AuthorModerator)
 	return &Handler{
 		mat:         opts.Materializer,
 		fetcher:     opts.Fetcher,
@@ -133,6 +223,11 @@ func NewHandler(opts HandlerOptions) (*Handler, error) {
 		records:     opts.Records,
 		votes:       opts.Votes,
 		backfill:    opts.Backfill,
+		moderation:  moderation,
+		bans:        bans,
+		authorMod:   authorMod,
+		classifier:  opts.Echo,
+		echoLog:     ratelimit.NewSampler(echoDropLogInterval),
 		serviceID:   opts.ServiceActorID,
 		logger:      logger,
 	}, nil
@@ -163,13 +258,38 @@ func (h *Handler) Process(ctx context.Context, event *store.InboxEvent) error {
 	case ap.TypeCreate, ap.TypeUpdate:
 		return h.handleBareCreateUpdate(ctx, activity, signer)
 	case ap.TypeDelete:
+		// A bare Delete/Undo has no envelope for handleAnnounce's guard to
+		// read, and the ordinary path each falls into is DESTRUCTIVE when the
+		// target is one of our own ids: the delete lays a tombstone marker and
+		// soft-deletes the mapping — which makes ResolveStrongRef answer
+		// Tombstoned and silently drops every genuine Lemmy reply beneath the
+		// post — while the undo's restore dereferences our own origin and
+		// re-materializes what comes back, minting a bridged actor for our own
+		// persona along the way.
+		//
+		// The suppression therefore runs HERE, before the handler: both lay
+		// their marker before authorizing, so a check any later leaves behind
+		// exactly the damage it was meant to prevent.
+		if err := h.suppressEcho(ctx, activity.ID, activity); err != nil {
+			return err
+		}
 		return h.handleDelete(ctx, activity, signer, nil)
 	case ap.TypeUndo:
+		// Same guard, same reason, on the branch whose restore path is the
+		// more dangerous of the two (see the Delete case above).
+		if err := h.suppressEcho(ctx, activity.ID, activity); err != nil {
+			return err
+		}
 		return h.handleUndo(ctx, activity, signer, nil)
 	case ap.TypeAccept:
 		return h.handleAccept(ctx, activity, signer)
 	case ap.TypeReject:
 		return h.handleReject(ctx, activity, signer)
+	case ap.TypeBlock:
+		// A Block delivered DIRECTLY to the banned user's inbox. Lemmy sends one
+		// of these alongside every announced ban, and it is the copy we cannot
+		// authorize: see ignoreDirectBlock.
+		return h.ignoreDirectBlock(activity, signer)
 	case ap.TypeLike, ap.TypeDislike:
 		// Bare votes (rare; Lemmy normally announces them via the group).
 		// The inbox already bound this top-level activity's actor to the
@@ -208,6 +328,19 @@ func (h *Handler) handleAnnounce(ctx context.Context, announce *ap.Object, signe
 	if inner == nil || (inner.ID == "" && inner.Type == "") {
 		return errors.NewValidationError("announce", "announce carries no object")
 	}
+	// Echo suppression on the RAW envelope, BEFORE anything is dereferenced.
+	// The community fans our own activities straight back at us, and a bare
+	// IRI that is ours must be dropped WITHOUT being fetched: dialing our own
+	// origin to learn whether we minted an id is a round trip for an answer we
+	// already hold, and it makes a remote redirect part of the decision.
+	//
+	// It runs AFTER the followed-community gate on purpose — an announce from
+	// a community we do not follow must skip for THAT reason, or it lands in
+	// the echo counters and corrupts the very signal that would expose a
+	// classifier false positive.
+	if err := h.suppressEcho(ctx, announce.ID, announce); err != nil {
+		return err
+	}
 	// A bare-IRI announce (object is just an id): fetch it. FetchObject
 	// fetches exactly inner.ID, and resolveDelivered below re-checks the
 	// body's self-asserted id, so cross-host forgery cannot slip in.
@@ -217,6 +350,13 @@ func (h *Handler) handleAnnounce(ctx context.Context, announce *ap.Object, signe
 			return err
 		}
 		inner = fetched
+		// Classify the FETCHED body too: the IRI can be one we do not
+		// recognize while the document behind it is our own activity re-served
+		// under a different id. The embedded shapes need no second pass — the
+		// walk above already descended through them.
+		if err := h.suppressEcho(ctx, announce.ID, inner); err != nil {
+			return err
+		}
 	}
 
 	switch inner.Type {
@@ -237,11 +377,56 @@ func (h *Handler) handleAnnounce(ctx context.Context, announce *ap.Object, signe
 		return h.handleDelete(ctx, inner, signer, community)
 	case ap.TypeUndo:
 		return h.handleUndo(ctx, inner, signer, community)
+	case ap.TypeLock:
+		// A community closing one of its own threads. The Undo arrives on the
+		// TypeUndo branch above and lands in the same handler with locked=false.
+		return h.handleLock(ctx, inner, community, true)
+	case ap.TypeBlock:
+		// A community banning a native author. This is the AUTHORITATIVE copy —
+		// the direct one, delivered to the banned user's inbox, is signed by the
+		// moderator's Person and cannot satisfy decision 18 by construction.
+		return h.handleBlock(ctx, inner, community, true)
 	default:
-		// Lock, Add, Remove, Block, ... — moderation activities the bridge
-		// does not translate in v1.
+		// Add, Remove, Flag, ... — moderation activities the bridge does not
+		// translate yet. Remove in particular is NOT content removal in Lemmy
+		// (it is un-pin / demote-moderator, dispatched by `target`), so it must
+		// never be folded in beside Lock or Block on the assumption that it is.
 		return skip(announce.ID, "unsupported announced activity type "+inner.Type)
 	}
+}
+
+// suppressEcho drops an activity the bridge itself sent, whether it arrived
+// announced by a community or delivered bare. Letting our own content back into
+// materialization duplicates it, double-counts our own votes, and — worst —
+// reads as MODERATION of our own records.
+//
+// It returns a skip when the envelope resolves to one of our own entities, nil
+// when it is genuine remote traffic, and the classifier's error otherwise. A
+// failed lookup is never a verdict: calling it "not ours" re-materializes the
+// echo, calling it "ours" drops real Lemmy content permanently, and only the
+// retry the wrapped error buys is honest.
+func (h *Handler) suppressEcho(ctx context.Context, activityID string, envelope *ap.Object) error {
+	identity, err := h.classifier.Classify(ctx, envelope)
+	if err != nil {
+		return fmt.Errorf("ingest: echo classification for %s: %w", activityID, err)
+	}
+	if identity.Class == echo.ClassNone {
+		return nil
+	}
+	// Per-class, never a total: a spike in one class is a different bug from a
+	// spike in another, and a false positive is only legible in the split.
+	echo.CountDrop(identity.Class)
+	// INFO, not Debug: this line is the human-readable half of the
+	// false-positive detector, and genuine community content dropped as an
+	// echo is invisible at Debug in production.
+	if h.echoLog.Allow(time.Now()) {
+		h.logger.Info("dropped an echo of our own activity",
+			"activity_id", activityID,
+			"class", string(identity.Class),
+			"did", identity.DID,
+			"at_uri", identity.ATURI)
+	}
+	return skip(activityID, "echo of our own "+string(identity.Class))
 }
 
 // handleBareCreateUpdate processes a Create/Update delivered directly by a
@@ -342,11 +527,15 @@ func (h *Handler) materializeContent(ctx context.Context, obj *ap.Object, signer
 		}
 	} else {
 		// Announced content must belong to the announcing community itself: a
-		// followed community may fan out only its own content, never inject
-		// into a DIFFERENT community's repo (even one co-hosted on the same
-		// instance). The materializer derives the target community from the
-		// object's own audience and EnsureCommunity()s it, so without this the
-		// announcer could name any community it likes.
+		// followed community may fan out only its own content, never claim
+		// another community's (even one co-hosted on the same instance). Since
+		// the flip the consequence is not a foreign write into a community repo
+		// — a postv2 goes to its author's repo — but a false BINDING: the
+		// materializer derives the target community from the object's own
+		// audience, EnsureCommunity()s it, records it as the mapping's
+		// community_did and writes that community's acceptance. Without this
+		// guard an announcer could name any community it likes and hand it both
+		// visibility over the post and moderation authority over it.
 		if objCommunity := communityIRIFrom(obj); objCommunity != "" && objCommunity != announcer {
 			return skip(obj.ID, fmt.Sprintf(
 				"announced object names community %s but was announced by %s", objCommunity, announcer))

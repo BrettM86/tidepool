@@ -9,7 +9,7 @@
       "properties": {
         "post": {
           "type": "ref",
-          "ref": "social.coves.community.post.get#postView"
+          "ref": "social.coves.community.post.defs#postView"
         },
         "reason": {
           "type": "union",
@@ -29,7 +29,7 @@
       "properties": {
         "by": {
           "type": "ref",
-          "ref": "social.coves.community.post.get#authorView"
+          "ref": "social.coves.community.post.defs#authorView"
         },
         "indexedAt": {
           "type": "string",
@@ -44,7 +44,7 @@
       "properties": {
         "community": {
           "type": "ref",
-          "ref": "social.coves.community.post.get#communityRef"
+          "ref": "social.coves.community.post.defs#communityRef"
         }
       }
     },

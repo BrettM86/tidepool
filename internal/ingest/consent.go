@@ -21,8 +21,8 @@ package ingest
 
 import (
 	"context"
+	"expvar"
 	"fmt"
-	"strings"
 
 	"tidepool/internal/ap"
 	"tidepool/internal/errors"
@@ -93,6 +93,26 @@ func (h *Handler) handleDelete(ctx context.Context, del *ap.Object, signer strin
 		return err
 	}
 
+	// MODERATOR REMOVAL, not a delete. Lemmy spells the two with the same
+	// activity and distinguishes them by `summary`: a moderator's removal
+	// carries the key (EMPTY when they gave no reason), an author deleting
+	// their own post omits it entirely. Reading one as the other either
+	// destroys an author's post over a moderator's hidden action or fabricates
+	// a moderation record against someone who moderated nobody, so the
+	// question asked is key PRESENCE (HasSummary), never whether the text is
+	// empty.
+	//
+	// It diverts before the tombstone marker and the delete dispatch below on
+	// purpose: the post is not going anywhere. Laying a marker would suppress
+	// the post's own later Creates and Updates, and deleting the record would
+	// hand one community the power to destroy content in all the others.
+	if announcer != nil {
+		handled, err := h.moderateAnnouncedDelete(ctx, del, targetID, announcer)
+		if err != nil || handled {
+			return err
+		}
+	}
+
 	// Record the tombstone marker BEFORE deleting: if this is a Delete for
 	// an object we never materialized, the marker is the only thing
 	// stopping a later (re-delivered, out-of-order) Create from
@@ -120,6 +140,144 @@ func (h *Handler) handleDelete(ctx context.Context, del *ap.Object, signer strin
 		return err
 	}
 	return nil
+}
+
+// moderateAnnouncedDelete decides what an ANNOUNCED Delete of bridged content
+// actually is, and applies it when the answer is a community removal. It
+// reports whether it took the activity; declining leaves the caller on the
+// ordinary delete path.
+//
+// TWO questions, in this order:
+//
+//  1. Does the activity carry a `summary`? Lemmy marks a moderator removal by
+//     putting the key on the Delete (EMPTY when no reason was typed) and an
+//     author's own delete by omitting it. Presence, never emptiness.
+//  2. If it does NOT, is the inner Delete's actor the post's author? The
+//     HTTP signature covers the ANNOUNCING COMMUNITY's key, not the inner
+//     attribution, so that attribution is a claim rather than a proof — but
+//     it is the only signal distinguishing the two shapes, and self-delete
+//     semantics DESTROY the author's record. A community announcing a
+//     summary-less Delete attributed to somebody else is claiming an
+//     authority it does not have: at most it may withdraw the post from
+//     ITSELF. Granting it the author's path would let one followed community
+//     destroy any bridged author's content with a single activity, leaving no
+//     moderation record behind. So anything that is not provably the author
+//     is treated as a removal — the community-scoped action it is entitled to.
+//
+// It declines for everything the postv2 moderation records do not describe: an
+// id the bridge never materialized, a mapping already tombstoned, and above
+// all the PRE-FLIP era, whose posts live in the community's own repo with no
+// acceptance to replace. Writing a removal for a legacy post would announce a
+// visibility mechanism Coves does not consult for that collection, so those
+// keep the v1 behaviour exactly: delete the record, tombstone the mapping.
+//
+// A NATIVE (bridge-origin) comment is TAKEN here and decided by
+// moderateNativeComment: declining would run that v1 behaviour against a record
+// in the author's own repo.
+//
+// The three counters below are the operator's answer to "what has this bridge
+// done about native comments?", and they are SEPARATE because the questions are.
+// A moderator's removal and an author's own delete arrive on the same activity,
+// distinguished only by `summary`, so counting them together (as 17c-1's single
+// deferred counter did) reports a number that cannot tell a moderated comment
+// from an unmoderated one.
+var (
+	// NativeCommentRemoved counts announced moderator removals of native
+	// comments that were RECORDED bridge-side.
+	NativeCommentRemoved = expvar.NewInt("tidepool_moderation_native_comment_removed")
+	// NativeCommentRemovalLifted counts the Undos that cleared one.
+	NativeCommentRemovalLifted = expvar.NewInt("tidepool_moderation_native_comment_removal_lifted")
+	// NativeCommentSummarylessDelete counts summary-less announced deletes of
+	// native comments: taken, and deliberately recorded nowhere. A DECIDED
+	// non-action, so it is counted — a flat zero must not be readable as "this
+	// never happens".
+	//
+	// It is named for the SHAPE, not for a motive. The obvious name
+	// (…_self_deleted) would claim the author deleted their own comment, and
+	// nothing here establishes that: an Announce's inner actor is not
+	// authenticated, and a TRUTHFUL author self-delete is dropped as a
+	// local-actor echo before this branch is reached. So what this counter
+	// actually sees is summary-less announces carrying foreign or unverifiable
+	// attribution, and it must not be read as a census of author deletions.
+	NativeCommentSummarylessDelete = expvar.NewInt("tidepool_moderation_native_comment_summaryless_delete")
+)
+
+func (h *Handler) moderateAnnouncedDelete(ctx context.Context, del *ap.Object, targetID string, announcer *store.Community) (bool, error) {
+	mapping, err := h.objects.GetByAPID(ctx, targetID)
+	if errors.IsNotFound(err) {
+		if del.HasSummary() {
+			// A moderator removal for something never materialized. Nothing to
+			// remove, and the tombstone marker below is all that happens —
+			// worth saying out loud, because it is also what a removal
+			// announced for another community's content looks like.
+			h.logger.Warn("announced moderator removal for an unmapped object; nothing to remove",
+				"ap_id", targetID)
+		}
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("ingest: look up mapping for removal of %s: %w", targetID, err)
+	}
+	if mapping.IsDeleted() {
+		return false, nil
+	}
+	if mapping.Collection != materialize.CollectionPostV2 {
+		// A NATIVE comment: TAKEN here, never declined into the path below.
+		//
+		// Declining used to be safe by accident — a bridge-origin mapping had no
+		// community_did, so authorization refused before reaching this function
+		// at all. Task 17c binds those mappings, so an announced removal of a
+		// native comment now arrives authorized, and falling through would run
+		// the v1 DELETE path on it: soft-delete our own mapping and attempt a
+		// record delete in the AUTHOR's repo, which this bridge does not host.
+		// That is destruction on behalf of a decision (comment removal) that
+		// decision 18 does not authorize, and it is self-inconsistent besides —
+		// resolveSubject reads the still-live outbound row, so replies to the
+		// "removed" comment keep federating regardless.
+		//
+		// EVERY announced delete of a native comment is taken, not only a
+		// summary-bearing one: the author's own deletes arrive through the
+		// consumer (their repo), never announced back at us, so an announced
+		// one is either a moderation action or an echo — and neither may reach
+		// a path that deletes the author's record.
+		if mapping.Origin == store.OriginBridge {
+			return true, h.moderateNativeComment(ctx, del, mapping, announcer)
+		}
+		return false, nil
+	}
+	if !del.HasSummary() {
+		authored, aerr := h.deleteIsByAuthor(ctx, del, mapping)
+		if aerr != nil {
+			return false, aerr
+		}
+		if authored {
+			return false, nil // the author's own delete: v1 self-delete semantics
+		}
+		h.logger.Info("summary-less announced delete is not the author's; treating it as a community removal",
+			"ap_id", targetID, "actor", refID(del.Actor))
+		return true, h.mat.RemovePost(ctx, mapping, "")
+	}
+	return true, h.mat.RemovePost(ctx, mapping, del.Summary)
+}
+
+// deleteIsByAuthor reports whether the inner Delete is attributed to the
+// bridged author of the mapped record. Unresolvable in any way — no actor id,
+// no author on the mapping, no bridged_actors row — answers FALSE: the
+// destructive path needs a positive identification, not the absence of a
+// contradiction.
+func (h *Handler) deleteIsByAuthor(ctx context.Context, del *ap.Object, mapping *store.APObjectMapping) (bool, error) {
+	actorID := refID(del.Actor)
+	if actorID == "" || mapping.AuthorDID == "" {
+		return false, nil
+	}
+	author, err := h.actors.GetByDID(ctx, mapping.AuthorDID)
+	if errors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("ingest: resolve author %s of %s: %w", mapping.AuthorDID, mapping.APID, err)
+	}
+	return author.APActorID == actorID, nil
 }
 
 // announcerGroupID is the announcing community's AP group id, or "" for a
@@ -159,6 +317,27 @@ func (h *Handler) handleUndo(ctx context.Context, undo *ap.Object, signer string
 		return h.votes.RetractVote(ctx, inner, announcerID)
 	case ap.TypeDelete:
 		return h.handleUndoDelete(ctx, undo, inner, signer, announcer)
+	case ap.TypeLock:
+		// Lemmy carries the Lock INLINE inside the Undo rather than referencing
+		// its id, so the same handler that applied it lifts it. A lock the
+		// moderators lifted that still refuses comments is moderation state
+		// nobody can reach: no later activity clears it, because this is the
+		// only one Lemmy will ever send about it.
+		return h.handleLock(ctx, inner, announcer, false)
+	case ap.TypeBlock:
+		if announcer == nil {
+			// Lemmy sends BOTH halves of a ban to the banned user's inbox
+			// directly. Only the announced copies can be authorized, so both
+			// direct copies are ignored — and both are COUNTED, on the same
+			// counter: a number that moves for direct bans but not direct unbans
+			// makes a broken announce path look like a community that bans and
+			// never forgives.
+			return h.ignoreDirectBlock(inner, signer)
+		}
+		// The unban, with the Block carried INLINE. It lifts the exclusion and
+		// nothing else: content removed under removeData stays removed, because
+		// Lemmy models restoration as a separate restore_data flag.
+		return h.handleBlock(ctx, inner, announcer, false)
 	case ap.TypeFollow:
 		// A remote undoing a follow of us — the bridge has no followers in
 		// v1 (read-only), nothing to do.
@@ -218,6 +397,24 @@ func (h *Handler) handleUndoDelete(ctx context.Context, undo, del *ap.Object, si
 	}
 	if err != nil {
 		return fmt.Errorf("ingest: look up mapping for restore of %s: %w", targetID, err)
+	}
+
+	// OUR OWN CONTENT TAKES THE MODERATION PATH, NEVER THE RE-MATERIALIZATION
+	// ONE — decided BEFORE the fetch, because the fetch is the first step of
+	// the damage.
+	//
+	// A bridge-origin id is a record in a NATIVE author's repo that this bridge
+	// federated outward. There is nothing to re-materialize: the removal never
+	// touched the record, only the community's acceptance of it, so a restore is
+	// that acceptance coming back and nothing else. Falling through would
+	// dereference our own origin, hand the result to HandleUpdate (which never
+	// sees materializeContent's bridge-origin echo guard), MINT a bridged actor
+	// and PLC DID for a native Coves user, fail the commit against a repo we do
+	// not host, and then compensate by soft-deleting our own mapping and
+	// tombstoning our own AP id — after which moderateAnnouncedDelete declines
+	// forever on IsDeleted() and the post can never be moderated again.
+	if mapping.Origin == store.OriginBridge {
+		return h.restoreNativeContent(ctx, undo, mapping, announcer, scope)
 	}
 
 	// Pinned to the target's own authority: this fetch's answer is what
@@ -288,6 +485,34 @@ func (h *Handler) handleUndoDelete(ctx context.Context, undo, del *ap.Object, si
 			"ap_id", targetID, "reason", err)
 		return err
 	}
+	// Undo of a moderator REMOVAL. That removal deleted no record and
+	// tombstoned no mapping, so everything above was a no-op for it: the
+	// re-materialization put the post back exactly as it already was, and its
+	// acceptance write was refused by the terminality guard because the removal
+	// still stands. Lifting it is a separate transition — delete the removal,
+	// re-accept the CURRENT version, one commit — and it runs AFTER the
+	// re-materialization so the version it pins is the one now in the repo.
+	// RestorePost is a no-op when no removal stands, which is every ordinary
+	// restore.
+	//
+	// Lifting a REMOVAL is a community decision, so only the community may
+	// make it: an ANNOUNCED undo of a delete that carried a summary — the same
+	// pair of signals that produced the removal in the first place.
+	//
+	// A BARE undo deliberately does not qualify. That path exists so an ORIGIN
+	// can un-delete content it re-serves, and it is permissive by design
+	// (same-authority signer, pinned re-fetch). None of that says anything
+	// about a community's decision to remove the post from itself, and a fresh
+	// acceptance IS a restore — so honouring it would let an author's own
+	// instance overturn moderation by re-serving the post. The bare path still
+	// restores the RECORD and its mapping; the acceptance stays withheld by
+	// the terminality guard in acceptPost, which leaves the post present but
+	// invisible in that community until a moderator restores it.
+	if mapping.Collection == materialize.CollectionPostV2 && announcer != nil && del.HasSummary() {
+		if err := h.mat.RestorePost(ctx, mapping); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -298,13 +523,65 @@ func (h *Handler) handleUndoDelete(ctx context.Context, undo, del *ap.Object, si
 // (Delete(Actor) is terminal by design).
 func restoredTypeMatches(collection, apType string) bool {
 	switch collection {
-	case materialize.CollectionPost:
+	case materialize.CollectionPost, materialize.CollectionPostV2:
+		// Both eras answer to a Page/Article: a restored post re-materializes
+		// through MaterializePost, which writes a postv2 unless the mapping
+		// already says otherwise.
 		return apType == ap.TypePage || apType == ap.TypeArticle
 	case materialize.CollectionComment:
 		return apType == ap.TypeNote
 	default:
 		return false
 	}
+}
+
+// restoreNativeContent lifts a community's removal of a post THIS BRIDGE
+// federated on a native author's behalf. It is the mirror of
+// moderateAnnouncedDelete: the same actor (the owning community), the same
+// records (its acceptance and removal, one rkey, one commit), and the same
+// hands-off rule about the author's record, which neither the removal nor the
+// restore ever touches.
+//
+// Only an ANNOUNCED undo may do it. A bare Undo{Delete} would have to come from
+// the target id's own authority, and that authority is US — a bare restore of
+// our own object is either an echo of something we never send or somebody
+// claiming to speak for our origin, and neither is a moderation decision.
+//
+// The two state clears are legacy repair, not part of the restore: an announced
+// delete of native content in the pre-17c era laid a marker and soft-deleted the
+// mapping (there was no community binding, so it fell into the v1 delete path).
+// Both are idempotent and cost one statement each, and leaving either behind
+// would keep the post suppressed or unmoderatable after a legitimate restore.
+//
+// It is deliberately NOT gated on the undone Delete's `summary`. On the delete
+// side that key separates two opposite actions — destroy the author's record,
+// or record a community removal — so presence has to decide. Here both readings
+// converge on the same non-destructive outcome (the acceptance returns), and
+// requiring the key would only create a way for a real restore to be dropped,
+// leaving a removal the moderators lifted standing forever.
+func (h *Handler) restoreNativeContent(ctx context.Context, undo *ap.Object,
+	mapping *store.APObjectMapping, announcer *store.Community, scope string) error {
+
+	if announcer == nil {
+		return skip(mapping.APID, "bare undo of a delete cannot restore the bridge's own content")
+	}
+	if mapping.Collection != materialize.CollectionPostV2 {
+		// A COMMENT: its removal lives in the bridge's own moderation state, not
+		// in the community repo, so lifting it is a state clear rather than the
+		// acceptance transition below. It takes the SAME legacy repair with it —
+		// see liftNativeCommentRemoval, which does both.
+		return h.liftNativeCommentRemoval(ctx, undo, mapping, announcer, scope)
+	}
+	if err := h.tombstones.Remove(ctx, mapping.APID, scope); err != nil {
+		return fmt.Errorf("ingest: clear tombstone for %s: %w", mapping.APID, err)
+	}
+	if err := h.objects.Restore(ctx, mapping.APID); err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("ingest: restore mapping for %s: %w", mapping.APID, err)
+	}
+	h.logger.Info("community lifted its removal of a native post; re-accepting",
+		"ap_id", mapping.APID, "at_uri", mapping.ATURI, "community", announcer.APGroupID,
+		"activity", undo.ID)
+	return h.mat.RestorePost(ctx, mapping)
 }
 
 // retractDeleteMarker is Undo{Delete} for an id with no mapping: the delete
@@ -358,10 +635,13 @@ func (h *Handler) authorizeBareVote(activityID string, vote *ap.Object, signer s
 //     post in a lemmy.world community carries a jlai.lu ap_id, and its
 //     Delete fans out through the community's Announce (the normal remote-
 //     author federation shape). MEMBERSHIP in the announcing community, not
-//     the target's host, is therefore the test: posts commit into the
-//     community's own repo (mapping.DID answers directly), comments into
-//     their AUTHOR's repo (their thread root answers for them — see
-//     authorizeAnnouncedCommentDelete). A target belonging elsewhere
+//     the target's host, is therefore the test — and it is one question asked
+//     of one function: materialize.CommunityDIDOf, which reads the mapping's
+//     community_did and falls back to deriving it from the record for rows
+//     written before that column existed (see authorizeAnnouncedContentDelete).
+//     Repo placement no longer answers it: since the author-owned flip only a
+//     legacy post sits in the community's own repo, while a postv2 and every
+//     comment sit in their AUTHOR's. A target belonging elsewhere
 //     (another community's content, even co-hosted on the announcer's
 //     instance) drops. A target that is itself a bridged ACTOR — the
 //     terminal DeleteActor scrub — may only be the community ITSELF, never a
@@ -409,82 +689,53 @@ func (h *Handler) authorizeDelete(ctx context.Context, activityID, targetID, sig
 		// whose actor row was scrubbed is still an actor, not content.
 		return skip(activityID, fmt.Sprintf(
 			"community %s may not delete actor %s", announcer.APGroupID, targetID))
-	case materialize.CollectionComment:
-		return h.authorizeAnnouncedCommentDelete(ctx, activityID, mapping, announcer)
 	}
-	if mapping.DID != announcer.DID {
-		return skip(activityID, fmt.Sprintf(
-			"announced delete of %s targets a record outside %s's repo", targetID, announcer.APGroupID))
-	}
-	return nil
+	return h.authorizeAnnouncedContentDelete(ctx, activityID, mapping, announcer)
 }
 
-// authorizeAnnouncedCommentDelete answers community membership for a
-// COMMENT, which its mapping cannot: comments commit into their AUTHOR's
-// repo (only posts land in the community's), so mapping.DID is the author's
-// DID for every comment in every community — comparing it to the announcer's
-// repo would drop every announced comment delete there is. The thread is the
-// membership signal instead: the materializer guarantees reply.root on every
-// comment and the thread's root post lives in the community's own repo, so
-// one record read recovers the owning community's DID (the same derivation
-// the vote aggregator uses to bind announced votes).
-func (h *Handler) authorizeAnnouncedCommentDelete(ctx context.Context, activityID string, mapping *store.APObjectMapping, announcer *store.Community) error {
-	if mapping.IsDeleted() {
-		// Already soft-deleted: the record — and with it the reply.root this
-		// check reads — is gone from the repo, so there is nothing left to
-		// authorize against, and re-deleting is a downstream no-op. The
-		// allowance is exactly that and no more: idempotence for re-delivered
-		// deletes. The RESTORE path rides the same authorizeDelete call and is
-		// therefore admitted here too, but it is not authorized here — its
-		// guarantees are post-fetch (handleUndoDelete): the origin must serve
-		// the object again over a pinned fetch, its type must match the
-		// mapping, and an announced restore must NAME the announcing community.
-		// Those are what stop a sibling community from reviving another
-		// community's soft-deleted comment.
-		return nil
-	}
-	record, _, err := h.records.GetRecord(ctx, mapping.DID, mapping.Collection, mapping.RKey)
-	if errors.IsNotFound(err) {
-		// A live mapping with no record is a permanent inconsistency: a retry
-		// would re-read the same missing record forever and wedge the
-		// ordering key behind it. Log it and drop the delete.
-		h.logger.Warn("announced comment delete: live mapping has no record",
-			"ap_id", mapping.APID, "at_uri", mapping.ATURI)
-		return skip(activityID, "comment "+mapping.ATURI+" has no record to authorize against")
-	}
+// authorizeAnnouncedContentDelete answers community membership for one piece
+// of bridged CONTENT. Repo placement used to answer it directly — posts sat in
+// the community's repo — but a postv2 sits in the author's, and a comment
+// never sat there at all, so the membership answer is recorded on the mapping
+// and read back through materialize.CommunityDIDOf (which also covers the rows
+// predating that column). An answer that cannot be determined REFUSES: an
+// announced delete is a moderation action by a community over its own
+// content, and content whose community we cannot name is not that.
+//
+// Announced Lock/Undo{Lock} (17c-2) ask THIS function, not a copy of it: the
+// conjunction is one rule for every announced moderation verb, and a second
+// implementation of it is a second place for the two conjuncts to drift apart.
+// The messages therefore speak of moderation generally.
+func (h *Handler) authorizeAnnouncedContentDelete(ctx context.Context, activityID string, mapping *store.APObjectMapping, announcer *store.Community) error {
+	communityDID, err := materialize.CommunityDIDOf(ctx, h.records, mapping)
 	if err != nil {
-		return fmt.Errorf("ingest: read comment record %s: %w", mapping.ATURI, err)
+		return fmt.Errorf("ingest: bind %s to a community: %w", mapping.APID, err)
 	}
-	rootDID := replyRootDID(record)
-	if rootDID == "" {
-		h.logger.Warn("announced comment delete: record carries no reply.root",
-			"ap_id", mapping.APID, "at_uri", mapping.ATURI)
-		return skip(activityID, "comment "+mapping.ATURI+" carries no reply.root to authorize against")
+	if communityDID == "" {
+		if mapping.IsDeleted() {
+			// Already soft-deleted: the record the derivation reads is gone, so
+			// there is nothing left to authorize against and re-deleting is a
+			// downstream no-op. The allowance is exactly that and no more —
+			// idempotence for re-delivered deletes, never for a live mapping.
+			// The RESTORE path rides this same call and is therefore admitted
+			// here too, but it is not authorized here: its guarantees are
+			// post-fetch (handleUndoDelete) — the origin must serve the object
+			// again over a pinned fetch, its type must match the mapping, and an
+			// announced restore must NAME the announcing community. Those are
+			// what stop a sibling community reviving another's soft-deleted
+			// content.
+			return nil
+		}
+		// A live mapping we cannot bind is a permanent inconsistency (a missing
+		// record, a comment with no reply.root). Retrying would re-read the same
+		// hole forever and wedge the ordering key behind it: log and drop.
+		h.logger.Warn("announced moderation: cannot bind target to a community",
+			"ap_id", mapping.APID, "at_uri", mapping.ATURI, "collection", mapping.Collection)
+		return skip(activityID, mapping.ATURI+" cannot be bound to a community to authorize against")
 	}
-	if rootDID != announcer.DID {
+	if communityDID != announcer.DID {
 		return skip(activityID, fmt.Sprintf(
-			"announced delete of %s targets a comment in a thread outside %s",
-			mapping.APID, announcer.APGroupID))
+			"announced moderation of %s targets content outside %s", mapping.APID, announcer.APGroupID))
 	}
 	return nil
-}
-
-// replyRootDID extracts the repo DID from a comment record's reply.root
-// strongRef uri (at://did/collection/rkey). Malformed records yield "".
-func replyRootDID(record map[string]any) string {
-	reply, ok := record["reply"].(map[string]any)
-	if !ok {
-		return ""
-	}
-	root, ok := reply["root"].(map[string]any)
-	if !ok {
-		return ""
-	}
-	uri, _ := root["uri"].(string)
-	rest, ok := strings.CutPrefix(uri, "at://")
-	if !ok {
-		return ""
-	}
-	did, _, _ := strings.Cut(rest, "/")
-	return did
 }

@@ -7,7 +7,9 @@
       "description": "List all aggregators authorized for a specific community. Used by community settings UI to show enabled/disabled aggregators. Authentication optional.",
       "parameters": {
         "type": "params",
-        "required": ["community"],
+        "required": [
+          "community"
+        ],
         "properties": {
           "community": {
             "type": "string",
@@ -28,7 +30,8 @@
           },
           "cursor": {
             "type": "string",
-            "description": "Pagination cursor"
+            "description": "Pagination cursor",
+            "maxLength": 500
           }
         }
       },
@@ -36,7 +39,9 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["aggregators"],
+          "required": [
+            "aggregators"
+          ],
           "properties": {
             "aggregators": {
               "type": "array",
@@ -48,7 +53,8 @@
             },
             "cursor": {
               "type": "string",
-              "description": "Pagination cursor for next page"
+              "description": "Pagination cursor for next page",
+              "maxLength": 500
             }
           }
         }

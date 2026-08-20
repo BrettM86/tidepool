@@ -32,13 +32,13 @@
             "items": {
               "type": "string",
               "knownValues": [
-                "remove_posts",
-                "remove_comments",
-                "ban_users",
-                "manage_rules",
-                "manage_wiki",
-                "manage_moderators",
-                "manage_settings"
+                "remove-posts",
+                "remove-comments",
+                "ban-users",
+                "manage-rules",
+                "manage-wiki",
+                "manage-moderators",
+                "manage-settings"
               ],
               "maxLength": 64
             }

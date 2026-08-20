@@ -23,7 +23,8 @@
             },
             "reason": {
               "type": "string",
-              "maxLength": 1000,
+              "maxGraphemes": 1000,
+              "maxLength": 10000,
               "description": "Reason for unbanning (optional)"
             }
           }
@@ -33,13 +34,7 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["success"],
-          "properties": {
-            "success": {
-              "type": "boolean",
-              "description": "Whether the unban was successful"
-            }
-          }
+          "properties": {}
         }
       },
       "errors": [

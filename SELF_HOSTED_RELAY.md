@@ -30,7 +30,16 @@ at bsky.network, so native Coves signup #101 would silently vanish from
 the app exactly like the bridged commenters did.
 
 Design decisions and their reasons live as comments on the compose
-services; this file is the runbook.
+services; this file is the runbook for the **ingest** path only. The v2
+deploy — config gate, the `CONSUMER_ENABLED`/`OUTBOUND_WORKERS` staging
+order, the coves.social Caddy change, rollout and rollback — is
+[`DEPLOY.md`](DEPLOY.md).
+
+Note the direction: this file describes the relay and Jetstream that feed
+**Coves**. Tidepool's own consumer reads the same Jetstream from the other
+side, over `JETSTREAM_URL`
+(`ws://tidepool-prod-jetstream:8080/subscribe`, :8080 = `JETSTREAM_ADDR`;
+:6060 is the debug listener and serves no `/subscribe`).
 
 ## Not in scope here (Phase 2+, Coves repo)
 

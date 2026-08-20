@@ -14,6 +14,68 @@ import (
 	"time"
 )
 
+// ObjectModeration is the moderation state the BRIDGE owns for one bridged
+// object: a community's thread LOCK, and its removal of a native COMMENT —
+// decisions with no home in either repo (see migration 025).
+//
+// It is its OWN interface, held only by the two places that moderate: the
+// announced-moderation dispatch and the native comment consumer. It was briefly
+// embedded in APObjects, which every strongRef resolution holds — the echo
+// classifier, the vote aggregator, the stats refresher, the materializer, the
+// outbound enqueuer — and that put SetLock/SetRemoval/ClearRemoval within reach
+// of five callers that have no business moderating anything. The TABLE is
+// separate from ap_objects for its own reason (putMapping rewrites a whole
+// mapping row, so a re-pin would clear a lock); this separation is the other
+// one, and they are not the same argument.
+type ObjectModeration interface {
+	// SetLock records or clears a community's lock on an object. Locking an
+	// already-locked object preserves the ORIGINAL locked_at — a re-announced
+	// Lock is the same decision, not a new one. Unlocking is scoped to the
+	// community that holds the lock: clearing is a no-op for anyone else, and a
+	// no-op success for an object that was never locked.
+	SetLock(ctx context.Context, object ModeratedObject, locked bool) error
+
+	// LockedAmong returns the first of the given at-uris that currently carries
+	// a lock, or "" when none does. It takes a SET because the question is
+	// always asked of a thread — a comment is refused by a lock on its parent
+	// OR on its thread root — and one statement keeps that one round trip
+	// however many ancestors it names. Empty at-uris are ignored; an object no
+	// community has ever moderated simply has no row, which is the answer
+	// "open" rather than an error.
+	LockedAmong(ctx context.Context, atURIs ...string) (string, error)
+
+	// SetRemoval records a community's removal of a COMMENT: when it happened,
+	// under which code, and with the moderator's own reason. Re-recording an
+	// existing removal keeps the ORIGINAL removed_at — a re-delivered Delete is
+	// the same decision arriving twice.
+	//
+	// COMMENTS ONLY, deliberately. A post's removal is a record in the
+	// community's own repo, written atomically with the withdrawal of the
+	// acceptance it replaces; a second copy here would be a second source of
+	// truth for one decision, and the two would disagree the first time the
+	// commit succeeded and this write did not.
+	SetRemoval(ctx context.Context, object ModeratedObject, code, reason string) error
+
+	// ClearRemoval lifts a removal (Undo{Delete}), scoped to the community that
+	// made it: clearing is a no-op for anyone else, and a no-op success for an
+	// object nobody removed. The row survives — a lock on the same object is a
+	// separate decision and is not lifted with it.
+	//
+	// cleared reports whether a removal was actually standing, so a caller can
+	// count and log what HAPPENED rather than what was attempted: a re-delivered
+	// Undo, or one for a comment this community never removed, is a no-op and
+	// must not read in the metrics as another moderator reversal.
+	ClearRemoval(ctx context.Context, atURI, communityDID string) (cleared bool, err error)
+
+	// CommunityHoldsAnyLock reports whether a community currently holds a lock
+	// on anything at all. It answers the ONE question left when a comment's
+	// thread cannot be determined: a community holding no lock cannot have
+	// locked the thread we failed to name, so there is provably nothing to miss.
+	// It is never the refusal rule itself — a lock is per-object, and a
+	// community holding one says nothing about its other threads.
+	CommunityHoldsAnyLock(ctx context.Context, communityDID string) (bool, error)
+}
+
 // APObjects maps AP object ids to the atproto records they materialized
 // as, and back. Every materialization writes a mapping; every strongRef
 // resolution reads one.
@@ -60,8 +122,10 @@ type APObjects interface {
 
 	// ListByActorDID returns all live (not soft-deleted) mappings whose
 	// record either lives in the actor's repo (did) or was authored by the
-	// actor into another repo (author_did — posts live in community repos).
-	// Task 05's Delete(Actor) scrub enumerates these.
+	// actor into another repo (author_did). The second case is the LEGACY
+	// post era only: those posts were written into the community's repo. A
+	// postv2 and every comment live in the author's own repo, so did answers
+	// for them. Task 05's Delete(Actor) scrub enumerates these.
 	ListByActorDID(ctx context.Context, did string) ([]*APObjectMapping, error)
 
 	// SoftDelete marks the mapping for an AP object id as deleted, in one
@@ -119,6 +183,148 @@ type BridgedActors interface {
 	MarkProfileSynced(ctx context.Context, apActorID string, syncedAt time.Time) error
 }
 
+// APActors persists the ActivityPub identities Coves users get on the user
+// origin (task 13): one Person actor per DID, its sealed RSA key, and the
+// webfinger lookup key (normalized_origin, local_part).
+//
+// The local part is FROZEN at creation: a handle change updates the profile
+// cache only, never the local part, so a minted @alice@coves.social keeps
+// resolving after the user renames.
+type APActors interface {
+	// Create inserts a new actor and returns the stored row. A created
+	// actor is always enabled and unpaused (default-on federation,
+	// decision 11): the lifecycle fields on the argument are ignored, and
+	// disabling goes through SetEnabled. Uniqueness violations — did,
+	// actor_id, or (normalized_origin, local_part) — return an error
+	// satisfying errors.IsAlreadyExists, mapped from the constraint name
+	// rather than pre-checked (a pre-check races).
+	Create(ctx context.Context, actor APActor) (*APActor, error)
+
+	// GetByDID returns the actor for a Coves DID. A miss is an error
+	// satisfying errors.IsNotFound.
+	GetByDID(ctx context.Context, did string) (*APActor, error)
+
+	// GetByOriginLocalPart returns the actor for a (normalized origin,
+	// local part) pair — the webfinger lookup, scoped to the routed Host so
+	// vanity origins hosting the same local part stay distinct. A miss is
+	// an error satisfying errors.IsNotFound.
+	GetByOriginLocalPart(ctx context.Context, normalizedOrigin, localPart string) (*APActor, error)
+
+	// SetEnabled toggles federation for an actor: disabling stamps
+	// disabled_at, re-enabling clears it and re-stamps enabled_at. A
+	// missing actor is an error satisfying errors.IsNotFound.
+	//
+	// A TOMBSTONED actor is never re-enabled: the destructive tier is terminal,
+	// and the refusal lives in the statement so no caller can undo a withdrawal
+	// by writing a preference. Disabling one is still honoured (it is already
+	// disabled, and the write is idempotent).
+	SetEnabled(ctx context.Context, did string, enabled bool) error
+
+	// SetEnabledTx is SetEnabled on an existing transaction — the seam the
+	// opt-out uses so the flag and the cancellation of the actor's queued work
+	// land together. Half of that state is a silent wrong answer in either
+	// direction: an actor disabled with live deliveries keeps publishing for
+	// someone who opted out, and cancelled deliveries under an enabled actor
+	// lose work while the bridge believes it still federates for them. A nil tx
+	// is an error satisfying errors.IsValidation.
+	SetEnabledTx(ctx context.Context, tx *sql.Tx, did string, enabled bool) error
+
+	// SetPaused toggles delivery_paused (the transient #account state).
+	// A missing actor is an error satisfying errors.IsNotFound.
+	SetPaused(ctx context.Context, did string, paused bool) error
+
+	// Tombstone withdraws the identity (task 17d's destructive tier): the actor
+	// document answers 410 Gone from then on, and the actor is disabled in the
+	// same statement so it cannot stay discoverable after being withdrawn.
+	//
+	// TERMINAL. Nothing clears it, and nothing here promises resurrection:
+	// peers that honoured the Delete this accompanies cannot restore what they
+	// dropped. Re-tombstoning preserves the original time. A missing actor is an
+	// error satisfying errors.IsNotFound.
+	Tombstone(ctx context.Context, did string) error
+
+	// TombstoneTx is Tombstone on an existing transaction — the seam the
+	// destructive tier uses so the withdrawal and the activities that announce
+	// it commit together. An actor tombstoned without the Delete being enqueued
+	// is an identity that vanished while its content stayed. A nil tx is an
+	// error satisfying errors.IsValidation.
+	TombstoneTx(ctx context.Context, tx *sql.Tx, did string) error
+
+	// UpdateProfile refreshes the cached display name, summary, and avatar
+	// and bumps updated_at. It NEVER touches local_part — the identity
+	// handler (task 14) reaches this method on handle changes, and the
+	// frozen local part is what keeps federated mentions resolving.
+	// A missing actor is an error satisfying errors.IsNotFound.
+	UpdateProfile(ctx context.Context, did string, profile APActorProfile) error
+}
+
+// CommunityBans is one community's exclusion of one native author (migration
+// 027) — the durable half of an announced Block.
+//
+// It is its OWN interface, held only by the two places that need it: the
+// announced-moderation dispatch that writes bans, and the admission gate that
+// reads them. It is not part of Communities, which half the bridge holds to
+// resolve follow state and AP group ids.
+type CommunityBans interface {
+	// Ban records the exclusion AND cancels that author's PENDING deliveries to
+	// that community, in ONE transaction, returning how many were cancelled.
+	//
+	// The two are one decision and cannot be separated: the row stops the
+	// author's NEXT post, the cancellation stops the ones already queued, and a
+	// row that committed without the cancellation would leave the queue pushing
+	// a banned author's posts at a community that rejects them until each
+	// poisons — with nothing to retry, because Lemmy sends the Block once.
+	//
+	// Re-banning preserves the original banned_at (a re-delivered Block is the
+	// same ban twice) while taking the expiry, reason and removeData from the
+	// new activity, which are the parts a moderator can genuinely re-issue.
+	//
+	// A ban whose expiry has ALREADY PASSED is still RECORDED — it is a faithful
+	// account of what the moderator sent, and a redelivery must find the same row
+	// — but it cancels nothing, because it is not in force and a cancelled
+	// delivery is never re-queued.
+	//
+	// AND IT NEVER WEAKENS A BAN THAT IS IN FORCE. An old Block redriven from the
+	// dead-letter queue or replayed from a backfill arrives under a new activity
+	// id that inbox dedup cannot recognize; written last-writer-wins over the
+	// permanent ban the moderators escalated to, its past expiry reads as
+	// unbanned forever after, and no activity exists that could correct it. So a
+	// write that is already expired on arrival is dropped when a standing ban
+	// would lose by it — expiry, reason and removeData together.
+	Ban(ctx context.Context, ban CommunityBan) (cancelled int64, err error)
+
+	// Lift removes the ban (Undo{Block}). lifted says a ban was removed;
+	// retained says one was there and was DELIBERATELY LEFT — the two are
+	// different answers and both are false only when there was nothing at all.
+	//
+	// It lifts ONLY the exclusion: content removed under removeData stays
+	// removed, because Lemmy models restoration as a separate restore_data flag.
+	//
+	// undoneExpiry is the expiry the UNDONE Block named (nil when it named none),
+	// and it is the replay guard: an Undo can be redriven under a new activity id
+	// after the ban it reversed has been replaced, and an unconditional delete
+	// then lifts the newer ban forever. An Undo of a ban ending at T therefore
+	// cannot remove a ban that outlives T. An Undo naming NO expiry still lifts
+	// unconditionally — nothing in the row can distinguish it from its own
+	// replay.
+	Lift(ctx context.Context, communityDID, subjectDID string, undoneExpiry *time.Time) (lifted, retained bool, err error)
+
+	// Standing reports whether the author is CURRENTLY banned from the
+	// community — expiry included, because a lapsed ban must read exactly like
+	// no ban: Lemmy sends no Undo when a timed ban runs out, so the clock is the
+	// only thing that ever lifts it.
+	Standing(ctx context.Context, communityDID, subjectDID string) (bool, error)
+
+	// StandingTx is Standing on an existing transaction — the seam the
+	// acceptance commit uses to re-ask the question INSIDE the transaction that
+	// writes the acceptance and enqueues the delivery. A ban read before that
+	// transaction opens is a decision made about state that can change before it
+	// is acted on: the ban's own transaction cancels every pending delivery, so
+	// a post admitted after it lands is one the cancellation could never catch.
+	// A nil tx is an error satisfying errors.IsValidation.
+	StandingTx(ctx context.Context, tx *sql.Tx, communityDID, subjectDID string) (bool, error)
+}
+
 // Communities tracks the AP groups the bridge subscribes to and their
 // backfill progress.
 type Communities interface {
@@ -169,6 +375,12 @@ type Communities interface {
 // actor's AP-side RSA private key). Keys are create-once: there is no update
 // or delete, so a stored key can never be silently rotated out from under
 // signatures already in flight.
+//
+// The KEK re-seal drill (identity.Reseal) is the one writer that updates a
+// stored row, with its own SQL rather than a method here, and it is not an
+// exception to that rule: it re-WRAPS the same key material under a new KEK,
+// and its UPDATE is guarded on the exact old bytes, so the key any signature
+// was made with is never replaced — only the envelope around it.
 type ServiceKeys interface {
 	// Create inserts a new named key and returns the stored row. An existing
 	// name returns an error satisfying errors.IsAlreadyExists — callers that
@@ -246,6 +458,217 @@ type InboxEvents interface {
 	GetEvent(ctx context.Context, activityID string) (*InboxEvent, error)
 }
 
+// OutboundObjects persists the state every outbound Delete and Update is
+// rebuilt from (task 14, decision 14). A Jetstream delete commit carries the
+// DID, collection and rkey and nothing else — no record body, no CID — so a
+// Delete{Note} can only be built from what was written here at create time.
+//
+// Rows are TOMBSTONED, never removed: the row is what a late replay of the
+// create is rejected against.
+type OutboundObjects interface {
+	// Upsert idempotently writes the outbound state keyed on ATURI and
+	// returns the stored row. A new row starts at LastActivitySeq 0; every
+	// later upsert of the same at-uri bumps it, so each applied operation
+	// gets its own stable activity id. CreatedAt is preserved.
+	//
+	// The bump is safe ONLY because the rev gate runs first: a replayed
+	// commit never reaches this method, so the seq (and therefore the
+	// activity id) is stable under replay.
+	Upsert(ctx context.Context, object OutboundObject) (*OutboundObject, error)
+
+	// UpsertTx is Upsert on an existing transaction — the seam that lets the
+	// rev-gate claim and the outbound state land in ONE commit. A nil tx is
+	// an error satisfying errors.IsValidation.
+	UpsertTx(ctx context.Context, tx *sql.Tx, object OutboundObject) (*OutboundObject, error)
+
+	// GetByATURI returns the outbound state for an at-uri, tombstoned rows
+	// included (callers check IsTombstoned). A miss is an error satisfying
+	// errors.IsNotFound.
+	GetByATURI(ctx context.Context, atURI string) (*OutboundObject, error)
+
+	// Tombstone stamps tombstoned_at, bumps LastActivitySeq and returns the
+	// full stored row — the state the Delete activity is built from, handed
+	// back in the same statement that tombstones it so no read/write window
+	// exists. Tombstoning an already-tombstoned row is a no-op success that
+	// preserves the original tombstoned_at AND the seq (a redelivered delete
+	// must reuse the id the first one sent). A missing row is an error
+	// satisfying errors.IsNotFound.
+	Tombstone(ctx context.Context, atURI string) (*OutboundObject, error)
+
+	// TombstoneTx is Tombstone on an existing transaction. A nil tx is an
+	// error satisfying errors.IsValidation.
+	TombstoneTx(ctx context.Context, tx *sql.Tx, atURI string) (*OutboundObject, error)
+
+	// UntombstoneTx clears tombstoned_at on an existing transaction: the
+	// object is live outward again because a caller re-published it. It is
+	// the ONLY way the flag comes off — Upsert deliberately preserves it —
+	// so re-publishing and un-tombstoning commit together or not at all.
+	// LastActivitySeq is untouched (the upsert on the same transaction owns
+	// the activity-id counter). Clearing an already-live row is a no-op
+	// success; a missing row is an error satisfying errors.IsNotFound, and a
+	// nil tx one satisfying errors.IsValidation.
+	UntombstoneTx(ctx context.Context, tx *sql.Tx, atURI string) (*OutboundObject, error)
+
+	// SetAccepted stamps accepted_at — the causal-gating marker (task 15,
+	// decision 15). Delivery SUCCESS sets it; a NULL accepted_at means the
+	// object has not yet been delivered to its community, which is what keeps a
+	// BRIDGE-origin child (a reply) ineligible until its parent lands.
+	// Stamping an already-accepted row preserves the original time (a
+	// redelivery must not move the causal boundary). A missing row is an error
+	// satisfying errors.IsNotFound.
+	SetAccepted(ctx context.Context, atURI string) error
+}
+
+// OutboundVotes persists the state an outbound Undo is rebuilt from (decision
+// 16). A vote delete commit names the vote record and nothing else, so the
+// direction and the activity id the Like/Dislike went out under have to be
+// readable back from here.
+type OutboundVotes interface {
+	// Upsert idempotently writes the vote intent keyed on VoteATURI and
+	// returns the stored row. An empty DeliveredState defaults to
+	// DeliveredStatePending — the consumer records intent only; delivery is
+	// task 15's to claim. A new row starts at ActivitySeq 0; re-upserting the
+	// same vote at-uri bumps it. Writing a DIFFERENT vote at-uri for an
+	// (ActorDID, SubjectATURI) pair that already has one returns an error
+	// satisfying errors.IsAlreadyExists: one actor holds at most one live
+	// vote per subject, and silently clobbering the old row would strand its
+	// Undo.
+	//
+	// ONE STATE TRANSITION IS REFUSED: `pending` over a stored `delivered`
+	// keeps `delivered`. A re-cast replaces a vote the peer still holds rather
+	// than withdrawing it, and the caller states `pending` on every write
+	// because it records intent and cannot know what the wire said — so
+	// letting it land would erase the only record that a delivery happened.
+	// Every other column still updates and ActivitySeq still bumps, and the
+	// RETURNED row reflects the KEPT state: callers build their outgoing
+	// intent from what comes back, so the struct and the stored row cannot
+	// disagree. No other transition is defended — `undone` (the purge's
+	// retraction) and `delivered` both write straight through.
+	Upsert(ctx context.Context, vote OutboundVote) (*OutboundVote, error)
+
+	// UpsertTx is Upsert on an existing transaction. A nil tx is an error
+	// satisfying errors.IsValidation.
+	UpsertTx(ctx context.Context, tx *sql.Tx, vote OutboundVote) (*OutboundVote, error)
+
+	// GetByATURI returns the vote for a vote record's at-uri — the DELETE
+	// path's lookup key, because a delete commit carries nothing else. A miss
+	// is an error satisfying errors.IsNotFound.
+	GetByATURI(ctx context.Context, voteATURI string) (*OutboundVote, error)
+
+	// GetByActorSubject returns the actor's live vote on a subject — the
+	// CREATE path's lookup, which asks "did this actor already vote here?".
+	// A miss is an error satisfying errors.IsNotFound.
+	GetByActorSubject(ctx context.Context, actorDID, subjectATURI string) (*OutboundVote, error)
+
+	// GetByActivityID returns the vote whose CurrentActivityID equals
+	// activityID — the DELIVERY callback's lookup (task 15). A Like/Dislike is
+	// delivered under CurrentActivityID; an Undo embeds that same id as its
+	// inner object, so both delivery-success callbacks resolve the vote row
+	// from the one activity id. A miss is an error satisfying errors.IsNotFound.
+	GetByActivityID(ctx context.Context, activityID string) (*OutboundVote, error)
+
+	// ListStandingForActor returns the votes a PEER STILL HOLDS for this actor:
+	// those already settled as delivered, AND those whose delivery is held for
+	// settlement — accepted on the wire, with only our bookkeeping outstanding.
+	//
+	// The second half is what makes it correct as the destructive tier's input.
+	// A held vote reads 'pending' until the worker returns, and that return
+	// happens AFTER the withdrawal — so an enumeration of 'delivered' alone
+	// leaves a real vote standing on a real instance, attributed to an actor the
+	// bridge has told the world is gone, with nothing left that will notice.
+	//
+	// A vote already flipped `undone` is NEVER standing, even while its Like
+	// delivery still sits held: `undone` records a retraction already on the
+	// books, and re-enumerating it hands a replayed purge a fresh seq — a
+	// duplicate Undo under a new id, refused by the peer into poison.
+	ListStandingForActor(ctx context.Context, actorDID string) ([]OutboundVote, error)
+
+	// SetDeliveredState transitions the delivery state. An unknown state is
+	// an error satisfying errors.IsValidation; a missing vote is an error
+	// satisfying errors.IsNotFound. `undone` is TERMINAL here: any other
+	// write over an undone row is refused and reports SUCCESS (a decided
+	// no-op — failing it would leave a settlement retrying a write that can
+	// never apply), and re-setting `undone` stays allowed so the write is
+	// idempotent. This is the settlement writer's guard against late facts
+	// about old messages; the intent-writer's one refused transition lives
+	// on Upsert, deliberately different (see its doc).
+	SetDeliveredState(ctx context.Context, voteATURI string, state DeliveredState) error
+
+	// Delete removes the vote state once its Undo is delivered. Deleting a
+	// missing vote is a no-op success.
+	Delete(ctx context.Context, voteATURI string) error
+}
+
+// FederationPrefs stores Coves users' federation preferences (decision 11).
+//
+// Federation is DEFAULT-ON and social.coves.bridge.federation is an OPT-OUT
+// record, so an ABSENT row means enabled. Get therefore returns NotFound for
+// a user who never said anything — it never invents an enabled row, because a
+// caller that cannot tell "opted in" from "never spoke" cannot tell a
+// re-enable from a first sighting either.
+type FederationPrefs interface {
+	// Upsert writes the preference keyed on DID and returns the stored row.
+	// Every field is overwritten, so re-enabling (Enabled true) also clears a
+	// previously requested DeleteRemote. Source must be stated explicitly:
+	// the zero value is an error satisfying errors.IsValidation.
+	Upsert(ctx context.Context, pref FederationPref) (*FederationPref, error)
+
+	// UpsertTx is Upsert on an existing transaction — the seam the consumer's
+	// opt-out handler uses so the preference, the delivery cancellation and the
+	// rev-gate advance commit as ONE unit. A nil tx is an error satisfying
+	// errors.IsValidation.
+	//
+	// NOT for a caller that then reaches a seam opening its own transaction
+	// against this row: it cannot release what it holds without committing, and
+	// the two block each other (see consume/rev_gate.go's DEADLOCK NOTE).
+	UpsertTx(ctx context.Context, tx *sql.Tx, pref FederationPref) (*FederationPref, error)
+
+	// Get returns the preference for a DID. A miss is an error satisfying
+	// errors.IsNotFound and MEANS default-on, not "unknown".
+	Get(ctx context.Context, did string) (*FederationPref, error)
+
+	// Delete removes the preference — the record-delete path, which restores
+	// the default-on state. Deleting a missing preference is a no-op success,
+	// and so is deleting one whose purge COMMITTED: absence means default-on,
+	// and a user whose content peers were already told to delete has nothing to
+	// come back to. Callers that report an outcome read the row back.
+	Delete(ctx context.Context, did string) error
+
+	// DeleteTx is Delete on an existing transaction — the re-enable half of the
+	// consumer's opt-out door, so the clearing rides the rev-gate advance and a
+	// failed event cannot leave federation silently restored for a user who
+	// asked us to stop. A nil tx is an error satisfying errors.IsValidation.
+	//
+	// It reports whether a row was actually removed, which is how a caller tells
+	// the ordinary re-enable from the one case this refuses: a COMMITTED PURGE
+	// is not deletable. A false with no error means either "there was nothing to
+	// clear" or "the identity was withdrawn and cannot come back", and since
+	// nothing was written, the caller may read the row back on any connection to
+	// tell which.
+	DeleteTx(ctx context.Context, tx *sql.Tx, did string) (deleted bool, err error)
+
+	// MarkPurged records that the destructive tier actually asked peers to
+	// delete this user's content — the fact that makes the preference terminal.
+	// The FIRST commit wins; a retry never moves the date. A missing preference
+	// is an error satisfying errors.IsNotFound, because a purge that committed
+	// with no preference to mark is a hole in the ordering, not a no-op.
+	MarkPurged(ctx context.Context, did string) error
+
+	// MarkPurgedTx is MarkPurged on an existing transaction — the seam the
+	// purge itself uses so the marker lands atomically with the withdrawal it
+	// records. A nil tx is an error satisfying errors.IsValidation.
+	MarkPurgedTx(ctx context.Context, tx *sql.Tx, did string) error
+
+	// ClearRequestedPurge withdraws a preference this tier wrote for a deletion
+	// that never happened — an account reported deleted, the purge failed, and
+	// the account is confirmed live again. It reports whether one was cleared.
+	//
+	// It clears ONLY (source=account AND purged_at IS NULL): a user's own
+	// opt-out is theirs to keep, and a committed purge is not undoable. Both
+	// terms live in the statement so a caller cannot reach past either.
+	ClearRequestedPurge(ctx context.Context, did string) (cleared bool, err error)
+}
+
 // Tombstones remembers AP object ids whose Delete arrived before (or
 // without) a materialization — the create-after-delete gap: a Create
 // delivered after its Delete must not resurrect content the origin removed.
@@ -285,4 +708,176 @@ type Tombstones interface {
 	// TOMBSTONE_RETENTION's default (30 days) is orders of magnitude above
 	// any observed redelivery horizon.
 	Prune(ctx context.Context, cutoff time.Time) (int64, error)
+}
+
+// OutboundActivities persists the canonical, immutable wire payloads outbound
+// deliveries fan out from (task 15, decision 15). One activity id maps to one
+// payload byte-string that GET /ap/activity/{hash} serves and a redelivery
+// re-sends verbatim; a peer dedupes on the stable id. The payload never
+// changes once written — an edit is a NEW activity, not a rewrite.
+type OutboundActivities interface {
+	// Insert idempotently writes one activity. It returns inserted=true when a
+	// new row was written and inserted=false (no error) when the activity id
+	// already existed: the ON CONFLICT DO NOTHING is deliberate — the payload
+	// of an activity a peer may already hold must never be overwritten.
+	Insert(ctx context.Context, activity OutboundActivity) (inserted bool, err error)
+
+	// InsertTx is Insert on an existing transaction — the seam the enqueuer
+	// uses so the activity, its deliveries and the rev-gate advance land in ONE
+	// commit (an enqueue whose gate tx rolls back must leave no activity or
+	// delivery row). A nil tx is an error satisfying errors.IsValidation.
+	InsertTx(ctx context.Context, tx *sql.Tx, activity OutboundActivity) (inserted bool, err error)
+
+	// Get returns the canonical activity for an id. A miss is an error
+	// satisfying errors.IsNotFound.
+	Get(ctx context.Context, activityID string) (*OutboundActivity, error)
+}
+
+// OutboundDeliveries is the per-inbox delivery queue (task 15). It generalizes
+// the inbox_events fenced work queue: claimed_until fencing, per-ordering-key
+// serialization via a loose index scan, SKIP LOCKED concurrency. The ordering
+// key is the community AP id, so all deliveries bound for one community form a
+// single serial line.
+type OutboundDeliveries interface {
+	// Enqueue writes one pending delivery keyed on (ActivityID, TargetInbox)
+	// and returns the stored row. A duplicate (activity, inbox) is an error
+	// satisfying errors.IsAlreadyExists.
+	Enqueue(ctx context.Context, delivery OutboundDelivery) (*OutboundDelivery, error)
+
+	// EnqueueTx is Enqueue on an existing transaction — rides the enqueuer's
+	// gate tx — and is IDEMPOTENT where Enqueue refuses: a duplicate (activity,
+	// inbox) returns the STANDING row instead of an error.
+	//
+	// Both halves of that are load-bearing. A unique violation inside a caller's
+	// transaction aborts the whole transaction, so the rev-gate advance riding it
+	// dies too and the event replays forever. And a duplicate is not a caller
+	// bug here: ONE activity fans out to MANY inboxes, so a redelivery re-visits
+	// pairs that already exist while others still need writing. Returning the
+	// standing row (never resetting it) is what keeps a delivered, cancelled or
+	// poisoned delivery from being revived by a replay.
+	//
+	// A nil tx is an error satisfying errors.IsValidation.
+	EnqueueTx(ctx context.Context, tx *sql.Tx, delivery OutboundDelivery) (*OutboundDelivery, error)
+
+	// ClaimNext atomically claims the oldest processable delivery and
+	// increments its attempt counter. A delivery is processable when it is
+	// pending, past its next_attempt_at, unleased (or the lease expired), and —
+	// the per-community ordering guarantee — is the head (min Seq) of its
+	// ordering key among pending rows: a younger delivery on a key is invisible
+	// while an older PENDING sibling exists, and a delivered/poisoned/cancelled
+	// sibling stops blocking. An empty queue returns an error satisfying
+	// errors.IsNotFound.
+	//
+	// The returned delivery's ClaimedUntil is the fencing/claim token: the
+	// Mark*/Release methods require it so a worker whose lease expired and was
+	// re-claimed by another cannot clobber the newer attempt's outcome.
+	ClaimNext(ctx context.Context, lease time.Duration) (*OutboundDelivery, error)
+
+	// MarkDelivered stamps the delivery delivered (delivered_at set, lease
+	// cleared), recording lastStatusCode. claimToken must equal the claim's
+	// ClaimedUntil. It returns exists=false for a missing (activity, inbox);
+	// applied=false (no error) when the claim was stale or the row already
+	// terminal, so the outcome was discarded without a clobber.
+	MarkDelivered(ctx context.Context, activityID, targetInbox string, lastStatusCode int, claimToken time.Time) (exists, applied bool, err error)
+
+	// Release records a transient failure and schedules the retry (error class,
+	// status and excerpt stored, lease cleared, next_attempt_at set), leaving
+	// the delivery pending. claimToken must equal the claim's ClaimedUntil.
+	// Same (exists, applied) split as MarkDelivered.
+	Release(ctx context.Context, activityID, targetInbox, errorClass, excerpt string, lastStatusCode int, nextAttempt, claimToken time.Time) (exists, applied bool, err error)
+
+	// ReleaseParked is Release for a delivery that was HELD, not tried: an
+	// operator kill switch, dry-run, or a causal wait. It is identical in every
+	// respect but one — it is ATTEMPT-NEUTRAL, handing back the single increment
+	// its own claim took (ClaimNext does attempts = attempts + 1), so a hold
+	// costs the delivery none of the retry budget it will need when the hold
+	// lifts. Real failures still spend it; only park claims are given back.
+	//
+	// Same fence and non-terminal guard as Release (state = 'pending' AND
+	// claimed_until = claimToken), which is what stops a stale park from
+	// un-counting a newer claim's attempt. Same (exists, applied) split.
+	ReleaseParked(ctx context.Context, activityID, targetInbox, errorClass, excerpt string, lastStatusCode int, nextAttempt, claimToken time.Time) (exists, applied bool, err error)
+
+	// MarkPoisoned permanently fails the delivery (state=poisoned, lease
+	// cleared, error class/status/excerpt stored). Poisoned rows are skipped by
+	// ClaimNext and stop blocking their ordering key. claimToken must equal the
+	// claim's ClaimedUntil. Same (exists, applied) split.
+	MarkPoisoned(ctx context.Context, activityID, targetInbox, errorClass, excerpt string, lastStatusCode int, claimToken time.Time) (exists, applied bool, err error)
+
+	// CancelForActor moves every PENDING delivery of the actor's activities to
+	// cancelled (the consent/kill-switch withdrawal — a disabled or paused
+	// actor's create/update work is parked, never poisoned). Terminal
+	// deliveries are untouched. Returns how many rows were cancelled.
+	//
+	// It is scoped to the ACTOR across every community they have work in,
+	// because that is the scope of the decision: an opt-out cancelled per
+	// community would leave the user federating everywhere else they ever
+	// posted. (A community BAN is the other shape and has its own statement.)
+	CancelForActor(ctx context.Context, actorDID string) (int64, error)
+
+	// CancelForActorTx is CancelForActor on an existing transaction. A nil tx is
+	// an error satisfying errors.IsValidation.
+	CancelForActorTx(ctx context.Context, tx *sql.Tx, actorDID string) (int64, error)
+
+	// CancelOutwardForActorTx is the CONSENT withdrawal, and the one an opt-out
+	// uses: it cancels everything that PUBLISHES for the actor and leaves their
+	// RETRACTIONS (Delete, Undo — see RetractionKinds) to go out.
+	//
+	// A user who deletes a post and then opts out must still have that delete
+	// delivered, or it stands on the peer forever; and the destructive tier's own
+	// Delete{Person} is a retraction too, so a sweeping cancel on a replay would
+	// silently cancel the erasure a previous attempt already committed. The
+	// worker draws the identical line at claim time — one list, so the two
+	// cannot disagree about what a stopped user is still owed.
+	//
+	// A nil tx is an error satisfying errors.IsValidation.
+	CancelOutwardForActorTx(ctx context.Context, tx *sql.Tx, actorDID string) (int64, error)
+
+	// CancelForCommunity moves every PENDING delivery on an ordering key (a
+	// community AP id) to cancelled — a community deleted or unfollowed out
+	// from under pending work. Returns how many rows were cancelled.
+	CancelForCommunity(ctx context.Context, orderingKey string) (int64, error)
+
+	// Get returns the delivery for an (activity, inbox) pair. A miss is an
+	// error satisfying errors.IsNotFound.
+	Get(ctx context.Context, activityID, targetInbox string) (*OutboundDelivery, error)
+
+	// DistinctInboxesForActor lists every inbox this actor's content has been
+	// delivered to, one row per inbox, each carrying an ordering key from the
+	// history. It is the address book the destructive tier fans a Delete{Person}
+	// out over — the delivery history is the only record of which instances hold
+	// a user's content — and it is deliberately blind to delivery STATE (see the
+	// implementation for why, and for the instances it cannot reach).
+	DistinctInboxesForActor(ctx context.Context, actorDID string) ([]DeliveryTarget, error)
+
+	// ParentDeliveryDisposition reports what has become of the deliveries of the
+	// child's ACTUAL parent (the activities that federated parentATURI as their
+	// object, to the same inbox) — the causal signal task 15's worker reads to
+	// decide a child whose bridge-origin parent will NEVER land, as distinct
+	// from one merely waiting for a pending parent (parent_unaccepted).
+	//
+	// Keyed on the parent's object id, NOT on seq-ancestry, so an unrelated
+	// poisoned row on the same serial line does not poison the child. Poisoned
+	// is reported if ANY delivery poisoned; cancelled only if EVERY delivery was
+	// cancelled and there is at least one, so a pending sibling keeps the parent
+	// open and a parent with no deliveries at all (fediverse-origin) never reads
+	// as decided against.
+	ParentDeliveryDisposition(ctx context.Context, parentATURI, targetInbox string) (ParentDeliveryDisposition, error)
+
+	// CancelClaimed cancels a SINGLE claimed delivery under its fencing token
+	// (the consent-block outcome for one create/update), leaving the actor's
+	// other pending work — its Delete/Undo retractions above all — untouched.
+	// Same (exists, applied) fencing contract as MarkDelivered.
+	CancelClaimed(ctx context.Context, activityID, targetInbox string, claimToken time.Time) (exists, applied bool, err error)
+
+	// CountsByState returns the number of deliveries in each state — the
+	// operator queue-inspect (GET /admin/outbound).
+	CountsByState(ctx context.Context) (map[DeliveryState]int, error)
+
+	// RedrivePoisoned resets poisoned deliveries back to pending for
+	// redelivery, clearing the lease and rescheduling now. activityID and
+	// orderingKey are optional filters (empty = no filter on that column); the
+	// attempt counter is reset so a redriven delivery gets a fresh budget.
+	// Returns how many rows were redriven.
+	RedrivePoisoned(ctx context.Context, activityID, orderingKey string) (int64, error)
 }

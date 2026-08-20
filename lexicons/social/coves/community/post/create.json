@@ -9,7 +9,9 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["community"],
+          "required": [
+            "community"
+          ],
           "properties": {
             "community": {
               "type": "string",
@@ -67,7 +69,7 @@
               "maxLength": 8,
               "items": {
                 "type": "string",
-                "maxLength": 64,
+                "maxLength": 640,
                 "maxGraphemes": 64
               }
             }
@@ -78,7 +80,10 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["uri", "cid"],
+          "required": [
+            "uri",
+            "cid"
+          ],
           "properties": {
             "uri": {
               "type": "string",
@@ -89,6 +94,11 @@
               "type": "string",
               "format": "cid",
               "description": "CID of the created post"
+            },
+            "status": {
+              "type": "string",
+              "knownValues": ["accepted", "pending"],
+              "description": "The community's decision as of this response. 'accepted' means this host runs the community's admission and a community acceptance now stands for the post; 'pending' means no acceptance covers it yet - either the community is hosted elsewhere and decides for itself, or the synchronous acceptance failed and will be retried. Pending is a SUCCESS, not an error: the post exists in its author's repository either way. Optional, so a client predating the field decodes an unchanged response. knownValues rather than an enum because the vocabulary may grow, and a closed enum would make adding a status a breaking change for every generated client in the network."
             }
           }
         }

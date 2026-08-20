@@ -110,3 +110,70 @@ func TestReemitRepo(t *testing.T) {
 		assert.NotEmpty(t, res.Error)
 	})
 }
+
+// putIndex finds where a record's re-create landed in the call sequence.
+func putIndex(t *testing.T, calls []string, did, collection, rkey string) int {
+	t.Helper()
+	want := fmt.Sprintf("put %s %s/%s", did, collection, rkey)
+	for i, call := range calls {
+		if call == want {
+			return i
+		}
+	}
+	t.Fatalf("no re-emit of %s/%s in %v", collection, rkey, calls)
+	return -1
+}
+
+// TestReemitRepoOrdersBothPostEras pins the re-emit ordering across the two
+// post eras and the community-side moderation records.
+//
+// The rank exists so an indexer never sees a record before the thing it
+// references. postv2 falling into the default bucket puts an author's
+// comments ahead of the root posts they reply to — the exact dangling-
+// reference the ordering was written to prevent, reintroduced by the flip
+// because the rank matched on the deprecated collection name only.
+//
+// Acceptance and removal rank AFTER content: reemitRepo iterates the repo's
+// RECORDS (ListRecords), not ap_objects mappings, so these are re-emitted
+// like anything else — and each strongRef-pins a post, so they must not
+// precede one. (Their subject lives in the AUTHOR's repo while they live in
+// the COMMUNITY's, and cross-repo order is relay-dependent regardless; this
+// is the within-repo half the bridge can actually control.)
+func TestReemitRepoOrdersBothPostEras(t *testing.T) {
+	const did = "did:plc:community"
+	// Deliberately adversarial input order: every record before the one it
+	// should follow.
+	f := &fakeReemitter{records: map[string][]repo.RecordEntry{
+		did: {
+			entry("social.coves.community.acceptance", "a1"),
+			entry("social.coves.community.comment", "c1"),
+			entry("social.coves.community.postv2", "p2"),
+			entry("social.coves.community.removal", "r1"),
+			entry("social.coves.community.post", "p1"),
+			entry("social.coves.community.profile", "self"),
+		},
+	}}
+
+	res := reemitRepo(t.Context(), f, did, slog.Default())
+	require.Empty(t, res.Error)
+	require.Equal(t, 6, res.Reemited)
+
+	profile := putIndex(t, f.calls, did, "social.coves.community.profile", "self")
+	legacyPost := putIndex(t, f.calls, did, "social.coves.community.post", "p1")
+	postV2 := putIndex(t, f.calls, did, "social.coves.community.postv2", "p2")
+	comment := putIndex(t, f.calls, did, "social.coves.community.comment", "c1")
+	acceptance := putIndex(t, f.calls, did, "social.coves.community.acceptance", "a1")
+	removal := putIndex(t, f.calls, did, "social.coves.community.removal", "r1")
+
+	assert.Less(t, postV2, comment,
+		"a postv2 must be re-emitted BEFORE comments, exactly as a legacy post is: a comment "+
+			"reply.root-pins its post, and an indexer that sees the comment first has a dangling ref")
+	assert.Less(t, profile, postV2, "profiles still precede content of either era")
+	assert.Less(t, profile, legacyPost)
+	assert.Less(t, comment, acceptance,
+		"acceptance records strongRef a post and must follow all content")
+	assert.Less(t, comment, removal,
+		"removal records strongRef a post and must follow all content")
+	assert.Less(t, postV2, acceptance)
+	assert.Less(t, postV2, removal)
+}

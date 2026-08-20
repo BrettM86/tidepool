@@ -8,13 +8,15 @@
       "key": "literal:self",
       "record": {
         "type": "object",
-        "required": ["name", "createdAt", "createdBy", "hostedBy"],
+        "required": [
+          "name",
+          "createdAt"
+        ],
         "properties": {
           "name": {
             "type": "string",
-            "maxLength": 64,
-            "maxGraphemes": 64,
-            "description": "Short community name (local part of handle)"
+            "maxLength": 63,
+            "description": "Short community name (local part of handle). Must be a valid DNS label: ASCII letters, digits, and hyphens only."
           },
           "displayName": {
             "type": "string",
@@ -38,12 +40,20 @@
           },
           "avatar": {
             "type": "blob",
-            "accept": ["image/png", "image/jpeg", "image/webp"],
+            "accept": [
+              "image/png",
+              "image/jpeg",
+              "image/webp"
+            ],
             "maxSize": 1000000
           },
           "banner": {
             "type": "blob",
-            "accept": ["image/png", "image/jpeg", "image/webp"],
+            "accept": [
+              "image/png",
+              "image/jpeg",
+              "image/webp"
+            ],
             "maxSize": 2000000
           },
           "createdBy": {
@@ -58,14 +68,21 @@
           },
           "visibility": {
             "type": "string",
-            "knownValues": ["public", "unlisted", "private"],
+            "knownValues": [
+              "public",
+              "unlisted",
+              "private"
+            ],
             "default": "public",
             "maxLength": 64,
             "description": "Community visibility level"
           },
           "moderationType": {
             "type": "string",
-            "knownValues": ["moderator", "sortition"],
+            "knownValues": [
+              "moderator",
+              "sortition"
+            ],
             "default": "moderator",
             "maxLength": 64,
             "description": "Type of moderation system (moderator=traditional moderator team, sortition=community tribunal)"
@@ -75,7 +92,11 @@
             "description": "Required content warnings for this community",
             "items": {
               "type": "string",
-              "knownValues": ["nsfw", "violence", "spoilers"],
+              "knownValues": [
+                "nsfw",
+                "violence",
+                "spoilers"
+              ],
               "maxLength": 32
             }
           },

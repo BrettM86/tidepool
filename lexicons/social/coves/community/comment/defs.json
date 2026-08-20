@@ -5,7 +5,16 @@
     "commentView": {
       "type": "object",
       "description": "Base view for a single comment with voting, stats, and viewer state",
-      "required": ["uri", "cid", "author", "record", "post", "createdAt", "indexedAt", "stats"],
+      "required": [
+        "uri",
+        "cid",
+        "author",
+        "record",
+        "post",
+        "createdAt",
+        "indexedAt",
+        "stats"
+      ],
       "properties": {
         "uri": {
           "type": "string",
@@ -19,7 +28,7 @@
         },
         "author": {
           "type": "ref",
-          "ref": "social.coves.community.post.get#authorView",
+          "ref": "social.coves.community.post.defs#authorView",
           "description": "Comment author information"
         },
         "record": {
@@ -38,9 +47,11 @@
         },
         "embed": {
           "type": "union",
-          "description": "Embedded content in the comment (images or quoted post)",
+          "description": "Embedded content from the comment record (images or quoted post). The AppView transforms blob references into fetchable image URLs and enriches quoted posts with a resolved view, so a served embed carries a #view type.",
           "refs": [
+            "social.coves.embed.images",
             "social.coves.embed.images#view",
+            "social.coves.embed.post",
             "social.coves.embed.post#view"
           ]
         },
@@ -69,7 +80,9 @@
     "threadViewComment": {
       "type": "object",
       "description": "Wrapper for threaded comment structure, similar to Bluesky's threadViewPost pattern",
-      "required": ["comment"],
+      "required": [
+        "comment"
+      ],
       "properties": {
         "comment": {
           "type": "ref",
@@ -81,7 +94,11 @@
           "description": "Nested replies to this comment",
           "items": {
             "type": "union",
-            "refs": ["#threadViewComment", "#notFoundComment", "#blockedComment"]
+            "refs": [
+              "#threadViewComment",
+              "#notFoundComment",
+              "#blockedComment"
+            ]
           }
         },
         "hasMore": {
@@ -93,7 +110,10 @@
     "commentRef": {
       "type": "object",
       "description": "Reference to a comment record",
-      "required": ["uri", "cid"],
+      "required": [
+        "uri",
+        "cid"
+      ],
       "properties": {
         "uri": {
           "type": "string",
@@ -110,7 +130,10 @@
     "postRef": {
       "type": "object",
       "description": "Reference to a post record",
-      "required": ["uri", "cid"],
+      "required": [
+        "uri",
+        "cid"
+      ],
       "properties": {
         "uri": {
           "type": "string",
@@ -127,7 +150,10 @@
     "notFoundComment": {
       "type": "object",
       "description": "Comment was not found (deleted, never indexed, or invalid URI)",
-      "required": ["uri", "notFound"],
+      "required": [
+        "uri",
+        "notFound"
+      ],
       "properties": {
         "uri": {
           "type": "string",
@@ -144,7 +170,10 @@
     "blockedComment": {
       "type": "object",
       "description": "Comment is blocked due to viewer blocking author or moderation action",
-      "required": ["uri", "blocked"],
+      "required": [
+        "uri",
+        "blocked"
+      ],
       "properties": {
         "uri": {
           "type": "string",
@@ -158,15 +187,24 @@
         },
         "blockedBy": {
           "type": "string",
-          "knownValues": ["author", "moderator"],
-          "description": "What caused the block: viewer blocked author, or comment was removed by moderators"
+          "knownValues": [
+            "author",
+            "moderator"
+          ],
+          "description": "What caused the block: viewer blocked author, or comment was removed by moderators",
+          "maxLength": 64
         }
       }
     },
     "commentStats": {
       "type": "object",
       "description": "Statistics for a comment",
-      "required": ["upvotes", "downvotes", "score", "replyCount"],
+      "required": [
+        "upvotes",
+        "downvotes",
+        "score",
+        "replyCount"
+      ],
       "properties": {
         "upvotes": {
           "type": "integer",
@@ -195,8 +233,12 @@
       "properties": {
         "vote": {
           "type": "string",
-          "knownValues": ["up", "down"],
-          "description": "Viewer's vote on this comment"
+          "knownValues": [
+            "up",
+            "down"
+          ],
+          "description": "Viewer's vote on this comment",
+          "maxLength": 64
         },
         "voteUri": {
           "type": "string",

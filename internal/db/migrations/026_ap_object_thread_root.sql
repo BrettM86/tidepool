@@ -1,0 +1,38 @@
+-- +goose Up
+-- Task 17c-2 cycle 2: which THREAD a materialized comment hangs in.
+--
+-- A community locks a THREAD, and it can lock a Lemmy post exactly as it locks
+-- a native one. But the bridge holds no outbound state for fediverse content,
+-- and "no outbound state" is read as "the top of the thread" everywhere else
+-- (the same boundary recordedState draws for depth) — so a native reply to a
+-- LEMMY COMMENT resolved its thread to that comment, and the lock recorded on
+-- the post above it never reached the reply. Lemmy threads are mostly Lemmy
+-- comments, so that is the ordinary shape, not the corner: reply under any
+-- existing comment in a closed thread and the bridge federates something Lemmy
+-- rejects server-side.
+--
+-- The answer already exists at materialization time and nowhere else afterwards.
+-- resolveReplyRefs computes each comment's reply.root as it commits the record
+-- (one parent-record read, paid once per comment); recovering it later would
+-- mean re-reading that record on the hot path of every native reply. So it is
+-- recorded here, on the mapping every reader already holds — the same treatment,
+-- for the same reason, as community_did in migration 016.
+--
+-- NOT moderation state, and deliberately not on object_moderation: this is
+-- thread STRUCTURE, immutable for the life of the record, and re-supplied by the
+-- materializer on every re-put — so unlike a lock it cannot be lost to a repin.
+-- putMapping still COALESCEs it, because a write path that simply omits the
+-- field must not blank a good one.
+--
+-- Nullable, and NOT backfilled: a comment's root lives in its record's reply.root
+-- (or, for a legacy row, in the thread above it), where no UPDATE can reach. Rows
+-- written before this migration read as NULL, and the reader treats that exactly
+-- as it did before this column existed — the reply resolves to its own parent as
+-- the top of the thread. Those rows heal when the comment is next materialized.
+--
+-- No index: every reader arrives holding the mapping it already fetched by ap_id
+-- or at_uri and reads this column in memory. Nothing queries BY it.
+ALTER TABLE ap_objects ADD COLUMN thread_root_at_uri TEXT;
+
+-- +goose Down
+ALTER TABLE ap_objects DROP COLUMN IF EXISTS thread_root_at_uri;

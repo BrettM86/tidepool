@@ -14,11 +14,18 @@ import (
 
 type postgresCommunities struct {
 	db *sql.DB
+	// The ban repository is EMBEDDED, and only so that a holder of the concrete
+	// communities store can be type-asserted to store.CommunityBans (see
+	// ingest.NewHandler and accept.NewEngine, which both already hold one). It
+	// is deliberately NOT part of the Communities interface: a ban is a
+	// different table with a different key, and the follow-state readers that
+	// hold Communities have no business writing exclusions.
+	postgresCommunityBans
 }
 
 // NewCommunities creates the postgres-backed communities repository.
 func NewCommunities(db *sql.DB) Communities {
-	return &postgresCommunities{db: db}
+	return &postgresCommunities{db: db, postgresCommunityBans: postgresCommunityBans{db: db}}
 }
 
 const communityColumns = `

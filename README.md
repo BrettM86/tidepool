@@ -87,8 +87,8 @@ your directory is on a different port.
 The end-to-end harness runs the whole read path against **real
 infrastructure** — a real Lemmy federating with the bridge, a real did:plc
 directory backing DID minting, a real atproto relay (indigo **BigSky**)
-crawling the bridge, and a real Jetstream decoding the **relay's** firehose
-— in one compose network:
+crawling the bridge, a real reference PDS hosting a native account, and a
+real Jetstream decoding the **relay's** firehose — in one compose network:
 
 ```
                         docker-compose.e2e.yml
@@ -103,9 +103,13 @@ crawling the bridge, and a real Jetstream decoding the **relay's** firehose
  │                              ┌─────────────▼──┐           │ │request  │
  │                              │ plc (did:plc   │◀────┐     │ │Crawl    │
  │                              │ + plc-postgres)│     │  ┌──▼─┴───────┐ │
- │                              └────────────────┘ DID │  │ relay      │ │
- │                                          resolution └──│ (BigSky)   │ │
- │                                                        │ + postgres │ │
+ │                              └──┬─────────────┘ DID │  │ relay      │ │
+ │                                 ▲        resolution └──│ (BigSky)   │ │
+ │                                 │                      │ + postgres │ │
+ │                              ┌──┴─────────────┐        │ + the      │ │
+ │                              │ pds (reference │  CBOR  │ reference  │ │
+ │                              │  @atproto/pds) ├───────▶│ pds, in    │ │
+ │                              └────────────────┘ frames │ this netns │ │
  │                                                        └──────┬─────┘ │
  │                                                    CBOR frames│       │
  │                                                       ┌───────▼─────┐ │
@@ -114,7 +118,7 @@ crawling the bridge, and a real Jetstream decoding the **relay's** firehose
  │                                                       └───────┬─────┘ │
  └───────────────────────────────────────────────────────────────┼───────┘
       host (127.0.0.1 only): tidepool :8092, lemmy :8541,        │
-                             relay :2480, jetstream :6028 ◀──────┘
+                  relay :2480, pds :3081, jetstream :6028 ◀──────┘
                     tests/e2e (go test -tags e2e)
 ```
 
@@ -130,22 +134,52 @@ relay's new-PDS-per-day limit is 0 (refuses all non-admin `requestCrawl`),
 so a one-shot `relay-bootstrap` service raises the limit over the admin API
 before the bridge starts — the announcement itself is still
 bridge-originated, and the suite asserts it landed (`relay_test.go`).
-Bridged handles verify for real too: `HANDLE_RESOLVER_HOSTS=tidepool`
-points bigsky's trial-host resolver at the bridge's Host-header-keyed
-`/.well-known/atproto-did` (compose-DNS-invisible names like
-`alice.lemmy.tidepool` would otherwise fail handle verification, which
-bigsky treats as non-fatal). For debugging, a direct bridge→Jetstream tap
+Bridged handles verify for real too:
+`HANDLE_RESOLVER_HOSTS=tidepool,localhost:3001` points bigsky's trial-host
+resolver at the bridge's Host-header-keyed `/.well-known/atproto-did`, and
+at the reference PDS's (below) for its own handles (compose-DNS-invisible
+names like `alice.lemmy.tidepool` would otherwise fail handle verification,
+which bigsky treats as non-fatal). For debugging, a direct bridge→Jetstream tap
 exists behind the `direct` compose profile (`jetstream-direct`, host port
 6038) — it is not the tested path.
 
+The relay also crawls a **reference PDS** — `ghcr.io/bluesky-social/pds`,
+pinned by digest — hosting a native account (`native-alice.pds.test`) whose
+DID is minted in the same local PLC. It is there because every other repo on
+this firehose is the bridge's: our commits, read back by our own
+understanding of the spec at both ends, so a misreading shared by the writer
+and the reader is invisible and the suite goes green on the agreement. A
+repo host we did not write cannot share it. The `pds` container runs in the
+**relay's network namespace** (`network_mode: "service:relay"`), which is
+not a convenience: `@atproto/pds` derives its public URL from
+`PDS_HOSTNAME`, special-casing `localhost` to `http://localhost:$PDS_PORT`
+and turning every other hostname into `https://`, which this plain-HTTP
+harness cannot serve — and bigsky peers a PDS by the host in its DID
+*documents*, calling `describeServer` at that url from inside its own
+namespace. Sharing the namespace is what makes `http://localhost:3001` true
+for both. Consequences: the PDS's host port is published on the `relay`
+service (a container-network-mode service cannot publish its own), and it is
+3081 rather than 3001 because the Coves dev stack already owns 3001. A
+one-shot `pds-bootstrap` creates the account over the plain public
+`createAccount` (no admin API — the PDS runs with invites off), treats an
+already-taken handle as success, gates on `createSession` returning 200, and
+then `requestCrawl`s `localhost:3001` at the relay.
+
 One ordering consequence worth knowing: bigsky indexes its inbound firehose
 with a parallel scheduler keyed by repo DID, so **per-repo event order
-survives the relay but cross-repo order does not** — an author's
-`actor.profile` (author repo) and their post (community repo) may swap on
-the relay's output, and any AppView consuming through relay infrastructure
-must tolerate that (see FOLLOWUPS.md).
+survives the relay but cross-repo order does not**. Since the author-owned
+flip a post is a `community.postv2` in the AUTHOR's repo plus a
+`community.acceptance` in the COMMUNITY's — two repos, so those two events
+may arrive in either order, and an AppView can see the acceptance for a post
+it has not indexed yet (or the post before anything makes it visible in the
+community). The same applies to an author's `actor.profile` and their
+content. Any AppView consuming through relay infrastructure must tolerate it
+(see FOLLOWUPS.md). Pre-flip `community.post` records are the exception that
+proves the rule: they sat in the community's repo with no separate
+attestation, so there was no cross-repo pair to reorder — those records still
+exist and are not migrated.
 
-The host ports bind **loopback-only** (`127.0.0.1:8092/8541/2480/6028`):
+The host ports bind **loopback-only** (`127.0.0.1:8092/8541/2480/3081/6028`):
 the stack carries admin tokens and runs with `ALLOW_PRIVATE_FETCH=1`, so it
 must not be reachable from the local network.
 
@@ -169,8 +203,9 @@ plain-HTTP AP ids to match. See the header comments in
 `docker-compose.e2e.yml` and `e2e/lemmy/Dockerfile` for the full story.
 
 The suite (`tests/e2e/`, build tag `e2e`: `bridge_test.go`,
-`lifecycle_test.go`, `media_test.go`, `relay_test.go`,
-`votes_hammer_test.go`, `zz_sweep_test.go`)
+`lifecycle_test.go`, `media_test.go`, `moderation_test.go`,
+`native_pds_test.go`, `relay_test.go`, `votes_hammer_test.go`,
+`zz_sweep_test.go`)
 covers: subscribe → `community.profile` on the firehose; a link post →
 `actor.profile` and `community.post` (presence + author linkage; arrival
 order across the two repos is relay-dependent, see above), with the shared
@@ -220,11 +255,25 @@ sentinel alone. Every negative
 assertion ("nothing bridged") is bounded by a positive control in the same
 window — never a bare sleep-and-assert-nothing.
 
+Task 18 adds the **native-PDS smoke scenario** (`native_pds_test.go`): the
+suite authenticates as the bootstrap account on the reference PDS, writes
+one `community.postv2` into that account's own repo, and follows it through
+the relay to Jetstream and into the relay's own `getLatestCommit` state.
+Deliberately a smoke test, not a feature test — what it buys is the wire,
+not the record. Note before extending it: `vetEvent`'s `expectedCollections`
+allowlist knows nothing about which repo a record came from, so it fails
+**closed** on a collection outside the list (a vote record in the native repo
+fails its own test and the `zz_sweep` replay) and **open** on one inside it
+(an `actor.profile` in the native repo passes silently, indistinguishable
+from the bridge writing its own). That second half is why the allowlist wants
+rescoping by repo class — task 18's sweep item, see FOLLOWUPS.md.
+
 Every
 create/update the tests consume from Jetstream has passed the relay's
 signature verification AND is validated against the vendored Coves lexicons
-on the consumer side of the wire, and any collection outside the four the
-bridge emits fails the suite immediately (votes must never become records). Two scripts keep the vendored
+on the consumer side of the wire, and any collection outside the
+`expectedCollections` allowlist fails the suite immediately, in any repo
+(votes must never become records). Two scripts keep the vendored
 lexicons honest: `scripts/sync-lexicons.sh` copies them from a Coves
 checkout; `scripts/check-lexicons.sh` verifies the committed manifest and
 byte-compares against the current Coves checkout. CI clones the canonical Coves
@@ -235,25 +284,42 @@ relays, or public Lemmy instances.
 
 ## Configuration
 
-Environment variables with logged dev defaults (see
-`internal/config/config.go`); everything below is **required in
-production**:
+All configuration is environment variables, read **once at process start**
+(`config.Load`) — there is no reload signal, so changing any value below means
+recreating the container.
+
+Two classes, and the difference matters at boot:
+
+- **Required in production** — `DATABASE_URL`, `LISTEN_ADDR`,
+  `BRIDGE_HOSTNAME`, `PLC_DIRECTORY_URL`, `BRIDGE_KEK`, `ADMIN_TOKEN`,
+  `AP_USER_ORIGIN`. These have *dev defaults only*; unset with
+  `ENVIRONMENT=production` the process refuses to start (`config: <NAME> is
+  required in production`). Fail-closed on purpose: every one of them is baked
+  into identities or authority, where a defaulted guess is worse than no boot.
+- **Tuning knobs** — everything else. Real defaults in every environment,
+  logged when applied.
 
 | Variable | Dev default | Meaning |
 |---|---|---|
+| `ENVIRONMENT` | `development` | `development` or `production`; any other value is refused at boot. Development enables migrations-on-start, dev defaults, and strict lexicon validation. Production additionally *refuses* `BRIDGE_SCHEME=http`, `ALLOW_PRIVATE_FETCH`, `ALLOW_DEV_REQUEST_CRAWL`, and `AP_HOST_FALLTHROUGH_DEV` |
 | `DATABASE_URL` | local dev postgres | bridge state |
 | `LISTEN_ADDR` | `:8091` | HTTP bind address |
 | `BRIDGE_HOSTNAME` | `localhost` | public domain of the bridge; anchors handles and the PDS endpoint in minted DID docs |
 | `BRIDGE_SCHEME` | `https` | scheme of the bridge's own AP URLs (actor id, inbox, activity ids). `http` is dev-only — the e2e harness federates with a debug-mode Lemmy over plain HTTP |
 | `PLC_DIRECTORY_URL` | `http://localhost:3002` (local, `make plc-up`) | did:plc directory; production uses `https://plc.directory` |
 | `BRIDGE_KEK` | fixed public dev key | 32-byte key-encryption key (64 hex chars or base64) sealing per-actor signing keys and the escrow rotation key at rest (AES-256-GCM) |
+| `BRIDGE_KEK_PREVIOUS` | *(unset)* | the KEK being rotated away from, same encodings. Set only during a rotation: sealed material opens under either key while it is set, nothing new is sealed under it, and `tidepool rotate-kek` moves every blob onto `BRIDGE_KEK` so it can be unset again (runbook: `DEPLOY.md` §6) |
 | `BRIDGE_SERVICE_DID` | *(optional)* | pre-provisioned service DID for the bridge's own actor |
 | `USER_AGENT` | derived | outbound HTTP user agent |
 | `ALLOW_PRIVATE_FETCH` | off | dev-only: disables the SSRF egress guard (AP fetches **and** PLC directory requests) so localhost targets work |
 | `FIREHOSE_RETENTION` | `72h` | how long `firehose_events` rows are kept for `subscribeRepos` cursor replay (Go duration; a background pruner trims older events hourly) |
+| `MAX_BLOB_BYTES` | `5242880` (5 MiB) | outer transport budget for remote media (avatars, banners, post images) the materializer downloads per blob. Individual lexicon slots impose tighter caps (avatars 1 MB); this is the ceiling over all of them. Fails closed — oversized media is dropped, never truncated |
+| `PROFILE_REFRESH_TTL` | `24h` | how stale a bridged actor's materialized profile may get before the materializer re-fetches it. `Update{Person\|Group}` refreshes immediately regardless — this covers what Lemmy never federates (bio edits, and so the `#nobridge` marker) |
 | `RELAY_HOSTS` | *(optional)* | comma-separated relays to send `com.atproto.sync.requestCrawl` to on startup (each retried on a bounded budget — the relay calls back into `describeServer` before subscribing, which can race process start); in development the request is logged, never sent, unless `ALLOW_DEV_REQUEST_CRAWL` opts in |
 | `ALLOW_DEV_REQUEST_CRAWL` | off | dev-only: actually SEND `requestCrawl` to `RELAY_HOSTS` in development (exists for the e2e stack's local BigSky); refused in production, where sending is already the behavior |
 | `ADMIN_TOKEN` | `dev-admin-token` | bearer token protecting the `/admin` API |
+| `AP_USER_ORIGIN` | `http://localhost:8091` | origin the Coves users' ActivityPub actors live under (e.g. `https://coves.social`). Baked into every `actor_id` minted under it, so serving derives URLs from the stored row and never from this value; its host must not be `BRIDGE_HOSTNAME` or a subdomain of it, which would shadow the bridged handle namespace (refused at startup) |
+| `AP_HOST_FALLTHROUGH_DEV` | **on** in development | route unknown `Host`s to the bridge surface instead of refusing them with 421. The one dev flag that defaults ON — a laptop is reached by IP or tunnel hostname — and the only posture in production is off: setting it there is refused |
 | `BACKFILL_MAX_POSTS` | `100` | posts materialized per community backfill run |
 | `MINT_RATE_PER_MINUTE` / `MINT_BURST` | `60` / `120` | rate gate on inbound DID minting (PLC registrations are forever; unseen authors in delivered content trigger mints) |
 | `INGEST_WORKERS` | `4` | inbox queue worker-pool size |
@@ -271,11 +337,51 @@ production**:
 | `SYNC_MAX_SUBSCRIBERS` | `100` | concurrent `subscribeRepos` connection cap |
 | `FOLLOW_LIST_PATH` | *(optional)* | declarative follow list (see below); unset = the `/admin` API is the only subscription control |
 | `FOLLOW_LIST_INTERVAL` | `15m` | follow-list reconciler sweep cadence |
+| `DIVERGENCE_INTERVAL` | `15m` | cadence of the reconciliation sweep (task 17e) that compares atproto state against outbound state and publishes the `tidepool_divergence_*` gauges. **Not an on/off switch:** the sweep is wired unconditionally, runs once at startup before its first tick, and `0` is refused — it is read-only (it reports, never repairs), which is what makes an always-on schedule safe. `GET /admin/divergence` runs one on demand |
+| `DIVERGENCE_ACCEPTANCE_STALE_AFTER` | `12h` | how long a pending delivery may sit before the sweep reports its acceptance as **stale**. The report's one crying-wolf knob — shorter and every in-flight post is a finding, longer and a queue that stopped this morning is not in tonight's report. 12h is derived from the causal wait budget (6h, the binding envelope) with the retry schedule inside it — 8 attempts of 30s doubling sum to 3810s, so **~63 minutes** to poison, not the "2–3h" this row claimed before 2026-08-14 — not picked |
+| `CONSUMER_ENABLED` | **off** | turns on the Jetstream consumer (task 14): native users' opt-outs, profiles, posts, comments and votes flowing outward. Default off because it writes durable outbound state, and because a deployment that has not been canaried should not start accumulating it — not because the seams behind it are stubbed. They are wired: with it on, the **real** enqueuer persists outbound intent, the acceptance engine admits postv2 and writes community-signed acceptances, and opt-out `deleteRemote` / confirmed account deletions actually purge at peers. It also gates two other things — the `OUTBOUND_WORKERS` AND, and whether `/admin/admissions*` exists at all |
+| `JETSTREAM_URL` | *(optional)* | the self-hosted Jetstream the consumer subscribes to (`ws://` or `wss://`); **required** when `CONSUMER_ENABLED`, and validated at boot whenever set so a typo fails fast instead of becoming a reconnect loop. May be staged ahead of the flag |
+| `OUTBOUND_WORKERS` | `0` (**off**) | how many delivery workers run. **There is no `OUTBOUND_ENABLED`:** delivery starts only when this is `>0` *and* `CONSUMER_ENABLED`. With the consumer on and this at `0`, outbound intent still accumulates durably and nothing is POSTed — which is the intended staging step, not a broken state. Raising it drains the accumulated backlog immediately |
+| `OUTBOUND_DISABLED` | off | global delivery kill switch. A blocked delivery is **parked** — it stays `pending` and resumes when the switch clears — and park itself never poisons or cancels. A park is also **attempt-neutral**: `ClaimNext` increments `attempts` on every claim, but a park settles through `ReleaseParked`, which hands that increment back under the claim fence, so a held switch costs no retries and needs no `redrive`. **What it does cost is writes:** with workers running each ordering key's head is re-claimed and re-parked every ~5s for as long as the switch is engaged, so **`OUTBOUND_WORKERS=0` is the cheaper switch** for stopping everything — no worker is constructed. Also note every switch here is **inert** while `OUTBOUND_WORKERS=0`. See `DEPLOY.md` §2 |
+| `OUTBOUND_DISABLED_HOSTS` | *(empty)* | comma-separated inbox **hosts** to park. Lowercased on load and compared case-insensitively — a kill switch must fail closed on case |
+| `OUTBOUND_DISABLED_COMMUNITIES` | *(empty)* | comma-separated community **AP ids** to park (`https://lemmy.world/c/comicstrips`), matched **exactly and case-sensitively** against the delivery's ordering key. There is no allowlist form: a one-community canary is spelled by disabling every other community |
+| `OUTBOUND_DISABLED_ACTORS` | *(empty)* | comma-separated actor **DIDs** to park, exact match |
+| `OUTBOUND_DRY_RUN` | off | log every claimed delivery and POST nothing; the worker parks **before** signing. It does **not** validate the translator — translation happens at *enqueue* time inside the consumer's gate transaction and the worker POSTs the stored payload verbatim, so the translator has already run on everything the moment `CONSUMER_ENABLED=true`. Parks like the kill switches: attempt-neutral, and parked rows stay `pending`, so deliveries **resume on their own** when the flag clears — no `redrive` (which matches only `poisoned` rows and would be a no-op here; an unscoped `{"all":true}` redrive would instead replay unrelated poisoned deliveries). The cost of a long dry run is the ~5s re-claim write cycle per ordering key, not retries |
+| `ADMISSION_MAX_PER_AUTHOR_PER_COMMUNITY` | `50` | acceptance-engine flood cap: how many posts one native author may have accepted into one bridged community. `0` = unlimited. Tidepool signs the community's acceptance, so this bounds what it vouches for |
 
-## Subscribing to communities (admin API)
+## The admin API
 
-Community subscriptions are operator-driven, over bearer-token-protected
-endpoints (`Authorization: Bearer $ADMIN_TOKEN`):
+Every route below is bearer-protected (`Authorization: Bearer $ADMIN_TOKEN`)
+and mounted on the bridge's own `Host`. Production publishes port
+`127.0.0.1:8091` on the box for exactly this — admin calls do not round-trip
+through Caddy.
+
+| Route | Purpose | Answers 501/404 when |
+|---|---|---|
+| `POST /admin/communities` | subscribe (WebFinger → Group → materialize → signed `Follow`) | — |
+| `DELETE /admin/communities` | unsubscribe (`Undo{Follow}`; records kept, content stops) | — |
+| `GET /admin/communities` | list subscriptions and their state | — |
+| `POST /admin/communities/backfill` | on-demand outbox backfill | backfill unconfigured (**501**) |
+| `POST /admin/communities/reconcile` | force one follow-list sweep | **501** — `FOLLOW_LIST_PATH` is unset. The reconciler is only built when the path is set, so this is "no follow list configured", not a broken endpoint |
+| `POST /admin/reemit` | re-emit a repo's records as delete+create pairs (relay cold-start gap) | repo manager unconfigured (**501**) |
+| `POST /admin/objects/sweep-deleted` | origin-verified cleanup of missed deletes | sweeper unconfigured (**501**) |
+| `GET /admin/divergence` | run one reconciliation sweep synchronously and return the report | always wired in a normal deployment |
+| `GET /admin/outbound` | delivery queue depth by state (`pending`/`poisoned`/`cancelled`/…) | — the store is always wired, so this answers even with the consumer off and workers at 0. An empty queue then is the truth, not a misconfiguration |
+| `POST /admin/outbound/redrive` | reset poisoned deliveries to pending | — |
+| `POST /admin/outbound/cancel` | **terminally** cancel an actor's or a community's pending deliveries (consent withdrawal, community removal). Not a pause: `cancelled` is terminal and `redrive` revives only `poisoned` rows, so this is not the reversible sibling of a kill-switch **park** | — |
+| `GET /admin/admissions` | list acceptance decisions with `status`, `decisionCode`, `evaluatedCid`; filter by `?status=`/`?community=` | **404** — these routes are registered **only** when `CONSUMER_ENABLED`. A 404 here means the consumer is off, not that the endpoint is broken |
+| `POST /admin/admissions/readmit` | force re-admit a rejected post | **404**, same reason |
+| `GET /admin/metrics` | expvar counters filtered to the `tidepool*` prefix (never Go's `cmdline`/`memstats`) | — |
+
+`POST /admin/outbound/redrive` **refuses an unscoped redrive**: send
+`{"activity":"…"}`, `{"community":"…"}`, or an explicit `{"all":true}`. A
+missing filter is a 400, never a silent fleet-wide replay of every poisoned
+delivery. `POST /admin/outbound/cancel` requires exactly one of
+`{"actor":"did:…"}` or `{"community":"https://…"}`.
+
+### Subscribing to communities
+
+Community subscriptions are operator-driven:
 
 ```sh
 # follow: WebFinger → fetch Group → materialize community → signed Follow
@@ -488,6 +594,27 @@ The contract is the lexicon at
 [`lexicons/social/coves/bridge/getVoteAggregates.json`](lexicons/social/coves/bridge/getVoteAggregates.json)
 and is versioned by nsid: breaking changes ship under a new name.
 
+Its sibling under the same Tidepool-owned namespace is
+[`lexicons/social/coves/bridge/federation.json`](lexicons/social/coves/bridge/federation.json)
+(`key: literal:self`, one record per repo), the user-facing federation
+preference. It is an **opt-OUT**: federation is on by default, so the record's
+ABSENCE means enabled and it only ever exists to turn federation down. When
+`CONSUMER_ENABLED` is set, the task-14 Jetstream consumer reads this record and
+enforces it: `enabled: false` is a **soft disable** — the actor stops resolving
+via WebFinger and stops delivering, while its actor document and
+already-federated references stay intact. Adding `deleteRemote: true` escalates
+to the destructive tier, which **is wired** (task 17d): the bridge sends
+`Delete{Person, removeData: true}` to every inbox that ever received the
+user's content, tombstones the actor (410), and stamps the identity purged —
+irreversible on both sides. For a **soft** opt-out, deleting the record or
+writing `enabled: true` restores the default under the SAME actor identity
+(the local part is frozen at creation and never re-derived); after a
+destructive purge, re-enablement is **refused** — the tombstoned identity
+never federates again.
+With `CONSUMER_ENABLED` off (the default), nothing reads the record and
+federation stays on for every minted actor — the lexicon is still published so
+Coves' settings UI can write against a stable shape ahead of the switch.
+
 Counts reflect each distinct voter's **latest** state — flips
 (`Like` → `Dislike`) and `Undo`s are folded in, re-delivered activities are
 deduplicated by activity id. Votes on content the bridge never materialized
@@ -507,6 +634,38 @@ is `asOf`-stamped with the aggregate's `updated_at`, which the AppView can use
 to discard a stale update). Every `bridgedStats` write goes through the same
 lexicon validation and mapping bookkeeping as any other record commit, and a
 Lemmy edit that rebuilds a record carries an existing `bridgedStats` forward.
+
+## Coves user origin (the `coves.social` AP surface)
+
+Coves users get ActivityPub identities of their own, served on
+`AP_USER_ORIGIN` — a **second origin on the same listener**, distinct from the
+bridge's `BRIDGE_HOSTNAME` surface. A `Host` router splits the two: the bridge
+hostname and its bridged-handle subdomains (plus `localhost`, **loopback** IPs,
+and an absent `Host` — container healthchecks) reach the bridge; the user
+origin's own `Host` reaches the user surface; anything else — including a
+public bare-IP `Host`, which names no configured surface — is refused with
+**421 Misdirected Request** unless `AP_HOST_FALLTHROUGH_DEV` is on. When both names resolve to one
+authority (the dev default, `localhost:8091`), the split falls back to the path:
+the user surface answers first and its 404s fall through to the bridge.
+
+What the user origin serves:
+
+| Route | Purpose |
+|---|---|
+| `GET /.well-known/webfinger?resource=acct:alice@…` | discovery for a minted local part, scoped to the routed `Host` |
+| `GET /ap/actor/{did}` | the user's `Person` document (`publicKey`, `inbox`, `endpoints.sharedInbox`, `outbox`, `published`) |
+| `GET /ap/actor/{did}/outbox` | empty `OrderedCollection` — Lemmy requires the field, and a missing outbox rejects the whole actor |
+| `POST /ap/inbox` | shared inbox; dispatched **verbatim** to the existing ingest pipeline (one verification, dedupe, and refusal taxonomy — never a second copy) |
+| `GET /` | the origin's instance (`Application`) actor, republishing the bridge's key — Lemmy delivers `Delete{Person}` and other send-to-all-instances activities only to the inbox on that row |
+| `GET /.well-known/nodeinfo`, `GET /nodeinfo/2.0` | software identification (`software.name: tidepool`) |
+
+An actor is minted lazily on a user's first federating interaction. Its local
+part is derived once and then **frozen**: a native handle
+(`alice.coves.social`) yields `alice`, anything else keeps its full handle
+(`bretton.dev` stays `bretton.dev`), collisions take `-2`, `-3`, … , and a
+later handle change refreshes only the cached display name, summary, and
+avatar. The RSA private key is sealed with `BRIDGE_KEK` (AES-256-GCM, bound to
+the DID) and never stored in the clear; only the public PEM is published.
 
 ## Verifying with Jetstream
 
@@ -560,6 +719,36 @@ other bridged instance). The bridge then answers both resolution paths:
 Note TLS: a single wildcard certificate only covers one label level, while
 bridged handles sit two levels below `BRIDGE_HOSTNAME` — terminate TLS with
 on-demand certificate issuance (e.g. Caddy) or per-instance wildcard certs.
+
+## Production deploy
+
+The runbook is **[`DEPLOY.md`](DEPLOY.md)**: the boot-time config gate, the v2
+flag topology (`CONSUMER_ENABLED` → `OUTBOUND_WORKERS` → kill switches), the
+cross-repo Caddy change that puts the native-user AP surface on
+`coves.social`, the staged canary and its rollback order, and — explicitly —
+the things that have **no** mechanism today (per-actor RSA rotation, a
+divergence off switch, a periodic vote re-seed). `BRIDGE_KEK` rotation and
+backup/restore both used to head that list; each is now a runbook in the same
+section (nightly `pg_dump` plus a throwaway-container restore drill).
+[`SELF_HOSTED_RELAY.md`](SELF_HOSTED_RELAY.md) covers the relay + Jetstream
+ingest path.
+
+One thing to know before deploying HEAD onto an existing box: `AP_USER_ORIGIN`
+is required in production and was not in the pre-v2 env file, so the process
+fails at startup rather than coming up half-configured. That is the intended
+behaviour — see DEPLOY.md §1.
+
+### Support matrix
+
+| Peer | Status |
+|---|---|
+| **Lemmy 0.19.20** | targeted — the e2e target and strictness ceiling |
+| **PieFed** | best-effort, behind captured-wire conformance (votes arrive from anonymous per-user actors: fine for tallies, no per-voter identity) |
+| **Lemmy 1.0-beta** | tracked, not targeted (vote `FederationMode`, inbox collapsing, `NoteWrapper`) |
+| **Mastodon** | incidental — the `security/v1` context is published so its parser accepts our `publicKey`; not a target, not tested |
+
+`e2e/lemmy/Dockerfile` pins `0.19.20`, matching decision 19 and the task
+docs — see DEPLOY.md §7.
 
 ## License
 

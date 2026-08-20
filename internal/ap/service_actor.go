@@ -19,6 +19,16 @@ const ServiceKeyName = "service-actor"
 // from (the HTTP route itself lands with the inbox in task 06).
 const ServiceActorPath = "/actor"
 
+// SoftwareName and SoftwareVersion identify this implementation in every
+// nodeinfo document the deployment serves. Lemmy admins allowlist by the
+// exact name string, and both of the bridge's origins describe the SAME
+// deployment — so the pair lives here rather than once per surface, where
+// the two could drift into claiming to be different software.
+const (
+	SoftwareName    = "tidepool"
+	SoftwareVersion = "0.1.0"
+)
+
 // serviceActorContext is the JSON-LD context for the service actor document:
 // core AS2 plus the security vocabulary that defines publicKey.
 const serviceActorContext = `["https://www.w3.org/ns/activitystreams","https://w3id.org/security/v1"]`
@@ -40,9 +50,8 @@ type ServiceActor struct {
 	// Key is the actor's RSA private key.
 	Key *rsa.PrivateKey
 	// CreatedAt is when the service key was first provisioned — the
-	// `published` timestamp of the actor documents (Lemmy's Instance
-	// protocol REQUIRES published; a zero value falls back to a fixed
-	// epoch so hand-built test actors still render valid documents).
+	// `published` timestamp of the actor documents. A zero value means the
+	// time is unknown, and the field is then omitted rather than invented.
 	CreatedAt time.Time
 }
 
@@ -180,10 +189,6 @@ func (a *ServiceActor) DocumentJSON() ([]byte, error) {
 // origin, yielding "{scheme}://{host}/").
 func (a *ServiceActor) InstanceActorID() string { return a.BaseURL() + "/" }
 
-// instanceActorFallbackPublished keeps hand-built test actors (zero
-// CreatedAt) rendering a valid document — Lemmy requires `published`.
-const instanceActorFallbackPublished = "2026-01-01T00:00:00Z"
-
 // InstanceDocumentJSON renders the bridge's INSTANCE actor — the AP face of
 // the whole deployment, served at the origin apex ("/"). This is a separate
 // identity from the /actor service actor, and it is load-bearing for
@@ -210,10 +215,6 @@ func (a *ServiceActor) InstanceDocumentJSON() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	published := instanceActorFallbackPublished
-	if !a.CreatedAt.IsZero() {
-		published = a.CreatedAt.UTC().Format(time.RFC3339)
-	}
 	id := a.InstanceActorID()
 	doc := map[string]any{
 		"@context":          json.RawMessage(serviceActorContext),
@@ -224,12 +225,18 @@ func (a *ServiceActor) InstanceDocumentJSON() ([]byte, error) {
 		"summary":           "Bridges threadiverse communities into atproto. " + a.BaseURL(),
 		"inbox":             a.InboxURL(),
 		"outbox":            a.OutboxURL(),
-		"published":         published,
 		"publicKey": map[string]any{
 			"id":           id + "#main-key",
 			"owner":        id,
 			"publicKeyPem": string(publicPEM),
 		},
+	}
+	// Lemmy requires published, but a provisioning time the bridge does not
+	// know is a date it would be INVENTING — and every peer caches it. An
+	// unknown time is omitted instead; only hand-built literals lack one,
+	// since production loads CreatedAt from the service_keys row.
+	if !a.CreatedAt.IsZero() {
+		doc["published"] = a.CreatedAt.UTC().Format(time.RFC3339)
 	}
 	data, err := json.Marshal(doc)
 	if err != nil {

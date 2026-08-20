@@ -1,0 +1,37 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.moderation.defs",
+  "defs": {
+    "banView": {
+      "type": "object",
+      "description": "Hydrated view of a ban record as indexed by the AppView",
+      "required": [
+        "uri",
+        "cid",
+        "record",
+        "indexedAt"
+      ],
+      "properties": {
+        "uri": {
+          "type": "string",
+          "format": "at-uri",
+          "description": "AT-URI of the ban record"
+        },
+        "cid": {
+          "type": "string",
+          "format": "cid",
+          "description": "CID of the ban record"
+        },
+        "record": {
+          "type": "unknown",
+          "description": "The social.coves.moderation.ban record, verbatim"
+        },
+        "indexedAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "When this ban was indexed by the AppView"
+        }
+      }
+    }
+  }
+}

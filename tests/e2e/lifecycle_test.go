@@ -66,7 +66,7 @@ func TestConsent_NobridgeLifecycle(t *testing.T) {
 
 	l.await("phase-1 control post", func(e *jsEvent) bool {
 		got, _ := fieldOf(e.Commit.Record, "title")
-		return e.Commit.Collection == colPost && e.Did == sub.DID && got == control1Title
+		return e.Commit.Collection == colPostV2 && got == control1Title
 	})
 	assertNoMarkedOutput := func(phase, forbiddenTitle string) {
 		t.Helper()
@@ -105,9 +105,16 @@ func TestConsent_NobridgeLifecycle(t *testing.T) {
 	markedDID := profileEv.Did
 	resumeEv := l.await("resumed post create", func(e *jsEvent) bool {
 		got, _ := fieldOf(e.Commit.Record, "title")
-		return e.Commit.Collection == colPost && e.Did == sub.DID &&
+		return e.Commit.Collection == colPostV2 &&
 			e.Commit.Operation == opCreate && got == resumeTitle
 	})
+	if resumeEv.Did != markedDID {
+		t.Errorf("resumed post landed in repo %q, want the re-opted-in author's repo %q",
+			resumeEv.Did, markedDID)
+	}
+	if got := recordField(t, resumeEv.Commit.Record, "community"); got != sub.DID {
+		t.Errorf("resumed post community = %q, want %q", got, sub.DID)
+	}
 	if did, res := h.bridgeResolveHandle(t, handle); res.status != 200 || did != markedDID {
 		t.Fatalf("phase 2: handle %s should resolve to %s after opt-in (status %d, did %q)",
 			handle, markedDID, res.status, did)
@@ -127,8 +134,8 @@ func TestConsent_NobridgeLifecycle(t *testing.T) {
 	// the actor profile (author repo), each on the exact rkey observed at
 	// create time.
 	l.await("scrub delete of the resumed post", func(e *jsEvent) bool {
-		return e.Commit.Collection == colPost && e.Commit.Operation == opDelete &&
-			e.Did == sub.DID && e.Commit.RKey == resumeEv.Commit.RKey
+		return e.Commit.Collection == colPostV2 && e.Commit.Operation == opDelete &&
+			e.Did == resumeEv.Did && e.Commit.RKey == resumeEv.Commit.RKey
 	})
 	l.await("scrub delete of the actor profile", func(e *jsEvent) bool {
 		return e.Commit.Collection == colActorProfile && e.Commit.Operation == opDelete &&
@@ -141,7 +148,7 @@ func TestConsent_NobridgeLifecycle(t *testing.T) {
 	control.createPost(t, community.ID, control2Title, "positive control after scrub")
 	l.await("phase-3 control post", func(e *jsEvent) bool {
 		got, _ := fieldOf(e.Commit.Record, "title")
-		return e.Commit.Collection == colPost && e.Did == sub.DID && got == control2Title
+		return e.Commit.Collection == colPostV2 && got == control2Title
 	})
 	assertNoMarkedOutput("phase 3 (bridged actor opted out)", scrubTriggerTitle)
 
@@ -191,7 +198,7 @@ func TestDeleteActor_ScrubsAndTombstones(t *testing.T) {
 	// the community's own profile (rkey `self`) must SURVIVE its member's
 	// deletion, and a delete of it could not be seen through a narrower
 	// filter.
-	l := h.newListener(t, cursor, colActorProfile, colPost, colComment, colCommunityProfile)
+	l := h.newListener(t, cursor, colActorProfile, colPostV2, colAcceptance, colComment, colCommunityProfile)
 
 	title := "Doomed post " + h.suffix
 	post := user.createPost(t, community.ID, title, "author will self-delete")
@@ -203,7 +210,7 @@ func TestDeleteActor_ScrubsAndTombstones(t *testing.T) {
 	authorDID := profileEv.Did
 	postEv := l.await("post create", func(e *jsEvent) bool {
 		got, _ := fieldOf(e.Commit.Record, "title")
-		return e.Commit.Collection == colPost && e.Did == sub.DID &&
+		return e.Commit.Collection == colPostV2 && e.Did == authorDID &&
 			e.Commit.Operation == opCreate && got == title
 	})
 	user.createComment(t, post.ID, 0, "doomed comment")
@@ -229,9 +236,16 @@ func TestDeleteActor_ScrubsAndTombstones(t *testing.T) {
 	user.deleteAccount(t)
 
 	// Scrub delete-commits for all three records, on their observed rkeys.
-	l.await("delete of the post (community repo)", func(e *jsEvent) bool {
-		return e.Commit.Collection == colPost && e.Commit.Operation == opDelete &&
-			e.Did == sub.DID && e.Commit.RKey == postEv.Commit.RKey
+	l.await("delete of the post (author repo)", func(e *jsEvent) bool {
+		return e.Commit.Collection == colPostV2 && e.Commit.Operation == opDelete &&
+			e.Did == authorDID && e.Commit.RKey == postEv.Commit.RKey
+	})
+	// The community's attestation must go with it: an acceptance whose
+	// subject no longer exists is a community vouching for a record that
+	// isn't there.
+	l.await("delete of the post's acceptance (community repo)", func(e *jsEvent) bool {
+		return e.Commit.Collection == colAcceptance && e.Commit.Operation == opDelete &&
+			e.Did == sub.DID && e.Commit.RKey == subjectRKey(postEv.atURI())
 	})
 	l.await("delete of the comment (author repo)", func(e *jsEvent) bool {
 		return e.Commit.Collection == colComment && e.Commit.Operation == opDelete &&
@@ -363,13 +377,26 @@ func TestUnsubscribe_StopsBridging(t *testing.T) {
 
 	// Prove the doomed community flows BEFORE unsubscribing (otherwise the
 	// negative below would pass vacuously on a broken subscription).
+	//
+	// A post is now TWO commits in TWO repos — the postv2 in the author's
+	// and the acceptance in the community's — so awaiting only the postv2
+	// leaves the acceptance in flight, and the Undo{Follow} then races it
+	// into the negative window below. That is correct production behaviour
+	// (an in-flight materialization finishes; the unfollow fences FUTURE
+	// deliveries, exactly as v1 behaved for an in-flight post), so the
+	// scenario has to settle the pair before it starts asserting absence.
 	preCursor := cursorNow()
-	pre := h.newListener(t, preCursor, colPost)
+	pre := h.newListener(t, preCursor, colPostV2, colAcceptance)
 	preTitle := "Pre-unsubscribe " + h.suffix
 	user.createPost(t, unsCommunity.ID, preTitle, "flows while subscribed")
 	preEv := pre.await("pre-unsubscribe post", func(e *jsEvent) bool {
 		got, _ := fieldOf(e.Commit.Record, "title")
-		return e.Commit.Collection == colPost && e.Did == unsSub.DID && got == preTitle
+		return e.Commit.Collection == colPostV2 && got == preTitle
+	})
+	preAcceptEv := pre.await("pre-unsubscribe post's acceptance", func(e *jsEvent) bool {
+		uri, _ := fieldOf(e.Commit.Record, "subject", "uri")
+		return e.Commit.Collection == colAcceptance && e.Did == unsSub.DID &&
+			e.Commit.RKey == subjectRKey(preEv.atURI()) && uri == preEv.atURI()
 	})
 	pre.close()
 
@@ -392,47 +419,49 @@ func TestUnsubscribe_StopsBridging(t *testing.T) {
 	// therefore the only cursor that reliably bounds this window; the one
 	// known replayed event (the pre-post itself) is excluded by timestamp
 	// in the sweep below.
-	l := h.newListener(t, preEv.TimeUs)
+	l := h.newListener(t, preAcceptEv.TimeUs)
 
 	deadTitle := "Dead post " + h.suffix
 	user.createPost(t, unsCommunity.ID, deadTitle, "must not bridge")
 	liveTitle := "Live post " + h.suffix
 	user.createPost(t, ctlCommunity.ID, liveTitle, "control keeps flowing")
 
-	l.await("control community post", func(e *jsEvent) bool {
+	ctlEv := l.await("control community post", func(e *jsEvent) bool {
 		got, _ := fieldOf(e.Commit.Record, "title")
-		return e.Commit.Collection == colPost && e.Did == ctlSub.DID &&
+		return e.Commit.Collection == colPostV2 &&
 			e.Commit.Operation == opCreate && got == liveTitle
 	})
+	if got := recordField(t, ctlEv.Commit.Record, "community"); got != ctlSub.DID {
+		t.Errorf("control post community = %q, want the still-subscribed community %q", got, ctlSub.DID)
+	}
 
 	// Bounded negative: nothing on the unsubscribed community's repo
-	// STRICTLY NEWER than the pre-post (the newest thing it legitimately
-	// emitted), and the dead post's title nowhere (belt against it landing
-	// in a wrong repo).
+	// STRICTLY NEWER than that repo's own newest legitimate event (the
+	// pre-post's acceptance), and the dead post's title nowhere (belt
+	// against it landing in a wrong repo).
 	for _, ev := range l.drain(negativeWindow) {
 		if ev.Kind != kindCommit || ev.Commit == nil {
 			continue
 		}
-		if ev.Did == unsSub.DID && ev.TimeUs > preEv.TimeUs {
-			// A trailing bridgedStats UPDATE on an ALREADY-bridged post is the
-			// vote-stats refresher settling seeded counts (SEED_COUNTS_FROM_API
-			// is on), not new content bridged after the Undo{Follow} —
-			// unsubscribe stops NEW content, it does not roll back stats the
-			// aggregates already hold. Tolerated, but ONLY as a pure stats
-			// settle: carry-forward ships the whole record, so a genuine content
-			// change could hide inside a stats-shaped update. Pin the pre-post's
-			// title AND content unchanged so a real edit cannot pass as one.
-			if isBridgedStatsUpdate(ev) {
-				if got, _ := fieldOf(ev.Commit.Record, "title"); got != preTitle {
-					t.Errorf("stats-shaped update on unsubscribed repo %s changed the title to %q (want the pre-post %q): %s",
-						unsSub.DID, got, preTitle, ev)
-				}
-				if got, _ := fieldOf(ev.Commit.Record, "content"); got != "flows while subscribed" {
-					t.Errorf("stats-shaped update on unsubscribed repo %s changed the content to %q (want the pre-post body): %s",
-						unsSub.DID, got, ev)
-				}
-			} else {
+		if ev.Did == unsSub.DID && ev.TimeUs > preAcceptEv.TimeUs {
+			// ONE late event is still legitimate here: the vote-stats
+			// refresher settling the pre-post's seeded counts
+			// (SEED_COUNTS_FROM_API is on) rewrites that post — in the
+			// AUTHOR's repo — which moves its CID, and its acceptance is
+			// re-pinned to follow, in THIS repo. Unsubscribe stops NEW
+			// content; it does not roll back a settle already in flight.
+			// Tolerated ONLY for the pre-post's own subject, so an
+			// acceptance for anything else (the dead post above all) still
+			// fails. The stats stamp itself can no longer appear on this
+			// repo at all — content lives in the author's repo now — so
+			// there is nothing else to excuse.
+			if !isAcceptanceRepinOf(ev, preEv.atURI()) {
 				t.Errorf("unsubscribed community repo %s emitted after Undo{Follow}: %s", unsSub.DID, ev)
+			} else {
+				// Logged, not silent: if this stops firing across runs the
+				// tolerance is dead weight, and a tolerance nobody can see
+				// exercised is indistinguishable from a hole.
+				t.Logf("tolerated in-flight stats repin of the pre-post's acceptance: %s", ev)
 			}
 		}
 		if got, _ := fieldOf(ev.Commit.Record, "title"); got == deadTitle {

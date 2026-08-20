@@ -181,7 +181,11 @@ func TestNobridgeAddedOnRefresh(t *testing.T) {
 }
 
 // TestListByActorDIDSpine sanity-checks the store addition this task made:
-// author_did finds cross-repo posts.
+// author_did finds an actor's content. Post-flip a postv2 is an own-repo
+// record, so author_did and did agree for it — but the column is still the
+// spine every scrub and admin sweep walks, and it must carry the author for
+// content of BOTH eras (legacy posts remain in community repos, where
+// author_did is the only thing tying them back to their author).
 func TestListByActorDIDSpine(t *testing.T) {
 	h := newHarness(t)
 	h.serveLemmyWorldFixtures()
@@ -198,8 +202,8 @@ func TestListByActorDIDSpine(t *testing.T) {
 	for _, mapping := range mappings {
 		collections = append(collections, mapping.Collection)
 	}
-	assert.Contains(t, collections, CollectionPost,
-		"posts in community repos are found via author_did")
+	assert.Contains(t, collections, CollectionPostV2,
+		"the author's posts are found via author_did")
 	assert.Contains(t, collections, CollectionActorProfile,
 		"own-repo records are found via did")
 

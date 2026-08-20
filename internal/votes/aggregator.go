@@ -18,17 +18,60 @@ import (
 	"context"
 	"database/sql"
 	stderrors "errors"
+	"expvar"
 	"fmt"
 	"log/slog"
 	"sort"
-	"strings"
 	"time"
 
 	"tidepool/internal/ap"
+	"tidepool/internal/echo"
 	"tidepool/internal/errors"
 	"tidepool/internal/materialize"
+	"tidepool/internal/ratelimit"
 	"tidepool/internal/store"
 )
+
+// voteWarnInterval throttles each of the aggregator's rare-but-loud notices: a
+// suppressed voter, and a clamped seed baseline. Both are rare by construction,
+// so a sampler costs nothing in steady state — but each announces itself at
+// volume in exactly the failure it exists to expose (a probe that has started
+// matching GENUINE voters; an origin whose totals no longer contain the votes
+// we wrote back), and one line per vote or per backfilled post would bury it.
+//
+// The interval is shared; the SAMPLERS are not. Their causes are correlated —
+// switching write-back on produces echoed votes AND clamped baselines — so one
+// sampler would let each signal suppress the other in every window of precisely
+// the incident both lines exist to describe.
+const voteWarnInterval = time.Second
+
+// SeedBaselineClamped counts seeds whose computed baseline came out NEGATIVE
+// and was clamped to zero: the origin's total for that DIRECTION was smaller
+// than the votes we can already account for on that subject.
+//
+// Read it for what it is — a floor breach, not a discard detector. It can only
+// fire where api_total < live + ours, i.e. on subjects whose entire fediverse
+// tally is smaller than the deficit; on any post with a real score, an origin
+// silently discarding the votes we write back (a restrictive Lemmy
+// FederationMode, decision 16's named risk) understates the served tally with
+// the raw baseline still comfortably positive, and this counter stays at zero.
+// SeedOursSubtracted is the signal that covers those subjects.
+//
+// The "tidepool_" prefix is load-bearing: the admin metrics surface serves ONLY
+// that prefix, so a counter named without it is published to expvar and then
+// filtered straight back out — indistinguishable from a counter that never
+// fires.
+var SeedBaselineClamped = expvar.NewInt("tidepool_vote_seed_baseline_clamped")
+
+// SeedOursSubtracted totals the delivered outbound votes netted out of seeded
+// baselines, across directions and subjects.
+//
+// It is the volume half of the clamp's signal, and unlike the clamp it advances
+// on ordinary healthy subjects: it says how many votes the bridge BELIEVES the
+// origin is holding for our personas. Compared against a Lemmy-side sample of
+// the same posts, a persistent gap is a discard being absorbed silently —
+// which the clamp only ever catches on near-zero-score subjects.
+var SeedOursSubtracted = expvar.NewInt("tidepool_vote_seed_ours_subtracted")
 
 // Vote directions (vote_events.direction).
 const (
@@ -45,12 +88,28 @@ const (
 // and drops (the previous baseline survives).
 const MaxSeededCount = 1_000_000
 
-// RecordReader is the slice of *repo.Manager the aggregator uses to read a
-// bridged comment's stored record: the record's reply.root strongRef names
-// the thread's root post in the community repo, which is how an announced
-// comment vote is bound to its announcing community.
+// RecordReader is the slice of *repo.Manager the aggregator hands to
+// materialize.CommunityDIDOf: the reader it uses to derive a subject's
+// community when the mapping's community_did is unset (rows written before
+// migration 016), by reading the postv2's `community` field or walking a
+// comment's reply.root to its thread root. A mapping that carries the column
+// needs no read at all.
 type RecordReader interface {
 	GetRecord(ctx context.Context, did, collection, rkey string) (record map[string]any, recordCID string, err error)
+}
+
+// VoterProbe answers whether a voter is one of the bridge's OWN minted
+// personas (ap_actors) rather than a genuine remote human. *echo.Classifier
+// satisfies it: the actor route's lookup is exactly this question, including
+// the vanity-origin rule and the fail-safe error direction.
+//
+// This guard is NOT redundant with ingest's envelope classifier. That one asks
+// an ENVELOPE question at the dispatch boundary ("is this announced traffic
+// ours?"); this one asks a VOTER question at the MUTATION site, and so also
+// covers callers that never pass through handleAnnounce at all — the bare
+// /ap/inbox vote branch, the community-outbox backfill, and the seed paths.
+type VoterProbe interface {
+	Identify(ctx context.Context, apID string) (echo.Identity, error)
 }
 
 // Aggregator implements ingest.VoteAggregator over the vote_aggregates /
@@ -65,11 +124,14 @@ type Aggregator struct {
 	objects     store.APObjects
 	communities store.Communities
 	records     RecordReader
+	voters      VoterProbe
+	echoLog     *ratelimit.Sampler
+	clampLog    *ratelimit.Sampler
 	logger      *slog.Logger
 }
 
 // NewAggregator validates dependencies and builds an Aggregator.
-func NewAggregator(db *sql.DB, objects store.APObjects, communities store.Communities, records RecordReader, logger *slog.Logger) (*Aggregator, error) {
+func NewAggregator(db *sql.DB, objects store.APObjects, communities store.Communities, records RecordReader, voters VoterProbe, logger *slog.Logger) (*Aggregator, error) {
 	if db == nil {
 		return nil, errors.NewValidationError("db", "must not be nil")
 	}
@@ -82,10 +144,22 @@ func NewAggregator(db *sql.DB, objects store.APObjects, communities store.Commun
 	if records == nil {
 		return nil, errors.NewValidationError("records", "must not be nil")
 	}
+	// REQUIRED, not optional. A nil probe is an aggregator that counts our own
+	// votes as inbound ones — silently, and only in whichever binary forgot to
+	// pass it, which is exactly how this guard was left out of production while
+	// every test had it. There is no caller for whom "no echo suppression" is
+	// the right behaviour, so it is not expressible.
+	if voters == nil {
+		return nil, errors.NewValidationError("voters", "must not be nil")
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Aggregator{db: db, objects: objects, communities: communities, records: records, logger: logger}, nil
+	return &Aggregator{db: db, objects: objects, communities: communities, records: records,
+		voters:   voters,
+		echoLog:  ratelimit.NewSampler(voteWarnInterval),
+		clampLog: ratelimit.NewSampler(voteWarnInterval),
+		logger:   logger}, nil
 }
 
 // ApplyVote records one Like or Dislike: insert the activity (duplicate
@@ -109,6 +183,20 @@ func (a *Aggregator) ApplyVote(ctx context.Context, vote *ap.Object, communityIR
 	if vote.ID == "" || voter == "" || subject == "" {
 		a.logger.Debug("vote dropped: missing activity id, voter, or subject",
 			"activity", vote.ID, "voter", voter, "subject", subject, "community", communityIRI)
+		return nil
+	}
+
+	// The voter probe runs BEFORE anything is read or locked for this subject:
+	// a suppressed vote must leave no trace at all, and lockAggregate would
+	// mint a 0/0 vote_aggregates row that the XRPC contract reads as "this
+	// subject has been voted on". Outside inTx by construction, so it adds no
+	// lock-ordering hazard to the transaction below.
+	ours, err := a.isOurPersona(ctx, voter)
+	if err != nil {
+		return err
+	}
+	if ours {
+		a.dropEchoedVote("vote", vote, voter, subject, communityIRI)
 		return nil
 	}
 
@@ -232,6 +320,21 @@ func (a *Aggregator) RetractVote(ctx context.Context, vote *ap.Object, community
 			"activity", vote.ID, "voter", voter, "subject", subject, "community", communityIRI)
 		return nil
 	}
+
+	// The SAME probe on the retraction path, and for a sharper reason than
+	// symmetry: step 2 below retracts the voter's live vote regardless of
+	// activity id, so an unsuppressed echo of our own Undo would retract a row
+	// this very guard stopped us from writing — a phantom retraction driven by
+	// whatever that persona's history happens to hold.
+	ours, err := a.isOurPersona(ctx, voter)
+	if err != nil {
+		return err
+	}
+	if ours {
+		a.dropEchoedVote("vote retraction", vote, voter, subject, communityIRI)
+		return nil
+	}
+
 	if communityIRI != "" {
 		mapping, err := a.subjectMapping(ctx, subject)
 		if err != nil {
@@ -338,27 +441,75 @@ func (a *Aggregator) RetractVote(ctx context.Context, vote *ap.Object, community
 // activities the bridge never saw (Lemmy outboxes announce historical votes
 // only sparsely). Live vote_events stack on top of the baseline.
 //
-// The origin's counts are a TOTAL: they include every vote that ALSO
-// federated live and sits in vote_events as a live row (any vote cast after
-// the community was subscribed). Storing them raw would count those voters
-// twice — once in the baseline, once in the recompute's live term — so the
-// baseline is stored NET of the subject's live counts, per direction,
-// clamped at zero. Served totals therefore equal the origin's counts at
-// seed time, and live events stack on top from there. This also makes a
-// re-seed (backfill redo) the drift healer: a voter counted only in the
-// baseline who later flips federates a bare Dislike (Lemmy sends no Undo on
+// WHAT THE SERVED AGGREGATE MEANS (task 17b). The Coves appview (a separate
+// repo) keeps native and bridged tallies in SEPARATE columns on its post
+// record — bridged_upvote_count beside the native count — so what Tidepool
+// serves is the FEDIVERSE-ONLY tally:
+//
+//	served(subject) = api_total(subject) − { our personas' votes Lemmy currently holds }
+//
+// The origin's counts are a TOTAL, and two populations inside it are already
+// accounted for elsewhere:
+//
+//   - votes that ALSO federated live and sit in vote_events as live rows (any
+//     vote cast after the community was subscribed). Keeping them counts those
+//     voters twice — once in the baseline, once in the recompute's live term;
+//   - votes TIDEPOOL ITSELF wrote back for native users, which Lemmy is holding
+//     and reporting. Coves counts those in its NATIVE column, so keeping them
+//     counts one person's single vote twice across the two columns in the UI.
+//
+// So the baseline is stored NET of both, per direction, clamped at zero. See
+// reportSeed for what the seed publishes about that: the volume it subtracted,
+// and — on the rare subject whose whole tally is smaller than the deficit — the
+// clamp that would otherwise absorb the difference in silence.
+//
+// The subtraction lives in the BASELINE rather than the served columns because
+// recomputeAggregate rewrites the served columns on every single inbound vote:
+// a correction applied there would be undone minutes later by the next voter,
+// with nothing connecting the drift back to the seed.
+//
+// A re-seed (backfill redo) is also the drift healer: a voter counted only in
+// the baseline who later flips federates a bare Dislike (Lemmy sends no Undo on
 // flips), leaving the retired upvote in the baseline next to the new live
-// downvote — until the next re-seed, whose subtraction converges the served
-// totals back to the origin's truth. Two symmetric residual races span the
-// origin API fetch and this transaction, both transient and self-healing on
-// the next re-seed (the pre-fix over-count race was PERMANENT and compounding):
+// downvote — until the next re-seed converges the served totals back. But
+// nothing re-seeds PERIODICALLY: the one caller is ingest's Backfill.seedCounts
+// on its post walk, behind SEED_COUNTS_FROM_API, and an un-forced trigger skips
+// the whole run inside the freshness window — so for a quiet community "heals
+// on the next re-seed" can mean "heals when an admin forces a backfill", and
+// may mean never.
+//
+// Three residual races span the origin API fetch and this transaction. The
+// first two are transient and self-healing on the next re-seed, with the caveat
+// above (the pre-fix over-count race was PERMANENT and compounding); the third
+// heals on the FLIP'S DELIVERY rather than on a re-seed, so re-seeding inside
+// its window reproduces it rather than converging it:
 //   - under-count by one: a vote federates AFTER the fetch but is live here, so
 //     it is net-subtracted from the baseline yet not present in the fetched
 //     total;
 //   - over-count by one (the mirror): a vote already IN the fetched total whose
 //     federated activity arrives AFTER this seed tx — the net-of-live
 //     subtraction cannot yet see it as a live row, so the baseline keeps it AND
-//     the later live event adds it again, until the next re-seed reconciles.
+//     the later live event adds it again, until the next re-seed reconciles;
+//   - direction incoherence during a re-cast window, outbound side: a native
+//     user RE-CASTS a vote they had already delivered. The CLOBBER this bullet
+//     used to describe is closed — OutboundVotes.Upsert now keeps 'delivered'
+//     through a flip, so the row stays in the `ours` term instead of dropping
+//     out of it entirely, and the vote is no longer invisible to this seed.
+//     What remains is narrower and is a DIFFERENT error, not the same one:
+//     the row's direction is already the NEW one while the peer still holds
+//     the OLD, so the subtraction lands on the wrong side of the tally — the
+//     direction the peer holds is not subtracted, and the direction it does
+//     not hold is. It heals when the flip delivers or the vote is undone — and
+//     if the flip's delivery POISONS, neither event ever comes: the wrong-side
+//     subtraction then recurs on every re-seed until an undo, and the standing
+//     divergence is RecastDivergence's finding. It is signalled while it lasts
+//     ONLY when the mis-subtraction breaches the zero floor (see the ours.*
+//     binding in SeedAggregates: SeedBaselineClamped fires on the breach, and
+//     unrelated votes in the same direction can absorb the error silently —
+//     the counters witness the clamping shape, not every window). The "what
+//     the peer holds" vs "what the user
+//     wants" column pair once proposed here was REJECTED with reasons; they
+//     are recorded in FOLLOWUPS.md so it is not re-proposed.
 //
 // Subjects not present in ap_objects are dropped and logged at debug, like
 // ApplyVote.
@@ -384,7 +535,12 @@ func (a *Aggregator) SeedAggregates(ctx context.Context, subjectAPID string, upv
 	}
 	atURI := mapping.ATURI
 
-	return a.inTx(ctx, func(tx *sql.Tx) error {
+	// Seed facts are collected inside the transaction and reported AFTER it
+	// commits: recomputeAggregate can still fail and roll the whole seed back,
+	// and a counter advanced for a seed that never happened — then advanced
+	// again by the caller's retry — is worse than no counter.
+	var seed seedOutcome
+	if err := a.inTx(ctx, func(tx *sql.Tx) error {
 		// Upsert-and-lock the aggregate row first — the per-subject
 		// serialization point every mutation goes through — so the live-count
 		// read below cannot interleave with a concurrent ApplyVote/RetractVote
@@ -392,23 +548,156 @@ func (a *Aggregator) SeedAggregates(ctx context.Context, subjectAPID string, upv
 		if err := lockAggregate(ctx, tx, subjectAPID, atURI); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `
+		// ONE statement for both subtrahends, deliberately: a second statement
+		// would read on its own READ COMMITTED snapshot (inTx takes the default
+		// isolation), so the two counts could come from different moments —
+		// creating exactly the torn read the aggregate lock exists to prevent.
+		//
+		// ours.* is the votes LEMMY CURRENTLY HOLDS for our personas — exactly
+		// per ROW, only APPROXIMATELY per DIRECTION — and the predicate is the
+		// POSITIVE EQUALITY delivered_state = 'delivered':
+		//
+		//	pending (first try, retrying, poisoned) → the peer does not hold it
+		//	delivered                               → it does: subtract
+		//	delivered, Undo in flight               → still subtract; consume's
+		//	                                          applyVoteDelete re-upserts
+		//	                                          'delivered' precisely because the
+		//	                                          peer has not yet processed the
+		//	                                          withdrawal
+		//	row gone (Undo delivered)               → nothing to subtract
+		//
+		// THE DIRECTION IS THE APPROXIMATE HALF, and only inside a re-cast
+		// window. The row's `direction` tracks the newest INTENT while
+		// `delivered_state` describes a delivery that already happened, so
+		// after a flip the two come from different moments (see
+		// store.DeliveredStateDelivered). This subtracts the flip's direction
+		// from an origin total that still contains the old one: the direction
+		// the peer really holds is left in the baseline, and the direction it
+		// does not hold is subtracted from a total that never contained it.
+		// Per row the term is RIGHT — the vote is counted among `ours`, which
+		// is what the upsert guard bought — and per direction it is wrong
+		// until the flip delivers or the vote is undone.
+		//
+		// It is signalled ONLY when the wrong-side subtraction breaches the
+		// zero floor: SeedOursSubtracted counts the row (it also counts every
+		// healthy delivered vote, so it identifies routine work, not this
+		// window), and GREATEST(0, …) trips SeedBaselineClamped plus the
+		// sampled clamp Warn naming direction, deficit_* and ours_* — but
+		// unrelated votes in the subtracted direction can keep the raw
+		// baseline non-negative, in which case the misread is absorbed with
+		// NO distinguishing signal. The two directional errors can also
+		// CANCEL in the served number, so vote_aggregates alone shows a
+		// healthy subject either way. The clamping shape — the one that does
+		// signal — is pinned exactly as it stands by
+		// TestReseedDuringARecastWindowMisreadsBothDirections; the silent
+		// shape has no witness here, and a standing one is RecastDivergence's
+		// to report.
+		//
+		// A negation ("NOT undone", "<> 'pending'") would be WRONG TODAY, not
+		// merely future-hostile: 'undone' has a live writer — 17d's purge
+		// (outbound.Purger.undoLiveVotes) retracts a withdrawn actor's votes
+		// through the upsert — and it records OUR decision to stop counting
+		// at purge time, not the peer's acceptance (store.DeliveredStateUndone).
+		// A negation would resume subtracting a withdrawn actor's votes; this
+		// equality stays correct. A poisoned Undo leaves a delivered row
+		// subtracting forever, which is the same hazard decision 16 cites for
+		// banning queue-history arithmetic: "delivered Likes minus delivered
+		// Undos" gets that row permanently wrong.
+		//
+		// The read takes no row locks. The seed holds the aggregate lock and
+		// reads outbound_votes lock-free; the delivery worker locks
+		// outbound_votes and never touches vote_aggregates — so there is no
+		// cycle, and FOR UPDATE would both create one and park a backfill's
+		// seeding behind in-flight HTTP deliveries.
+		if err := tx.QueryRowContext(ctx, `
 			UPDATE vote_aggregates a
-			SET seeded_upvotes = GREATEST(0, $2 - live.up),
-			    seeded_downvotes = GREATEST(0, $3 - live.down)
+			SET seeded_upvotes = GREATEST(0, $2 - live.up - ours.up),
+			    seeded_downvotes = GREATEST(0, $3 - live.down - ours.down)
 			FROM (
 				SELECT
 					COUNT(*) FILTER (WHERE direction = 'up') AS up,
 					COUNT(*) FILTER (WHERE direction = 'down') AS down
 				FROM vote_events
 				WHERE subject_ap_id = $1 AND NOT undone
-			) live
-			WHERE a.subject_ap_id = $1`,
-			subjectAPID, upvotes, downvotes); err != nil {
+			) live, (
+				SELECT
+					COUNT(*) FILTER (WHERE direction = 'up') AS up,
+					COUNT(*) FILTER (WHERE direction = 'down') AS down
+				FROM outbound_votes
+				WHERE subject_ap_id = $1 AND delivered_state = 'delivered'
+			) ours
+			WHERE a.subject_ap_id = $1
+			RETURNING $2 - live.up - ours.up, $3 - live.down - ours.down,
+			          live.up, live.down, ours.up, ours.down`,
+			subjectAPID, upvotes, downvotes).Scan(
+			&seed.rawUp, &seed.rawDown, &seed.liveUp, &seed.liveDown,
+			&seed.oursUp, &seed.oursDown); err != nil {
 			return fmt.Errorf("seed vote aggregate for %q: %w", subjectAPID, err)
 		}
 		return recomputeAggregate(ctx, tx, subjectAPID)
-	})
+	}); err != nil {
+		return err
+	}
+	a.reportSeed(subjectAPID, upvotes, downvotes, seed)
+	return nil
+}
+
+// seedOutcome is what one committed seed observed: the raw (pre-clamp) signed
+// baselines, and the two subtrahends they were computed from.
+type seedOutcome struct {
+	rawUp, rawDown   int64
+	liveUp, liveDown int64
+	oursUp, oursDown int64
+}
+
+// reportSeed publishes what a COMMITTED seed observed.
+//
+// SeedOursSubtracted is the routine half: how many of our personas' votes this
+// seed believes the origin is holding. It advances on healthy subjects, which
+// is the point — a persistent gap against a Lemmy-side sample is how a silent
+// discard shows up on posts with real scores.
+//
+// The clamp is the exceptional half, and it makes GREATEST(0, …) visible: a
+// negative raw baseline means the origin's total for that direction is smaller
+// than what we can already account for, and the clamp then absorbs the deficit
+// silently. Counters always advance (a sampled counter counts nothing); only
+// the line is sampled, because a backfill seeds one subject per post and a
+// systemic cause produces one line per post for the whole run.
+func (a *Aggregator) reportSeed(subject string, apiUp, apiDown int, seed seedOutcome) {
+	if ours := seed.oursUp + seed.oursDown; ours > 0 {
+		SeedOursSubtracted.Add(ours)
+	}
+	if seed.rawUp >= 0 && seed.rawDown >= 0 {
+		return
+	}
+	SeedBaselineClamped.Add(1)
+	// Both directions are reported, always: when both breach, naming one hides
+	// the other, and the pair is what says whether the cause is directional.
+	direction := directionUp
+	switch {
+	case seed.rawUp < 0 && seed.rawDown < 0:
+		direction = directionUp + "+" + directionDown
+	case seed.rawDown < 0:
+		direction = directionDown
+	}
+	if a.clampLog.Allow(time.Now()) {
+		a.logger.Warn("vote seed baseline clamped: the origin's total is short of the votes we can account for",
+			"subject", subject, "direction", direction,
+			"deficit_up", min64(seed.rawUp, 0), "deficit_down", min64(seed.rawDown, 0),
+			"api_up", apiUp, "api_down", apiDown,
+			"live_up", seed.liveUp, "live_down", seed.liveDown,
+			"ours_up", seed.oursUp, "ours_down", seed.oursDown)
+	}
+}
+
+// min64 reports the smaller of two int64s (the deficit fields log 0 for a
+// direction that did not breach, rather than a positive baseline that would
+// read as one).
+func min64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // ScrubVoter erases every vote_events row a voter ever produced — the vote
@@ -565,6 +854,41 @@ func (a *Aggregator) PruneUndoneEvents(ctx context.Context, cutoff time.Time) (i
 	}
 }
 
+// isOurPersona reports whether the voter is one of the personas the bridge
+// mints and SPEAKS AS (ap_actors) — a vote of ours coming home, which must
+// never be counted as inbound.
+//
+// The probe is the classifier's actor route, so it distinguishes the one thing
+// that matters: a bridged actor is a real fediverse human the bridge MIRRORS
+// into atproto, holding a DID we minted and a bridged_actors row, and their
+// votes are genuine. Matching that table instead would drop every inbound vote
+// in the network and take the served tallies to zero.
+//
+// An error is returned, never absorbed into a verdict: "not ours" on a failed
+// read double-counts our own vote, "ours" loses a real one, and only the retry
+// is honest.
+func (a *Aggregator) isOurPersona(ctx context.Context, voter string) (bool, error) {
+	identity, err := a.voters.Identify(ctx, voter)
+	if err != nil {
+		return false, fmt.Errorf("probe voter %q: %w", voter, err)
+	}
+	return identity.Class == echo.ClassLocalActor, nil
+}
+
+// dropEchoedVote records a suppressed vote: the per-class echo counter plus a
+// sampled INFO line. INFO, not Debug, and deliberately unlike the surrounding
+// vote drops: those are ordinary traffic, while this one is the only visible
+// evidence if the probe ever starts matching genuine voters — which would
+// silently zero every community's tallies.
+func (a *Aggregator) dropEchoedVote(what string, vote *ap.Object, voter, subject, communityIRI string) {
+	echo.CountDrop(echo.ClassLocalActor)
+	if a.echoLog.Allow(time.Now()) {
+		a.logger.Info(what+" dropped: voter is one of our own personas",
+			"activity", vote.ID, "type", vote.Type, "voter", voter,
+			"subject", subject, "community", communityIRI)
+	}
+}
+
 // subjectMapping resolves a voted-on AP id to its materialized mapping. It
 // returns nil (drop the vote) when the subject was never materialized or its
 // mapping is soft-deleted — voting on deleted content stays a no-op.
@@ -591,11 +915,14 @@ func (a *Aggregator) subjectMapping(ctx context.Context, subject string) (*store
 //
 // The binding is by community DID, not IRI authority: Lemmy hosts a post's
 // AP object on the AUTHOR's instance, so a legitimate cross-instance-authored
-// post would fail any SameAuthority(subject, announcer) check. Posts are
-// written into the community's own repo (PLAN.md decision 3), so the
-// mapping's DID IS the community DID. Comments live in the author's repo;
-// their stored record's reply.root strongRef names the thread's root post in
-// the community repo, so one record read recovers the community DID.
+// post would fail any SameAuthority(subject, announcer) check. Which community
+// a subject belongs to is materialize.CommunityDIDOf's question — the same one
+// ingest's announced-delete authorization asks, answered in one place so the
+// two cannot drift into disagreeing about who owns a piece of content.
+//
+// A subject that cannot be bound counts for NOBODY: an unbindable subject is
+// indistinguishable from another community's, and the cost of erring the safe
+// way is a vote that does not move a counter.
 func (a *Aggregator) subjectBelongsToCommunity(ctx context.Context, mapping *store.APObjectMapping, communityIRI string) (bool, error) {
 	community, err := a.communities.GetByAPGroupID(ctx, communityIRI)
 	if errors.IsNotFound(err) {
@@ -604,43 +931,11 @@ func (a *Aggregator) subjectBelongsToCommunity(ctx context.Context, mapping *sto
 	if err != nil {
 		return false, fmt.Errorf("votes: resolve announcing community %s: %w", communityIRI, err)
 	}
-	switch mapping.Collection {
-	case materialize.CollectionPost:
-		return mapping.DID == community.DID, nil
-	case materialize.CollectionComment:
-		record, _, err := a.records.GetRecord(ctx, mapping.DID, mapping.Collection, mapping.RKey)
-		if errors.IsNotFound(err) {
-			return false, nil
-		}
-		if err != nil {
-			return false, fmt.Errorf("votes: read comment record %s: %w", mapping.ATURI, err)
-		}
-		rootDID := replyRootDID(record)
-		return rootDID != "" && rootDID == community.DID, nil
-	default:
-		// Votes bind to posts and comments only.
-		return false, nil
+	subjectCommunityDID, err := materialize.CommunityDIDOf(ctx, a.records, mapping)
+	if err != nil {
+		return false, fmt.Errorf("votes: bind subject %s to a community: %w", mapping.APID, err)
 	}
-}
-
-// replyRootDID extracts the repo DID from a comment record's reply.root
-// strongRef uri (at://did/collection/rkey). Malformed records yield "".
-func replyRootDID(record map[string]any) string {
-	reply, ok := record["reply"].(map[string]any)
-	if !ok {
-		return ""
-	}
-	root, ok := reply["root"].(map[string]any)
-	if !ok {
-		return ""
-	}
-	uri, _ := root["uri"].(string)
-	rest, ok := strings.CutPrefix(uri, "at://")
-	if !ok {
-		return ""
-	}
-	did, _, _ := strings.Cut(rest, "/")
-	return did
+	return subjectCommunityDID != "" && subjectCommunityDID == community.DID, nil
 }
 
 // inTx runs fn inside a transaction, committing on nil and rolling back on

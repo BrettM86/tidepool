@@ -10,15 +10,28 @@
         "properties": {
           "sort": {
             "type": "string",
-            "knownValues": ["hot", "top", "new"],
+            "knownValues": [
+              "hot",
+              "top",
+              "new"
+            ],
             "default": "hot",
-            "description": "Sort order for timeline feed"
+            "description": "Sort order for timeline feed",
+            "maxLength": 64
           },
           "timeframe": {
             "type": "string",
-            "knownValues": ["hour", "day", "week", "month", "year", "all"],
+            "knownValues": [
+              "hour",
+              "day",
+              "week",
+              "month",
+              "year",
+              "all"
+            ],
             "default": "day",
-            "description": "Timeframe for top sorting (only applies when sort=top)"
+            "description": "Timeframe for top sorting (only applies when sort=top)",
+            "maxLength": 64
           },
           "limit": {
             "type": "integer",
@@ -27,7 +40,8 @@
             "default": 15
           },
           "cursor": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 500
           }
         }
       },
@@ -35,7 +49,9 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["feed"],
+          "required": [
+            "feed"
+          ],
           "properties": {
             "feed": {
               "type": "array",
@@ -45,7 +61,8 @@
               }
             },
             "cursor": {
-              "type": "string"
+              "type": "string",
+              "maxLength": 500
             }
           }
         }

@@ -14,6 +14,8 @@ import (
 	"testing"
 
 	"github.com/bluesky-social/indigo/atproto/atcrypto"
+	"github.com/bluesky-social/indigo/atproto/atdata"
+	"github.com/ipfs/go-cid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -288,8 +290,9 @@ func countMappings(t *testing.T, h *harness, apID string) int {
 
 // TestMaterializePostEndToEnd runs the whole pipeline on the captured
 // lemmy.world fixtures: community + author bridged and profiled, post
-// committed into the community repo with author = the person's DID,
-// external-link embed with a fetched thumbnail blob, mapping row written.
+// committed into the AUTHOR's repo as a postv2 (PLAN.md decision 20 —
+// authorship IS the repo, so there is no in-record author), external-link
+// embed with a fetched thumbnail blob, mapping row written.
 func TestMaterializePostEndToEnd(t *testing.T) {
 	h := newHarness(t)
 	h.serveLemmyWorldFixtures()
@@ -301,23 +304,42 @@ func TestMaterializePostEndToEnd(t *testing.T) {
 
 	communityDID := testDIDFor("technology", "lemmy.world")
 	authorDID := testDIDFor("LeftLeaningFreedomFighters", "lemmy.world")
-	assert.Equal(t, communityDID, res.DID, "posts live in the COMMUNITY's repo")
+	assert.Equal(t, authorDID, res.DID, "posts live in the AUTHOR's repo")
 
-	// The record satisfies the Coves post consumer's security checks.
+	// The record satisfies the Coves postv2 consumer's security checks.
 	mapping, err := h.objects.GetByAPID(ctx, pageID)
 	require.NoError(t, err)
-	assert.Equal(t, communityDID, mapping.DID)
+	assert.Equal(t, authorDID, mapping.DID)
 	assert.Equal(t, authorDID, mapping.AuthorDID)
-	assert.Equal(t, CollectionPost, mapping.Collection)
+	assert.Equal(t, CollectionPostV2, mapping.Collection)
 
-	record, _, err := h.manager.GetRecord(ctx, communityDID, CollectionPost, mapping.RKey)
+	record, _, err := h.manager.GetRecord(ctx, authorDID, CollectionPostV2, mapping.RKey)
 	require.NoError(t, err)
-	assert.Equal(t, communityDID, record["community"], "repo DID must equal record.community")
-	assert.Equal(t, authorDID, record["author"])
+	assert.Equal(t, communityDID, record["community"], "the post names the community it was submitted to")
+	assert.NotContains(t, record, "author",
+		"authorship is the repo the record lives in; an author field would invite a consumer to trust it instead")
 	assert.Contains(t, record["title"], "DRAM price-fixing")
+
+	// Bridged provenance: who wrote it upstream, and where it came from.
+	originalAuthor, ok := record["originalAuthor"].(map[string]any)
+	require.True(t, ok, "a bridged postv2 carries originalAuthor")
+	assert.Equal(t, personID, originalAuthor["apId"])
+	assert.Equal(t, "lemmy.world", originalAuthor["instance"])
+	federatedFrom, ok := record["federatedFrom"].(map[string]any)
+	require.True(t, ok, "a bridged postv2 carries federatedFrom")
+	assert.Equal(t, "lemmy", federatedFrom["platform"])
+	assert.Equal(t, "lemmy.world", federatedFrom["instance"])
+
 	embed, ok := record["embed"].(map[string]any)
 	require.True(t, ok, "link post must carry an external embed")
 	assert.Equal(t, "social.coves.embed.external", embed["$type"])
+
+	// The embed's thumbnail blob lives in the repo holding the record — a
+	// blob ref resolves against that repo and nowhere else.
+	blobs := atdata.ExtractBlobs(record)
+	require.NotEmpty(t, blobs, "the fixture post embeds a thumbnail blob")
+	_, _, err = h.manager.GetBlob(ctx, authorDID, cid.Cid(blobs[0].Ref).String())
+	require.NoError(t, err, "the post's embed blob is stored under the author's DID")
 
 	// Profiles exist with rkey self, in the right repos.
 	_, _, err = h.manager.GetRecord(ctx, communityDID, CollectionCommunityProfile, ProfileRKey)
@@ -357,7 +379,7 @@ func TestEmissionOrdering(t *testing.T) {
 	}
 	communityProfileSeq := seqOf(CollectionCommunityProfile)
 	actorProfileSeq := seqOf(CollectionActorProfile)
-	postSeq := seqOf(CollectionPost)
+	postSeq := seqOf(CollectionPostV2)
 
 	assert.Less(t, communityProfileSeq, postSeq,
 		"community profile must be committed before the post that references it")
@@ -497,18 +519,29 @@ func TestOversizedOrWrongTypeMediaDropped(t *testing.T) {
 // the whole ordering key off into poison over a perfectly ordinary post. The
 // group in `to` answers instead.
 func TestPublicOnlyAudienceFallsBackToAddressing(t *testing.T) {
-	h := newHarness(t)
-	h.serveLemmyWorldFixtures()
-	ctx := context.Background()
-
 	for _, spelling := range []string{"as:Public", "Public", ap.PublicAudience} {
+		// A FRESH harness per spelling: the community is now a record FIELD
+		// rather than the record's repo, and carry-forward pins that field
+		// after the first materialization — so reusing one harness would let
+		// the first spelling's answer stand in for the other two.
+		h := newHarness(t)
+		h.serveLemmyWorldFixtures()
+		ctx := context.Background()
+
 		pageObj := loadFixtureObject(t, "page_lemmy_world.json")
 		pageObj.Audience = ap.Audience{spelling}
 		pageObj.To = ap.Audience{groupID, ap.PublicAudience}
 
 		res, err := h.m.MaterializePost(ctx, pageObj)
 		require.NoError(t, err, "audience %q must not be mistaken for a community", spelling)
-		assert.Equal(t, testDIDFor("technology", "lemmy.world"), res.DID,
-			"the post lands in the community named by to")
+		assert.Equal(t, testDIDFor("LeftLeaningFreedomFighters", "lemmy.world"), res.DID,
+			"the post lands in the author's repo")
+
+		mapping, err := h.objects.GetByAPID(ctx, pageID)
+		require.NoError(t, err)
+		record, _, err := h.manager.GetRecord(ctx, mapping.DID, mapping.Collection, mapping.RKey)
+		require.NoError(t, err)
+		assert.Equal(t, testDIDFor("technology", "lemmy.world"), record["community"],
+			"the post names the community found in `to`, not the public collection")
 	}
 }

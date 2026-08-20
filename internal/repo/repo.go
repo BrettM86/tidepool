@@ -225,6 +225,272 @@ func (m *Manager) putRecord(ctx context.Context, did, collection, rkey string, r
 	return m.commitWrite(ctx, did, collection, rkey, &c, recordBytes, pre, sideEffect)
 }
 
+// RecordOp is one record mutation in a multi-op commit. Action OpActionDelete
+// removes the record; any other action is a put of Record.
+//
+// CREATE AND UPDATE ARE NOT DISTINGUISHED. Both upsert, and the action that
+// reaches the firehose is derived from the MST — whether a value was already
+// at that path — not from what the caller wrote here. A caller wanting a
+// GUARDED create asks for it with ExpectPrevCID pointing at "", which requires
+// the record to be absent at commit time; spelling the Action "create" asserts
+// nothing.
+//
+// ExpectPrevCID is an optional per-op CAS precondition (nil = none; a pointer
+// to "" requires the record to not currently exist), mirroring putRecord's
+// internal casPrecondition.
+type RecordOp struct {
+	Action        OpAction
+	Collection    string
+	RKey          string
+	Record        map[string]any
+	ExpectPrevCID *string
+}
+
+// ApplyOps commits several record ops on ONE repo in ONE commit — the
+// primitive a moderation transition needs. Deleting an acceptance and writing
+// a removal as two commits puts a window on the firehose where a consumer sees
+// the post as neither accepted nor removed; one commit has no such window.
+//
+// It is commitWrite's discipline generalized, not a second implementation:
+// same per-DID mutex and global advisory lock, same repo_state FOR UPDATE,
+// same tree cache, same signed-commit tail (finalizeCommit). Where it
+// deliberately DIFFERS from the single-op path:
+//
+//   - A delete of a record that is not there is INERT, not an error. These
+//     batches are re-run by heal flows, and the second run necessarily finds
+//     the delete already applied; erroring would abort the batch and stop the
+//     ops beside it from healing. DeleteRecord keeps its NotFound because a
+//     caller asking to delete one specific record wants to hear that.
+//   - Key use is decided by the BATCH, not per op: any put makes the whole
+//     batch a write. A batch that asked for KeyUseDelete because it happens to
+//     contain a delete would smuggle a put past a tombstoned actor's consent
+//     gate.
+//
+// Every put is validated and encoded BEFORE the MST is touched, so the common
+// rejection costs no commit work; anything that fails later rolls back with
+// the transaction, leaving neither a record change nor a firehose event.
+func (m *Manager) ApplyOps(ctx context.Context, did string, ops []RecordOp) (*CommitResult, error) {
+	return m.ApplyOpsTx(ctx, did, ops, nil)
+}
+
+// ApplyOpsTx is ApplyOps with a side effect executed inside the commit
+// transaction (see TxSideEffect). The side effect runs on BOTH the committed
+// branch (after the ops write, before COMMIT) AND the all-inert NoOp branch
+// (every op turned out to change nothing, so there is no new commit — but the
+// side effect must still run and be made durable, because it carries the
+// at-least-once outbound enqueue a redelivery has to re-fire). A nil sideEffect
+// is exactly ApplyOps.
+func (m *Manager) ApplyOpsTx(ctx context.Context, did string, ops []RecordOp, sideEffect TxSideEffect) (*CommitResult, error) {
+	if len(ops) == 0 {
+		return nil, errors.NewValidationError("ops", "must not be empty")
+	}
+
+	prepared := make([]preparedOp, 0, len(ops))
+	seen := make(map[string]struct{}, len(ops))
+	var parsedDID syntax.DID
+	use := KeyUseDelete
+	for _, op := range ops {
+		path, parsed, err := validatePath(did, op.Collection, op.RKey)
+		if err != nil {
+			return nil, err
+		}
+		// Two ops on ONE record in ONE commit is a caller bug, not a
+		// composition. The MST would keep only the last write, the firehose op
+		// list would disagree with the diff about how many things happened, and
+		// the ops are applied in slice order — so which one survived would be
+		// decided by argument order rather than by anything the caller meant.
+		// Refused at validation, before any of it can reach the tree.
+		if _, dup := seen[path]; dup {
+			return nil, errors.NewValidationError("ops",
+				fmt.Sprintf("path %s appears more than once in one batch", path))
+		}
+		seen[path] = struct{}{}
+		parsedDID = parsed
+		next := preparedOp{path: path, expectPrevCID: op.ExpectPrevCID}
+		if op.Action != OpActionDelete {
+			// Same gate PutRecord applies, run here so a malformed record in
+			// op 5 cannot be discovered halfway through mutating the tree.
+			if err := validateRecord(op.Record); err != nil {
+				return nil, err
+			}
+			recordBytes, err := atdata.MarshalCBOR(op.Record)
+			if err != nil {
+				return nil, fmt.Errorf("repo: encode record %s: %w", path, err)
+			}
+			c, err := cidForBlock(recordBytes)
+			if err != nil {
+				return nil, err
+			}
+			next.newCID, next.bytes = &c, recordBytes
+			use = KeyUseWrite
+		}
+		prepared = append(prepared, next)
+	}
+
+	lock := m.lockFor(did)
+	lock.Lock()
+	defer lock.Unlock()
+
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("repo: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx,
+		`SELECT pg_advisory_xact_lock($1)`, commitAdvisoryLockKey); err != nil {
+		return nil, fmt.Errorf("repo: take commit advisory lock: %w", err)
+	}
+
+	// The consent gate; see commitWrite for the residual TOCTOU this narrows.
+	signingKey, err := m.keys.SigningKey(ctx, did, use)
+	if err != nil {
+		return nil, err
+	}
+
+	state, err := readRepoState(ctx, tx, did, true)
+	if err != nil && !errors.IsNotFound(err) {
+		return nil, err
+	}
+
+	var tree *mst.Tree
+	var prevRev string
+	var prevData *cid.Cid
+	if state == nil {
+		if use == KeyUseDelete {
+			// Nothing exists and nothing is being written: every op is a
+			// delete against a repo with no records, so the whole batch is
+			// inert. Genesis is reserved for commits that put something.
+			res := &CommitResult{NoOp: true}
+			if sideEffect != nil {
+				// The at-least-once side effect (the outbound enqueue) still runs
+				// and must be made durable even though no repo commit happened —
+				// a retraction whose community repo was never created must still
+				// enqueue its Delete{Page}. Mirrors the len(emitted)==0 branch.
+				if err := sideEffect(ctx, tx, res); err != nil {
+					return nil, err
+				}
+				if err := tx.Commit(); err != nil {
+					return nil, fmt.Errorf("repo: commit genesis-delete side effect for %s: %w", did, err)
+				}
+			}
+			return res, nil
+		}
+		empty := mst.NewEmptyTree()
+		tree = &empty
+	} else {
+		prevRev = state.rev
+		if cached, root, ok := m.treeCache.take(did, state.headCID); ok {
+			tree = cached
+			headData := root
+			prevData = &headData
+		} else {
+			var headData cid.Cid
+			tree, headData, err = loadTree(ctx, tx, did, state.headCID)
+			if err != nil {
+				return nil, err
+			}
+			prevData = &headData
+		}
+	}
+
+	// One tree, mutated by every op in turn, so the batch produces a single
+	// MST diff and a single commit.
+	var emitted []Op
+	var records []pendingRecord
+	for _, op := range prepared {
+		applied, err := indigorepo.ApplyOp(tree, op.path, op.newCID)
+		if err != nil {
+			return nil, fmt.Errorf("repo: apply op %s: %w", op.path, err)
+		}
+		// Preconditions are checked even for ops that turn out inert: a caller
+		// asserting what the record was is asserting it either way.
+		if op.expectPrevCID != nil {
+			var current string
+			if applied.Prev != nil {
+				current = applied.Prev.String()
+			}
+			if current != *op.expectPrevCID {
+				return nil, fmt.Errorf("repo: precondition for %s/%s: expected prev cid %q, have %q: %w",
+					did, op.path, *op.expectPrevCID, current, ErrPreconditionFailed)
+			}
+		}
+		switch {
+		case op.newCID == nil && applied.Prev == nil:
+			continue // tolerated missing delete: nothing happened, report nothing
+		case op.newCID != nil && applied.Prev != nil && applied.Prev.Equals(*op.newCID):
+			continue // byte-identical re-put
+		}
+		emitted = append(emitted, opFromIndigoOp(applied))
+		if op.newCID != nil {
+			records = append(records, pendingRecord{cid: *op.newCID, bytes: op.bytes})
+		}
+	}
+
+	if len(emitted) == 0 {
+		// Every op was inert, so there is nothing to commit and nothing to put
+		// on the firehose: redelivery of an already-applied batch must not
+		// churn the repo. The transaction rolls back having written nothing.
+		//
+		// state is non-nil here, and not by luck: a nil state means the repo
+		// does not exist, which the genesis branch above already returned from
+		// unless the batch contains a put — and a put against an empty tree
+		// always emits (it has no prior value to be identical to). So reaching
+		// this line with every op inert implies the repo existed.
+		res := &CommitResult{CommitCID: state.headCID, Rev: prevRev, NoOp: true}
+		if prevData != nil {
+			// The tree is untouched by inert ops, so it still represents this
+			// head exactly and can go back in the cache.
+			m.cacheTree(did, state.headCID, *prevData, tree)
+		}
+		if sideEffect != nil {
+			// The side effect (the at-least-once outbound enqueue) still runs
+			// and must still be durable, so this — otherwise write-free —
+			// transaction commits even though no repo commit happened. A
+			// redelivery whose acceptance record is byte-identical must re-fire
+			// the enqueue; dedupe is the peer's job. The head is unchanged
+			// whatever the side effect does, so the cacheTree above stays valid.
+			if err := sideEffect(ctx, tx, res); err != nil {
+				return nil, err
+			}
+			if err := tx.Commit(); err != nil {
+				return nil, fmt.Errorf("repo: commit no-op side effect for %s: %w", did, err)
+			}
+		}
+		return res, nil
+	}
+
+	res, newRoot, err := m.finalizeCommit(ctx, tx, did, parsedDID, signingKey,
+		tree, prevRev, prevData, records, emitted)
+	if err != nil {
+		return nil, err
+	}
+	if sideEffect != nil {
+		// Inside the transaction, after the ops write and before COMMIT: a
+		// failing side effect rolls the record ops back too — the acceptance
+		// commit and the outbound enqueue land together or not at all.
+		if err := sideEffect(ctx, tx, res); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("repo: commit tx for %s: %w", did, err)
+	}
+	m.cacheTree(did, res.CommitCID, newRoot, tree)
+
+	m.logger.Debug("repo batch commit",
+		"did", did, "rev", res.Rev, "commit", res.CommitCID, "ops", len(emitted), "seq", res.Seq)
+	return res, nil
+}
+
+// preparedOp is one RecordOp validated and encoded ahead of the commit locks.
+type preparedOp struct {
+	path          string
+	newCID        *cid.Cid // nil for a delete
+	bytes         []byte
+	expectPrevCID *string
+}
+
 // DeleteRecord removes a record and commits the change. A missing record —
 // or a repo that does not exist yet — is an error satisfying
 // errors.IsNotFound. The result's RecordCID is empty.
@@ -451,99 +717,14 @@ func (m *Manager) commitWrite(ctx context.Context, did, collection, rkey string,
 		return res, nil
 	}
 
-	// New blocks this commit introduces: MST diff nodes + the record block
-	// (for puts) + the commit block, captured in order for the CAR slice.
-	newBlocks := newMemBlockstore()
-	newRoot, err := tree.WriteDiffBlocks(ctx, newBlocks)
-	if err != nil {
-		return nil, fmt.Errorf("repo: write MST diff: %w", err)
-	}
-
+	var records []pendingRecord
 	if newCID != nil {
-		blk, err := blockformat.NewBlockWithCid(recordBytes, *newCID)
-		if err != nil {
-			return nil, fmt.Errorf("repo: build record block: %w", err)
-		}
-		if err := newBlocks.Put(ctx, blk); err != nil {
-			return nil, err
-		}
+		records = append(records, pendingRecord{cid: *newCID, bytes: recordBytes})
 	}
-
-	rev, err := NextRev(prevRev)
-	if err != nil {
-		return nil, fmt.Errorf("repo: next rev after %q for %s: %w", prevRev, did, err)
-	}
-
-	commit := indigorepo.Commit{
-		DID:     parsedDID.String(),
-		Version: indigorepo.ATPROTO_REPO_VERSION,
-		Prev:    nil, // v3 commits carry no prev pointer; prevData rides the firehose event
-		Data:    *newRoot,
-		Rev:     rev.String(),
-	}
-	if err := commit.Sign(signingKey); err != nil {
-		return nil, fmt.Errorf("repo: sign commit for %s: %w", did, err)
-	}
-	var commitBuf bytes.Buffer
-	if err := commit.MarshalCBOR(&commitBuf); err != nil {
-		return nil, fmt.Errorf("repo: encode commit: %w", err)
-	}
-	commitCID, err := cidForBlock(commitBuf.Bytes())
+	res, newRoot, err := m.finalizeCommit(ctx, tx, did, parsedDID, signingKey,
+		tree, prevRev, prevData, records, []Op{opFromIndigoOp(op)})
 	if err != nil {
 		return nil, err
-	}
-	commitBlock, err := blockformat.NewBlockWithCid(commitBuf.Bytes(), commitCID)
-	if err != nil {
-		return nil, fmt.Errorf("repo: build commit block: %w", err)
-	}
-	if err := newBlocks.Put(ctx, commitBlock); err != nil {
-		return nil, err
-	}
-
-	for _, blk := range newBlocks.ordered() {
-		// ON CONFLICT refreshes created_at rather than DO NOTHING: blocks are
-		// content-addressed so the bytes are identical, but the timestamp is
-		// the GC retention floor (see gc.go). A block re-written by this commit
-		// — e.g. an MST node whose CID reappears after churn — must read as
-		// "written now" so the GC floor protects it even if an in-flight sweep
-		// computed it as unreachable from an older head. Refreshing created_at
-		// can only make GC MORE conservative, never delete a live block sooner.
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO blocks (did, cid, bytes) VALUES ($1, $2, $3)
-			 ON CONFLICT (did, cid) DO UPDATE SET created_at = clock_timestamp()`,
-			did, blk.Cid().String(), blk.RawData()); err != nil {
-			return nil, fmt.Errorf("repo: store block %s: %w", blk.Cid(), err)
-		}
-	}
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO repo_state (did, head_cid, rev) VALUES ($1, $2, $3)
-		ON CONFLICT (did) DO UPDATE SET
-			head_cid = EXCLUDED.head_cid,
-			rev = EXCLUDED.rev,
-			updated_at = CURRENT_TIMESTAMP`,
-		did, commitCID.String(), rev.String()); err != nil {
-		return nil, fmt.Errorf("repo: update repo_state for %s: %w", did, err)
-	}
-
-	// The firehose event rides the same transaction: a commit either
-	// appears on the stream exactly once or does not exist at all.
-	seq, err := appendFirehoseEvent(ctx, tx, firehoseEvent{
-		did:       did,
-		commitCID: commitCID,
-		prevData:  prevData,
-		sinceRev:  prevRev, // empty on genesis → NULL
-		rev:       rev.String(),
-		ops:       []Op{opFromIndigoOp(op)},
-		blocks:    newBlocks.ordered(),
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	res := &CommitResult{
-		CommitCID: commitCID.String(),
-		Rev:       rev.String(),
-		Seq:       seq,
 	}
 	if newCID != nil {
 		res.RecordCID = newCID.String()
@@ -564,11 +745,125 @@ func (m *Manager) commitWrite(ctx context.Context, did, collection, rkey string,
 	// The commit is durable: the mutated tree now exactly represents the new
 	// head, so cache it for the next commit (skips a full-tree reload). Cached
 	// only after a successful Commit — never for a rolled-back write.
-	m.cacheTree(did, commitCID.String(), *newRoot, tree)
+	m.cacheTree(did, res.CommitCID, newRoot, tree)
 
 	m.logger.Debug("repo commit",
-		"did", did, "rev", rev.String(), "commit", commitCID.String(), "path", path, "seq", seq)
+		"did", did, "rev", res.Rev, "commit", res.CommitCID, "path", path, "seq", res.Seq)
 	return res, nil
+}
+
+// pendingRecord is a record block a commit is about to introduce.
+type pendingRecord struct {
+	cid   cid.Cid
+	bytes []byte
+}
+
+// finalizeCommit is the shared tail of every commit path: turn a mutated tree
+// into a signed commit and persist blocks, head, and the firehose event in the
+// caller's transaction. It is deliberately decision-free — the caller has
+// already decided WHAT changed, which key use it needs, and whether anything
+// changed at all — so single-op and multi-op commits produce byte-identical
+// structure rather than two implementations that drift.
+//
+// The block ORDER is part of the contract: MST diff nodes, then record blocks,
+// then the commit block, which is the order the CAR slice on the firehose
+// event must carry.
+func (m *Manager) finalizeCommit(ctx context.Context, tx *sql.Tx, did string, parsedDID syntax.DID,
+	signingKey atcrypto.PrivateKey, tree *mst.Tree, prevRev string, prevData *cid.Cid,
+	records []pendingRecord, ops []Op) (*CommitResult, cid.Cid, error) {
+
+	newBlocks := newMemBlockstore()
+	newRoot, err := tree.WriteDiffBlocks(ctx, newBlocks)
+	if err != nil {
+		return nil, cid.Cid{}, fmt.Errorf("repo: write MST diff: %w", err)
+	}
+
+	for _, rec := range records {
+		blk, err := blockformat.NewBlockWithCid(rec.bytes, rec.cid)
+		if err != nil {
+			return nil, cid.Cid{}, fmt.Errorf("repo: build record block: %w", err)
+		}
+		if err := newBlocks.Put(ctx, blk); err != nil {
+			return nil, cid.Cid{}, err
+		}
+	}
+
+	rev, err := NextRev(prevRev)
+	if err != nil {
+		return nil, cid.Cid{}, fmt.Errorf("repo: next rev after %q for %s: %w", prevRev, did, err)
+	}
+
+	commit := indigorepo.Commit{
+		DID:     parsedDID.String(),
+		Version: indigorepo.ATPROTO_REPO_VERSION,
+		Prev:    nil, // v3 commits carry no prev pointer; prevData rides the firehose event
+		Data:    *newRoot,
+		Rev:     rev.String(),
+	}
+	if err := commit.Sign(signingKey); err != nil {
+		return nil, cid.Cid{}, fmt.Errorf("repo: sign commit for %s: %w", did, err)
+	}
+	var commitBuf bytes.Buffer
+	if err := commit.MarshalCBOR(&commitBuf); err != nil {
+		return nil, cid.Cid{}, fmt.Errorf("repo: encode commit: %w", err)
+	}
+	commitCID, err := cidForBlock(commitBuf.Bytes())
+	if err != nil {
+		return nil, cid.Cid{}, err
+	}
+	commitBlock, err := blockformat.NewBlockWithCid(commitBuf.Bytes(), commitCID)
+	if err != nil {
+		return nil, cid.Cid{}, fmt.Errorf("repo: build commit block: %w", err)
+	}
+	if err := newBlocks.Put(ctx, commitBlock); err != nil {
+		return nil, cid.Cid{}, err
+	}
+
+	for _, blk := range newBlocks.ordered() {
+		// ON CONFLICT refreshes created_at rather than DO NOTHING: blocks are
+		// content-addressed so the bytes are identical, but the timestamp is
+		// the GC retention floor (see gc.go). A block re-written by this commit
+		// — e.g. an MST node whose CID reappears after churn — must read as
+		// "written now" so the GC floor protects it even if an in-flight sweep
+		// computed it as unreachable from an older head. Refreshing created_at
+		// can only make GC MORE conservative, never delete a live block sooner.
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO blocks (did, cid, bytes) VALUES ($1, $2, $3)
+			 ON CONFLICT (did, cid) DO UPDATE SET created_at = clock_timestamp()`,
+			did, blk.Cid().String(), blk.RawData()); err != nil {
+			return nil, cid.Cid{}, fmt.Errorf("repo: store block %s: %w", blk.Cid(), err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO repo_state (did, head_cid, rev) VALUES ($1, $2, $3)
+		ON CONFLICT (did) DO UPDATE SET
+			head_cid = EXCLUDED.head_cid,
+			rev = EXCLUDED.rev,
+			updated_at = CURRENT_TIMESTAMP`,
+		did, commitCID.String(), rev.String()); err != nil {
+		return nil, cid.Cid{}, fmt.Errorf("repo: update repo_state for %s: %w", did, err)
+	}
+
+	// The firehose event rides the same transaction: a commit either
+	// appears on the stream exactly once or does not exist at all.
+	seq, err := appendFirehoseEvent(ctx, tx, firehoseEvent{
+		did:       did,
+		commitCID: commitCID,
+		prevData:  prevData,
+		sinceRev:  prevRev, // empty on genesis → NULL
+		rev:       rev.String(),
+		ops:       ops,
+		blocks:    newBlocks.ordered(),
+	})
+	if err != nil {
+		return nil, cid.Cid{}, err
+	}
+
+	return &CommitResult{
+		CommitCID: commitCID.String(),
+		Rev:       rev.String(),
+		Seq:       seq,
+	}, *newRoot, nil
 }
 
 // cacheTree installs a decoded tree into the per-DID MST cache for reuse by the

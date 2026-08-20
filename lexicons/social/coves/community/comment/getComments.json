@@ -7,7 +7,9 @@
       "description": "Get comments for a post with threading and sorting support. Supports hot/top/new sorting, configurable nesting depth, and pagination.",
       "parameters": {
         "type": "params",
-        "required": ["post"],
+        "required": [
+          "post"
+        ],
         "properties": {
           "post": {
             "type": "string",
@@ -22,13 +24,26 @@
           "sort": {
             "type": "string",
             "default": "hot",
-            "knownValues": ["hot", "top", "new"],
-            "description": "Sort order: hot (trending), top (highest score), new (most recent)"
+            "knownValues": [
+              "hot",
+              "top",
+              "new"
+            ],
+            "description": "Sort order: hot (trending), top (highest score), new (most recent)",
+            "maxLength": 64
           },
           "timeframe": {
             "type": "string",
-            "knownValues": ["hour", "day", "week", "month", "year", "all"],
-            "description": "Timeframe for 'top' sort. Ignored for other sort types."
+            "knownValues": [
+              "hour",
+              "day",
+              "week",
+              "month",
+              "year",
+              "all"
+            ],
+            "description": "Timeframe for 'top' sort. Ignored for other sort types.",
+            "maxLength": 64
           },
           "depth": {
             "type": "integer",
@@ -46,7 +61,8 @@
           },
           "cursor": {
             "type": "string",
-            "description": "Pagination cursor from previous response"
+            "description": "Pagination cursor from previous response",
+            "maxLength": 500
           }
         }
       },
@@ -54,7 +70,10 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["comments", "post"],
+          "required": [
+            "comments",
+            "post"
+          ],
           "properties": {
             "comments": {
               "type": "array",
@@ -66,12 +85,13 @@
             },
             "post": {
               "type": "ref",
-              "ref": "social.coves.community.post.get#postView",
+              "ref": "social.coves.community.post.defs#postView",
               "description": "The post these comments belong to"
             },
             "cursor": {
               "type": "string",
-              "description": "Pagination cursor for fetching next page of top-level comments"
+              "description": "Pagination cursor for fetching next page of top-level comments",
+              "maxLength": 500
             }
           }
         }

@@ -23,7 +23,8 @@
             },
             "reason": {
               "type": "string",
-              "maxLength": 2000,
+              "maxGraphemes": 2000,
+              "maxLength": 20000,
               "description": "Reason for the ban"
             },
             "duration": {
@@ -42,7 +43,7 @@
           "properties": {
             "ban": {
               "type": "ref",
-              "ref": "social.coves.moderation.ban"
+              "ref": "social.coves.moderation.defs#banView"
             }
           }
         }

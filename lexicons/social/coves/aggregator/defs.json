@@ -5,7 +5,11 @@
     "aggregatorView": {
       "type": "object",
       "description": "Detailed view of an aggregator service",
-      "required": ["did", "displayName", "createdAt"],
+      "required": [
+        "did",
+        "displayName",
+        "createdAt"
+      ],
       "properties": {
         "did": {
           "type": "string",
@@ -57,7 +61,12 @@
     "aggregatorViewDetailed": {
       "type": "object",
       "description": "Detailed view of an aggregator with stats",
-      "required": ["did", "displayName", "createdAt", "stats"],
+      "required": [
+        "did",
+        "displayName",
+        "createdAt",
+        "stats"
+      ],
       "properties": {
         "did": {
           "type": "string",
@@ -105,7 +114,10 @@
     "aggregatorStats": {
       "type": "object",
       "description": "Statistics about an aggregator's usage",
-      "required": ["communitiesUsing", "postsCreated"],
+      "required": [
+        "communitiesUsing",
+        "postsCreated"
+      ],
       "properties": {
         "communitiesUsing": {
           "type": "integer",
@@ -122,7 +134,12 @@
     "authorizationView": {
       "type": "object",
       "description": "View of an aggregator authorization for a community",
-      "required": ["aggregatorDid", "communityDid", "enabled", "createdAt"],
+      "required": [
+        "aggregatorDid",
+        "communityDid",
+        "enabled",
+        "createdAt"
+      ],
       "properties": {
         "aggregatorDid": {
           "type": "string",
@@ -141,7 +158,8 @@
         },
         "communityName": {
           "type": "string",
-          "description": "Display name of the community"
+          "description": "Display name of the community",
+          "maxLength": 1280
         },
         "enabled": {
           "type": "boolean",
@@ -180,7 +198,11 @@
     "communityAuthView": {
       "type": "object",
       "description": "Aggregator's view of authorization for a community (used by aggregators querying their authorizations)",
-      "required": ["aggregator", "enabled", "createdAt"],
+      "required": [
+        "aggregator",
+        "enabled",
+        "createdAt"
+      ],
       "properties": {
         "aggregator": {
           "type": "ref",
@@ -208,11 +230,16 @@
     "apiKeyView": {
       "type": "object",
       "description": "View of an API key's metadata. The actual key value is never returned after initial creation.",
-      "required": ["prefix", "createdAt", "isRevoked"],
+      "required": [
+        "prefix",
+        "createdAt",
+        "isRevoked"
+      ],
       "properties": {
         "prefix": {
           "type": "string",
-          "description": "First 12 characters of the key (e.g., 'ckapi_ab12cd') for identification in logs and UI"
+          "description": "First 12 characters of the key (e.g., 'ckapi_ab12cd') for identification in logs and UI",
+          "maxLength": 64
         },
         "createdAt": {
           "type": "string",

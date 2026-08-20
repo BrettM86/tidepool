@@ -20,25 +20,27 @@
               "type": "string",
               "maxGraphemes": 256,
               "maxLength": 2560,
-              "description": "User bio with rich text support"
+              "description": "User bio. Stored as the `description` field of the social.coves.actor.profile record."
             },
-            "bioFacets": {
-              "type": "array",
-              "description": "Rich text annotations for bio",
-              "items": {
-                "type": "ref",
-                "ref": "social.coves.richtext.facet"
-              }
+            "avatarBlob": {
+              "type": "string",
+              "maxLength": 1400000,
+              "description": "Base64-encoded avatar image data (png, jpeg, or webp; decoded size limit 1MB)"
             },
-            "avatar": {
-              "type": "blob",
-              "accept": ["image/png", "image/jpeg", "image/webp"],
-              "maxSize": 1000000
+            "avatarMimeType": {
+              "type": "string",
+              "maxLength": 128,
+              "description": "MIME type of the avatar image (image/png, image/jpeg, image/webp)"
             },
-            "banner": {
-              "type": "blob",
-              "accept": ["image/png", "image/jpeg", "image/webp"],
-              "maxSize": 2000000
+            "bannerBlob": {
+              "type": "string",
+              "maxLength": 2800000,
+              "description": "Base64-encoded banner image data (png, jpeg, or webp; decoded size limit 2MB)"
+            },
+            "bannerMimeType": {
+              "type": "string",
+              "maxLength": 128,
+              "description": "MIME type of the banner image (image/png, image/jpeg, image/webp)"
             }
           }
         }
@@ -47,7 +49,10 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["uri", "cid"],
+          "required": [
+            "uri",
+            "cid"
+          ],
           "properties": {
             "uri": {
               "type": "string",

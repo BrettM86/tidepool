@@ -5,10 +5,13 @@ import (
 	"context"
 	"crypto/rsa"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base32"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,7 +23,9 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/require"
 
+	"tidepool/internal/accept"
 	"tidepool/internal/ap"
+	"tidepool/internal/echo"
 	"tidepool/internal/identity"
 	"tidepool/internal/materialize"
 	"tidepool/internal/repo"
@@ -142,24 +147,52 @@ type recordingVotes struct {
 	mu        sync.Mutex
 	applied   []string
 	retracted []string
+	// delegate, when set, receives the hand-off after it is recorded: the echo
+	// tests need the REAL aggregator behind the dispatcher, because the
+	// aggregator-level voter guard is a different guard from the classifier and
+	// only vote_events can tell them apart.
+	delegate VoteAggregator
 }
 
-func (v *recordingVotes) ApplyVote(_ context.Context, vote *ap.Object, _ string) error {
+func (v *recordingVotes) ApplyVote(ctx context.Context, vote *ap.Object, communityIRI string) error {
 	v.mu.Lock()
-	defer v.mu.Unlock()
 	v.applied = append(v.applied, vote.Type+" "+refID(vote.Object))
+	delegate := v.delegate
+	v.mu.Unlock()
+	if delegate != nil {
+		return delegate.ApplyVote(ctx, vote, communityIRI)
+	}
 	return nil
 }
 
-func (v *recordingVotes) RetractVote(_ context.Context, vote *ap.Object, _ string) error {
+func (v *recordingVotes) RetractVote(ctx context.Context, vote *ap.Object, communityIRI string) error {
 	v.mu.Lock()
-	defer v.mu.Unlock()
 	v.retracted = append(v.retracted, vote.Type+" "+refID(vote.Object))
+	delegate := v.delegate
+	v.mu.Unlock()
+	if delegate != nil {
+		return delegate.RetractVote(ctx, vote, communityIRI)
+	}
 	return nil
 }
 
 type harness struct {
 	t *testing.T
+
+	// db and custodian are the raw seams the outbound half of the echo
+	// acceptance test needs (it wires the real enqueuer/worker against this
+	// same database and unseals the personas' AP keys).
+	db        *sql.DB
+	custodian *identity.Custodian
+	// classifier is the harness's echo classifier over the real stores. It is
+	// kept so a rebuilt dispatcher keeps the SAME guard: echo suppression is
+	// mandatory, and a swap that quietly dropped it would disable it for the
+	// swapped test only.
+	classifier EchoClassifier
+	// logs captures the dispatcher's own log output, so a test can assert that
+	// a drop was INTENTIONAL — an incidental drop and a deliberate one are
+	// indistinguishable from state alone.
+	logs *syncBuffer
 
 	router      chi.Router
 	queue       *Queue
@@ -213,7 +246,34 @@ func newHarness(t *testing.T) *harness {
 	database := testutil.DB(t)
 	testutil.Truncate(t, database,
 		"ap_objects", "bridged_actors", "communities", "inbox_events",
-		"ap_tombstones", "blocks", "repo_state", "firehose_events", "blobs")
+		"ap_tombstones", "blocks", "repo_state", "firehose_events", "blobs",
+		// The outbound half (echo acceptance test): a leftover activity or
+		// persona from another package's run would make an echo look like
+		// someone else's.
+		"outbound_deliveries", "outbound_activities", "outbound_objects",
+		"outbound_votes", "ap_actors", "vote_events", "vote_aggregates",
+		// Consumer + engine state, for the tests that drive a real Jetstream
+		// commit through the acceptance engine. The rev gate is the one that
+		// bites: a leftover jetstream_record_revs row makes the SECOND test to
+		// use a given rev skip its own fixture as already-applied, and the
+		// failure surfaces as a missing acceptance record rather than as
+		// anything about revs.
+		"jetstream_record_revs", "jetstream_dead_letters", "consumer_cursors",
+		"admissions", "federation_prefs",
+		// The moderation state the bridge owns (migration 025). It MUST be
+		// cleared: the moderation fixtures' at-uris are package-level constants,
+		// so a lock left by one run refuses the next run's comment before the
+		// test that locks it has run — green first, red second, which a single CI
+		// run never sees.
+		"object_moderation",
+		// Bans (migration 027) are the same trap one turn worse. The moderation
+		// fixtures' community and author DIDs are package constants, so a
+		// standing ban refuses the NEXT test's post at admission — and because
+		// nothing here truncated it, a row survived across `go test`
+		// invocations, poisoning tests that run BEFORE the ban tests as well as
+		// after. The failure reads as "my post was not accepted", which names
+		// neither bans nor the test that left one.
+		"community_bans")
 
 	custodian, err := identity.NewCustodian(testKEK)
 	require.NoError(t, err)
@@ -227,6 +287,8 @@ func newHarness(t *testing.T) *harness {
 
 	h := &harness{
 		t:           t,
+		db:          database,
+		custodian:   custodian,
 		objects:     objects,
 		actors:      actors,
 		communities: communities,
@@ -271,12 +333,24 @@ func newHarness(t *testing.T) *harness {
 
 	h.minter = &fakeMinter{custodian: custodian}
 	h.mat, err = materialize.New(materialize.Options{
-		Fetcher:          h.client,
-		Objects:          objects,
-		Actors:           actors,
-		Communities:      communities,
-		Repos:            manager,
-		Minter:           h.minter,
+		Fetcher:     h.client,
+		Objects:     objects,
+		Actors:      actors,
+		Communities: communities,
+		Repos:       manager,
+		Minter:      h.minter,
+		// Wired because PRODUCTION wires it: without it restorePin's entire
+		// bridge-origin branch takes the outbound == nil warn-and-refuse path,
+		// so the origin dispatch, the tombstone refusal and the empty-CID
+		// refusal are all dead code in every ingest test — passing by never
+		// running.
+		OutboundObjects: store.NewOutboundObjects(database),
+		// Same rule, same reason (main.go passes *accept.Admissions here): with
+		// a nil ledger restorePin silently takes its LastCID FALLBACK, so the
+		// primary source is never exercised and a restore pins whatever was last
+		// federated — which is the pre-removal version exactly when an author
+		// edited while removed.
+		Ledger:           accept.NewAdmissions(database),
 		ServiceDID:       testServiceDID,
 		StrictValidation: true,
 	})
@@ -284,6 +358,17 @@ func newHarness(t *testing.T) *harness {
 
 	h.backfills = &recordingBackfill{}
 	h.votes = &recordingVotes{}
+	h.logs = &syncBuffer{}
+	// The echo classifier reads the same database the outbound half writes:
+	// what the bridge sent is what must not come back in.
+	classifier, err := echo.New(echo.Options{
+		Objects:         objects,
+		OutboundObjects: store.NewOutboundObjects(database),
+		Activities:      store.NewOutboundActivities(database),
+		Actors:          store.NewAPActors(database),
+	})
+	require.NoError(t, err)
+	h.classifier = classifier
 	h.handler, err = NewHandler(HandlerOptions{
 		Materializer:   h.mat,
 		Fetcher:        h.client,
@@ -294,7 +379,10 @@ func newHarness(t *testing.T) *harness {
 		Records:        manager,
 		Votes:          h.votes,
 		Backfill:       h.backfills,
+		Echo:           classifier,
 		ServiceActorID: h.service.ID,
+		Logger: slog.New(slog.NewTextHandler(h.logs,
+			&slog.HandlerOptions{Level: slog.LevelDebug})),
 	})
 	require.NoError(t, err)
 
@@ -304,6 +392,12 @@ func newHarness(t *testing.T) *harness {
 		Workers:     1,
 		MaxAttempts: 3,
 		Lease:       time.Minute,
+		// Captured for the same reason the handler's is: a SKIP reason is not
+		// stored on the event row (the queue logs it and marks the event
+		// processed), so this log line is the only place the bridge says WHY it
+		// decided to do nothing — and "did nothing for reason X" versus "did
+		// nothing for reason Y" is a distinction some behaviours are made of.
+		Logger: slog.New(slog.NewTextHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	})
 	require.NoError(t, err)
 
@@ -332,6 +426,25 @@ func newHarness(t *testing.T) *harness {
 	h.admin.Routes(router)
 	h.router = router
 	return h
+}
+
+// syncBuffer is a concurrency-safe log sink: the queue worker and the harness
+// goroutine both write through the handler's logger.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 func readAll(r *http.Request) ([]byte, error) {
@@ -572,6 +685,71 @@ func (h *harness) subscribeTechnology() *remoteActor {
 	community, err := h.communities.GetByAPGroupID(context.Background(), groupID)
 	require.NoError(h.t, err)
 	require.Equal(h.t, store.FollowStateAccepted, community.FollowState)
+	return group
+}
+
+// originOf is the scheme://host of an AP id.
+func originOf(apID string) string {
+	parsed, err := url.Parse(apID)
+	if err != nil || parsed.Host == "" {
+		return apID
+	}
+	return parsed.Scheme + "://" + parsed.Host
+}
+
+// subscribeCommunityURL subscribes to a SECOND community through the real admin
+// path — resolve, mint, Follow, Accept — and returns its signing handle.
+//
+// It takes the AP URL rather than a !name@instance handle because
+// resolveCommunity passes URLs straight through: the harness serves ONE
+// WebFinger document, so a handle-based second subscribe would have to overwrite
+// the first community's and the two would race for the same path.
+//
+// The Group document advertises the shared inbox the harness captures, exactly
+// as the lemmy.world fixture does. Without it the bridge POSTs the Follow to a
+// per-community inbox nothing answers, and the subscribe fails as a bad gateway
+// — a fixture that looks like a bug in follow delivery.
+func (h *harness) subscribeCommunityURL(apGroupID, username string) *remoteActor {
+	h.t.Helper()
+	group := h.newRemoteActor(apGroupID, map[string]any{
+		"type":              "Group",
+		"id":                apGroupID,
+		"preferredUsername": username,
+		"inbox":             apGroupID + "/inbox",
+		// The shared inbox is derived from the community's OWN host, so
+		// co-hosted communities share one (which is what makes ordering_key
+		// rather than target_inbox the thing that carries scope) while
+		// communities on different instances do not (which is what makes a
+		// fan-out across instances expressible at all).
+		"endpoints": map[string]any{"sharedInbox": originOf(apGroupID) + "/inbox"},
+		"published": "2024-01-01T00:00:00.000000Z",
+	})
+
+	rec := h.adminRequest(http.MethodPost, "/admin/communities",
+		map[string]any{"community": apGroupID})
+	require.Equal(h.t, http.StatusAccepted, rec.Code, rec.Body.String())
+
+	h.mu.Lock()
+	require.NotEmpty(h.t, h.inboxLog, "subscribe must deliver a Follow")
+	followRaw := h.inboxLog[len(h.inboxLog)-1]
+	h.mu.Unlock()
+	follow, err := ap.ParseObject(followRaw)
+	require.NoError(h.t, err)
+	require.Equal(h.t, apGroupID, follow.Object.ID, "the Follow must name THIS community")
+
+	status := h.deliver(group, map[string]any{
+		"id":     apGroupID + "/activities/accept/follow-1",
+		"type":   "Accept",
+		"actor":  apGroupID,
+		"object": map[string]any{"id": follow.ID, "type": "Follow", "actor": h.service.ID, "object": apGroupID},
+	})
+	require.Equal(h.t, http.StatusAccepted, status)
+	h.drain()
+
+	community, err := h.communities.GetByAPGroupID(context.Background(), apGroupID)
+	require.NoError(h.t, err)
+	require.Equal(h.t, store.FollowStateAccepted, community.FollowState)
+	require.NotEmpty(h.t, community.DID, "a subscribed community holds a minted repo")
 	return group
 }
 

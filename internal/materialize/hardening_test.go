@@ -24,9 +24,13 @@ import (
 
 // TestDeleteActor_AccountEventVoteAndBlobScrub drives the full terminal
 // scrub on the captured lemmy.world fixtures: record deletes, the voter's
-// vote_events scrub, blob deletion under BOTH the author's and the
-// community's DID, and the trailing #account{active:false,status:deleted}
-// firehose event.
+// vote_events scrub, deletion of the blobs the scrubbed records referenced,
+// and the trailing #account{active:false,status:deleted} firehose event.
+//
+// The scrub walks the actor's records and deletes each one's blobs in the
+// repo that record lives in. Post-flip both the postv2 and its embed blob
+// live in the author's own repo; the community's profile media must survive
+// untouched, because only THIS actor's records are walked.
 func TestDeleteActor_AccountEventVoteAndBlobScrub(t *testing.T) {
 	h := newHarness(t)
 	h.serveLemmyWorldFixtures()
@@ -37,28 +41,38 @@ func TestDeleteActor_AccountEventVoteAndBlobScrub(t *testing.T) {
 	communityDID := testDIDFor("technology", "lemmy.world")
 	authorDID := testDIDFor("LeftLeaningFreedomFighters", "lemmy.world")
 
-	// The post's external embed carries a thumbnail blob stored under the
-	// COMMUNITY's DID — the blob nothing but this scrub would ever clean up.
+	// The post's external embed carries a thumbnail blob — the blob nothing
+	// but this scrub would ever clean up.
 	mapping, err := h.objects.GetByAPID(ctx, pageID)
 	require.NoError(t, err)
-	record, _, err := h.manager.GetRecord(ctx, communityDID, CollectionPost, mapping.RKey)
+	record, _, err := h.manager.GetRecord(ctx, authorDID, CollectionPostV2, mapping.RKey)
 	require.NoError(t, err)
 	blobs := atdata.ExtractBlobs(record)
 	require.NotEmpty(t, blobs, "the fixture post must embed a thumbnail blob")
 	thumbCID := cid.Cid(blobs[0].Ref).String()
-	_, _, err = h.manager.GetBlob(ctx, communityDID, thumbCID)
-	require.NoError(t, err, "thumbnail blob stored under the community DID before the scrub")
+	_, _, err = h.manager.GetBlob(ctx, authorDID, thumbCID)
+	require.NoError(t, err, "thumbnail blob stored under the author DID before the scrub")
+
+	// The community's own profile media, which the scrub must NOT touch.
+	communityProfile, _, err := h.manager.GetRecord(ctx, communityDID, CollectionCommunityProfile, ProfileRKey)
+	require.NoError(t, err)
+	communityBlobs := atdata.ExtractBlobs(communityProfile)
+	require.NotEmpty(t, communityBlobs, "the fixture community profile must carry icon/banner blobs")
 
 	require.NoError(t, h.m.DeleteActor(ctx, personID))
 
 	// Vote scrub hook called with the actor's AP id.
 	assert.Equal(t, []string{personID}, h.scrubbed.calls())
 
-	// The community-DID thumbnail blob is gone; the community's own profile
-	// media (if any) would survive because only THIS actor's records were
-	// walked.
-	_, _, err = h.manager.GetBlob(ctx, communityDID, thumbCID)
-	assert.True(t, errors.IsNotFound(err), "the deleted author's post thumbnail must be scrubbed from the community repo")
+	// The post's thumbnail is gone.
+	_, _, err = h.manager.GetBlob(ctx, authorDID, thumbCID)
+	assert.True(t, errors.IsNotFound(err), "the deleted author's post thumbnail must be scrubbed")
+
+	// The community's own media survives: only THIS actor's records were walked.
+	for _, blob := range communityBlobs {
+		_, _, err = h.manager.GetBlob(ctx, communityDID, cid.Cid(blob.Ref).String())
+		assert.NoError(t, err, "the community's own profile media must survive an author scrub")
+	}
 
 	// Every blob under the author's own (terminally frozen) DID is gone.
 	n, err := h.manager.DeleteBlobsForDID(ctx, authorDID)
@@ -87,7 +101,7 @@ func TestDeleteActor_AccountEventVoteAndBlobScrub(t *testing.T) {
 		}
 	}
 	assert.Equal(t, 1, accountEvents, "exactly one account event for one Delete(Actor)")
-	assert.Equal(t, 2, deleteOps, "scrub deletes: the post and the actor profile")
+	assert.Equal(t, 3, deleteOps, "scrub deletes: the acceptance, the post and the actor profile")
 }
 
 // TestSuppressActor_ScrubsVotesToo: the reversible nobridge scrub erases
@@ -224,10 +238,10 @@ func TestDeleteActor_BlobScrubFailureIsRetryable(t *testing.T) {
 
 	_, err := h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"))
 	require.NoError(t, err)
-	communityDID := testDIDFor("technology", "lemmy.world")
+	authorDID := testDIDFor("LeftLeaningFreedomFighters", "lemmy.world")
 	mapping, err := h.objects.GetByAPID(ctx, pageID)
 	require.NoError(t, err)
-	record, _, err := h.manager.GetRecord(ctx, communityDID, CollectionPost, mapping.RKey)
+	record, _, err := h.manager.GetRecord(ctx, authorDID, CollectionPostV2, mapping.RKey)
 	require.NoError(t, err)
 	blobs := atdata.ExtractBlobs(record)
 	require.NotEmpty(t, blobs, "the fixture post must embed a thumbnail blob")
@@ -249,7 +263,7 @@ func TestDeleteActor_BlobScrubFailureIsRetryable(t *testing.T) {
 	err = h.m.DeleteActor(ctx, personID)
 	require.Error(t, err)
 	assert.False(t, IsSkip(err), "a blob scrub failure must be retryable, not a skip")
-	_, _, err = h.manager.GetBlob(ctx, communityDID, thumbCID)
+	_, _, err = h.manager.GetBlob(ctx, authorDID, thumbCID)
 	require.NoError(t, err, "the orphan blob survives the failed scrub")
 	for _, ev := range h.firehoseEvents() {
 		assert.NotEqual(t, repo.EventKindAccount, ev.Kind,
@@ -259,7 +273,7 @@ func TestDeleteActor_BlobScrubFailureIsRetryable(t *testing.T) {
 	// Retry with the failure cleared: DeleteActor is idempotent and completes.
 	fail.Store(false)
 	require.NoError(t, h.m.DeleteActor(ctx, personID))
-	_, _, err = h.manager.GetBlob(ctx, communityDID, thumbCID)
+	_, _, err = h.manager.GetBlob(ctx, authorDID, thumbCID)
 	assert.True(t, errors.IsNotFound(err), "the retry scrubs the orphaned blob")
 	events := h.firehoseEvents()
 	require.NotEmpty(t, events)

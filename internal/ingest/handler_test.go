@@ -129,17 +129,17 @@ func TestAnnounceCreatePageEndToEnd(t *testing.T) {
 	require.NotNil(t, event.ProcessedAt)
 	assert.Empty(t, event.Error)
 
-	// The post is mapped and lives in the community repo.
+	// The post is mapped and lives in the AUTHOR's repo (PLAN.md decision 20).
 	mapping, err := h.objects.GetByAPID(context.Background(), pageID)
 	require.NoError(t, err)
-	communityDID := testDIDFor("technology", "lemmy.world")
-	assert.Equal(t, communityDID, mapping.DID)
-	assert.Equal(t, materialize.CollectionPost, mapping.Collection)
+	authorDID := testDIDFor("LeftLeaningFreedomFighters", "lemmy.world")
+	assert.Equal(t, authorDID, mapping.DID)
+	assert.Equal(t, materialize.CollectionPostV2, mapping.Collection)
 
 	// ... and is visible via the firehose (task 04 reads the same log).
 	var postOps int
 	for _, path := range h.firehoseOps() {
-		if strings.HasPrefix(path, materialize.CollectionPost+"/") {
+		if strings.HasPrefix(path, materialize.CollectionPostV2+"/") {
 			postOps++
 		}
 	}
@@ -664,9 +664,39 @@ func TestAnnouncedDeleteOfOwnPost(t *testing.T) {
 	}))
 	h.drain()
 
+	// REMOVAL-SCOPED, since the author-owned flip. In v1 the post record lived
+	// in the community's OWN repo, so "the community may delete its own
+	// announced post" was a statement about a record it owned, and deleting it
+	// outright was right. Post-flip the record is the AUTHOR's, in the
+	// author's repo, and the community's authority stops at its own
+	// attestations: it may withdraw the post from itself (acceptance out,
+	// removal in) and nothing more. The authorization being tested is
+	// unchanged — this community may act on this post — only the scope of
+	// what "act" means moved. (The legacy era keeps the v1 outcome verbatim:
+	// TestLegacyPostModRemovalKeepsV1Semantics.)
+	communityDID := testDIDFor("technology", "lemmy.world")
+	authorDID := testDIDFor("LeftLeaningFreedomFighters", "lemmy.world")
+	postURI := "at://" + authorDID + "/" + materialize.CollectionPostV2 + "/" + mapping.RKey
+	digest := testDigestRKey(postURI)
+
+	_, _, err = h.manager.GetRecord(ctx, communityDID, materialize.CollectionAcceptance, digest)
+	assert.True(t, errors.IsNotFound(err),
+		"the community withdrew the post from itself: its acceptance must be gone (err=%v)", err)
+
+	removal, _, err := h.manager.GetRecord(ctx, communityDID, materialize.CollectionRemoval, digest)
+	require.NoError(t, err, "a community acting on a post it hosts records a removal")
+	assert.Equal(t, "moderator-discretion", removal["code"])
+
+	_, _, err = h.manager.GetRecord(ctx, authorDID, materialize.CollectionPostV2, mapping.RKey)
+	assert.NoError(t, err,
+		"the author's record must survive: it lives in the author's repo, and a community's "+
+			"announced delete is not authority over a repo it does not own")
+
 	mapping, err = h.objects.GetByAPID(ctx, pageID)
 	require.NoError(t, err)
-	assert.True(t, mapping.IsDeleted(), "a community may delete its own announced post")
+	assert.False(t, mapping.IsDeleted(),
+		"the post still exists, so its mapping stays live — tombstoning it would block every "+
+			"later edit and vote for a post the author never withdrew")
 }
 
 // TestCrossAuthorityAnnouncedDeleteDropped (Finding 1, negative): a followed
@@ -1884,15 +1914,20 @@ func (s *oneShotMissingObjects) GetByAPID(ctx context.Context, apID string) (*st
 func (h *harness) swapHandlerStores(objects store.APObjects, actors store.BridgedActors) {
 	h.t.Helper()
 	handler, err := NewHandler(HandlerOptions{
-		Materializer:   h.mat,
-		Fetcher:        h.client,
-		Objects:        objects,
-		Actors:         actors,
-		Communities:    h.communities,
-		Tombstones:     h.tombstones,
-		Records:        h.manager,
-		Votes:          h.votes,
-		Backfill:       h.backfills,
+		Materializer: h.mat,
+		Fetcher:      h.client,
+		Objects:      objects,
+		Actors:       actors,
+		Communities:  h.communities,
+		Tombstones:   h.tombstones,
+		Records:      h.manager,
+		Votes:        h.votes,
+		Backfill:     h.backfills,
+		// The SAME classifier, deliberately over the harness's real stores: this
+		// helper swaps the dispatcher's store VIEWS, and pointing the guard at a
+		// substitute view would change what is being tested here into a test of
+		// the guard.
+		Echo:           h.classifier,
 		ServiceActorID: h.service.ID,
 	})
 	require.NoError(h.t, err)

@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"tidepool/internal/ap"
+	"tidepool/internal/echo"
 	"tidepool/internal/errors"
 	"tidepool/internal/store"
 	"tidepool/internal/testutil"
@@ -37,13 +38,48 @@ const (
 	voterCarol = "https://sh.itjust.works/u/carol"
 )
 
-// testDB returns a migrated connection with the vote tables (and the
-// ap_objects spine the aggregator resolves subjects through) truncated.
+// voteTablesToTruncate is the ONE list every helper in this package starts
+// from. There were four divergent lists before, and the omission that mattered
+// was invisible: 17b made outbound_votes an INPUT to the seed, so a leftover
+// delivered row silently subtracted one from every later test that seeded that
+// subject — green on the first run, red on the second. A helper that starts
+// from this list gains the next shared-state input automatically instead of
+// waiting for someone to notice a discrepancy four places at once.
+//
+// Truncating more than a test needs is free; truncating less is a bug that
+// surfaces somewhere else, later, as an off-by-one.
+var voteTablesToTruncate = []string{
+	// The aggregate spine.
+	"vote_events", "vote_aggregates", "ap_objects", "communities",
+	// The outbound side: an input to the seed since 17b.
+	"outbound_votes", "outbound_deliveries", "outbound_activities", "outbound_objects",
+	// Identity: ap_actors is what the voter probe reads, bridged_actors is what
+	// it must NOT read.
+	"ap_actors", "bridged_actors",
+	// Consumer state, for the tests that drive the real write path.
+	"federation_prefs", "jetstream_record_revs", "jetstream_dead_letters",
+	"consumer_cursors", "repo_state",
+	// The acceptance ledger. 17e's divergence sweep runs here (the re-cast
+	// tests drive the real reconciler), and it READS this table — so a row left
+	// by another package's run would surface as an undelivered-acceptance
+	// finding in a vote test. Harmless only by coincidence today: the query
+	// inner-joins through outbound_objects, which IS truncated. That coincidence
+	// is exactly what this list exists to stop depending on.
+	"admissions",
+}
+
+// truncateVoteTables clears everything in voteTablesToTruncate.
+func truncateVoteTables(t *testing.T, database *sql.DB) {
+	t.Helper()
+	testutil.Truncate(t, database, voteTablesToTruncate...)
+}
+
+// testDB returns a migrated connection with every table this package's
+// fixtures touch truncated.
 func testDB(t *testing.T) *sql.DB {
 	t.Helper()
 	database := testutil.DB(t)
-	testutil.Truncate(t, database,
-		"vote_events", "vote_aggregates", "ap_objects", "communities")
+	truncateVoteTables(t, database)
 	return database
 }
 
@@ -62,7 +98,17 @@ func testAggregatorWithRecords(t *testing.T, database *sql.DB) (*Aggregator, sto
 	t.Helper()
 	objects := store.NewAPObjects(database)
 	records := &fakeRecords{records: map[string]map[string]any{}}
-	agg, err := NewAggregator(database, objects, store.NewCommunities(database), records, slog.Default())
+	// The REAL voter probe over the same database: every existing case votes as
+	// a fediverse user, so it answers ClassNone for all of them — and would stop
+	// answering that the moment the probe started matching the wrong table.
+	probe, err := echo.New(echo.Options{
+		Objects:         objects,
+		OutboundObjects: store.NewOutboundObjects(database),
+		Activities:      store.NewOutboundActivities(database),
+		Actors:          store.NewAPActors(database),
+	})
+	require.NoError(t, err)
+	agg, err := NewAggregator(database, objects, store.NewCommunities(database), records, probe, slog.Default())
 	require.NoError(t, err)
 	return agg, objects, records
 }

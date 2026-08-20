@@ -2,6 +2,7 @@ package votes
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/url"
@@ -11,11 +12,29 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"tidepool/internal/ap"
+	"tidepool/internal/echo"
 	"tidepool/internal/errors"
 	"tidepool/internal/ingest"
 	"tidepool/internal/materialize"
 	"tidepool/internal/store"
 )
+
+// e2eClassifier is the REAL echo classifier over this test's stores. These
+// fixtures vote as fediverse users on fediverse content, so it answers
+// ClassNone throughout — and would stop doing so the moment the classifier
+// started matching genuine remote traffic, which is the failure that takes the
+// vote pipeline dark.
+func e2eClassifier(t *testing.T, database *sql.DB, objects store.APObjects) *echo.Classifier {
+	t.Helper()
+	classifier, err := echo.New(echo.Options{
+		Objects:         objects,
+		OutboundObjects: store.NewOutboundObjects(database),
+		Activities:      store.NewOutboundActivities(database),
+		Actors:          store.NewAPActors(database),
+	})
+	require.NoError(t, err)
+	return classifier
+}
 
 // The aggregator is the real implementation behind task 06's seam.
 var _ ingest.VoteAggregator = (*Aggregator)(nil)
@@ -70,6 +89,16 @@ func (s *stubMaterializer) RefreshCommunity(context.Context, *ap.Object) (*store
 func (s *stubMaterializer) EnsureCommunity(context.Context, *ap.Object) (*store.Community, error) {
 	s.t.Fatal("votes must never reach EnsureCommunity")
 	return nil, nil
+}
+
+func (s *stubMaterializer) RemovePost(context.Context, *store.APObjectMapping, string) error {
+	s.t.Fatal("votes must never reach RemovePost")
+	return nil
+}
+
+func (s *stubMaterializer) RestorePost(context.Context, *store.APObjectMapping) error {
+	s.t.Fatal("votes must never reach RestorePost")
+	return nil
 }
 
 // stubFetcher fails loudly on any fetch: inline vote activities must be
@@ -151,6 +180,7 @@ func TestFakeLemmyVoteE2E(t *testing.T) {
 		Tombstones:     store.NewTombstones(database),
 		Records:        &fakeRecords{records: map[string]map[string]any{}},
 		Votes:          agg,
+		Echo:           e2eClassifier(t, database, objects),
 		ServiceActorID: e2eServiceID,
 	})
 	require.NoError(t, err)
@@ -202,6 +232,7 @@ func TestBareVoteDispatch(t *testing.T) {
 		Tombstones:     store.NewTombstones(database),
 		Records:        &fakeRecords{records: map[string]map[string]any{}},
 		Votes:          agg,
+		Echo:           e2eClassifier(t, database, objects),
 		ServiceActorID: e2eServiceID,
 	})
 	require.NoError(t, err)

@@ -421,3 +421,105 @@ func TestParseObjectRejectsNonObjects(t *testing.T) {
 		assert.Error(t, err, "payload %q must be rejected", raw)
 	}
 }
+
+// TestBanExpiryReadsBothSpellings pins the tri-state (absent / valid /
+// unparseable) across BOTH wire spellings of a Block's expiry, and the
+// precedence between them.
+//
+// This is the unit-level half of the chunk-7 "endTime has zero coverage" gap:
+// before it, deleting `return o.EndTime` from BanExpiry left the whole suite
+// green — every timed ban from newer Lemmy (which sends AS2's `endTime`) would
+// silently read as permanent, and Lemmy sends NO Undo when a timed ban lapses,
+// so nothing would ever clear it. The endTime-only subtests below are what
+// kill that one-line deletion.
+func TestBanExpiryReadsBothSpellings(t *testing.T) {
+	block := func(t *testing.T, expiryFields string) *Object {
+		t.Helper()
+		obj, err := ParseObject([]byte(
+			`{"id": "https://lemmy.world/activities/block/1", "type": "Block"` + expiryFields + `}`))
+		require.NoError(t, err, "the Block must parse — expiry tolerance is per-field, never fatal")
+		return obj
+	}
+	valid := "2099-01-01T00:00:00Z"
+	validTime := time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC)
+	other := "2030-06-15T12:00:00Z"
+	otherTime := time.Date(2030, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	t.Run("absent means permanent", func(t *testing.T) {
+		assert.Nil(t, block(t, ``).BanExpiry(),
+			"no expiry under EITHER spelling is a permanent ban — nil, which callers must keep "+
+				"distinct from present-but-unreadable (non-nil, Valid=false)")
+	})
+
+	t.Run("expires alone is read", func(t *testing.T) {
+		expiry := block(t, `, "expires": "`+valid+`"`).BanExpiry()
+		require.NotNil(t, expiry, "Lemmy 0.19's spelling must be read")
+		require.True(t, expiry.Valid)
+		assert.True(t, expiry.Time.Equal(validTime))
+	})
+
+	t.Run("endTime alone is read", func(t *testing.T) {
+		// THE deletion this subtest kills: `return o.EndTime`. Without it a
+		// newer-Lemmy timed ban carries its whole duration in a field nobody
+		// reads, BanExpiry answers nil, and the ban is stored permanent — the
+		// exact version-upgrade bug the field's own doc comment warns about.
+		expiry := block(t, `, "endTime": "`+valid+`"`).BanExpiry()
+		require.NotNil(t, expiry,
+			"AS2's endTime spelling must be read: newer Lemmy sends it INSTEAD of `expires`, and "+
+				"a nil here turns every timed ban from those versions into a permanent one that "+
+				"no later activity can ever lift")
+		require.True(t, expiry.Valid)
+		assert.True(t, expiry.Time.Equal(validTime))
+	})
+
+	t.Run("unparseable expires alone is refusable", func(t *testing.T) {
+		expiry := block(t, `, "expires": "next tuesday"`).BanExpiry()
+		require.NotNil(t, expiry,
+			"present-but-unreadable must stay distinct from absent: collapsing them maps 'we "+
+				"could not read how long' onto 'forever'")
+		assert.False(t, expiry.Valid, "with Valid=false, the refuse signal applyBan acts on")
+	})
+
+	t.Run("unparseable endTime alone is refusable", func(t *testing.T) {
+		expiry := block(t, `, "endTime": 12345`).BanExpiry()
+		require.NotNil(t, expiry,
+			"the endTime spelling gets the SAME tri-state: an unreadable endTime is a ban we "+
+				"cannot bound, not a permanent one")
+		assert.False(t, expiry.Valid)
+	})
+
+	t.Run("expires wins over endTime when both are readable", func(t *testing.T) {
+		// Pins the precedence BanExpiry implements: Expires is checked FIRST,
+		// endTime only fills its absence. A sender spelling the expiry both ways
+		// gets the 0.19 spelling honoured.
+		expiry := block(t, `, "expires": "`+other+`", "endTime": "`+valid+`"`).BanExpiry()
+		require.NotNil(t, expiry)
+		require.True(t, expiry.Valid)
+		assert.True(t, expiry.Time.Equal(otherTime),
+			"`expires` takes precedence when both spellings are present")
+	})
+
+	t.Run("an unreadable expires shadows a readable endTime", func(t *testing.T) {
+		// PINS CURRENT BEHAVIOR, quirk included: because precedence is decided on
+		// key presence (Expires != nil), an `expires` that was present but could
+		// not be parsed SHADOWS a perfectly readable `endTime` — BanExpiry
+		// answers the unreadable one and applyBan REFUSES the activity rather
+		// than storing a ban it cannot bound. That is the safe direction (refuse,
+		// never silently substitute a duration the sender may not have meant),
+		// so a change that starts falling through to endTime here is a semantics
+		// change to argue for, not an obvious fix.
+		expiry := block(t, `, "expires": "next tuesday", "endTime": "`+valid+`"`).BanExpiry()
+		require.NotNil(t, expiry)
+		assert.False(t, expiry.Valid,
+			"the unreadable `expires` is what comes back — the refuse/poison path, not the "+
+				"readable endTime beside it")
+	})
+
+	t.Run("a readable expires wins over an unreadable endTime", func(t *testing.T) {
+		expiry := block(t, `, "expires": "`+valid+`", "endTime": "garbage"`).BanExpiry()
+		require.NotNil(t, expiry)
+		require.True(t, expiry.Valid,
+			"garbage in the spelling that LOST precedence must not poison the readable one")
+		assert.True(t, expiry.Time.Equal(validTime))
+	})
+}

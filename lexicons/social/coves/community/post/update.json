@@ -9,7 +9,9 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["uri"],
+          "required": [
+            "uri"
+          ],
           "properties": {
             "uri": {
               "type": "string",
@@ -24,8 +26,8 @@
             },
             "content": {
               "type": "string",
-              "maxLength": 50000,
-              "maxGraphemes": 20000,
+              "maxLength": 100000,
+              "maxGraphemes": 10000,
               "description": "Updated content - main text for text posts, description for media, etc."
             },
             "facets": {
@@ -67,15 +69,15 @@
               "maxLength": 8,
               "items": {
                 "type": "string",
-                "maxLength": 64,
+                "maxLength": 640,
                 "maxGraphemes": 64
               }
             },
             "editNote": {
               "type": "string",
-              "maxLength": 300,
+              "maxLength": 3000,
               "maxGraphemes": 300,
-              "description": "Optional note explaining the edit"
+              "description": "DEPRECATED, retained for backward compatibility: an optional note explaining the edit. This field ships on main; removing it is a non-additive break, so it stays declared as an optional input until a new-NSID change retires it."
             }
           }
         }
@@ -84,7 +86,10 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["uri", "cid"],
+          "required": [
+            "uri",
+            "cid"
+          ],
           "properties": {
             "uri": {
               "type": "string",
@@ -109,12 +114,20 @@
           "description": "User is not authorized to edit this post"
         },
         {
+          "name": "ConcurrentModification",
+          "description": "The post changed between being read and being written, so the edit was composed against content that no longer stands. Re-read the post and re-apply the edit; the server does not merge, because re-applying server-side would silently erase a change the editor never saw."
+        },
+        {
+          "name": "NoAuthorCredentials",
+          "description": "The service holds no credentials it can write to the author's repository with. Distinct from an expired caller session: signing in again is the fix for a person and no fix at all for a non-interactive author whose stored grant was revoked."
+        },
+        {
           "name": "EditWindowExpired",
-          "description": "Edit window has expired (posts can only be edited within 24 hours)"
+          "description": "DEPRECATED, retained for backward compatibility: no edit window is enforced - a post is editable by its author for as long as it exists. This name ships on main; removing a declared error is a non-additive break, so it stays declared until a new-NSID change retires it."
         },
         {
           "name": "InvalidUpdate",
-          "description": "Invalid update operation (e.g., changing post type)"
+          "description": "DEPRECATED, retained for backward compatibility: never emitted. Refusals this once covered are answered by name instead - an edit naming a different community is an InvalidRequest validation error, and a post whose collection is not editable is the same. This name ships on main; removing a declared error is a non-additive break, so it stays declared until a new-NSID change retires it."
         }
       ]
     }

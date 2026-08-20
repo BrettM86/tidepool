@@ -64,18 +64,20 @@ func TestCommentThreadRootedAtNote_SkipsWithoutPanic(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
 
-	// A root Note with no inReplyTo, served upstream.
+	// A root Note with no inReplyTo, served upstream. Author and object share
+	// an authority throughout, as genuine traffic does, so the skip below can
+	// only be the parentless root and not the attribution check.
 	rootNote := map[string]any{
 		"type":         "Note",
 		"id":           "https://lemmy.zip/comment/root",
-		"attributedTo": personID,
+		"attributedTo": "https://lemmy.zip/u/carol",
 		"audience":     groupID,
 		"source":       map[string]any{"content": "root", "mediaType": "text/markdown"},
 		"published":    "2024-01-02T00:00:00.000000Z",
 	}
 	h.serveObject("/comment/root", rootNote)
 
-	child := note("https://lemmy.zip/comment/child", personID,
+	child := note("https://lemmy.zip/comment/child", "https://lemmy.zip/u/carol",
 		"https://lemmy.zip/comment/root", "child", "2024-01-02T01:00:00.000000Z")
 
 	res, err := h.m.MaterializeComment(ctx, mustObject(t, child))

@@ -10,28 +10,55 @@
         "properties": {
           "sort": {
             "type": "string",
-            "knownValues": ["hot", "top", "new"],
+            "knownValues": [
+              "hot",
+              "top",
+              "new"
+            ],
             "default": "hot",
-            "description": "Sort order for global feed"
+            "description": "Sort order for global feed",
+            "maxLength": 64
           },
           "postType": {
             "type": "string",
-            "knownValues": ["text", "article", "image", "video", "microblog"],
-            "description": "Filter by a single post type (computed from embed structure)"
+            "knownValues": [
+              "text",
+              "article",
+              "image",
+              "video",
+              "microblog"
+            ],
+            "description": "Filter by a single post type (computed from embed structure)",
+            "maxLength": 64
           },
           "postTypes": {
             "type": "array",
             "items": {
               "type": "string",
-              "knownValues": ["text", "article", "image", "video", "microblog"]
+              "knownValues": [
+                "text",
+                "article",
+                "image",
+                "video",
+                "microblog"
+              ],
+              "maxLength": 64
             },
             "description": "Filter by multiple post types (computed from embed structure)"
           },
           "timeframe": {
             "type": "string",
-            "knownValues": ["hour", "day", "week", "month", "year", "all"],
+            "knownValues": [
+              "hour",
+              "day",
+              "week",
+              "month",
+              "year",
+              "all"
+            ],
             "default": "day",
-            "description": "Timeframe for top sorting (only applies when sort=top)"
+            "description": "Timeframe for top sorting (only applies when sort=top)",
+            "maxLength": 64
           },
           "limit": {
             "type": "integer",
@@ -40,7 +67,8 @@
             "default": 15
           },
           "cursor": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 500
           }
         }
       },
@@ -48,7 +76,9 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["feed"],
+          "required": [
+            "feed"
+          ],
           "properties": {
             "feed": {
               "type": "array",
@@ -58,7 +88,8 @@
               }
             },
             "cursor": {
-              "type": "string"
+              "type": "string",
+              "maxLength": 500
             }
           }
         }

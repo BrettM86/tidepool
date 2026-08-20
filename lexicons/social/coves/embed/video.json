@@ -5,23 +5,62 @@
     "main": {
       "type": "object",
       "description": "Video embed with metadata",
-      "required": ["video"],
+      "required": [
+        "video"
+      ],
       "properties": {
         "video": {
           "type": "blob",
-          "accept": ["video/mp4", "video/webm"],
+          "accept": [
+            "video/mp4",
+            "video/webm"
+          ],
           "maxSize": 100000000,
           "description": "Video blob reference"
         },
         "thumbnail": {
           "type": "blob",
-          "accept": ["image/png", "image/jpeg", "image/webp"],
+          "accept": [
+            "image/png",
+            "image/jpeg",
+            "image/webp"
+          ],
           "maxSize": 1000000,
           "description": "Video thumbnail image"
         },
         "alt": {
           "type": "string",
-          "maxLength": 1000,
+          "maxLength": 10000,
+          "maxGraphemes": 1000,
+          "description": "Alt text describing video content"
+        },
+        "duration": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Duration in seconds"
+        }
+      }
+    },
+    "view": {
+      "type": "object",
+      "description": "View of a video embed as served by the AppView; blob references are replaced with fetchable URLs",
+      "required": [
+        "video"
+      ],
+      "properties": {
+        "video": {
+          "type": "string",
+          "format": "uri",
+          "description": "URL of the video, served from the hosting PDS blob endpoint. Unlike images, video is not routed through the AppView's image proxy: the proxy decodes and re-encodes stills and cannot stream."
+        },
+        "thumbnail": {
+          "type": "string",
+          "format": "uri",
+          "description": "URL of the video thumbnail image"
+        },
+        "alt": {
+          "type": "string",
+          "maxLength": 10000,
           "maxGraphemes": 1000,
           "description": "Alt text describing video content"
         },

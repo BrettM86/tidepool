@@ -37,6 +37,9 @@ func (d *Dispatcher) handleComment(ctx context.Context, tx *sql.Tx, did string, 
 	case operationDelete:
 		return d.applyCommentDelete(ctx, tx, did, commit)
 	default:
+		// Unreachable: validateCommitEnvelope rejects any other operation as
+		// permanent before the gate. A claimed skip, since an operation this
+		// build cannot name is not something a replay improves.
 		d.logger.Debug("unknown comment operation",
 			slog.String("operation", commit.Operation), slog.String("did", did))
 		return nil
@@ -68,6 +71,10 @@ func (d *Dispatcher) applyCommentWrite(ctx context.Context, tx *sql.Tx, did stri
 	if !federating {
 		// The residual split-thread case, explicitly chosen (decision 11): the
 		// comment stays on the atproto side and the Lemmy side never sees it.
+		//
+		// PERMANENT, and it CLAIMS the gate: the author's "no" is not a fact
+		// that changes underneath this frame, and a later re-enable federates
+		// what they write next rather than what they wrote while opted out.
 		d.logger.Debug("skipping comment from an opted-out author",
 			slog.String("did", did), slog.String("rkey", commit.RKey),
 			slog.String("operation", commit.Operation))
@@ -84,10 +91,16 @@ func (d *Dispatcher) applyCommentWrite(ctx context.Context, tx *sql.Tx, did stri
 		// with no prior state are edits to a comment that never federated.
 		// Dead-lettering either would bury the queue in events working exactly
 		// as intended.
-		d.logger.Debug("skipping comment with no federated thread",
-			slog.String("did", did), slog.String("rkey", commit.RKey),
-			slog.String("operation", commit.Operation))
-		return nil
+		//
+		// UNCLAIMED. A reply can reach this consumer before the thing it replies
+		// to has been materialized — the two arrive milliseconds apart and
+		// nothing orders them — and a claimed gate row would swallow the
+		// reconnect rewind that recovers it, so the comment would silently never
+		// federate. The update case rides the same ruling for the same reason:
+		// an edit resolves through the state its CREATE wrote, so it becomes
+		// resolvable exactly when the create is recovered.
+		return fmt.Errorf("%w: comment %s belongs to no thread this bridge federates (yet)",
+			errSkipUnclaimed, atURI)
 	}
 
 	if thread.Depth > maxCommentDepth {
@@ -280,6 +293,11 @@ func (d *Dispatcher) applyCommentDelete(ctx context.Context, tx *sql.Tx, did str
 	if errors.IsNotFound(err) {
 		// A comment this bridge never federated. There is nothing to withdraw,
 		// and most native comment deletes are exactly this.
+		//
+		// PERMANENT, and the claim is LOAD-BEARING: the gate row a delete leaves
+		// IS the tombstone that rejects a stale create for the same URI, so
+		// releasing it would let a replay past the delete resurrect content the
+		// user removed.
 		d.logger.Debug("skipping delete for a comment with no outbound state",
 			slog.String("did", did), slog.String("rkey", commit.RKey))
 		return nil

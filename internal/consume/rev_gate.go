@@ -118,6 +118,71 @@ func logSkippedStaleRev(consumer, operation, uri, rev string) {
 		slog.String("rev", rev))
 }
 
+// errSkipUnclaimed is the sentinel a commit handler returns to skip an event
+// WITHOUT claiming its gate row. applyGatedTx reports the event handled (the
+// cursor advances) but rolls the claim back, so a redelivery of the same frame
+// re-enters the handler instead of losing at `rev < EXCLUDED.rev`.
+//
+// WHICH SKIPS BELONG HERE. Only the ones whose answer can CHANGE while the
+// event stays exactly as it is:
+//
+//   - a vote or a comment on something this bridge has not materialized yet
+//     (the parent lands milliseconds later, and the vote arrived first);
+//   - a post for a community nobody has bridged yet (an operator bridges it);
+//   - a vote direction this build does not understand — `direction` is an OPEN
+//     enum, so the record is forward-compatible and a LATER BUILD is its
+//     recovery path.
+//
+// Everything else keeps claiming. An opted-out author's write, a delete with no
+// outbound state, a malformed record: those are final for THIS frame, and a
+// released claim would only re-run a decision that is already made — or, for a
+// delete, throw away the tombstone that rejects the stale create.
+//
+// The first bullet is deliberately IMPRECISE, and the imprecision is the safe
+// direction. resolveSubject answers nil for "never materialized" and for
+// "materialized and since removed" alike, so a vote on a deleted post takes the
+// unclaimed branch too. That costs a repeated skip if the frame is ever
+// redelivered and nothing else — where guessing the other way would be the
+// silent loss this sentinel exists to end.
+//
+// WHAT ACTUALLY REPLAYS THE EVENT, stated plainly because the sentinel is not a
+// retry and must not be read as one. Jetstream delivers live traffic once, and
+// a skip never dead-letters, so the DLQ redriver is NOT a path here. The real
+// ones, in the order they matter:
+//
+//  1. the reconnect cursor REWIND. Every re-dial resumes a few seconds behind
+//     the last processed event (Connector.cursorRewind, 5s), which is exactly
+//     the window the parent-materializes-late race lives in.
+//  2. a cursor behind Jetstream's retention, which replays the whole store.
+//  3. a CursorSchemaVersion bump with the mandated truncate of
+//     jetstream_record_revs (GateResetRequiredOnSchemaBump) — the from-scratch
+//     replay a build that understands the new lexicon relies on.
+//
+// None of those is guaranteed to happen soon, and this sentinel does not make
+// one happen. What it does is remove the POISON: with a gate row claimed, every
+// one of those three replays is a silent no-op and the content is lost for
+// good. Without it, each of them recovers the event.
+var errSkipUnclaimed = stderrors.New("skipped without claiming the rev gate")
+
+// logSkipUnclaimed is the single, grep-able line for an unclaimed skip, and it
+// is INFO rather than debug on purpose: unlike a stale-rev skip, this one means
+// something did NOT happen that may still be owed. It is the only trace the
+// event leaves anywhere — no DLQ row, no failed event, no state — so a
+// deployment running at default level would otherwise have no way to see a
+// backlog of votes waiting on a materializer that stalled.
+//
+// The reason travels in the error, not in an attribute, so each handler states
+// its own case once and this stays the only place that formats it.
+func logSkipUnclaimed(consumer, operation, uri, rev string, reason error) {
+	unclaimedSkips.Add(1)
+	slog.Info("rev-gate claim released: event skipped and left replayable",
+		slog.String("consumer", consumer),
+		slog.String("operation", operation),
+		slog.String("uri", uri),
+		slog.String("rev", rev),
+		slog.String("reason", reason.Error()))
+}
+
 // RevGate carries the gate's own DB handle. applyGated/applyGatedTx use it to
 // open the claim transaction held across apply, which is how EVERY commit
 // handler is currently gated.
@@ -180,7 +245,8 @@ func (g *RevGate) Advance(ctx context.Context, uri, rev string) error {
 // gate row lock a pure per-record mutex around apply. applyGatedTx now hands
 // that transaction to handlers so their durable state commits with the gate
 // advance, and they use it: the comment path writes outbound_objects on it, and
-// the federation path writes outbound_deliveries and ap_actors.
+// the federation path writes federation_prefs, outbound_deliveries and
+// ap_actors.
 //
 // The rule that replaces the old proof: A HANDLER WRITING ON THIS TRANSACTION
 // MUST NOT THEN CALL SOMETHING THAT OPENS A SECOND TRANSACTION TOUCHING THE
@@ -188,14 +254,18 @@ func (g *RevGate) Advance(ctx context.Context, uri, rev string) error {
 // handler is synchronously waiting, so the two deadlock until a timeout. The
 // destructive opt-out tier is exactly that shape — the seam takes no
 // transaction and opens its own — which is why handleFederation defers its
-// ap_actors write until after that call.
+// ap_actors write until after that call, and why the same path is the ONE that
+// commits its federation_prefs row ahead of this transaction instead of on it
+// (applyOptOut): the purge marks that very row from its own transaction.
 //
 // An apply error — or a panic, which the deferred rollback covers equally —
 // releases the claim WITHOUT advancing, so the connector's retry/redrive
 // replays the event instead of losing it behind its own gate entry.
 //
 // A gate SKIP returns nil, not an error: the event is fully accounted for and
-// the cursor must advance past it.
+// the cursor must advance past it. So does an errSkipUnclaimed skip — with the
+// difference that the claim is rolled back rather than committed, which is what
+// keeps the event replayable.
 func applyGated(ctx context.Context, gate *RevGate, consumer, did string, commit *CommitEvent, apply func() error) error {
 	return applyGatedTx(ctx, gate, consumer, did, commit, func(*sql.Tx) error { return apply() })
 }
@@ -218,10 +288,20 @@ func applyGated(ctx context.Context, gate *RevGate, consumer, did string, commit
 // get a validation error from UpsertTx, which is the correct refusal for a
 // path that has opted out of gating.
 func applyGatedTx(ctx context.Context, gate *RevGate, consumer, did string, commit *CommitEvent, apply func(tx *sql.Tx) error) error {
-	if gate == nil || commit.Rev == "" {
-		return apply(nil)
-	}
 	uri := commitRecordURI(did, commit)
+	if gate == nil || commit.Rev == "" {
+		// The bypass still has to understand the sentinel: a handler cannot know
+		// whether it is running under a claim, and returning the skip as an error
+		// would dead-letter an event that was merely not-yet-applicable.
+		if err := apply(nil); err != nil {
+			if stderrors.Is(err, errSkipUnclaimed) {
+				logSkipUnclaimed(consumer, commit.Operation, uri, commit.Rev, err)
+				return nil
+			}
+			return err
+		}
+		return nil
+	}
 	tx, err := gate.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin rev-gate transaction for %s: %w", uri, err)
@@ -242,6 +322,15 @@ func applyGatedTx(ctx context.Context, gate *RevGate, consumer, did string, comm
 		return nil
 	}
 	if err := apply(tx); err != nil {
+		if stderrors.Is(err, errSkipUnclaimed) {
+			// Deliberately un-advanced: the deferred rollback releases the claim
+			// with no gate row written, so the same frame re-enters this handler
+			// on any of the replay paths errSkipUnclaimed documents. The event is
+			// still reported HANDLED — nothing is owed to the retry budget and
+			// the cursor must move past it.
+			logSkipUnclaimed(consumer, commit.Operation, uri, commit.Rev, err)
+			return nil
+		}
 		return err // the deferred rollback releases the claim un-advanced
 	}
 	if err := tx.Commit(); err != nil {

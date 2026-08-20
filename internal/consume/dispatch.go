@@ -517,6 +517,18 @@ func validateCommitEnvelope(did string, commit *CommitEvent) error {
 // here is also what makes the lexicon's community-immutability rule
 // enforceable in ONE place: there is no second copy of the answer to disagree
 // with the engine's.
+//
+// THE GATE TRANSACTION IS DELIBERATELY NOT PASSED ON, and the underscore says
+// so rather than hiding it. AdmitPost takes no transaction and opens its own —
+// the acceptance write into the community repo, the ledger row and the outbound
+// enqueue are one commit that only the engine can compose — so handing it this
+// one would break the rule rev_gate.go's DEADLOCK NOTE states: a handler must
+// not write on the gate tx and then call something that opens a second
+// transaction touching the same rows. The consequence is stated plainly: if the
+// gate later fails to commit, the engine's work stands under an unadvanced gate
+// and the replay re-enters AdmitPost. That is survivable only because the
+// engine decides from STORED state (its prior binding, its ledger row), so a
+// re-admission of the same rev re-reaches the same conclusion.
 func (d *Dispatcher) handlePostV2(ctx context.Context, _ *sql.Tx, did string, commit *CommitEvent) error {
 	// The nil-engine skip happens before the gate (see handleCommit), so a
 	// non-nil engine is guaranteed here.
@@ -551,9 +563,14 @@ func (d *Dispatcher) handlePostV2(ctx context.Context, _ *sql.Tx, did string, co
 			// Most Coves posts are exactly this. Admitting one would write an
 			// acceptance record into a community repo that has no business
 			// existing.
-			d.logger.Debug("skipping postv2 for a non-bridged community",
-				slog.String("did", did), slog.String("community", communityDID))
-			return nil
+			//
+			// UNCLAIMED, for the same reason the nil-engine skip happens BEFORE
+			// the gate a few lines up in handleCommit: whether this community is
+			// bridged is an operator's decision that can be made tomorrow, and a
+			// gate row claimed today would turn the replay that should admit the
+			// post into a silent no-op, dropping it forever.
+			return fmt.Errorf("%w: postv2 %s is for community %s, which this bridge does not federate (yet)",
+				errSkipUnclaimed, commitRecordURI(did, commit), strconv.Quote(communityDID))
 		}
 	}
 

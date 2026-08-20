@@ -188,6 +188,66 @@ func TestIdentityHandler_ActorlessDIDResolvesNothing(t *testing.T) {
 	assert.Zero(t, countRows(t, database, "ap_actors"), "and no eager mint")
 }
 
+// identityFrameSplitDID is an #identity frame whose NESTED payload names a
+// different DID than the envelope — the exact disagreement handleAccount
+// rejects as permanent.
+func identityFrameSplitDID(envelopeDID, innerDID, handle string) []byte {
+	return []byte(fmt.Sprintf(
+		`{"did":%q,"time_us":6600,"kind":"identity",`+
+			`"identity":{"did":%q,"handle":%q,"seq":10,"time":"2026-08-12T10:00:00.000Z"}}`,
+		envelopeDID, innerDID, handle))
+}
+
+// identityFrameNoInnerDID omits identity.did entirely. Jetstream always fills
+// it, but the DLQ stores raw frames and a redriven or hand-repaired one can be
+// thinner than the wire shape.
+func identityFrameNoInnerDID(envelopeDID, handle string) []byte {
+	return []byte(fmt.Sprintf(
+		`{"did":%q,"time_us":6600,"kind":"identity",`+
+			`"identity":{"handle":%q,"seq":10,"time":"2026-08-12T10:00:00.000Z"}}`,
+		envelopeDID, handle))
+}
+
+// Chunk 3 finding 5: handleIdentity trusted the NESTED payload's DID over the
+// envelope's and never compared them, while its sibling handleAccount rejects
+// exactly that disagreement. A crafted frame could therefore name any DID it
+// liked and spend this bridge's PLC and well-known round-trips on it.
+func TestIdentityHandler_InnerDIDDisagreeingWithTheEnvelopeIsPermanent(t *testing.T) {
+	database := dispatchTestDB(t)
+	const victimDID = "did:plc:44ybard66vv44zksje25o7dz"
+	seedAPActor(t, database, victimDID, "victim")
+	fixture := newDispatchFixture(t, database)
+
+	err := fixture.handle(t, identityFrameSplitDID(dispatchNativeDID, victimDID, "attacker.example"))
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrPermanentEvent,
+		"a frame ABOUT DID A that carries DID B is malformed or hostile, and no retry "+
+			"makes the two agree — the same ruling handleAccount already makes, for the "+
+			"same reason: acting on the inner one lets a frame about A mutate B")
+
+	assert.Empty(t, fixture.resolver.Calls(),
+		"and it is refused BEFORE the resolver runs: a crafted frame must not be able "+
+			"to point this bridge's PLC and well-known lookups at any DID it names")
+
+	displayName, _, _ := profileCache(t, database, victimDID)
+	assert.Empty(t, displayName, "no state is touched for the DID the payload named")
+}
+
+func TestIdentityHandler_EmptyInnerDIDFallsBackToTheEnvelope(t *testing.T) {
+	database := dispatchTestDB(t)
+	seedAPActor(t, database, dispatchNativeDID, "alice")
+	fixture := newDispatchFixture(t, database)
+	fixture.resolver.handle = "alice2.coves.social"
+
+	require.NoError(t, fixture.handle(t,
+		identityFrameNoInnerDID(dispatchNativeDID, "alice2.coves.social")),
+		"an ABSENT inner DID is not a disagreement: the envelope answers for the frame")
+
+	displayName, _, _ := profileCache(t, database, dispatchNativeDID)
+	assert.Equal(t, "alice2.coves.social", displayName)
+}
+
 func TestIdentityHandler_ResolverFailureLeavesTheCacheAlone(t *testing.T) {
 	database := dispatchTestDB(t)
 	seedAPActor(t, database, dispatchNativeDID, "alice")

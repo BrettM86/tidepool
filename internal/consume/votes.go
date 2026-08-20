@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"strconv"
 
 	"tidepool/internal/errors"
 	"tidepool/internal/store"
@@ -37,6 +38,9 @@ func (d *Dispatcher) handleVote(ctx context.Context, tx *sql.Tx, did string, com
 	case operationDelete:
 		return d.applyVoteDelete(ctx, tx, did, commit)
 	default:
+		// Unreachable: validateCommitEnvelope rejects any other operation as
+		// permanent before the gate. Kept as a claimed skip because an operation
+		// this build cannot name is not something a replay improves.
 		d.logger.Debug("unknown vote operation",
 			slog.String("operation", commit.Operation), slog.String("did", did))
 		return nil
@@ -56,6 +60,9 @@ func (d *Dispatcher) applyVoteWrite(ctx context.Context, tx *sql.Tx, did string,
 		return err
 	}
 	if !federating {
+		// PERMANENT, and it CLAIMS the gate. The author asked us to stop, which
+		// is not a fact that changes underneath this frame: a later re-enable
+		// federates what they write next, not what they wrote while opted out.
 		d.logger.Debug("skipping vote from an opted-out author",
 			slog.String("did", did), slog.String("rkey", commit.RKey))
 		return nil
@@ -66,13 +73,20 @@ func (d *Dispatcher) applyVoteWrite(ctx context.Context, tx *sql.Tx, did string,
 		// Nothing is stored: guessing a direction would push a vote the user
 		// never cast, and dead-lettering would turn a lexicon rollout into a
 		// queue full of rows nobody can redrive.
-		d.logger.Debug("skipping vote with an unrecognised direction",
-			slog.String("did", did), slog.String("direction", direction))
-		return nil
+		//
+		// UNCLAIMED, because `direction` is an OPEN enum: this record is
+		// forward-compatible rather than malformed, and the recovery path is a
+		// LATER BUILD replaying it (see errSkipUnclaimed). A claimed gate row
+		// would make that replay a silent no-op, which is the one outcome a
+		// forward-compatible field must not produce.
+		return fmt.Errorf("%w: vote %s has direction %s, which this build does not understand",
+			errSkipUnclaimed, commitRecordURI(did, commit), strconv.Quote(direction))
 	}
 
 	subjectATURI := refURI(commit.Record, "subject")
 	if subjectATURI == "" {
+		// PERMANENT: the lexicon requires subject, and no later state makes an
+		// absent field appear. The claim commits.
 		d.logger.Debug("skipping vote with no subject", slog.String("did", did))
 		return nil
 	}
@@ -83,9 +97,13 @@ func (d *Dispatcher) applyVoteWrite(ctx context.Context, tx *sql.Tx, did string,
 	if subject == nil {
 		// Native users vote in native communities constantly; dead-lettering
 		// that would bury the queue.
-		d.logger.Debug("skipping vote on a subject this bridge does not federate",
-			slog.String("did", did), slog.String("subject", subjectATURI))
-		return nil
+		//
+		// UNCLAIMED. This is the finding's headline case: a vote cast a few
+		// hundred milliseconds before its subject was materialized resolves to
+		// nothing, and a claimed gate row would swallow the reconnect rewind
+		// that exists to recover it — the vote would silently never federate.
+		return fmt.Errorf("%w: vote %s names subject %s, which this bridge does not federate (yet)",
+			errSkipUnclaimed, commitRecordURI(did, commit), strconv.Quote(subjectATURI))
 	}
 
 	if err := d.refuseBannedAuthor(ctx, did, subject.CommunityDID, "vote "+commitRecordURI(did, commit)); err != nil {
@@ -164,6 +182,11 @@ func (d *Dispatcher) applyVoteDelete(ctx context.Context, tx *sql.Tx, did string
 	stored, err := d.votes.GetByATURI(ctx, voteATURI)
 	if errors.IsNotFound(err) {
 		// No Undo may be sent for a Like no peer ever received.
+		//
+		// PERMANENT, and the claim is LOAD-BEARING rather than merely harmless:
+		// the gate row a delete leaves IS the tombstone that rejects a stale
+		// create for the same URI. Releasing it would let a replay past the
+		// delete re-cast a vote the user withdrew.
 		d.logger.Debug("skipping delete for a vote with no outbound state",
 			slog.String("did", did), slog.String("vote", voteATURI))
 		return nil

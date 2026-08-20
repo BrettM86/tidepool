@@ -43,6 +43,41 @@ func (o *failingOutboundObjects) GetByATURI(ctx context.Context, atURI string) (
 	return o.OutboundObjects.GetByATURI(ctx, atURI)
 }
 
+// failingOutboundDeliveries delegates to a real store but fails the opt-out's
+// cancellation. That call is the LAST thing the soft opt-out does on the
+// rev-gate transaction before it commits, so failing it is the realistic shape
+// of "the preference was written, then the unit failed" — the window in which a
+// preference written on its own connection would survive an unadvanced gate.
+type failingOutboundDeliveries struct {
+	store.OutboundDeliveries
+	err error
+}
+
+func (d *failingOutboundDeliveries) CancelOutwardForActorTx(_ context.Context, _ *sql.Tx, _ string) (int64, error) {
+	return 0, d.err
+}
+
+// prefProbingDeleter stands in for the destructive seam and answers the one
+// question that seam's ORDERING is about: by the time peers are asked to delete
+// this user's content, is the user's intent already durable? It reads
+// federation_prefs on its OWN connection, exactly as outbound.Purger does.
+type prefProbingDeleter struct {
+	db            *sql.DB
+	called        bool
+	sawPreference bool
+}
+
+func (d *prefProbingDeleter) DeleteRemoteContent(ctx context.Context, did string) error {
+	d.called = true
+	var count int
+	if err := d.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM federation_prefs WHERE did = $1`, did).Scan(&count); err != nil {
+		return err
+	}
+	d.sawPreference = count > 0
+	return nil
+}
+
 // failingCommunities delegates to a real store but fails GetByDID. The vote
 // delete path resolves the target community through it (communityAPID), where
 // a swallowed DB error silently addresses the Undo to nobody.

@@ -251,3 +251,108 @@ func TestFederationPrefs_UpsertNeverTouchesPurgedAt(t *testing.T) {
 	require.NotNil(t, got.PurgedAt, "and the read-back agrees with the returned row")
 	assert.True(t, got.PurgedAt.Equal(*purged.PurgedAt))
 }
+
+// ---------------------------------------------------------------------------
+// The transactional flavors (chunk 3 finding 4)
+// ---------------------------------------------------------------------------
+//
+// The consumer's opt-out door writes its preference on the rev-gate's
+// transaction so the preference, the delivery cancellation and the gate advance
+// commit as one unit. These pin the property that makes that possible — that
+// these two really do ride the caller's transaction — because a method that
+// quietly ran on r.db instead would leave every consumer-side atomicity test
+// passing for the wrong reason.
+
+func TestFederationPrefs_UpsertTxRidesTheCallersTransaction(t *testing.T) {
+	database := federationPrefsTestDB(t)
+	repo := NewFederationPrefs(database)
+	ctx := context.Background()
+
+	tx, err := database.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	stored, err := repo.UpsertTx(ctx, tx, fpOptOut(testDID, FederationPrefSourceRecord))
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	require.NoError(t, tx.Rollback())
+
+	_, err = repo.Get(ctx, testDID)
+	require.Error(t, err)
+	assert.True(t, errors.IsNotFound(err),
+		"a rolled-back transaction leaves NO preference: the write is the caller's to "+
+			"commit, which is what lets the opt-out roll back with its gate advance")
+
+	// Positive control: the same call on a committed transaction does write.
+	tx, err = database.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	_, err = repo.UpsertTx(ctx, tx, fpOptOut(testDID, FederationPrefSourceRecord))
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+
+	got, err := repo.Get(ctx, testDID)
+	require.NoError(t, err)
+	assert.False(t, got.Enabled)
+}
+
+func TestFederationPrefs_DeleteTxRidesTheCallersTransactionAndReportsTheOutcome(t *testing.T) {
+	database := federationPrefsTestDB(t)
+	repo := NewFederationPrefs(database)
+	ctx := context.Background()
+
+	_, err := repo.Upsert(ctx, fpOptOut(testDID, FederationPrefSourceRecord))
+	require.NoError(t, err)
+
+	tx, err := database.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	deleted, err := repo.DeleteTx(ctx, tx, testDID)
+	require.NoError(t, err)
+	assert.True(t, deleted, "a standing preference is cleared, and the caller is told so")
+	require.NoError(t, tx.Rollback())
+
+	_, err = repo.Get(ctx, testDID)
+	require.NoError(t, err,
+		"and the rollback restores it: absence means default-on, so a delete that "+
+			"outlived a failed event would silently re-enable a user who asked us to stop")
+
+	// A COMMITTED PURGE is refused, and the false is how the caller learns that
+	// this is not an ordinary re-enable.
+	purged := mustPurgedPref(t, repo, testSecondDID, FederationPrefSourceRecord)
+	require.NotNil(t, purged.PurgedAt)
+
+	tx, err = database.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	deleted, err = repo.DeleteTx(ctx, tx, testSecondDID)
+	require.NoError(t, err)
+	assert.False(t, deleted,
+		"a withdrawn identity has nothing to come back to, and the caller must be able "+
+			"to tell that apart from 'there was nothing to clear'")
+	require.NoError(t, tx.Commit())
+
+	survivor, err := repo.Get(ctx, testSecondDID)
+	require.NoError(t, err, "the purged row survives its own delete")
+	require.NotNil(t, survivor.PurgedAt)
+
+	// And a DID that never opted out is also false — same signal, different
+	// meaning, which is why restoreDefaultFederation reads the row back.
+	tx, err = database.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	deleted, err = repo.DeleteTx(ctx, tx, fpThirdDID)
+	require.NoError(t, err)
+	assert.False(t, deleted)
+	require.NoError(t, tx.Commit())
+}
+
+func TestFederationPrefs_TxFlavorsRefuseANilTransaction(t *testing.T) {
+	database := federationPrefsTestDB(t)
+	repo := NewFederationPrefs(database)
+	ctx := context.Background()
+
+	_, err := repo.UpsertTx(ctx, nil, fpOptOut(testDID, FederationPrefSourceRecord))
+	require.Error(t, err)
+	assert.True(t, errors.IsValidation(err),
+		"a nil tx is the correct refusal for a path that has opted out of the gate, not "+
+			"a silent fall-back to autocommit")
+
+	_, err = repo.DeleteTx(ctx, nil, testDID)
+	require.Error(t, err)
+	assert.True(t, errors.IsValidation(err))
+}

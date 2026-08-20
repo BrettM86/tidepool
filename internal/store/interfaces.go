@@ -613,6 +613,16 @@ type FederationPrefs interface {
 	// the zero value is an error satisfying errors.IsValidation.
 	Upsert(ctx context.Context, pref FederationPref) (*FederationPref, error)
 
+	// UpsertTx is Upsert on an existing transaction — the seam the consumer's
+	// opt-out handler uses so the preference, the delivery cancellation and the
+	// rev-gate advance commit as ONE unit. A nil tx is an error satisfying
+	// errors.IsValidation.
+	//
+	// NOT for a caller that then reaches a seam opening its own transaction
+	// against this row: it cannot release what it holds without committing, and
+	// the two block each other (see consume/rev_gate.go's DEADLOCK NOTE).
+	UpsertTx(ctx context.Context, tx *sql.Tx, pref FederationPref) (*FederationPref, error)
+
 	// Get returns the preference for a DID. A miss is an error satisfying
 	// errors.IsNotFound and MEANS default-on, not "unknown".
 	Get(ctx context.Context, did string) (*FederationPref, error)
@@ -623,6 +633,19 @@ type FederationPrefs interface {
 	// and a user whose content peers were already told to delete has nothing to
 	// come back to. Callers that report an outcome read the row back.
 	Delete(ctx context.Context, did string) error
+
+	// DeleteTx is Delete on an existing transaction — the re-enable half of the
+	// consumer's opt-out door, so the clearing rides the rev-gate advance and a
+	// failed event cannot leave federation silently restored for a user who
+	// asked us to stop. A nil tx is an error satisfying errors.IsValidation.
+	//
+	// It reports whether a row was actually removed, which is how a caller tells
+	// the ordinary re-enable from the one case this refuses: a COMMITTED PURGE
+	// is not deletable. A false with no error means either "there was nothing to
+	// clear" or "the identity was withdrawn and cannot come back", and since
+	// nothing was written, the caller may read the row back on any connection to
+	// tell which.
+	DeleteTx(ctx context.Context, tx *sql.Tx, did string) (deleted bool, err error)
 
 	// MarkPurged records that the destructive tier actually asked peers to
 	// delete this user's content — the fact that makes the preference terminal.

@@ -21,6 +21,17 @@ func NewFederationPrefs(db *sql.DB) FederationPrefs {
 const federationPrefColumns = `did, enabled, delete_remote, source, purged_at, updated_at`
 
 func (r *postgresFederationPrefs) Upsert(ctx context.Context, pref FederationPref) (*FederationPref, error) {
+	return r.upsert(ctx, r.db, pref)
+}
+
+func (r *postgresFederationPrefs) UpsertTx(ctx context.Context, tx *sql.Tx, pref FederationPref) (*FederationPref, error) {
+	if tx == nil {
+		return nil, errors.NewValidationError("tx", "must not be nil")
+	}
+	return r.upsert(ctx, tx, pref)
+}
+
+func (r *postgresFederationPrefs) upsert(ctx context.Context, ex execer, pref FederationPref) (*FederationPref, error) {
 	if !pref.Source.Valid() {
 		// Including the zero value: an unstated source hides whether the
 		// preference came off a record we saw or a probe we made, and those
@@ -48,7 +59,7 @@ func (r *postgresFederationPrefs) Upsert(ctx context.Context, pref FederationPre
 			updated_at = now()
 		RETURNING ` + federationPrefColumns
 
-	row := r.db.QueryRowContext(ctx, query,
+	row := ex.QueryRowContext(ctx, query,
 		pref.DID, pref.Enabled, pref.DeleteRemote, string(pref.Source))
 	stored, err := scanFederationPref(row)
 	if err != nil {
@@ -84,11 +95,28 @@ func (r *postgresFederationPrefs) Delete(ctx context.Context, did string) error 
 	// which is the most innocuous-looking way to undo an irreversible decision.
 	// The caller is told nothing changed by reading the row back, which
 	// restoreDefaultFederation does before it says anything to an operator.
-	if _, err := r.db.ExecContext(ctx,
-		`DELETE FROM federation_prefs WHERE did = $1 AND purged_at IS NULL`, did); err != nil {
-		return fmt.Errorf("delete federation_pref %q: %w", did, err)
+	_, err := deleteFederationPref(ctx, r.db, did)
+	return err
+}
+
+func (r *postgresFederationPrefs) DeleteTx(ctx context.Context, tx *sql.Tx, did string) (bool, error) {
+	if tx == nil {
+		return false, errors.NewValidationError("tx", "must not be nil")
 	}
-	return nil
+	return deleteFederationPref(ctx, tx, did)
+}
+
+func deleteFederationPref(ctx context.Context, ex execer, did string) (bool, error) {
+	result, err := ex.ExecContext(ctx,
+		`DELETE FROM federation_prefs WHERE did = $1 AND purged_at IS NULL`, did)
+	if err != nil {
+		return false, fmt.Errorf("delete federation_pref %q: %w", did, err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("delete federation_pref %q: rows affected: %w", did, err)
+	}
+	return affected > 0, nil
 }
 
 func (r *postgresFederationPrefs) MarkPurgedTx(ctx context.Context, tx *sql.Tx, did string) error {

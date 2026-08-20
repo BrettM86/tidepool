@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"strconv"
 
 	"tidepool/internal/errors"
 	"tidepool/internal/store"
@@ -24,6 +25,18 @@ import (
 // A DID with no actor row is skipped rather than minted: a profile edit is not
 // a federating interaction, and minting here would give an AP identity to
 // every Coves user who ever set a display name.
+//
+// That skip CLAIMS its gate row, unlike the transient skips errSkipUnclaimed
+// covers, and the trade is deliberate. The actor could exist tomorrow, so the
+// skip is technically recoverable — but what is lost is one cached display
+// name, the actor document already falls back to the local part, and the next
+// profile write refreshes it. Against that: a profile edit by a user who never
+// federates anything is one of the most common events on this stream, and
+// releasing the claim would put every one of them in the unclaimed-skip counter
+// and an INFO log, drowning the signal that counter exists to carry.
+//
+// The tx is unused for the same reason handleProfile writes no outbound state:
+// this handler only refreshes a cache, and UpdateProfile is last-write-wins.
 func (d *Dispatcher) handleProfile(ctx context.Context, _ *sql.Tx, did string, commit *CommitEvent) error {
 	if _, err := d.apActors.GetByDID(ctx, did); err != nil {
 		if errors.IsNotFound(err) {
@@ -69,14 +82,46 @@ func (d *Dispatcher) handleProfile(ctx context.Context, _ *sql.Tx, did string, c
 // The local part is untouched. It was frozen at actor creation, and
 // re-deriving it would strand every federated mention of the old name — a
 // rename may refresh the profile CACHE and nothing else.
+//
+// NO ORDERING GUARD, AND THAT IS THE RULING RATHER THAN AN OVERSIGHT.
+// IdentityEvent.Seq is parsed off the wire and deliberately not consulted here,
+// where the sibling #account tier claims its seq (applyAccountClaimed) before
+// touching anything. The difference is what each handler WRITES. An #account
+// frame's payload IS the state applied — active/status go straight into the
+// actor row — so a stale replay writes stale facts and a user who came back
+// silently stays paused. This handler writes nothing the frame carries: the
+// handle is re-resolved from PLC and well-known every time, so a frame from an
+// hour ago and a frame from a second ago apply the IDENTICAL current answer.
+// Replaying one cannot regress the cache.
+//
+// The residual, named so a later change does not rediscover it as a surprise:
+// two handlers racing for one DID could resolve in one order and write in the
+// other, leaving the older handle cached. It is bounded to a single write —
+// the fallback below fires only while DisplayName is empty, and the first
+// write fills it — so the window closes after the first rename and no seq
+// claim is worth holding an advisory lock across two network round-trips for.
+// A seq claim becomes REQUIRED the moment this handler starts persisting
+// anything the frame itself asserts.
 func (d *Dispatcher) handleIdentity(ctx context.Context, event *JetstreamEvent) error {
 	if event.Identity == nil {
 		return fmt.Errorf("%w: identity event for %s carries no identity", ErrPermanentEvent, event.DID)
 	}
-	did := event.Identity.DID
-	if did == "" {
-		did = event.DID
+
+	// The envelope DID is authoritative, exactly as it is for #account. A nested
+	// payload naming a DIFFERENT DID is malformed or hostile — acting on the
+	// inner one lets a frame about DID A resolve, verify and cache DID B — and
+	// no retry makes the two agree, so it is rejected as permanent BEFORE the
+	// resolver is reached. That last part is the security half: without it a
+	// crafted #identity frame aims this bridge's PLC and well-known round trips
+	// at any DID the attacker cares to name.
+	if event.Identity.DID != "" && event.Identity.DID != event.DID {
+		return fmt.Errorf("%w: identity payload DID %s disagrees with the envelope DID %s",
+			ErrPermanentEvent, strconv.Quote(event.Identity.DID), strconv.Quote(event.DID))
 	}
+	// An ABSENT inner DID is not a disagreement: the envelope answers for the
+	// frame. Jetstream always fills it, but the DLQ stores raw frames and a
+	// redriven or hand-repaired one can be thinner than the wire shape.
+	did := event.DID
 
 	// The actor check comes FIRST: every Coves user who renames emits one of
 	// these, and resolving would spend two network round-trips updating a

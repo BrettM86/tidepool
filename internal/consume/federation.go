@@ -31,12 +31,16 @@ import (
 // clears any stored deleteRemote: a stale destructive flag on a re-enabled
 // user is a loaded gun pointed at the task 17 tier.
 //
-// tx is the REV-GATE's transaction, and the disable path writes on it: the
-// actor mirror and the cancellation of that actor's queued deliveries are one
-// decision, and they commit with the gate advance or not at all. Atomicity here
-// is structural rather than defended — there is no window in which one landed
-// and the other did not, and a failure leaves the gate un-advanced so the record
-// replays and re-applies both.
+// tx is the REV-GATE's transaction, and every state write this handler makes
+// rides it: the preference row, the cancellation of that actor's queued
+// deliveries, and the actor mirror are ONE decision that commits with the gate
+// advance or not at all. A failure leaves the gate un-advanced and nothing
+// committed, so the record replays and re-applies the whole decision.
+//
+// WITH ONE EXCEPTION, and it is the destructive tier — see applyOptOut. The
+// preference has to be durable BEFORE peers are asked to delete anything, and
+// the seam that asks them writes the very same row from its own transaction, so
+// on that path the preference is committed ahead of the gate on purpose.
 func (d *Dispatcher) handleFederation(ctx context.Context, tx *sql.Tx, did string, commit *CommitEvent) error {
 	if commit.Operation == operationDelete {
 		// A delete commit carries no record body, which costs nothing here:
@@ -60,19 +64,53 @@ func (d *Dispatcher) handleFederation(ctx context.Context, tx *sql.Tx, did strin
 	// deleteRemote is optional and defaults to false: the soft tier. Nothing
 	// destructive is ever INFERRED — only an explicit true escalates.
 	deleteRemote, _ := boolField(commit.Record, "deleteRemote")
+	return d.applyOptOut(ctx, tx, did, deleteRemote)
+}
 
-	// The preference is recorded BEFORE the destructive seam is reached, and
-	// deliberately NOT on the transaction below. Peers that honor a Delete
-	// cannot restore what they dropped, so the user's intent must be durable
-	// before anything is sent — and the gate transaction has not committed by
-	// the time the destructive seam runs. It is the authority besides: it
-	// answers for every DID, including the ones with no actor to mirror onto.
-	if _, err := d.prefs.Upsert(ctx, store.FederationPref{
+// applyOptOut records the opt-out and stops the user's outbound traffic.
+//
+// THE RESULTING ORDER, and which connection each step runs on, because that is
+// the whole of this function:
+//
+//  1. the PREFERENCE. On the gate tx for the soft tier; on its own connection,
+//     committed immediately, for the destructive one (see below).
+//  2. the CANCELLATION of everything already queued — on the gate tx.
+//  3. the DESTRUCTIVE SEAM, if asked for. Outside any transaction of ours: it
+//     opens its own.
+//  4. the ACTOR MIRROR — on the gate tx, and LAST, because the seam above
+//     updates that same row from its own transaction.
+//
+// WHY STEP 1 SPLITS. The seam in step 3 reads and writes federation_prefs from
+// its own transaction: outbound.Purger marks this exact row purged there, and
+// purged_at is the only durable record that peers were really asked to delete.
+// Holding the row uncommitted on the gate tx across that call would do both
+// halves of the damage at once — the purge would find no preference to mark,
+// and its UPDATE of the row would block on a lock this handler cannot release
+// without committing while it waits synchronously for the call to return. That
+// is precisely the shape rev_gate.go's DEADLOCK NOTE forbids.
+//
+// The cost of the split is stated rather than hidden: on the destructive path a
+// later failure leaves a committed preference under an unadvanced gate, so the
+// record replays. That is safe because the opt-out is idempotent (the same
+// upsert, the same deterministic activity ids, a delivery insert that returns
+// the standing row) and because the preference is the SAFE half to have
+// committed early — it says "stop", and a replay re-asserts it.
+func (d *Dispatcher) applyOptOut(ctx context.Context, tx *sql.Tx, did string, deleteRemote bool) error {
+	// The preference is the AUTHORITY, not a mirror: it answers for every DID,
+	// including the ones with no actor to mirror onto.
+	pref := store.FederationPref{
 		DID:          did,
 		Enabled:      false,
 		DeleteRemote: deleteRemote,
 		Source:       store.FederationPrefSourceRecord,
-	}); err != nil {
+	}
+	var err error
+	if deleteRemote {
+		_, err = d.prefs.Upsert(ctx, pref)
+	} else {
+		_, err = d.prefs.UpsertTx(ctx, tx, pref)
+	}
+	if err != nil {
 		return fmt.Errorf("record federation opt-out for %s: %w", did, err)
 	}
 
@@ -165,21 +203,38 @@ func (d *Dispatcher) deleteRemoteContent(ctx context.Context, did string) error 
 // Delete cannot remove a purged preference — so this reads the outcome back
 // rather than deciding it, and says so once, loudly, where an operator can see
 // that a user tried to come back and could not.
+//
+// BOTH HALVES RIDE THE GATE TRANSACTION. No destructive seam is reachable from
+// here, so nothing opens a second transaction against either row and the whole
+// restore commits with the gate advance — which matters in this direction most
+// of all: absence means default-on, so a cleared preference that outlived a
+// failed event would silently re-enable federation for somebody who asked us to
+// stop.
 func (d *Dispatcher) restoreDefaultFederation(ctx context.Context, tx *sql.Tx, did string) error {
-	if err := d.prefs.Delete(ctx, did); err != nil {
+	cleared, err := d.prefs.DeleteTx(ctx, tx, did)
+	if err != nil {
 		return fmt.Errorf("clear federation preference for %s: %w", did, err)
 	}
 	if err := d.mirrorActorEnabled(ctx, tx, did, true); err != nil {
 		return err
 	}
+	if cleared {
+		return nil // an ordinary re-enable
+	}
 
+	// Nothing was cleared, so this is either a DID that never opted out or one
+	// whose withdrawal committed and cannot be undone. The read tells them
+	// apart, and it is safe on any connection precisely BECAUSE nothing was
+	// written: this transaction has changed nothing about the row it is asking
+	// about, so an outside snapshot and the transaction's own agree.
+	//
 	// The read is the report. Nothing here can fail the event: the record was
 	// applied exactly as far as it is allowed to go, and retrying would re-ask a
 	// question whose answer is terminal.
 	pref, err := d.prefs.Get(ctx, did)
 	switch {
 	case errors.IsNotFound(err):
-		return nil // cleared: an ordinary re-enable
+		return nil // there was nothing to clear
 	case err != nil:
 		return fmt.Errorf("read federation preference for %s: %w", did, err)
 	case pref.PurgedAt != nil:

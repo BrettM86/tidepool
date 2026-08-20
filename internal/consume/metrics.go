@@ -21,7 +21,30 @@ const (
 	MetricConnected           = "tidepool_consumer_connected"
 	MetricDialFailures        = "tidepool_consumer_dial_failures"
 	MetricDisconnectedSeconds = "tidepool_consumer_disconnected_seconds"
+	MetricUnclaimedSkips      = "tidepool_consumer_unclaimed_skips"
 )
+
+// unclaimedSkips counts the handler skips that DELIBERATELY release the rev
+// gate un-advanced (errSkipUnclaimed): a vote whose subject has not
+// materialized, a comment whose thread has not, a post for a community nobody
+// has bridged yet, a vote direction this build does not understand.
+//
+// It is the only trace such an event leaves. It is not a failure, so it never
+// reaches the DLQ; it is not applied, so it writes no state; and the event is
+// reported handled, so the cursor moves past it. A backlog of them is a real
+// condition — a community that should have been bridged, a materializer that
+// has stalled — and without this counter the only symptom is content quietly
+// not federating.
+//
+// A COUNTER RATHER THAN A GAUGE, and it is a RATE that matters, not a total:
+// the ordinary case (a native user voting in a native community) increments it
+// constantly, so the number is meaningless in isolation and informative when it
+// moves against its own baseline.
+//
+// Declared at package scope rather than inside PublishMetrics because the
+// increment happens in the gate, which knows nothing about the connector the
+// other gauges read; expvar.NewInt registers it exactly once per process.
+var unclaimedSkips = expvar.NewInt(MetricUnclaimedSkips)
 
 // deadLetterDepthUnavailable is what the backlog gauge reports when storage
 // cannot be read. A negative value is impossible for a count, so it is

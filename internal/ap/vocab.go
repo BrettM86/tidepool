@@ -19,11 +19,20 @@ import (
 )
 
 // AS2 media types. Lemmy serves and accepts application/activity+json;
-// Mastodon prefers the ld+json profile form. We send both in Accept.
+// Mastodon prefers the ld+json profile form when SERVING.
+//
+// Accept is the bare activity+json type, deliberately not a compound
+// "activity+json, ld+json; profile=...; q=0.9" list: some Lemmy deployments
+// (startrek.website, 2026-08, an Elestio-packaged nginx) route to the
+// backend only when Accept is byte-for-byte one of the two types — anything
+// with a comma or q-value falls through to lemmy-ui and comes back as a
+// 200 text/html SPA shell. The bare type is exactly what Lemmy's
+// activitypub-federation crate, PieFed and Mbin send on their own fetches,
+// and every AP implementation serves it, so nothing is lost by matching them.
 const (
 	ContentTypeActivityJSON = "application/activity+json"
 	ContentTypeLDJSON       = `application/ld+json; profile="https://www.w3.org/ns/activitystreams"`
-	acceptActivityJSON      = ContentTypeActivityJSON + `, application/ld+json; profile="https://www.w3.org/ns/activitystreams"; q=0.9`
+	acceptActivityJSON      = ContentTypeActivityJSON
 )
 
 // PublicAudience is the special AS2 collection meaning "public".

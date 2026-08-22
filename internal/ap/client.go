@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand/v2"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -970,6 +971,9 @@ func (c *Client) getOnce(ctx context.Context, iri string, mode fetchMode) (body 
 
 		switch {
 		case resp.StatusCode >= 200 && resp.StatusCode < 300:
+			if err := checkJSONResponse(resp, body); err != nil {
+				return nil, false, fmt.Errorf("ap: GET %s: %w", target, err)
+			}
 			return body, false, nil
 		case resp.StatusCode == http.StatusGone:
 			// 410 Gone is how Lemmy serves deleted objects (with a Tombstone
@@ -997,6 +1001,25 @@ func (c *Client) getOnce(ctx context.Context, iri string, mode fetchMode) (body 
 			return nil, false, HTTPError{URL: iri, StatusCode: resp.StatusCode}
 		}
 	}
+}
+
+// checkJSONResponse names the failure when a 2xx response is not JSON at
+// all. It fires only when BOTH the body does not look like JSON AND the
+// declared Content-Type is a non-JSON type (text/html …): a server that
+// mislabels valid JSON still parses, and a JSON-typed garbage body still
+// reaches the parser for its own error. Without this, a content-negotiation
+// miss (an instance's proxy serving its HTML frontend with 200 to an AP
+// fetch) surfaces as the opaque "payload is not a JSON object".
+func checkJSONResponse(resp *http.Response, body []byte) error {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[') {
+		return nil
+	}
+	mediaType, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if err != nil || mediaType == "" || strings.Contains(mediaType, "json") {
+		return nil
+	}
+	return fmt.Errorf("response is %s, not JSON (content negotiation failed?)", mediaType)
 }
 
 // readBody drains the response body through the size cap and closes it.

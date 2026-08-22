@@ -57,7 +57,10 @@ func TestFetchObject_SignedGET(t *testing.T) {
 	assert.Equal(t, "https://lemmy.world/post/49131386", obj.ID)
 
 	require.NotNil(t, sawRequest)
-	assert.Contains(t, sawRequest.Header.Get("Accept"), "application/activity+json")
+	// Pinned to the bare type, not a compound list: at least one Lemmy
+	// deployment's proxy (startrek.website) exact-matches Accept and serves
+	// its HTML frontend to anything else. See acceptActivityJSON.
+	assert.Equal(t, ContentTypeActivityJSON, sawRequest.Header.Get("Accept"))
 	assert.Equal(t, "tidepool-test/0", sawRequest.Header.Get("User-Agent"))
 
 	// The GET must carry a signature Lemmy would accept: verify it
@@ -66,6 +69,54 @@ func TestFetchObject_SignedGET(t *testing.T) {
 	require.NoError(t, err, "signed GET must verify against the signer's public key")
 	fields := parseSignatureHeader(sawRequest.Header.Get("Signature"))
 	assert.Equal(t, "(request-target) host date digest", fields["headers"])
+}
+
+// A 200 whose body is the instance's HTML frontend (content negotiation
+// missed) must be reported as such — naming the media type — rather than as
+// the opaque "payload is not a JSON object". Conversely, valid JSON served
+// under a wrong Content-Type must still parse: the check is a diagnostic,
+// not a strictness gate.
+func TestFetchObject_NonJSONResponseNamesContentType(t *testing.T) {
+	t.Run("html with 200 is diagnosed", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write([]byte("\n    <!DOCTYPE html>\n    <html lang=\"en\"><head></head><body>spa shell</body></html>"))
+		}))
+		defer server.Close()
+
+		client := newTestClient(t, ClientOptions{})
+		_, err := client.FetchObject(context.Background(), server.URL+"/c/startrek")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "text/html")
+		assert.Contains(t, err.Error(), "not JSON")
+		assert.NotContains(t, err.Error(), "payload is not a JSON object")
+	})
+
+	t.Run("json under a non-json content-type still parses", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = w.Write(loadFixture(t, "page_lemmy_world.json"))
+		}))
+		defer server.Close()
+
+		client := newTestClient(t, ClientOptions{})
+		obj, err := client.FetchObject(context.Background(), server.URL+"/post/49131386")
+		require.NoError(t, err)
+		assert.Equal(t, TypePage, obj.Type)
+	})
+
+	t.Run("json content-type with a non-json body still reaches the parser", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", ContentTypeActivityJSON)
+			_, _ = w.Write([]byte(`"just a string"`))
+		}))
+		defer server.Close()
+
+		client := newTestClient(t, ClientOptions{})
+		_, err := client.FetchObject(context.Background(), server.URL+"/x")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "payload is not a JSON object")
+	})
 }
 
 func TestFetchObject_StatusMapping(t *testing.T) {

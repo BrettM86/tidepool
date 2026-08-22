@@ -442,3 +442,54 @@ func TestHostRouter_ComposedFallbackOnlyOn404(t *testing.T) {
 		})
 	}
 }
+
+// TestHostRouter_HostAgnosticPaths: Caddy's on-demand TLS ask reaches this
+// process addressed by its DOCKER DNS NAME — the compose `ask` URL is
+// http://tidepool:80/.well-known/tidepool-tls-ask, so the request carries
+// Host "tidepool", a name that is neither configured surface. The ask gate is
+// infrastructure: it must answer for whatever name the edge proxy happens to
+// reach the container by, because refusing it with 421 silently breaks every
+// NEW handle-cert issuance and every renewal (observed in production
+// 2026-08-22). Paths listed as host-agnostic therefore go to the service
+// handler before any Host judgment; every other path on the same unrecognized
+// Host keeps the 421 posture.
+func TestHostRouter_HostAgnosticPaths(t *testing.T) {
+	const askPath = "/.well-known/tidepool-tls-ask"
+
+	service := newMarker("service")
+	user := newMarker("user")
+	router, err := NewHostRouter(HostRouterOptions{
+		ServiceHost:       serviceHost,
+		ServiceHandler:    service,
+		UserHost:          userHost,
+		UserHandler:       user,
+		HostAgnosticPaths: []string{askPath},
+	})
+	require.NoError(t, err)
+
+	for _, host := range []string{
+		"tidepool",          // the compose service name — production's actual ask Host
+		"tidepool:80",       // with the port the ask URL names
+		"anything.example",  // any other name the proxy might be told to use
+	} {
+		t.Run("ask via "+host, func(t *testing.T) {
+			rec := routeHost(t, router, "http", host, askPath+"?domain=alice.lemmy-world."+serviceHost)
+			assert.Equal(t, http.StatusOK, rec.Code,
+				"the TLS ask must be served regardless of Host; a 421 here denies certificate issuance")
+			assert.Equal(t, "service", rec.Header().Get("X-Handler"),
+				"the ask gate lives on the service surface")
+		})
+	}
+
+	// The exemption is the PATH, not the Host: the same unrecognized name
+	// asking for anything else is still refused.
+	rec := routeHost(t, router, "http", "tidepool", "/ap/inbox")
+	assert.Equal(t, http.StatusMisdirectedRequest, rec.Code,
+		"an unrecognized Host must stay refused for every path not listed as host-agnostic")
+
+	// And on the recognized surfaces nothing changes: the ask path was
+	// already served for the bridge hostname.
+	rec = routeHost(t, router, "https", serviceHost, askPath)
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "service", rec.Header().Get("X-Handler"))
+}

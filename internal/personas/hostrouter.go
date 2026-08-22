@@ -30,6 +30,14 @@ type HostRouterOptions struct {
 	// refusing them. A laptop is reached by IP, tunnel hostname, or whatever
 	// the tunnel minted this morning; a production deployment is not.
 	DevFallthrough bool
+	// HostAgnosticPaths are served by ServiceHandler regardless of Host.
+	// This exists for infrastructure the edge proxy addresses by the
+	// container's own DNS name rather than a public hostname: Caddy's
+	// on-demand TLS `ask` URL is http://tidepool:80/..., so its requests
+	// carry Host "tidepool" — a name neither surface claims — and judging
+	// them by Host silently denies certificate issuance for every bridged
+	// handle. Match is on the exact request path.
+	HostAgnosticPaths []string
 	// Logger receives a sampled warning for refused Hosts. Nil uses
 	// slog.Default().
 	Logger *slog.Logger
@@ -65,12 +73,17 @@ func NewHostRouter(opts HostRouterOptions) (http.Handler, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	hostAgnostic := make(map[string]bool, len(opts.HostAgnosticPaths))
+	for _, path := range opts.HostAgnosticPaths {
+		hostAgnostic[path] = true
+	}
 	return &hostRouter{
 		serviceHost:    normalizeHost(opts.ServiceHost),
 		serviceHandler: opts.ServiceHandler,
 		userHost:       normalizeHost(opts.UserHost),
 		userHandler:    opts.UserHandler,
 		devFallthrough: opts.DevFallthrough,
+		hostAgnostic:   hostAgnostic,
 		logger:         logger,
 		refusalLog:     ratelimit.NewSampler(misdirectedLogInterval),
 	}, nil
@@ -82,11 +95,18 @@ type hostRouter struct {
 	userHost       string
 	userHandler    http.Handler
 	devFallthrough bool
+	hostAgnostic   map[string]bool
 	logger         *slog.Logger
 	refusalLog     *ratelimit.Sampler
 }
 
 func (h *hostRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Host-agnostic paths are judged before the Host is: they belong to the
+	// service surface under ANY name, including ones neither bucket claims.
+	if h.hostAgnostic[r.URL.Path] {
+		h.serviceHandler.ServeHTTP(w, r)
+		return
+	}
 	host := normalizeHost(r.Host)
 	switch {
 	case host == h.userHost && h.isServiceHost(host):

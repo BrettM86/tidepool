@@ -443,8 +443,14 @@ actors are minted lazily on first federating interaction.
 
 `tdpl.io`, the per-instance wildcard blocks, and the on-demand catch-all are
 untouched by v2. The `on_demand_tls ask` gate still points at
-`http://tidepool:80/.well-known/tidepool-tls-ask`, which is served on the
-bridge Host (`cmd/tidepool/main.go:165`) and is unaffected by anything above.
+`http://tidepool:80/.well-known/tidepool-tls-ask` — but note that URL names
+the CONTAINER, so the request arrives carrying `Host: tidepool`, a name the
+v2 host router recognizes as neither surface. The gate only keeps working
+because the router serves `identity.TLSAskPath` host-agnostically, before any
+Host judgment (`HostAgnosticPaths`, `internal/personas/hostrouter.go`). An
+earlier revision of this section claimed the gate was "unaffected" by the
+host router; it was not — the 421s it produced denied issuance for every new
+handle cert and renewal until the exemption landed (2026-08-22).
 
 ---
 

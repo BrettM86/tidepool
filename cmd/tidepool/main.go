@@ -276,7 +276,7 @@ func run(logger *slog.Logger) error {
 	// Cert-issuance gate for TLS-terminating proxies with on-demand
 	// issuance (production Caddy asks here before requesting a cert for a
 	// bridged-handle subdomain; see docker-compose.prod.yml header).
-	router.Get("/.well-known/tidepool-tls-ask", identity.TLSAskHandler(resolver, logger))
+	router.Get(identity.TLSAskPath, identity.TLSAskHandler(resolver, logger))
 	// The bridge's own did:web document (404 when a non-did:web
 	// BRIDGE_SERVICE_DID is provisioned).
 	router.Get("/.well-known/did.json", identity.DIDWebHandler(serviceDID, cfg.BridgeHostname))
@@ -695,6 +695,11 @@ func run(logger *slog.Logger) error {
 		UserHost:       userHost.Host,
 		UserHandler:    personasService,
 		DevFallthrough: cfg.APHostFallthroughDev,
+		// Caddy's on-demand TLS ask reaches this process by its container
+		// DNS name (the compose ask URL is http://tidepool:80/...), so the
+		// cert gate must answer under a Host neither surface claims —
+		// refusing it denies issuance for every bridged handle.
+		HostAgnosticPaths: []string{identity.TLSAskPath},
 	})
 	if err != nil {
 		return fmt.Errorf("host router: %w", err)

@@ -130,6 +130,13 @@ func WellKnownDIDHandler(resolver Resolver, logger *slog.Logger) http.HandlerFun
 	}
 }
 
+// TLSAskPath is where TLSAskHandler is served. It is a named constant
+// because the path is load-bearing in two places that must agree: the route
+// registration, and the host router's host-agnostic exemption — the proxy's
+// `ask` URL addresses this process by its container DNS name, so the request
+// arrives under a Host the router would otherwise refuse.
+const TLSAskPath = "/.well-known/tidepool-tls-ask"
+
 // TLSAskHandler gates on-demand TLS certificate issuance for the bridged
 // handle space: GET /.well-known/tidepool-tls-ask?domain=<hostname> answers
 // 200 iff the hostname is a handle the bridge would serve (resolvable, not

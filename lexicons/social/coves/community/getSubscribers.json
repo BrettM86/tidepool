@@ -13,8 +13,8 @@
         "properties": {
           "community": {
             "type": "string",
-            "format": "at-identifier",
-            "description": "DID or handle of the community"
+            "maxLength": 320,
+            "description": "Community identifier: a DID (did:plc:...), an atProto handle (c-gaming.coves.social or gaming.coves.social), a scoped identifier with or without the ! prefix (gaming@coves.social, comicstrips@lemmy.world), or a bare name for a community on this instance (gaming)"
           },
           "limit": {
             "type": "integer",

@@ -18,6 +18,11 @@
             "maxLength": 63,
             "description": "Short community name (local part of handle). Must be a valid DNS label: ASCII letters, digits, and hyphens only."
           },
+          "origin": {
+            "type": "string",
+            "maxLength": 253,
+            "description": "Instance this community actually lives on (hostname only, e.g. lemmy.world). Self-asserted; appviews must validate against the verified handle."
+          },
           "displayName": {
             "type": "string",
             "maxGraphemes": 128,

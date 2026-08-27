@@ -639,6 +639,18 @@ func (c *lemmyClient) editCommunity(t *testing.T, communityID int, title, descri
 // construction.
 func lemmyInternalOrigin() string { return envOr("LEMMY_E2E_INTERNAL_ORIGIN", "http://lemmy") }
 
+// lemmyHostname is the bare host of Lemmy's AP ids ("lemmy" in compose) —
+// what the bridge writes into community.profile.origin, since the origin
+// field is derived from the Group actor's id host and nothing else.
+func lemmyHostname(t *testing.T) string {
+	t.Helper()
+	u, err := url.Parse(lemmyInternalOrigin())
+	if err != nil || u.Hostname() == "" {
+		t.Fatalf("LEMMY_E2E_INTERNAL_ORIGIN %q has no hostname (err=%v)", lemmyInternalOrigin(), err)
+	}
+	return u.Hostname()
+}
+
 // uploadImage pushes image bytes through Lemmy's authenticated pictrs proxy
 // (POST /pictrs/image, multipart field "images[]" — Lemmy streams the body
 // to pict-rs unchanged) and returns the compose-internal image URL in the

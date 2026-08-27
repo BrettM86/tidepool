@@ -142,6 +142,11 @@
           "type": "string",
           "maxLength": 63
         },
+        "origin": {
+          "type": "string",
+          "maxLength": 253,
+          "description": "Instance this community actually lives on (hostname only, e.g. lemmy.world). Validated by the AppView at index time."
+        },
         "avatar": {
           "type": "string",
           "format": "uri"

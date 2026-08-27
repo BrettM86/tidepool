@@ -22,5 +22,6 @@
   "displayName": "Technology",
   "hostedBy": "did:web:tidepool.test",
   "name": "technology",
+  "origin": "lemmy.world",
   "visibility": "public"
 }

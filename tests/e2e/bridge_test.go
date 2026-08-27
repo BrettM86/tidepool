@@ -46,6 +46,12 @@ func TestSubscribe_CommunityProfileOnFirehose(t *testing.T) {
 	if got := recordField(t, ev.Commit.Record, "name"); got != community.Name {
 		t.Errorf("community.profile name = %q, want %q", got, community.Name)
 	}
+	// origin is the Lemmy host the community really lives on, taken from the
+	// Group id and nothing else (self-asserted; what an appview does with it
+	// is its trust policy, not something this suite observes).
+	if got := recordField(t, ev.Commit.Record, "origin"); got != lemmyHostname(t) {
+		t.Errorf("community.profile origin = %q, want the Lemmy host %q", got, lemmyHostname(t))
+	}
 }
 
 // Scenario 2: a Lemmy user shares a link → actor.profile AND community.post

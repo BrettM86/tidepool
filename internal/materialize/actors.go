@@ -3,6 +3,8 @@ package materialize
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/url"
 	"strings"
 	"time"
 
@@ -473,8 +475,12 @@ func (m *Materializer) buildActorProfile(doc *ap.Object, fallbackCreatedAt time.
 // bridge's service DID (the bridge hosts and administers the mirror).
 func (m *Materializer) buildCommunityProfile(doc *ap.Object, fallbackCreatedAt time.Time, avatar, banner *atdata.Blob) map[string]any {
 	record := map[string]any{
-		"$type":     CollectionCommunityProfile,
-		"name":      truncateText(doc.PreferredUsername, 64, 64),
+		"$type": CollectionCommunityProfile,
+		// name is a DNS label (the local part of the community's handle), and
+		// the lexicon caps it at 63 — the DNS label limit — not 64. Nothing
+		// here validates against the lexicon, so the cap must hold at build
+		// time or a 64-byte name ships and the appview refuses it.
+		"name":      truncateText(doc.PreferredUsername, 63, 63),
 		"createdBy": m.serviceDID,
 		"hostedBy":  m.serviceDID,
 		"createdAt": recordDatetime(actorCreatedAt(doc, fallbackCreatedAt)),
@@ -487,6 +493,32 @@ func (m *Materializer) buildCommunityProfile(doc *ap.Object, fallbackCreatedAt t
 	}
 	if doc.Name != "" {
 		record["displayName"] = truncateText(doc.Name, 128, 1280)
+	}
+	// origin is the instance the community REALLY lives on ("lemmy.world"),
+	// so clients can render !technology@lemmy.world instead of the flattened
+	// DNS handle technology.lemmy-world.tdpl.io — the handle can carry the
+	// Lemmy host only lossily (dots become hyphens), and the mapping is not
+	// reversible on the client side.
+	//
+	// The value is SELF-ASSERTED: nothing in the record proves it. The Coves
+	// AppView honours it only when the writing repo's PDS is in its
+	// TRUSTED_BRIDGE_PDS_HOSTS or the origin is provable from the repo's
+	// DNS-verified handle (see admitCommunityOrigin in the Coves repo; that
+	// side lives on the coves feat/community-origin-resolve stack). A
+	// bridged community's handle proves tdpl.io, never lemmy.world, so this
+	// field renders on Coves ONLY because the bridge PDS is in that trust
+	// list — an appview that does not trust us drops it with a warning and
+	// indexes the community without an origin (the record is never refused
+	// over it). It is the bare lowercase hostname: the only form the appview
+	// accepts — a scheme, port, IP literal or trailing dot is dropped at
+	// index time, so originHost omits the field rather than assert one that
+	// would be thrown away or, worse, name the wrong instance.
+	//
+	// Not to be confused with store.Origin (models.go), which records which
+	// SIDE of the bridge authored an object (fediverse vs bridge) for echo
+	// suppression; store.OriginInstance is the field with this meaning.
+	if originInstance := originHost(doc); originInstance != "" {
+		record["origin"] = originInstance
 	}
 	record["description"] = bioWithProvenance(markdownFromSummary(doc),
 		provenanceLine("!", doc.PreferredUsername, doc.Host()), 1000, 10000)
@@ -547,4 +579,31 @@ func bioWithProvenance(bio, provenance string, maxGraphemes, maxBytes int) strin
 		return truncateText(provenance, maxGraphemes, maxBytes)
 	}
 	return truncateText(bio, budget, byteBudget) + "\n\n" + provenance
+}
+
+// maxOriginHostLen is the lexicon's maxLength for community.profile.origin
+// (the DNS name limit).
+const maxOriginHostLen = 253
+
+// originHost derives the community.profile origin from the Group's canonical
+// id: the lowercase hostname, or "" when the id carries nothing the appview
+// would accept as one. A non-default port is a different instance than the
+// bare host (lemmy.example:8536 is not lemmy.example), so rather than assert
+// a wrong origin the field is omitted and the community keeps rendering by
+// its flattened handle. IP literals and over-long names are omitted for the
+// same reason: the appview refuses them, and an omitted field degrades to
+// today's behaviour while a refused record would not.
+func originHost(doc *ap.Object) string {
+	if doc.ID == "" {
+		return ""
+	}
+	u, err := url.Parse(doc.ID)
+	if err != nil || u.Port() != "" {
+		return ""
+	}
+	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+	if host == "" || len(host) > maxOriginHostLen || net.ParseIP(host) != nil {
+		return ""
+	}
+	return host
 }

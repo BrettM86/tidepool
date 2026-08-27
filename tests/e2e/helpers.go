@@ -642,10 +642,11 @@ func lemmyInternalOrigin() string { return envOr("LEMMY_E2E_INTERNAL_ORIGIN", "h
 // lemmyHostname is the bare host of Lemmy's AP ids ("lemmy" in compose) —
 // what the bridge writes into community.profile.origin, since the origin
 // field is derived from the Group actor's id host and nothing else.
-func lemmyHostname() string {
+func lemmyHostname(t *testing.T) string {
+	t.Helper()
 	u, err := url.Parse(lemmyInternalOrigin())
-	if err != nil {
-		return ""
+	if err != nil || u.Hostname() == "" {
+		t.Fatalf("LEMMY_E2E_INTERNAL_ORIGIN %q has no hostname (err=%v)", lemmyInternalOrigin(), err)
 	}
 	return u.Hostname()
 }

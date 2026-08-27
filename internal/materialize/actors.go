@@ -3,6 +3,8 @@ package materialize
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/url"
 	"strings"
 	"time"
 
@@ -475,8 +477,9 @@ func (m *Materializer) buildCommunityProfile(doc *ap.Object, fallbackCreatedAt t
 	record := map[string]any{
 		"$type": CollectionCommunityProfile,
 		// name is a DNS label (the local part of the community's handle), and
-		// the lexicon caps it at 63 — the DNS label limit — not 64. A 64-byte
-		// name would fail lexicon validation and never be committed.
+		// the lexicon caps it at 63 — the DNS label limit — not 64. Nothing
+		// here validates against the lexicon, so the cap must hold at build
+		// time or a 64-byte name ships and the appview refuses it.
 		"name":      truncateText(doc.PreferredUsername, 63, 63),
 		"createdBy": m.serviceDID,
 		"hostedBy":  m.serviceDID,
@@ -498,23 +501,23 @@ func (m *Materializer) buildCommunityProfile(doc *ap.Object, fallbackCreatedAt t
 	// reversible on the client side.
 	//
 	// The value is SELF-ASSERTED: nothing in the record proves it. The Coves
-	// AppView's community consumer (admitCommunityOrigin) therefore honours
-	// it only when the writing repo lives on a PDS listed in its
-	// TRUSTED_BRIDGE_PDS_HOSTS (the same BridgeTrust gate as bridgedStats),
-	// or when the origin is a domain the repo's DNS-verified handle already
-	// proves (its registrable domain or a parent domain). A bridged
-	// community's handle proves tdpl.io, never lemmy.world, so this field
-	// renders on Coves ONLY because the bridge PDS is in that trust list —
-	// an appview that does not trust us drops it with a warning and indexes
-	// the community without an origin (the record is never refused over
-	// it). It is deliberately the bare hostname (no scheme, no port), the
-	// form the lexicon documents and the appview normalizes.
+	// AppView honours it only when the writing repo's PDS is in its
+	// TRUSTED_BRIDGE_PDS_HOSTS or the origin is provable from the repo's
+	// DNS-verified handle (see admitCommunityOrigin in the Coves repo; that
+	// side lives on the coves origin-field branch alongside this one). A
+	// bridged community's handle proves tdpl.io, never lemmy.world, so this
+	// field renders on Coves ONLY because the bridge PDS is in that trust
+	// list — an appview that does not trust us drops it with a warning and
+	// indexes the community without an origin (the record is never refused
+	// over it). It is the bare lowercase hostname: the only form the appview
+	// accepts — a scheme, port, IP literal or trailing dot is dropped at
+	// index time, so originHost omits the field rather than assert one that
+	// would be thrown away or, worse, name the wrong instance.
 	//
 	// Not to be confused with store.Origin (models.go), which records which
 	// SIDE of the bridge authored an object (fediverse vs bridge) for echo
-	// suppression; if this value ever needs a Go identifier, call it
-	// OriginInstance.
-	if originInstance := doc.Host(); originInstance != "" {
+	// suppression; store.OriginInstance is the field with this meaning.
+	if originInstance := originHost(doc); originInstance != "" {
 		record["origin"] = originInstance
 	}
 	record["description"] = bioWithProvenance(markdownFromSummary(doc),
@@ -576,4 +579,31 @@ func bioWithProvenance(bio, provenance string, maxGraphemes, maxBytes int) strin
 		return truncateText(provenance, maxGraphemes, maxBytes)
 	}
 	return truncateText(bio, budget, byteBudget) + "\n\n" + provenance
+}
+
+// maxOriginHostLen is the lexicon's maxLength for community.profile.origin
+// (the DNS name limit).
+const maxOriginHostLen = 253
+
+// originHost derives the community.profile origin from the Group's canonical
+// id: the lowercase hostname, or "" when the id carries nothing the appview
+// would accept as one. A non-default port is a different instance than the
+// bare host (lemmy.example:8536 is not lemmy.example), so rather than assert
+// a wrong origin the field is omitted and the community keeps rendering by
+// its flattened handle. IP literals and over-long names are omitted for the
+// same reason: the appview refuses them, and an omitted field degrades to
+// today's behaviour while a refused record would not.
+func originHost(doc *ap.Object) string {
+	if doc.ID == "" {
+		return ""
+	}
+	u, err := url.Parse(doc.ID)
+	if err != nil || u.Port() != "" {
+		return ""
+	}
+	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+	if host == "" || len(host) > maxOriginHostLen || net.ParseIP(host) != nil {
+		return ""
+	}
+	return host
 }

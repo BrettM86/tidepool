@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/go-chi/chi/v5"
 
@@ -56,7 +57,12 @@ type AdminOptions struct {
 	// POST /admin/outbound/redrive resets poisoned rows, POST
 	// /admin/outbound/cancel parks an actor's or community's pending work.
 	Deliveries store.OutboundDeliveries
-	Logger     *slog.Logger
+	// BaseContext is the root context background admin work (the
+	// refresh-profile walk) runs under. Wiring the server/run context here
+	// lets a walk observe shutdown, as BackfillOptions.BaseContext does for
+	// async backfills. Defaults to context.Background().
+	BaseContext context.Context
+	Logger      *slog.Logger
 }
 
 // Admin is the operator API driving the community subscription lifecycle,
@@ -93,6 +99,14 @@ type Admin struct {
 	// 501) unless the reconciliation sweep is wired. Set once during
 	// startup via SetDivergenceReconciler, before the server listens.
 	divergence *DivergenceReconciler
+	// baseCtx roots background admin work; walkMu serializes the
+	// refresh-profile walk (TryLock refuses a second walk while one runs
+	// instead of doubling the fetch rate); walks lets Wait drain it on
+	// shutdown. Per instance, not package-level, so two Admins (or two test
+	// harnesses) never share a gate.
+	baseCtx context.Context
+	walkMu  sync.Mutex
+	walks   sync.WaitGroup
 }
 
 // SetFollowReconciler wires the optional follow-list reconciler in after
@@ -125,6 +139,10 @@ func NewAdmin(opts AdminOptions) (*Admin, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	baseCtx := opts.BaseContext
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
 	return &Admin{
 		token:       opts.Token,
 		client:      opts.Client,
@@ -136,6 +154,7 @@ func NewAdmin(opts AdminOptions) (*Admin, error) {
 		sweeper:     opts.Sweeper,
 		deliveries:  opts.Deliveries,
 		logger:      logger,
+		baseCtx:     baseCtx,
 	}, nil
 }
 

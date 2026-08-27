@@ -362,6 +362,7 @@ through Caddy.
 | `DELETE /admin/communities` | unsubscribe (`Undo{Follow}`; records kept, content stops) | — |
 | `GET /admin/communities` | list subscriptions and their state | — |
 | `POST /admin/communities/backfill` | on-demand outbox backfill | backfill unconfigured (**501**) |
+| `POST /admin/communities/refresh-profile` | force a `community.profile` re-materialization past the profile TTL (backfills new record fields into dormant communities). `{"community":…}` is synchronous; `{"all":true}` answers **202** and walks every bridged community in the background, one at a time with a pause, **409** while a walk is running; progress and the final `done`/`failed`/`skipped` summary go to the log, and shutdown stops the walk at its next community | — |
 | `POST /admin/communities/reconcile` | force one follow-list sweep | **501** — `FOLLOW_LIST_PATH` is unset. The reconciler is only built when the path is set, so this is "no follow list configured", not a broken endpoint |
 | `POST /admin/reemit` | re-emit a repo's records as delete+create pairs (relay cold-start gap) | repo manager unconfigured (**501**) |
 | `POST /admin/objects/sweep-deleted` | origin-verified cleanup of missed deletes | sweeper unconfigured (**501**) |
@@ -401,6 +402,9 @@ curl localhost:8091/admin/communities \
 curl -X POST localhost:8091/admin/communities/backfill \
   -H "Authorization: Bearer dev-admin-token" \
   -d '{"community":"!technology@lemmy.world"}'        # on-demand backfill
+curl -X POST localhost:8091/admin/communities/refresh-profile \
+  -H "Authorization: Bearer dev-admin-token" \
+  -d '{"all":true}'                                   # re-materialize every profile (202; 409 if running)
 curl -X DELETE localhost:8091/admin/communities \
   -H "Authorization: Bearer dev-admin-token" \
   -d '{"community":"!technology@lemmy.world"}'        # Undo{Follow}

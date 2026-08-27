@@ -576,7 +576,11 @@ func run(logger *slog.Logger) error {
 		Repos:        repoManager,
 		Sweeper:      handler,
 		Deliveries:   store.NewOutboundDeliveries(database),
-		Logger:       logger,
+		// The refresh-profile walk derives from the run context so it stops
+		// at its next community once shutdown starts; the drain below waits
+		// for it, like the backfill drain.
+		BaseContext: ctx,
+		Logger:      logger,
 	})
 	if err != nil {
 		return err
@@ -747,11 +751,11 @@ func run(logger *slog.Logger) error {
 		// last_backfill_at unset, which is resumable). Wait bounded so a stuck
 		// run can't hold shutdown open past the deadline.
 		drained := make(chan struct{})
-		go func() { backfill.Wait(); close(drained) }()
+		go func() { backfill.Wait(); admin.Wait(); close(drained) }()
 		select {
 		case <-drained:
 		case <-shutdownCtx.Done():
-			logger.Warn("backfill drain timed out; abandoning in-flight run (resumable on restart)")
+			logger.Warn("backfill/refresh-profile drain timed out; abandoning in-flight run (re-triggerable on restart)")
 		}
 		// Wait for the consumer's read loop to exit. Its shutdown path flushes
 		// the cursor on a fresh context, so cutting the process short here

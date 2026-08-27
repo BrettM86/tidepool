@@ -506,6 +506,9 @@ func TestCommunityUpdate_ProfileUpdateEvent(t *testing.T) {
 	if got := recordField(t, updateEv.Commit.Record, "name"); got != community.Name {
 		t.Errorf("community.profile name = %q, want the slug %q (renames change displayName, not name)", got, community.Name)
 	}
+	if got := recordField(t, updateEv.Commit.Record, "origin"); got != lemmyHostname() {
+		t.Errorf("community.profile origin = %q, want the Lemmy host %q (must survive a profile update)", got, lemmyHostname())
+	}
 	desc := recordField(t, updateEv.Commit.Record, "description")
 	if !strings.Contains(desc, newDesc) {
 		t.Errorf("community.profile description %q does not contain the new sidebar %q", desc, newDesc)

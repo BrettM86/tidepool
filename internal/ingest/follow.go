@@ -66,6 +66,7 @@ type AdminOptions struct {
 //	DELETE /admin/communities           {"community":"!tech@lemmy.world"}
 //	GET    /admin/communities
 //	POST   /admin/communities/backfill  {"community":"!tech@lemmy.world"}
+//	POST   /admin/communities/refresh-profile {"community":"!tech@lemmy.world"} (or {"all":true})
 //	POST   /admin/communities/reconcile (follow list configured only)
 //	POST   /admin/reemit                {"did":"did:plc:..."} (or {} for all)
 //	POST   /admin/objects/sweep-deleted {"ap_ids":["https://..."]}
@@ -151,6 +152,7 @@ func (a *Admin) Routes(r chi.Router) {
 		r.Delete("/communities", a.handleUnsubscribe)
 		r.Get("/communities", a.handleList)
 		r.Post("/communities/backfill", a.handleBackfill)
+		r.Post("/communities/refresh-profile", a.handleRefreshProfile)
 		r.Post("/communities/reconcile", a.handleReconcile)
 		r.Post("/reemit", a.handleReemit)
 		r.Post("/objects/sweep-deleted", a.handleSweepDeleted)

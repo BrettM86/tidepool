@@ -473,8 +473,11 @@ func (m *Materializer) buildActorProfile(doc *ap.Object, fallbackCreatedAt time.
 // bridge's service DID (the bridge hosts and administers the mirror).
 func (m *Materializer) buildCommunityProfile(doc *ap.Object, fallbackCreatedAt time.Time, avatar, banner *atdata.Blob) map[string]any {
 	record := map[string]any{
-		"$type":     CollectionCommunityProfile,
-		"name":      truncateText(doc.PreferredUsername, 64, 64),
+		"$type": CollectionCommunityProfile,
+		// name is a DNS label (the local part of the community's handle), and
+		// the lexicon caps it at 63 — the DNS label limit — not 64. A 64-byte
+		// name would fail lexicon validation and never be committed.
+		"name":      truncateText(doc.PreferredUsername, 63, 63),
 		"createdBy": m.serviceDID,
 		"hostedBy":  m.serviceDID,
 		"createdAt": recordDatetime(actorCreatedAt(doc, fallbackCreatedAt)),
@@ -487,6 +490,32 @@ func (m *Materializer) buildCommunityProfile(doc *ap.Object, fallbackCreatedAt t
 	}
 	if doc.Name != "" {
 		record["displayName"] = truncateText(doc.Name, 128, 1280)
+	}
+	// origin is the instance the community REALLY lives on ("lemmy.world"),
+	// so clients can render !technology@lemmy.world instead of the flattened
+	// DNS handle technology.lemmy-world.tdpl.io — the handle can carry the
+	// Lemmy host only lossily (dots become hyphens), and the mapping is not
+	// reversible on the client side.
+	//
+	// The value is SELF-ASSERTED: nothing in the record proves it. The Coves
+	// AppView's community consumer (admitCommunityOrigin) therefore honours
+	// it only when the writing repo lives on a PDS listed in its
+	// TRUSTED_BRIDGE_PDS_HOSTS (the same BridgeTrust gate as bridgedStats),
+	// or when the origin is a domain the repo's DNS-verified handle already
+	// proves (its registrable domain or a parent domain). A bridged
+	// community's handle proves tdpl.io, never lemmy.world, so this field
+	// renders on Coves ONLY because the bridge PDS is in that trust list —
+	// an appview that does not trust us drops it with a warning and indexes
+	// the community without an origin (the record is never refused over
+	// it). It is deliberately the bare hostname (no scheme, no port), the
+	// form the lexicon documents and the appview normalizes.
+	//
+	// Not to be confused with store.Origin (models.go), which records which
+	// SIDE of the bridge authored an object (fediverse vs bridge) for echo
+	// suppression; if this value ever needs a Go identifier, call it
+	// OriginInstance.
+	if originInstance := doc.Host(); originInstance != "" {
+		record["origin"] = originInstance
 	}
 	record["description"] = bioWithProvenance(markdownFromSummary(doc),
 		provenanceLine("!", doc.PreferredUsername, doc.Host()), 1000, 10000)

@@ -46,6 +46,12 @@ func TestSubscribe_CommunityProfileOnFirehose(t *testing.T) {
 	if got := recordField(t, ev.Commit.Record, "name"); got != community.Name {
 		t.Errorf("community.profile name = %q, want %q", got, community.Name)
 	}
+	// origin is the Lemmy host the community really lives on (self-asserted;
+	// the appview honours it because the bridge PDS is a trusted bridge), so
+	// Coves can render !name@lemmy instead of the flattened DNS handle.
+	if got := recordField(t, ev.Commit.Record, "origin"); got != lemmyHostname() {
+		t.Errorf("community.profile origin = %q, want the Lemmy host %q", got, lemmyHostname())
+	}
 }
 
 // Scenario 2: a Lemmy user shares a link → actor.profile AND community.post

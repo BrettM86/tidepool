@@ -504,7 +504,7 @@ func (m *Materializer) buildCommunityProfile(doc *ap.Object, fallbackCreatedAt t
 	// AppView honours it only when the writing repo's PDS is in its
 	// TRUSTED_BRIDGE_PDS_HOSTS or the origin is provable from the repo's
 	// DNS-verified handle (see admitCommunityOrigin in the Coves repo; that
-	// side lives on the coves origin-field branch alongside this one). A
+	// side lives on the coves feat/community-origin-resolve stack). A
 	// bridged community's handle proves tdpl.io, never lemmy.world, so this
 	// field renders on Coves ONLY because the bridge PDS is in that trust
 	// list — an appview that does not trust us drops it with a warning and

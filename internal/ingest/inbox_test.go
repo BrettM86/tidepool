@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -524,4 +525,45 @@ func TestInstanceActorRoute(t *testing.T) {
 	assert.Equal(t, ap.TypeApplication, doc.Type)
 	require.NotNil(t, doc.PublicKey)
 	assert.NotEmpty(t, doc.PublicKey.PublicKeyPem)
+}
+
+func TestInstanceActorRouteHEAD(t *testing.T) {
+	h := newHarness(t)
+	server := httptest.NewServer(h.router)
+	t.Cleanup(server.Close)
+
+	for _, accept := range []string{ap.ContentTypeActivityJSON, ap.ContentTypeLDJSON, ""} {
+		t.Run(accept, func(t *testing.T) {
+			var contentType string
+			for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPost} {
+				request, err := http.NewRequest(method, server.URL+"/", nil)
+				require.NoError(t, err)
+				request.Host = bridgeHost
+				request.Header.Set("Accept", accept)
+				response, err := server.Client().Do(request)
+				require.NoError(t, err)
+				body, readErr := io.ReadAll(response.Body)
+				closeErr := response.Body.Close()
+				require.NoError(t, readErr)
+				require.NoError(t, closeErr)
+
+				if method == http.MethodPost {
+					assert.Equal(t, http.StatusMethodNotAllowed, response.StatusCode, "POST / must remain restricted")
+					continue
+				}
+				assert.Equal(t, http.StatusOK, response.StatusCode, "%s / with Accept %q", method, accept)
+				if method == http.MethodGet {
+					contentType = response.Header.Get("Content-Type")
+					assert.Equal(t, ap.ContentTypeActivityJSON, contentType)
+					document, err := ap.ParseObject(body)
+					require.NoError(t, err)
+					assert.Equal(t, h.service.InstanceActorID(), document.ID)
+					assert.Equal(t, ap.TypeApplication, document.Type)
+				} else {
+					assert.Equal(t, contentType, response.Header.Get("Content-Type"), "HEAD must preserve GET headers")
+					assert.Empty(t, body, "HEAD must not send a response body")
+				}
+			}
+		})
+	}
 }

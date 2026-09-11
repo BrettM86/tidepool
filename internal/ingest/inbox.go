@@ -187,6 +187,7 @@ func (ib *Inbox) Routes(r chi.Router) {
 	// document advertises; without it those activities are silently
 	// skipped ("no inboxes"). See ap.ServiceActor.InstanceDocumentJSON.
 	r.Get("/", ib.handleInstanceActor)
+	r.Head("/", ib.handleInstanceActor)
 	r.Get("/.well-known/webfinger", ib.handleWebFinger)
 	r.Get("/.well-known/nodeinfo", ib.handleNodeInfoDiscovery)
 	r.Get("/nodeinfo/2.0", ib.handleNodeInfo)

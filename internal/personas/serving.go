@@ -46,7 +46,7 @@ const (
 //	GET  /ap/actor/{did}          the user's Person document
 //	GET  /ap/actor/{did}/outbox   the (empty) outbox Lemmy requires
 //	POST /ap/inbox                shared inbox, dispatched to the ingest inbox
-//	GET  /                        the origin's instance (Application) actor
+//	GET/HEAD /                    the origin's instance (Application) actor
 //	GET  /.well-known/nodeinfo    nodeinfo discovery
 //	GET  /nodeinfo/2.0            nodeinfo 2.0 document
 //
@@ -63,7 +63,9 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		s.handleWebFinger(w, r)
 	case path == "/":
-		if !isGET(w, r) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Allow", "GET, HEAD")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 		s.handleInstanceActor(w, r)

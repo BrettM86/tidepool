@@ -37,3 +37,19 @@ communities:
   # activity this week), 3 named mods with posted rules, not NSFW.
   # acct: resolution is unambiguous here — WebFinger returns the Group.
   - "!startrek@startrek.website"
+  # added 2026-09-13 on request: active gaming discussion with diverse contributors.
+  - "https://lemmy.world/c/games"
+  # added 2026-09-13 on request: active general-interest photos and pet discussion.
+  - "https://lemmy.world/c/cat"
+  # added 2026-09-13 on request: reading discussions and community challenges.
+  - "https://lemmy.world/c/books"
+  # added 2026-09-13 on request: active programming discussion; another source instance.
+  - "https://programming.dev/c/programming"
+  # added 2026-09-13 on request: maker projects and practical troubleshooting.
+  - "https://lemmy.world/c/3dprinting"
+  # added 2026-09-13 on request: moderated plant-care community on mander.xyz.
+  - "https://mander.xyz/c/houseplants"
+  # added 2026-09-13 on request: science humor alongside the existing comic community.
+  - "https://mander.xyz/c/science_memes"
+  # added 2026-09-13 on request: climate coverage from slrpnk.net.
+  - "https://slrpnk.net/c/climate"

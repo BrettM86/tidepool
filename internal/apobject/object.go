@@ -11,8 +11,9 @@ package apobject
 import (
 	"encoding/json"
 	"fmt"
-	"html"
 	"strings"
+
+	"github.com/rivo/uniseg"
 
 	"tidepool/internal/ap"
 	"tidepool/internal/errors"
@@ -23,12 +24,59 @@ import (
 // mediaType, audience), so the plain context is sufficient for Lemmy 0.19.20.
 const ContextActivityStreams = "https://www.w3.org/ns/activitystreams"
 
+// The lexicon limits on a native record's rendered body, shared by
+// social.coves.community.comment and social.coves.community.postv2 (content,
+// facets) and social.coves.richtext.facet (features). A string maxLength counts
+// UTF-8 bytes.
+const (
+	MaximumContentBytes     = 100000
+	MaximumContentGraphemes = 10000
+	MaximumFacets           = 200
+	MaximumFeaturesPerFacet = 20
+)
+
+// CheckRecordLimits rejects a native record whose content or facets exceed the
+// lexicon limits. A postv2 is lexicon-validated by the acceptance engine before
+// it is ever snapshotted; a comment is not validated anywhere upstream, so every
+// render path checks this before rendering. An over-limit record is REJECTED,
+// never rendered with facets dropped: dropping a spoiler facet would publish the
+// text it hides. Only the shape the lexicon bounds is counted here — a facets
+// value that is not an array is left to the renderer, which ignores it.
+func CheckRecordLimits(record map[string]any) error {
+	content, _ := record["content"].(string)
+	if len(content) > MaximumContentBytes {
+		return errors.NewValidationError("record.content",
+			fmt.Sprintf("exceeds the lexicon maximum of %d bytes", MaximumContentBytes))
+	}
+	if uniseg.GraphemeClusterCount(content) > MaximumContentGraphemes {
+		return errors.NewValidationError("record.content",
+			fmt.Sprintf("exceeds the lexicon maximum of %d graphemes", MaximumContentGraphemes))
+	}
+	facets, _ := record["facets"].([]any)
+	if len(facets) > MaximumFacets {
+		return errors.NewValidationError("record.facets",
+			fmt.Sprintf("%d facets exceed the lexicon maximum of %d", len(facets), MaximumFacets))
+	}
+	for position, raw := range facets {
+		facet, _ := raw.(map[string]any)
+		features, _ := facet["features"].([]any)
+		if len(features) > MaximumFeaturesPerFacet {
+			return errors.NewValidationError("record.facets.features",
+				fmt.Sprintf("facet %d has %d features, over the lexicon maximum of %d",
+					position, len(features), MaximumFeaturesPerFacet))
+		}
+	}
+	return nil
+}
+
 // BuildNote renders a comment as an AP Note. The Note carries the community in
 // cc (the Note half of the Page/Note addressing split), to ⊇ as:Public,
 // attributedTo as a SINGLE STRING, and HTML content alongside its markdown
-// source. inReplyTo is emitted only when a parent is known.
+// source. inReplyTo is emitted only when a parent is known. The caller runs
+// CheckRecordLimits first; BuildNote does not.
 func BuildNote(actorID, communityAPID, parentAPID, objectURL string, record map[string]any) map[string]any {
 	source, _ := record["content"].(string)
+	markdown, content := renderBody(source, record["facets"])
 	note := map[string]any{
 		"type":         "Note",
 		"id":           objectURL,
@@ -37,9 +85,9 @@ func BuildNote(actorID, communityAPID, parentAPID, objectURL string, record map[
 		"cc":           []string{communityAPID},
 		"audience":     communityAPID,
 		"mediaType":    "text/html",
-		"content":      renderHTML(source),
+		"content":      content,
 		"source": map[string]any{
-			"content":   source,
+			"content":   markdown,
 			"mediaType": "text/markdown",
 		},
 	}
@@ -62,7 +110,11 @@ func BuildPage(actorID, communityAPID, objectURL string, record map[string]any) 
 	if title == "" {
 		return nil, errors.NewValidationError("title", "a Page requires a name (Lemmy rejects a titleless post)")
 	}
+	if err := CheckRecordLimits(record); err != nil {
+		return nil, err
+	}
 	source, _ := record["content"].(string)
+	markdown, content := renderBody(source, record["facets"])
 	page := map[string]any{
 		"type":         "Page",
 		"id":           objectURL,
@@ -73,9 +125,9 @@ func BuildPage(actorID, communityAPID, objectURL string, record map[string]any) 
 		"name":      title,
 		"audience":  communityAPID,
 		"mediaType": "text/html",
-		"content":   renderHTML(source),
+		"content":   content,
 		"source": map[string]any{
-			"content":   source,
+			"content":   markdown,
 			"mediaType": "text/markdown",
 		},
 		"sensitive": hasNSFWLabel(record),
@@ -182,6 +234,9 @@ func RenderObject(userOrigin string, snapshot []byte) (map[string]any, error) {
 			return nil, err
 		}
 	} else {
+		if err := CheckRecordLimits(record); err != nil {
+			return nil, err
+		}
 		object = BuildNote(actorID, community, parentAPID, objectURL, record)
 	}
 	// Served standalone (not embedded in an activity), so it carries its own
@@ -202,27 +257,4 @@ func ParseSnapshot(raw []byte) (map[string]any, error) {
 		return nil, fmt.Errorf("apobject: decode snapshot: %w", err)
 	}
 	return snap, nil
-}
-
-// renderHTML wraps the markdown source in the minimal HTML Lemmy stores as
-// `content` (the source itself rides `source.content`). Paragraphs are split on
-// blank lines and escaped so the source's own angle brackets cannot inject
-// markup.
-func renderHTML(source string) string {
-	source = strings.ReplaceAll(source, "\r\n", "\n")
-	blocks := strings.Split(source, "\n\n")
-	var b strings.Builder
-	for _, block := range blocks {
-		block = strings.TrimSpace(block)
-		if block == "" {
-			continue
-		}
-		b.WriteString("<p>")
-		b.WriteString(html.EscapeString(block))
-		b.WriteString("</p>\n")
-	}
-	if b.Len() == 0 {
-		return "<p></p>\n"
-	}
-	return b.String()
 }

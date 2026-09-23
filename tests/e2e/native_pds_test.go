@@ -59,9 +59,12 @@ const (
 // nativeCommunityDID is a syntactically valid did:plc that nothing in this
 // stack resolves — the smoke record needs the postv2 lexicon's required
 // `community` field to PARSE as a DID, and nothing more. No acceptance
-// record is ever written for this post (CONSUMER_ENABLED is off in the e2e
-// stack, so the acceptance engine never sees it), so the community is a
-// name on a record, not a participant.
+// record is ever written for this post: the bridge's Jetstream consumer
+// (CONSUMER_ENABLED=1 in the e2e stack) does see it, but the dispatcher's
+// pre-engine check (handlePostV2 → isBridgedCommunity) finds no
+// communities row for this DID and skips the post unclaimed, so it never
+// reaches the acceptance engine. The community is a name on a record, not a
+// participant — never create a bridged community with this DID.
 const nativeCommunityDID = "did:plc:e2enativepdssmokecommun2"
 
 // pdsURL is the reference PDS's host endpoint. It is published on the RELAY

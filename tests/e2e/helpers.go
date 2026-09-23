@@ -333,7 +333,9 @@ func (h *harness) setupLemmySite() error {
 		"registration_mode":  "Open",
 		"captcha_enabled":    false,
 		"federation_enabled": true,
-		"allowed_instances":  []string{"tidepool"},
+		// coves-users is AP_USER_ORIGIN's host (docker-compose.e2e.yml): the
+		// authority native Coves authors' Person actors are served under.
+		"allowed_instances": []string{"tidepool", "coves-users"},
 	}
 	var out json.RawMessage
 	if err := admin.do(http.MethodPut, "/api/v3/site", body, &out); err != nil {

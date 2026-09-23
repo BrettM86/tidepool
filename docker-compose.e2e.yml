@@ -172,13 +172,54 @@ services:
       # other scenarios: a re-fetch that yields an unchanged profile is an
       # idempotent re-put (no commit, no firehose event).
       PROFILE_REFRESH_TTL: 2s
+      # The outbound path (native Coves content → Lemmy): the Jetstream
+      # consumer reads the relay-fed Jetstream, the acceptance engine admits
+      # native postv2s into bridged communities, and one delivery worker
+      # POSTs the Create{Page} to Lemmy. Native authors' Person actors live on
+      # a SEPARATE authority (AP_USER_ORIGIN must not be BRIDGE_HOSTNAME or a
+      # subdomain of it); `coves-users` is a network alias of this container,
+      # so Lemmy's actor fetches reach the same listener and the host router
+      # sends them to the user-origin surface.
+      CONSUMER_ENABLED: "1"
+      JETSTREAM_URL: ws://jetstream:6018/subscribe
+      OUTBOUND_WORKERS: "1"
+      AP_USER_ORIGIN: http://coves-users
+      # Minting a native author's actor verifies their handle against the
+      # HTTPS well-known (https://{handle}/.well-known/atproto-did). The
+      # `handle-tls` service terminates that TLS with Caddy's local CA; this
+      # makes the bridge trust ONLY that CA, so no public HTTPS endpoint is
+      # reachable-and-trusted from inside the stack. Go's crypto/x509 reads
+      # SSL_CERT_FILE in place of the bundle file list BUT still scans the
+      # default directories (/etc/ssl/certs, which alpine's ca-certificates
+      # fills with public roots) unless SSL_CERT_DIR replaces them too — so
+      # both point at the volume, which holds nothing but the local root.
+      SSL_CERT_FILE: /handle-tls-ca/root.crt
+      SSL_CERT_DIR: /handle-tls-ca
       LOG_LEVEL: debug
+    volumes:
+      - handle-tls-ca:/handle-tls-ca:ro
     ports:
       - "127.0.0.1:${TIDEPOOL_E2E_PORT:-8092}:80"
-    networks: [tidepool-e2e]
+    # Handle verification's DNS half (_atproto.{handle} TXT) must not leave
+    # the stack. On a user-defined network the container's resolver stays
+    # Docker's embedded DNS (127.0.0.11), which keeps answering compose
+    # service names and aliases itself; `dns:` only replaces the upstream it
+    # forwards EVERYTHING ELSE to (the host's resolvers by default). Pointed
+    # at the in-stack `dns` service, no query reaches a host or public
+    # resolver. `dns:` takes an IP, hence that service's fixed address.
+    dns: [10.231.53.53]
+    networks:
+      tidepool-e2e:
+        aliases: [coves-users]
     depends_on:
       tidepool-migrate:
         condition: service_completed_successfully
+      dns:
+        condition: service_started
+      jetstream:
+        condition: service_healthy
+      handle-tls:
+        condition: service_healthy
       plc:
         condition: service_healthy
       # The relay must be up AND willing to accept new PDS subscriptions
@@ -506,6 +547,80 @@ services:
       relay-bootstrap:
         condition: service_completed_successfully
 
+  # ── Handle TLS (HTTPS well-known for native handles) ─────────────────────
+  # The acceptance engine verifies a native author's handle before minting
+  # their AP actor: DNS TXT first (the in-stack `dns` service answers
+  # `.test` with an authoritative NXDOMAIN, "no claim"), then
+  # GET https://{handle}/.well-known/atproto-did. This
+  # Caddy answers that name (a network alias) with a certificate from its own
+  # local CA and proxies to the reference PDS, which serves the DID for the
+  # handles it hosts by Host header. The CA root is copied world-readable
+  # into a shared volume the bridge mounts as its ONLY trust store.
+  #
+  # The volume outlives the container (only `down -v` removes it) while
+  # Caddy's /data — and so its CA — is the image's anonymous volume, which a
+  # container created after `down` (without -v) does not inherit, so Caddy
+  # mints a new CA. A root.crt left by a previous run would pass
+  # the healthcheck before this Caddy's root is copied, and the bridge would
+  # start trusting a CA that no longer signs anything. So the old file is
+  # deleted first, and the new one lands by rename so the healthcheck never
+  # sees a partial copy.
+  handle-tls:
+    image: caddy:2.11-alpine
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        rm -f /handle-tls-ca/root.crt /handle-tls-ca/root.crt.tmp
+        cat > /etc/caddy/Caddyfile <<'CADDYFILE'
+        {
+          skip_install_trust
+        }
+        native-alice.pds.test {
+          tls internal
+          reverse_proxy relay:3001
+        }
+        CADDYFILE
+        caddy run --config /etc/caddy/Caddyfile --adapter caddyfile &
+        caddy_pid=$$!
+        until [ -f /data/caddy/pki/authorities/local/root.crt ]; do sleep 0.2; done
+        cp /data/caddy/pki/authorities/local/root.crt /handle-tls-ca/root.crt.tmp
+        chmod 644 /handle-tls-ca/root.crt.tmp
+        mv /handle-tls-ca/root.crt.tmp /handle-tls-ca/root.crt
+        wait $$caddy_pid
+    volumes:
+      - handle-tls-ca:/handle-tls-ca
+    networks:
+      tidepool-e2e:
+        aliases: [native-alice.pds.test]
+    depends_on:
+      pds:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "test", "-f", "/handle-tls-ca/root.crt"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+
+  # ── In-stack DNS (the bridge's only upstream resolver) ───────────────────
+  # CoreDNS serving the `.test` zone authoritatively and answering every
+  # other name NXDOMAIN; it forwards nothing. Config: tests/e2e/dns/. The
+  # `log` plugin prints each query it receives, so
+  # `docker compose -f docker-compose.e2e.yml logs dns` is the full list of
+  # names the bridge asked about beyond compose service names. Fixed address
+  # (outside the network's dynamic ip_range) because `dns:` takes an IP.
+  # No healthcheck: the image is scratch-based (no shell/wget), and the
+  # first TXT lookup happens long after startup.
+  dns:
+    image: coredns/coredns:1.14.7@sha256:7efd3c635b03efd68c4e8398fc45f0d993d0e9ab016f72c1cefb0fd6d01aa286
+    command: ["-conf", "/etc/coredns/Corefile"]
+    volumes:
+      - ./tests/e2e/dns:/etc/coredns:ro
+    networks:
+      tidepool-e2e:
+        ipv4_address: 10.231.53.53
+    restart: "no"
+
   # ── Jetstream (consumes the RELAY's firehose — the tested pipeline) ─────
   jetstream:
     image: ghcr.io/bluesky-social/jetstream:sha-306e463693365e21a5ffd3ec051a5a7920000214
@@ -625,8 +740,19 @@ networks:
   tidepool-e2e:
     driver: bridge
     name: tidepool-e2e-network
+    # Explicit subnet so the `dns` service can hold a fixed address (the
+    # bridge's `dns:` needs an IP). 10.x sits outside Docker's default
+    # auto-allocation pools (172.17-31.x, 192.168.x), so it cannot collide
+    # with another compose project's network. Dynamic addresses come only
+    # from ip_range (.128-.255), so no container can take .53 first.
+    ipam:
+      config:
+        - subnet: 10.231.53.0/24
+          ip_range: 10.231.53.128/25
 
 volumes:
+  # handle-tls's local CA root, shared read-only with the bridge.
+  handle-tls-ca:
   # The reference PDS's repos, blobs and account database (why it must exist
   # at all: see the `pds` service's volumes). Named rather than anonymous so
   # the native account survives a `docker compose up` that recreates the

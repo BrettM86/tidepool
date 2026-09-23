@@ -94,6 +94,9 @@ func (t *Translator) comment(actorID string, intent consume.CommentIntent) (*Tra
 	}
 
 	record, _ := snap["record"].(map[string]any)
+	if err := apobject.CheckRecordLimits(record); err != nil {
+		return nil, err
+	}
 	note := apobject.BuildNote(actorID, intent.CommunityAPID, intent.ParentAPID, objectURL, record)
 	kind := "Create"
 	if intent.Op == "update" {

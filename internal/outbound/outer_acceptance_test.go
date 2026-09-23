@@ -14,8 +14,10 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/net/html"
 
 	"tidepool/internal/ap"
+	"tidepool/internal/apobject"
 	"tidepool/internal/consume"
 	"tidepool/internal/identity"
 	"tidepool/internal/personas"
@@ -267,6 +269,218 @@ func TestOutboundDeliversASignedNativeComment(t *testing.T) {
 	assert.Equal(t, store.DeliveryStateDelivered, redelivered.State,
 		"Lemmy's duplicate-activity response must classify as DELIVERED, never poisoned — a crash "+
 			"between deliver and mark is expected and safe under at-least-once")
+}
+
+func TestOutboundFederatesNativeCovesFacetsAsSafeLemmyMarkdown(t *testing.T) {
+	const plaintext = "Literal *stars* [brackets] # hash > marker and café\n\n" +
+		"Roadmap\n\n" +
+		"quoted > marker\n\n" +
+		"Make bold visit docs and run a*b.\n\n" +
+		"secret ending"
+	const expectedMarkdown = "Literal \\*stars\\* \\[brackets\\] \\# hash \\> marker and café\n\n" +
+		"## Roadmap\n\n" +
+		"> quoted \\> marker\n\n" +
+		"Make **bold** visit [docs](https://example.com/docs) and run `a*b`.\n\n" +
+		"::: spoiler Ending\nsecret ending\n:::"
+
+	facet := func(text string, feature map[string]any) map[string]any {
+		t.Helper()
+		require.Equal(t, 1, strings.Count(plaintext, text), "facet text must be unique in the fixture")
+		start := strings.Index(plaintext, text)
+		require.NotEqual(t, -1, start)
+		return map[string]any{
+			"index":    map[string]any{"byteStart": start, "byteEnd": start + len(text)},
+			"features": []any{feature},
+		}
+	}
+
+	headingStart := strings.Index(plaintext, "Roadmap")
+	require.Greater(t, headingStart, len([]rune(plaintext[:headingStart])),
+		"a multibyte character must precede a facet so rune offsets cannot satisfy the contract")
+
+	snapshot, err := json.Marshal(map[string]any{
+		"atUri":      outCommentATURI,
+		"cid":        outCommentCID,
+		"rev":        outCommentRev,
+		"collection": "social.coves.community.comment",
+		"record": map[string]any{
+			"$type":   "social.coves.community.comment",
+			"content": plaintext,
+			"facets": []any{
+				facet("Roadmap", map[string]any{
+					"$type": "social.coves.richtext.facet#heading", "level": 2,
+				}),
+				facet("quoted > marker", map[string]any{
+					"$type": "social.coves.richtext.facet#blockquote", "level": 1,
+				}),
+				facet("bold", map[string]any{
+					"$type": "social.coves.richtext.facet#bold",
+				}),
+				facet("docs", map[string]any{
+					"$type": "social.coves.richtext.facet#link", "uri": "https://example.com/docs",
+				}),
+				facet("a*b", map[string]any{
+					"$type": "social.coves.richtext.facet#code",
+				}),
+				facet("secret ending", map[string]any{
+					"$type": "social.coves.richtext.facet#spoiler", "reason": "Ending",
+				}),
+			},
+			"reply": map[string]any{
+				"root":   map[string]any{"uri": outRootATURI, "cid": outRootCID},
+				"parent": map[string]any{"uri": outRootATURI, "cid": outRootCID},
+			},
+			"createdAt": "2026-08-12T10:00:00.000Z",
+		},
+		"parentAtUri":   outRootATURI,
+		"parentApId":    outRootAPID,
+		"communityApId": outCommunityAPID,
+	})
+	require.NoError(t, err)
+
+	conn := outboundAcceptanceDB(t)
+	ctx := context.Background()
+	custodian, err := identity.NewCustodian(outKEK)
+	require.NoError(t, err)
+	personasService, err := personas.New(personas.Options{
+		DB: conn, Custodian: custodian, UserOrigin: outUserOrigin,
+	})
+	require.NoError(t, err)
+	actor, err := personasService.CreateActorForDID(ctx, outCommenterDID, outCommenterHandle)
+	require.NoError(t, err)
+
+	personasServer := httptest.NewServer(personasService)
+	t.Cleanup(personasServer.Close)
+	lemmy := &fakeLemmy{
+		host: outLemmyHost, communityAPI: outCommunityAPID, sharedInbox: outSharedInbox,
+		seen: map[string]bool{},
+	}
+	lemmyServer := httptest.NewServer(lemmy)
+	t.Cleanup(lemmyServer.Close)
+	client := ap.NewClient(ap.ClientOptions{HTTPClient: &http.Client{Transport: hostRewrite{routes: map[string]string{
+		outCovesHost: personasServer.Listener.Addr().String(),
+		outLemmyHost: lemmyServer.Listener.Addr().String(),
+	}}}})
+	lemmy.verifier = ap.NewVerifier(client)
+	seedAcceptedParent(t, conn)
+
+	enqueuer, err := NewEnqueuer(EnqueuerOptions{
+		DB: conn, Translator: NewTranslator(outUserOrigin), Inboxes: inboxResolver{client: client},
+		Actors: store.NewAPActors(conn), UserOrigin: outUserOrigin,
+	})
+	require.NoError(t, err)
+	worker, err := NewWorker(WorkerOptions{
+		DB: conn, Actors: store.NewAPActors(conn),
+		Signers: sealedSigners{actors: store.NewAPActors(conn), custodian: custodian},
+		Inboxes: inboxResolver{client: client}, Sender: client, Lease: time.Minute,
+	})
+	require.NoError(t, err)
+
+	intent := consume.CommentIntent{
+		Op: "create", ATURI: outCommentATURI,
+		ID:            consume.ActivityID(outUserOrigin, outCommentATURI, "create", 0),
+		CommunityAPID: outCommunityAPID, ParentAPID: outRootAPID, Snapshot: snapshot,
+	}
+	tx, err := conn.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	require.NoError(t, enqueuer.EnqueueActivity(ctx, tx, outCommenterDID, outCommunityAPID, outRootATURI, intent))
+	require.NoError(t, tx.Commit())
+	drainWorker(t, ctx, worker)
+
+	require.Equal(t, 1, lemmy.postCount(), "the real worker must deliver one activity")
+	received := lemmy.lastActivity(t)
+	require.NoError(t, received.verifyErr, "the delivered activity must carry a valid HTTP signature")
+	require.Equal(t, actor.ActorID, received.verifiedActorID)
+	note := asMap(t, received.body["object"], "Create.object")
+	source := asMap(t, note["source"], "Note.source")
+	assert.Equal(t, "text/markdown", source["mediaType"])
+	require.Equal(t, expectedMarkdown, source["content"],
+		"canonical plaintext must be escaped before Coves facets become Lemmy Markdown")
+
+	content, ok := note["content"].(string)
+	require.True(t, ok, "Note.content must be structural HTML")
+	document, err := html.Parse(strings.NewReader(content))
+	require.NoError(t, err)
+	paragraphs := findHTMLElements(document, "p")
+	require.Len(t, paragraphs, 4)
+	assert.Equal(t, "Literal *stars* [brackets] # hash > marker and café", htmlText(paragraphs[0]),
+		"unannotated Markdown metacharacters must render as literal text")
+	assertHTMLElement(t, document, "h2", "Roadmap")
+	assertHTMLElement(t, document, "blockquote", "quoted > marker")
+	assertHTMLElement(t, document, "strong", "bold")
+	link := assertHTMLElement(t, document, "a", "docs")
+	assert.Equal(t, "https://example.com/docs", htmlAttribute(link, "href"))
+	assertHTMLElement(t, document, "code", "a*b")
+	detailsElements := findHTMLElements(document, "details")
+	require.Len(t, detailsElements, 1, "the spoiler must render as one <details> element")
+	details := detailsElements[0]
+	assert.False(t, hasHTMLAttribute(details, "open"), "the spoiler must be hidden until explicitly opened")
+	assertHTMLElement(t, details, "summary", "Ending")
+	assertHTMLElement(t, details, "p", "secret ending")
+	assert.Empty(t, findHTMLElements(document, "em"), "unannotated stars must not create emphasis")
+
+	wireObject, err := json.Marshal(note)
+	require.NoError(t, err)
+	for _, metadata := range []string{"facets", "byteStart", "byteEnd", "social.coves.richtext.facet"} {
+		assert.NotContains(t, string(wireObject), metadata, "Coves facet metadata must not leak into ActivityPub")
+	}
+
+	served, err := apobject.RenderObject(outUserOrigin, snapshot)
+	require.NoError(t, err)
+	assert.Equal(t, source, served["source"], "served source must match the delivered durable snapshot rendering")
+	assert.Equal(t, content, served["content"], "served HTML must match the delivered durable snapshot rendering")
+}
+
+func assertHTMLElement(t *testing.T, root *html.Node, tag, text string) *html.Node {
+	t.Helper()
+	elements := findHTMLElements(root, tag)
+	require.Len(t, elements, 1, "expected exactly one <%s> element", tag)
+	assert.Equal(t, text, htmlText(elements[0]), "unexpected <%s> text", tag)
+	return elements[0]
+}
+
+func findHTMLElements(root *html.Node, tag string) []*html.Node {
+	var elements []*html.Node
+	if root.Type == html.ElementNode && root.Data == tag {
+		elements = append(elements, root)
+	}
+	for child := root.FirstChild; child != nil; child = child.NextSibling {
+		elements = append(elements, findHTMLElements(child, tag)...)
+	}
+	return elements
+}
+
+func htmlText(root *html.Node) string {
+	var text strings.Builder
+	var walk func(*html.Node)
+	walk = func(node *html.Node) {
+		if node.Type == html.TextNode {
+			text.WriteString(node.Data)
+		}
+		for child := node.FirstChild; child != nil; child = child.NextSibling {
+			walk(child)
+		}
+	}
+	walk(root)
+	return strings.TrimSpace(text.String())
+}
+
+func htmlAttribute(node *html.Node, key string) string {
+	for _, attribute := range node.Attr {
+		if attribute.Key == key {
+			return attribute.Val
+		}
+	}
+	return ""
+}
+
+func hasHTMLAttribute(node *html.Node, key string) bool {
+	for _, attribute := range node.Attr {
+		if attribute.Key == key {
+			return true
+		}
+	}
+	return false
 }
 
 // ---------------------------------------------------------------------------

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 
+	"tidepool/internal/apobject"
 	"tidepool/internal/errors"
 	"tidepool/internal/store"
 )
@@ -109,6 +110,14 @@ func (d *Dispatcher) applyCommentWrite(ctx context.Context, tx *sql.Tx, did stri
 		// triaging the queue has to go on.
 		return fmt.Errorf("%w: comment %s is at depth %d, beyond Lemmy's cap of %d",
 			ErrPermanentEvent, atURI, thread.Depth, maxCommentDepth)
+	}
+
+	// A comment is lexicon-validated nowhere upstream, so the limits the
+	// renderer depends on are enforced here, before any state or identity
+	// exists for it. PERMANENT: the record cannot shrink on a retry, and an
+	// update that fails leaves the last accepted snapshot in place.
+	if err := apobject.CheckRecordLimits(commit.Record); err != nil {
+		return fmt.Errorf("%w: comment %s: %w", ErrPermanentEvent, atURI, err)
 	}
 
 	if err := d.refuseInLockedThread(ctx, atURI, thread); err != nil {

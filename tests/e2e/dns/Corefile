@@ -1,0 +1,30 @@
+# In-stack DNS for the e2e bridge (docker-compose.e2e.yml `dns` service).
+#
+# The bridge container points its `dns:` at this server, so Docker's
+# embedded resolver still answers compose service names and aliases itself
+# and forwards only everything else here. Nothing is forwarded upstream: a
+# query that reaches this server is answered from this file or not at all,
+# and `log` records every one of them (docker compose logs dns).
+
+# The .test zone, served authoritatively. It holds no _atproto TXT records,
+# so the handle-verification lookup for _atproto.native-alice.pds.test gets
+# an authoritative NXDOMAIN ("this handle publishes no DNS claim") and the
+# bridge falls back to the HTTPS well-known served by `handle-tls`.
+test:53 {
+    log
+    errors
+    file /etc/coredns/test.zone
+}
+
+# Every other name: authoritative NXDOMAIN, never forwarded. NXDOMAIN rather
+# than REFUSED because Go's resolver reports the error of the LAST
+# search-domain candidate it tried; a REFUSED there would turn the .test
+# NXDOMAIN into a non-authoritative failure whenever the container inherits
+# search domains.
+.:53 {
+    log
+    errors
+    template ANY ANY {
+        rcode NXDOMAIN
+    }
+}

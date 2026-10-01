@@ -9,3 +9,8 @@ tasks/
 docker-compose*.yml
 Dockerfile
 .github/
+
+# Nightly pg_dump output (scripts/pg-backup.sh). Root-only on the production
+# host, so a build context that includes it fails with permission denied, and
+# the dumps are gigabytes that must never enter an image layer.
+backups/

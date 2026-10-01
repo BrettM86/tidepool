@@ -1,0 +1,17 @@
+[Unit]
+Description=Tidepool nightly Postgres backup
+Requires=docker.service
+After=docker.service
+# Persistent=true on the timer fires a missed run at boot, possibly before the
+# postgres container is up: retry, but stop after 4 starts in 2 hours so a
+# persistent failure ends as a failed unit instead of looping.
+StartLimitIntervalSec=2h
+StartLimitBurst=4
+
+[Service]
+Type=oneshot
+# A root-owned installed copy, not the checkout: a checkout writable by a
+# non-root user should not supply code that runs as root.
+ExecStart=/usr/local/sbin/tidepool-pg-backup
+Restart=on-failure
+RestartSec=5min

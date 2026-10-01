@@ -946,15 +946,32 @@ no previous key to fall back to — is still unrecoverable.
 scripts, both exercised end-to-end before landing (backup → archive
 verification → restore → inventory gates):
 
-- `scripts/pg-backup.sh` — run from host cron. Dumps custom-format into the
+- `scripts/pg-backup.sh` — run by a host systemd timer. Dumps custom-format into the
   `./backups` mount the compose file already provides, verifies the archive
-  with `pg_restore --list` **before** it gets its final name (a dump that
-  cannot be listed is not a backup), `chmod 600`s it, then ages out completed
-  dumps older than `RETENTION_DAYS` (default 14). Partials are never deleted at
-  any age; ones older than a day are warned about, because a partial is the
-  corpse of a failed run and worth seeing. Install:
+  with a full `pg_restore -f /dev/null` read **before** it gets its final name
+  (a dump that cannot be read end to end is not a backup; `--list` reads only
+  the TOC and would pass a truncated dump), `chmod 600`s it, then ages out completed
+  dumps older than `RETENTION_DAYS` (default 14). A failed run keeps only the
+  most recent failed partial, under the fixed name
+  `backups/tidepool-last-failed.dump.partial`, so retries overwrite it rather
+  than pile up ~2GB files; partials are not aged out, and ones older than a day
+  are warned about, because a partial is the corpse of a failed run and worth
+  seeing. The production host has no cron
+  daemon, so it runs from the systemd units in `scripts/systemd/` (02:17 UTC,
+  as root, output in the journal). A failed run retries every 5 minutes, up to
+  4 starts in 2 hours, which covers a boot-time catch-up run that fires before
+  the containers are up. The unit runs a root-owned copy at
+  `/usr/local/sbin/tidepool-pg-backup`, not the checkout's script: a checkout
+  writable by a non-root user should not supply code that runs as root.
+  Install, from `/opt/tidepool`, and re-run the `install` line after any change
+  to `scripts/pg-backup.sh`:
 
-      17 2 * * * /opt/tidepool/scripts/pg-backup.sh >> /opt/tidepool/backups/backup.log 2>&1
+      sudo install -m 755 scripts/pg-backup.sh /usr/local/sbin/tidepool-pg-backup
+      sudo cp scripts/systemd/tidepool-pg-backup.{service,timer} /etc/systemd/system/
+      sudo systemctl daemon-reload
+      sudo systemctl enable --now tidepool-pg-backup.timer
+      sudo systemctl start tidepool-pg-backup.service    # first backup now
+      journalctl -u tidepool-pg-backup.service            # its output
 
   **Provisioning: `chmod 700 /opt/tidepool/backups` once, by hand.** The script
   can only fix the files it creates. Every dump in that directory contains the
@@ -1002,8 +1019,8 @@ material anywhere — a genuinely fresh install — is allowed to mint on an
 unproven key.
 
 **Retention and drill cadence interact, and not in your favour.** Retention
-ages dumps out on `pg-backup.sh`'s own criteria, which is `pg_restore --list`
-succeeding; a dump that lists but would fail the drill therefore keeps
+ages dumps out on `pg-backup.sh`'s own criteria, which is a full `pg_restore`
+read succeeding; a dump that reads cleanly but would fail the drill therefore keeps
 refreshing the retention window for up to `RETENTION_DAYS` while the last
 *drilled* dump ages out from under it. The drill is the deeper check and
 nothing runs it automatically: **run it after the first backup, after any
@@ -1013,7 +1030,7 @@ restore, and quarterly.**
 copy of `.env` (password manager or sealed storage, not this server), and
 `touch backups/.env-backed-up` after each copy — `pg-backup.sh` warns on every
 run where `.env` is newer than that marker, so a rotated or edited KEK that
-was never re-escrowed shows up in the backup log instead of in an incident.
+was never re-escrowed shows up in the backup's journal output instead of in an incident.
 
 Residual limits, stated rather than implied: dumps live on the same host they
 protect (no offsite replication of `./backups` yet — copying them into the

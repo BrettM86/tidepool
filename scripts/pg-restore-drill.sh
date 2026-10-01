@@ -39,8 +39,11 @@ if [[ -z "${DUMP}" || ! -f "${DUMP}" ]]; then
 fi
 echo "drilling restore of: ${DUMP}"
 
+# -v removes the anonymous data volume the postgres image declares. Without it
+# every drill leaves the restored production dataset on disk after the
+# container is gone.
 cleanup() {
-    docker rm -f "${DRILL_NAME}" > /dev/null 2>&1 ||
+    docker rm -f -v "${DRILL_NAME}" > /dev/null 2>&1 ||
         echo "WARNING: could not remove drill container ${DRILL_NAME} — it may still hold a copy of production data; remove it by hand" >&2
 }
 trap cleanup EXIT

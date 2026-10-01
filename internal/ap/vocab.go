@@ -259,14 +259,26 @@ func (o *Object) UnmarshalJSON(data []byte) error {
 	// survives), absent means a self-delete (it does not). A RawMessage is
 	// empty only when the key was genuinely absent, so presence is decided on
 	// the KEY and the text is read only when there is a JSON string to read.
+	//
+	// `source` is shadowed too, and only a JSON object is decoded into Source.
+	// A string `source` is never markdown (Mbin, for one, sends a link post's
+	// external URL there); like any other non-object shape (number, array,
+	// bool, null) it leaves Source nil instead of failing the whole object. A
+	// malformed object still fails the parse, with an error naming `source`.
 	var wire struct {
 		objectAlias
 		Summary json.RawMessage `json:"summary"`
+		Source  json.RawMessage `json:"source"`
 	}
 	if err := json.Unmarshal(data, &wire); err != nil {
 		return err
 	}
 	*o = Object(wire.objectAlias)
+	if len(wire.Source) > 0 && wire.Source[0] == '{' {
+		if err := json.Unmarshal(wire.Source, &o.Source); err != nil {
+			return fmt.Errorf("object %q source: %w", o.ID, err)
+		}
+	}
 	if len(wire.Summary) > 0 {
 		o.summaryPresent = true
 		// Anything that is not a JSON string (null, and any wrong-typed value
@@ -610,7 +622,9 @@ func unmarshalOneOrMany[S ~[]E, E any](data []byte, out *S) error {
 }
 
 // Source carries the original markdown of an object (Lemmy always includes
-// it alongside the rendered HTML content).
+// it alongside the rendered HTML content). Only a JSON object `source` is
+// decoded; a string is never markdown and, like any other non-object shape,
+// leaves Source nil (see Object.UnmarshalJSON).
 type Source struct {
 	Content   string `json:"content,omitempty"`
 	MediaType string `json:"mediaType,omitempty"`

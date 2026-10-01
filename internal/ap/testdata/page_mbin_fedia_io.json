@@ -1,0 +1,33 @@
+{
+  "@context": [
+    "https://www.w3.org/ns/activitystreams",
+    "https://w3id.org/security/v1",
+    "https://fedia.io/contexts"
+  ],
+  "id": "https://fedia.io/m/startrek@startrek.website/t/4194502",
+  "type": "Page",
+  "attributedTo": "https://fedia.io/u/troed",
+  "to": [
+    "https://startrek.website/c/startrek",
+    "https://www.w3.org/ns/activitystreams#Public"
+  ],
+  "cc": [
+    "https://fedia.io/u/troed/followers"
+  ],
+  "name": "Star Trek clip shared from fedia.io",
+  "audience": "https://startrek.website/c/startrek",
+  "content": "<p>Mbin link post body text</p>",
+  "mediaType": "text/html",
+  "source": "https://video.troed.se/w/5FqDa2jVqCcQWxetJEivnw",
+  "url": "https://fedia.io/m/startrek@startrek.website/t/4194502",
+  "attachment": [
+    {
+      "type": "Link",
+      "href": "https://video.troed.se/w/5FqDa2jVqCcQWxetJEivnw"
+    }
+  ],
+  "commentsEnabled": true,
+  "sensitive": false,
+  "stickied": false,
+  "published": "2026-09-27T18:04:11+00:00"
+}

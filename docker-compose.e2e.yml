@@ -227,6 +227,14 @@ services:
       # or the announcement burns its retry budget against a 0-limit relay.
       relay-bootstrap:
         condition: service_completed_successfully
+      # `up --wait` fails as soon as its poll sees a one-shot's container
+      # exited, even with code 0, unless some service depends on that
+      # one-shot with `condition: service_completed_successfully`. Awaiting
+      # it here also makes a failed bootstrap fail `up`, and starts the
+      # bridge only once the native account exists. Guard test:
+      # tests/e2e/compose_oneshots_test.go.
+      pds-bootstrap:
+        condition: service_completed_successfully
     healthcheck:
       # /healthz pings the database, so healthy == migrated and serving.
       test: ["CMD", "wget", "--spider", "-q", "http://localhost/healthz"]

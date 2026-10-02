@@ -27,6 +27,7 @@ import (
 	"tidepool/internal/config"
 	"tidepool/internal/consume"
 	"tidepool/internal/db"
+	"tidepool/internal/delegation"
 	"tidepool/internal/dns"
 	"tidepool/internal/echo"
 	"tidepool/internal/identity"
@@ -275,6 +276,9 @@ func run(logger *slog.Logger) error {
 	dnsErrors, err := startDNSServer(ctx, cfg, resolver, logger)
 	if err != nil {
 		return err
+	}
+	if _, err := startDelegation(ctx, cfg, actors, delegation.CloudflareAPIBaseURL, logger); err != nil {
+		return fmt.Errorf("delegation: %w", err)
 	}
 	router.Get("/xrpc/com.atproto.identity.resolveHandle", identity.ResolveHandleHandler(resolver, logger))
 	router.Get("/.well-known/atproto-did", identity.WellKnownDIDHandler(resolver, logger))
@@ -1042,4 +1046,41 @@ func startDNSServer(ctx context.Context, cfg *config.Config, resolver identity.R
 	}
 	logger.Info("dns server listening", "addr", cfg.DNSListen, "zone_root", cfg.BridgeHostname)
 	return serveErrors, nil
+}
+
+// startDelegation starts one asynchronous delegation pass when a Cloudflare
+// token is configured, returning the reconciler without waiting for the pass.
+func startDelegation(ctx context.Context, cfg *config.Config, actors store.BridgedActors, cloudflareBaseURL string, logger *slog.Logger) (*delegation.Reconciler, error) {
+	if cfg.CloudflareAPIToken == "" {
+		return nil, nil
+	}
+	client, err := delegation.NewCloudflareClient(delegation.CloudflareOptions{
+		BaseURL:    cloudflareBaseURL,
+		Token:      cfg.CloudflareAPIToken,
+		ZoneID:     cfg.CloudflareZoneID,
+		HTTPClient: ap.NewGuardedHTTPClient(cfg.AllowPrivateAddresses, 30*time.Second),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create Cloudflare client: %w", err)
+	}
+	reconciler, err := delegation.NewReconciler(delegation.Options{
+		Client: client, Labels: actors, ZoneRoot: cfg.BridgeHostname,
+		Nameservers: cfg.DNSNameservers, Logger: logger,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create delegation reconciler: %w", err)
+	}
+	go func() {
+		result, err := reconciler.Reconcile(ctx)
+		logger.InfoContext(ctx, "startup delegation pass finished", "component", "delegation",
+			"created_count", len(result.Created), "created", result.Created,
+			"already_delegated_count", len(result.AlreadyDelegated),
+			"conflicting_count", len(result.Conflicting), "conflicting", result.Conflicting,
+			"failed_count", len(result.Failed), "failed", result.Failed,
+			"delegated_without_live_actors_count", len(result.DelegatedWithoutLiveActors))
+		if err != nil {
+			logger.ErrorContext(ctx, "startup delegation pass failed", "component", "delegation", "error", err)
+		}
+	}()
+	return reconciler, nil
 }

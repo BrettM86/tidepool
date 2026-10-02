@@ -323,6 +323,8 @@ Two classes, and the difference matters at boot:
 | `DNS_PUBLIC_IPV4` | *(unset)* | IPv4 address returned in A answers; required when `DNS_LISTEN` is set |
 | `DNS_PUBLIC_IPV6` | *(unset)* | optional IPv6 address returned in AAAA answers when DNS is enabled |
 | `DNS_NAMESERVERS` | `ns1`/`ns2` under `BRIDGE_HOSTNAME` when DNS is enabled | comma-separated nameserver hostnames returned in apex NS answers (first is the SOA primary) |
+| `CLOUDFLARE_API_TOKEN` | *(empty; disabled)* | Cloudflare API token with DNS edit on the zone; enables a startup pass creating `<label>.<BRIDGE_HOSTNAME> NS <first DNS_NAMESERVERS entry>` records. Requires `DNS_LISTEN` and `CLOUDFLARE_ZONE_ID`; empty disables delegation |
+| `CLOUDFLARE_ZONE_ID` | *(unset)* | zone ID of the zone holding `BRIDGE_HOSTNAME`; required when `CLOUDFLARE_API_TOKEN` is set |
 | `BRIDGE_SCHEME` | `https` | scheme of the bridge's own AP URLs (actor id, inbox, activity ids). `http` is dev-only — the e2e harness federates with a debug-mode Lemmy over plain HTTP |
 | `PLC_DIRECTORY_URL` | `http://localhost:3002` (local, `make plc-up`) | did:plc directory; production uses `https://plc.directory` |
 | `BRIDGE_KEK` | fixed public dev key | 32-byte key-encryption key (64 hex chars or base64) sealing per-actor signing keys and the escrow rotation key at rest (AES-256-GCM) |

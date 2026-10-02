@@ -520,3 +520,10 @@ type OutboundDelivery struct {
 	CreatedAt       time.Time
 	UpdatedAt       time.Time
 }
+
+// InstanceLabel describes a bridged instance's DNS label and whether at least
+// one of its actors has not been deleted.
+type InstanceLabel struct {
+	Label        string
+	HasLiveActor bool
+}

@@ -21,6 +21,7 @@ func clearConfigEnv(t *testing.T) {
 	for _, name := range []string{
 		"ENVIRONMENT", "DATABASE_URL", "LISTEN_ADDR", "BRIDGE_HOSTNAME",
 		"DNS_LISTEN", "DNS_PUBLIC_IPV4", "DNS_PUBLIC_IPV6", "DNS_NAMESERVERS",
+		"CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ZONE_ID",
 		"PLC_DIRECTORY_URL", "BRIDGE_SERVICE_DID", "USER_AGENT", "BRIDGE_KEK",
 		"BRIDGE_KEK_PREVIOUS",
 		"ADMIN_TOKEN", "BACKFILL_MAX_POSTS", "MINT_RATE_PER_MINUTE",
@@ -146,6 +147,44 @@ func TestLoad_DNSAcceptsSingleLabelZoneRoot(t *testing.T) {
 	cfg, err := Load(discardLogger())
 	require.NoError(t, err)
 	require.Equal(t, []string{"ns1.localhost", "ns2.localhost"}, cfg.DNSNameservers)
+}
+
+func TestLoad_CloudflareDelegationConfiguration(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		token      string
+		zoneID     string
+		dnsEnabled bool
+		wantErrors []string
+	}{
+		{name: "token unset disables delegation"},
+		{name: "token requires zone ID", token: "cf-config-token", dnsEnabled: true, wantErrors: []string{"CLOUDFLARE_ZONE_ID"}},
+		{name: "token requires DNS listener", token: "cf-config-token", zoneID: "zone-config", wantErrors: []string{"CLOUDFLARE_API_TOKEN", "DNS_LISTEN"}},
+		{name: "enabled values are carried", token: "cf-config-token", zoneID: "zone-config", dnsEnabled: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearConfigEnv(t)
+			t.Setenv("CLOUDFLARE_API_TOKEN", tc.token)
+			t.Setenv("CLOUDFLARE_ZONE_ID", tc.zoneID)
+			if tc.dnsEnabled {
+				t.Setenv("BRIDGE_HOSTNAME", "localhost")
+				t.Setenv("DNS_LISTEN", "127.0.0.1:5300")
+				t.Setenv("DNS_PUBLIC_IPV4", "127.0.0.1")
+			}
+
+			cfg, err := Load(discardLogger())
+			if len(tc.wantErrors) > 0 {
+				require.Error(t, err)
+				for _, name := range tc.wantErrors {
+					assert.Contains(t, err.Error(), name)
+				}
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.token, cfg.CloudflareAPIToken)
+			assert.Equal(t, tc.zoneID, cfg.CloudflareZoneID)
+		})
+	}
 }
 
 func TestLoad_BridgeHostnameWithPortLoadsWhenDNSDisabled(t *testing.T) {

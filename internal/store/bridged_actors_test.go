@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -305,4 +306,42 @@ func TestBridgedActors_HandleCollisionIsConflict(t *testing.T) {
 	noHandle.Handle = ""
 	_, err = repo.UpsertActor(ctx, noHandle)
 	assert.NoError(t, err, "actors without handles must not collide")
+}
+
+func TestBridgedActors_ListInstanceLabels(t *testing.T) {
+	repo := NewBridgedActors(testDB(t))
+	ctx := context.Background()
+	for index, fixture := range []struct {
+		handle  string
+		consent ConsentState
+	}{
+		{"alice.a.tdpl.example", ConsentStateOK},
+		{"bob.b.tdpl.example", ConsentStateDeleted},
+		{"carol.b.tdpl.example", ConsentStateDeleted},
+		{"dave.c.tdpl.example", ConsentStateDeleted},
+		{"eve.c.tdpl.example", ConsentStateOK},
+		{"frank.n.tdpl.example", ConsentStateNoBridge},
+		{"user.foreign.nottdpl.example", ConsentStateOK},
+		{"x.d.other.example", ConsentStateOK},
+	} {
+		actor := testActor()
+		actor.APActorID = fmt.Sprintf("https://lemmy.example/u/instance-label-%d", index)
+		actor.DID = fmt.Sprintf("did:plc:%024d", index+1)
+		actor.Handle = fixture.handle
+		actor.ConsentState = ConsentStateOK
+		_, err := repo.UpsertActor(ctx, actor)
+		require.NoError(t, err, "insert %s", fixture.handle)
+		if fixture.consent != ConsentStateOK {
+			require.NoError(t, repo.SetConsentState(ctx, actor.APActorID, fixture.consent))
+		}
+	}
+
+	labels, err := repo.ListInstanceLabels(ctx, "tdpl.example")
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []InstanceLabel{
+		{Label: "a", HasLiveActor: true},
+		{Label: "b", HasLiveActor: false},
+		{Label: "c", HasLiveActor: true},
+		{Label: "n", HasLiveActor: true},
+	}, labels)
 }

@@ -181,6 +181,10 @@ type BridgedActors interface {
 	// MarkProfileSynced records when the actor's profile record was last
 	// (re)materialized.
 	MarkProfileSynced(ctx context.Context, apActorID string, syncedAt time.Time) error
+
+	// ListInstanceLabels returns distinct second-label instances under zoneRoot,
+	// including labels whose actors are all deleted (HasLiveActor=false).
+	ListInstanceLabels(ctx context.Context, zoneRoot string) ([]InstanceLabel, error)
 }
 
 // APActors persists the ActivityPub identities Coves users get on the user

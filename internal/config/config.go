@@ -43,6 +43,10 @@ type Config struct {
 	DNSPublicIPv4  netip.Addr
 	DNSPublicIPv6  netip.Addr
 	DNSNameservers []string
+	// CloudflareAPIToken enables the startup delegation pass when set.
+	CloudflareAPIToken string
+	// CloudflareZoneID identifies the zone containing BridgeHostname.
+	CloudflareZoneID string
 	// BridgeScheme is the URL scheme the bridge's own AP URLs (service
 	// actor id, inbox, activity ids, nodeinfo) are built with. BRIDGE_SCHEME,
 	// default "https". "http" is only accepted in development — it exists for
@@ -349,6 +353,16 @@ func Load(logger *slog.Logger) (*Config, error) {
 			}
 		} else {
 			cfg.DNSNameservers = []string{"ns1." + root, "ns2." + root}
+		}
+	}
+	cfg.CloudflareAPIToken = strings.TrimSpace(os.Getenv("CLOUDFLARE_API_TOKEN"))
+	cfg.CloudflareZoneID = strings.TrimSpace(os.Getenv("CLOUDFLARE_ZONE_ID"))
+	if cfg.CloudflareAPIToken != "" {
+		if cfg.CloudflareZoneID == "" {
+			return nil, fmt.Errorf("config: CLOUDFLARE_ZONE_ID is required when CLOUDFLARE_API_TOKEN is set")
+		}
+		if cfg.DNSListen == "" {
+			return nil, fmt.Errorf("config: DNS_LISTEN is required when CLOUDFLARE_API_TOKEN is set")
 		}
 	}
 	cfg.PLCDirectoryURL, err = stringVar(logger, isDevelopment, "PLC_DIRECTORY_URL", "http://localhost:3002")

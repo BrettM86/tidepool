@@ -142,6 +142,8 @@ func TestRunDNSBindFailurePrecedesHTTP(t *testing.T) {
 			t.Setenv("DNS_PUBLIC_IPV4", "127.0.0.1")
 			t.Setenv("DNS_PUBLIC_IPV6", "")
 			t.Setenv("DNS_NAMESERVERS", "")
+			t.Setenv("CLOUDFLARE_API_TOKEN", "")
+			t.Setenv("CLOUDFLARE_ZONE_ID", "")
 			t.Setenv("BRIDGE_HOSTNAME", "tdpl.example")
 			t.Setenv("BRIDGE_KEK", rotateTestKEK)
 			t.Setenv("BRIDGE_KEK_PREVIOUS", "")

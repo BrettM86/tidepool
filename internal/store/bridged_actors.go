@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	stderrors "errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/bluesky-social/indigo/atproto/syntax"
@@ -218,4 +219,35 @@ func scanBridgedActor(row rowScanner) (*BridgedActor, error) {
 	actor.ActorType = ActorType(actorType)
 	actor.ConsentState = ConsentState(consentState)
 	return &actor, nil
+}
+
+// ListInstanceLabels returns each instance label under zoneRoot and whether it
+// has at least one actor that has not been deleted.
+func (r *postgresBridgedActors) ListInstanceLabels(ctx context.Context, zoneRoot string) ([]InstanceLabel, error) {
+	root := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(zoneRoot)), ".")
+	const query = `
+		SELECT split_part(lower(handle), '.', 2) AS label,
+		       bool_or(consent_state <> $2) AS has_live_actor
+		FROM bridged_actors
+		WHERE right(lower(handle), length($1) + 1) = '.' || $1
+		  AND cardinality(string_to_array(lower(handle), '.')) = cardinality(string_to_array($1, '.')) + 2
+		GROUP BY label
+		ORDER BY label`
+	rows, err := r.db.QueryContext(ctx, query, root, string(ConsentStateDeleted))
+	if err != nil {
+		return nil, fmt.Errorf("list instance labels under %q: %w", root, err)
+	}
+	defer rows.Close()
+	var labels []InstanceLabel
+	for rows.Next() {
+		var label InstanceLabel
+		if err := rows.Scan(&label.Label, &label.HasLiveActor); err != nil {
+			return nil, fmt.Errorf("scan instance label under %q: %w", root, err)
+		}
+		labels = append(labels, label)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read instance labels under %q: %w", root, err)
+	}
+	return labels, nil
 }

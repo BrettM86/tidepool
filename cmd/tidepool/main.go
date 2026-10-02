@@ -1017,8 +1017,8 @@ func startConsumer(
 	return done, engine, nil
 }
 
-// startDNSServer serves handle TXT lookups when DNS_LISTEN is set. The
-// returned channel carries ServeUDP's unexpected-stop error; it is nil when
+// startDNSServer serves handle DNS over UDP and TCP when DNS_LISTEN is set. The
+// returned channel carries Serve's unexpected-stop error; it is nil when
 // DNS is disabled, so receiving from it in run's select blocks forever.
 func startDNSServer(ctx context.Context, cfg *config.Config, resolver identity.Resolver, logger *slog.Logger) (<-chan error, error) {
 	if cfg.DNSListen == "" {
@@ -1036,7 +1036,7 @@ func startDNSServer(ctx context.Context, cfg *config.Config, resolver identity.R
 	if err != nil {
 		return nil, fmt.Errorf("dns server %s: %w", cfg.DNSListen, err)
 	}
-	serveErrors, err := dns.ServeUDP(ctx, cfg.DNSListen, handler)
+	serveErrors, err := dns.Serve(ctx, cfg.DNSListen, handler, logger)
 	if err != nil {
 		return nil, fmt.Errorf("dns server %s: %w", cfg.DNSListen, err)
 	}

@@ -8,9 +8,11 @@ import (
 	"net"
 	"net/netip"
 	"strings"
+	"sync"
 	"time"
 
 	miekgdns "github.com/miekg/dns"
+	"golang.org/x/net/netutil"
 
 	internalerrors "tidepool/internal/errors"
 	"tidepool/internal/identity"
@@ -18,10 +20,34 @@ import (
 
 const handleLookupTimeout = 2 * time.Second
 
+const (
+	zoneRecordTTL = 3600
+	soaMinimumTTL = 300
+	soaRefresh    = 3600
+	soaRetry      = 600
+	soaExpire     = 1209600
+	handleTXTTTL  = 300
+)
+
 // maxConcurrentHandleLookups bounds how many DNS queries may run a handle
 // lookup at once, so spoofed UDP floods cannot exhaust the shared database
 // connection pool. Queries over the limit are answered SERVFAIL.
 const maxConcurrentHandleLookups = 8
+
+// advertisedUDPPayloadSize is the UDP payload size the server reads and
+// advertises in its OPT record (the DNS Flag Day 2020 recommendation).
+const advertisedUDPPayloadSize = 1232
+
+// TCP limits keep a connection flood from exhausting the file descriptors,
+// memory and CPU that the DNS server shares with the rest of the process.
+const (
+	maxTCPConnections          = 256
+	tcpReadTimeout             = 2 * time.Second
+	tcpIdleTimeout             = 3 * time.Second
+	maxTCPQueriesPerConnection = 16
+	acceptRetryInitialDelay    = 5 * time.Millisecond
+	acceptRetryMaximumDelay    = time.Second
+)
 
 // Options configures an authoritative DNS handler for bridged handles.
 type Options struct {
@@ -36,11 +62,11 @@ type Options struct {
 
 // Handler answers DNS queries in the configured handle subzones.
 type Handler struct {
-	zoneRoot   string
-	nameserver string
-	serial     uint32
-	resolver   identity.Resolver
-	logger     *slog.Logger
+	zoneRoot    string
+	nameservers []string
+	serial      uint32
+	resolver    identity.Resolver
+	logger      *slog.Logger
 	// lookupSlots holds one token per in-flight handle lookup.
 	lookupSlots chan struct{}
 }
@@ -80,7 +106,7 @@ func NewHandler(options Options) (*Handler, error) {
 	}
 	return &Handler{
 		zoneRoot:    zoneRoot,
-		nameserver:  nameservers[0],
+		nameservers: nameservers,
 		serial:      options.Serial,
 		resolver:    options.Resolver,
 		logger:      logger,
@@ -105,11 +131,16 @@ func normalizeDomainName(name string) (string, error) {
 	return normalized, nil
 }
 
-// ServeDNS answers handle TXT queries and returns NODATA for other in-zone queries.
+// ServeDNS answers handle TXT and label-apex SOA/NS queries, returning NODATA
+// for other in-zone questions.
 func (h *Handler) ServeDNS(writer miekgdns.ResponseWriter, request *miekgdns.Msg) {
 	response := new(miekgdns.Msg)
 	response.SetReply(request)
 	response.RecursionAvailable = false
+	// SetReply does not copy the request's OPT record (RFC 6891 section 7).
+	if request.IsEdns0() != nil {
+		response.SetEdns0(advertisedUDPPayloadSize, false)
+	}
 	if len(request.Question) != 1 {
 		response.Rcode = miekgdns.RcodeFormatError
 		h.writeResponse(writer, response)
@@ -148,7 +179,7 @@ func (h *Handler) ServeDNS(writer miekgdns.ResponseWriter, request *miekgdns.Msg
 		switch {
 		case err == nil:
 			response.Answer = []miekgdns.RR{&miekgdns.TXT{
-				Hdr: miekgdns.RR_Header{Name: question.Name, Rrtype: miekgdns.TypeTXT, Class: miekgdns.ClassINET, Ttl: 300},
+				Hdr: miekgdns.RR_Header{Name: question.Name, Rrtype: miekgdns.TypeTXT, Class: miekgdns.ClassINET, Ttl: handleTXTTTL},
 				Txt: []string{"did=" + did},
 			}}
 		case internalerrors.IsNotFound(err) || internalerrors.IsValidation(err):
@@ -161,7 +192,23 @@ func (h *Handler) ServeDNS(writer miekgdns.ResponseWriter, request *miekgdns.Msg
 		return
 	}
 
-	// Task 02: answer SOA and NS queries at the label apex here.
+	if len(labels) == 1 {
+		switch question.Qtype {
+		case miekgdns.TypeSOA:
+			response.Answer = []miekgdns.RR{h.soa(apex)}
+			h.writeResponse(writer, response)
+			return
+		case miekgdns.TypeNS:
+			for _, nameserver := range h.nameservers {
+				response.Answer = append(response.Answer, &miekgdns.NS{
+					Hdr: miekgdns.RR_Header{Name: apex, Rrtype: miekgdns.TypeNS, Class: miekgdns.ClassINET, Ttl: zoneRecordTTL},
+					Ns:  nameserver,
+				})
+			}
+			h.writeResponse(writer, response)
+			return
+		}
+	}
 	// Task 03: answer A and AAAA queries here.
 	h.addSOA(response, apex)
 	h.writeResponse(writer, response)
@@ -184,55 +231,102 @@ func (h *Handler) writeResponse(writer miekgdns.ResponseWriter, response *miekgd
 	failure.MsgHdr = response.MsgHdr
 	failure.Question = response.Question
 	failure.Rcode = miekgdns.RcodeServerFailure
+	if opt := response.IsEdns0(); opt != nil {
+		failure.Extra = []miekgdns.RR{opt}
+	}
 	if err := writer.WriteMsg(failure); err != nil {
 		h.logger.Warn("DNS SERVFAIL write failed", "error", err)
 	}
 }
 
 func (h *Handler) addSOA(response *miekgdns.Msg, apex string) {
-	response.Ns = []miekgdns.RR{&miekgdns.SOA{
-		Hdr:     miekgdns.RR_Header{Name: apex, Rrtype: miekgdns.TypeSOA, Class: miekgdns.ClassINET, Ttl: 3600},
-		Ns:      h.nameserver,
+	response.Ns = []miekgdns.RR{h.soa(apex)}
+}
+
+func (h *Handler) soa(apex string) *miekgdns.SOA {
+	return &miekgdns.SOA{
+		Hdr:     miekgdns.RR_Header{Name: apex, Rrtype: miekgdns.TypeSOA, Class: miekgdns.ClassINET, Ttl: zoneRecordTTL},
+		Ns:      h.nameservers[0],
 		Mbox:    "hostmaster." + h.zoneRoot,
 		Serial:  h.serial,
-		Refresh: 3600,
-		Retry:   600,
-		Expire:  1209600,
-		Minttl:  300,
-	}}
+		Refresh: soaRefresh,
+		Retry:   soaRetry,
+		Expire:  soaExpire,
+		Minttl:  soaMinimumTTL,
+	}
 }
 
-// ServeUDP binds address synchronously and returns the bind or startup error.
-// Once started it serves in the background until ctx is cancelled. The returned
-// channel receives one non-nil error if serving stops for any reason other than
-// ctx cancellation, and is closed once the server has stopped.
-func ServeUDP(ctx context.Context, address string, handler miekgdns.Handler) (<-chan error, error) {
-	packet, err := net.ListenPacket("udp", address)
-	if err != nil {
-		return nil, fmt.Errorf("bind DNS UDP %s: %w", address, err)
-	}
-	done, err := servePacketConn(ctx, packet, handler)
-	if err != nil {
-		return nil, fmt.Errorf("start DNS UDP %s: %w", address, err)
-	}
-	return done, nil
-}
-
-// servePacketConn serves DNS on packet with the contract of ServeUDP. It takes
-// ownership of packet and closes it when serving stops. When a serve failure
-// races with ctx cancellation, the failure is reported only if ctx.Err() is
-// still nil at that point: a stop during shutdown is treated as the shutdown.
+// servePacketConn serves DNS on packet and takes ownership of it.
 func servePacketConn(ctx context.Context, packet net.PacketConn, handler miekgdns.Handler) (<-chan error, error) {
+	server := &miekgdns.Server{PacketConn: packet, Handler: handler, UDPSize: advertisedUDPPayloadSize}
+	return serveServer(ctx, server, packet.Close, packet.LocalAddr())
+}
+
+// serveListener serves DNS on listener with bounded connections, timeouts and
+// queries per connection, and takes ownership of it.
+func serveListener(ctx context.Context, listener net.Listener, handler miekgdns.Handler, logger *slog.Logger) (<-chan error, error) {
+	// The backoff wraps the limit so a retrying Accept does not hold a slot.
+	limited := newAcceptBackoffListener(netutil.LimitListener(listener, maxTCPConnections), logger)
+	server := &miekgdns.Server{
+		Listener:      limited,
+		Handler:       handler,
+		ReadTimeout:   tcpReadTimeout,
+		IdleTimeout:   func() time.Duration { return tcpIdleTimeout },
+		MaxTCPQueries: maxTCPQueriesPerConnection,
+	}
+	return serveServer(ctx, server, limited.Close, listener.Addr())
+}
+
+// acceptBackoffListener retries temporary Accept errors such as EMFILE with
+// exponential backoff and a warning, where miekg would retry at once and
+// silently. Other errors, including the one Accept returns after Close, pass
+// through.
+type acceptBackoffListener struct {
+	net.Listener
+	logger    *slog.Logger
+	closeOnce sync.Once
+	closed    chan struct{}
+}
+
+func newAcceptBackoffListener(listener net.Listener, logger *slog.Logger) *acceptBackoffListener {
+	return &acceptBackoffListener{Listener: listener, logger: logger, closed: make(chan struct{})}
+}
+
+func (l *acceptBackoffListener) Accept() (net.Conn, error) {
+	var delay time.Duration
+	for {
+		conn, err := l.Listener.Accept()
+		var netError net.Error
+		if err == nil || !errors.As(err, &netError) || !netError.Temporary() { //nolint:staticcheck // Temporary is the test miekg applies to Accept errors.
+			return conn, err
+		}
+		delay = min(max(delay*2, acceptRetryInitialDelay), acceptRetryMaximumDelay)
+		l.logger.Warn("DNS TCP accept failed; retrying", "error", err, "retry_in", delay)
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-l.closed:
+			timer.Stop()
+			return nil, net.ErrClosed
+		}
+	}
+}
+
+// Close interrupts a backoff in progress and closes the wrapped listener.
+func (l *acceptBackoffListener) Close() error {
+	l.closeOnce.Do(func() { close(l.closed) })
+	return l.Listener.Close()
+}
+
+// serveServer waits for startup and reports an unexpected stop unless the
+// context is cancelled. It closes the socket once serving stops.
+func serveServer(ctx context.Context, server *miekgdns.Server, closeSocket func() error, address net.Addr) (<-chan error, error) {
 	started := make(chan struct{})
 	stopped := make(chan error, 1)
-	server := &miekgdns.Server{
-		PacketConn:        packet,
-		Handler:           handler,
-		NotifyStartedFunc: func() { close(started) },
-	}
+	server.NotifyStartedFunc = func() { close(started) }
 	go func() {
 		err := server.ActivateAndServe()
-		_ = packet.Close()
+		_ = closeSocket()
 		stopped <- err
 	}()
 	select {
@@ -259,7 +353,104 @@ func servePacketConn(ctx context.Context, packet net.PacketConn, handler miekgdn
 			if err == nil {
 				err = errors.New("DNS server stopped unexpectedly")
 			}
-			done <- fmt.Errorf("serve DNS on %s: %w", packet.LocalAddr(), err)
+			done <- fmt.Errorf("serve DNS on %s: %w", address, err)
+		}
+	}()
+	return done, nil
+}
+
+// Serve binds UDP and TCP on the same address before starting either server.
+// Its channel reports one unexpected transport failure and closes after both
+// transports stop; cancellation shuts both down without reporting an error.
+// TCP accept failures that are retried are logged to logger.
+func Serve(ctx context.Context, address string, handler miekgdns.Handler, logger *slog.Logger) (<-chan error, error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	packet, err := net.ListenPacket("udp", address)
+	if err != nil {
+		return nil, fmt.Errorf("bind DNS UDP %s: %w", address, err)
+	}
+	tcpAddress := address
+	if _, port, splitErr := net.SplitHostPort(address); splitErr == nil && port == "0" {
+		tcpAddress = packet.LocalAddr().String()
+	}
+	listener, err := net.Listen("tcp", tcpAddress)
+	if err != nil {
+		_ = packet.Close()
+		return nil, fmt.Errorf("bind DNS TCP %s: %w", tcpAddress, err)
+	}
+	done, err := serveConns(ctx, packet, listener, handler, logger)
+	if err != nil {
+		return nil, fmt.Errorf("start DNS on %s: %w", address, err)
+	}
+	return done, nil
+}
+
+// udpResponseWriter applies the request's UDP payload limit before sending.
+type udpResponseWriter struct {
+	miekgdns.ResponseWriter
+	size int
+}
+
+func (writer udpResponseWriter) WriteMsg(response *miekgdns.Msg) error {
+	response.Truncate(writer.size)
+	return writer.ResponseWriter.WriteMsg(response)
+}
+
+type udpHandler struct{ miekgdns.Handler }
+
+func (handler udpHandler) ServeDNS(writer miekgdns.ResponseWriter, request *miekgdns.Msg) {
+	size := miekgdns.MinMsgSize
+	requestOPT := request.IsEdns0()
+	if requestOPT != nil {
+		size = int(requestOPT.UDPSize())
+		if size < miekgdns.MinMsgSize {
+			size = miekgdns.MinMsgSize
+		}
+	}
+	handler.Handler.ServeDNS(udpResponseWriter{ResponseWriter: writer, size: size}, request)
+}
+
+// serveConns takes ownership of both sockets and reports the first unexpected
+// stop, closing its channel after both transports have stopped.
+func serveConns(ctx context.Context, packet net.PacketConn, listener net.Listener, handler miekgdns.Handler, logger *slog.Logger) (<-chan error, error) {
+	serveContext, cancel := context.WithCancel(ctx)
+	udpDone, err := servePacketConn(serveContext, packet, udpHandler{handler})
+	if err != nil {
+		cancel()
+		_ = listener.Close()
+		return nil, fmt.Errorf("start DNS UDP: %w", err)
+	}
+	tcpDone, err := serveListener(serveContext, listener, handler, logger)
+	if err != nil {
+		cancel()
+		for range udpDone {
+		}
+		return nil, fmt.Errorf("start DNS TCP: %w", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		defer close(done)
+		defer cancel()
+		for udpDone != nil || tcpDone != nil {
+			select {
+			case err, open := <-udpDone:
+				if !open {
+					udpDone = nil
+				} else if serveContext.Err() == nil {
+					done <- err
+					cancel()
+				}
+			case err, open := <-tcpDone:
+				if !open {
+					tcpDone = nil
+				} else if serveContext.Err() == nil {
+					done <- err
+					cancel()
+				}
+			}
 		}
 	}()
 	return done, nil

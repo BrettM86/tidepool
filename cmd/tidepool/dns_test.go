@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/netip"
+	"syscall"
 	"testing"
 	"time"
 
@@ -21,11 +23,29 @@ func (r *dnsStartupResolver) ResolveHandle(_ context.Context, handle string) (st
 	return r.handles[handle], nil
 }
 
+func freeStartupDNSAddress(t *testing.T) string {
+	t.Helper()
+	for attempt := 0; attempt < 10; attempt++ {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		address := listener.Addr().String()
+		packet, err := net.ListenPacket("udp", address)
+		if err == nil {
+			require.NoError(t, packet.Close())
+			require.NoError(t, listener.Close())
+			return address
+		}
+		require.NoError(t, listener.Close())
+		if !errors.Is(err, syscall.EADDRINUSE) {
+			require.NoError(t, err)
+		}
+	}
+	t.Fatal("could not find a loopback port free for both UDP and TCP")
+	return ""
+}
+
 func TestStartDNSServerUsesConfiguredZoneAndResolver(t *testing.T) {
-	probe, err := net.ListenPacket("udp", "127.0.0.1:0")
-	require.NoError(t, err)
-	address := probe.LocalAddr().String()
-	require.NoError(t, probe.Close())
+	address := freeStartupDNSAddress(t)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -83,6 +103,51 @@ func TestStartDNSServerUsesConfiguredZoneAndResolver(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("the DNS error channel must close once the server stops")
 	}
+}
+
+func TestStartDNSServerReleasesUDPWhenTCPBindFails(t *testing.T) {
+	var listener net.Listener
+	for attempt := 0; attempt < 10; attempt++ {
+		candidate, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		packet, err := net.ListenPacket("udp", candidate.Addr().String())
+		if err == nil {
+			require.NoError(t, packet.Close())
+			listener = candidate
+			break
+		}
+		require.NoError(t, candidate.Close())
+		if !errors.Is(err, syscall.EADDRINUSE) {
+			require.NoError(t, err)
+		}
+	}
+	require.NotNil(t, listener)
+	defer listener.Close()
+	address := listener.Addr().String()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	cfg := &config.Config{
+		DNSListen:      address,
+		BridgeHostname: "tdpl.example",
+		DNSPublicIPv4:  netip.MustParseAddr("127.0.0.1"),
+		DNSNameservers: []string{"ns1.tdpl.example", "ns2.tdpl.example"},
+	}
+	done, err := startDNSServer(ctx, cfg, &dnsStartupResolver{}, testLogger())
+	defer func() {
+		cancel()
+		if done != nil {
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				t.Error("DNS server did not stop after cancellation")
+			}
+		}
+	}()
+	require.Error(t, err, "occupied TCP port must fail startup synchronously")
+	require.Nil(t, done)
+	packet, err := net.ListenPacket("udp", address)
+	require.NoError(t, err, "TCP bind failure must release UDP before context cancellation")
+	require.NoError(t, packet.Close())
 }
 
 func TestStartDNSServerDisabledReturnsNilChannel(t *testing.T) {

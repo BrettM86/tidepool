@@ -101,7 +101,7 @@ func TestNewHandlerOptions(t *testing.T) {
 	handler, err = NewHandler(options)
 	require.NoError(t, err)
 	require.Equal(t, "tdpl.example.", handler.zoneRoot, "zone root must be stored trimmed, lowercased and fully qualified")
-	require.Equal(t, "ns1.tdpl.example.", handler.nameserver, "nameserver must be stored trimmed, lowercased and fully qualified")
+	require.Equal(t, []string{"ns1.tdpl.example.", "ns2.tdpl.example."}, handler.nameservers, "nameservers must be stored trimmed, lowercased and fully qualified")
 }
 
 func TestHandlerNameClassification(t *testing.T) {
@@ -299,6 +299,67 @@ func TestHandlerNameClassification(t *testing.T) {
 	}
 }
 
+func TestHandlerApexSOAAndNS(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		question      string
+		questionType  uint16
+		wantAnswer    int
+		wantAuthority int
+	}{
+		{"B1 apex SOA", "lemmy-world.tdpl.example.", miekgdns.TypeSOA, 1, 0},
+		{"B1 nested SOA NODATA", "alice.lemmy-world.tdpl.example.", miekgdns.TypeSOA, 0, 1},
+		{"B2 apex NS", "lemmy-world.tdpl.example.", miekgdns.TypeNS, 2, 0},
+		{"B2 nested NS NODATA", "alice.lemmy-world.tdpl.example.", miekgdns.TypeNS, 0, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resolver := &recordingResolver{}
+			handler, err := NewHandler(handlerOptions(resolver))
+			require.NoError(t, err)
+			request := new(miekgdns.Msg)
+			request.SetQuestion(tc.question, tc.questionType)
+			writer := &recordingDNSWriter{}
+			handler.ServeDNS(writer, request)
+			require.NotNil(t, writer.response)
+			response := writer.response
+			require.Equal(t, miekgdns.RcodeSuccess, response.Rcode)
+			require.True(t, response.Authoritative)
+			require.Len(t, response.Answer, tc.wantAnswer)
+			require.Len(t, response.Ns, tc.wantAuthority)
+			require.Empty(t, response.Extra)
+			require.Empty(t, resolver.asked)
+
+			if tc.questionType == miekgdns.TypeNS && tc.wantAnswer != 0 {
+				for index, wantTarget := range []string{"ns1.tdpl.example.", "ns2.tdpl.example."} {
+					ns, ok := response.Answer[index].(*miekgdns.NS)
+					require.True(t, ok, "answer %d must be NS, got %T", index, response.Answer[index])
+					require.Equal(t, "lemmy-world.tdpl.example.", ns.Hdr.Name)
+					require.Equal(t, uint16(miekgdns.ClassINET), ns.Hdr.Class)
+					require.Equal(t, uint32(3600), ns.Hdr.Ttl)
+					require.Equal(t, wantTarget, ns.Ns)
+				}
+				return
+			}
+
+			var record miekgdns.RR
+			if tc.wantAnswer != 0 {
+				record = response.Answer[0]
+			} else {
+				record = response.Ns[0]
+			}
+			soa, ok := record.(*miekgdns.SOA)
+			require.True(t, ok, "expected SOA, got %T", record)
+			require.Equal(t, "lemmy-world.tdpl.example.", soa.Hdr.Name)
+			require.Equal(t, uint16(miekgdns.ClassINET), soa.Hdr.Class)
+			require.Equal(t, uint32(3600), soa.Hdr.Ttl)
+			require.Equal(t, "ns1.tdpl.example.", soa.Ns)
+			require.Equal(t, "hostmaster.tdpl.example.", soa.Mbox)
+			require.Equal(t, uint32(2024100101), soa.Serial)
+			require.Equal(t, uint32(300), soa.Minttl)
+		})
+	}
+}
+
 type failingDNSWriter struct {
 	recordingDNSWriter
 	writeErrors []error
@@ -322,12 +383,20 @@ func TestHandlerLogsWriteFailures(t *testing.T) {
 		wantLevel    string
 		wantMessages int
 		wantRetry    bool
+		requestEDNS  bool
 	}{
 		{
 			name:        "pack failure logs error and answers SERVFAIL",
 			writeErrors: []error{miekgdns.ErrRdata},
 			wantLevel:   "level=ERROR",
 			wantRetry:   true,
+		},
+		{
+			name:        "pack failure of an EDNS query answers SERVFAIL with an OPT record",
+			writeErrors: []error{miekgdns.ErrRdata},
+			wantLevel:   "level=ERROR",
+			wantRetry:   true,
+			requestEDNS: true,
 		},
 		{
 			name:        "socket failure logs warning",
@@ -344,6 +413,9 @@ func TestHandlerLogsWriteFailures(t *testing.T) {
 
 			request := new(miekgdns.Msg)
 			request.SetQuestion("alice.lemmy-world.tdpl.example.", miekgdns.TypeTXT)
+			if tc.requestEDNS {
+				request.SetEdns0(4096, false)
+			}
 			writer := &failingDNSWriter{writeErrors: tc.writeErrors}
 			handler.ServeDNS(writer, request)
 
@@ -358,7 +430,14 @@ func TestHandlerLogsWriteFailures(t *testing.T) {
 				require.Equal(t, request.Question, failure.Question)
 				require.Empty(t, failure.Answer)
 				require.Empty(t, failure.Ns)
-				require.Empty(t, failure.Extra)
+				if tc.requestEDNS {
+					require.Len(t, failure.Extra, 1, "the SERVFAIL must carry only the OPT record")
+					opt := failure.IsEdns0()
+					require.NotNil(t, opt, "an EDNS query's SERVFAIL must carry an OPT record")
+					require.Equal(t, uint16(advertisedUDPPayloadSize), opt.UDPSize())
+				} else {
+					require.Empty(t, failure.Extra)
+				}
 			} else {
 				require.Len(t, writer.written, 1, "a socket failure must not be retried")
 			}

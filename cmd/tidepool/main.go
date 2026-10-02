@@ -27,6 +27,7 @@ import (
 	"tidepool/internal/config"
 	"tidepool/internal/consume"
 	"tidepool/internal/db"
+	"tidepool/internal/dns"
 	"tidepool/internal/echo"
 	"tidepool/internal/identity"
 	"tidepool/internal/ingest"
@@ -271,6 +272,10 @@ func run(logger *slog.Logger) error {
 	// all here (see README, "Handle resolution & DNS").
 	actors := store.NewBridgedActors(database)
 	resolver := identity.NewStoreResolver(actors, cfg.BridgeHostname, serviceDID)
+	dnsErrors, err := startDNSServer(ctx, cfg, resolver, logger)
+	if err != nil {
+		return err
+	}
 	router.Get("/xrpc/com.atproto.identity.resolveHandle", identity.ResolveHandleHandler(resolver, logger))
 	router.Get("/.well-known/atproto-did", identity.WellKnownDIDHandler(resolver, logger))
 	// Cert-issuance gate for TLS-terminating proxies with on-demand
@@ -733,49 +738,63 @@ func run(logger *slog.Logger) error {
 		serverErrors <- server.ListenAndServe()
 	}()
 
-	select {
-	case err := <-serverErrors:
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			return fmt.Errorf("http server: %w", err)
-		}
-		return nil
-	case <-ctx.Done():
-		logger.Info("shutdown signal received, draining connections")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-		defer cancel()
-		if err := server.Shutdown(shutdownCtx); err != nil {
-			return fmt.Errorf("graceful shutdown: %w", err)
-		}
-		// Drain in-flight backfill. ctx is already cancelled, so async runs
-		// are unwinding (they stop pulling remote pages and leave
-		// last_backfill_at unset, which is resumable). Wait bounded so a stuck
-		// run can't hold shutdown open past the deadline.
-		drained := make(chan struct{})
-		go func() { backfill.Wait(); admin.Wait(); close(drained) }()
+	for {
 		select {
-		case <-drained:
-		case <-shutdownCtx.Done():
-			logger.Warn("backfill/refresh-profile drain timed out; abandoning in-flight run (re-triggerable on restart)")
-		}
-		// Wait for the consumer's read loop to exit. Its shutdown path flushes
-		// the cursor on a fresh context, so cutting the process short here
-		// would lose the progress since the last periodic flush and replay it
-		// on the next boot.
-		if consumerDone != nil {
-			select {
-			case <-consumerDone:
-			case <-shutdownCtx.Done():
-				logger.Warn("jetstream consumer did not stop in time; its cursor may replay on restart")
+		case err := <-serverErrors:
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+				return fmt.Errorf("http server: %w", err)
 			}
+			return nil
+		case err, open := <-dnsErrors:
+			if !open {
+				// Closed without an error: ctx was cancelled and the
+				// ctx.Done case below runs the shutdown. A nil channel
+				// (DNS disabled) never reaches here.
+				dnsErrors = nil
+				continue
+			}
+			// DNS stopped on its own. Exit non-zero so the supervisor
+			// restarts the process instead of leaving HTTP healthy while
+			// handle TXT lookups go unanswered.
+			return fmt.Errorf("dns server: %w", err)
+		case <-ctx.Done():
+			logger.Info("shutdown signal received, draining connections")
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+			defer cancel()
+			if err := server.Shutdown(shutdownCtx); err != nil {
+				return fmt.Errorf("graceful shutdown: %w", err)
+			}
+			// Drain in-flight backfill. ctx is already cancelled, so async runs
+			// are unwinding (they stop pulling remote pages and leave
+			// last_backfill_at unset, which is resumable). Wait bounded so a stuck
+			// run can't hold shutdown open past the deadline.
+			drained := make(chan struct{})
+			go func() { backfill.Wait(); admin.Wait(); close(drained) }()
+			select {
+			case <-drained:
+			case <-shutdownCtx.Done():
+				logger.Warn("backfill/refresh-profile drain timed out; abandoning in-flight run (re-triggerable on restart)")
+			}
+			// Wait for the consumer's read loop to exit. Its shutdown path flushes
+			// the cursor on a fresh context, so cutting the process short here
+			// would lose the progress since the last periodic flush and replay it
+			// on the next boot.
+			if consumerDone != nil {
+				select {
+				case <-consumerDone:
+				case <-shutdownCtx.Done():
+					logger.Warn("jetstream consumer did not stop in time; its cursor may replay on restart")
+				}
+			}
+			// ListenAndServe has returned by now (Shutdown guarantees it);
+			// drain its error so a bind failure racing the signal still exits
+			// non-zero instead of being lost in the buffered channel.
+			if err := <-serverErrors; err != nil && !errors.Is(err, http.ErrServerClosed) {
+				return fmt.Errorf("http server: %w", err)
+			}
+			logger.Info("shutdown complete")
+			return nil
 		}
-		// ListenAndServe has returned by now (Shutdown guarantees it);
-		// drain its error so a bind failure racing the signal still exits
-		// non-zero instead of being lost in the buffered channel.
-		if err := <-serverErrors; err != nil && !errors.Is(err, http.ErrServerClosed) {
-			return fmt.Errorf("http server: %w", err)
-		}
-		logger.Info("shutdown complete")
-		return nil
 	}
 }
 
@@ -996,4 +1015,31 @@ func startConsumer(
 	}()
 	logger.Info("jetstream consumer started", "url", subscribeURL)
 	return done, engine, nil
+}
+
+// startDNSServer serves handle TXT lookups when DNS_LISTEN is set. The
+// returned channel carries ServeUDP's unexpected-stop error; it is nil when
+// DNS is disabled, so receiving from it in run's select blocks forever.
+func startDNSServer(ctx context.Context, cfg *config.Config, resolver identity.Resolver, logger *slog.Logger) (<-chan error, error) {
+	if cfg.DNSListen == "" {
+		return nil, nil
+	}
+	handler, err := dns.NewHandler(dns.Options{
+		ZoneRoot:    cfg.BridgeHostname,
+		Nameservers: cfg.DNSNameservers,
+		PublicIPv4:  cfg.DNSPublicIPv4,
+		PublicIPv6:  cfg.DNSPublicIPv6,
+		Serial:      uint32(time.Now().Unix()),
+		Resolver:    resolver,
+		Logger:      logger,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("dns server %s: %w", cfg.DNSListen, err)
+	}
+	serveErrors, err := dns.ServeUDP(ctx, cfg.DNSListen, handler)
+	if err != nil {
+		return nil, fmt.Errorf("dns server %s: %w", cfg.DNSListen, err)
+	}
+	logger.Info("dns server listening", "addr", cfg.DNSListen, "zone_root", cfg.BridgeHostname)
+	return serveErrors, nil
 }

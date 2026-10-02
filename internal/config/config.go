@@ -9,11 +9,14 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	miekgdns "github.com/miekg/dns"
 
 	"tidepool/internal/ingest"
 	"tidepool/internal/personas"
@@ -36,6 +39,10 @@ type Config struct {
 	// BridgeHostname is the public domain the bridge is served from,
 	// e.g. "tidepool.example". Used for WebFinger, actor IDs, and handles.
 	BridgeHostname string
+	DNSListen      string
+	DNSPublicIPv4  netip.Addr
+	DNSPublicIPv6  netip.Addr
+	DNSNameservers []string
 	// BridgeScheme is the URL scheme the bridge's own AP URLs (service
 	// actor id, inbox, activity ids, nodeinfo) are built with. BRIDGE_SCHEME,
 	// default "https". "http" is only accepted in development — it exists for
@@ -309,6 +316,40 @@ func Load(logger *slog.Logger) (*Config, error) {
 	cfg.BridgeHostname, err = stringVar(logger, isDevelopment, "BRIDGE_HOSTNAME", "localhost")
 	if err != nil {
 		return nil, err
+	}
+	cfg.DNSListen = os.Getenv("DNS_LISTEN")
+	if cfg.DNSListen != "" {
+		// The zone root and default nameservers derive from BRIDGE_HOSTNAME,
+		// so it must be a DNS name before anything is built from it.
+		root := strings.ToLower(strings.TrimSuffix(cfg.BridgeHostname, "."))
+		if err := validateDNSName("BRIDGE_HOSTNAME", root); err != nil {
+			return nil, err
+		}
+		ipv4 := os.Getenv("DNS_PUBLIC_IPV4")
+		cfg.DNSPublicIPv4, err = netip.ParseAddr(ipv4)
+		if err != nil || !cfg.DNSPublicIPv4.Is4() {
+			return nil, fmt.Errorf("config: DNS_PUBLIC_IPV4 must be an IPv4 literal, got %q", ipv4)
+		}
+		if ipv6 := os.Getenv("DNS_PUBLIC_IPV6"); ipv6 != "" {
+			cfg.DNSPublicIPv6, err = netip.ParseAddr(ipv6)
+			if err != nil || !cfg.DNSPublicIPv6.Is6() || cfg.DNSPublicIPv6.Is4In6() {
+				return nil, fmt.Errorf("config: DNS_PUBLIC_IPV6 must be an IPv6 literal, got %q", ipv6)
+			}
+		}
+		if nameservers := os.Getenv("DNS_NAMESERVERS"); nameservers != "" {
+			for _, nameserver := range strings.Split(nameservers, ",") {
+				nameserver = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(nameserver)), ".")
+				if nameserver == "" {
+					return nil, fmt.Errorf("config: DNS_NAMESERVERS must not contain an empty entry")
+				}
+				if err := validateDNSName("DNS_NAMESERVERS", nameserver); err != nil {
+					return nil, err
+				}
+				cfg.DNSNameservers = append(cfg.DNSNameservers, nameserver)
+			}
+		} else {
+			cfg.DNSNameservers = []string{"ns1." + root, "ns2." + root}
+		}
 	}
 	cfg.PLCDirectoryURL, err = stringVar(logger, isDevelopment, "PLC_DIRECTORY_URL", "http://localhost:3002")
 	if err != nil {
@@ -856,6 +897,25 @@ func canonicalBridgeHost(raw string) string {
 // stringVar returns the value of an environment variable. When unset it
 // falls back to the logged dev default in development and errors in
 // production.
+// validateDNSName rejects a name the DNS server could not put on the wire:
+// miekg packs an invalid name as "bad rdata" and the answer is never sent.
+// A port (BRIDGE_HOSTNAME "tdpl.io:443") is rejected explicitly because
+// IsDomainName treats ':' as an ordinary label byte.
+func validateDNSName(variable, name string) error {
+	if strings.Contains(name, ":") {
+		return fmt.Errorf("config: %s must be a domain name without a port, got %q", variable, name)
+	}
+	if _, ok := miekgdns.IsDomainName(name); !ok {
+		return fmt.Errorf("config: %s must be a valid domain name, got %q", variable, name)
+	}
+	for _, label := range strings.Split(name, ".") {
+		if label == "" || len(label) > 63 {
+			return fmt.Errorf("config: %s labels must be 1 to 63 bytes, got %q", variable, name)
+		}
+	}
+	return nil
+}
+
 func stringVar(logger *slog.Logger, isDevelopment bool, name, devDefault string) (string, error) {
 	if value := os.Getenv(name); value != "" {
 		return value, nil

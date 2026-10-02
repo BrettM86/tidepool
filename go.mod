@@ -12,6 +12,7 @@ require (
 	github.com/ipfs/go-ipld-format v0.6.0
 	github.com/ipld/go-car v0.6.1-0.20230509095817-92d28eb23ba4
 	github.com/lib/pq v1.12.3
+	github.com/miekg/dns v1.1.68
 	github.com/multiformats/go-multihash v0.2.3
 	github.com/pressly/goose/v3 v3.27.2
 	github.com/rivo/uniseg v0.4.7
@@ -89,7 +90,9 @@ require (
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.26.0 // indirect
 	golang.org/x/crypto v0.52.0 // indirect
+	golang.org/x/mod v0.24.0 // indirect
 	golang.org/x/sys v0.45.0 // indirect
+	golang.org/x/tools v0.33.0 // indirect
 	golang.org/x/xerrors v0.0.0-20231012003039-104605ab7028 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	gorm.io/gorm v1.25.9 // indirect

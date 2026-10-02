@@ -7,9 +7,11 @@ import (
 	"encoding/hex"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bluesky-social/indigo/atproto/atcrypto"
 	"github.com/stretchr/testify/assert"
@@ -94,6 +96,76 @@ func TestRunMigrationsRequiresDatabaseURL(t *testing.T) {
 	err := runMigrations(testLogger())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "DATABASE_URL is required")
+}
+
+func TestRunDNSBindFailurePrecedesHTTP(t *testing.T) {
+	database := testutil.DB(t)
+	testutil.Truncate(t, database, "service_keys", "bridged_actors", "ap_actors", "inbox_events", "communities")
+	databaseURL := os.Getenv("TIDEPOOL_TEST_DATABASE_URL")
+
+	for _, tc := range []struct {
+		name       string
+		dnsEnabled bool
+	}{
+		{name: "occupied DNS port fails startup first", dnsEnabled: true},
+		{name: "disabled DNS reaches occupied HTTP port"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			httpListener, err := net.Listen("tcp", "127.0.0.1:0")
+			require.NoError(t, err)
+			defer httpListener.Close()
+			httpAddress := httpListener.Addr().String()
+			_, httpPort, err := net.SplitHostPort(httpAddress)
+			require.NoError(t, err)
+
+			var dnsSocket net.PacketConn
+			for {
+				dnsSocket, err = net.ListenPacket("udp", "127.0.0.1:0")
+				require.NoError(t, err)
+				_, dnsPort, err := net.SplitHostPort(dnsSocket.LocalAddr().String())
+				require.NoError(t, err)
+				if dnsPort != httpPort {
+					break
+				}
+				require.NoError(t, dnsSocket.Close())
+			}
+			defer dnsSocket.Close()
+			dnsAddress := dnsSocket.LocalAddr().String()
+
+			t.Setenv("ENVIRONMENT", "development")
+			t.Setenv("DATABASE_URL", databaseURL)
+			t.Setenv("LISTEN_ADDR", httpAddress)
+			t.Setenv("DNS_LISTEN", "")
+			if tc.dnsEnabled {
+				t.Setenv("DNS_LISTEN", dnsAddress)
+			}
+			t.Setenv("DNS_PUBLIC_IPV4", "127.0.0.1")
+			t.Setenv("DNS_PUBLIC_IPV6", "")
+			t.Setenv("DNS_NAMESERVERS", "")
+			t.Setenv("BRIDGE_HOSTNAME", "tdpl.example")
+			t.Setenv("BRIDGE_KEK", rotateTestKEK)
+			t.Setenv("BRIDGE_KEK_PREVIOUS", "")
+			t.Setenv("RELAY_HOSTS", "")
+			t.Setenv("CONSUMER_ENABLED", "")
+			t.Setenv("FOLLOW_LIST_PATH", "")
+			t.Setenv("AP_USER_ORIGIN", "http://127.0.0.1:8091")
+
+			result := make(chan error, 1)
+			go func() { result <- run(testLogger()) }()
+			select {
+			case err := <-result:
+				require.Error(t, err)
+				if tc.dnsEnabled {
+					require.Contains(t, err.Error(), dnsAddress, "the occupied DNS socket must fail before HTTP starts")
+					require.NotContains(t, err.Error(), httpAddress)
+				} else {
+					require.Contains(t, err.Error(), httpAddress, "with DNS disabled, HTTP must reach its occupied socket")
+				}
+			case <-time.After(60 * time.Second):
+				t.Fatal("run did not return its bind failure within 60 seconds")
+			}
+		})
+	}
 }
 
 // The rotate-kek subcommand.

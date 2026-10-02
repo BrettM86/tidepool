@@ -3,6 +3,9 @@ package config
 import (
 	"io"
 	"log/slog"
+	"net/netip"
+	"os"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -17,6 +20,7 @@ func clearConfigEnv(t *testing.T) {
 	t.Helper()
 	for _, name := range []string{
 		"ENVIRONMENT", "DATABASE_URL", "LISTEN_ADDR", "BRIDGE_HOSTNAME",
+		"DNS_LISTEN", "DNS_PUBLIC_IPV4", "DNS_PUBLIC_IPV6", "DNS_NAMESERVERS",
 		"PLC_DIRECTORY_URL", "BRIDGE_SERVICE_DID", "USER_AGENT", "BRIDGE_KEK",
 		"BRIDGE_KEK_PREVIOUS",
 		"ADMIN_TOKEN", "BACKFILL_MAX_POSTS", "MINT_RATE_PER_MINUTE",
@@ -30,6 +34,129 @@ func clearConfigEnv(t *testing.T) {
 	} {
 		t.Setenv(name, "")
 	}
+}
+
+func TestLoad_DNSDisabledWithoutPublicAddresses(t *testing.T) {
+	for _, environment := range []string{EnvironmentDevelopment, EnvironmentProduction} {
+		for _, listen := range []string{"unset", "empty"} {
+			t.Run(environment+"/"+listen, func(t *testing.T) {
+				if environment == EnvironmentProduction {
+					setProductionEnv(t)
+				} else {
+					clearConfigEnv(t)
+				}
+				if listen == "unset" {
+					require.NoError(t, os.Unsetenv("DNS_LISTEN"))
+				}
+				for _, name := range []string{"DNS_PUBLIC_IPV4", "DNS_PUBLIC_IPV6", "DNS_NAMESERVERS"} {
+					require.NoError(t, os.Unsetenv(name))
+				}
+
+				cfg, err := Load(discardLogger())
+				require.NoError(t, err)
+				require.Empty(t, cfg.DNSListen)
+			})
+		}
+	}
+}
+
+func TestLoad_DNSEnabledConfiguration(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		ipv4            string
+		ipv6            string
+		nameservers     string
+		wantError       string
+		wantNameservers []string
+		wantIPv6        netip.Addr
+	}{
+		{name: "missing IPv4", wantError: "DNS_PUBLIC_IPV4"},
+		{name: "invalid IPv4", ipv4: "not-an-ip", wantError: "DNS_PUBLIC_IPV4"},
+		{name: "IPv6 in IPv4", ipv4: "2001:db8::1", wantError: "DNS_PUBLIC_IPV4"},
+		{name: "IPv4 in IPv6", ipv4: "192.0.2.1", ipv6: "192.0.2.1", wantError: "DNS_PUBLIC_IPV6"},
+		{name: "invalid IPv6", ipv4: "192.0.2.1", ipv6: "garbage", wantError: "DNS_PUBLIC_IPV6"},
+		{name: "empty nameserver entry", ipv4: "192.0.2.1", nameservers: "ns1.example,,ns2.example", wantError: "DNS_NAMESERVERS"},
+		{name: "default nameservers and no IPv6", ipv4: "192.0.2.1", wantNameservers: []string{"ns1.tdpl.example", "ns2.tdpl.example"}},
+		{name: "canonical nameservers and IPv6", ipv4: "192.0.2.1", ipv6: "2001:db8::1", nameservers: " NS-A.example. , ns-b.example ",
+			wantNameservers: []string{"ns-a.example", "ns-b.example"}, wantIPv6: netip.MustParseAddr("2001:db8::1")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearConfigEnv(t)
+			t.Setenv("BRIDGE_HOSTNAME", "tdpl.example")
+			t.Setenv("DNS_LISTEN", "127.0.0.1:5353")
+			t.Setenv("DNS_PUBLIC_IPV4", tc.ipv4)
+			t.Setenv("DNS_PUBLIC_IPV6", tc.ipv6)
+			t.Setenv("DNS_NAMESERVERS", tc.nameservers)
+			if tc.name == "default nameservers and no IPv6" {
+				require.NoError(t, os.Unsetenv("DNS_NAMESERVERS"))
+				require.NoError(t, os.Unsetenv("DNS_PUBLIC_IPV6"))
+			}
+
+			cfg, err := Load(discardLogger())
+			if tc.wantError != "" {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tc.wantError)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, "127.0.0.1:5353", cfg.DNSListen)
+			require.Equal(t, netip.MustParseAddr("192.0.2.1"), cfg.DNSPublicIPv4)
+			require.Equal(t, tc.wantIPv6, cfg.DNSPublicIPv6)
+			require.Equal(t, tc.wantNameservers, cfg.DNSNameservers)
+		})
+	}
+}
+
+func TestLoad_DNSRejectsInvalidDomainNames(t *testing.T) {
+	longLabel := strings.Repeat("a", 64)
+	for _, tc := range []struct {
+		name           string
+		bridgeHostname string
+		nameservers    string
+		wantError      string
+	}{
+		{name: "nameserver with empty label", bridgeHostname: "tdpl.example", nameservers: "ns1..example", wantError: "DNS_NAMESERVERS"},
+		{name: "nameserver with 64-byte label", bridgeHostname: "tdpl.example", nameservers: "ns1.example," + longLabel + ".example", wantError: "DNS_NAMESERVERS"},
+		{name: "nameserver with port", bridgeHostname: "tdpl.example", nameservers: "ns1.example:53", wantError: "DNS_NAMESERVERS"},
+		{name: "bridge hostname with port", bridgeHostname: "tdpl.io:443", wantError: "BRIDGE_HOSTNAME"},
+		{name: "bridge hostname with port and explicit nameservers", bridgeHostname: "tdpl.io:443", nameservers: "ns1.example", wantError: "BRIDGE_HOSTNAME"},
+		{name: "bridge hostname with empty label", bridgeHostname: "tdpl..example", wantError: "BRIDGE_HOSTNAME"},
+		{name: "bridge hostname with 64-byte label", bridgeHostname: longLabel + ".example", wantError: "BRIDGE_HOSTNAME"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearConfigEnv(t)
+			t.Setenv("BRIDGE_HOSTNAME", tc.bridgeHostname)
+			t.Setenv("DNS_LISTEN", "127.0.0.1:5300")
+			t.Setenv("DNS_PUBLIC_IPV4", "192.0.2.1")
+			t.Setenv("DNS_NAMESERVERS", tc.nameservers)
+
+			_, err := Load(discardLogger())
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tc.wantError)
+		})
+	}
+}
+
+func TestLoad_DNSAcceptsSingleLabelZoneRoot(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("BRIDGE_HOSTNAME", "localhost")
+	t.Setenv("DNS_LISTEN", "127.0.0.1:5300")
+	t.Setenv("DNS_PUBLIC_IPV4", "127.0.0.1")
+
+	cfg, err := Load(discardLogger())
+	require.NoError(t, err)
+	require.Equal(t, []string{"ns1.localhost", "ns2.localhost"}, cfg.DNSNameservers)
+}
+
+func TestLoad_BridgeHostnameWithPortLoadsWhenDNSDisabled(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("BRIDGE_HOSTNAME", "tdpl.io:443")
+
+	cfg, err := Load(discardLogger())
+	require.NoError(t, err)
+	require.Equal(t, "tdpl.io:443", cfg.BridgeHostname)
+	require.Empty(t, cfg.DNSListen)
+	require.Empty(t, cfg.DNSNameservers)
 }
 
 // setProductionEnv sets every variable production requires, so a test about

@@ -21,12 +21,13 @@ import (
 const handleLookupTimeout = 2 * time.Second
 
 const (
-	zoneRecordTTL = 3600
-	soaMinimumTTL = 300
-	soaRefresh    = 3600
-	soaRetry      = 600
-	soaExpire     = 1209600
-	handleTXTTTL  = 300
+	zoneRecordTTL    = 3600
+	soaMinimumTTL    = 300
+	soaRefresh       = 3600
+	soaRetry         = 600
+	soaExpire        = 1209600
+	handleTXTTTL     = 300
+	addressRecordTTL = 300
 )
 
 // maxConcurrentHandleLookups bounds how many DNS queries may run a handle
@@ -64,6 +65,8 @@ type Options struct {
 type Handler struct {
 	zoneRoot    string
 	nameservers []string
+	publicIPv4  netip.Addr
+	publicIPv6  netip.Addr
 	serial      uint32
 	resolver    identity.Resolver
 	logger      *slog.Logger
@@ -107,6 +110,8 @@ func NewHandler(options Options) (*Handler, error) {
 	return &Handler{
 		zoneRoot:    zoneRoot,
 		nameservers: nameservers,
+		publicIPv4:  options.PublicIPv4,
+		publicIPv6:  options.PublicIPv6,
 		serial:      options.Serial,
 		resolver:    options.Resolver,
 		logger:      logger,
@@ -131,8 +136,9 @@ func normalizeDomainName(name string) (string, error) {
 	return normalized, nil
 }
 
-// ServeDNS answers handle TXT and label-apex SOA/NS queries, returning NODATA
-// for other in-zone questions.
+// ServeDNS answers handle TXT, label-apex SOA/NS, and label-apex and handle
+// A/AAAA queries. It refuses zone transfers and returns NODATA for other
+// in-zone questions.
 func (h *Handler) ServeDNS(writer miekgdns.ResponseWriter, request *miekgdns.Msg) {
 	response := new(miekgdns.Msg)
 	response.SetReply(request)
@@ -159,9 +165,15 @@ func (h *Handler) ServeDNS(writer miekgdns.ResponseWriter, request *miekgdns.Msg
 	nameLabels := miekgdns.SplitDomainName(name)
 	labels := nameLabels[:len(nameLabels)-miekgdns.CountLabel(h.zoneRoot)]
 	apex := labels[len(labels)-1] + "." + h.zoneRoot
+
+	// Zone transfers are not supported for handle subzones.
+	if question.Qtype == miekgdns.TypeAXFR || question.Qtype == miekgdns.TypeIXFR {
+		response.Rcode = miekgdns.RcodeRefused
+		h.writeResponse(writer, response)
+		return
+	}
 	response.Authoritative = true
 
-	// Task 03: refuse in-zone AXFR and IXFR here.
 	if question.Qtype == miekgdns.TypeTXT && len(labels) == 3 && labels[0] == "_atproto" {
 		handle := labels[1] + "." + labels[2] + "." + strings.TrimSuffix(h.zoneRoot, ".")
 		select {
@@ -209,7 +221,27 @@ func (h *Handler) ServeDNS(writer miekgdns.ResponseWriter, request *miekgdns.Msg
 			return
 		}
 	}
-	// Task 03: answer A and AAAA queries here.
+	// Address answers belong to the question name, including unknown handles.
+	if len(labels) == 1 || len(labels) == 2 {
+		switch question.Qtype {
+		case miekgdns.TypeA:
+			response.Answer = []miekgdns.RR{&miekgdns.A{
+				Hdr: miekgdns.RR_Header{Name: question.Name, Rrtype: miekgdns.TypeA, Class: miekgdns.ClassINET, Ttl: addressRecordTTL},
+				A:   net.IP(h.publicIPv4.AsSlice()),
+			}}
+			h.writeResponse(writer, response)
+			return
+		case miekgdns.TypeAAAA:
+			if h.publicIPv6.IsValid() {
+				response.Answer = []miekgdns.RR{&miekgdns.AAAA{
+					Hdr:  miekgdns.RR_Header{Name: question.Name, Rrtype: miekgdns.TypeAAAA, Class: miekgdns.ClassINET, Ttl: addressRecordTTL},
+					AAAA: net.IP(h.publicIPv6.AsSlice()),
+				}}
+				h.writeResponse(writer, response)
+				return
+			}
+		}
+	}
 	h.addSOA(response, apex)
 	h.writeResponse(writer, response)
 }

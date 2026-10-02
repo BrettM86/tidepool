@@ -67,6 +67,11 @@ func envOr(name, fallback string) string {
 func tidepoolURL() string { return envOr("TIDEPOOL_E2E_URL", "http://localhost:8092") }
 func lemmyURL() string    { return envOr("LEMMY_E2E_URL", "http://localhost:8541") }
 func relayURL() string    { return envOr("RELAY_E2E_URL", "http://localhost:2480") }
+func dnsAddress() string  { return "127.0.0.1:" + envOr("TIDEPOOL_E2E_DNS_PORT", "5380") }
+
+// dnsPublicIPv4 is the A answer the e2e Tidepool serves. It must match
+// DNS_PUBLIC_IPV4 on the tidepool service in docker-compose.e2e.yml.
+func dnsPublicIPv4() string { return "192.0.2.80" }
 func jetstreamURL() string {
 	return envOr("JETSTREAM_E2E_URL", "ws://localhost:6028")
 }

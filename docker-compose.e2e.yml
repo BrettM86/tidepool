@@ -80,6 +80,7 @@
 # ALLOW_PRIVATE_FETCH=1, so it must not be reachable from the local
 # network; offset from the dev stack AND the Coves dev relay so all can run):
 #   127.0.0.1:8092  Tidepool HTTP (admin API, XRPC, healthz)
+#   127.0.0.1:5380  Tidepool DNS (UDP and TCP; TIDEPOOL_E2E_DNS_PORT overrides)
 #   127.0.0.1:8541  Lemmy HTTP API (8541 nods to lemmy_alpha in upstream's federation compose)
 #   127.0.0.1:2480  Relay (BigSky) XRPC + admin API
 #   127.0.0.1:3081  Reference PDS XRPC — PUBLISHED ON THE `relay` SERVICE (the
@@ -137,6 +138,9 @@ services:
       DATABASE_URL: postgres://tidepool:tidepool@tidepool-postgres:5432/tidepool?sslmode=disable
       LISTEN_ADDR: ":80"
       BRIDGE_HOSTNAME: tidepool
+      # Serve bridged handles on an unprivileged port; publish DNS on host loopback.
+      DNS_LISTEN: ":5300"
+      DNS_PUBLIC_IPV4: "192.0.2.80"
       # Plain-HTTP AP ids so a debug-mode Lemmy can fetch/deliver to us.
       BRIDGE_SCHEME: http
       # The compose network is private address space; the SSRF guard must let
@@ -200,6 +204,8 @@ services:
       - handle-tls-ca:/handle-tls-ca:ro
     ports:
       - "127.0.0.1:${TIDEPOOL_E2E_PORT:-8092}:80"
+      - "127.0.0.1:${TIDEPOOL_E2E_DNS_PORT:-5380}:5300/udp"
+      - "127.0.0.1:${TIDEPOOL_E2E_DNS_PORT:-5380}:5300/tcp"
     # Handle verification's DNS half (_atproto.{handle} TXT) must not leave
     # the stack. On a user-defined network the container's resolver stays
     # Docker's embedded DNS (127.0.0.11), which keeps answering compose

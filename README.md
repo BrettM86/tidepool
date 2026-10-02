@@ -20,7 +20,8 @@ make test        # start the test postgres (localhost:5443) and run the suite
 
 To try DNS locally, pass the DNS variables to `make run` (the dev Compose file
 has no Tidepool service). DNS listens on UDP and TCP at the same address and
-answers SOA and NS at each label apex. Use a free port; 5353 is mDNS and
+answers handle TXT, SOA/NS at each label apex, and A/AAAA at label apexes and
+handle names. Zone transfers are refused. Use a free port; 5353 is mDNS and
 usually taken. The dev zone root is `localhost`:
 
 ```sh
@@ -128,8 +129,9 @@ real Jetstream decoding the **relay's** firehose — in one compose network:
  │                                                       │ (JSON)      │ │
  │                                                       └───────┬─────┘ │
  └───────────────────────────────────────────────────────────────┼───────┘
-      host (127.0.0.1 only): tidepool :8092, lemmy :8541,        │
-                  relay :2480, pds :3081, jetstream :6028 ◀──────┘
+       host (127.0.0.1 only): tidepool :8092, DNS :5380 UDP/TCP, │
+             lemmy :8541, relay :2480, pds :3081,               │
+             jetstream :6028 ◀───────────────────────────────────┘
                     tests/e2e (go test -tags e2e)
 ```
 
@@ -190,7 +192,8 @@ proves the rule: they sat in the community's repo with no separate
 attestation, so there was no cross-repo pair to reorder — those records still
 exist and are not migrated.
 
-The host ports bind **loopback-only** (`127.0.0.1:8092/8541/2480/3081/6028`):
+The host ports bind **loopback-only** (`127.0.0.1:8092/5380/8541/2480/3081/6028`;
+DNS uses UDP and TCP and `TIDEPOOL_E2E_DNS_PORT` overrides 5380):
 the stack carries admin tokens and runs with `ALLOW_PRIVATE_FETCH=1`, so it
 must not be reachable from the local network.
 
@@ -316,9 +319,9 @@ Two classes, and the difference matters at boot:
 | `DATABASE_URL` | local dev postgres | bridge state |
 | `LISTEN_ADDR` | `:8091` | HTTP bind address |
 | `BRIDGE_HOSTNAME` | `localhost` | public domain of the bridge; anchors handles and the PDS endpoint in minted DID docs |
-| `DNS_LISTEN` | *(empty; disabled)* | UDP and TCP listen address (e.g. `:53`); empty disables the DNS server; answers SOA and NS at each label apex |
-| `DNS_PUBLIC_IPV4` | *(unset)* | public IPv4 address; required when `DNS_LISTEN` is set |
-| `DNS_PUBLIC_IPV6` | *(unset)* | optional public IPv6 address when DNS is enabled |
+| `DNS_LISTEN` | *(empty; disabled)* | UDP and TCP listen address (e.g. `:53`); empty disables DNS; answers handle TXT, SOA/NS at each label apex, and A/AAAA at label apexes and handle names; zone transfers are refused |
+| `DNS_PUBLIC_IPV4` | *(unset)* | IPv4 address returned in A answers; required when `DNS_LISTEN` is set |
+| `DNS_PUBLIC_IPV6` | *(unset)* | optional IPv6 address returned in AAAA answers when DNS is enabled |
 | `DNS_NAMESERVERS` | `ns1`/`ns2` under `BRIDGE_HOSTNAME` when DNS is enabled | comma-separated nameserver hostnames returned in apex NS answers (first is the SOA primary) |
 | `BRIDGE_SCHEME` | `https` | scheme of the bridge's own AP URLs (actor id, inbox, activity ids). `http` is dev-only — the e2e harness federates with a debug-mode Lemmy over plain HTTP |
 | `PLC_DIRECTORY_URL` | `http://localhost:3002` (local, `make plc-up`) | did:plc directory; production uses `https://plc.directory` |

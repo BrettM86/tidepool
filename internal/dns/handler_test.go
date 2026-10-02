@@ -360,6 +360,91 @@ func TestHandlerApexSOAAndNS(t *testing.T) {
 	}
 }
 
+func TestHandlerAddressAnswersAndTransferRefusal(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		question     string
+		questionType uint16
+		publicIPv6   bool
+		wantAddress  string
+		wantSOA      bool
+		wantRefused  bool
+	}{
+		{name: "B1 A label apex", question: "lemmy-world.tdpl.example.", questionType: miekgdns.TypeA, wantAddress: "192.0.2.10"},
+		{name: "B1 A known handle", question: "alice.lemmy-world.tdpl.example.", questionType: miekgdns.TypeA, wantAddress: "192.0.2.10"},
+		{name: "B1 A unknown handle", question: "nobody.lemmy-world.tdpl.example.", questionType: miekgdns.TypeA, wantAddress: "192.0.2.10"},
+		{name: "B1 A atproto name is NODATA", question: "_atproto.alice.lemmy-world.tdpl.example.", questionType: miekgdns.TypeA, wantSOA: true},
+		{name: "B1 A four labels is NODATA", question: "x.y.alice.lemmy-world.tdpl.example.", questionType: miekgdns.TypeA, wantSOA: true},
+		{name: "B2 AAAA label apex", question: "lemmy-world.tdpl.example.", questionType: miekgdns.TypeAAAA, publicIPv6: true, wantAddress: "2001:db8::10"},
+		{name: "B2 AAAA handle", question: "alice.lemmy-world.tdpl.example.", questionType: miekgdns.TypeAAAA, publicIPv6: true, wantAddress: "2001:db8::10"},
+		{name: "B2 AAAA atproto name is NODATA", question: "_atproto.alice.lemmy-world.tdpl.example.", questionType: miekgdns.TypeAAAA, publicIPv6: true, wantSOA: true},
+		{name: "B2 AAAA four labels is NODATA", question: "x.y.alice.lemmy-world.tdpl.example.", questionType: miekgdns.TypeAAAA, publicIPv6: true, wantSOA: true},
+		{name: "B2 AAAA label apex without IPv6 is NODATA", question: "lemmy-world.tdpl.example.", questionType: miekgdns.TypeAAAA, wantSOA: true},
+		{name: "B2 AAAA handle without IPv6 is NODATA", question: "alice.lemmy-world.tdpl.example.", questionType: miekgdns.TypeAAAA, wantSOA: true},
+		{name: "B3 AXFR label apex refused", question: "lemmy-world.tdpl.example.", questionType: miekgdns.TypeAXFR, wantRefused: true},
+		{name: "B3 IXFR label apex refused", question: "lemmy-world.tdpl.example.", questionType: miekgdns.TypeIXFR, wantRefused: true},
+		{name: "B3 AXFR handle refused", question: "alice.lemmy-world.tdpl.example.", questionType: miekgdns.TypeAXFR, wantRefused: true},
+		{name: "B3 IXFR handle refused", question: "alice.lemmy-world.tdpl.example.", questionType: miekgdns.TypeIXFR, wantRefused: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resolver := &recordingResolver{handles: map[string]string{"alice.lemmy-world.tdpl.example": "did:plc:alice"}}
+			options := handlerOptions(resolver)
+			options.PublicIPv4 = netip.MustParseAddr("192.0.2.10")
+			if tc.publicIPv6 {
+				options.PublicIPv6 = netip.MustParseAddr("2001:db8::10")
+			}
+			handler, err := NewHandler(options)
+			require.NoError(t, err)
+
+			request := new(miekgdns.Msg)
+			request.SetQuestion(tc.question, tc.questionType)
+			writer := &recordingDNSWriter{}
+			handler.ServeDNS(writer, request)
+			require.NotNil(t, writer.response, "no response written")
+			response := writer.response
+			require.Empty(t, resolver.asked, "address and transfer queries must not resolve handles")
+			require.Empty(t, response.Extra)
+			if tc.wantRefused {
+				require.Equal(t, miekgdns.RcodeRefused, response.Rcode)
+				require.Empty(t, response.Answer)
+				require.Empty(t, response.Ns)
+				return
+			}
+
+			require.Equal(t, miekgdns.RcodeSuccess, response.Rcode)
+			require.True(t, response.Authoritative)
+			if tc.wantSOA {
+				require.Empty(t, response.Answer)
+				require.Len(t, response.Ns, 1)
+				soa, ok := response.Ns[0].(*miekgdns.SOA)
+				require.True(t, ok, "authority must be SOA, got %T", response.Ns[0])
+				require.Equal(t, "lemmy-world.tdpl.example.", soa.Hdr.Name)
+				require.Equal(t, uint16(miekgdns.TypeSOA), soa.Hdr.Rrtype)
+				return
+			}
+
+			require.Empty(t, response.Ns)
+			require.Len(t, response.Answer, 1)
+			switch tc.questionType {
+			case miekgdns.TypeA:
+				record, ok := response.Answer[0].(*miekgdns.A)
+				require.True(t, ok, "answer must be A, got %T", response.Answer[0])
+				require.Equal(t, tc.question, record.Hdr.Name)
+				require.Equal(t, uint16(miekgdns.ClassINET), record.Hdr.Class)
+				require.Equal(t, uint32(300), record.Hdr.Ttl)
+				require.Equal(t, tc.wantAddress, record.A.String())
+			case miekgdns.TypeAAAA:
+				record, ok := response.Answer[0].(*miekgdns.AAAA)
+				require.True(t, ok, "answer must be AAAA, got %T", response.Answer[0])
+				require.Equal(t, tc.question, record.Hdr.Name)
+				require.Equal(t, uint16(miekgdns.ClassINET), record.Hdr.Class)
+				require.Equal(t, uint32(300), record.Hdr.Ttl)
+				require.Equal(t, tc.wantAddress, record.AAAA.String())
+			}
+		})
+	}
+}
+
 type failingDNSWriter struct {
 	recordingDNSWriter
 	writeErrors []error

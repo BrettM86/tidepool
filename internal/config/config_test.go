@@ -21,7 +21,7 @@ func clearConfigEnv(t *testing.T) {
 	for _, name := range []string{
 		"ENVIRONMENT", "DATABASE_URL", "LISTEN_ADDR", "BRIDGE_HOSTNAME",
 		"DNS_LISTEN", "DNS_PUBLIC_IPV4", "DNS_PUBLIC_IPV6", "DNS_NAMESERVERS",
-		"CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ZONE_ID",
+		"CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ZONE_ID", "DELEGATION_MAX_NS_RECORDS",
 		"PLC_DIRECTORY_URL", "BRIDGE_SERVICE_DID", "USER_AGENT", "BRIDGE_KEK",
 		"BRIDGE_KEK_PREVIOUS",
 		"ADMIN_TOKEN", "BACKFILL_MAX_POSTS", "MINT_RATE_PER_MINUTE",
@@ -155,17 +155,29 @@ func TestLoad_CloudflareDelegationConfiguration(t *testing.T) {
 		token      string
 		zoneID     string
 		dnsEnabled bool
+		maxRecords string
+		unsetMax   bool
+		wantMax    int
 		wantErrors []string
 	}{
-		{name: "token unset disables delegation"},
-		{name: "token requires zone ID", token: "cf-config-token", dnsEnabled: true, wantErrors: []string{"CLOUDFLARE_ZONE_ID"}},
-		{name: "token requires DNS listener", token: "cf-config-token", zoneID: "zone-config", wantErrors: []string{"CLOUDFLARE_API_TOKEN", "DNS_LISTEN"}},
-		{name: "enabled values are carried", token: "cf-config-token", zoneID: "zone-config", dnsEnabled: true},
+		{name: "token unset disables delegation", unsetMax: true},
+		{name: "token requires zone ID", token: "cf-config-token", dnsEnabled: true, maxRecords: "3000", wantErrors: []string{"CLOUDFLARE_ZONE_ID"}},
+		{name: "token requires DNS listener", token: "cf-config-token", zoneID: "zone-config", maxRecords: "3000", wantErrors: []string{"CLOUDFLARE_API_TOKEN", "DNS_LISTEN"}},
+		{name: "enabled values are carried", token: "cf-config-token", zoneID: "zone-config", dnsEnabled: true, maxRecords: "3000", wantMax: 3000},
+		{name: "enabled ceiling unset", token: "cf-config-token", zoneID: "zone-config", dnsEnabled: true, unsetMax: true, wantErrors: []string{"DELEGATION_MAX_NS_RECORDS"}},
+		{name: "enabled ceiling empty", token: "cf-config-token", zoneID: "zone-config", dnsEnabled: true, wantErrors: []string{"DELEGATION_MAX_NS_RECORDS"}},
+		{name: "enabled ceiling nonnumeric", token: "cf-config-token", zoneID: "zone-config", dnsEnabled: true, maxRecords: "abc", wantErrors: []string{"DELEGATION_MAX_NS_RECORDS"}},
+		{name: "enabled ceiling zero", token: "cf-config-token", zoneID: "zone-config", dnsEnabled: true, maxRecords: "0", wantErrors: []string{"DELEGATION_MAX_NS_RECORDS"}},
+		{name: "enabled ceiling negative", token: "cf-config-token", zoneID: "zone-config", dnsEnabled: true, maxRecords: "-5", wantErrors: []string{"DELEGATION_MAX_NS_RECORDS"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			clearConfigEnv(t)
 			t.Setenv("CLOUDFLARE_API_TOKEN", tc.token)
 			t.Setenv("CLOUDFLARE_ZONE_ID", tc.zoneID)
+			t.Setenv("DELEGATION_MAX_NS_RECORDS", tc.maxRecords)
+			if tc.unsetMax {
+				require.NoError(t, os.Unsetenv("DELEGATION_MAX_NS_RECORDS"))
+			}
 			if tc.dnsEnabled {
 				t.Setenv("BRIDGE_HOSTNAME", "localhost")
 				t.Setenv("DNS_LISTEN", "127.0.0.1:5300")
@@ -183,6 +195,9 @@ func TestLoad_CloudflareDelegationConfiguration(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, tc.token, cfg.CloudflareAPIToken)
 			assert.Equal(t, tc.zoneID, cfg.CloudflareZoneID)
+			if tc.wantMax != 0 {
+				assert.Equal(t, tc.wantMax, cfg.DelegationMaxNSRecords)
+			}
 		})
 	}
 }

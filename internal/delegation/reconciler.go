@@ -21,6 +21,9 @@ type LabelSource interface {
 const (
 	minimumStandingAge            = time.Hour
 	contributionCandidatePageSize = 100
+	maximumCreatesPerHour         = 20
+	budgetWindow                  = time.Hour
+	ceilingWarningPercent         = 80
 )
 
 var grandfatherCutoff = time.Date(2026, 10, 3, 0, 0, 0, 0, time.UTC)
@@ -46,10 +49,15 @@ type Options struct {
 	Contributions ContributionSource
 	Acceptances   AcceptanceChecker
 	Now           func() time.Time
+	MaxNSRecords  int
 }
 
+// ErrCeilingReached reports that the NS record ceiling stopped a pass with qualifying labels left.
+var ErrCeilingReached = errors.New("delegation NS record ceiling reached")
+
 // Reconciler compares bridged instance labels with Cloudflare NS records and
-// creates missing delegations without modifying existing records.
+// creates missing delegations without modifying existing records, within an
+// NS record ceiling and an hourly create budget counted across the whole zone.
 type Reconciler struct {
 	client        *CloudflareClient
 	labels        LabelSource
@@ -59,6 +67,7 @@ type Reconciler struct {
 	zoneRoot      string
 	nameservers   []string
 	logger        *slog.Logger
+	maxNSRecords  int
 }
 
 func normalizeDNSName(name string) string {
@@ -69,6 +78,9 @@ func normalizeDNSName(name string) string {
 func NewReconciler(options Options) (*Reconciler, error) {
 	if options.Client == nil || options.Labels == nil || options.Contributions == nil || options.Acceptances == nil || normalizeDNSName(options.ZoneRoot) == "" || len(options.Nameservers) == 0 {
 		return nil, fmt.Errorf("delegation client, label source, contribution source, acceptance checker, zone root and nameservers are required")
+	}
+	if options.MaxNSRecords <= 0 {
+		return nil, fmt.Errorf("delegation MaxNSRecords must be positive")
 	}
 	nameservers := make([]string, len(options.Nameservers))
 	for index, nameserver := range options.Nameservers {
@@ -88,7 +100,7 @@ func NewReconciler(options Options) (*Reconciler, error) {
 	return &Reconciler{
 		client: options.Client, labels: options.Labels, zoneRoot: normalizeDNSName(options.ZoneRoot),
 		contributions: options.Contributions, acceptances: options.Acceptances, now: now,
-		nameservers: nameservers, logger: logger,
+		nameservers: nameservers, logger: logger, maxNSRecords: options.MaxNSRecords,
 	}, nil
 }
 
@@ -109,6 +121,14 @@ type Result struct {
 	DelegatedWithoutLiveActors []string
 	// Pending contains live labels without a standing contribution or outright qualification.
 	Pending []string
+	// Deferred contains qualifying labels left for a later pass by the ceiling or the hourly budget.
+	Deferred []string
+	// DelegatedRecords counts configured-nameserver NS records at any name in
+	// the zone, including names outside the bridge hostname, plus this pass's
+	// successful creates.
+	DelegatedRecords int
+	// Ceiling is the configured maximum number of configured-nameserver NS records.
+	Ceiling int
 }
 
 // Conflict identifies a label and the foreign nameservers in its NS records.
@@ -124,9 +144,13 @@ type Failure struct {
 }
 
 // Reconcile lists labels and zone NS records, qualifies eligible live labels,
-// then creates their missing delegations. Per-label failures do not stop the pass.
+// then creates their missing delegations oldest qualification first. Creates
+// are limited by the NS record ceiling and the rolling-hour create budget;
+// qualifying labels left over go to Deferred. When the ceiling stops the pass,
+// the returned error wraps ErrCeilingReached (testable with errors.Is).
+// Per-label failures do not stop the pass.
 func (r *Reconciler) Reconcile(ctx context.Context) (Result, error) {
-	var result Result
+	result := Result{Ceiling: r.maxNSRecords}
 	labels, err := r.labels.ListInstanceLabels(ctx, r.zoneRoot)
 	if err != nil {
 		return result, fmt.Errorf("list instance labels for %s: %w", r.zoneRoot, err)
@@ -145,6 +169,8 @@ func (r *Reconciler) Reconcile(ctx context.Context) (Result, error) {
 	for _, nameserver := range r.nameservers {
 		configured[nameserver] = true
 	}
+	now := r.now()
+	recentRecords := 0
 	type delegationState struct {
 		delegated bool
 		foreign   []string
@@ -153,6 +179,14 @@ func (r *Reconciler) Reconcile(ctx context.Context) (Result, error) {
 	for _, record := range records {
 		if !strings.EqualFold(record.Type, "NS") {
 			continue
+		}
+		// Both guards protect the per-zone Cloudflare quota, so they count
+		// configured-nameserver NS records at any name in the zone.
+		if configured[normalizeDNSName(record.Content)] {
+			result.DelegatedRecords++
+			if record.CreatedOn.After(now.Add(-budgetWindow)) {
+				recentRecords++
+			}
 		}
 		name := normalizeDNSName(record.Name)
 		label, ok := strings.CutSuffix(name, "."+r.zoneRoot)
@@ -191,7 +225,6 @@ func (r *Reconciler) Reconcile(ctx context.Context) (Result, error) {
 			eligible = append(eligible, label)
 		}
 	}
-	// Keep the qualification timestamp internally for task 08's ordering.
 	qualifiedAt := make(map[string]time.Time, len(eligible))
 	if len(eligible) > 0 {
 		outright, err := r.contributions.ListOutrightQualifiedLabels(ctx, r.zoneRoot, eligible, grandfatherCutoff)
@@ -202,8 +235,9 @@ func (r *Reconciler) Reconcile(ctx context.Context) (Result, error) {
 			qualifiedAt[entry.Label] = entry.QualifiedAt
 		}
 	}
-	cutoff := r.now().Add(-minimumStandingAge)
+	cutoff := now.Add(-minimumStandingAge)
 	var failures []error
+	var qualifying []string
 	for _, label := range orderedLabels {
 		state := delegations[label]
 		if state != nil {
@@ -241,6 +275,31 @@ func (r *Reconciler) Reconcile(ctx context.Context) (Result, error) {
 			}
 			qualifiedAt[label] = standingAt
 		}
+		qualifying = append(qualifying, label)
+	}
+	sort.Slice(qualifying, func(i, j int) bool {
+		first, second := qualifying[i], qualifying[j]
+		if qualifiedAt[first].Equal(qualifiedAt[second]) {
+			return first < second
+		}
+		return qualifiedAt[first].Before(qualifiedAt[second])
+	})
+	remainingBudget := max(0, maximumCreatesPerHour-recentRecords)
+	ceilingReached := false
+	for index, label := range qualifying {
+		if result.DelegatedRecords >= r.maxNSRecords {
+			result.Deferred = append(result.Deferred, qualifying[index:]...)
+			ceilingReached = true
+			r.logger.ErrorContext(ctx, "delegation NS record ceiling reached", "ceiling", r.maxNSRecords, "deferred", len(result.Deferred))
+			failures = append(failures, fmt.Errorf("ceiling %d: %w", r.maxNSRecords, ErrCeilingReached))
+			break
+		}
+		if remainingBudget == 0 {
+			result.Deferred = append(result.Deferred, qualifying[index:]...)
+			r.logger.WarnContext(ctx, "delegation hourly create budget exhausted", "deferred", len(result.Deferred))
+			break
+		}
+		remainingBudget--
 		if err := r.client.createRecord(ctx, label+"."+r.zoneRoot, r.nameservers[0]); err != nil {
 			result.Failed = append(result.Failed, Failure{Label: label, Reason: err.Error()})
 			failures = append(failures, err)
@@ -248,6 +307,10 @@ func (r *Reconciler) Reconcile(ctx context.Context) (Result, error) {
 			continue
 		}
 		result.Created = append(result.Created, label)
+		result.DelegatedRecords++
+	}
+	if !ceilingReached && int64(result.DelegatedRecords)*100 >= int64(r.maxNSRecords)*ceilingWarningPercent {
+		r.logger.WarnContext(ctx, "delegation NS record ceiling nearing", "records", result.DelegatedRecords, "ceiling", r.maxNSRecords)
 	}
 	r.logger.InfoContext(ctx, "delegation pass complete", "created", len(result.Created), "already_delegated", len(result.AlreadyDelegated),
 		"conflicting", len(result.Conflicting), "failed", len(result.Failed), "pending", len(result.Pending),

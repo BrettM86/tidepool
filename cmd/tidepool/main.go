@@ -1076,6 +1076,7 @@ func startDelegation(ctx context.Context, cfg *config.Config, actors store.Bridg
 	reconciler, err := delegation.NewReconciler(delegation.Options{
 		Client: client, Labels: actors, ZoneRoot: cfg.BridgeHostname,
 		Nameservers: cfg.DNSNameservers, Logger: logger, Contributions: actors, Acceptances: acceptances,
+		MaxNSRecords: cfg.DelegationMaxNSRecords,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create delegation reconciler: %w", err)
@@ -1087,6 +1088,7 @@ func startDelegation(ctx context.Context, cfg *config.Config, actors store.Bridg
 			"already_delegated_count", len(result.AlreadyDelegated),
 			"conflicting_count", len(result.Conflicting), "conflicting", result.Conflicting,
 			"pending_count", len(result.Pending), "pending", result.Pending,
+			"deferred_count", len(result.Deferred), "delegated_records", result.DelegatedRecords, "ceiling", result.Ceiling,
 			"failed_count", len(result.Failed), "failed", result.Failed,
 			"delegated_without_live_actors_count", len(result.DelegatedWithoutLiveActors))
 		if err != nil {

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -30,6 +31,7 @@ type startupCloudflareRequest struct {
 
 type startupCloudflareAPI struct {
 	server       *httptest.Server
+	records      []startupDNSRecord
 	firstGET     chan struct{}
 	releaseGET   chan struct{}
 	releaseOnce  sync.Once
@@ -38,6 +40,14 @@ type startupCloudflareAPI struct {
 	requests     []startupCloudflareRequest
 	unauthorized bool
 	blockFirst   bool
+}
+
+type startupDNSRecord struct {
+	ID        string `json:"id"`
+	Type      string `json:"type"`
+	Name      string `json:"name"`
+	Content   string `json:"content"`
+	CreatedOn string `json:"created_on"`
 }
 
 func newStartupCloudflareAPI(t *testing.T, blockFirst bool) *startupCloudflareAPI {
@@ -108,7 +118,22 @@ func (fake *startupCloudflareAPI) serveHTTP(w http.ResponseWriter, r *http.Reque
 	}
 	switch r.Method {
 	case http.MethodGet:
-		_, _ = w.Write([]byte(`{"success":true,"errors":[],"messages":[],"result":[],"result_info":{"page":1,"per_page":2,"count":0,"total_count":0,"total_pages":1}}`))
+		page, err := strconv.Atoi(r.URL.Query().Get("page"))
+		if err != nil || page < 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		fake.mutex.Lock()
+		records := append([]startupDNSRecord(nil), fake.records...)
+		fake.mutex.Unlock()
+		const pageSize = 2
+		start := min((page-1)*pageSize, len(records))
+		end := min(start+pageSize, len(records))
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success": true, "errors": []any{}, "messages": []any{}, "result": records[start:end],
+			"result_info": map[string]int{"page": page, "per_page": pageSize, "count": end - start,
+				"total_count": len(records), "total_pages": max(1, (len(records)+pageSize-1)/pageSize)},
+		})
 	case http.MethodPost:
 		_, _ = w.Write([]byte(`{"success":true,"errors":[],"messages":[],"result":{"id":"new-record","type":"NS","name":"lemmy-example.tdpl.example","content":"a.ns.example","ttl":3600}}`))
 		fake.post <- request
@@ -119,12 +144,13 @@ func (fake *startupCloudflareAPI) serveHTTP(w http.ResponseWriter, r *http.Reque
 
 func startupDelegationConfig(allowPrivate bool) *config.Config {
 	return &config.Config{
-		BridgeHostname:        "tdpl.example",
-		DNSListen:             "127.0.0.1:5300",
-		DNSNameservers:        []string{"a.ns.example", "b.ns.example"},
-		CloudflareAPIToken:    "cf-startup-token",
-		CloudflareZoneID:      "zone-startup",
-		AllowPrivateAddresses: allowPrivate,
+		BridgeHostname:         "tdpl.example",
+		DNSListen:              "127.0.0.1:5300",
+		DNSNameservers:         []string{"a.ns.example", "b.ns.example"},
+		CloudflareAPIToken:     "cf-startup-token",
+		CloudflareZoneID:       "zone-startup",
+		DelegationMaxNSRecords: 100,
+		AllowPrivateAddresses:  allowPrivate,
 	}
 }
 
@@ -367,6 +393,90 @@ func (handler startupErrorSignal) Handle(ctx context.Context, record slog.Record
 		}
 	}
 	return err
+}
+
+type startupCeilingSignal struct {
+	slog.Handler
+	finished chan slog.Record
+	errors   chan slog.Record
+}
+
+func (handler startupCeilingSignal) Handle(ctx context.Context, record slog.Record) error {
+	err := handler.Handler.Handle(ctx, record)
+	if record.Level == slog.LevelError {
+		select {
+		case handler.errors <- record.Clone():
+		default:
+		}
+	}
+	if record.Message == "startup delegation pass finished" {
+		handler.finished <- record.Clone()
+	}
+	return err
+}
+
+func TestStartDelegationHonorsConfiguredCeiling(t *testing.T) {
+	conn := testutil.DB(t)
+	testutil.Truncate(t, conn, "ap_objects", "bridged_actors", "communities")
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	now := time.Now()
+	actors := store.NewBridgedActors(conn)
+	_, err := actors.UpsertActor(ctx, store.BridgedActor{
+		APActorID: "https://lemmy.example/u/ceiling-startup", ActorType: store.ActorTypePerson,
+		DID: "did:plc:cmddelegationceiling000001", Handle: "ceiling.lemmy-example.tdpl.example", ConsentState: store.ConsentStateOK,
+	})
+	require.NoError(t, err)
+	_, err = conn.ExecContext(ctx, `UPDATE bridged_actors SET created_at = $2 WHERE did = $1`, "did:plc:cmddelegationceiling000001", now)
+	require.NoError(t, err)
+	seedStartupFollowedCommunity(t, ctx, conn, "https://lemmy.example/c/ceiling", "did:plc:cmddelegationceilinggroup001")
+	seedStartupComment(t, ctx, conn, "did:plc:cmddelegationceiling000001", "did:plc:cmddelegationceilinggroup001", "ceiling-startup", now.Add(-2*time.Hour))
+
+	fake := newStartupCloudflareAPI(t, false)
+	fake.records = []startupDNSRecord{
+		{ID: "existing-1", Type: "NS", Name: "existing-1.tdpl.example", Content: "a.ns.example", CreatedOn: now.Add(-3 * time.Hour).Format("2006-01-02T15:04:05.000000Z07:00")},
+		{ID: "existing-2", Type: "NS", Name: "existing-2.tdpl.example", Content: "a.ns.example", CreatedOn: now.Add(-3 * time.Hour).Format("2006-01-02T15:04:05.000000Z07:00")},
+	}
+	finished := make(chan slog.Record, 1)
+	errors := make(chan slog.Record, 16)
+	logger := slog.New(startupCeilingSignal{Handler: testLogger().Handler(), finished: finished, errors: errors})
+	cfg := startupDelegationConfig(true)
+	cfg.DelegationMaxNSRecords = 2
+	reconciler, err := startDelegation(ctx, cfg, actors, startupAcceptanceChecker{}, fake.server.URL+"/client/v4", logger)
+	require.NoError(t, err)
+	require.NotNil(t, reconciler)
+	var summary slog.Record
+	select {
+	case summary = <-finished:
+	case <-time.After(5 * time.Second):
+		t.Fatal("startup delegation pass did not finish")
+	}
+	requests, unauthorized := fake.snapshot()
+	require.False(t, unauthorized)
+	require.NotEmpty(t, requests, "startup must list Cloudflare records")
+	for _, request := range requests {
+		require.Equal(t, http.MethodGet, request.Method, "the full ceiling must prevent every POST")
+	}
+	// The reconciler logs its ceiling Error before the summary, so it is already buffered.
+	ceilingLogged := false
+	for !ceilingLogged {
+		select {
+		case record := <-errors:
+			if value, ok := attr(record, "ceiling"); ok && value.Int64() == 2 {
+				ceilingLogged = true
+			}
+		default:
+			t.Fatal("startup pass did not log an Error with ceiling=2 before its summary")
+		}
+	}
+	for _, expected := range []struct {
+		name  string
+		value int64
+	}{{"deferred_count", 1}, {"delegated_records", 2}, {"ceiling", 2}} {
+		value, ok := attr(summary, expected.name)
+		require.True(t, ok, "startup summary must carry %s", expected.name)
+		require.Equal(t, expected.value, value.Int64(), expected.name)
+	}
 }
 
 func TestStartDelegationGuardsPrivateAddresses(t *testing.T) {

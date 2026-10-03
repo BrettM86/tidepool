@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // CloudflareAPIBaseURL is the production Cloudflare v4 API endpoint.
@@ -51,9 +52,11 @@ func NewCloudflareClient(options CloudflareOptions) (*CloudflareClient, error) {
 }
 
 type dnsRecord struct {
-	Type    string `json:"type"`
-	Name    string `json:"name"`
-	Content string `json:"content"`
+	ID        string    `json:"id"`
+	Type      string    `json:"type"`
+	Name      string    `json:"name"`
+	Content   string    `json:"content"`
+	CreatedOn time.Time `json:"created_on"`
 }
 
 type apiResponse struct {
@@ -120,7 +123,7 @@ func (c *CloudflareClient) listRecords(ctx context.Context) ([]dnsRecord, error)
 		if err != nil {
 			return nil, fmt.Errorf("list Cloudflare NS records on page %d: %w", page, err)
 		}
-		var pageRecords []dnsRecord
+		var pageRecords []json.RawMessage
 		if err := json.Unmarshal(response.Result, &pageRecords); err != nil {
 			return nil, fmt.Errorf("decode Cloudflare NS records on page %d: %w", page, err)
 		}
@@ -131,7 +134,28 @@ func (c *CloudflareClient) listRecords(ctx context.Context) ([]dnsRecord, error)
 		if totalPages < 1 && len(pageRecords) > 0 {
 			return nil, fmt.Errorf("list Cloudflare NS records on page %d: result_info.total_pages is %d but the page returned %d records", page, totalPages, len(pageRecords))
 		}
-		records = append(records, pageRecords...)
+		for _, raw := range pageRecords {
+			var record struct {
+				ID        string          `json:"id"`
+				Type      string          `json:"type"`
+				Name      string          `json:"name"`
+				Content   string          `json:"content"`
+				CreatedOn json.RawMessage `json:"created_on"`
+			}
+			if err := json.Unmarshal(raw, &record); err != nil {
+				return nil, fmt.Errorf("decode Cloudflare NS record on page %d: %w", page, err)
+			}
+			var timestamp string
+			if err := json.Unmarshal(record.CreatedOn, &timestamp); err != nil {
+				return nil, fmt.Errorf("decode Cloudflare NS record %s created_on on page %d: %w", record.ID, page, err)
+			}
+			createdOn, err := time.Parse(time.RFC3339Nano, timestamp)
+			if err != nil {
+				return nil, fmt.Errorf("decode Cloudflare NS record %s created_on on page %d: %w", record.ID, page, err)
+			}
+			records = append(records, dnsRecord{ID: record.ID, Type: record.Type, Name: record.Name,
+				Content: record.Content, CreatedOn: createdOn})
+		}
 		if page >= totalPages {
 			return records, nil
 		}

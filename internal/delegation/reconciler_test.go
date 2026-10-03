@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -39,6 +40,8 @@ type fakeLabelSource struct {
 	outrightActors map[string][]fakeOutrightActor
 	outrightError  error
 	acceptances    fakeAcceptanceChecker
+	// unfilteredOutright is returned by ListOutrightQualifiedLabels whatever labels were requested.
+	unfilteredOutright []store.OutrightQualification
 }
 
 type contributionRequest struct {
@@ -97,7 +100,7 @@ func (s fakeLabelSource) ListOutrightQualifiedLabels(_ context.Context, _ string
 	if s.outrightError != nil {
 		return nil, s.outrightError
 	}
-	var qualified []store.OutrightQualification
+	qualified := append([]store.OutrightQualification(nil), s.unfilteredOutright...)
 	for _, label := range labels {
 		for _, actor := range s.outrightActors[label] {
 			if actor.followedCommunity || actor.createdAt.Before(grandfatherCutoff) {
@@ -147,12 +150,16 @@ func testContribution(label, collection string, indexedAt time.Time, id int64) s
 }
 
 type fakeDNSRecord struct {
-	ID      string `json:"id"`
-	Type    string `json:"type"`
-	Name    string `json:"name"`
-	Content string `json:"content"`
-	TTL     int    `json:"ttl"`
+	ID            string `json:"id"`
+	Type          string `json:"type"`
+	Name          string `json:"name"`
+	Content       string `json:"content"`
+	TTL           int    `json:"ttl"`
+	CreatedOn     string `json:"created_on,omitempty"`
+	omitCreatedOn bool
 }
+
+const cloudflareTimestampLayout = "2006-01-02T15:04:05.000000Z07:00"
 
 type fakeCloudflareRequest struct {
 	Method        string
@@ -173,6 +180,9 @@ type fakeCloudflareAPI struct {
 	createFailCode  int
 	createFailBody  string
 	failedPostLabel string
+	failPostLabels  map[string]bool
+	now             func() time.Time
+	maxNSRecords    int
 	postCount       int
 	// pageSize overrides the default listing page size when positive.
 	pageSize int
@@ -184,7 +194,13 @@ type fakeCloudflareAPI struct {
 
 func newFakeCloudflareAPI(t *testing.T, records []fakeDNSRecord) *fakeCloudflareAPI {
 	t.Helper()
-	fake := &fakeCloudflareAPI{records: append([]fakeDNSRecord{}, records...)}
+	fake := &fakeCloudflareAPI{records: append([]fakeDNSRecord{}, records...),
+		now: func() time.Time { return delegationTestNow }, maxNSRecords: 1000}
+	for index := range fake.records {
+		if fake.records[index].CreatedOn == "" && !fake.records[index].omitCreatedOn {
+			fake.records[index].CreatedOn = delegationTestNow.Add(-3 * time.Hour).Format(cloudflareTimestampLayout)
+		}
+	}
 	fake.server = httptest.NewServer(http.HandlerFunc(fake.serveHTTP))
 	t.Cleanup(func() {
 		fake.server.Close()
@@ -259,31 +275,45 @@ func (f *fakeCloudflareAPI) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		if f.pageSize > 0 {
 			pageSize = f.pageSize
 		}
-		start := min((page-1)*pageSize, len(f.records))
-		end := min(start+pageSize, len(f.records))
+		f.mu.Lock()
+		records := append([]fakeDNSRecord(nil), f.records...)
+		f.mu.Unlock()
+		start := min((page-1)*pageSize, len(records))
+		end := min(start+pageSize, len(records))
 		// Cloudflare reports total_pages 0 for an empty result set.
-		totalPages := (len(f.records) + pageSize - 1) / pageSize
+		totalPages := (len(records) + pageSize - 1) / pageSize
 		if f.reportedTotalPages > 0 {
 			totalPages = f.reportedTotalPages
 		}
 		response := map[string]any{
-			"success": true, "errors": []any{}, "messages": []any{}, "result": f.records[start:end],
+			"success": true, "errors": []any{}, "messages": []any{}, "result": records[start:end],
 		}
 		if !f.omitResultInfo {
 			response["result_info"] = map[string]int{"page": page, "per_page": pageSize, "count": end - start,
-				"total_count": len(f.records), "total_pages": totalPages}
+				"total_count": len(records), "total_pages": totalPages}
 		}
 		_ = json.NewEncoder(w).Encode(response)
 	case http.MethodPost:
-		if postPosition == 2 && f.createFailBody != "" {
-			name, _ := request.Body["name"].(string)
+		name, _ := request.Body["name"].(string)
+		label := strings.TrimSuffix(name, "."+delegationZoneRoot)
+		if f.failPostLabels[label] || postPosition == 2 && f.createFailBody != "" {
 			f.mu.Lock()
-			f.failedPostLabel = strings.TrimSuffix(name, "."+delegationZoneRoot)
+			f.failedPostLabel = label
 			f.mu.Unlock()
-			w.WriteHeader(f.createFailCode)
-			_, _ = w.Write([]byte(f.createFailBody))
+			if f.failPostLabels[label] {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"success":false,"errors":[{"message":"create refused"}],"result":null}`))
+			} else {
+				w.WriteHeader(f.createFailCode)
+				_, _ = w.Write([]byte(f.createFailBody))
+			}
 			return
 		}
+		f.mu.Lock()
+		f.records = append(f.records, fakeDNSRecord{ID: fmt.Sprintf("created-%d", postPosition),
+			Type: "NS", Name: name, Content: request.Body["content"].(string),
+			CreatedOn: f.now().Format(cloudflareTimestampLayout)})
+		f.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"success": true, "errors": []any{}, "messages": []any{}, "result": request.Body,
 		})
@@ -293,6 +323,11 @@ func (f *fakeCloudflareAPI) serveHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func newTestReconciler(t *testing.T, fake *fakeCloudflareAPI, labels fakeLabelSource) (*Reconciler, *bytes.Buffer) {
+	t.Helper()
+	return newTestReconcilerWithSource(t, fake, &labels)
+}
+
+func newTestReconcilerWithSource(t *testing.T, fake *fakeCloudflareAPI, labels *fakeLabelSource) (*Reconciler, *bytes.Buffer) {
 	t.Helper()
 	if labels.contributions == nil {
 		labels.contributions = make(map[string][]store.Contribution)
@@ -314,7 +349,8 @@ func newTestReconciler(t *testing.T, fake *fakeCloudflareAPI, labels fakeLabelSo
 		Client: client, Labels: labels, ZoneRoot: delegationZoneRoot,
 		Nameservers:   []string{"ns1.tdpl.example", "ns2.tdpl.example"},
 		Logger:        slog.New(slog.NewTextHandler(&log, &slog.HandlerOptions{Level: slog.LevelDebug})),
-		Contributions: labels, Acceptances: labels.acceptances, Now: func() time.Time { return delegationTestNow },
+		Contributions: labels, Acceptances: labels.acceptances, Now: func() time.Time { return fake.now() },
+		MaxNSRecords: fake.maxNSRecords,
 	})
 	require.NoError(t, err)
 	return reconciler, &log
@@ -695,6 +731,455 @@ func postNames(requests []fakeCloudflareRequest) []string {
 		names = append(names, request.Body["name"].(string))
 	}
 	return names
+}
+
+func configuredFakeRecords(count, recent int) []fakeDNSRecord {
+	records := make([]fakeDNSRecord, 0, count)
+	for index := range count {
+		record := fakeDNSRecord{ID: fmt.Sprintf("existing-%02d", index), Type: "NS",
+			Name: fmt.Sprintf("existing-%02d.tdpl.example", index), Content: "ns1.tdpl.example"}
+		if index < recent {
+			record.CreatedOn = delegationTestNow.Add(-30 * time.Minute).Format(cloudflareTimestampLayout)
+		}
+		records = append(records, record)
+	}
+	return records
+}
+
+func delegationLogLines(log string, level string, attributes ...string) []string {
+	var matching []string
+	for _, line := range strings.Split(strings.TrimSpace(log), "\n") {
+		if !regexp.MustCompile(`(^| )level=` + regexp.QuoteMeta(level) + `( |$)`).MatchString(line) {
+			continue
+		}
+		matches := true
+		for _, attribute := range attributes {
+			if !regexp.MustCompile(`(^| )` + regexp.QuoteMeta(attribute) + `( |$)`).MatchString(line) {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			matching = append(matching, line)
+		}
+	}
+	return matching
+}
+
+func TestReconcileRejectsRecordsWithoutValidCreatedOn(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		record fakeDNSRecord
+	}{
+		{name: "missing created_on", record: fakeDNSRecord{ID: "rec-broken", Type: "NS", Name: "broken.tdpl.example", Content: "ns1.tdpl.example", omitCreatedOn: true}},
+		{name: "invalid created_on", record: fakeDNSRecord{ID: "rec-broken", Type: "NS", Name: "broken.tdpl.example", Content: "ns1.tdpl.example", CreatedOn: "yesterday"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newFakeCloudflareAPI(t, []fakeDNSRecord{tc.record})
+			r, _ := newTestReconciler(t, fake, fakeLabelSource{labels: []store.InstanceLabel{{Label: "qualifying", HasLiveActor: true}}})
+			_, err := r.Reconcile(context.Background())
+			require.ErrorContains(t, err, "rec-broken")
+			require.Empty(t, postNames(fake.snapshot()))
+		})
+	}
+}
+
+func TestReconcileCountsConfiguredNSRecordsAcrossZone(t *testing.T) {
+	fake := newFakeCloudflareAPI(t, []fakeDNSRecord{
+		{Type: "NS", Name: "a.tdpl.example", Content: "ns1.tdpl.example"},
+		{Type: "NS", Name: "b.tdpl.example", Content: "ns1.tdpl.example"},
+		{Type: "NS", Name: "c.tdpl.example", Content: "ns1.tdpl.example"},
+		{Type: "NS", Name: "d.tdpl.example", Content: "ns1.tdpl.example"},
+		{Type: "NS", Name: "d.tdpl.example", Content: "ns2.tdpl.example"},
+		{Type: "NS", Name: "tdpl.example", Content: "ns1.tdpl.example"},
+		{Type: "NS", Name: "x.e.tdpl.example", Content: "ns1.tdpl.example"},
+		{Type: "NS", Name: "f.tdpl.example", Content: "other-provider.example"},
+		{Type: "A", Name: "ns1.tdpl.example", Content: "ns1.tdpl.example"},
+	})
+	fake.maxNSRecords = 100
+	r, _ := newTestReconciler(t, fake, fakeLabelSource{labels: []store.InstanceLabel{{Label: "q", HasLiveActor: true}}})
+	result, err := r.Reconcile(context.Background())
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{"q.tdpl.example"}, postNames(fake.snapshot()))
+	require.ElementsMatch(t, []string{"q"}, result.Created)
+	require.Equal(t, 8, result.DelegatedRecords)
+	require.Equal(t, 100, result.Ceiling)
+}
+
+func TestReconcileCountsConfiguredNSRecordsOutsideBridgeHostname(t *testing.T) {
+	outside := fakeDNSRecord{ID: "outside", Type: "NS", Name: "elsewhere.example", Content: "ns1.tdpl.example",
+		CreatedOn: delegationTestNow.Add(-30 * time.Minute).Format(cloudflareTimestampLayout)}
+	t.Run("ceiling", func(t *testing.T) {
+		fake := newFakeCloudflareAPI(t, append(configuredFakeRecords(9, 0), outside))
+		fake.maxNSRecords = 10
+		r, _ := newTestReconciler(t, fake, fakeLabelSource{labels: []store.InstanceLabel{{Label: "qualified", HasLiveActor: true}}})
+		result, err := r.Reconcile(context.Background())
+		require.ErrorIs(t, err, ErrCeilingReached)
+		require.Empty(t, postNames(fake.snapshot()))
+		require.Empty(t, result.Created)
+		require.ElementsMatch(t, []string{"qualified"}, result.Deferred)
+		require.Equal(t, 10, result.DelegatedRecords)
+	})
+	t.Run("hourly budget", func(t *testing.T) {
+		fake := newFakeCloudflareAPI(t, append(configuredFakeRecords(19, 19), outside))
+		r, _ := newTestReconciler(t, fake, fakeLabelSource{labels: []store.InstanceLabel{{Label: "qualified", HasLiveActor: true}}})
+		result, err := r.Reconcile(context.Background())
+		require.NoError(t, err)
+		require.Empty(t, postNames(fake.snapshot()))
+		require.Empty(t, result.Created)
+		require.ElementsMatch(t, []string{"qualified"}, result.Deferred)
+		require.Equal(t, 20, result.DelegatedRecords)
+	})
+}
+
+func TestReconcileCreatesOnlyForEligibleOutrightLabels(t *testing.T) {
+	fake := newFakeCloudflareAPI(t, []fakeDNSRecord{
+		{Type: "NS", Name: "foreign.tdpl.example", Content: "other-provider.example"},
+		{Type: "NS", Name: "delegated.tdpl.example", Content: "ns1.tdpl.example"},
+	})
+	qualifiedAt := delegationTestNow.Add(-48 * time.Hour)
+	r, _ := newTestReconciler(t, fake, fakeLabelSource{
+		labels: []store.InstanceLabel{
+			{Label: "eligible", HasLiveActor: true}, {Label: "foreign", HasLiveActor: true},
+			{Label: "delegated", HasLiveActor: true}, {Label: "dormant", HasLiveActor: false},
+		},
+		contributions: map[string][]store.Contribution{},
+		// The source ignores the requested labels and also returns ineligible ones.
+		unfilteredOutright: []store.OutrightQualification{
+			{Label: "eligible", QualifiedAt: qualifiedAt}, {Label: "foreign", QualifiedAt: qualifiedAt},
+			{Label: "delegated", QualifiedAt: qualifiedAt}, {Label: "dormant", QualifiedAt: qualifiedAt},
+			{Label: "unlisted", QualifiedAt: qualifiedAt},
+		},
+	})
+	result, err := r.Reconcile(context.Background())
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{"eligible.tdpl.example"}, postNames(fake.snapshot()))
+	requireDelegationResult(t, result, []string{"eligible"}, []string{"delegated"}, nil,
+		[]Conflict{{Label: "foreign", Contents: []string{"other-provider.example"}}}, nil)
+	require.Empty(t, result.Deferred)
+	require.Empty(t, result.Pending)
+	require.Equal(t, 2, result.DelegatedRecords)
+}
+
+func TestReconcileStopsAtCeilingOldestFirst(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		existing int
+		created  []string
+		deferred []string
+		count    int
+	}{
+		{name: "full ceiling", existing: 10, deferred: []string{"alpha", "zulu"}, count: 2},
+		{name: "one place left", existing: 9, created: []string{"zulu"}, deferred: []string{"alpha"}, count: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newFakeCloudflareAPI(t, configuredFakeRecords(tc.existing, 0))
+			fake.maxNSRecords = 10
+			r, log := newTestReconciler(t, fake, fakeLabelSource{
+				labels: []store.InstanceLabel{{Label: "alpha", HasLiveActor: true}, {Label: "zulu", HasLiveActor: true}},
+				contributions: map[string][]store.Contribution{
+					"alpha": {testContribution("alpha", "social.coves.community.comment", delegationTestNow.Add(-2*time.Hour), 1)},
+					"zulu":  {testContribution("zulu", "social.coves.community.comment", delegationTestNow.Add(-5*time.Hour), 2)},
+				},
+			})
+			result, err := r.Reconcile(context.Background())
+			require.ErrorIs(t, err, ErrCeilingReached)
+			require.ElementsMatch(t, tc.created, result.Created)
+			var names []string
+			for _, label := range tc.created {
+				names = append(names, label+".tdpl.example")
+			}
+			require.ElementsMatch(t, names, postNames(fake.snapshot()))
+			require.ElementsMatch(t, tc.deferred, result.Deferred)
+			require.Equal(t, 10, result.DelegatedRecords)
+			require.Equal(t, 10, result.Ceiling)
+			require.Len(t, delegationLogLines(log.String(), "ERROR", "ceiling=10", fmt.Sprintf("deferred=%d", tc.count)), 1)
+			require.Empty(t, delegationLogLines(log.String(), "WARN", "ceiling=10"))
+		})
+	}
+}
+
+func TestReconcileWarnsNearCeilingWithoutQualifyingLabelsLeft(t *testing.T) {
+	for _, tc := range []struct {
+		name                string
+		ceiling, existing   int
+		qualifying, pending bool
+		wantCount           int
+	}{
+		{name: "full with pending only", ceiling: 10, existing: 10, pending: true, wantCount: 10},
+		{name: "create fills ceiling and leaves pending", ceiling: 10, existing: 9, qualifying: true, pending: true, wantCount: 10},
+		{name: "create reaches eighty percent", ceiling: 10, existing: 7, qualifying: true, wantCount: 8},
+		{name: "below eighty percent with pending", ceiling: 10, existing: 7, pending: true},
+		{name: "two of three is below eighty percent", ceiling: 3, existing: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newFakeCloudflareAPI(t, configuredFakeRecords(tc.existing, 0))
+			fake.maxNSRecords = tc.ceiling
+			source := fakeLabelSource{contributions: map[string][]store.Contribution{}}
+			if tc.qualifying {
+				source.labels = append(source.labels, store.InstanceLabel{Label: "qualified", HasLiveActor: true})
+				source.contributions["qualified"] = []store.Contribution{testContribution("qualified", "social.coves.community.comment", delegationTestNow.Add(-2*time.Hour), 1)}
+			}
+			if tc.pending {
+				source.labels = append(source.labels, store.InstanceLabel{Label: "pending", HasLiveActor: true})
+				source.contributions["pending"] = []store.Contribution{testContribution("pending", "social.coves.community.comment", delegationTestNow.Add(-10*time.Minute), 2)}
+			}
+			r, log := newTestReconciler(t, fake, source)
+			result, err := r.Reconcile(context.Background())
+			require.NoError(t, err)
+			if tc.qualifying {
+				require.ElementsMatch(t, []string{"qualified"}, result.Created)
+				require.ElementsMatch(t, []string{"qualified.tdpl.example"}, postNames(fake.snapshot()))
+			} else {
+				require.Empty(t, result.Created)
+				require.Empty(t, postNames(fake.snapshot()))
+			}
+			if tc.pending {
+				require.ElementsMatch(t, []string{"pending"}, result.Pending)
+			} else {
+				require.Empty(t, result.Pending)
+			}
+			require.Empty(t, result.Deferred)
+			require.Empty(t, delegationLogLines(log.String(), "ERROR", fmt.Sprintf("ceiling=%d", tc.ceiling)))
+			if tc.wantCount > 0 {
+				require.Len(t, delegationLogLines(log.String(), "WARN", fmt.Sprintf("records=%d", tc.wantCount), fmt.Sprintf("ceiling=%d", tc.ceiling)), 1)
+			} else {
+				require.Empty(t, delegationLogLines(log.String(), "WARN", fmt.Sprintf("ceiling=%d", tc.ceiling)))
+			}
+			require.Equal(t, tc.existing+len(result.Created), result.DelegatedRecords)
+			require.Equal(t, tc.ceiling, result.Ceiling)
+		})
+	}
+}
+
+func TestReconcileCeilingTakesPrecedenceOverExhaustedBudget(t *testing.T) {
+	fake := newFakeCloudflareAPI(t, configuredFakeRecords(25, 20))
+	fake.maxNSRecords = 25
+	r, log := newTestReconciler(t, fake, fakeLabelSource{labels: []store.InstanceLabel{{Label: "qualified", HasLiveActor: true}}})
+	result, err := r.Reconcile(context.Background())
+	require.ErrorIs(t, err, ErrCeilingReached)
+	require.Empty(t, postNames(fake.snapshot()))
+	require.Empty(t, result.Created)
+	require.ElementsMatch(t, []string{"qualified"}, result.Deferred)
+	require.Equal(t, 25, result.DelegatedRecords)
+	require.Equal(t, 25, result.Ceiling)
+	require.Len(t, delegationLogLines(log.String(), "ERROR", "ceiling=25", "deferred=1"), 1)
+	for _, line := range delegationLogLines(log.String(), "WARN", "deferred=1") {
+		require.NotRegexp(t, `(^| )ceiling=25( |$)`, line)
+	}
+}
+
+func TestReconcileFailedCreateDoesNotConsumeCeiling(t *testing.T) {
+	fake := newFakeCloudflareAPI(t, configuredFakeRecords(8, 0))
+	fake.maxNSRecords = 10
+	fake.failPostLabels = map[string]bool{"zulu": true}
+	r, log := newTestReconciler(t, fake, fakeLabelSource{
+		labels: []store.InstanceLabel{{Label: "alpha", HasLiveActor: true}, {Label: "middle", HasLiveActor: true}, {Label: "zulu", HasLiveActor: true}},
+		contributions: map[string][]store.Contribution{
+			"zulu":   {testContribution("zulu", "social.coves.community.comment", delegationTestNow.Add(-5*time.Hour), 1)},
+			"middle": {testContribution("middle", "social.coves.community.comment", delegationTestNow.Add(-4*time.Hour), 2)},
+			"alpha":  {testContribution("alpha", "social.coves.community.comment", delegationTestNow.Add(-3*time.Hour), 3)},
+		},
+	})
+	result, err := r.Reconcile(context.Background())
+	require.Error(t, err)
+	require.NotErrorIs(t, err, ErrCeilingReached)
+	require.ElementsMatch(t, []string{"zulu.tdpl.example", "middle.tdpl.example", "alpha.tdpl.example"}, postNames(fake.snapshot()))
+	require.Len(t, result.Failed, 1)
+	require.Equal(t, "zulu", result.Failed[0].Label)
+	require.ElementsMatch(t, []string{"middle", "alpha"}, result.Created)
+	require.Empty(t, result.Deferred)
+	require.Equal(t, 10, result.DelegatedRecords)
+	require.Equal(t, 10, result.Ceiling)
+	require.Empty(t, delegationLogLines(log.String(), "ERROR", "ceiling=10"))
+}
+
+func TestReconcileRebuildsHourlyBudgetFromListedRecords(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		records          []fakeDNSRecord
+		created          []string
+		deferred         []string
+		delegatedRecords int
+		budgetWarning    int
+	}{
+		{name: "a recent twenty exhaust budget", records: configuredFakeRecords(20, 20), deferred: []string{"zulu", "middle", "alpha"}, delegatedRecords: 20, budgetWarning: 3},
+		{name: "b records aged sixty-one minutes do not spend budget", records: func() []fakeDNSRecord {
+			records := configuredFakeRecords(20, 0)
+			for index := range records {
+				records[index].CreatedOn = delegationTestNow.Add(-61 * time.Minute).Format(cloudflareTimestampLayout)
+			}
+			return records
+		}(), created: []string{"zulu", "middle", "alpha"}, delegatedRecords: 23},
+		{name: "c eighteen recent records leave two requests", records: configuredFakeRecords(20, 18), created: []string{"zulu", "middle"}, deferred: []string{"alpha"}, delegatedRecords: 22, budgetWarning: 1},
+		{name: "d root and deeper records spend budget", records: func() []fakeDNSRecord {
+			records := configuredFakeRecords(20, 20)
+			records[18].Name = "tdpl.example"
+			records[19].Name = "x.nested.tdpl.example"
+			return records
+		}(), deferred: []string{"zulu", "middle", "alpha"}, delegatedRecords: 20, budgetWarning: 3},
+		{name: "e foreign records do not spend budget", records: append(configuredFakeRecords(18, 18),
+			fakeDNSRecord{Type: "NS", Name: "foreign1.tdpl.example", Content: "other-provider.example", CreatedOn: delegationTestNow.Add(-30 * time.Minute).Format(cloudflareTimestampLayout)},
+			fakeDNSRecord{Type: "NS", Name: "foreign2.tdpl.example", Content: "other-provider.example", CreatedOn: delegationTestNow.Add(-30 * time.Minute).Format(cloudflareTimestampLayout)},
+			fakeDNSRecord{Type: "NS", Name: "foreign3.tdpl.example", Content: "other-provider.example", CreatedOn: delegationTestNow.Add(-30 * time.Minute).Format(cloudflareTimestampLayout)},
+		), created: []string{"zulu", "middle"}, deferred: []string{"alpha"}, delegatedRecords: 20, budgetWarning: 1},
+		{name: "f records exactly sixty minutes old do not spend budget", records: func() []fakeDNSRecord {
+			records := configuredFakeRecords(20, 0)
+			for index := range records {
+				records[index].CreatedOn = delegationTestNow.Add(-60 * time.Minute).Format(cloudflareTimestampLayout)
+			}
+			return records
+		}(), created: []string{"zulu", "middle", "alpha"}, delegatedRecords: 23},
+		{name: "g more than twenty recent records floor budget at zero", records: configuredFakeRecords(25, 25), deferred: []string{"zulu", "middle", "alpha"}, delegatedRecords: 25, budgetWarning: 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newFakeCloudflareAPI(t, tc.records)
+			r, log := newTestReconciler(t, fake, fakeLabelSource{
+				labels: []store.InstanceLabel{{Label: "alpha", HasLiveActor: true}, {Label: "middle", HasLiveActor: true}, {Label: "zulu", HasLiveActor: true}},
+				contributions: map[string][]store.Contribution{
+					"zulu":   {testContribution("zulu", "social.coves.community.comment", delegationTestNow.Add(-5*time.Hour), 1)},
+					"middle": {testContribution("middle", "social.coves.community.comment", delegationTestNow.Add(-4*time.Hour), 2)},
+					"alpha":  {testContribution("alpha", "social.coves.community.comment", delegationTestNow.Add(-3*time.Hour), 3)},
+				},
+			})
+			result, err := r.Reconcile(context.Background())
+			require.NoError(t, err)
+			var names []string
+			for _, label := range tc.created {
+				names = append(names, label+".tdpl.example")
+			}
+			require.ElementsMatch(t, names, postNames(fake.snapshot()))
+			require.ElementsMatch(t, tc.created, result.Created)
+			require.ElementsMatch(t, tc.deferred, result.Deferred)
+			require.Equal(t, tc.delegatedRecords, result.DelegatedRecords)
+			require.Equal(t, 1000, result.Ceiling)
+			if tc.budgetWarning > 0 {
+				lines := delegationLogLines(log.String(), "WARN", fmt.Sprintf("deferred=%d", tc.budgetWarning))
+				require.Len(t, lines, 1)
+				for _, line := range lines {
+					require.NotRegexp(t, `(^| )ceiling=`, line)
+				}
+			} else {
+				require.Empty(t, delegationLogLines(log.String(), "WARN", "deferred=3"))
+				require.Empty(t, delegationLogLines(log.String(), "WARN", "deferred=1"))
+			}
+		})
+	}
+}
+
+func TestReconcileFailedRequestsSpendHourlyBudget(t *testing.T) {
+	fake := newFakeCloudflareAPI(t, configuredFakeRecords(15, 15))
+	fake.failPostLabels = map[string]bool{"zulu": true, "yankee": true, "xray": true}
+	source := fakeLabelSource{contributions: make(map[string][]store.Contribution)}
+	ages := map[string]int{"zulu": 8, "yankee": 7, "xray": 6, "whiskey": 5, "victor": 4, "uniform": 3, "tango": 2, "sierra": 1}
+	for index, label := range []string{"sierra", "uniform", "whiskey", "zulu", "tango", "victor", "xray", "yankee"} {
+		source.labels = append(source.labels, store.InstanceLabel{Label: label, HasLiveActor: true})
+		// Qualification ages deliberately disagree with the source and alphabetical orders.
+		source.contributions[label] = []store.Contribution{testContribution(label, "social.coves.community.comment", delegationTestNow.Add(-time.Duration(ages[label])*time.Hour), int64(index+1))}
+	}
+	r, log := newTestReconciler(t, fake, source)
+	result, err := r.Reconcile(context.Background())
+	require.Error(t, err)
+	require.ElementsMatch(t, []string{"zulu.tdpl.example", "yankee.tdpl.example", "xray.tdpl.example", "whiskey.tdpl.example", "victor.tdpl.example"}, postNames(fake.snapshot()))
+	require.Len(t, requestsByMethod(fake.snapshot(), http.MethodPost), 5)
+	require.Len(t, result.Failed, 3)
+	require.ElementsMatch(t, []string{"zulu", "yankee", "xray"}, []string{result.Failed[0].Label, result.Failed[1].Label, result.Failed[2].Label})
+	require.ElementsMatch(t, []string{"whiskey", "victor"}, result.Created)
+	require.ElementsMatch(t, []string{"uniform", "tango", "sierra"}, result.Deferred)
+	require.Len(t, delegationLogLines(log.String(), "WARN", "deferred=3"), 1)
+}
+
+func TestReconcileSpreadsCreatesAcrossRollingHour(t *testing.T) {
+	current := delegationTestNow
+	fake := newFakeCloudflareAPI(t, nil)
+	fake.now = func() time.Time { return current }
+	source := &fakeLabelSource{
+		contributions:  make(map[string][]store.Contribution),
+		outrightActors: make(map[string][]fakeOutrightActor),
+	}
+	// Reverse-numbered names put age in the opposite order from alphabetical
+	// order. The source permutation is neither alphabetical nor chronological.
+	for index := range 25 {
+		label := fmt.Sprintf("old%02d", 25-index)
+		source.labels = append(source.labels, store.InstanceLabel{Label: fmt.Sprintf("old%02d", 25-(index*7)%25), HasLiveActor: true})
+		qualifiedAt := delegationTestNow.Add(time.Duration(-120+index) * time.Minute)
+		if index == 2 || index == 7 || index == 12 || index == 18 || index == 23 {
+			source.outrightActors[label] = []fakeOutrightActor{{createdAt: qualifiedAt, followedCommunity: true}}
+		} else {
+			source.contributions[label] = []store.Contribution{testContribution(label, "social.coves.community.comment", qualifiedAt, int64(index+1))}
+		}
+	}
+	r, log := newTestReconcilerWithSource(t, fake, source)
+	first, err := r.Reconcile(context.Background())
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{
+		"old25.tdpl.example", "old24.tdpl.example", "old23.tdpl.example", "old22.tdpl.example", "old21.tdpl.example",
+		"old20.tdpl.example", "old19.tdpl.example", "old18.tdpl.example", "old17.tdpl.example", "old16.tdpl.example",
+		"old15.tdpl.example", "old14.tdpl.example", "old13.tdpl.example", "old12.tdpl.example", "old11.tdpl.example",
+		"old10.tdpl.example", "old09.tdpl.example", "old08.tdpl.example", "old07.tdpl.example", "old06.tdpl.example",
+	}, postNames(fake.snapshot()))
+	require.ElementsMatch(t, []string{"old05", "old04", "old03", "old02", "old01"}, first.Deferred)
+	require.Len(t, first.Created, 20)
+	require.Len(t, delegationLogLines(log.String(), "WARN", "deferred=5"), 1)
+
+	current = delegationTestNow.Add(59 * time.Minute)
+	second, err := r.Reconcile(context.Background())
+	require.NoError(t, err)
+	require.Len(t, postNames(fake.snapshot()), 20, "no creates while the first pass is inside the rolling hour")
+	require.Empty(t, second.Created)
+	require.ElementsMatch(t, []string{"old05", "old04", "old03", "old02", "old01"}, second.Deferred)
+
+	// Every new qualification predates the pass-3 cutoff but follows the five
+	// deferred qualifications. new24 and new23 tie within the first fifteen.
+	for index := range 30 {
+		label := fmt.Sprintf("new%02d", 30-index)
+		source.labels = append(source.labels, store.InstanceLabel{Label: fmt.Sprintf("new%02d", 30-(index*7)%30), HasLiveActor: true})
+		ageIndex := index
+		if index == 7 {
+			ageIndex = 6
+		}
+		source.contributions[label] = []store.Contribution{testContribution(label, "social.coves.community.comment", delegationTestNow.Add(time.Duration(-90+ageIndex)*time.Minute), int64(100+index))}
+	}
+	current = delegationTestNow.Add(61 * time.Minute)
+	third, err := r.Reconcile(context.Background())
+	require.NoError(t, err)
+	allPosts := postNames(fake.snapshot())
+	require.Len(t, allPosts, 40, "the third pass must issue exactly twenty new requests")
+	require.Equal(t, []string{
+		"old05.tdpl.example", "old04.tdpl.example", "old03.tdpl.example", "old02.tdpl.example", "old01.tdpl.example",
+		"new30.tdpl.example", "new29.tdpl.example", "new28.tdpl.example", "new27.tdpl.example", "new26.tdpl.example",
+		"new25.tdpl.example", "new23.tdpl.example", "new24.tdpl.example", "new22.tdpl.example", "new21.tdpl.example",
+		"new20.tdpl.example", "new19.tdpl.example", "new18.tdpl.example", "new17.tdpl.example", "new16.tdpl.example",
+	}, allPosts[20:])
+	require.ElementsMatch(t, []string{
+		"new15", "new14", "new13", "new12", "new11", "new10", "new09", "new08", "new07", "new06",
+		"new05", "new04", "new03", "new02", "new01",
+	}, third.Deferred)
+	require.Len(t, third.Created, 20)
+}
+
+func TestNewReconcilerRequiresPositiveMaxNSRecords(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		max  int
+	}{{name: "zero", max: 0}, {name: "negative", max: -1}} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newFakeCloudflareAPI(t, nil)
+			client, err := NewCloudflareClient(CloudflareOptions{
+				BaseURL: fake.server.URL + "/client/v4", Token: delegationToken, ZoneID: delegationZoneID,
+				HTTPClient: ap.NewGuardedHTTPClient(true, 5*time.Second),
+			})
+			require.NoError(t, err)
+			source := &fakeLabelSource{contributions: make(map[string][]store.Contribution)}
+			_, err = NewReconciler(Options{
+				Client: client, Labels: source, Contributions: source, Acceptances: fakeAcceptanceChecker{},
+				ZoneRoot: delegationZoneRoot, Nameservers: []string{"ns1.tdpl.example", "ns2.tdpl.example"},
+				Logger: slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)), Now: func() time.Time { return delegationTestNow },
+				MaxNSRecords: tc.max,
+			})
+			require.Error(t, err)
+		})
+	}
 }
 
 func removedPostv2Candidates(label string) ([]store.Contribution, fakeAcceptanceChecker) {

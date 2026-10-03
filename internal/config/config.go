@@ -45,6 +45,8 @@ type Config struct {
 	DNSNameservers []string
 	// CloudflareAPIToken enables the startup delegation pass when set.
 	CloudflareAPIToken string
+	// DelegationMaxNSRecords caps configured-nameserver NS records in the zone.
+	DelegationMaxNSRecords int
 	// CloudflareZoneID identifies the zone containing BridgeHostname.
 	CloudflareZoneID string
 	// BridgeScheme is the URL scheme the bridge's own AP URLs (service
@@ -363,6 +365,11 @@ func Load(logger *slog.Logger) (*Config, error) {
 		}
 		if cfg.DNSListen == "" {
 			return nil, fmt.Errorf("config: DNS_LISTEN is required when CLOUDFLARE_API_TOKEN is set")
+		}
+		raw := os.Getenv("DELEGATION_MAX_NS_RECORDS")
+		cfg.DelegationMaxNSRecords, err = strconv.Atoi(raw)
+		if err != nil || cfg.DelegationMaxNSRecords <= 0 {
+			return nil, fmt.Errorf("config: DELEGATION_MAX_NS_RECORDS must be a positive integer, got %q", raw)
 		}
 	}
 	cfg.PLCDirectoryURL, err = stringVar(logger, isDevelopment, "PLC_DIRECTORY_URL", "http://localhost:3002")

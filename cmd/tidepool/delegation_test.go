@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -44,7 +45,7 @@ func newStartupCloudflareAPI(t *testing.T, blockFirst bool) *startupCloudflareAP
 	fake := &startupCloudflareAPI{
 		firstGET:   make(chan struct{}),
 		releaseGET: make(chan struct{}),
-		post:       make(chan startupCloudflareRequest, 1),
+		post:       make(chan startupCloudflareRequest, 8),
 		blockFirst: blockFirst,
 	}
 	fake.server = httptest.NewServer(http.HandlerFunc(fake.serveHTTP))
@@ -127,9 +128,48 @@ func startupDelegationConfig(allowPrivate bool) *config.Config {
 	}
 }
 
+type startupAcceptanceChecker struct{}
+
+func (startupAcceptanceChecker) AcceptanceStands(context.Context, string, string) (bool, error) {
+	return true, nil
+}
+
+func seedStartupFollowedCommunity(t *testing.T, ctx context.Context, conn *sql.DB, groupID, did string) {
+	t.Helper()
+	communities := store.NewCommunities(conn)
+	_, err := communities.UpsertCommunity(ctx, store.Community{
+		APGroupID: groupID, DID: did, PreferredUsername: "followed", Instance: "lemmy.example",
+	})
+	require.NoError(t, err)
+	require.NoError(t, communities.SetFollowState(ctx, groupID, store.FollowStateAccepted))
+}
+
+// seedStartupComment seeds a comment the community announced, under a
+// standing legacy post root in the community's repo.
+func seedStartupComment(t *testing.T, ctx context.Context, conn *sql.DB, actorDID, communityDID, suffix string, indexedAt time.Time) {
+	t.Helper()
+	objects := store.NewAPObjects(conn)
+	root, err := objects.PutMapping(ctx, store.APObjectMapping{
+		APID: "https://lemmy.example/post/" + suffix, APType: "Page", OriginInstance: "lemmy.example",
+		DID: communityDID, Collection: "social.coves.community.post", RKey: "post-" + suffix,
+		CID: "bafyreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	})
+	require.NoError(t, err)
+	_, err = objects.PutMapping(ctx, store.APObjectMapping{
+		APID: "https://lemmy.example/comment/" + suffix, APType: "Note", OriginInstance: "lemmy.example",
+		DID: actorDID, AuthorDID: actorDID, CommunityDID: communityDID, ThreadRootATURI: root.ATURI,
+		Collection: "social.coves.community.comment", RKey: "comment-" + suffix,
+		CID: "bafyreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	})
+	require.NoError(t, err)
+	require.NoError(t, objects.MarkCommunityAnnounced(ctx, "https://lemmy.example/comment/"+suffix))
+	_, err = conn.ExecContext(ctx, `UPDATE ap_objects SET indexed_at = $2 WHERE ap_id = $1`, "https://lemmy.example/comment/"+suffix, indexedAt)
+	require.NoError(t, err)
+}
+
 func TestStartDelegationStartsBackgroundPass(t *testing.T) {
 	conn := testutil.DB(t)
-	testutil.Truncate(t, conn, "bridged_actors")
+	testutil.Truncate(t, conn, "ap_objects", "bridged_actors", "communities")
 	actors := store.NewBridgedActors(conn)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -141,6 +181,11 @@ func TestStartDelegationStartsBackgroundPass(t *testing.T) {
 		ConsentState: store.ConsentStateOK,
 	})
 	require.NoError(t, err)
+	now := time.Now()
+	_, err = conn.ExecContext(ctx, `UPDATE bridged_actors SET created_at = $2 WHERE did = $1`, "did:plc:cmddelegationstart000000001", now)
+	require.NoError(t, err)
+	seedStartupFollowedCommunity(t, ctx, conn, "https://lemmy.example/c/startup", "did:plc:cmddelegationcommunity00001")
+	seedStartupComment(t, ctx, conn, "did:plc:cmddelegationstart000000001", "did:plc:cmddelegationcommunity00001", "startup", now.Add(-2*time.Hour))
 
 	fake := newStartupCloudflareAPI(t, true)
 	type startupResult struct {
@@ -149,7 +194,7 @@ func TestStartDelegationStartsBackgroundPass(t *testing.T) {
 	}
 	returned := make(chan startupResult, 1)
 	go func() {
-		reconciler, err := startDelegation(ctx, startupDelegationConfig(true), actors,
+		reconciler, err := startDelegation(ctx, startupDelegationConfig(true), actors, startupAcceptanceChecker{},
 			fake.server.URL+"/client/v4", testLogger())
 		returned <- startupResult{reconciler, err}
 	}()
@@ -208,7 +253,7 @@ func TestStartDelegationDisabledWithoutToken(t *testing.T) {
 	fake := newStartupCloudflareAPI(t, false)
 	cfg := startupDelegationConfig(true)
 	cfg.CloudflareAPIToken = ""
-	reconciler, err := startDelegation(ctx, cfg, nil, fake.server.URL+"/client/v4", testLogger())
+	reconciler, err := startDelegation(ctx, cfg, nil, startupAcceptanceChecker{}, fake.server.URL+"/client/v4", testLogger())
 	require.NoError(t, err)
 	assert.Nil(t, reconciler)
 	requests, _ := fake.snapshot()
@@ -226,6 +271,91 @@ func (startupLabelSource) ListInstanceLabels(context.Context, string) ([]store.I
 type startupErrorSignal struct {
 	slog.Handler
 	errors chan slog.Record
+}
+
+type startupPassSignal struct {
+	slog.Handler
+	finished chan slog.Record
+}
+
+func (handler startupPassSignal) Handle(ctx context.Context, record slog.Record) error {
+	err := handler.Handler.Handle(ctx, record)
+	if record.Message == "startup delegation pass finished" {
+		handler.finished <- record.Clone()
+	}
+	return err
+}
+
+func TestStartDelegationQualifiesStartupLabels(t *testing.T) {
+	conn := testutil.DB(t)
+	testutil.Truncate(t, conn, "ap_objects", "bridged_actors", "communities")
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	now := time.Now()
+	actors := store.NewBridgedActors(conn)
+	for _, actor := range []struct {
+		label string
+		did   string
+		kind  store.ActorType
+	}{
+		{label: "l", did: "did:plc:cmddelegationlongcontent001", kind: store.ActorTypePerson},
+		{label: "m", did: "did:plc:cmddelegationyoungcontent01", kind: store.ActorTypePerson},
+		{label: "g", did: "did:plc:cmddelegationgroup00000001", kind: store.ActorTypeGroup},
+	} {
+		actorID := "https://lemmy.example/u/" + actor.label
+		if actor.kind == store.ActorTypeGroup {
+			actorID = "https://lemmy.example/c/g"
+		}
+		_, err := actors.UpsertActor(ctx, store.BridgedActor{
+			APActorID: actorID,
+			ActorType: actor.kind, DID: actor.did, Handle: "alice." + actor.label + ".tdpl.example", ConsentState: store.ConsentStateOK,
+		})
+		require.NoError(t, err)
+		_, err = conn.ExecContext(ctx, `UPDATE bridged_actors SET created_at = $2 WHERE did = $1`, actor.did, now)
+		require.NoError(t, err)
+	}
+	seedStartupFollowedCommunity(t, ctx, conn, "https://lemmy.example/c/qualification", "did:plc:cmddelegationfollowed000001")
+	seedStartupFollowedCommunity(t, ctx, conn, "https://lemmy.example/c/g", "did:plc:cmddelegationgroup00000001")
+	seedStartupComment(t, ctx, conn, "did:plc:cmddelegationlongcontent001", "did:plc:cmddelegationfollowed000001", "old", now.Add(-2*time.Hour))
+	seedStartupComment(t, ctx, conn, "did:plc:cmddelegationyoungcontent01", "did:plc:cmddelegationfollowed000001", "young", now.Add(-10*time.Minute))
+
+	fake := newStartupCloudflareAPI(t, false)
+	finished := make(chan slog.Record, 1)
+	logger := slog.New(startupPassSignal{Handler: testLogger().Handler(), finished: finished})
+	reconciler, err := startDelegation(ctx, startupDelegationConfig(true), actors, startupAcceptanceChecker{},
+		fake.server.URL+"/client/v4", logger)
+	require.NoError(t, err)
+	require.NotNil(t, reconciler)
+	var record slog.Record
+	select {
+	case record = <-finished:
+	case <-time.After(5 * time.Second):
+		t.Fatal("startup delegation pass did not finish")
+	}
+	// Drain POST notifications: even a broken pass that creates M must never block the HTTP handler.
+	for {
+		select {
+		case <-fake.post:
+		default:
+			goto drained
+		}
+	}
+drained:
+	requests, unauthorized := fake.snapshot()
+	require.False(t, unauthorized)
+	var names []string
+	for _, request := range requests {
+		if request.Method == http.MethodPost {
+			names = append(names, request.Body["name"].(string))
+		}
+	}
+	require.ElementsMatch(t, []string{"g.tdpl.example", "l.tdpl.example"}, names)
+	pendingCount, ok := attr(record, "pending_count")
+	require.True(t, ok, "startup pass should log pending count")
+	require.Equal(t, int64(1), pendingCount.Int64())
+	pending, ok := attr(record, "pending")
+	require.True(t, ok, "startup pass should log pending labels")
+	require.Equal(t, []string{"m"}, pending.Any())
 }
 
 func (handler startupErrorSignal) Handle(ctx context.Context, record slog.Record) error {
@@ -246,7 +376,7 @@ func TestStartDelegationGuardsPrivateAddresses(t *testing.T) {
 	logger, _ := capturingLogger()
 	errors := make(chan slog.Record, 1)
 	logger = slog.New(startupErrorSignal{Handler: logger.Handler(), errors: errors})
-	reconciler, err := startDelegation(ctx, startupDelegationConfig(false), startupLabelSource{},
+	reconciler, err := startDelegation(ctx, startupDelegationConfig(false), startupLabelSource{}, startupAcceptanceChecker{},
 		fake.server.URL+"/client/v4", logger)
 	require.NoError(t, err)
 	require.NotNil(t, reconciler)

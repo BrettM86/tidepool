@@ -577,7 +577,19 @@ func (h *Handler) materializeContent(ctx context.Context, obj *ap.Object, signer
 	default:
 		return skip(obj.ID, "unsupported content type "+obj.Type)
 	}
-	return err
+	if err != nil || announcer == "" {
+		return err
+	}
+	// Only the community's own Announce makes an object count toward the
+	// delegation bar. The mark goes on after the object is mapped and on the
+	// announced object alone, never its fetched ancestors. An object that first
+	// arrived bare is re-materialized here as a no-op and still gets the mark,
+	// so it counts from the moment the community announces it; a later bare
+	// delivery never clears it.
+	if err := h.objects.MarkCommunityAnnounced(ctx, obj.ID); err != nil {
+		return fmt.Errorf("ingest: mark %s community announced: %w", obj.ID, err)
+	}
+	return nil
 }
 
 // resolveDelivered decides whether a delivered (embedded) object may be

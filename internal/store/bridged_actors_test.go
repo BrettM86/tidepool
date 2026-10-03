@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"testing"
 	"time"
@@ -11,6 +12,107 @@ import (
 
 	"tidepool/internal/errors"
 )
+
+const (
+	qualificationAuthorDID     = "did:plc:000000000000000000000001"
+	qualificationOtherDID      = "did:plc:000000000000000000000002"
+	qualificationCommunityDID  = "did:plc:000000000000000000000003"
+	qualificationUnfollowedDID = "did:plc:000000000000000000000004"
+	qualificationRootAuthorDID = "did:plc:000000000000000000000005"
+)
+
+type qualificationFixture struct {
+	t           *testing.T
+	db          *sql.DB
+	ctx         context.Context
+	actors      BridgedActors
+	communities Communities
+	objects     APObjects
+}
+
+func newQualificationFixture(t *testing.T) *qualificationFixture {
+	t.Helper()
+	db := testDB(t) // Truncates ap_objects, bridged_actors and communities.
+	return &qualificationFixture{t: t, db: db, ctx: context.Background(),
+		actors: NewBridgedActors(db), communities: NewCommunities(db), objects: NewAPObjects(db)}
+}
+
+func qualificationTime(t *testing.T, value string) time.Time {
+	t.Helper()
+	when, err := time.Parse(time.RFC3339, value)
+	require.NoError(t, err)
+	return when
+}
+
+func (f *qualificationFixture) actor(handle, did string, consent ConsentState, createdAt time.Time, actorType ActorType) {
+	f.t.Helper()
+	if consent == "" {
+		consent = ConsentStateOK
+	}
+	apID := "https://lemmy.example/actor/" + handle
+	_, err := f.actors.UpsertActor(f.ctx, BridgedActor{
+		APActorID: apID, ActorType: actorType, DID: did, Handle: handle,
+		ConsentState: ConsentStateOK, SigningKeyEncrypted: []byte("fixture-key"),
+	})
+	require.NoError(f.t, err)
+	if consent != ConsentStateOK {
+		require.NoError(f.t, f.actors.SetConsentState(f.ctx, apID, consent))
+	}
+	_, err = f.db.ExecContext(f.ctx, `UPDATE bridged_actors SET created_at = $2 WHERE ap_actor_id = $1`, apID, createdAt)
+	require.NoError(f.t, err)
+}
+
+func (f *qualificationFixture) community(did string, state FollowState) {
+	f.t.Helper()
+	apID := "https://lemmy.example/group/" + did
+	_, err := f.communities.UpsertCommunity(f.ctx, Community{
+		APGroupID: apID, DID: did, PreferredUsername: "fixture", Instance: "lemmy.example",
+	})
+	require.NoError(f.t, err)
+	require.NoError(f.t, f.communities.SetFollowState(f.ctx, apID, state))
+}
+
+type qualificationMapping struct {
+	name, authorDID, did, collection, communityDID, threadRoot string
+	indexedAt                                                  time.Time
+	deletedAt, publishedAt                                     *time.Time
+	// notAnnounced leaves the row as it would be after a bare delivery or an
+	// ancestor fetch; by default fixtures arrived inside the community's Announce.
+	notAnnounced bool
+}
+
+func (f *qualificationFixture) mapping(row qualificationMapping) *APObjectMapping {
+	f.t.Helper()
+	inserted, err := f.objects.PutMapping(f.ctx, APObjectMapping{
+		APID: "https://lemmy.example/object/" + row.name, APType: "Page", OriginInstance: "lemmy.example",
+		AuthorDID: row.authorDID, DID: row.did, Collection: row.collection, RKey: row.name,
+		CommunityDID: row.communityDID, ThreadRootATURI: row.threadRoot, CID: testCID,
+	})
+	require.NoError(f.t, err)
+	arrival := "community_announced"
+	if row.notAnnounced {
+		arrival = "not_announced"
+	}
+	_, err = f.db.ExecContext(f.ctx, `UPDATE ap_objects SET indexed_at = $2, deleted_at = $3, ap_published_at = $4, arrival = $5 WHERE id = $1`,
+		inserted.ID, row.indexedAt, row.deletedAt, row.publishedAt, arrival)
+	require.NoError(f.t, err)
+	return inserted
+}
+
+func assertQualificationContributions(t *testing.T, got, want []Contribution) {
+	t.Helper()
+	require.Len(t, got, len(want))
+	for index, expected := range want {
+		assert.Equal(t, expected.ATURI, got[index].ATURI)
+		assert.Equal(t, expected.Collection, got[index].Collection)
+		assert.Equal(t, expected.CommunityDID, got[index].CommunityDID)
+		assert.True(t, got[index].IndexedAt.Equal(expected.IndexedAt), "row %d indexed_at: got %s, want %s", index, got[index].IndexedAt, expected.IndexedAt)
+		assert.Equal(t, expected.ID, got[index].ID)
+		assert.Equal(t, expected.RootATURI, got[index].RootATURI)
+		assert.Equal(t, expected.RootCollection, got[index].RootCollection)
+		assert.Equal(t, expected.RootCommunityDID, got[index].RootCommunityDID)
+	}
+}
 
 func TestBridgedActors_UpsertIsIdempotent(t *testing.T) {
 	database := testDB(t)
@@ -344,4 +446,264 @@ func TestBridgedActors_ListInstanceLabels(t *testing.T) {
 		{Label: "c", HasLiveActor: true},
 		{Label: "n", HasLiveActor: true},
 	}, labels)
+}
+
+func TestBridgedActors_ListLabelContributionsFilters(t *testing.T) {
+	cases := []struct {
+		name, handle, indexedAt, collection, publishedAt string
+		consent                                          ConsentState
+		follow                                           FollowState
+		deleted, rootDeleted, notAnnounced, wantRow      bool
+	}{
+		{name: "old comment in followed community", handle: "alice.a.tdpl.example", indexedAt: "2026-09-01T10:00:00Z", wantRow: true},
+		{name: "indexed exactly at cutoff", handle: "alice.a.tdpl.example", indexedAt: "2026-09-01T10:40:00Z", wantRow: true},
+		{name: "nobridge author is live", handle: "alice.a.tdpl.example", indexedAt: "2026-09-01T10:00:00Z", consent: ConsentStateNoBridge, wantRow: true},
+		{name: "ten minutes old", handle: "alice.a.tdpl.example", indexedAt: "2026-09-01T10:50:00Z"},
+		{name: "soft deleted mapping", handle: "alice.a.tdpl.example", indexedAt: "2026-09-01T10:00:00Z", deleted: true},
+		{name: "community not followed", handle: "alice.a.tdpl.example", indexedAt: "2026-09-01T10:00:00Z", follow: FollowStateNone},
+		{name: "deleted author with another live actor on label", handle: "alice.a.tdpl.example", indexedAt: "2026-09-01T10:00:00Z", consent: ConsentStateDeleted},
+		{name: "other label", handle: "alice.b.tdpl.example", indexedAt: "2026-09-01T10:00:00Z"},
+		{name: "unsupported collection", handle: "alice.a.tdpl.example", indexedAt: "2026-09-01T10:00:00Z", collection: "social.coves.feed.vote"},
+		{name: "published before but indexed after cutoff", handle: "alice.a.tdpl.example", indexedAt: "2026-09-01T10:50:00Z", publishedAt: "2026-09-01T10:00:00Z"},
+		{name: "different zone root", handle: "alice.a.foreign.example", indexedAt: "2026-09-01T10:00:00Z"},
+		{name: "extra handle label depth", handle: "alice.a.deep.tdpl.example", indexedAt: "2026-09-01T10:00:00Z"},
+		{name: "not announced by the community", handle: "alice.a.tdpl.example", indexedAt: "2026-09-01T10:00:00Z", notAnnounced: true},
+		{name: "thread root deleted", handle: "alice.a.tdpl.example", indexedAt: "2026-09-01T10:00:00Z", rootDeleted: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newQualificationFixture(t)
+			created := qualificationTime(t, "2026-09-01T09:00:00Z")
+			f.actor(tc.handle, qualificationAuthorDID, tc.consent, created, ActorTypePerson)
+			if tc.consent == ConsentStateDeleted {
+				f.actor("bob.a.tdpl.example", qualificationOtherDID, ConsentStateOK, created, ActorTypePerson)
+			}
+			follow := tc.follow
+			if follow == "" {
+				follow = FollowStateAccepted
+			}
+			f.community(qualificationCommunityDID, follow)
+			collection := tc.collection
+			if collection == "" {
+				collection = "social.coves.community.comment"
+			}
+			var deletedAt, publishedAt *time.Time
+			if tc.deleted {
+				deletedAt = &created
+			}
+			if tc.publishedAt != "" {
+				published := qualificationTime(t, tc.publishedAt)
+				publishedAt = &published
+			}
+			// A comment counts only while its thread root stands. The root's
+			// author has no handle, so the root itself is never a contribution.
+			var rootDeletedAt *time.Time
+			if tc.rootDeleted {
+				rootDeletedAt = &created
+			}
+			root := f.mapping(qualificationMapping{name: "filterroot", authorDID: qualificationRootAuthorDID,
+				did: qualificationCommunityDID, collection: "social.coves.community.post",
+				indexedAt: created, deletedAt: rootDeletedAt})
+			row := f.mapping(qualificationMapping{name: "filtercase", authorDID: qualificationAuthorDID,
+				did: qualificationAuthorDID, collection: collection, communityDID: qualificationCommunityDID, threadRoot: root.ATURI,
+				indexedAt: qualificationTime(t, tc.indexedAt), deletedAt: deletedAt, publishedAt: publishedAt, notAnnounced: tc.notAnnounced})
+			got, err := f.actors.ListLabelContributions(f.ctx, "tdpl.example", "a",
+				qualificationTime(t, "2026-09-01T10:40:00Z"), ContributionCursor{}, 10)
+			require.NoError(t, err)
+			if !tc.wantRow {
+				assert.Empty(t, got)
+				return
+			}
+			assertQualificationContributions(t, got, []Contribution{{
+				ATURI:      "at://did:plc:000000000000000000000001/social.coves.community.comment/filtercase",
+				Collection: "social.coves.community.comment", CommunityDID: "did:plc:000000000000000000000003",
+				IndexedAt: qualificationTime(t, tc.indexedAt), ID: row.ID,
+				RootATURI:      "at://did:plc:000000000000000000000003/social.coves.community.post/filterroot",
+				RootCollection: "social.coves.community.post", RootCommunityDID: "did:plc:000000000000000000000003",
+			}})
+		})
+	}
+}
+
+func TestBridgedActors_ListLabelContributionsResolvesCommunities(t *testing.T) {
+	f := newQualificationFixture(t)
+	indexed := qualificationTime(t, "2026-09-01T10:00:00Z")
+	f.actor("alice.a.tdpl.example", qualificationAuthorDID, ConsentStateOK, indexed, ActorTypePerson)
+	f.community(qualificationCommunityDID, FollowStateAccepted)
+	f.community(qualificationUnfollowedDID, FollowStateNone)
+	postv2Root := f.mapping(qualificationMapping{name: "postv2root", authorDID: qualificationOtherDID,
+		did: qualificationOtherDID, collection: "social.coves.community.postv2", communityDID: qualificationCommunityDID, indexedAt: indexed})
+	legacyRoot := f.mapping(qualificationMapping{name: "legacyroot", authorDID: qualificationOtherDID,
+		did: qualificationCommunityDID, collection: "social.coves.community.post", indexedAt: indexed})
+	unfollowedRoot := f.mapping(qualificationMapping{name: "unfollowedroot", authorDID: qualificationOtherDID,
+		did: qualificationOtherDID, collection: "social.coves.community.postv2", communityDID: qualificationUnfollowedDID, indexedAt: indexed})
+	deletedRoot := f.mapping(qualificationMapping{name: "deletedroot", authorDID: qualificationOtherDID,
+		did: qualificationOtherDID, collection: "social.coves.community.postv2", communityDID: qualificationCommunityDID,
+		indexedAt: indexed, deletedAt: &indexed})
+	cases := []struct {
+		name, did, collection, communityDID, root, atURI string
+		rootCollection, rootCommunityDID                 string
+		want                                             bool
+	}{
+		{name: "postv2", did: qualificationAuthorDID, collection: "social.coves.community.postv2", communityDID: qualificationCommunityDID,
+			atURI: "at://did:plc:000000000000000000000001/social.coves.community.postv2/postv2", want: true},
+		{name: "legacy", did: qualificationCommunityDID, collection: "social.coves.community.post",
+			atURI: "at://did:plc:000000000000000000000003/social.coves.community.post/legacy", want: true},
+		{name: "postv2 root fallback", did: qualificationAuthorDID, collection: "social.coves.community.comment", root: postv2Root.ATURI,
+			atURI:          "at://did:plc:000000000000000000000001/social.coves.community.comment/postv2rootfallback",
+			rootCollection: "social.coves.community.postv2", rootCommunityDID: "did:plc:000000000000000000000003", want: true},
+		{name: "legacy root fallback", did: qualificationAuthorDID, collection: "social.coves.community.comment", root: legacyRoot.ATURI,
+			atURI:          "at://did:plc:000000000000000000000001/social.coves.community.comment/legacyrootfallback",
+			rootCollection: "social.coves.community.post", rootCommunityDID: "did:plc:000000000000000000000003", want: true},
+		{name: "own community takes precedence", did: qualificationAuthorDID, collection: "social.coves.community.comment", communityDID: qualificationCommunityDID, root: unfollowedRoot.ATURI,
+			atURI:          "at://did:plc:000000000000000000000001/social.coves.community.comment/owncommunitytakesprecedence",
+			rootCollection: "social.coves.community.postv2", rootCommunityDID: "did:plc:000000000000000000000004", want: true},
+		{name: "missing root", did: qualificationAuthorDID, collection: "social.coves.community.comment", root: "at://did:plc:000000000000000000000002/social.coves.community.postv2/missing",
+			atURI: "at://did:plc:000000000000000000000001/social.coves.community.comment/missingroot"},
+		{name: "missing root with own community", did: qualificationAuthorDID, collection: "social.coves.community.comment", communityDID: qualificationCommunityDID,
+			root:  "at://did:plc:000000000000000000000002/social.coves.community.postv2/missing",
+			atURI: "at://did:plc:000000000000000000000001/social.coves.community.comment/missingrootowncommunity"},
+		{name: "deleted root with own community", did: qualificationAuthorDID, collection: "social.coves.community.comment", communityDID: qualificationCommunityDID,
+			root: deletedRoot.ATURI, atURI: "at://did:plc:000000000000000000000001/social.coves.community.comment/deletedrootowncommunity"},
+	}
+	var want []Contribution
+	for _, tc := range cases {
+		// Names are stable record keys; expected AT-URIs are independent literals.
+		key := map[string]string{"postv2 root fallback": "postv2rootfallback", "legacy root fallback": "legacyrootfallback",
+			"own community takes precedence": "owncommunitytakesprecedence", "missing root": "missingroot",
+			"missing root with own community": "missingrootowncommunity", "deleted root with own community": "deletedrootowncommunity"}[tc.name]
+		if key == "" {
+			key = tc.name
+		}
+		row := f.mapping(qualificationMapping{name: key, authorDID: qualificationAuthorDID,
+			did: tc.did, collection: tc.collection, communityDID: tc.communityDID, threadRoot: tc.root, indexedAt: indexed})
+		if tc.want {
+			want = append(want, Contribution{ATURI: tc.atURI, Collection: tc.collection,
+				CommunityDID: "did:plc:000000000000000000000003", IndexedAt: indexed, ID: row.ID,
+				RootATURI: tc.root, RootCollection: tc.rootCollection, RootCommunityDID: tc.rootCommunityDID})
+		}
+	}
+	got, err := f.actors.ListLabelContributions(f.ctx, "tdpl.example", "a", qualificationTime(t, "2026-09-01T11:00:00Z"), ContributionCursor{}, 20)
+	require.NoError(t, err)
+	assertQualificationContributions(t, got, want)
+}
+
+func TestBridgedActors_ListLabelContributionsKeysetPages(t *testing.T) {
+	f := newQualificationFixture(t)
+	indexed := qualificationTime(t, "2026-09-01T10:00:00Z")
+	f.actor("alice.a.tdpl.example", qualificationAuthorDID, ConsentStateOK, indexed, ActorTypePerson)
+	f.community(qualificationCommunityDID, FollowStateAccepted)
+	times := []string{"2026-09-01T10:00:00Z", "2026-09-01T10:01:00Z", "2026-09-01T10:01:00Z", "2026-09-01T10:02:00Z", "2026-09-01T10:03:00Z"}
+	uri := []string{
+		"at://did:plc:000000000000000000000001/social.coves.community.comment/pageone",
+		"at://did:plc:000000000000000000000001/social.coves.community.comment/pagetwo",
+		"at://did:plc:000000000000000000000001/social.coves.community.comment/pagethree",
+		"at://did:plc:000000000000000000000001/social.coves.community.comment/pagefour",
+		"at://did:plc:000000000000000000000001/social.coves.community.comment/pagefive",
+	}
+	keys := []string{"pageone", "pagetwo", "pagethree", "pagefour", "pagefive"}
+	root := f.mapping(qualificationMapping{name: "pageroot", authorDID: qualificationRootAuthorDID, did: qualificationCommunityDID,
+		collection: "social.coves.community.post", indexedAt: indexed})
+	var want []Contribution
+	for i, key := range keys {
+		when := qualificationTime(t, times[i])
+		row := f.mapping(qualificationMapping{name: key, authorDID: qualificationAuthorDID, did: qualificationAuthorDID,
+			collection: "social.coves.community.comment", communityDID: qualificationCommunityDID, threadRoot: root.ATURI, indexedAt: when})
+		want = append(want, Contribution{ATURI: uri[i], Collection: "social.coves.community.comment",
+			CommunityDID: "did:plc:000000000000000000000003", IndexedAt: when, ID: row.ID,
+			RootATURI:      "at://did:plc:000000000000000000000003/social.coves.community.post/pageroot",
+			RootCollection: "social.coves.community.post", RootCommunityDID: "did:plc:000000000000000000000003"})
+	}
+	cursor := ContributionCursor{}
+	for page, expected := range [][]Contribution{want[:2], want[2:4], want[4:]} {
+		got, err := f.actors.ListLabelContributions(f.ctx, "tdpl.example", "a", qualificationTime(t, "2026-09-01T11:00:00Z"), cursor, 2)
+		require.NoError(t, err, "page %d", page+1)
+		assertQualificationContributions(t, got, expected)
+		cursor = ContributionCursor{IndexedAt: got[len(got)-1].IndexedAt, ID: got[len(got)-1].ID}
+	}
+	got, err := f.actors.ListLabelContributions(f.ctx, "tdpl.example", "a", qualificationTime(t, "2026-09-01T11:00:00Z"), cursor, 2)
+	require.NoError(t, err)
+	assert.Empty(t, got)
+}
+
+func TestBridgedActors_ListOutrightQualifiedLabelsFollowedCommunity(t *testing.T) {
+	cases := []struct {
+		name            string
+		follow          FollowState
+		consent         ConsentState
+		requested, want bool
+	}{
+		{name: "accepted", follow: FollowStateAccepted, consent: ConsentStateOK, requested: true, want: true},
+		{name: "pending", follow: FollowStatePending, consent: ConsentStateOK, requested: true},
+		{name: "none", follow: FollowStateNone, consent: ConsentStateOK, requested: true},
+		{name: "deleted community actor", follow: FollowStateAccepted, consent: ConsentStateDeleted, requested: true},
+		{name: "unrequested label", follow: FollowStateAccepted, consent: ConsentStateOK},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newQualificationFixture(t)
+			created := qualificationTime(t, "2026-10-04T10:00:00Z")
+			f.actor("group.a.tdpl.example", qualificationCommunityDID, tc.consent, created, ActorTypeGroup)
+			f.community(qualificationCommunityDID, tc.follow)
+			labels := []string{"other"}
+			if tc.requested {
+				labels = []string{"a"}
+			}
+			got, err := f.actors.ListOutrightQualifiedLabels(f.ctx, "tdpl.example", labels,
+				qualificationTime(t, "2026-10-03T00:00:00Z"))
+			require.NoError(t, err)
+			if !tc.want {
+				assert.Empty(t, got)
+				return
+			}
+			require.Len(t, got, 1)
+			assert.Equal(t, "a", got[0].Label)
+			assert.True(t, got[0].QualifiedAt.Equal(created), "qualified_at: got %s, want %s", got[0].QualifiedAt, created)
+		})
+	}
+}
+
+func TestBridgedActors_ListOutrightQualifiedLabelsGrandfather(t *testing.T) {
+	cases := []struct {
+		name                        string
+		firstCreated, secondCreated string
+		firstConsent                ConsentState
+		secondFollow                FollowState
+		wantAt                      string
+	}{
+		{name: "before cutoff", firstCreated: "2026-10-02T23:00:00Z", wantAt: "2026-10-02T23:00:00Z"},
+		{name: "equal cutoff", firstCreated: "2026-10-03T00:00:00Z"},
+		{name: "after cutoff", firstCreated: "2026-10-03T01:00:00Z"},
+		{name: "deleted old actor with live post-cutoff actor", firstCreated: "2026-10-02T23:00:00Z", firstConsent: ConsentStateDeleted,
+			secondCreated: "2026-10-04T10:00:00Z"},
+		{name: "earlier grandfather and later followed community", firstCreated: "2026-10-02T23:00:00Z",
+			secondCreated: "2026-10-04T10:00:00Z", secondFollow: FollowStateAccepted, wantAt: "2026-10-02T23:00:00Z"},
+		{name: "earliest unqualified actor before later followed community", firstCreated: "2026-10-03T01:00:00Z",
+			secondCreated: "2026-10-04T10:00:00Z", secondFollow: FollowStateAccepted, wantAt: "2026-10-04T10:00:00Z"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newQualificationFixture(t)
+			f.actor("alice.a.tdpl.example", qualificationAuthorDID, tc.firstConsent,
+				qualificationTime(t, tc.firstCreated), ActorTypePerson)
+			if tc.secondCreated != "" {
+				f.actor("group.a.tdpl.example", qualificationCommunityDID, ConsentStateOK,
+					qualificationTime(t, tc.secondCreated), ActorTypeGroup)
+				if tc.secondFollow != "" {
+					f.community(qualificationCommunityDID, tc.secondFollow)
+				}
+			}
+			got, err := f.actors.ListOutrightQualifiedLabels(f.ctx, "tdpl.example", []string{"a"},
+				qualificationTime(t, "2026-10-03T00:00:00Z"))
+			require.NoError(t, err)
+			if tc.wantAt == "" {
+				assert.Empty(t, got)
+				return
+			}
+			require.Len(t, got, 1, "a must occur once even with two qualifying actors")
+			assert.Equal(t, "a", got[0].Label)
+			want := qualificationTime(t, tc.wantAt)
+			assert.True(t, got[0].QualifiedAt.Equal(want), "qualified_at: got %s, want %s", got[0].QualifiedAt, want)
+		})
+	}
 }

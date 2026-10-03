@@ -527,3 +527,29 @@ type InstanceLabel struct {
 	Label        string
 	HasLiveActor bool
 }
+
+// ContributionCursor identifies the last contribution in a keyset page; its zero value starts at the beginning.
+type ContributionCursor struct {
+	IndexedAt time.Time
+	ID        int64
+}
+
+// Contribution is a live bridged record in a followed community, dated by its local index time.
+// For a comment, the Root fields describe its thread root, which exists and is not deleted;
+// they are empty for posts.
+type Contribution struct {
+	ATURI            string
+	Collection       string
+	CommunityDID     string
+	IndexedAt        time.Time
+	ID               int64
+	RootATURI        string
+	RootCollection   string
+	RootCommunityDID string
+}
+
+// OutrightQualification records the earliest qualifying actor creation time for a label.
+type OutrightQualification struct {
+	Label       string
+	QualifiedAt time.Time
+}

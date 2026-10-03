@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"time"
 
 	"tidepool/internal/store"
 )
@@ -17,23 +18,47 @@ type LabelSource interface {
 	ListInstanceLabels(ctx context.Context, zoneRoot string) ([]store.InstanceLabel, error)
 }
 
+const (
+	minimumStandingAge            = time.Hour
+	contributionCandidatePageSize = 100
+)
+
+var grandfatherCutoff = time.Date(2026, 10, 3, 0, 0, 0, 0, time.UTC)
+
+// ContributionSource lists candidates and outright qualifications for live labels.
+type ContributionSource interface {
+	ListLabelContributions(ctx context.Context, zoneRoot, label string, cutoff time.Time, after store.ContributionCursor, limit int) ([]store.Contribution, error)
+	ListOutrightQualifiedLabels(ctx context.Context, zoneRoot string, labels []string, grandfatherCutoff time.Time) ([]store.OutrightQualification, error)
+}
+
+// AcceptanceChecker checks whether a postv2's community acceptance still stands.
+type AcceptanceChecker interface {
+	AcceptanceStands(ctx context.Context, communityDID, subjectURI string) (bool, error)
+}
+
 // Options configures a delegation reconciler for a DNS zone.
 type Options struct {
-	Client      *CloudflareClient
-	Labels      LabelSource
-	ZoneRoot    string
-	Nameservers []string
-	Logger      *slog.Logger
+	Client        *CloudflareClient
+	Labels        LabelSource
+	ZoneRoot      string
+	Nameservers   []string
+	Logger        *slog.Logger
+	Contributions ContributionSource
+	Acceptances   AcceptanceChecker
+	Now           func() time.Time
 }
 
 // Reconciler compares bridged instance labels with Cloudflare NS records and
 // creates missing delegations without modifying existing records.
 type Reconciler struct {
-	client      *CloudflareClient
-	labels      LabelSource
-	zoneRoot    string
-	nameservers []string
-	logger      *slog.Logger
+	client        *CloudflareClient
+	labels        LabelSource
+	contributions ContributionSource
+	acceptances   AcceptanceChecker
+	now           func() time.Time
+	zoneRoot      string
+	nameservers   []string
+	logger        *slog.Logger
 }
 
 func normalizeDNSName(name string) string {
@@ -42,8 +67,8 @@ func normalizeDNSName(name string) string {
 
 // NewReconciler validates options and normalizes the zone and nameservers.
 func NewReconciler(options Options) (*Reconciler, error) {
-	if options.Client == nil || options.Labels == nil || normalizeDNSName(options.ZoneRoot) == "" || len(options.Nameservers) == 0 {
-		return nil, fmt.Errorf("delegation client, label source, zone root and nameservers are required")
+	if options.Client == nil || options.Labels == nil || options.Contributions == nil || options.Acceptances == nil || normalizeDNSName(options.ZoneRoot) == "" || len(options.Nameservers) == 0 {
+		return nil, fmt.Errorf("delegation client, label source, contribution source, acceptance checker, zone root and nameservers are required")
 	}
 	nameservers := make([]string, len(options.Nameservers))
 	for index, nameserver := range options.Nameservers {
@@ -56,8 +81,13 @@ func NewReconciler(options Options) (*Reconciler, error) {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
+	now := options.Now
+	if now == nil {
+		now = time.Now
+	}
 	return &Reconciler{
 		client: options.Client, labels: options.Labels, zoneRoot: normalizeDNSName(options.ZoneRoot),
+		contributions: options.Contributions, acceptances: options.Acceptances, now: now,
 		nameservers: nameservers, logger: logger,
 	}, nil
 }
@@ -72,11 +102,13 @@ type Result struct {
 	// Conflicting contains labels with foreign NS records, including labels
 	// that also have a configured NS record.
 	Conflicting []Conflict
-	// Failed contains live labels whose NS record could not be created.
+	// Failed contains live labels whose qualification or NS creation failed.
 	Failed []Failure
 	// DelegatedWithoutLiveActors contains labels with configured NS records
 	// but no live actors and no foreign NS records.
 	DelegatedWithoutLiveActors []string
+	// Pending contains live labels without a standing contribution or outright qualification.
+	Pending []string
 }
 
 // Conflict identifies a label and the foreign nameservers in its NS records.
@@ -91,9 +123,8 @@ type Failure struct {
 	Reason string
 }
 
-// Reconcile lists all instance labels and zone NS records, then creates only
-// the missing delegations for live labels. It reports create failures after
-// attempting the remaining labels.
+// Reconcile lists labels and zone NS records, qualifies eligible live labels,
+// then creates their missing delegations. Per-label failures do not stop the pass.
 func (r *Reconciler) Reconcile(ctx context.Context) (Result, error) {
 	var result Result
 	labels, err := r.labels.ListInstanceLabels(ctx, r.zoneRoot)
@@ -153,6 +184,25 @@ func (r *Reconciler) Reconcile(ctx context.Context) (Result, error) {
 		orderedLabels = append(orderedLabels, label)
 	}
 	sort.Strings(orderedLabels)
+	var eligible []string
+	for _, label := range orderedLabels {
+		state := delegations[label]
+		if liveLabels[label] && (state == nil || !state.delegated && len(state.foreign) == 0) {
+			eligible = append(eligible, label)
+		}
+	}
+	// Keep the qualification timestamp internally for task 08's ordering.
+	qualifiedAt := make(map[string]time.Time, len(eligible))
+	if len(eligible) > 0 {
+		outright, err := r.contributions.ListOutrightQualifiedLabels(ctx, r.zoneRoot, eligible, grandfatherCutoff)
+		if err != nil {
+			return result, fmt.Errorf("list outright qualified labels for %s: %w", r.zoneRoot, err)
+		}
+		for _, entry := range outright {
+			qualifiedAt[entry.Label] = entry.QualifiedAt
+		}
+	}
+	cutoff := r.now().Add(-minimumStandingAge)
 	var failures []error
 	for _, label := range orderedLabels {
 		state := delegations[label]
@@ -176,6 +226,21 @@ func (r *Reconciler) Reconcile(ctx context.Context) (Result, error) {
 		if !liveLabels[label] {
 			continue
 		}
+		if _, qualified := qualifiedAt[label]; !qualified {
+			standingAt, stands, err := r.firstStandingContribution(ctx, label, cutoff)
+			if err != nil {
+				failure := fmt.Errorf("qualify label %s: %w", label, err)
+				result.Failed = append(result.Failed, Failure{Label: label, Reason: failure.Error()})
+				failures = append(failures, failure)
+				r.logger.ErrorContext(ctx, "delegation qualification failed", "label", label, "error", failure)
+				continue
+			}
+			if !stands {
+				result.Pending = append(result.Pending, label)
+				continue
+			}
+			qualifiedAt[label] = standingAt
+		}
 		if err := r.client.createRecord(ctx, label+"."+r.zoneRoot, r.nameservers[0]); err != nil {
 			result.Failed = append(result.Failed, Failure{Label: label, Reason: err.Error()})
 			failures = append(failures, err)
@@ -185,6 +250,61 @@ func (r *Reconciler) Reconcile(ctx context.Context) (Result, error) {
 		result.Created = append(result.Created, label)
 	}
 	r.logger.InfoContext(ctx, "delegation pass complete", "created", len(result.Created), "already_delegated", len(result.AlreadyDelegated),
-		"conflicting", len(result.Conflicting), "failed", len(result.Failed), "delegated_without_live_actors", len(result.DelegatedWithoutLiveActors))
+		"conflicting", len(result.Conflicting), "failed", len(result.Failed), "pending", len(result.Pending),
+		"delegated_without_live_actors", len(result.DelegatedWithoutLiveActors))
 	return result, errors.Join(failures...)
+}
+
+// firstStandingContribution pages until a candidate stands or the source runs out.
+func (r *Reconciler) firstStandingContribution(ctx context.Context, label string, cutoff time.Time) (time.Time, bool, error) {
+	var cursor store.ContributionCursor
+	for {
+		candidates, err := r.contributions.ListLabelContributions(ctx, r.zoneRoot, label, cutoff, cursor, contributionCandidatePageSize)
+		if err != nil {
+			return time.Time{}, false, fmt.Errorf("list contributions: %w", err)
+		}
+		for _, candidate := range candidates {
+			stands, err := r.contributionStands(ctx, candidate)
+			if err != nil {
+				return time.Time{}, false, err
+			}
+			if stands {
+				return candidate.IndexedAt, true, nil
+			}
+		}
+		if len(candidates) < contributionCandidatePageSize {
+			return time.Time{}, false, nil
+		}
+		last := candidates[len(candidates)-1]
+		cursor = store.ContributionCursor{IndexedAt: last.IndexedAt, ID: last.ID}
+	}
+}
+
+// contributionStands reports whether a candidate is still visible. A postv2
+// needs its community's acceptance; a comment counts only while its thread
+// root stands, so a comment under a postv2 root needs the root's acceptance in
+// the root's community. Legacy posts and their comments have no acceptance.
+func (r *Reconciler) contributionStands(ctx context.Context, candidate store.Contribution) (bool, error) {
+	switch candidate.Collection {
+	case "social.coves.community.post":
+		return true, nil
+	case "social.coves.community.postv2":
+		return r.acceptanceStands(ctx, candidate.CommunityDID, candidate.ATURI)
+	case "social.coves.community.comment":
+		switch candidate.RootCollection {
+		case "social.coves.community.post":
+			return true, nil
+		case "social.coves.community.postv2":
+			return r.acceptanceStands(ctx, candidate.RootCommunityDID, candidate.RootATURI)
+		}
+	}
+	return false, nil
+}
+
+func (r *Reconciler) acceptanceStands(ctx context.Context, communityDID, subjectURI string) (bool, error) {
+	stands, err := r.acceptances.AcceptanceStands(ctx, communityDID, subjectURI)
+	if err != nil {
+		return false, fmt.Errorf("check acceptance for %s: %w", subjectURI, err)
+	}
+	return stands, nil
 }

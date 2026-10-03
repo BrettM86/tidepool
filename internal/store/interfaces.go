@@ -140,6 +140,12 @@ type APObjects interface {
 	// deleted_at is set). Restoring a live mapping is a no-op success; a
 	// missing mapping is an error satisfying errors.IsNotFound.
 	Restore(ctx context.Context, apID string) error
+
+	// MarkCommunityAnnounced records that a followed community's own Announce
+	// carried the object. The mark is one-way: nothing clears it, and
+	// PutMapping upserts leave it alone. A missing mapping is an error
+	// satisfying errors.IsNotFound.
+	MarkCommunityAnnounced(ctx context.Context, apID string) error
 }
 
 // BridgedActors registers fediverse actors bridged into atproto and their
@@ -185,6 +191,10 @@ type BridgedActors interface {
 	// ListInstanceLabels returns distinct second-label instances under zoneRoot,
 	// including labels whose actors are all deleted (HasLiveActor=false).
 	ListInstanceLabels(ctx context.Context, zoneRoot string) ([]InstanceLabel, error)
+
+	ListLabelContributions(ctx context.Context, zoneRoot, label string, cutoff time.Time, after ContributionCursor, limit int) ([]Contribution, error)
+
+	ListOutrightQualifiedLabels(ctx context.Context, zoneRoot string, labels []string, grandfatherCutoff time.Time) ([]OutrightQualification, error)
 }
 
 // APActors persists the ActivityPub identities Coves users get on the user

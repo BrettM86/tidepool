@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/indigo/atproto/syntax"
+	"github.com/lib/pq"
 
 	"tidepool/internal/errors"
 )
@@ -224,13 +225,12 @@ func scanBridgedActor(row rowScanner) (*BridgedActor, error) {
 // ListInstanceLabels returns each instance label under zoneRoot and whether it
 // has at least one actor that has not been deleted.
 func (r *postgresBridgedActors) ListInstanceLabels(ctx context.Context, zoneRoot string) ([]InstanceLabel, error) {
-	root := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(zoneRoot)), ".")
-	const query = `
+	root := normalizeZoneRoot(zoneRoot)
+	query := `
 		SELECT split_part(lower(handle), '.', 2) AS label,
 		       bool_or(consent_state <> $2) AS has_live_actor
 		FROM bridged_actors
-		WHERE right(lower(handle), length($1) + 1) = '.' || $1
-		  AND cardinality(string_to_array(lower(handle), '.')) = cardinality(string_to_array($1, '.')) + 2
+		WHERE ` + instanceHandleScope + `
 		GROUP BY label
 		ORDER BY label`
 	rows, err := r.db.QueryContext(ctx, query, root, string(ConsentStateDeleted))
@@ -250,4 +250,114 @@ func (r *postgresBridgedActors) ListInstanceLabels(ctx context.Context, zoneRoot
 		return nil, fmt.Errorf("read instance labels under %q: %w", root, err)
 	}
 	return labels, nil
+}
+
+// instanceHandleScope is shared by all label queries so the suffix and exact
+// handle depth agree with ListInstanceLabels even for multi-label zone roots.
+const instanceHandleScope = `right(lower(handle), length($1) + 1) = '.' || $1
+	AND cardinality(string_to_array(lower(handle), '.')) = cardinality(string_to_array($1, '.')) + 2`
+
+func normalizeZoneRoot(zoneRoot string) string {
+	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(zoneRoot)), ".")
+}
+
+func (r *postgresBridgedActors) ListLabelContributions(ctx context.Context, zoneRoot, label string, cutoff time.Time, after ContributionCursor, limit int) ([]Contribution, error) {
+	root := normalizeZoneRoot(zoneRoot)
+	// The zero cursor has no timestamp in Postgres; NULL bypasses the keyset
+	// predicate only for the first page.
+	var cursorTime any
+	if !after.IndexedAt.IsZero() {
+		cursorTime = after.IndexedAt
+	}
+	query := `
+		SELECT object.at_uri, object.collection, community.did, object.indexed_at, object.id,
+		       thread_root.at_uri, thread_root.collection,
+		       CASE WHEN thread_root.collection = 'social.coves.community.post'
+		            THEN thread_root.did ELSE NULLIF(thread_root.community_did, '') END
+		FROM bridged_actors
+		JOIN ap_objects AS object ON object.author_did = bridged_actors.did
+		LEFT JOIN ap_objects AS thread_root ON thread_root.at_uri = object.thread_root_at_uri
+		JOIN communities AS community ON community.did =
+			CASE
+				WHEN object.collection = 'social.coves.community.post' THEN object.did
+				WHEN object.collection = 'social.coves.community.comment' THEN
+					COALESCE(NULLIF(object.community_did, ''),
+						CASE WHEN thread_root.collection = 'social.coves.community.post'
+							THEN thread_root.did ELSE NULLIF(thread_root.community_did, '') END)
+				ELSE NULLIF(object.community_did, '')
+			END
+			AND community.follow_state = 'accepted'
+		WHERE ` + instanceHandleScope + `
+		  AND split_part(lower(handle), '.', 2) = $3
+		  AND bridged_actors.consent_state <> $2
+		  AND object.deleted_at IS NULL
+		  AND object.arrival = 'community_announced'
+		  -- A comment counts only while its thread root stands: removing a thread
+		  -- hides its comments without a per-comment delete. A root that was never
+		  -- mapped cannot be shown to stand. The caller checks a postv2 root's
+		  -- acceptance, which this table does not record.
+		  AND (object.collection <> 'social.coves.community.comment'
+		       OR (thread_root.id IS NOT NULL AND thread_root.deleted_at IS NULL))
+		  AND object.collection IN ('social.coves.community.post', 'social.coves.community.postv2', 'social.coves.community.comment')
+		  AND object.indexed_at <= $4
+		  AND ($5::timestamptz IS NULL OR (object.indexed_at, object.id) > ($5::timestamptz, $6))
+		ORDER BY object.indexed_at, object.id
+		LIMIT $7`
+	rows, err := r.db.QueryContext(ctx, query, root, string(ConsentStateDeleted), label, cutoff, cursorTime, after.ID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list contributions for label %q under %q: %w", label, root, err)
+	}
+	defer rows.Close()
+	var contributions []Contribution
+	for rows.Next() {
+		var contribution Contribution
+		var rootATURI, rootCollection, rootCommunityDID sql.NullString
+		if err := rows.Scan(&contribution.ATURI, &contribution.Collection, &contribution.CommunityDID, &contribution.IndexedAt, &contribution.ID,
+			&rootATURI, &rootCollection, &rootCommunityDID); err != nil {
+			return nil, fmt.Errorf("scan contributions for label %q under %q: %w", label, root, err)
+		}
+		contribution.RootATURI, contribution.RootCollection, contribution.RootCommunityDID =
+			rootATURI.String, rootCollection.String, rootCommunityDID.String
+		contributions = append(contributions, contribution)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read contributions for label %q under %q: %w", label, root, err)
+	}
+	return contributions, nil
+}
+
+func (r *postgresBridgedActors) ListOutrightQualifiedLabels(ctx context.Context, zoneRoot string, labels []string, grandfatherCutoff time.Time) ([]OutrightQualification, error) {
+	if len(labels) == 0 {
+		return nil, nil
+	}
+	root := normalizeZoneRoot(zoneRoot)
+	query := `
+		SELECT split_part(lower(handle), '.', 2) AS label, MIN(bridged_actors.created_at)
+		FROM bridged_actors
+		WHERE ` + instanceHandleScope + `
+		  AND bridged_actors.consent_state <> $2
+		  AND split_part(lower(handle), '.', 2) = ANY($3::text[])
+		  AND (bridged_actors.created_at < $4 OR EXISTS (
+			SELECT 1 FROM communities
+			WHERE communities.did = bridged_actors.did AND communities.follow_state = 'accepted'
+		  ))
+		GROUP BY label
+		ORDER BY label`
+	rows, err := r.db.QueryContext(ctx, query, root, string(ConsentStateDeleted), pq.Array(labels), grandfatherCutoff)
+	if err != nil {
+		return nil, fmt.Errorf("list outright qualified labels under %q: %w", root, err)
+	}
+	defer rows.Close()
+	var qualified []OutrightQualification
+	for rows.Next() {
+		var entry OutrightQualification
+		if err := rows.Scan(&entry.Label, &entry.QualifiedAt); err != nil {
+			return nil, fmt.Errorf("scan outright qualified labels under %q: %w", root, err)
+		}
+		qualified = append(qualified, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read outright qualified labels under %q: %w", root, err)
+	}
+	return qualified, nil
 }

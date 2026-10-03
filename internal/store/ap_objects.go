@@ -248,6 +248,22 @@ func (r *postgresAPObjects) Restore(ctx context.Context, apID string) error {
 	return nil
 }
 
+func (r *postgresAPObjects) MarkCommunityAnnounced(ctx context.Context, apID string) error {
+	result, err := r.db.ExecContext(ctx,
+		`UPDATE ap_objects SET arrival = 'community_announced' WHERE ap_id = $1`, apID)
+	if err != nil {
+		return fmt.Errorf("mark ap_object %q community announced: %w", apID, err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("mark ap_object %q community announced: rows affected: %w", apID, err)
+	}
+	if affected == 0 {
+		return errors.NewNotFoundError("ap_object", apID)
+	}
+	return nil
+}
+
 // validateMapping checks the atproto identifiers with indigo's syntax
 // package, defaults Origin to fediverse, and derives ATURI from
 // (DID, Collection, RKey).

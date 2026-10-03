@@ -23,6 +23,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"tidepool/internal/accept"
+	"tidepool/internal/acceptrec"
 	"tidepool/internal/ap"
 	"tidepool/internal/config"
 	"tidepool/internal/consume"
@@ -277,9 +278,6 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	if _, err := startDelegation(ctx, cfg, actors, delegation.CloudflareAPIBaseURL, logger); err != nil {
-		return fmt.Errorf("delegation: %w", err)
-	}
 	router.Get("/xrpc/com.atproto.identity.resolveHandle", identity.ResolveHandleHandler(resolver, logger))
 	router.Get("/.well-known/atproto-did", identity.WellKnownDIDHandler(resolver, logger))
 	// Cert-issuance gate for TLS-terminating proxies with on-demand
@@ -301,6 +299,9 @@ func run(logger *slog.Logger) error {
 		repo.WithTreeCacheSize(cfg.MSTCacheSize))
 	if err != nil {
 		return err
+	}
+	if _, err := startDelegation(ctx, cfg, actors, repoAcceptanceChecker{repos: repoManager}, delegation.CloudflareAPIBaseURL, logger); err != nil {
+		return fmt.Errorf("delegation: %w", err)
 	}
 	broadcaster, err := tidepoolsync.NewBroadcaster(cfg.DatabaseURL, 0, logger)
 	if err != nil {
@@ -1048,9 +1049,18 @@ func startDNSServer(ctx context.Context, cfg *config.Config, resolver identity.R
 	return serveErrors, nil
 }
 
+// repoAcceptanceChecker reads standing acceptances from the community repos.
+type repoAcceptanceChecker struct {
+	repos *repo.Manager
+}
+
+func (checker repoAcceptanceChecker) AcceptanceStands(ctx context.Context, communityDID, subjectURI string) (bool, error) {
+	return acceptrec.AcceptanceStands(ctx, checker.repos, communityDID, subjectURI)
+}
+
 // startDelegation starts one asynchronous delegation pass when a Cloudflare
 // token is configured, returning the reconciler without waiting for the pass.
-func startDelegation(ctx context.Context, cfg *config.Config, actors store.BridgedActors, cloudflareBaseURL string, logger *slog.Logger) (*delegation.Reconciler, error) {
+func startDelegation(ctx context.Context, cfg *config.Config, actors store.BridgedActors, acceptances delegation.AcceptanceChecker, cloudflareBaseURL string, logger *slog.Logger) (*delegation.Reconciler, error) {
 	if cfg.CloudflareAPIToken == "" {
 		return nil, nil
 	}
@@ -1065,7 +1075,7 @@ func startDelegation(ctx context.Context, cfg *config.Config, actors store.Bridg
 	}
 	reconciler, err := delegation.NewReconciler(delegation.Options{
 		Client: client, Labels: actors, ZoneRoot: cfg.BridgeHostname,
-		Nameservers: cfg.DNSNameservers, Logger: logger,
+		Nameservers: cfg.DNSNameservers, Logger: logger, Contributions: actors, Acceptances: acceptances,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create delegation reconciler: %w", err)
@@ -1076,6 +1086,7 @@ func startDelegation(ctx context.Context, cfg *config.Config, actors store.Bridg
 			"created_count", len(result.Created), "created", result.Created,
 			"already_delegated_count", len(result.AlreadyDelegated),
 			"conflicting_count", len(result.Conflicting), "conflicting", result.Conflicting,
+			"pending_count", len(result.Pending), "pending", result.Pending,
 			"failed_count", len(result.Failed), "failed", result.Failed,
 			"delegated_without_live_actors_count", len(result.DelegatedWithoutLiveActors))
 		if err != nil {

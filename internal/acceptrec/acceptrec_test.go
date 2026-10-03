@@ -201,3 +201,46 @@ func TestAcceptSubject_RedeliveryRePutsNoOpButStillRunsSideEffect(t *testing.T) 
 		"the side effect must run AGAIN on the redelivery even though the record did not change: "+
 			"the outbound enqueue is at-least-once and dedupe is the peer's job")
 }
+
+func TestAcceptanceStandsAfterAcceptRemoveAndNeverAccepted(t *testing.T) {
+	repos, _ := newRepos(t)
+	ctx := context.Background()
+
+	_, err := AcceptSubject(ctx, repos, arCommunityDID, arPostURI, arPostCID, arPublishedAt, nil)
+	require.NoError(t, err)
+	t.Run("accepted subject stands", func(t *testing.T) {
+		stands, err := AcceptanceStands(ctx, repos, arCommunityDID, arPostURI)
+		require.NoError(t, err)
+		assert.True(t, stands, "the community repo holds an acceptance for the subject")
+	})
+
+	_, err = Remove(ctx, repos, arCommunityDID, arPostURI, arPostCID,
+		"moderator-discretion", "", arPublishedAt, nil)
+	require.NoError(t, err)
+	t.Run("removed subject does not stand", func(t *testing.T) {
+		stands, err := AcceptanceStands(ctx, repos, arCommunityDID, arPostURI)
+		require.NoError(t, err)
+		assert.False(t, stands)
+	})
+	t.Run("never accepted subject does not stand", func(t *testing.T) {
+		stands, err := AcceptanceStands(ctx, repos, arCommunityDID,
+			"at://did:plc:7iza6de2dwap2sbkpav7c6c6/social.coves.community.postv2/3lzneveraccept")
+		require.NoError(t, err)
+		assert.False(t, stands)
+	})
+}
+
+// A read that fails for any reason other than a missing record is an error, not
+// "does not stand": a caller must not treat a broken read as a withdrawn
+// acceptance.
+func TestAcceptanceStandsReturnsReadErrors(t *testing.T) {
+	repos, _ := newRepos(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	stands, err := AcceptanceStands(ctx, repos, arCommunityDID, arPostURI)
+	require.Error(t, err, "a failed repo read must surface as an error")
+	assert.False(t, errors.IsNotFound(err), "a failed read is not a missing acceptance: %v", err)
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.False(t, stands)
+}

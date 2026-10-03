@@ -285,3 +285,17 @@ func Restore(ctx context.Context, repos RepoManager, communityDID, subjectURI, s
 	}
 	return res, nil
 }
+
+// AcceptanceStands reports whether a community still holds an acceptance for a subject.
+func AcceptanceStands(ctx context.Context, repos RepoManager, communityDID, subjectURI string) (bool, error) {
+	rkey := SubjectRKey(subjectURI)
+	_, _, err := repos.GetRecord(ctx, communityDID, CollectionAcceptance, rkey)
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.IsNotFound(err):
+		return false, nil
+	default:
+		return false, fmt.Errorf("acceptrec: read acceptance %s/%s/%s: %w", communityDID, CollectionAcceptance, rkey, err)
+	}
+}

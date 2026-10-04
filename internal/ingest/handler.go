@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"context"
+	"expvar"
 	"fmt"
 	"log/slog"
 	"time"
@@ -291,19 +292,37 @@ func (h *Handler) Process(ctx context.Context, event *store.InboxEvent) error {
 		// authorize: see ignoreDirectBlock.
 		return h.ignoreDirectBlock(activity, signer)
 	case ap.TypeLike, ap.TypeDislike:
-		// Bare votes (rare; Lemmy normally announces them via the group).
-		// The inbox already bound this top-level activity's actor to the
-		// signer's authority, so for a well-formed vote the check below is
-		// redundant belt-and-braces; it keeps the dispatch layer's bare-vote
-		// rule self-contained (and handleUndo, where the inner vote's actor
-		// is NOT inbox-bound, shares it).
-		if err := h.authorizeBareVote(activity.ID, activity, signer); err != nil {
-			return err
-		}
-		return h.votes.ApplyVote(ctx, activity, "")
+		// A vote counts only inside the community's own Announce, which is
+		// also where the aggregator checks the subject belongs to that
+		// community; Lemmy always fans votes out that way. The inbox accepts
+		// any signed host, and a bare vote's only check was that its actor
+		// shared the signer's host: one key could sign votes for any number
+		// of fabricated voters (voter actors are never fetched) on any
+		// bridged subject, and those counts reached Coves where nothing
+		// periodically corrects them. Likes sent straight to a persona inbox
+		// by Mastodon- or Misskey-style servers are dropped on the same rule.
+		return h.dropBareVote(activity, activity, signer,
+			"bare "+activity.Type+" is not counted: votes count only inside a community Announce")
 	default:
 		return skip(activity.ID, "unsupported activity type "+activity.Type)
 	}
+}
+
+// VoteBareDropped counts bare (not Announce-wrapped) Like/Dislike and bare
+// Undo of one, dropped as processed skips: a vote counts only inside its
+// community's Announce. A DECIDED non-action, so it is counted: a flat zero
+// must not be readable as "this never happens".
+var VoteBareDropped = expvar.NewInt("tidepool_vote_bare_dropped")
+
+// dropBareVote counts, logs and skips a bare vote or bare Undo of one.
+// activity is what was delivered (the vote itself, or the Undo wrapping it);
+// vote is the Like/Dislike whose actor and subject are logged.
+func (h *Handler) dropBareVote(activity, vote *ap.Object, signer, reason string) error {
+	VoteBareDropped.Add(1)
+	h.logger.Info("dropping a bare vote",
+		"activity", activity.ID, "signer", signer,
+		"actor", refID(vote.Actor), "subject", refID(vote.Object))
+	return skip(activity.ID, reason)
 }
 
 // handleAnnounce unwraps FEP-1b12 group fan-out: Announce{Create|Update|

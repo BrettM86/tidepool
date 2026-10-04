@@ -185,8 +185,8 @@ func TestFediverseVotesOnOurFederatedPostAreCounted(t *testing.T) {
 	before := dropSnapshot()
 
 	// Each shape is its own subtest: they run in sequence (an Undo needs a live
-	// vote), but a failure in one must not hide the others — the four shapes
-	// reach the guard by four different routes.
+	// vote), but a failure in one must not hide the others — the three shapes
+	// reach the guard by three different routes.
 
 	t.Run("announced Like (depth 3)", func(t *testing.T) {
 		require.Equal(t, http.StatusAccepted, h.deliver(world.group,
@@ -235,35 +235,25 @@ func TestFediverseVotesOnOurFederatedPostAreCounted(t *testing.T) {
 			"a vote that can be cast but not withdrawn leaves a score nobody can correct")
 	})
 
-	t.Run("bare Like", func(t *testing.T) {
-		require.Equal(t, http.StatusAccepted, h.deliver(world.voter, map[string]any{
-			"id":     "https://lemmy.world/activities/like/tg-bare",
-			"type":   "Like",
-			"actor":  tgVoter,
-			"object": tgPostAPID,
-		}))
-		h.drain()
-		up, _, _ := aggregateOf(t, h, tgPostAPID)
-		assert.Equal(t, 1, up, "a bare Like on our object is still their vote")
-	})
-
 	t.Run("bare Undo{Like} through Process's guard", func(t *testing.T) {
+		// The undone Like was never cast: only the Undo's path through the
+		// echo classifier matters here.
 		require.Equal(t, http.StatusAccepted, h.deliver(world.voter, map[string]any{
 			"id":    "https://lemmy.world/activities/undo/tg-bare",
 			"type":  "Undo",
 			"actor": tgVoter,
 			"object": map[string]any{
-				"id":     "https://lemmy.world/activities/like/tg-bare",
+				"id":     "https://lemmy.world/activities/like/tg-bare-never-cast",
 				"type":   "Like",
 				"actor":  tgVoter,
 				"object": tgPostAPID,
 			},
 		}))
 		h.drain()
-		up, _, _ := aggregateOf(t, h, tgPostAPID)
-		assert.Equal(t, 0, up,
-			"the bare Undo branch runs the classifier BEFORE dispatch, so a walk that "+
-				"descends into the vote's target strands every retraction on our own content")
+		// A bare vote Undo is dropped by dispatch (only announced votes count,
+		// see TestBareVotesNeverCount), but Process's Undo branch runs the echo
+		// classifier BEFORE dispatch: the counter pin below is what catches a
+		// walk that descends into the vote's target and calls it ours.
 	})
 
 	// The mirror-image pin: none of this is an echo, so no counter may move.

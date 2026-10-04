@@ -141,8 +141,8 @@ func TestReplayedUndoDoesNotRetractReLike(t *testing.T) {
 }
 
 // TestLemmyClearAfterFlipRetractsLiveVote pins the vote-clear wire behavior
-// the e2e suite measured against a real Lemmy 0.19: a flip federates as a
-// bare opposite vote (no Undo), and a clear federates as an Undo whose inner
+// the e2e suite measured against a real Lemmy 0.19: a flip federates as an
+// announced opposite vote (Announce{Dislike}, no Undo), and a clear federates as an Undo whose inner
 // vote is RECONSTRUCTED — a freshly generated activity id, typed Like even
 // though the voter's live vote is the dislike. The retraction must fall back
 // to removing the voter's live vote regardless of the inner id/type.
@@ -153,7 +153,7 @@ func TestLemmyClearAfterFlipRetractsLiveVote(t *testing.T) {
 	bridgeSubject(t, objects, subjectPost, "3jzfcijpj2z2a")
 	ctx := context.Background()
 
-	// Like → flip (bare Dislike) → clear (Undo{Like} with a fresh id).
+	// Like → flip (announced Dislike, no Undo) → clear (Undo{Like} with a fresh id).
 	require.NoError(t, agg.ApplyVote(ctx, like(activityID(t, 1), voterAlice, subjectPost), ""))
 	require.NoError(t, agg.ApplyVote(ctx, dislike(activityID(t, 2), voterAlice, subjectPost), ""))
 	require.NoError(t, agg.RetractVote(ctx, like(activityID(t, 3), voterAlice, subjectPost), ""))
@@ -407,8 +407,8 @@ func TestReseedDoesNotDoubleCountLiveVotes(t *testing.T) {
 }
 
 // TestReseedHealsBaselineVoterDrift: a voter counted only in the seeded
-// baseline who flips federates a bare Dislike (Lemmy sends no Undo on
-// flips), leaving the retired upvote in the baseline next to the new live
+// baseline who flips federates an announced Dislike (Announce{Dislike};
+// Lemmy sends no Undo on flips), leaving the retired upvote in the baseline next to the new live
 // downvote. Accepted drift while it lasts — but a re-seed must converge the
 // served totals back to the origin's truth, which the raw-overwrite seed
 // never did (it re-imported the flipped vote AND kept the live row).
@@ -421,7 +421,7 @@ func TestReseedHealsBaselineVoterDrift(t *testing.T) {
 	// Alice's pre-subscribe upvote is part of the 10/0 baseline.
 	require.NoError(t, agg.SeedAggregates(ctx, subjectPost, 10, 0))
 
-	// She flips: a bare Dislike, no Undo. Known drift — her baseline upvote
+	// She flips: an announced Dislike (Announce{Dislike}), no Undo. Known drift — her baseline upvote
 	// lingers next to the live downvote (Lemmy's truth is 9/1).
 	require.NoError(t, agg.ApplyVote(ctx, dislike(activityID(t, 1), voterAlice, subjectPost), ""))
 	up, down, _ := counts(t, database, subjectPost)

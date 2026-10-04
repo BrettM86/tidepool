@@ -300,12 +300,13 @@ func TestBareUndoOfOurOwnDeleteIsDropped(t *testing.T) {
 	assert.Nil(t, event.FailedAt, "and never poisoned: %s", event.Error)
 }
 
-// TestGenuineBareDeletesAndUndosStillApply is the control, and it is the half
-// that would hurt more if it broke. Suppressing our own bare activities must
-// not become "ignore bare deletes and undos": a fediverse instance deleting its
-// OWN content, and a Lemmy human retracting their OWN vote, are the ordinary
-// traffic these branches exist for, and losing them is silent.
-func TestGenuineBareDeletesAndUndosStillApply(t *testing.T) {
+// TestGenuineBareDeletesApplyAndUndosPassEchoClassifier is the control, and it
+// is the half that would hurt more if it broke. Suppressing our own bare
+// activities must not become "ignore bare deletes": a fediverse instance
+// deleting its OWN content is the ordinary traffic these branches exist for,
+// and losing it is silent. A genuine bare vote Undo is dropped later as a bare
+// vote (TestBareVotesNeverCount), but it must not be classified as our echo.
+func TestGenuineBareDeletesApplyAndUndosPassEchoClassifier(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
 	group := h.subscribeTechnology()
@@ -331,7 +332,10 @@ func TestGenuineBareDeletesAndUndosStillApply(t *testing.T) {
 			"deleting its own content, and dropping it leaves us serving records their "+
 			"authors removed")
 
-	// (b) A bare Like and its bare Undo from a real Lemmy human.
+	// (b) A bare Like and its bare Undo from a real Lemmy human. Neither
+	// counts — only announced votes do (TestBareVotesNeverCount) — but the
+	// Undo crosses Process's echo classifier first, and genuine traffic must
+	// not move an echo counter.
 	require.Equal(t, http.StatusAccepted, h.deliver(author, map[string]any{
 		"id":     "https://lemmy.world/activities/like/genuine-bare-1",
 		"type":   "Like",
@@ -350,13 +354,6 @@ func TestGenuineBareDeletesAndUndosStillApply(t *testing.T) {
 		},
 	}))
 	h.drain()
-	h.votes.mu.Lock()
-	applied, retracted := len(h.votes.applied), len(h.votes.retracted)
-	h.votes.mu.Unlock()
-	assert.Equal(t, 1, applied, "a genuine bare vote still reaches the aggregator")
-	assert.Equal(t, 1, retracted,
-		"and so does its Undo: the aggregator's own voter probe decides votes, and it "+
-			"answers 'not ours' for every fediverse human")
 
 	for _, class := range echoClasses {
 		assert.Equal(t, before[class], echo.Drops(class),

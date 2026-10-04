@@ -18,8 +18,8 @@ import (
 	"tidepool/internal/errors"
 )
 
-// likeActivity is a small, valid activity for signature-path tests (it
-// dispatches to the recording vote stub, no fixtures needed).
+// likeActivity is a small, valid activity for signature-path tests (a bare
+// vote: processed and dropped, no fixtures needed).
 func likeActivity(id string, actor string) map[string]any {
 	return map[string]any{
 		"id":     id,
@@ -47,7 +47,6 @@ func TestInboxValidSignature(t *testing.T) {
 	event, err = h.events.GetEvent(context.Background(), "https://lemmy.world/activities/like/1")
 	require.NoError(t, err)
 	assert.NotNil(t, event.ProcessedAt, "valid deliveries must be processed")
-	assert.Len(t, h.votes.applied, 1, "bare Like goes to the vote aggregator")
 }
 
 // TestInboxActorInboxAlias: the per-actor inbox path accepts the same
@@ -428,23 +427,25 @@ func TestInboxActorSignerMismatch(t *testing.T) {
 }
 
 // TestInboxDedupe: re-delivering the same activity id acknowledges (200)
-// without re-enqueueing or re-processing.
+// without re-enqueueing or re-processing. The activity is an announced vote
+// because its hand-off to the aggregator is what makes a re-process visible.
 func TestInboxDedupe(t *testing.T) {
 	h := newHarness(t)
-	alice := h.newRemoteActor("https://lemmy.world/u/dedupe", person("https://lemmy.world/u/dedupe", "dedupe", nil))
-	activity := likeActivity("https://lemmy.world/activities/like/once", alice.id)
+	group := h.subscribeTechnology()
+	activity := loadFixture(t, "announce_like.json")
 
-	require.Equal(t, http.StatusAccepted, h.deliver(alice, activity))
+	require.Equal(t, http.StatusAccepted, h.deliver(group, activity))
 	h.drain()
 	require.Len(t, h.votes.applied, 1)
 
 	// Second delivery: acknowledged but not re-processed.
-	assert.Equal(t, http.StatusOK, h.deliver(alice, activity))
+	assert.Equal(t, http.StatusOK, h.deliver(group, activity))
 	h.drain()
 	assert.Len(t, h.votes.applied, 1, "duplicate deliveries must not re-process")
 
 	// Third delivery straight to the DB layer: still a single row.
-	isNew, err := h.events.RecordEvent(context.Background(), "https://lemmy.world/activities/like/once", "Like")
+	isNew, err := h.events.RecordEvent(context.Background(),
+		"https://lemmy.world/activities/announce/like/2a3b4c5d-6e7f-4809-9a0b-c1d2e3f4a5b6", "Announce")
 	require.NoError(t, err)
 	assert.False(t, isNew)
 }

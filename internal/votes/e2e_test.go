@@ -215,33 +215,3 @@ func TestFakeLemmyVoteE2E(t *testing.T) {
 	assert.Equal(t, 2, out.Aggregates[0].Upvotes)
 	assert.Equal(t, 1, out.Aggregates[0].Downvotes)
 }
-
-// TestBareVoteDispatch: a Like delivered directly (not group-announced)
-// rides Handler.Process's bare-vote arm with communityIRI "".
-func TestBareVoteDispatch(t *testing.T) {
-	database := testDB(t)
-	agg, objects := testAggregator(t, database)
-	bridgeSubject(t, objects, subjectPost, "3jzfcijpj2z2a")
-
-	handler, err := ingest.NewHandler(ingest.HandlerOptions{
-		Materializer:   &stubMaterializer{t: t},
-		Fetcher:        &stubFetcher{t: t},
-		Objects:        objects,
-		Actors:         store.NewBridgedActors(database),
-		Communities:    store.NewCommunities(database),
-		Tombstones:     store.NewTombstones(database),
-		Records:        &fakeRecords{records: map[string]map[string]any{}},
-		Votes:          agg,
-		Echo:           e2eClassifier(t, database, objects),
-		ServiceActorID: e2eServiceID,
-	})
-	require.NoError(t, err)
-
-	deliverVote(t, handler, voterAlice,
-		inlineVote("Like", "https://lemmy.world/activities/like/bare-1", voterAlice, subjectPost))
-
-	up, down, found := counts(t, database, subjectPost)
-	require.True(t, found)
-	assert.Equal(t, 1, up)
-	assert.Equal(t, 0, down)
-}

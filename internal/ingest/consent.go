@@ -303,16 +303,14 @@ func (h *Handler) handleUndo(ctx context.Context, undo *ap.Object, signer string
 	announcerID := announcerGroupID(announcer)
 	switch inner.Type {
 	case ap.TypeLike, ap.TypeDislike:
-		// The inbox binds only the OUTER Undo's actor to the signature; the
-		// inner vote's actor is unverified. A bare undo may therefore only
-		// retract votes attributed to the signer's own instance — otherwise
-		// any signer could retract other instances' users' votes. Announced
-		// undos ride the announcing community's vouching, exactly like
-		// announced votes (FEP-1b12 group fan-out).
+		// Only announced votes count (see Process), so only an announced undo
+		// may retract one: it rides the announcing community's vouching,
+		// exactly like the vote it undoes (FEP-1b12 group fan-out). A bare
+		// undo has no such vouching, and its inner vote's actor is not even
+		// bound to the signature.
 		if announcer == nil {
-			if err := h.authorizeBareVote(undo.ID, inner, signer); err != nil {
-				return err
-			}
+			return h.dropBareVote(undo, inner, signer,
+				"bare undo of a vote is not applied: votes count only inside a community Announce")
 		}
 		return h.votes.RetractVote(ctx, inner, announcerID)
 	case ap.TypeDelete:
@@ -608,20 +606,6 @@ func (h *Handler) retractDeleteMarker(ctx context.Context, activityID, targetID,
 		"ap_id", targetID, "scope", scope)
 	return skip(activityID, "restore of an id that was never materialized: "+targetID+
 		" (marker retracted; a fresh Create is what re-materializes it)")
-}
-
-// authorizeBareVote enforces who may cast (or retract) a BARE, un-announced
-// vote: the vote's actor must live on the verified signer's authority — host
-// granularity, the same instance-is-the-trust-unit rule as bare Delete (an
-// instance may speak for its own users, never for another instance's).
-// Mismatches (including an actorless vote) drop as processed skips, never
-// retryable errors — a retry would wedge the ordering key over a vote.
-func (h *Handler) authorizeBareVote(activityID string, vote *ap.Object, signer string) error {
-	if actor := refID(vote.Actor); !ap.SameAuthority(actor, signer) {
-		return skip(activityID, fmt.Sprintf(
-			"bare vote attributed to cross-authority actor %q signed by %s", actor, signer))
-	}
-	return nil
 }
 
 // authorizeDelete enforces who may Delete (or Undo{Delete}) a target id.

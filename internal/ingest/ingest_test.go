@@ -610,13 +610,26 @@ func (h *harness) deliver(actor *remoteActor, activity map[string]any) int {
 
 func (h *harness) deliverTo(path string, actor *remoteActor, activity map[string]any) int {
 	h.t.Helper()
+	return h.deliverThrough(h.router, path, actor, activity)
+}
+
+// deliverToUserInbox posts to the Coves user origin's /ap/inbox — the inbox
+// every persona advertises — through the exported handler the user origin
+// mounts (the harness router serves only the bridge host's paths).
+func (h *harness) deliverToUserInbox(actor *remoteActor, activity map[string]any) int {
+	h.t.Helper()
+	return h.deliverThrough(h.inbox.InboxHandler(), "/ap/inbox", actor, activity)
+}
+
+func (h *harness) deliverThrough(handler http.Handler, path string, actor *remoteActor, activity map[string]any) int {
+	h.t.Helper()
 	body, err := json.Marshal(activity)
 	require.NoError(h.t, err)
 	req := httptest.NewRequest(http.MethodPost, "https://"+bridgeHost+path, bytes.NewReader(body))
 	req.Header.Set("Content-Type", ap.ContentTypeActivityJSON)
 	require.NoError(h.t, actor.signer().SignRequest(req, body))
 	rec := httptest.NewRecorder()
-	h.router.ServeHTTP(rec, req)
+	handler.ServeHTTP(rec, req)
 	return rec.Code
 }
 

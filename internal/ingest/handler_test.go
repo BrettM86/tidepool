@@ -252,12 +252,12 @@ func TestAnnounceLikeRoutedToVotes(t *testing.T) {
 }
 
 // TestBareVoteCrossAuthorityDropped: the inbox binds only the TOP-LEVEL
-// activity's actor to the HTTP signature, so vote dispatch must not let a
-// signer submit or retract votes attributed to other instances' users. A
-// bare Like claiming a foreign actor dies at the inbox binding; a bare
-// Undo{Like} carries the unverified actor INSIDE the undo, so the dispatch
-// layer drops it — as a processed skip, never a retry that would wedge the
-// ordering key.
+// activity's actor to the HTTP signature, so a signer must not submit or
+// retract votes attributed to other instances' users. A bare Like claiming a
+// foreign actor dies at the inbox binding; a bare Undo{Like} passes the inbox
+// and is dropped at dispatch — as every bare vote Undo is, whatever its
+// authority (TestBareVotesNeverCount) — as a processed skip, never a retry
+// that would wedge the ordering key.
 func TestBareVoteCrossAuthorityDropped(t *testing.T) {
 	h := newHarness(t)
 	mallory := h.newRemoteActor("https://evil.example/u/mallory",
@@ -295,38 +295,6 @@ func TestBareVoteCrossAuthorityDropped(t *testing.T) {
 	assert.NotNil(t, event.ProcessedAt, "the drop is a processed skip, never a retry")
 	assert.Empty(t, h.votes.applied)
 	assert.Empty(t, h.votes.retracted, "a cross-authority undo must never reach the aggregator")
-}
-
-// TestBareVoteSameAuthorityRouted: bare votes and undos attributed to a user
-// on the signer's own instance reach the aggregator (host granularity — the
-// instance is the trust unit, as with bare Delete).
-func TestBareVoteSameAuthorityRouted(t *testing.T) {
-	h := newHarness(t)
-	voter := h.newRemoteActor(personID, person(personID, "LeftLeaningFreedomFighters", nil))
-
-	require.Equal(t, http.StatusAccepted, h.deliver(voter, map[string]any{
-		"id":     "https://lemmy.world/activities/like/bare-1",
-		"type":   "Like",
-		"actor":  personID,
-		"object": pageID,
-	}))
-	require.Equal(t, http.StatusAccepted, h.deliver(voter, map[string]any{
-		"id":    "https://lemmy.world/activities/undo/bare-1",
-		"type":  "Undo",
-		"actor": personID,
-		"object": map[string]any{
-			"id":     "https://lemmy.world/activities/like/bare-1",
-			"type":   "Like",
-			"actor":  personID,
-			"object": pageID,
-		},
-	}))
-	h.drain()
-
-	require.Len(t, h.votes.applied, 1)
-	assert.Equal(t, "Like "+pageID, h.votes.applied[0])
-	require.Len(t, h.votes.retracted, 1)
-	assert.Equal(t, "Like "+pageID, h.votes.retracted[0])
 }
 
 // TestEchoSuppression: an inbound activity whose object maps to a record

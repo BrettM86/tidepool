@@ -10,7 +10,7 @@ import (
 // Scenario 14: vote concurrency hammer — many real Lemmy voters on one
 // post, cast in parallel bursts. What this proves is END-TO-END BURST
 // EXACTNESS — a pile of near-simultaneous votes, then concurrent flips
-// (bare opposite vote, no Undo) and clears (Undo with a RECONSTRUCTED
+// (announced opposite vote, no Undo) and clears (Undo with a RECONSTRUCTED
 // inner Like) all landing with an exactly-correct final aggregate. It does
 // NOT exercise same-row lock contention in the aggregator: one post means
 // one community ordering key, so the bridge's queue fully serializes these
@@ -20,8 +20,8 @@ import (
 // right after each burst:
 //
 //   - burst 1: 7 upvotes + 3 downvotes land concurrently → (7, 3);
-//   - burst 2: the 7 upvoters flip to downvotes (Lemmy federates a bare
-//     opposite vote, no Undo) while the 3 downvoters clear (Undo with a
+//   - burst 2: the 7 upvoters flip to downvotes (Lemmy federates an
+//     announced opposite vote, no Undo) while the 3 downvoters clear (Undo with a
 //     RECONSTRUCTED inner Like — the task-07 wire quirk) → (0, 7).
 //
 // The post author's auto-upvote never federates (FOLLOWUPS "Author
@@ -90,7 +90,7 @@ func TestVoteHammer_ConcurrentVotersExactAggregates(t *testing.T) {
 
 	burst("burst 2 (flips + clears)", func(i int) int {
 		if i < upVoters {
-			return -1 // flip: bare Dislike on the wire, no Undo
+			return -1 // flip: announced Dislike (Announce{Dislike}) on the wire, no Undo
 		}
 		return 0 // clear: Undo with a reconstructed inner vote
 	})

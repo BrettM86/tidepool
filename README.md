@@ -622,7 +622,10 @@ Coves' settings UI can write against a stable shape ahead of the switch.
 Counts reflect each distinct voter's **latest** state — flips
 (`Like` → `Dislike`) and `Undo`s are folded in, re-delivered activities are
 deduplicated by activity id. Votes on content the bridge never materialized
-are dropped (logged at debug). Known limitation: AP delivers votes only
+are dropped (logged at debug). Only votes delivered inside the community's
+own `Announce` count; bare `Like`/`Dislike`/`Undo`, including Mastodon- or
+Misskey-style Likes sent to a persona inbox on Coves-authored posts, are
+dropped as processed skips. Known limitation: AP delivers votes only
 going forward, and Lemmy outboxes announce historical Likes sparsely — so
 backfilled posts would start near zero. `SEED_COUNTS_FROM_API` (default on)
 compensates by seeding a baseline from the origin's public API during

@@ -105,9 +105,10 @@ type RecordReader interface {
 //
 // This guard is NOT redundant with ingest's envelope classifier. That one asks
 // an ENVELOPE question at the dispatch boundary ("is this announced traffic
-// ours?"); this one asks a VOTER question at the MUTATION site, and so also
-// covers callers that never pass through handleAnnounce at all — the bare
-// /ap/inbox vote branch, the community-outbox backfill, and the seed paths.
+// ours?"); this one asks a VOTER question at the MUTATION site. It guards
+// every ApplyVote and RetractVote, all of which now arrive inside a
+// community's Announce, and catches our own personas' votes that a community
+// announces back: the envelope classifier never asks who the voter is.
 type VoterProbe interface {
 	Identify(ctx context.Context, apID string) (echo.Identity, error)
 }
@@ -170,6 +171,10 @@ func NewAggregator(db *sql.DB, objects store.APObjects, communities store.Commun
 // vote volume makes anything louder than debug unusable. Malformed votes
 // (no activity id, voter, or subject) are dropped the same way — there is
 // nothing to retry and poisoning the ordering key over a vote helps nobody.
+//
+// communityIRI is the announcing community's AP id, and the vote counts only
+// if its subject belongs to that community. "" skips that binding: production
+// ingest never passes it (only tests do), and new callers must not.
 func (a *Aggregator) ApplyVote(ctx context.Context, vote *ap.Object, communityIRI string) error {
 	if vote == nil {
 		return nil
@@ -284,7 +289,7 @@ func (a *Aggregator) ApplyVote(ctx context.Context, vote *ap.Object, communityIR
 // What Lemmy actually federates (measured by the e2e suite against a real
 // Lemmy 0.19, and NOT what task 07 originally assumed):
 //
-//   - flip (up → down): a bare Dislike, no Undo at all — ApplyVote's
+//   - flip (up → down): Announce{Dislike}, no Undo at all — ApplyVote's
 //     supersede handles it;
 //   - clear (score 0): Announce{Undo{Like}} whose inner vote is
 //     RECONSTRUCTED — a freshly generated activity id, and typed "Like"
@@ -305,6 +310,10 @@ func (a *Aggregator) ApplyVote(ctx context.Context, vote *ap.Object, communityIR
 // vote (out-of-order delivery, or history that only exists as a seeded
 // baseline), a replayed undo naming an already-superseded activity, and an
 // announced undo whose subject does not belong to the announcing community.
+//
+// communityIRI is the announcing community's AP id; "" skips the
+// subject-belongs-to-community binding. Production ingest never passes it
+// (only tests do), and new callers must not.
 func (a *Aggregator) RetractVote(ctx context.Context, vote *ap.Object, communityIRI string) error {
 	if vote == nil {
 		return nil
@@ -469,7 +478,7 @@ func (a *Aggregator) RetractVote(ctx context.Context, vote *ap.Object, community
 // with nothing connecting the drift back to the seed.
 //
 // A re-seed (backfill redo) is also the drift healer: a voter counted only in
-// the baseline who later flips federates a bare Dislike (Lemmy sends no Undo on
+// the baseline who later flips federates a Dislike (Lemmy sends no Undo on
 // flips), leaving the retired upvote in the baseline next to the new live
 // downvote — until the next re-seed converges the served totals back. But
 // nothing re-seeds PERIODICALLY: the one caller is ingest's Backfill.seedCounts

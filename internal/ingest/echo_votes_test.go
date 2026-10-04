@@ -2,7 +2,9 @@ package ingest
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"testing"
@@ -29,11 +31,12 @@ import (
 //     traffic ours?" — at the dispatch boundary, and it only ever sees
 //     handleAnnounce;
 //   - the aggregator asks a VOTER question — "may this voter appear in
-//     vote_events?" — at the mutation site, which is the ONLY guard on the
-//     paths that never reach handleAnnounce: Process's bare Like/Dislike
-//     branch, the community-outbox backfill, and the seeder.
+//     vote_events?" — at the mutation site, on every ApplyVote and
+//     RetractVote, independently of whatever envelope check ran before it.
 //
-// M2 exercises the second on the path the first cannot see.
+// Bare Like/Dislike never reach the aggregator: Process drops them at
+// dispatch, whoever the voter is (TestBareVotesNeverCount). The voter probe
+// itself is covered in internal/votes/echo_probe_test.go.
 const (
 	evUserOrigin  = "https://coves.social"
 	evPersonaDID  = "did:plc:evpersona000000001"
@@ -90,15 +93,17 @@ func voteRows(t *testing.T, h *harness, voter string) int {
 	return n
 }
 
-// aggregateOf reads the served totals for a subject.
+// aggregateOf reads the served totals for a subject; found is false only when
+// the subject has no aggregate row.
 func aggregateOf(t *testing.T, h *harness, subject string) (up, down int, found bool) {
 	t.Helper()
 	err := h.db.QueryRow(
 		`SELECT upvotes, downvotes FROM vote_aggregates WHERE subject_ap_id = $1`, subject).
 		Scan(&up, &down)
-	if err != nil {
+	if errors.Is(err, sql.ErrNoRows) {
 		return 0, 0, false
 	}
+	require.NoError(t, err, "read vote_aggregates for %s", subject)
 	return up, down, true
 }
 
@@ -117,16 +122,16 @@ func bridgeLemmyPost(t *testing.T, h *harness) *remoteActor {
 	return group
 }
 
-// TestBareEchoedVoteFromOurPersonaNeverCounts is M2: the path the envelope
-// classifier cannot see. Process dispatches a bare Like/Dislike straight to the
-// aggregator — no Announce, no envelope — so the only thing standing between
-// our own vote and vote_events is the voter probe.
+// TestBareEchoedVoteFromOurPersonaNeverCounts is M2: a bare Like/Dislike
+// attributed to one of our personas. There is no Announce, so the envelope
+// classifier never sees it; Process drops it at dispatch like every bare vote
+// (TestBareVotesNeverCount), before the aggregator's voter probe would run.
+// The probe is covered in internal/votes/echo_probe_test.go.
 func TestBareEchoedVoteFromOurPersonaNeverCounts(t *testing.T) {
 	h := newHarness(t)
-	bridgeLemmyPost(t, h)
+	group := bridgeLemmyPost(t, h)
 	withRealAggregator(t, h)
 	persona := mintPersona(t, h)
-	lemmyVoter := h.newRemoteActor(evLemmyVoter, person(evLemmyVoter, "LeftLeaningFreedomFighters", nil))
 
 	require.Equal(t, http.StatusAccepted, h.deliver(persona, map[string]any{
 		"id":     evUserOrigin + "/ap/activity/bare-echo-like",
@@ -144,21 +149,25 @@ func TestBareEchoedVoteFromOurPersonaNeverCounts(t *testing.T) {
 
 	assert.Equal(t, 0, voteRows(t, h, evPersonaID),
 		"a vote cast BY ONE OF OUR PERSONAS must never reach vote_events, however it arrives: "+
-			"the bare branch has no envelope for the classifier to read")
+			"bare votes are dropped at dispatch, our persona's included")
 	_, _, found := aggregateOf(t, h, evVoteSubject)
 	assert.False(t, found,
 		"and no aggregate row: minting a 0/0 row tells the XRPC contract this subject has votes")
 
-	// Control: the identical bare shape from a real Lemmy human IS counted, so
-	// the assertions above cannot be passing because the path is dead.
-	require.Equal(t, http.StatusAccepted, h.deliver(lemmyVoter, map[string]any{
-		"id":     "https://lemmy.world/activities/like/genuine-bare",
-		"type":   "Like",
-		"actor":  evLemmyVoter,
-		"object": evVoteSubject,
-	}))
+	// Control: a real Lemmy human's vote on the same subject IS counted, so the
+	// assertions above cannot be passing because the subject is unvotable or the
+	// aggregator is not wired. It arrives inside the community's Announce: no
+	// bare vote counts at all (TestBareVotesNeverCount).
+	require.Equal(t, http.StatusAccepted, h.deliver(group,
+		echoAnnounce("https://lemmy.world/activities/announce/like/genuine", map[string]any{
+			"id":       "https://lemmy.world/activities/like/genuine",
+			"type":     "Like",
+			"actor":    evLemmyVoter,
+			"object":   evVoteSubject,
+			"audience": groupID,
+		})))
 	h.drain()
-	assert.Equal(t, 1, voteRows(t, h, evLemmyVoter), "a genuine bare vote still counts")
+	assert.Equal(t, 1, voteRows(t, h, evLemmyVoter), "a genuine announced vote counts")
 	up, down, found := aggregateOf(t, h, evVoteSubject)
 	require.True(t, found)
 	assert.Equal(t, 1, up)
@@ -172,8 +181,8 @@ func TestBareEchoedVoteFromOurPersonaNeverCounts(t *testing.T) {
 // represented. If this does not hold, 17b double-subtracts.
 //
 // It also pins that the two guards are independent: the same echoed vote handed
-// straight to the aggregator (the backfill/seed path, which never passes through
-// handleAnnounce) must be refused there too.
+// straight to the aggregator, with no envelope classifier in front of it, must
+// be refused there too.
 func TestNativeVoteRoundTripLeavesNoVoteEvents(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
@@ -219,8 +228,8 @@ func TestNativeVoteRoundTripLeavesNoVoteEvents(t *testing.T) {
 	_, _, found := aggregateOf(t, h, evVoteSubject)
 	assert.False(t, found, "no aggregate may be minted by our own vote coming home")
 
-	// The SAME echo handed directly to the aggregator — the backfill and seed
-	// paths do exactly this, and no envelope classifier is in front of them.
+	// The SAME echo handed directly to the aggregator, with no envelope
+	// classifier in front of it: the voter probe must refuse it on its own.
 	parsedLike, err := ap.ParseObject(stored.Payload)
 	require.NoError(t, err)
 	require.NoError(t, h.votes.delegate.ApplyVote(ctx, parsedLike, groupID),

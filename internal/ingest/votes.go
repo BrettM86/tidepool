@@ -15,10 +15,13 @@ type VoteAggregator interface {
 	// ApplyVote records one Like or Dislike. vote is the (possibly
 	// Announce-unwrapped) activity: Type is Like or Dislike, Actor is the
 	// voter, Object is the voted-on AP object. communityIRI is the
-	// announcing community's AP id ("" for a bare, un-announced vote).
+	// announcing community's AP id; ingest never passes "" (bare votes are
+	// dropped before they reach the aggregator).
 	ApplyVote(ctx context.Context, vote *ap.Object, communityIRI string) error
 
 	// RetractVote undoes a previously applied vote (Undo{Like|Dislike});
-	// vote is the inner activity being undone.
+	// vote is the inner activity being undone. communityIRI is the
+	// announcing community's AP id; ingest never passes "" (bare undos of
+	// votes are dropped before they reach the aggregator).
 	RetractVote(ctx context.Context, vote *ap.Object, communityIRI string) error
 }

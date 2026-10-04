@@ -160,6 +160,14 @@ func (startupAcceptanceChecker) AcceptanceStands(context.Context, string, string
 	return true, nil
 }
 
+type recordingDNSReconcilerSetter struct {
+	received []*delegation.Reconciler
+}
+
+func (setter *recordingDNSReconcilerSetter) SetDNSReconciler(reconciler *delegation.Reconciler) {
+	setter.received = append(setter.received, reconciler)
+}
+
 func seedStartupFollowedCommunity(t *testing.T, ctx context.Context, conn *sql.DB, groupID, did string) {
 	t.Helper()
 	communities := store.NewCommunities(conn)
@@ -214,24 +222,37 @@ func TestStartDelegationStartsBackgroundPass(t *testing.T) {
 	seedStartupComment(t, ctx, conn, "did:plc:cmddelegationstart000000001", "did:plc:cmddelegationcommunity00001", "startup", now.Add(-2*time.Hour))
 
 	fake := newStartupCloudflareAPI(t, true)
+	setter := &recordingDNSReconcilerSetter{}
+	finished := make(chan slog.Record, 1)
+	logger := slog.New(startupPassSignal{Handler: testLogger().Handler(), finished: finished})
 	type startupResult struct {
 		reconciler *delegation.Reconciler
 		err        error
 	}
 	returned := make(chan startupResult, 1)
+	startDone := make(chan struct{})
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-startDone:
+		case <-time.After(5 * time.Second):
+			t.Error("startDelegation goroutine did not finish")
+		}
+	})
 	go func() {
+		defer close(startDone)
 		reconciler, err := startDelegation(ctx, startupDelegationConfig(true), actors, startupAcceptanceChecker{},
-			fake.server.URL+"/client/v4", testLogger())
+			setter, fake.server.URL+"/client/v4", logger)
 		returned <- startupResult{reconciler, err}
 	}()
 	// Whichever happens first, the returned value must be valid and the GET
 	// must start; the GET stays blocked until after both conditions hold.
-	returnedAlready := false
+	var reconciler *delegation.Reconciler
 	select {
 	case result := <-returned:
 		require.NoError(t, result.err)
 		require.NotNil(t, result.reconciler)
-		returnedAlready = true
+		reconciler = result.reconciler
 	case <-fake.firstGET:
 	case <-time.After(5 * time.Second):
 		t.Fatal("neither startDelegation returned nor the background GET started")
@@ -241,14 +262,18 @@ func TestStartDelegationStartsBackgroundPass(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("background pass never sent its first listing GET")
 	}
-	if !returnedAlready {
+	if reconciler == nil {
 		select {
 		case result := <-returned:
 			require.NoError(t, result.err)
 			require.NotNil(t, result.reconciler, "startDelegation must return before the listing GET finishes")
+			reconciler = result.reconciler
 		case <-time.After(5 * time.Second):
 			t.Fatal("startDelegation blocked on the held listing GET")
 		}
+	}
+	if assert.Len(t, setter.received, 1, "admin must receive the reconciler exactly once") {
+		assert.Same(t, reconciler, setter.received[0], "admin must receive the exact reconciler returned")
 	}
 	fake.release()
 	select {
@@ -263,6 +288,13 @@ func TestStartDelegationStartsBackgroundPass(t *testing.T) {
 		assert.NotContains(t, request.Body, "proxied")
 	case <-time.After(5 * time.Second):
 		t.Fatal("background pass did not create the delegation")
+	}
+	select {
+	case record := <-finished:
+		assert.Equal(t, slog.LevelInfo, record.Level)
+		assert.Equal(t, "delegation pass finished", record.Message)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not log a delegation pass finished summary")
 	}
 	requests, unauthorized := fake.snapshot()
 	assert.False(t, unauthorized, "every Cloudflare request must use the configured bearer token")
@@ -279,9 +311,11 @@ func TestStartDelegationDisabledWithoutToken(t *testing.T) {
 	fake := newStartupCloudflareAPI(t, false)
 	cfg := startupDelegationConfig(true)
 	cfg.CloudflareAPIToken = ""
-	reconciler, err := startDelegation(ctx, cfg, nil, startupAcceptanceChecker{}, fake.server.URL+"/client/v4", testLogger())
+	setter := &recordingDNSReconcilerSetter{}
+	reconciler, err := startDelegation(ctx, cfg, nil, startupAcceptanceChecker{}, setter, fake.server.URL+"/client/v4", testLogger())
 	require.NoError(t, err)
 	assert.Nil(t, reconciler)
+	assert.Empty(t, setter.received, "disabled delegation must not call the admin setter")
 	requests, _ := fake.snapshot()
 	assert.Empty(t, requests)
 }
@@ -306,7 +340,7 @@ type startupPassSignal struct {
 
 func (handler startupPassSignal) Handle(ctx context.Context, record slog.Record) error {
 	err := handler.Handler.Handle(ctx, record)
-	if record.Message == "startup delegation pass finished" {
+	if record.Message == "delegation pass finished" {
 		handler.finished <- record.Clone()
 	}
 	return err
@@ -348,8 +382,9 @@ func TestStartDelegationQualifiesStartupLabels(t *testing.T) {
 	fake := newStartupCloudflareAPI(t, false)
 	finished := make(chan slog.Record, 1)
 	logger := slog.New(startupPassSignal{Handler: testLogger().Handler(), finished: finished})
+	setter := &recordingDNSReconcilerSetter{}
 	reconciler, err := startDelegation(ctx, startupDelegationConfig(true), actors, startupAcceptanceChecker{},
-		fake.server.URL+"/client/v4", logger)
+		setter, fake.server.URL+"/client/v4", logger)
 	require.NoError(t, err)
 	require.NotNil(t, reconciler)
 	var record slog.Record
@@ -409,7 +444,7 @@ func (handler startupCeilingSignal) Handle(ctx context.Context, record slog.Reco
 		default:
 		}
 	}
-	if record.Message == "startup delegation pass finished" {
+	if record.Message == "delegation pass finished" {
 		handler.finished <- record.Clone()
 	}
 	return err
@@ -442,7 +477,8 @@ func TestStartDelegationHonorsConfiguredCeiling(t *testing.T) {
 	logger := slog.New(startupCeilingSignal{Handler: testLogger().Handler(), finished: finished, errors: errors})
 	cfg := startupDelegationConfig(true)
 	cfg.DelegationMaxNSRecords = 2
-	reconciler, err := startDelegation(ctx, cfg, actors, startupAcceptanceChecker{}, fake.server.URL+"/client/v4", logger)
+	setter := &recordingDNSReconcilerSetter{}
+	reconciler, err := startDelegation(ctx, cfg, actors, startupAcceptanceChecker{}, setter, fake.server.URL+"/client/v4", logger)
 	require.NoError(t, err)
 	require.NotNil(t, reconciler)
 	var summary slog.Record
@@ -486,8 +522,9 @@ func TestStartDelegationGuardsPrivateAddresses(t *testing.T) {
 	logger, _ := capturingLogger()
 	errors := make(chan slog.Record, 1)
 	logger = slog.New(startupErrorSignal{Handler: logger.Handler(), errors: errors})
+	setter := &recordingDNSReconcilerSetter{}
 	reconciler, err := startDelegation(ctx, startupDelegationConfig(false), startupLabelSource{}, startupAcceptanceChecker{},
-		fake.server.URL+"/client/v4", logger)
+		setter, fake.server.URL+"/client/v4", logger)
 	require.NoError(t, err)
 	require.NotNil(t, reconciler)
 	select {

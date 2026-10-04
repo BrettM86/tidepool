@@ -170,20 +170,25 @@ type fakeCloudflareRequest struct {
 }
 
 type fakeCloudflareAPI struct {
-	mu              sync.Mutex
-	server          *httptest.Server
-	records         []fakeDNSRecord
-	requests        []fakeCloudflareRequest
-	listingFailPage int
-	listingFailCode int
-	listingFailBody string
-	createFailCode  int
-	createFailBody  string
-	failedPostLabel string
-	failPostLabels  map[string]bool
-	now             func() time.Time
-	maxNSRecords    int
-	postCount       int
+	mu               sync.Mutex
+	server           *httptest.Server
+	records          []fakeDNSRecord
+	requests         []fakeCloudflareRequest
+	listingFailPage  int
+	listingFailCode  int
+	listingFailBody  string
+	createFailCode   int
+	createFailBody   string
+	failedPostLabel  string
+	failPostLabels   map[string]bool
+	now              func() time.Time
+	maxNSRecords     int
+	postCount        int
+	listingCount     int
+	failFirstListing bool
+	holdMethod       string
+	holdEntered      chan struct{}
+	holdRelease      chan struct{}
 	// pageSize overrides the default listing page size when positive.
 	pageSize int
 	// omitResultInfo drops result_info from listing responses.
@@ -226,6 +231,20 @@ func (f *fakeCloudflareAPI) failedLabel() string {
 	return f.failedPostLabel
 }
 
+// holdFirstRequest blocks only the first request of method after recording it.
+// Cleanup releases the handler before the fake server's Close cleanup runs.
+func (f *fakeCloudflareAPI) holdFirstRequest(t *testing.T, method string) (<-chan struct{}, func()) {
+	t.Helper()
+	entered, release := make(chan struct{}), make(chan struct{})
+	f.mu.Lock()
+	f.holdMethod, f.holdEntered, f.holdRelease = method, entered, release
+	f.mu.Unlock()
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(unblock)
+	return entered, unblock
+}
+
 func (f *fakeCloudflareAPI) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	request := fakeCloudflareRequest{
 		Method: r.Method, Path: r.URL.Path, Query: r.URL.Query(), Authorization: r.Header.Get("Authorization"),
@@ -236,11 +255,21 @@ func (f *fakeCloudflareAPI) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	f.mu.Lock()
 	f.requests = append(f.requests, request)
+	if r.Method == http.MethodGet {
+		f.listingCount++
+	}
 	if r.Method == http.MethodPost {
 		f.postCount++
 	}
 	postPosition := f.postCount
+	listingPosition := f.listingCount
+	hold := r.Method == f.holdMethod && (r.Method == http.MethodGet && listingPosition == 1 || r.Method == http.MethodPost && postPosition == 1)
+	entered, release := f.holdEntered, f.holdRelease
 	f.mu.Unlock()
+	if hold {
+		close(entered)
+		<-release
+	}
 	if bodyError != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		return
@@ -266,7 +295,7 @@ func (f *fakeCloudflareAPI) serveHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		if page == f.listingFailPage {
+		if page == f.listingFailPage || f.failFirstListing && listingPosition == 1 {
 			w.WriteHeader(f.listingFailCode)
 			_, _ = w.Write([]byte(f.listingFailBody))
 			return
@@ -322,12 +351,12 @@ func (f *fakeCloudflareAPI) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func newTestReconciler(t *testing.T, fake *fakeCloudflareAPI, labels fakeLabelSource) (*Reconciler, *bytes.Buffer) {
+func newTestReconciler(t *testing.T, fake *fakeCloudflareAPI, labels fakeLabelSource, interval ...time.Duration) (*Reconciler, *bytes.Buffer) {
 	t.Helper()
-	return newTestReconcilerWithSource(t, fake, &labels)
+	return newTestReconcilerWithSource(t, fake, &labels, interval...)
 }
 
-func newTestReconcilerWithSource(t *testing.T, fake *fakeCloudflareAPI, labels *fakeLabelSource) (*Reconciler, *bytes.Buffer) {
+func newTestReconcilerWithSource(t *testing.T, fake *fakeCloudflareAPI, labels *fakeLabelSource, interval ...time.Duration) (*Reconciler, *bytes.Buffer) {
 	t.Helper()
 	if labels.contributions == nil {
 		labels.contributions = make(map[string][]store.Contribution)
@@ -345,12 +374,16 @@ func newTestReconcilerWithSource(t *testing.T, fake *fakeCloudflareAPI, labels *
 	})
 	require.NoError(t, err)
 	var log bytes.Buffer
+	var configuredInterval time.Duration
+	if len(interval) > 0 {
+		configuredInterval = interval[0]
+	}
 	reconciler, err := NewReconciler(Options{
 		Client: client, Labels: labels, ZoneRoot: delegationZoneRoot,
 		Nameservers:   []string{"ns1.tdpl.example", "ns2.tdpl.example"},
 		Logger:        slog.New(slog.NewTextHandler(&log, &slog.HandlerOptions{Level: slog.LevelDebug})),
 		Contributions: labels, Acceptances: labels.acceptances, Now: func() time.Time { return fake.now() },
-		MaxNSRecords: fake.maxNSRecords,
+		MaxNSRecords: fake.maxNSRecords, Interval: configuredInterval,
 	})
 	require.NoError(t, err)
 	return reconciler, &log

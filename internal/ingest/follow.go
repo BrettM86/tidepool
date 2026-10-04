@@ -13,10 +13,12 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
 	"tidepool/internal/ap"
+	"tidepool/internal/delegation"
 	"tidepool/internal/errors"
 	"tidepool/internal/materialize"
 	"tidepool/internal/store"
@@ -74,6 +76,7 @@ type AdminOptions struct {
 //	POST   /admin/communities/backfill  {"community":"!tech@lemmy.world"}
 //	POST   /admin/communities/refresh-profile {"community":"!tech@lemmy.world"} (or {"all":true})
 //	POST   /admin/communities/reconcile (follow list configured only)
+//	POST   /admin/dns/reconcile         (Cloudflare token configured only)
 //	POST   /admin/reemit                {"did":"did:plc:..."} (or {} for all)
 //	POST   /admin/objects/sweep-deleted {"ap_ids":["https://..."]}
 //	GET    /admin/divergence            (reconciliation report; READ-ONLY)
@@ -95,6 +98,9 @@ type Admin struct {
 	// endpoint answers 501) unless a follow list is configured. Set once
 	// during startup via SetFollowReconciler, before the server listens.
 	reconciler *FollowReconciler
+	// dnsReconciler serves POST /admin/dns/reconcile; set during startup
+	// when Cloudflare delegation is configured.
+	dnsReconciler *delegation.Reconciler
 	// divergence serves GET /admin/divergence; nil (the endpoint answers
 	// 501) unless the reconciliation sweep is wired. Set once during
 	// startup via SetDivergenceReconciler, before the server listens.
@@ -117,6 +123,9 @@ func (a *Admin) SetFollowReconciler(r *FollowReconciler) { a.reconciler = r }
 // SetDivergenceReconciler wires the optional reconciliation sweep in after
 // construction, as SetFollowReconciler does for the follow list.
 func (a *Admin) SetDivergenceReconciler(r *DivergenceReconciler) { a.divergence = r }
+
+// SetDNSReconciler wires the optional DNS delegation reconciler during startup.
+func (a *Admin) SetDNSReconciler(r *delegation.Reconciler) { a.dnsReconciler = r }
 
 // NewAdmin validates options and builds the Admin API.
 func NewAdmin(opts AdminOptions) (*Admin, error) {
@@ -173,6 +182,7 @@ func (a *Admin) Routes(r chi.Router) {
 		r.Post("/communities/backfill", a.handleBackfill)
 		r.Post("/communities/refresh-profile", a.handleRefreshProfile)
 		r.Post("/communities/reconcile", a.handleReconcile)
+		r.Post("/dns/reconcile", a.handleDNSReconcile)
 		r.Post("/reemit", a.handleReemit)
 		r.Post("/objects/sweep-deleted", a.handleSweepDeleted)
 		r.Get("/divergence", a.handleDivergence)
@@ -604,6 +614,37 @@ func (a *Admin) handleReconcile(w http.ResponseWriter, r *http.Request) {
 		// admin API is operator-facing, so the real reason (file path,
 		// entry number) goes straight back.
 		http.Error(w, "reconcile failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// dnsReconcileWriteTimeout bounds how long POST /admin/dns/reconcile may take
+// to write its response. A normal pass takes seconds, but the request first
+// waits behind any running pass (the startup pass runs right when an operator
+// is told to force one) and then runs its own: a zone listing, per-label
+// qualification and up to 20 sequential creates, each Cloudflare request with
+// its own 30s client timeout. The server's default 30s WriteTimeout would drop
+// the result of such a pass after its records were already created.
+const dnsReconcileWriteTimeout = 10 * time.Minute
+
+// handleDNSReconcile runs one delegation pass and returns its result, including
+// partial results when the pass fails. It extends this response's write
+// deadline to dnsReconcileWriteTimeout and logs the pass summary the way the
+// scheduled passes do.
+func (a *Admin) handleDNSReconcile(w http.ResponseWriter, r *http.Request) {
+	if a.dnsReconciler == nil {
+		http.Error(w, "DNS delegation reconciliation is not configured", http.StatusNotImplemented)
+		return
+	}
+	ctx := r.Context()
+	if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(dnsReconcileWriteTimeout)); err != nil {
+		a.logger.WarnContext(ctx, "extend DNS reconcile write deadline", "component", "delegation", "error", err)
+	}
+	result, err := a.dnsReconciler.Reconcile(ctx)
+	a.dnsReconciler.LogPass(ctx, result, err)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error(), "result": result})
 		return
 	}
 	writeJSON(w, http.StatusOK, result)

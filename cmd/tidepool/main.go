@@ -300,9 +300,6 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	if _, err := startDelegation(ctx, cfg, actors, repoAcceptanceChecker{repos: repoManager}, delegation.CloudflareAPIBaseURL, logger); err != nil {
-		return fmt.Errorf("delegation: %w", err)
-	}
 	broadcaster, err := tidepoolsync.NewBroadcaster(cfg.DatabaseURL, 0, logger)
 	if err != nil {
 		return err
@@ -594,6 +591,9 @@ func run(logger *slog.Logger) error {
 	})
 	if err != nil {
 		return err
+	}
+	if _, err := startDelegation(ctx, cfg, actors, repoAcceptanceChecker{repos: repoManager}, admin, delegation.CloudflareAPIBaseURL, logger); err != nil {
+		return fmt.Errorf("delegation: %w", err)
 	}
 	admin.Routes(router)
 
@@ -1058,9 +1058,15 @@ func (checker repoAcceptanceChecker) AcceptanceStands(ctx context.Context, commu
 	return acceptrec.AcceptanceStands(ctx, checker.repos, communityDID, subjectURI)
 }
 
-// startDelegation starts one asynchronous delegation pass when a Cloudflare
-// token is configured, returning the reconciler without waiting for the pass.
-func startDelegation(ctx context.Context, cfg *config.Config, actors store.BridgedActors, acceptances delegation.AcceptanceChecker, cloudflareBaseURL string, logger *slog.Logger) (*delegation.Reconciler, error) {
+// dnsReconcilerSetter receives the delegation reconciler so the admin API can
+// run passes on demand.
+type dnsReconcilerSetter interface {
+	SetDNSReconciler(*delegation.Reconciler)
+}
+
+// startDelegation wires and starts scheduled delegation passes when a
+// Cloudflare token is configured, returning without waiting for the first pass.
+func startDelegation(ctx context.Context, cfg *config.Config, actors store.BridgedActors, acceptances delegation.AcceptanceChecker, admin dnsReconcilerSetter, cloudflareBaseURL string, logger *slog.Logger) (*delegation.Reconciler, error) {
 	if cfg.CloudflareAPIToken == "" {
 		return nil, nil
 	}
@@ -1081,19 +1087,7 @@ func startDelegation(ctx context.Context, cfg *config.Config, actors store.Bridg
 	if err != nil {
 		return nil, fmt.Errorf("create delegation reconciler: %w", err)
 	}
-	go func() {
-		result, err := reconciler.Reconcile(ctx)
-		logger.InfoContext(ctx, "startup delegation pass finished", "component", "delegation",
-			"created_count", len(result.Created), "created", result.Created,
-			"already_delegated_count", len(result.AlreadyDelegated),
-			"conflicting_count", len(result.Conflicting), "conflicting", result.Conflicting,
-			"pending_count", len(result.Pending), "pending", result.Pending,
-			"deferred_count", len(result.Deferred), "delegated_records", result.DelegatedRecords, "ceiling", result.Ceiling,
-			"failed_count", len(result.Failed), "failed", result.Failed,
-			"delegated_without_live_actors_count", len(result.DelegatedWithoutLiveActors))
-		if err != nil {
-			logger.ErrorContext(ctx, "startup delegation pass failed", "component", "delegation", "error", err)
-		}
-	}()
+	admin.SetDNSReconciler(reconciler)
+	go reconciler.Run(ctx)
 	return reconciler, nil
 }

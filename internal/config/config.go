@@ -43,7 +43,7 @@ type Config struct {
 	DNSPublicIPv4  netip.Addr
 	DNSPublicIPv6  netip.Addr
 	DNSNameservers []string
-	// CloudflareAPIToken enables the startup delegation pass when set.
+	// CloudflareAPIToken enables delegation passes (at startup and every 15 minutes) when set.
 	CloudflareAPIToken string
 	// DelegationMaxNSRecords caps configured-nameserver NS records in the zone.
 	DelegationMaxNSRecords int

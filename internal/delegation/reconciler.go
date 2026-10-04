@@ -50,6 +50,7 @@ type Options struct {
 	Acceptances   AcceptanceChecker
 	Now           func() time.Time
 	MaxNSRecords  int
+	Interval      time.Duration
 }
 
 // ErrCeilingReached reports that the NS record ceiling stopped a pass with qualifying labels left.
@@ -68,6 +69,53 @@ type Reconciler struct {
 	nameservers   []string
 	logger        *slog.Logger
 	maxNSRecords  int
+	interval      time.Duration
+	passSlot      chan struct{}
+}
+
+// Run reconciles immediately and at each configured interval until ctx is done.
+func (r *Reconciler) Run(ctx context.Context) {
+	pass := func() {
+		result, err := r.Reconcile(ctx)
+		r.LogPass(ctx, result, err)
+	}
+
+	if ctx.Err() != nil {
+		return
+	}
+	pass()
+	ticker := time.NewTicker(r.interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if ctx.Err() != nil {
+				return
+			}
+			pass()
+		}
+	}
+}
+
+// LogPass logs a pass's summary and error the way Run does; a pass ended by
+// ctx's own cancellation logs nothing.
+func (r *Reconciler) LogPass(ctx context.Context, result Result, err error) {
+	if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+		return
+	}
+	r.logger.InfoContext(ctx, "delegation pass finished", "component", "delegation",
+		"created_count", len(result.Created), "created", result.Created,
+		"already_delegated_count", len(result.AlreadyDelegated),
+		"conflicting_count", len(result.Conflicting), "conflicting", result.Conflicting,
+		"pending_count", len(result.Pending), "pending", result.Pending,
+		"deferred_count", len(result.Deferred), "delegated_records", result.DelegatedRecords, "ceiling", result.Ceiling,
+		"failed_count", len(result.Failed), "failed", result.Failed,
+		"delegated_without_live_actors_count", len(result.DelegatedWithoutLiveActors))
+	if err != nil {
+		r.logger.ErrorContext(ctx, "delegation pass failed", "component", "delegation", "error", err)
+	}
 }
 
 func normalizeDNSName(name string) string {
@@ -97,10 +145,15 @@ func NewReconciler(options Options) (*Reconciler, error) {
 	if now == nil {
 		now = time.Now
 	}
+	interval := options.Interval
+	if interval == 0 {
+		interval = 15 * time.Minute
+	}
 	return &Reconciler{
 		client: options.Client, labels: options.Labels, zoneRoot: normalizeDNSName(options.ZoneRoot),
 		contributions: options.Contributions, acceptances: options.Acceptances, now: now,
 		nameservers: nameservers, logger: logger, maxNSRecords: options.MaxNSRecords,
+		interval: interval, passSlot: make(chan struct{}, 1),
 	}, nil
 }
 
@@ -108,39 +161,39 @@ func NewReconciler(options Options) (*Reconciler, error) {
 // lowercased DNS labels rather than fully qualified names.
 type Result struct {
 	// Created contains live labels for which an NS record was created.
-	Created []string
+	Created []string `json:"created"`
 	// AlreadyDelegated contains live labels with a configured NS record.
-	AlreadyDelegated []string
+	AlreadyDelegated []string `json:"already_delegated"`
 	// Conflicting contains labels with foreign NS records, including labels
 	// that also have a configured NS record.
-	Conflicting []Conflict
+	Conflicting []Conflict `json:"conflicting"`
 	// Failed contains live labels whose qualification or NS creation failed.
-	Failed []Failure
+	Failed []Failure `json:"failed"`
 	// DelegatedWithoutLiveActors contains labels with configured NS records
 	// but no live actors and no foreign NS records.
-	DelegatedWithoutLiveActors []string
+	DelegatedWithoutLiveActors []string `json:"delegated_without_live_actors"`
 	// Pending contains live labels without a standing contribution or outright qualification.
-	Pending []string
+	Pending []string `json:"pending"`
 	// Deferred contains qualifying labels left for a later pass by the ceiling or the hourly budget.
-	Deferred []string
+	Deferred []string `json:"deferred"`
 	// DelegatedRecords counts configured-nameserver NS records at any name in
 	// the zone, including names outside the bridge hostname, plus this pass's
 	// successful creates.
-	DelegatedRecords int
+	DelegatedRecords int `json:"delegated_records"`
 	// Ceiling is the configured maximum number of configured-nameserver NS records.
-	Ceiling int
+	Ceiling int `json:"ceiling"`
 }
 
 // Conflict identifies a label and the foreign nameservers in its NS records.
 type Conflict struct {
-	Label    string
-	Contents []string
+	Label    string   `json:"label"`
+	Contents []string `json:"contents"`
 }
 
 // Failure identifies a label whose NS record could not be created and why.
 type Failure struct {
-	Label  string
-	Reason string
+	Label  string `json:"label"`
+	Reason string `json:"reason"`
 }
 
 // Reconcile lists labels and zone NS records, qualifies eligible live labels,
@@ -150,7 +203,23 @@ type Failure struct {
 // the returned error wraps ErrCeilingReached (testable with errors.Is).
 // Per-label failures do not stop the pass.
 func (r *Reconciler) Reconcile(ctx context.Context) (Result, error) {
-	result := Result{Ceiling: r.maxNSRecords}
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
+	}
+	select {
+	case r.passSlot <- struct{}{}:
+		defer func() { <-r.passSlot }()
+	case <-ctx.Done():
+		return Result{}, ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
+	}
+	result := Result{
+		Created: []string{}, AlreadyDelegated: []string{}, Conflicting: []Conflict{},
+		Failed: []Failure{}, DelegatedWithoutLiveActors: []string{},
+		Pending: []string{}, Deferred: []string{}, Ceiling: r.maxNSRecords,
+	}
 	labels, err := r.labels.ListInstanceLabels(ctx, r.zoneRoot)
 	if err != nil {
 		return result, fmt.Errorf("list instance labels for %s: %w", r.zoneRoot, err)

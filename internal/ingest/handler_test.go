@@ -1051,27 +1051,29 @@ func TestAnnouncedObjectForDifferentCommunityDropped(t *testing.T) {
 // TestUndoDeleteRollsBackWhenRematerializeSkips (Finding 4): if the restore's
 // re-materialization is declined (a skip), the compensation must re-soft-delete
 // the mapping and re-record the tombstone — never leave a live mapping without
-// a record.
+// a record. The restore is the community's Announce{Undo{Delete}}: a bare
+// Undo{Delete} of mapped content is dropped before it gets this far
+// (TestBareUndoDeleteNeverRematerializesContent).
 func TestUndoDeleteRollsBackWhenRematerializeSkips(t *testing.T) {
 	h := newHarness(t)
 	group := h.subscribeTechnology()
 	h.serveLemmyWorldContent()
-	author := h.newRemoteActor(personID, person(personID, "LeftLeaningFreedomFighters", nil))
+	h.newRemoteActor(personID, person(personID, "LeftLeaningFreedomFighters", nil))
 	ctx := context.Background()
 
 	postID := "https://lemmy.world/post/70001"
-	buildPage := func(withCommunity bool) map[string]any {
+	buildPage := func(withAuthor bool) map[string]any {
 		p := map[string]any{
-			"type":         "Page",
-			"id":           postID,
-			"attributedTo": personID,
-			"to":           []any{ap.PublicAudience},
-			"name":         "a post",
-			"source":       map[string]any{"content": "body", "mediaType": "text/markdown"},
-			"published":    "2026-07-07T08:00:00.000000Z",
+			"type":      "Page",
+			"id":        postID,
+			"to":        []any{ap.PublicAudience},
+			"audience":  groupID,
+			"name":      "a post",
+			"source":    map[string]any{"content": "body", "mediaType": "text/markdown"},
+			"published": "2026-07-07T08:00:00.000000Z",
 		}
-		if withCommunity {
-			p["audience"] = groupID
+		if withAuthor {
+			p["attributedTo"] = personID
 		}
 		return p
 	}
@@ -1095,34 +1097,34 @@ func TestUndoDeleteRollsBackWhenRematerializeSkips(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, mapping.IsDeleted())
 
-	// Delete it (bare, on the author's own authority).
-	require.Equal(t, http.StatusAccepted, h.deliver(author, map[string]any{
-		"id":     "https://lemmy.world/activities/delete/70001",
-		"type":   "Delete",
-		"actor":  personID,
-		"object": postID,
-	}))
-	h.drain()
+	// The author deletes it through the community.
+	h.announceDelete(group, "https://lemmy.world/activities/announce/delete/70001", personID, postID)
 	mapping, err = h.objects.GetByAPID(ctx, postID)
 	require.NoError(t, err)
 	require.True(t, mapping.IsDeleted())
-	tombstoned, err := h.tombstones.ExistsFor(ctx, postID, "")
-	require.NoError(t, err)
-	require.True(t, tombstoned)
+	require.Equal(t, []string{groupID}, h.tombstoneAnnouncers(postID))
 
-	// The origin re-serves the post but now WITHOUT a community, so
-	// re-materialization skips ("post names no community").
+	// The origin re-serves the post, still in the community, but now WITHOUT
+	// an author, so re-materialization skips ("post has no attributedTo
+	// author").
 	h.serveObject("/post/70001", buildPage(false))
 
-	require.Equal(t, http.StatusAccepted, h.deliver(author, map[string]any{
-		"id":    "https://lemmy.world/activities/undo/70001",
-		"type":  "Undo",
-		"actor": personID,
+	require.Equal(t, http.StatusAccepted, h.deliver(group, map[string]any{
+		"id":       "https://lemmy.world/activities/announce/undo/70001",
+		"type":     "Announce",
+		"actor":    groupID,
+		"audience": groupID,
 		"object": map[string]any{
-			"id":     "https://lemmy.world/activities/delete/70001",
-			"type":   "Delete",
-			"actor":  personID,
-			"object": postID,
+			"id":       "https://lemmy.world/activities/undo/70001",
+			"type":     "Undo",
+			"actor":    personID,
+			"audience": groupID,
+			"object": map[string]any{
+				"id":     "https://lemmy.world/activities/delete/70001",
+				"type":   "Delete",
+				"actor":  personID,
+				"object": postID,
+			},
 		},
 	}))
 	h.drain()
@@ -1130,9 +1132,8 @@ func TestUndoDeleteRollsBackWhenRematerializeSkips(t *testing.T) {
 	mapping, err = h.objects.GetByAPID(ctx, postID)
 	require.NoError(t, err)
 	assert.True(t, mapping.IsDeleted(), "a declined restore must re-soft-delete the mapping")
-	tombstoned, err = h.tombstones.ExistsFor(ctx, postID, "")
-	require.NoError(t, err)
-	assert.True(t, tombstoned, "a declined restore must retain the tombstone")
+	assert.Equal(t, []string{groupID}, h.tombstoneAnnouncers(postID),
+		"a declined restore must re-record the community's tombstone")
 }
 
 // TestLateAcceptAfterUnfollowIgnored (Finding 5): after an operator
@@ -1438,17 +1439,15 @@ func TestAnnouncedUndoDeleteIntoAnotherCommunityDropped(t *testing.T) {
 	assert.True(t, errors.IsNotFound(err), "the other community must not be bridged")
 }
 
-// TestBareReferenceCreateCannotDodgeScopedTombstone pins WHERE the
-// create-after-delete check may read its community scope from. Markers are
-// community-scoped, so the lookup needs a community context — and before the
-// object is resolved a BARE delivery offers only one: the delivered body's
-// own audience, which the deliverer wrote. A Create carrying nothing but
-// {"id": X} names no community at all, so a lookup keyed off that body reads
-// global markers only and sails straight past the community-scoped marker a
-// delete-before-create left for exactly that id — from ANY signer with a
-// valid signature, for content that is not theirs. That is the marker's core
-// case, so the scoped half of the check runs after resolveDelivered, against
-// the audience the ORIGIN serves.
+// TestBareReferenceCreateCannotDodgeScopedTombstone: a bare Create carrying
+// nothing but {"id": X} names no community at all, so it offers no scope for
+// the community-scoped marker a delete-before-create left for exactly that id
+// — from ANY signer with a valid signature, for content that is not theirs.
+// It never needs one: bare content is dropped outright before any fetch or
+// tombstone lookup, and content is materialized only from its community's
+// Announce, whose announcer scopes the marker check. This pins that a bare
+// reference to a tombstoned id is never materialized and leaves the marker
+// in place.
 func TestBareReferenceCreateCannotDodgeScopedTombstone(t *testing.T) {
 	h := newHarness(t)
 	group := h.subscribeTechnology()
@@ -1759,12 +1758,15 @@ func TestAnnouncedRestoreOfChangedTypeDropped(t *testing.T) {
 // authorization ("the origin must serve the object again") AND the body that
 // goes back into the repo, so an open redirect off the origin would both
 // license the restore and choose its content. Pinned like the delete sweep's
-// fetch (TestSweepDeletedRejectsCrossAuthorityRedirect), one call over.
+// fetch (TestSweepDeletedRejectsCrossAuthorityRedirect), one call over. The
+// restore is the community's Announce{Undo{Delete}}: a bare Undo{Delete} of
+// mapped content is dropped before any fetch
+// (TestBareUndoDeleteNeverRematerializesContent).
 func TestUndoDeleteRejectsCrossAuthorityRedirect(t *testing.T) {
 	h := newHarness(t)
 	group := h.subscribeTechnology()
 	h.serveLemmyWorldContent()
-	author := h.newRemoteActor(personID, person(personID, "LeftLeaningFreedomFighters", nil))
+	h.newRemoteActor(personID, person(personID, "LeftLeaningFreedomFighters", nil))
 	ctx := context.Background()
 
 	const slug = "restore-redirect"
@@ -1788,31 +1790,32 @@ func TestUndoDeleteRejectsCrossAuthorityRedirect(t *testing.T) {
 	})
 	require.Equal(t, postID, h.bridgePost(group, slug))
 
-	require.Equal(t, http.StatusAccepted, h.deliver(author, map[string]any{
-		"id":     "https://lemmy.world/activities/delete/" + slug,
-		"type":   "Delete",
-		"actor":  personID,
-		"object": postID,
-	}))
-	h.drain()
+	h.announceDelete(group, "https://lemmy.world/activities/announce/delete/"+slug, personID, postID)
 	mapping, err := h.objects.GetByAPID(ctx, postID)
 	require.NoError(t, err)
 	require.True(t, mapping.IsDeleted())
 
-	require.Equal(t, http.StatusAccepted, h.deliver(author, map[string]any{
-		"id":    "https://lemmy.world/activities/undo/" + slug,
-		"type":  "Undo",
-		"actor": personID,
+	require.Equal(t, http.StatusAccepted, h.deliver(group, map[string]any{
+		"id":       "https://lemmy.world/activities/announce/undo/" + slug,
+		"type":     "Announce",
+		"actor":    groupID,
+		"audience": groupID,
 		"object": map[string]any{
-			"id":     "https://lemmy.world/activities/delete/" + slug,
-			"type":   "Delete",
-			"actor":  personID,
-			"object": postID,
+			"id":       "https://lemmy.world/activities/undo/" + slug,
+			"type":     "Undo",
+			"actor":    personID,
+			"audience": groupID,
+			"object": map[string]any{
+				"id":     "https://lemmy.world/activities/delete/" + slug,
+				"type":   "Delete",
+				"actor":  personID,
+				"object": postID,
+			},
 		},
 	}))
 	h.drain()
 
-	event, err := h.events.GetEvent(ctx, "https://lemmy.world/activities/undo/"+slug)
+	event, err := h.events.GetEvent(ctx, "https://lemmy.world/activities/announce/undo/"+slug)
 	require.NoError(t, err)
 	assert.NotNil(t, event.FailedAt, "an off-authority redirect is permanent, so the event poisons")
 	assert.Contains(t, event.Error, "authority",
@@ -1820,9 +1823,7 @@ func TestUndoDeleteRejectsCrossAuthorityRedirect(t *testing.T) {
 	mapping, err = h.objects.GetByAPID(ctx, postID)
 	require.NoError(t, err)
 	assert.True(t, mapping.IsDeleted(), "a redirected restore must not revive the record")
-	tombstoned, err := h.tombstones.ExistsFor(ctx, postID, "")
-	require.NoError(t, err)
-	assert.True(t, tombstoned, "...nor clear the marker")
+	assert.Equal(t, []string{groupID}, h.tombstoneAnnouncers(postID), "...nor clear the marker")
 }
 
 // oneShotMissingActors hides ONE ap id from the first bridged_actors lookup

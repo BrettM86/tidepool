@@ -575,12 +575,11 @@ func TestNonAuthorDeleteWithoutSummaryKeepsAuthorRecord(t *testing.T) {
 // TestBareUndoDeleteDoesNotRestoreRemovedPost (F4): a removal is exited only
 // by an explicit moderator restore, and a BARE Undo{Delete} is not one.
 //
-// The bare path exists so an ORIGIN can un-delete content it re-serves, and it
-// is deliberately permissive: same-authority signer, existing mapping, pinned
-// re-fetch. None of that says anything about a COMMUNITY's decision to remove
-// the post from itself. Letting the bare path write a fresh acceptance would
-// let the author's own instance overturn a moderator's removal by re-serving
-// the post — the restore gate has to be the community's, not the origin's.
+// A bare Undo{Delete} of mapped content is dropped as a processed skip before
+// any fetch (TestBareUndoDeleteNeverRematerializesContent): content is restored
+// only from its community's Announce. That is also why the author's own
+// instance cannot overturn a moderator's removal by re-serving the post — the
+// restore gate is the community's, not the origin's.
 //
 // The announced restore (which IS the moderator's decision) is asserted by
 // TestModeration_RemoveRestoreAndSelfDelete at the e2e tier and by R4 here.

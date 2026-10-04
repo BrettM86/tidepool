@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"tidepool/internal/ap"
+	"tidepool/internal/errors"
 	"tidepool/internal/store"
 )
 
@@ -23,6 +24,10 @@ const (
 	// fakeMinter mints <username>.<instance with dashes>.bridge.test, so every
 	// lemmy.world actor in the harness lands on this label.
 	arrivalLabel = "lemmy-world"
+	// arrivalPostURI is where arrivalPage materializes: the fake minter's DID
+	// for arrivalauthor@lemmy.world and the rkey derived from the page's id and
+	// published time.
+	arrivalPostURI = "at://did:plc:56demzzr6cdn4afwayil4xsa/social.coves.community.postv2/3mq5ls44gerpn"
 )
 
 func arrivalPage() map[string]any {
@@ -103,9 +108,9 @@ func TestBareCreateDoesNotCountTowardDelegation(t *testing.T) {
 
 	h.deliverBareCreate(author, "https://lemmy.world/activities/create/arrival-bare", arrivalPage())
 
-	// Ingest is unchanged: the bare Create is still materialized.
-	h.mappedATURI(arrivalPostID)
-	assert.Equal(t, "not_announced", h.arrival(arrivalPostID))
+	// A bare Create is dropped, so there is no object to count.
+	_, err := h.objects.GetByAPID(context.Background(), arrivalPostID)
+	assert.True(t, errors.IsNotFound(err), "a bare Create must never be materialized")
 	assert.Empty(t, h.labelContributionURIs())
 }
 
@@ -115,19 +120,21 @@ func TestBareThenAnnouncedPostCountsTowardDelegation(t *testing.T) {
 	author := h.newRemoteActor(arrivalAuthorID, person(arrivalAuthorID, "arrivalauthor", nil))
 
 	h.deliverBareCreate(author, "https://lemmy.world/activities/create/arrival-first", arrivalPage())
+	_, err := h.objects.GetByAPID(context.Background(), arrivalPostID)
+	require.True(t, errors.IsNotFound(err), "the bare delivery is dropped: no mapping")
 	require.Empty(t, h.labelContributionURIs(), "the bare copy alone must not count")
 
-	// The Announce re-materializes an already-mapped object as a no-op; the
-	// community's Announce still marks it.
+	// The community's Announce materializes the post and marks it.
 	h.announceCreate(group, "https://lemmy.world/activities/announce/arrival-second", arrivalPage())
-	postURI := h.mappedATURI(arrivalPostID)
+	assert.Equal(t, arrivalPostURI, h.mappedATURI(arrivalPostID))
 	assert.Equal(t, "community_announced", h.arrival(arrivalPostID))
-	assert.Equal(t, []string{postURI}, h.labelContributionURIs())
+	assert.Equal(t, []string{arrivalPostURI}, h.labelContributionURIs())
 
-	// The mark is one-way: a later bare delivery does not downgrade it.
+	// A later bare delivery of the same object changes nothing.
 	h.deliverBareCreate(author, "https://lemmy.world/activities/create/arrival-third", arrivalPage())
+	assert.Equal(t, arrivalPostURI, h.mappedATURI(arrivalPostID))
 	assert.Equal(t, "community_announced", h.arrival(arrivalPostID))
-	assert.Equal(t, []string{postURI}, h.labelContributionURIs())
+	assert.Equal(t, []string{arrivalPostURI}, h.labelContributionURIs())
 }
 
 func TestAnnouncedCommentDoesNotMarkFetchedAncestors(t *testing.T) {

@@ -325,6 +325,25 @@ func (h *Handler) dropBareVote(activity, vote *ap.Object, signer, reason string)
 	return skip(activity.ID, reason)
 }
 
+// ContentBareDropped counts bare (not Announce-wrapped) Create/Update of
+// content and bare Undo{Delete} restores of mapped content, dropped as
+// processed skips: content is materialized only from its community's
+// Announce. A DECIDED non-action, so it is counted: a flat zero must not be
+// readable as "this never happens".
+var ContentBareDropped = expvar.NewInt("tidepool_content_bare_dropped")
+
+// dropBareContent counts, logs and skips a bare delivery of content or a bare
+// restore of it. activity is what was delivered; obj is the delivered object
+// (never fetched), whose own claimed audience is logged.
+func (h *Handler) dropBareContent(activity, obj *ap.Object, signer, reason string) error {
+	ContentBareDropped.Add(1)
+	h.logger.Info("dropping bare content",
+		"activity", activity.ID, "signer", signer,
+		"object", obj.ID, "object_type", obj.Type,
+		"audience", communityIRIFrom(obj))
+	return skip(activity.ID, reason)
+}
+
 // handleAnnounce unwraps FEP-1b12 group fan-out: Announce{Create|Update|
 // Delete|Undo|Like|Dislike|...} from a community we follow.
 func (h *Handler) handleAnnounce(ctx context.Context, announce *ap.Object, signer string) error {
@@ -380,12 +399,12 @@ func (h *Handler) handleAnnounce(ctx context.Context, announce *ap.Object, signe
 
 	switch inner.Type {
 	case ap.TypeCreate:
-		return h.materializeContent(ctx, inner.Object, signer, false, signer)
+		return h.materializeContent(ctx, inner.Object, signer, false)
 	case ap.TypeUpdate:
-		return h.materializeContent(ctx, inner.Object, signer, true, signer)
+		return h.materializeContent(ctx, inner.Object, signer, true)
 	case ap.TypePage, ap.TypeArticle, ap.TypeNote:
 		// Some implementations announce the object itself, not the Create.
-		return h.materializeContent(ctx, inner, signer, false, signer)
+		return h.materializeContent(ctx, inner, signer, false)
 	case ap.TypeLike, ap.TypeDislike:
 		return h.votes.ApplyVote(ctx, inner, signer)
 	case ap.TypeDelete:
@@ -449,27 +468,48 @@ func (h *Handler) suppressEcho(ctx context.Context, activityID string, envelope 
 }
 
 // handleBareCreateUpdate processes a Create/Update delivered directly by a
-// user (or community) actor rather than through group fan-out.
+// user (or community) actor rather than through group fan-out. A bare Create or
+// Update of a Person or Group goes to the refresh-only profile path (see
+// applyProfileUpdate); everything else is dropped.
 func (h *Handler) handleBareCreateUpdate(ctx context.Context, activity *ap.Object, signer string) error {
 	obj := activity.Object
 	if obj == nil || (obj.ID == "" && obj.Type == "") {
 		return errors.NewValidationError(activity.Type, "activity carries no object")
 	}
-	isUpdate := activity.Type == ap.TypeUpdate
-	return h.materializeContent(ctx, obj, signer, isUpdate, "")
+	// Content is materialized only from the community's own Announce. The inbox
+	// accepts any signed host, and a bare delivery's audience is whatever the
+	// sender wrote: materializing it would mint the author and write the
+	// community's acceptance for content the community never carried. Lemmy
+	// (verified) always fans community content out through the community's
+	// Announce, including its direct copy of a reply to the parent's author;
+	// PieFed and Mbin are assumed to follow the same FEP-1b12 fan-out. So the
+	// drop loses no genuine traffic. The drop costs a
+	// bare delivery no fetch, tombstone work or mint. A bare reference (no
+	// type) counts as content here, and actor types other than Person and Group
+	// (Service, Application) are dropped too.
+	if obj.Type != ap.TypePerson && obj.Type != ap.TypeGroup {
+		return h.dropBareContent(activity, obj, signer,
+			"bare delivery of a non-profile object; content is materialized only from its community's Announce")
+	}
+	if obj.ID == "" {
+		return errors.NewValidationError("object", "profile object carries no id")
+	}
+	return h.applyProfileUpdate(ctx, obj, signer, "")
 }
 
-// materializeContent is the single content funnel: echo suppression,
-// create-after-delete tombstones, embedded-object trust, followed-community
-// checks, then the materializer. announcer is the announcing community's AP
-// id ("" when the activity arrived bare).
-func (h *Handler) materializeContent(ctx context.Context, obj *ap.Object, signer string, isUpdate bool, announcer string) error {
+// materializeContent is the single content funnel for announced objects: echo
+// suppression, create-after-delete tombstones, embedded-object trust, the
+// announcer-owns-the-content check, then the materializer. It is reached only
+// from the Announce path, so the signer is always the announcing community.
+func (h *Handler) materializeContent(ctx context.Context, obj *ap.Object, signer string, isUpdate bool) error {
 	if obj == nil || obj.ID == "" {
 		return errors.NewValidationError("object", "content object carries no id")
 	}
+	// The signer of an Announce is the community that announced it.
+	announcer := signer
 
-	// Profile updates ride the same rails (Announce{Update{Group}}, bare
-	// Update{Person}) but have their own trust rule; nothing below applies.
+	// An announced profile update (Announce{Update{Person|Group}}) rides the
+	// same rails but has its own trust rule; nothing below applies.
 	if obj.Type == ap.TypePerson || obj.Type == ap.TypeGroup {
 		return h.applyProfileUpdate(ctx, obj, signer, announcer)
 	}
@@ -491,17 +531,10 @@ func (h *Handler) materializeContent(ctx context.Context, obj *ap.Object, signer
 	//
 	// Markers are scoped to whoever laid them, so the lookup needs this
 	// delivery's community context — and that context may only come from
-	// somewhere the DELIVERY cannot choose. Announced: the announcer, which
-	// the inbox bound to the HTTP signature, so a community's own marker
-	// suppresses its own re-announce right here, before any outbound fetch.
-	// Bare: nothing trustworthy names a community yet — the only candidate is
-	// the delivered body's audience, and a Create carrying a bare reference
-	// ({"id": X} with no type and no audience) names none at all, which would
-	// read straight past the community-scoped marker that a delete-before-
-	// create left for exactly this id. So the early check is global-only
-	// (still free, and a globally tombstoned id costs no fetch), and the
-	// community-scoped half runs below against the body resolveDelivered
-	// actually vouches for.
+	// somewhere the DELIVERY cannot choose: the announcer, which the inbox
+	// bound to the HTTP signature, so a community's own marker suppresses its
+	// own re-announce right here, before any outbound fetch. (Bare content
+	// never gets this far; handleBareCreateUpdate drops it.)
 	tombstoned, err := h.tombstones.ExistsFor(ctx, obj.ID, announcer)
 	if err != nil {
 		return fmt.Errorf("ingest: tombstone check for %s: %w", obj.ID, err)
@@ -515,50 +548,19 @@ func (h *Handler) materializeContent(ctx context.Context, obj *ap.Object, signer
 		return err
 	}
 
-	// Bare deliveries must belong to a community the bridge follows; the
-	// announce path already established that for its signer.
-	if announcer == "" {
-		communityIRI := communityIRIFrom(obj)
-		if communityIRI == "" {
-			return skip(obj.ID, "bare delivery names no community (no audience group IRI)")
-		}
-		// The community-scoped half of the create-after-delete check, deferred
-		// from above: this audience comes from a body the origin served (or one
-		// the signer vouched for on its own authority), not from a reference the
-		// deliverer wrote, so a marker laid by the community this object claims
-		// to belong to now applies to it.
-		tombstoned, err := h.tombstones.ExistsFor(ctx, obj.ID, communityIRI)
-		if err != nil {
-			return fmt.Errorf("ingest: tombstone check for %s: %w", obj.ID, err)
-		}
-		if tombstoned {
-			return skip(obj.ID, "object was deleted upstream before it was ever materialized")
-		}
-		community, err := h.communities.GetByAPGroupID(ctx, communityIRI)
-		if errors.IsNotFound(err) {
-			return skip(obj.ID, "bare delivery for a community we do not follow: "+communityIRI)
-		}
-		if err != nil {
-			return fmt.Errorf("ingest: look up community %s: %w", communityIRI, err)
-		}
-		if community.FollowState == store.FollowStateNone {
-			return skip(obj.ID, "bare delivery for unfollowed community "+communityIRI)
-		}
-	} else {
-		// Announced content must belong to the announcing community itself: a
-		// followed community may fan out only its own content, never claim
-		// another community's (even one co-hosted on the same instance). Since
-		// the flip the consequence is not a foreign write into a community repo
-		// — a postv2 goes to its author's repo — but a false BINDING: the
-		// materializer derives the target community from the object's own
-		// audience, EnsureCommunity()s it, records it as the mapping's
-		// community_did and writes that community's acceptance. Without this
-		// guard an announcer could name any community it likes and hand it both
-		// visibility over the post and moderation authority over it.
-		if objCommunity := communityIRIFrom(obj); objCommunity != "" && objCommunity != announcer {
-			return skip(obj.ID, fmt.Sprintf(
-				"announced object names community %s but was announced by %s", objCommunity, announcer))
-		}
+	// Announced content must belong to the announcing community itself: a
+	// followed community may fan out only its own content, never claim
+	// another community's (even one co-hosted on the same instance). Since
+	// the flip the consequence is not a foreign write into a community repo
+	// — a postv2 goes to its author's repo — but a false BINDING: the
+	// materializer derives the target community from the object's own
+	// audience, EnsureCommunity()s it, records it as the mapping's
+	// community_did and writes that community's acceptance. Without this
+	// guard an announcer could name any community it likes and hand it both
+	// visibility over the post and moderation authority over it.
+	if objCommunity := communityIRIFrom(obj); objCommunity != "" && objCommunity != announcer {
+		return skip(obj.ID, fmt.Sprintf(
+			"announced object names community %s but was announced by %s", objCommunity, announcer))
 	}
 
 	switch obj.Type {
@@ -577,15 +579,14 @@ func (h *Handler) materializeContent(ctx context.Context, obj *ap.Object, signer
 	default:
 		return skip(obj.ID, "unsupported content type "+obj.Type)
 	}
-	if err != nil || announcer == "" {
+	if err != nil {
 		return err
 	}
 	// Only the community's own Announce makes an object count toward the
 	// delegation bar. The mark goes on after the object is mapped and on the
-	// announced object alone, never its fetched ancestors. An object that first
-	// arrived bare is re-materialized here as a no-op and still gets the mark,
-	// so it counts from the moment the community announces it; a later bare
-	// delivery never clears it.
+	// announced object alone, never its fetched ancestors. An object first
+	// mapped as a fetched ancestor is re-materialized here as a no-op when its
+	// community announces it, and gets the mark then.
 	if err := h.objects.MarkCommunityAnnounced(ctx, obj.ID); err != nil {
 		return fmt.Errorf("ingest: mark %s community announced: %w", obj.ID, err)
 	}

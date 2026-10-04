@@ -532,10 +532,15 @@ activity by the ingestion layer:
   `hostedBy` to the bridge's service DID.
 
 Deliveries are accepted only over valid draft-cavage HTTP signatures
-(rsa-sha256, 1h date-skew window, digest required); content is accepted only
-from communities the operator subscribed to, and embedded objects are
-re-fetched from their origin instance whenever the delivering signer lacks
-authority over the object's id.
+(rsa-sha256, 1h date-skew window, digest required). Content (posts, comments,
+edits, restores) is materialized only from the subscribed community's own
+`Announce`, and embedded objects are re-fetched from their origin instance
+whenever the delivering signer lacks authority over the object's id. Bare
+`Create`/`Update` of content — including replies sent straight to a persona
+inbox and replies with no audience — and bare `Undo{Delete}` restores of
+content are dropped as processed skips, counted on
+`tidepool_content_bare_dropped`. A bare `Update{Person|Group}` only refreshes
+actors already bridged.
 
 ## Sync surface (what relays and Jetstream consume)
 
@@ -686,7 +691,7 @@ What the user origin serves:
 | `GET /.well-known/webfinger?resource=acct:alice@…` | discovery for a minted local part, scoped to the routed `Host` |
 | `GET /ap/actor/{did}` | the user's `Person` document (`publicKey`, `inbox`, `endpoints.sharedInbox`, `outbox`, `published`) |
 | `GET /ap/actor/{did}/outbox` | empty `OrderedCollection` — Lemmy requires the field, and a missing outbox rejects the whole actor |
-| `POST /ap/inbox` | shared inbox; dispatched **verbatim** to the existing ingest pipeline (one verification, dedupe, and refusal taxonomy — never a second copy) |
+| `POST /ap/inbox` | shared inbox; dispatched **verbatim** to the existing ingest pipeline (one verification, dedupe, and refusal taxonomy — never a second copy), so bare content sent here is dropped like any other |
 | `GET /` | the origin's instance (`Application`) actor, republishing the bridge's key — Lemmy delivers `Delete{Person}` and other send-to-all-instances activities only to the inbox on that row |
 | `GET /.well-known/nodeinfo`, `GET /nodeinfo/2.0` | software identification (`software.name: tidepool`) |
 

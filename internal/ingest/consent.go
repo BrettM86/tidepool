@@ -370,12 +370,9 @@ func (h *Handler) handleUndo(ctx context.Context, undo *ap.Object, signer string
 // Idempotent throughout; a restore for content that is still gone upstream is
 // a skip.
 //
-// Deliberate, operator-visible policy: a BARE restore of mapped content
-// overrides a community's moderation delete of that content. It is bounded by
-// the same-authority signer, an existing mapping, a pinned re-fetch and the
-// type check — i.e. an origin re-serving content it previously bridged — and
-// the origin re-serving an object is the strongest statement anyone makes
-// about it, which is what the bridge mirrors.
+// A BARE restore of mapped content is dropped before the fetch: the
+// re-materialization is content arriving, and content arrives only through its
+// community's Announce (Lemmy sends a restore as Announce{Undo{Delete}}).
 func (h *Handler) handleUndoDelete(ctx context.Context, undo, del *ap.Object, signer string, announcer *store.Community) error {
 	targetID := refID(del.Object)
 	if targetID == "" {
@@ -413,6 +410,14 @@ func (h *Handler) handleUndoDelete(ctx context.Context, undo, del *ap.Object, si
 	// forever on IsDeleted() and the post can never be moderated again.
 	if mapping.Origin == store.OriginBridge {
 		return h.restoreNativeContent(ctx, undo, mapping, announcer, scope)
+	}
+
+	if announcer == nil {
+		switch mapping.Collection {
+		case materialize.CollectionPost, materialize.CollectionPostV2, materialize.CollectionComment:
+			return h.dropBareContent(undo, del.Object, signer,
+				"bare restore of content is not applied: content is restored only from its community's Announce")
+		}
 	}
 
 	// Pinned to the target's own authority: this fetch's answer is what
@@ -473,9 +478,7 @@ func (h *Handler) handleUndoDelete(ctx context.Context, undo, del *ap.Object, si
 			return fmt.Errorf("ingest: re-soft-delete after failed restore of %s: %w", targetID, rerr)
 		}
 		// Same scope the delete would have used: the marker this authorization
-		// context is entitled to lay. A bare undo that cleared other communities'
-		// markers does not re-create them — it got here on the target id's own
-		// authority, which outranks their claim regardless of how this ends.
+		// context is entitled to lay.
 		if rerr := h.tombstones.Record(ctx, targetID, scope); rerr != nil {
 			return fmt.Errorf("ingest: re-record tombstone after failed restore of %s: %w", targetID, rerr)
 		}
@@ -497,15 +500,8 @@ func (h *Handler) handleUndoDelete(ctx context.Context, undo, del *ap.Object, si
 	// make it: an ANNOUNCED undo of a delete that carried a summary — the same
 	// pair of signals that produced the removal in the first place.
 	//
-	// A BARE undo deliberately does not qualify. That path exists so an ORIGIN
-	// can un-delete content it re-serves, and it is permissive by design
-	// (same-authority signer, pinned re-fetch). None of that says anything
-	// about a community's decision to remove the post from itself, and a fresh
-	// acceptance IS a restore — so honouring it would let an author's own
-	// instance overturn moderation by re-serving the post. The bare path still
-	// restores the RECORD and its mapping; the acceptance stays withheld by
-	// the terminality guard in acceptPost, which leaves the post present but
-	// invisible in that community until a moderator restores it.
+	// A BARE undo never gets here: a bare restore of content is dropped before
+	// the fetch.
 	if mapping.Collection == materialize.CollectionPostV2 && announcer != nil && del.HasSummary() {
 		if err := h.mat.RestorePost(ctx, mapping); err != nil {
 			return err

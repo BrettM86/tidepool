@@ -306,12 +306,13 @@ task documents and git history rather than this list.
   the followed-community gate, and the announcer could simply not announce
   the content instead — but there is no per-entity payload to corroborate
   against, so closing it needs a different mechanism.
-- **`materializeContent`'s legacy `origin=bridge` check is now a subset of
-  the classifier** for announced traffic, and its only unique coverage is
-  the bare Create/Update branch — the one dispatch branch that
-  deliberately does not call `suppressEcho`, unlike Delete/Undo. The
-  asymmetry is undocumented and the legacy check misses ids the classifier
-  would catch (outbound_objects-only ids, activity ids, our own actor).
+- **`materializeContent`'s legacy `origin=bridge` check is now a strict
+  subset of `suppressEcho`.** Bare content no longer reaches
+  `materializeContent` (bare Create/Update of content is dropped in
+  `handleBareCreateUpdate`), so the only path left is the Announce path,
+  where `suppressEcho` has already run and catches every id the legacy check
+  would plus ids it misses (outbound_objects-only ids, activity ids, our own
+  actor). The open question is only whether to delete it.
 - **`Drops()` is exported with no production caller** and the tests keep a
   parallel class list; adding a fifth class would silently under-assert
   every "only this class moved" test. Export the class list instead.

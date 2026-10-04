@@ -18,12 +18,18 @@ import (
 // AUTHOR's repo and is signed by that repo's key, so an accepted forgery here
 // is a signed post the victim never wrote. The delivering instance may only
 // ever attribute content to its own users — which is exactly what Lemmy's
-// verify_domains_match already guarantees of genuine traffic.
+// verify_domains_match already guarantees of genuine traffic. A bare Create
+// never reaches the materializer's same-authority author check
+// (requireSameAuthorityAuthor; covered directly in
+// internal/materialize/forged_attribution_test.go): bare content is dropped
+// outright, before any fetch or mint, and content is materialized only from
+// its community's Announce. This pins that a forged attributedTo delivered
+// bare is never materialized and never bridges the victim.
 func TestBareCreateCannotAttributeToAnotherInstance(t *testing.T) {
 	h := newHarness(t)
 	h.subscribeTechnology()
-	// The victim's actor document is fetchable, so the refusal below is the
-	// attribution check and not a failed mint.
+	// The victim's actor document is fetchable, so a refusal is a deliberate
+	// drop and not a failed mint.
 	h.serveLemmyWorldContent()
 	ctx := context.Background()
 

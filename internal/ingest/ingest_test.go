@@ -766,6 +766,18 @@ func (h *harness) subscribeCommunityURL(apGroupID, username string) *remoteActor
 	return group
 }
 
+// firehoseOpCount counts firehose ops (any action, any repo) in collection.
+func (h *harness) firehoseOpCount(collection string) int {
+	h.t.Helper()
+	count := 0
+	for _, path := range h.firehoseOps() {
+		if strings.HasPrefix(path, collection+"/") {
+			count++
+		}
+	}
+	return count
+}
+
 // firehoseOps flattens all firehose event op paths.
 func (h *harness) firehoseOps() []string {
 	h.t.Helper()

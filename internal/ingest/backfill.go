@@ -35,12 +35,14 @@ type BackfillFetcher interface {
 }
 
 // CountSeeder imports a backfilled post's historical vote counts from its
-// origin's public API (task 07's votes.LemmySeeder; AP alone cannot provide
-// them — outboxes announce historical Likes only sparsely). Optional and
-// best-effort: a nil seeder or a seeding failure never affects the backfill
-// outcome.
+// community host's public API (task 07's votes.LemmySeeder; AP alone cannot
+// provide them — outboxes announce historical Likes only sparsely). The
+// community IRI passed must be the community the post is stored under: the
+// seeder trusts that host for the post's counts and does not verify the
+// binding, so callers must. Optional and best-effort: a nil seeder or a
+// seeding failure never affects the backfill outcome.
 type CountSeeder interface {
-	SeedPostCounts(ctx context.Context, postAPID string) error
+	SeedPostCounts(ctx context.Context, postAPID, communityIRI string) error
 }
 
 // BackfillOptions configures NewBackfill. Fetcher, Materializer,
@@ -57,7 +59,7 @@ type BackfillOptions struct {
 	// the same reason the dispatcher's is (task 17a).
 	Echo EchoClassifier
 	// Seeder, when set, seeds each backfilled post's vote aggregates from
-	// the origin's public API (config SEED_COUNTS_FROM_API).
+	// the community host's public API (config SEED_COUNTS_FROM_API).
 	Seeder CountSeeder
 	// MaxPosts caps posts per run (default 100, config.BackfillMaxPosts).
 	MaxPosts int
@@ -227,7 +229,7 @@ func (b *Backfill) Run(ctx context.Context, community *store.Community, force bo
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		ok, err := b.materializeOutboxItem(ctx, item, community.APGroupID)
+		ok, err := b.materializeOutboxItem(ctx, item, community.APGroupID, community.DID)
 		switch {
 		case err == nil:
 			if ok {
@@ -266,7 +268,8 @@ func (b *Backfill) Run(ctx context.Context, community *store.Community, force bo
 // materializeOutboxItem unwraps one outbox entry (Announce{Create{Page}},
 // Create{Page}, or a bare Page) and materializes the post plus its
 // advertised replies. ok reports whether a post actually landed.
-func (b *Backfill) materializeOutboxItem(ctx context.Context, item *ap.Object, communityIRI string) (bool, error) {
+// communityIRI and communityDID identify the community being backfilled.
+func (b *Backfill) materializeOutboxItem(ctx context.Context, item *ap.Object, communityIRI, communityDID string) (bool, error) {
 	obj := item
 	for obj != nil && (obj.Type == ap.TypeAnnounce || obj.Type == ap.TypeCreate || obj.Type == ap.TypeUpdate) {
 		obj = obj.Object
@@ -316,10 +319,24 @@ func (b *Backfill) materializeOutboxItem(ctx context.Context, item *ap.Object, c
 
 	switch obj.Type {
 	case ap.TypePage, ap.TypeArticle:
-		if _, err := b.mat.MaterializePost(ctx, obj); err != nil {
+		res, err := b.mat.MaterializePost(ctx, obj)
+		if err != nil {
 			return false, err
 		}
-		b.seedCounts(ctx, obj.ID)
+		// A community's host is trusted only for its own posts' counts, and
+		// the STORED community binding is the authority on which community a
+		// post lives in. An outbox can list another community's post: on
+		// first materialization it is bound to its own declared community.
+		// An outbox can list a copy whose audience was retargeted at the
+		// walked community: the post stays where it was first stored. Either
+		// way the walked host has no say over its counts. An unknown binding
+		// (empty) seeds nothing.
+		if res.CommunityDID != "" && res.CommunityDID == communityDID {
+			b.seedCounts(ctx, obj.ID, communityIRI)
+		} else {
+			b.logger.Debug("backfill vote-count seeding skipped: stored community is not the walked one",
+				"post", obj.ID, "walked_community", communityDID, "stored_community", res.CommunityDID)
+		}
 		if err := b.backfillReplies(ctx, obj, communityIRI); err != nil {
 			// The post itself landed (and a retry's re-materialization is
 			// free), but an aborted reply pass fails the ITEM: that feeds the
@@ -363,21 +380,24 @@ func (b *Backfill) suppressEcho(ctx context.Context, node *ap.Object) (bool, err
 	return true, nil
 }
 
-// seedCounts imports a backfilled post's historical vote counts (task 07).
+// seedCounts imports a backfilled post's historical vote counts (task 07),
+// asked of the backfilled community's host (communityIRI).
 // Best-effort: failures are logged and never affect the run — a post with a
 // zero score is strictly better than no post. Warn (matching the
 // backfillReplies convention) so a systemic seeding outage is visible at
 // default log levels; a cancellation during shutdown is not an outage.
-func (b *Backfill) seedCounts(ctx context.Context, postAPID string) {
+func (b *Backfill) seedCounts(ctx context.Context, postAPID, communityIRI string) {
 	if b.seeder == nil {
 		return
 	}
-	if err := b.seeder.SeedPostCounts(ctx, postAPID); err != nil {
+	if err := b.seeder.SeedPostCounts(ctx, postAPID, communityIRI); err != nil {
 		if ctx.Err() != nil {
-			b.logger.Debug("backfill vote-count seeding canceled", "post", postAPID, "error", err)
+			b.logger.Debug("backfill vote-count seeding canceled",
+				"post", postAPID, "community", communityIRI, "error", err)
 			return
 		}
-		b.logger.Warn("backfill vote-count seeding failed", "post", postAPID, "error", err)
+		b.logger.Warn("backfill vote-count seeding failed",
+			"post", postAPID, "community", communityIRI, "error", err)
 	}
 }
 

@@ -193,7 +193,7 @@ type Config struct {
 	// default 4).
 	IngestWorkers int
 	// SeedCountsFromAPI enables seeding backfilled posts' vote aggregates
-	// from the origin instance's public API (Lemmy's `counts` field) —
+	// from the community host's public API (Lemmy's `counts` field) —
 	// history whose individual Like activities AP never delivers
 	// (SEED_COUNTS_FROM_API, default on; set to 0/false to disable).
 	SeedCountsFromAPI bool

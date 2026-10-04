@@ -624,10 +624,11 @@ func (r *recordingSeedStore) count() int {
 // post and a subtraction that would corrupt a total nobody seeded — there is no
 // check downstream.
 func TestSeedingNeverInvokesTheArithmeticForRefusedSubjects(t *testing.T) {
-	refused := []string{
-		"https://coves.social/ap/object/did:plc:ewvi7nxzyoun6zhxrhs64oiz/social.coves.community.postv2/3lznative0001",
-		"https://lemmy.world/comment/27485395",
-		"https://lemmy.world/post/49131386/replies",
+	refused := []struct{ apID, communityIRI string }{
+		{"https://coves.social/ap/object/did:plc:ewvi7nxzyoun6zhxrhs64oiz/social.coves.community.postv2/3lznative0001",
+			"https://coves.social/c/test"},
+		{"https://lemmy.world/comment/27485395", "https://lemmy.world/c/test"},
+		{"https://lemmy.world/post/49131386/replies", "https://lemmy.world/c/test"},
 	}
 	// The transport REFUSES everything, so this stays offline even under a
 	// deliberately relaxed parser: the assertion is that the guard holds BEFORE
@@ -635,8 +636,8 @@ func TestSeedingNeverInvokesTheArithmeticForRefusedSubjects(t *testing.T) {
 	recorder := &recordingSeedStore{}
 	seeder, err := NewLemmySeeder(recorder, &http.Client{Transport: refusingTransport{}}, "tidepool-test/0", nil)
 	require.NoError(t, err)
-	for _, apID := range refused {
-		_ = seeder.SeedPostCounts(context.Background(), apID)
+	for _, subject := range refused {
+		require.NoError(t, seeder.SeedPostCounts(context.Background(), subject.apID, subject.communityIRI))
 	}
 	assert.Zero(t, recorder.count(),
 		"SeedAggregates must never be invoked for a subject with no external total: the "+

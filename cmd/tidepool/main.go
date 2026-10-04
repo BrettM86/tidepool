@@ -479,8 +479,8 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 	go statsRefresher.Run(ctx)
-	// Seeding imports historical scores for backfilled posts from the origin
-	// instance's public API (AP alone cannot provide them).
+	// Seeding imports historical scores for backfilled posts from the
+	// community host's public API (AP alone cannot provide them).
 	var seeder ingest.CountSeeder
 	if cfg.SeedCountsFromAPI {
 		lemmySeeder, err := votes.NewLemmySeeder(voteAggregator,

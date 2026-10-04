@@ -337,6 +337,14 @@ type Result struct {
 	// NoOp marks an idempotent re-materialization: the identical record
 	// already existed, no new commit or firehose event was produced.
 	NoOp bool
+	// CommunityDID is the community binding the stored mapping holds after
+	// this commit (ap_objects.community_did). A binding made by an earlier
+	// materialization wins over this delivery's audience, so this, not the
+	// incoming object, says which community the content lives in. Set by
+	// commitRecord (post/comment materialization), and empty there when it
+	// cannot be determined. Empty for profiles and for Results from the
+	// stats-stamp and mapping-reload paths.
+	CommunityDID string
 }
 
 // commitRecord is the single write path for every materialized record:
@@ -447,7 +455,7 @@ func (m *Materializer) commitRecord(ctx context.Context, did, collection, rkey s
 		if err != nil {
 			return nil, fmt.Errorf("materialize: put %s/%s/%s for %s: %w", did, collection, rkey, obj.ID, err)
 		}
-		return &Result{DID: did, ATURI: stored.ATURI, CID: res.RecordCID, NoOp: res.NoOp}, nil
+		return &Result{DID: did, ATURI: stored.ATURI, CID: res.RecordCID, NoOp: res.NoOp, CommunityDID: stored.CommunityDID}, nil
 	}
 
 	// Update path: carry forward the fields the AP rebuild cannot reconstruct,
@@ -474,7 +482,7 @@ func (m *Materializer) commitRecord(ctx context.Context, did, collection, rkey s
 		if err != nil {
 			return nil, fmt.Errorf("materialize: put %s/%s/%s for %s: %w", did, collection, rkey, obj.ID, err)
 		}
-		return &Result{DID: did, ATURI: stored.ATURI, CID: res.RecordCID, NoOp: res.NoOp}, nil
+		return &Result{DID: did, ATURI: stored.ATURI, CID: res.RecordCID, NoOp: res.NoOp, CommunityDID: stored.CommunityDID}, nil
 	}
 }
 

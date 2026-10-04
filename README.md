@@ -344,7 +344,7 @@ Two classes, and the difference matters at boot:
 | `BACKFILL_MAX_POSTS` | `100` | posts materialized per community backfill run |
 | `MINT_RATE_PER_MINUTE` / `MINT_BURST` | `60` / `120` | rate gate on inbound DID minting (PLC registrations are forever; unseen authors in delivered content trigger mints) |
 | `INGEST_WORKERS` | `4` | inbox queue worker-pool size |
-| `SEED_COUNTS_FROM_API` | on | seed backfilled posts' vote aggregates from the origin instance's public API (`/api/v3/post` `counts`); set `0` to disable |
+| `SEED_COUNTS_FROM_API` | on | seed backfilled posts' vote aggregates from the community's host via Lemmy's public API (`/api/v3/post` for posts on that host, anonymous `/api/v3/resolve_object` for posts from other instances; never the post's own host); set `0` to disable |
 | `STATS_REFRESH_INTERVAL` | `30s` | how often the bridged-vote-stats refresher sweeps `vote_aggregates` and folds changed counts onto each subject's post/comment record (`bridgedStats` field); a debounce, so a hot subject's votes coalesce into one record update per sweep — longer is staler counts + fewer firehose events, shorter is fresher + more commit-lock traffic |
 | `STATS_REFRESH_BATCH` | `200` | max aggregates one refresher sweep processes (emits, or skips permanently, per row); commits are globally serialized, so the batch keeps a sweep from flooding the commit lock (the remainder waits for the next sweep) |
 | `TOMBSTONE_RETENTION` | `720h` | how long `ap_tombstones` markers (the delete-before-create guard) are kept before the hourly pruner reclaims them |
@@ -650,8 +650,10 @@ Misskey-style Likes sent to a persona inbox on Coves-authored posts, are
 dropped as processed skips. Known limitation: AP delivers votes only
 going forward, and Lemmy outboxes announce historical Likes sparsely — so
 backfilled posts would start near zero. `SEED_COUNTS_FROM_API` (default on)
-compensates by seeding a baseline from the origin's public API during
-backfill; live votes stack on top, and an undo of a vote that only exists in
+compensates by seeding a baseline from the community host's public API
+during backfill (a post from another instance is looked up on the community's
+host, never its own; one that host does not know is not re-seeded, and any
+earlier baseline is kept); live votes stack on top, and an undo of a vote that only exists in
 the baseline is a no-op (accepted drift, refreshed on re-seed). Comment
 scores are not seeded in v1 — comments accumulate live votes only (a comment
 with live votes still gets a `bridgedStats` field once the refresher folds

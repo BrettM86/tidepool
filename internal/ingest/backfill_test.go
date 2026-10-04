@@ -109,15 +109,17 @@ func TestBackfillProducesMappedHistory(t *testing.T) {
 // recordingSeeder captures CountSeeder invocations; a non-nil err makes
 // every call fail.
 type recordingSeeder struct {
-	mu     sync.Mutex
-	seeded []string
-	err    error
+	mu          sync.Mutex
+	seeded      []string
+	communities []string
+	err         error
 }
 
-func (s *recordingSeeder) SeedPostCounts(_ context.Context, postAPID string) error {
+func (s *recordingSeeder) SeedPostCounts(_ context.Context, postAPID, communityIRI string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.seeded = append(s.seeded, postAPID)
+	s.communities = append(s.communities, communityIRI)
 	return s.err
 }
 
@@ -132,31 +134,23 @@ func TestBackfillSeedsVoteCounts(t *testing.T) {
 	serveOutboxFixtures(t, h)
 	ctx := context.Background()
 
-	seeded := func(seeder *recordingSeeder) *Backfill {
-		b, err := NewBackfill(BackfillOptions{
-			Fetcher:      h.client,
-			Materializer: h.mat,
-			Communities:  h.communities,
-			Tombstones:   h.tombstones,
-			Seeder:       seeder,
-			Echo:         h.classifier,
-			MaxPosts:     10,
-		})
-		require.NoError(t, err)
-		return b
-	}
-
 	seeder := &recordingSeeder{}
 	community, err := h.communities.GetByAPGroupID(ctx, groupID)
 	require.NoError(t, err)
-	require.NoError(t, seeded(seeder).Run(ctx, community, true))
+	require.NoError(t, newSeededBackfill(t, h, seeder).Run(ctx, community, true))
 	assert.Equal(t, []string{pageID, secondPageID}, seeder.seeded,
 		"each materialized post is seeded once (newest first); replies are not")
+	// The seeder must learn which community each post was backfilled from:
+	// a post's own host may differ from the community's host, and only the
+	// community's host is trusted to report the post's score.
+	assert.Equal(t, []string{"https://lemmy.world/c/technology", "https://lemmy.world/c/technology"},
+		seeder.communities,
+		"each seeding call carries the backfilled community's AP Group IRI")
 
 	// A failing seeder is invisible to the run: no error, and the clean
 	// completion still stamps last_backfill_at.
 	failing := &recordingSeeder{err: fmt.Errorf("origin API is down")}
-	require.NoError(t, seeded(failing).Run(ctx, community, true),
+	require.NoError(t, newSeededBackfill(t, h, failing).Run(ctx, community, true),
 		"seeding failures must never fail the backfill")
 	assert.Equal(t, []string{pageID, secondPageID}, failing.seeded,
 		"the failing seeder is still invoked per post")
@@ -164,6 +158,158 @@ func TestBackfillSeedsVoteCounts(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotNil(t, community.LastBackfillAt,
 		"a run with seeding failures is still a clean completion")
+}
+
+// TestBackfillDoesNotSeedPostsOfAnotherCommunity: a community's outbox can
+// list a post that declares a DIFFERENT community. The post still lands (in
+// its own declared community), but its counts must not be asked of
+// the walked community's host — that host has no authority over another
+// community's post. The walked community's own post is still seeded, so the
+// test cannot pass by seeding nothing.
+func TestBackfillDoesNotSeedPostsOfAnotherCommunity(t *testing.T) {
+	h := newHarness(t)
+	h.subscribeTechnology()
+	serveOutboxFixtures(t, h)
+	const foreignCommunity = "https://lemmy.ml/c/linux"
+	h.subscribeCommunityURL(foreignCommunity, "linux")
+
+	// Re-serve the technology outbox with its second post re-addressed to the
+	// foreign community (audience and the to-list group IRI).
+	outboxRaw, err := os.ReadFile(filepath.Join("..", "ap", "testdata", "outbox_lemmy_world.json"))
+	require.NoError(t, err)
+	var outbox map[string]any
+	require.NoError(t, json.Unmarshal(outboxRaw, &outbox))
+	items := outbox["orderedItems"].([]any)
+	foreign := items[1].(map[string]any)["object"].(map[string]any)["object"].(map[string]any)
+	require.Equal(t, secondPageID, foreign["id"])
+	foreign["audience"] = foreignCommunity
+	foreign["to"] = []any{foreignCommunity, "https://www.w3.org/ns/activitystreams#Public"}
+	h.serveObject("/c/technology/outbox", outbox)
+
+	seeder := &recordingSeeder{}
+	b := newSeededBackfill(t, h, seeder)
+	ctx := context.Background()
+	community, err := h.communities.GetByAPGroupID(ctx, groupID)
+	require.NoError(t, err)
+	require.NoError(t, b.Run(ctx, community, true))
+
+	// Both posts still materialize.
+	for _, id := range []string{"https://lemmy.world/post/49131386", "https://lemmy.world/post/49122698"} {
+		mapping, err := h.objects.GetByAPID(ctx, id)
+		require.NoError(t, err, "outbox post %s must be materialized", id)
+		assert.Equal(t, materialize.CollectionPostV2, mapping.Collection)
+	}
+	// Only the walked community's own post is seeded.
+	assert.Equal(t, []string{"https://lemmy.world/post/49131386"}, seeder.seeded,
+		"a post declaring another community must not be seeded from the walked community's host")
+	assert.Equal(t, []string{"https://lemmy.world/c/technology"}, seeder.communities)
+}
+
+// newSeededBackfill is newBackfill with a CountSeeder wired in.
+func newSeededBackfill(t *testing.T, h *harness, seeder CountSeeder) *Backfill {
+	t.Helper()
+	b, err := NewBackfill(BackfillOptions{
+		Fetcher:      h.client,
+		Materializer: h.mat,
+		Communities:  h.communities,
+		Tombstones:   h.tombstones,
+		Seeder:       seeder,
+		Echo:         h.classifier,
+		MaxPosts:     10,
+	})
+	require.NoError(t, err)
+	return b
+}
+
+// TestBackfillDoesNotSeedFromARetargetedAudience: a post stays in the
+// community it was first materialized into, whatever a later copy's audience
+// says. A hostile host authors a post into an honest community, then
+// re-addresses it to a community it hosts itself and lists it in that
+// community's outbox. The re-addressed body is embedded on the hostile host's
+// own authority, so it is used as-is; the post still lives in the honest
+// community, and the hostile community's host must not be asked for its counts.
+func TestBackfillDoesNotSeedFromARetargetedAudience(t *testing.T) {
+	h := newHarness(t)
+	h.subscribeTechnology()
+	const (
+		hostileCommunity = "https://hostile.example/c/takeover"
+		hostilePost      = "https://hostile.example/post/777"
+		hostileAuthor    = "https://hostile.example/u/mallory"
+	)
+	hostileGroup := h.subscribeCommunityURL(hostileCommunity, "takeover")
+	// subscribeCommunityURL's Group advertises no outbox; re-serve it with one.
+	h.serveActorDoc(hostileCommunity, map[string]any{
+		"type":              "Group",
+		"id":                hostileCommunity,
+		"preferredUsername": "takeover",
+		"inbox":             hostileCommunity + "/inbox",
+		"outbox":            hostileCommunity + "/outbox",
+		"endpoints":         map[string]any{"sharedInbox": "https://hostile.example/inbox"},
+		"published":         "2024-01-01T00:00:00.000000Z",
+	}, &hostileGroup.key.PublicKey)
+	h.serveObject("/u/mallory", person(hostileAuthor, "mallory", nil))
+
+	addressedTo := func(community string) map[string]any {
+		return map[string]any{
+			"id":           hostilePost,
+			"type":         "Page",
+			"attributedTo": hostileAuthor,
+			"audience":     community,
+			"to":           []any{community, "https://www.w3.org/ns/activitystreams#Public"},
+			"name":         "a post that changes communities",
+			"content":      "<p>retargeted</p>",
+			"published":    "2026-08-13T09:00:00.000000Z",
+		}
+	}
+	outboxOf := func(community string, items ...any) map[string]any {
+		return map[string]any{
+			"type":         "OrderedCollection",
+			"id":           community + "/outbox",
+			"totalItems":   len(items),
+			"orderedItems": items,
+		}
+	}
+
+	// Walk 1: the honest community lists the post addressed to itself. The
+	// post's id is cross-authority with lemmy.world, so its body is fetched
+	// from the hostile origin — which, at this point, addresses the honest
+	// community.
+	h.serveObject("/post/777", addressedTo("https://lemmy.world/c/technology"))
+	h.serveObject("/c/technology/outbox",
+		outboxOf("https://lemmy.world/c/technology", addressedTo("https://lemmy.world/c/technology")))
+
+	seeder := &recordingSeeder{}
+	b := newSeededBackfill(t, h, seeder)
+	ctx := context.Background()
+	honest, err := h.communities.GetByAPGroupID(ctx, "https://lemmy.world/c/technology")
+	require.NoError(t, err)
+	require.NoError(t, b.Run(ctx, honest, true))
+	mapping, err := h.objects.GetByAPID(ctx, hostilePost)
+	require.NoError(t, err, "the post must materialize into the honest community")
+	require.Equal(t, honest.DID, mapping.CommunityDID)
+	require.Equal(t, 1, h.hitCount("/post/777"), "walk 1 fetches the cross-authority body from its origin")
+
+	// Walk 2: the hostile community lists the same post, now addressed to
+	// itself. Same authority as the hostile outbox, so the embedded body is
+	// trusted without a fetch.
+	h.serveObject("/c/takeover/outbox", outboxOf(hostileCommunity, addressedTo(hostileCommunity)))
+	hostile, err := h.communities.GetByAPGroupID(ctx, hostileCommunity)
+	require.NoError(t, err)
+	require.NoError(t, b.Run(ctx, hostile, true))
+	require.Equal(t, 1, h.hitCount("/post/777"),
+		"walk 2 must use the embedded body (same authority as the hostile outbox)")
+
+	// The stored binding wins: the post is still the honest community's.
+	mapping, err = h.objects.GetByAPID(ctx, hostilePost)
+	require.NoError(t, err)
+	assert.Equal(t, honest.DID, mapping.CommunityDID,
+		"a retargeted audience must not move a materialized post")
+
+	// Walk 1 seeded the post from the honest community; walk 2 seeded
+	// nothing, so the hostile host was never asked for that post's counts.
+	assert.Equal(t, []string{"https://hostile.example/post/777"}, seeder.seeded,
+		"a post living in another community must not be seeded from the walked (hostile) community's host")
+	assert.Equal(t, []string{"https://lemmy.world/c/technology"}, seeder.communities)
 }
 
 // TestBackfillHonorsMaxPosts: the post cap stops the walk early.

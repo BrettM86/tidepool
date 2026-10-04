@@ -22,7 +22,7 @@ import (
 //
 //  2. An Undo for every vote a peer still holds. Tidepool's aggregate is the
 //     FEDIVERSE-ONLY tally and the reseed SUBTRACTS live delivered votes from
-//     the origin's API count (task 17b), so a standing vote from a withdrawn
+//     the community host's API count (task 17b), so a standing vote from a withdrawn
 //     actor is a number the reseed keeps subtracting from a score readers see.
 //
 //     "Standing" is wider than delivered_state='delivered', deliberately: a vote
@@ -194,7 +194,7 @@ func (p *Purger) DeleteRemoteContent(ctx context.Context, did string) error {
 // undoLiveVotes retracts the votes peers still hold and marks them retracted.
 //
 // The state flip is the half that is easy to miss and impossible to see: without
-// it the reseed keeps subtracting these votes from the origin's API tally for an
+// it the reseed keeps subtracting these votes from the community host's API tally for an
 // actor that no longer exists, so a subject's served score drifts down and stays
 // there. It is written HERE rather than waiting for the Undo's delivery
 // callback, deliberately: a purge is terminal, and a withdrawn actor's vote must

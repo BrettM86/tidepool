@@ -36,7 +36,7 @@ import (
 // suppressed voter, and a clamped seed baseline. Both are rare by construction,
 // so a sampler costs nothing in steady state — but each announces itself at
 // volume in exactly the failure it exists to expose (a probe that has started
-// matching GENUINE voters; an origin whose totals no longer contain the votes
+// matching GENUINE voters; a community host whose totals no longer contain the votes
 // we wrote back), and one line per vote or per backfilled post would bury it.
 //
 // The interval is shared; the SAMPLERS are not. Their causes are correlated —
@@ -46,12 +46,12 @@ import (
 const voteWarnInterval = time.Second
 
 // SeedBaselineClamped counts seeds whose computed baseline came out NEGATIVE
-// and was clamped to zero: the origin's total for that DIRECTION was smaller
+// and was clamped to zero: the community host's total for that DIRECTION was smaller
 // than the votes we can already account for on that subject.
 //
 // Read it for what it is — a floor breach, not a discard detector. It can only
 // fire where api_total < live + ours, i.e. on subjects whose entire fediverse
-// tally is smaller than the deficit; on any post with a real score, an origin
+// tally is smaller than the deficit; on any post with a real score, a community host
 // silently discarding the votes we write back (a restrictive Lemmy
 // FederationMode, decision 16's named risk) understates the served tally with
 // the raw baseline still comfortably positive, and this counter stays at zero.
@@ -68,7 +68,7 @@ var SeedBaselineClamped = expvar.NewInt("tidepool_vote_seed_baseline_clamped")
 //
 // It is the volume half of the clamp's signal, and unlike the clamp it advances
 // on ordinary healthy subjects: it says how many votes the bridge BELIEVES the
-// origin is holding for our personas. Compared against a Lemmy-side sample of
+// community host is holding for our personas. Compared against a Lemmy-side sample of
 // the same posts, a persistent gap is a discard being absorbed silently —
 // which the clamp only ever catches on near-zero-score subjects.
 var SeedOursSubtracted = expvar.NewInt("tidepool_vote_seed_ours_subtracted")
@@ -81,7 +81,7 @@ const (
 
 // MaxSeededCount is the upper sanity cap on one seeded baseline value
 // (task 11). Seeds come from a REMOTE instance's public API — a hostile or
-// broken origin must not be able to inject absurd baselines into served
+// broken community host must not be able to inject absurd baselines into served
 // scores. The largest scores on the biggest Lemmy instances are low five
 // figures; one million is comfortably above anything real while making a
 // deliberately poisoned 2^31 baseline a validation error the seeder logs
@@ -446,7 +446,7 @@ func (a *Aggregator) RetractVote(ctx context.Context, vote *ap.Object, community
 }
 
 // SeedAggregates imports a baseline (upvotes, downvotes) for a bridged
-// subject from its origin's public API — history whose individual Like
+// subject from its community host's public API — history whose individual Like
 // activities the bridge never saw (Lemmy outboxes announce historical votes
 // only sparsely). Live vote_events stack on top of the baseline.
 //
@@ -457,7 +457,7 @@ func (a *Aggregator) RetractVote(ctx context.Context, vote *ap.Object, community
 //
 //	served(subject) = api_total(subject) − { our personas' votes Lemmy currently holds }
 //
-// The origin's counts are a TOTAL, and two populations inside it are already
+// The community host's counts are a TOTAL, and two populations inside it are already
 // accounted for elsewhere:
 //
 //   - votes that ALSO federated live and sit in vote_events as live rows (any
@@ -487,7 +487,7 @@ func (a *Aggregator) RetractVote(ctx context.Context, vote *ap.Object, community
 // on the next re-seed" can mean "heals when an admin forces a backfill", and
 // may mean never.
 //
-// Three residual races span the origin API fetch and this transaction. The
+// Three residual races span the community-host API fetch and this transaction. The
 // first two are transient and self-healing on the next re-seed, with the caveat
 // above (the pre-fix over-count race was PERMANENT and compounding); the third
 // heals on the FLIP'S DELIVERY rather than on a re-seed, so re-seeding inside
@@ -580,7 +580,7 @@ func (a *Aggregator) SeedAggregates(ctx context.Context, subjectAPID string, upv
 		// `delivered_state` describes a delivery that already happened, so
 		// after a flip the two come from different moments (see
 		// store.DeliveredStateDelivered). This subtracts the flip's direction
-		// from an origin total that still contains the old one: the direction
+		// from a community-host total that still contains the old one: the direction
 		// the peer really holds is left in the baseline, and the direction it
 		// does not hold is subtracted from a total that never contained it.
 		// Per row the term is RIGHT — the vote is counted among `ours`, which
@@ -662,12 +662,12 @@ type seedOutcome struct {
 // reportSeed publishes what a COMMITTED seed observed.
 //
 // SeedOursSubtracted is the routine half: how many of our personas' votes this
-// seed believes the origin is holding. It advances on healthy subjects, which
+// seed believes the community host is holding. It advances on healthy subjects, which
 // is the point — a persistent gap against a Lemmy-side sample is how a silent
 // discard shows up on posts with real scores.
 //
 // The clamp is the exceptional half, and it makes GREATEST(0, …) visible: a
-// negative raw baseline means the origin's total for that direction is smaller
+// negative raw baseline means the community host's total for that direction is smaller
 // than what we can already account for, and the clamp then absorbs the deficit
 // silently. Counters always advance (a sampled counter counts nothing); only
 // the line is sampled, because a backfill seeds one subject per post and a
@@ -690,7 +690,7 @@ func (a *Aggregator) reportSeed(subject string, apiUp, apiDown int, seed seedOut
 		direction = directionDown
 	}
 	if a.clampLog.Allow(time.Now()) {
-		a.logger.Warn("vote seed baseline clamped: the origin's total is short of the votes we can account for",
+		a.logger.Warn("vote seed baseline clamped: the community host's total is short of the votes we can account for",
 			"subject", subject, "direction", direction,
 			"deficit_up", min64(seed.rawUp, 0), "deficit_down", min64(seed.rawDown, 0),
 			"api_up", apiUp, "api_down", apiDown,

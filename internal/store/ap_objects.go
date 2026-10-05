@@ -264,6 +264,19 @@ func (r *postgresAPObjects) MarkCommunityAnnounced(ctx context.Context, apID str
 	return nil
 }
 
+func (r *postgresAPObjects) SetCommunityDIDIfUnset(ctx context.Context, apID, communityDID string) error {
+	if _, err := syntax.ParseDID(communityDID); err != nil {
+		return errors.NewValidationError("community_did", err.Error())
+	}
+	_, err := r.db.ExecContext(ctx,
+		`UPDATE ap_objects SET community_did = $2 WHERE ap_id = $1 AND community_did IS NULL`,
+		apID, communityDID)
+	if err != nil {
+		return fmt.Errorf("set community_did for ap_object %q: %w", apID, err)
+	}
+	return nil
+}
+
 // validateMapping checks the atproto identifiers with indigo's syntax
 // package, defaults Origin to fediverse, and derives ATURI from
 // (DID, Collection, RKey).

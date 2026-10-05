@@ -36,7 +36,7 @@ func TestDeleteActor_AccountEventVoteAndBlobScrub(t *testing.T) {
 	h.serveLemmyWorldFixtures()
 	ctx := context.Background()
 
-	_, err := h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"))
+	_, err := h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"), groupID)
 	require.NoError(t, err)
 	communityDID := testDIDFor("technology", "lemmy.world")
 	authorDID := testDIDFor("LeftLeaningFreedomFighters", "lemmy.world")
@@ -112,7 +112,7 @@ func TestSuppressActor_ScrubsVotesToo(t *testing.T) {
 	h.serveLemmyWorldFixtures()
 	ctx := context.Background()
 
-	_, err := h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"))
+	_, err := h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"), groupID)
 	require.NoError(t, err)
 
 	require.NoError(t, h.m.SuppressActor(ctx, personID))
@@ -236,7 +236,7 @@ func TestDeleteActor_BlobScrubFailureIsRetryable(t *testing.T) {
 	h.serveLemmyWorldFixtures()
 	ctx := context.Background()
 
-	_, err := h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"))
+	_, err := h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"), groupID)
 	require.NoError(t, err)
 	authorDID := testDIDFor("LeftLeaningFreedomFighters", "lemmy.world")
 	mapping, err := h.objects.GetByAPID(ctx, pageID)

@@ -420,6 +420,15 @@ func (h *Handler) handleUndoDelete(ctx context.Context, undo, del *ap.Object, si
 		}
 	}
 
+	// Content is re-materialized only for the community that announced the
+	// restore: that community is the binding HandleUpdate checks it against.
+	// The bare-content drop above leaves only non-content mappings here, and
+	// those have nothing to re-materialize.
+	boundCommunityIRI := announcerGroupID(announcer)
+	if boundCommunityIRI == "" {
+		return skip(undo.ID, "bare restore of "+targetID+" is not applied: only an announced restore re-materializes")
+	}
+
 	// Pinned to the target's own authority: this fetch's answer is what
 	// authorizes the restore AND what gets written into the repo, so an open
 	// redirect on the origin must fail it rather than both license the restore
@@ -440,21 +449,16 @@ func (h *Handler) handleUndoDelete(ctx context.Context, undo, del *ap.Object, si
 		return skip(targetID, fmt.Sprintf(
 			"restored object is a %q but %s is mapped as %s", restored.Type, targetID, mapping.Collection))
 	}
-	// An announced restore is bound to the announcing community exactly like
-	// announced content (materializeContent's guard) and one notch tighter: the
-	// restored body must NAME a community, and it must be the announcer's. The
-	// materializer derives the target community from the object's own audience
-	// and EnsureCommunity()s it, so letting an EMPTY audience pass would let a
-	// community vouch for a restore into whatever the object turns out to name
-	// — that vacuous pass is what let a sibling community revive another
-	// community's soft-deleted comment. Real Lemmy bodies always carry audience,
-	// so requiring it costs nothing.
-	if announcer != nil {
-		if objCommunity := communityIRIFrom(restored); objCommunity != announcer.APGroupID {
-			return skip(targetID, fmt.Sprintf(
-				"restored object names community %q but was announced by %s",
-				objCommunity, announcer.APGroupID))
-		}
+	// The authoritative binding is the materializer's: HandleUpdate refuses a
+	// restored body whose thread or stored community is not the announcer's.
+	// This guard is an early filter in front of it, refusing a body that names
+	// another community (or none) before the tombstone and the mapping's soft
+	// delete are cleared below, so a refused restore has nothing to undo. Real
+	// Lemmy bodies always carry audience, so requiring it costs nothing.
+	if objCommunity := communityIRIFrom(restored); objCommunity != boundCommunityIRI {
+		return skip(targetID, fmt.Sprintf(
+			"restored object names community %q but was announced by %s",
+			objCommunity, boundCommunityIRI))
 	}
 
 	if err := h.tombstones.Remove(ctx, targetID, scope); err != nil {
@@ -464,7 +468,7 @@ func (h *Handler) handleUndoDelete(ctx context.Context, undo, del *ap.Object, si
 		return fmt.Errorf("ingest: restore mapping for %s: %w", targetID, err)
 	}
 	h.logger.Info("object restored upstream; re-materializing", "ap_id", targetID)
-	if _, err = h.mat.HandleUpdate(ctx, restored); err != nil {
+	if _, err = h.mat.HandleUpdate(ctx, restored, boundCommunityIRI); err != nil {
 		// Compensation, for EVERY error class. The mapping's soft delete is
 		// already cleared and its record was deleted from the repo, so leaving
 		// the mapping live strands it WITHOUT a record (downstream

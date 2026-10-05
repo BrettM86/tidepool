@@ -29,13 +29,13 @@ func TestCommentEditCannotReattributeAuthor(t *testing.T) {
 	h.serveObject("/u/victim", person("https://lemmy.world/u/victim", "victim", nil))
 	ctx := context.Background()
 
-	_, err := h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"))
+	_, err := h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"), groupID)
 	require.NoError(t, err)
 
 	const commentID = "https://lemmy.world/comment/80001"
 	original := note(commentID, "https://lemmy.world/u/alice", pageID,
 		"alice wrote this", "2026-07-08T16:00:00.000000Z")
-	_, err = h.m.MaterializeComment(ctx, objectFromMap(t, original))
+	_, err = h.m.MaterializeComment(ctx, objectFromMap(t, original), groupID)
 	require.NoError(t, err)
 
 	aliceDID := testDIDFor("alice", "lemmy.world")
@@ -51,7 +51,7 @@ func TestCommentEditCannotReattributeAuthor(t *testing.T) {
 	// so the authority check below cannot be what refuses it.
 	forged := note(commentID, "https://lemmy.world/u/victim", pageID,
 		"alice wrote this (edited)", "2026-07-08T16:00:00.000000Z")
-	_, err = h.m.HandleUpdate(ctx, objectFromMap(t, forged))
+	_, err = h.m.HandleUpdate(ctx, objectFromMap(t, forged), groupID)
 	require.NoError(t, err, "a re-attributed edit must not error — it must simply not re-attribute")
 
 	after, err := h.objects.GetByAPID(ctx, commentID)
@@ -86,7 +86,7 @@ func TestCommentCrossAuthorityAttributionRefused(t *testing.T) {
 
 	// The thread root is real and materialized, so a refusal below cannot be
 	// the missing-parent protocol talking.
-	_, err := h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"))
+	_, err := h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"), groupID)
 	require.NoError(t, err)
 
 	const victimIRI = "https://lemmy.world/u/victim"
@@ -94,7 +94,7 @@ func TestCommentCrossAuthorityAttributionRefused(t *testing.T) {
 	h.serveObject("/u/victim", person(victimIRI, "victim", nil))
 
 	res, err := h.m.MaterializeComment(ctx, objectFromMap(t,
-		note(forgedID, victimIRI, pageID, "words the victim never wrote", "2026-07-08T16:10:00.000000Z")))
+		note(forgedID, victimIRI, pageID, "words the victim never wrote", "2026-07-08T16:10:00.000000Z")), groupID)
 	require.Nil(t, res)
 	require.Error(t, err)
 	assert.True(t, IsSkip(err), "cross-authority attribution must be a skip, got %v", err)
@@ -115,7 +115,7 @@ func TestPostCrossAuthorityAttributionRefused(t *testing.T) {
 
 	const forgedID = "https://evil.example/post/1"
 	res, err := h.m.MaterializePost(ctx, mustObject(t,
-		page(forgedID, personID, groupID, "not their post", "2026-07-08T16:20:00.000000Z")))
+		page(forgedID, personID, groupID, "not their post", "2026-07-08T16:20:00.000000Z")), groupID)
 	require.Nil(t, res)
 	require.Error(t, err)
 	assert.True(t, IsSkip(err), "cross-authority attribution must be a skip, got %v", err)

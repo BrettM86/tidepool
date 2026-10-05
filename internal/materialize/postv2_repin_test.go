@@ -33,7 +33,7 @@ func TestUpstreamEditRepinsAcceptance(t *testing.T) {
 	rkey, err := recordRKey(page)
 	require.NoError(t, err)
 
-	first, err := h.m.MaterializePost(ctx, page)
+	first, err := h.m.MaterializePost(ctx, page, groupID)
 	require.NoError(t, err)
 	require.False(t, first.NoOp)
 
@@ -53,7 +53,7 @@ func TestUpstreamEditRepinsAcceptance(t *testing.T) {
 	// The author edits the post upstream.
 	edited := loadFixtureObject(t, "page_lemmy_world.json")
 	edited.Source = &ap.Source{Content: "edited body text", MediaType: "text/markdown"}
-	res, err := h.m.HandleUpdate(ctx, edited)
+	res, err := h.m.HandleUpdate(ctx, edited, groupID)
 	require.NoError(t, err)
 	require.False(t, res.NoOp, "an edited body is a real commit")
 	require.NotEqual(t, first.CID, res.CID, "the edit must move the post's CID")
@@ -82,7 +82,7 @@ func TestRedeliveredEditDoesNotChurnEitherRepo(t *testing.T) {
 	ctx := context.Background()
 
 	page := loadFixtureObject(t, "page_lemmy_world.json")
-	_, err := h.m.MaterializePost(ctx, page)
+	_, err := h.m.MaterializePost(ctx, page, groupID)
 	require.NoError(t, err)
 
 	communityDID := testDIDFor("technology", "lemmy.world")
@@ -90,7 +90,7 @@ func TestRedeliveredEditDoesNotChurnEitherRepo(t *testing.T) {
 
 	editedOnce := loadFixtureObject(t, "page_lemmy_world.json")
 	editedOnce.Source = &ap.Source{Content: "edited body text", MediaType: "text/markdown"}
-	_, err = h.m.HandleUpdate(ctx, editedOnce)
+	_, err = h.m.HandleUpdate(ctx, editedOnce, groupID)
 	require.NoError(t, err)
 
 	authorEvents := eventsForDID(t, h, authorDID)
@@ -103,7 +103,7 @@ func TestRedeliveredEditDoesNotChurnEitherRepo(t *testing.T) {
 	// The queue redelivers the identical Update.
 	editedAgain := loadFixtureObject(t, "page_lemmy_world.json")
 	editedAgain.Source = &ap.Source{Content: "edited body text", MediaType: "text/markdown"}
-	again, err := h.m.HandleUpdate(ctx, editedAgain)
+	again, err := h.m.HandleUpdate(ctx, editedAgain, groupID)
 	require.NoError(t, err)
 	assert.True(t, again.NoOp, "an unchanged redelivered edit is a no-op at the postv2 commit")
 
@@ -131,7 +131,7 @@ func TestStaleAcceptanceRepinnedDespiteNoOpStamp(t *testing.T) {
 	rkey, err := recordRKey(page)
 	require.NoError(t, err)
 
-	first, err := h.m.MaterializePost(ctx, page)
+	first, err := h.m.MaterializePost(ctx, page, groupID)
 	require.NoError(t, err)
 	require.False(t, first.NoOp)
 

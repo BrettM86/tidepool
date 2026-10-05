@@ -91,6 +91,38 @@ func (h *harness) followedCommunity(id, username, instance string) *remoteActor 
 	return actor
 }
 
+// The co-hosted second community of the community-binding tests: followed,
+// on the same instance as technology, with one post of its own materialized.
+const (
+	linuxCommunityID = "https://lemmy.world/c/linux"
+	linuxPostID      = "https://lemmy.world/post/linux-1"
+)
+
+// coHostedCommunityPost subscribes linux — a second community on technology's
+// own instance — and materializes linuxPostID through linux's own Announce, so
+// a reply naming that post as its parent anchors on a thread that lives in
+// linux.
+func (h *harness) coHostedCommunityPost() {
+	h.t.Helper()
+	linux := h.subscribeCommunityURL(linuxCommunityID, "linux")
+	const authorID = "https://lemmy.world/u/linuxAuthor"
+	h.serveObject("/u/linuxAuthor", person(authorID, "linuxAuthor", nil))
+	h.announceCreate(linux, "https://lemmy.world/activities/announce/create/linux-1", map[string]any{
+		"type":         "Page",
+		"id":           linuxPostID,
+		"attributedTo": authorID,
+		"to":           []any{linuxCommunityID, ap.PublicAudience},
+		"audience":     linuxCommunityID,
+		"name":         "a post in linux",
+		"source":       map[string]any{"content": "linux body", "mediaType": "text/markdown"},
+		"published":    "2026-07-09T10:00:00.000000Z",
+	})
+	mapping, err := h.objects.GetByAPID(context.Background(), linuxPostID)
+	require.NoError(h.t, err, "linux's own post is the premise")
+	require.Equal(h.t, testDIDFor("linux", "lemmy.world"), mapping.CommunityDID,
+		"linux's post lives in linux")
+}
+
 // tombstoneAnnouncers lists the raw marker rows for an ap id. ExistsFor
 // cannot answer "whose row is it": a global marker is visible in every scope,
 // so it masks exactly the per-announcer removals the scoping rules are about.
@@ -1048,6 +1080,40 @@ func TestAnnouncedObjectForDifferentCommunityDropped(t *testing.T) {
 	assert.True(t, errors.IsNotFound(err), "the other community must not be bridged")
 }
 
+// TestAnnouncedCommentReplyingIntoAnotherCommunityDropped: the audience guard
+// in materializeContent reads only the comment's own claim, but a comment's
+// community is its thread's. A followed community announcing a comment whose
+// body names that community yet replies to a post living in a co-hosted
+// community must not place the comment in the other community's thread. The
+// comment's id is on the author's own host, so its body is re-fetched from
+// there: the refusal must hold for the origin's answer, not just for an
+// embedded copy.
+func TestAnnouncedCommentReplyingIntoAnotherCommunityDropped(t *testing.T) {
+	h := newHarness(t)
+	group := h.subscribeTechnology()
+	h.coHostedCommunityPost()
+	ctx := context.Background()
+
+	const (
+		authorID  = "https://sopuli.example/u/threadHopper"
+		commentID = "https://sopuli.example/comment/thread-hop-1"
+	)
+	h.serveObject("/u/threadHopper", person(authorID, "threadHopper", nil))
+	// Names technology, so the leaf audience guard lets it through; replies to
+	// linux's post.
+	comment := note(commentID, authorID, linuxPostID, "a reply into linux", "2026-07-09T11:00:00.000000Z")
+	h.serveObject("/comment/thread-hop-1", comment)
+
+	h.announceCreate(group, "https://lemmy.world/activities/announce/create/thread-hop-1", comment)
+
+	require.Equal(t, 1, h.hitCount("/comment/thread-hop-1"),
+		"the cross-authority comment is re-fetched from its origin")
+	_, err := h.objects.GetByAPID(ctx, commentID)
+	assert.True(t, errors.IsNotFound(err),
+		"a comment announced by technology must not be materialized into linux's thread (err=%v)", err)
+	assert.Equal(t, 0, h.firehoseOpCount(materialize.CollectionComment), "no comment record in any repo")
+}
+
 // TestUndoDeleteRollsBackWhenRematerializeSkips (Finding 4): if the restore's
 // re-materialization is declined (a skip), the compensation must re-soft-delete
 // the mapping and re-record the tombstone — never leave a live mapping without
@@ -1437,6 +1503,83 @@ func TestAnnouncedUndoDeleteIntoAnotherCommunityDropped(t *testing.T) {
 	assert.True(t, tombstoned, "the tombstone marker survives a dropped restore")
 	_, err = h.communities.GetByAPGroupID(ctx, otherCommunity)
 	assert.True(t, errors.IsNotFound(err), "the other community must not be bridged")
+}
+
+// TestAnnouncedRestoreReplyingIntoAnotherCommunityDropped: the restore guard
+// checks only the restored body's own audience, but a comment's community is
+// its thread's. A comment first materialized in technology's thread is
+// deleted, and technology then announces its restore — but the origin now
+// serves the body still naming technology while replying to a post that lives
+// in co-hosted linux. The restore must not revive the comment into linux's
+// thread: the mapping stays soft-deleted and technology's tombstone stays.
+func TestAnnouncedRestoreReplyingIntoAnotherCommunityDropped(t *testing.T) {
+	h := newHarness(t)
+	group := h.subscribeTechnology()
+	h.serveLemmyWorldContent()
+	h.coHostedCommunityPost()
+	ctx := context.Background()
+
+	const (
+		techPostID = "https://lemmy.world/post/restore-hop-post"
+		commentID  = "https://lemmy.world/comment/restore-hop-1"
+	)
+	h.announceCreate(group, "https://lemmy.world/activities/announce/create/restore-hop-post", map[string]any{
+		"type":         "Page",
+		"id":           techPostID,
+		"attributedTo": personID,
+		"to":           []any{groupID, ap.PublicAudience},
+		"audience":     groupID,
+		"name":         "a post in technology",
+		"source":       map[string]any{"content": "technology body", "mediaType": "text/markdown"},
+		"published":    "2026-07-09T12:00:00.000000Z",
+	})
+	h.announceCreate(group, "https://lemmy.world/activities/announce/create/restore-hop-1",
+		note(commentID, personID, techPostID, "a reply in technology", "2026-07-09T12:30:00.000000Z"))
+	mapping, err := h.objects.GetByAPID(ctx, commentID)
+	require.NoError(t, err)
+	require.Equal(t, testDIDFor("technology", "lemmy.world"), mapping.CommunityDID,
+		"the comment first lands in technology's thread")
+
+	h.announceDelete(group, "https://lemmy.world/activities/announce/delete/restore-hop-1", personID, commentID)
+	mapping, err = h.objects.GetByAPID(ctx, commentID)
+	require.NoError(t, err)
+	require.True(t, mapping.IsDeleted())
+	require.Equal(t, []string{groupID}, h.tombstoneAnnouncers(commentID))
+
+	// The origin now serves the comment still naming technology, but replying
+	// to linux's post.
+	h.serveObject("/comment/restore-hop-1",
+		note(commentID, personID, linuxPostID, "a reply in technology", "2026-07-09T12:30:00.000000Z"))
+	hitsBefore := h.hitCount("/comment/restore-hop-1")
+	require.Equal(t, http.StatusAccepted, h.deliver(group, map[string]any{
+		"id":       "https://lemmy.world/activities/announce/undo/restore-hop-1",
+		"type":     "Announce",
+		"actor":    groupID,
+		"audience": groupID,
+		"object": map[string]any{
+			"id":       "https://lemmy.world/activities/undo/restore-hop-1",
+			"type":     "Undo",
+			"actor":    personID,
+			"audience": groupID,
+			"object": map[string]any{
+				"id":     "https://lemmy.world/activities/delete/restore-hop-1",
+				"type":   "Delete",
+				"actor":  personID,
+				"object": commentID,
+			},
+		},
+	}))
+	h.drain()
+
+	require.Equal(t, hitsBefore+1, h.hitCount("/comment/restore-hop-1"),
+		"the restore re-fetches the comment from its origin")
+	mapping, err = h.objects.GetByAPID(ctx, commentID)
+	require.NoError(t, err)
+	assert.True(t, mapping.IsDeleted(), "a restore into linux's thread must not revive the mapping")
+	assert.Equal(t, []string{groupID}, h.tombstoneAnnouncers(commentID),
+		"technology's tombstone survives the refused restore")
+	_, _, err = h.manager.GetRecord(ctx, mapping.DID, mapping.Collection, mapping.RKey)
+	assert.True(t, errors.IsNotFound(err), "the refused restore must not rewrite the record (err=%v)", err)
 }
 
 // TestBareReferenceCreateCannotDodgeScopedTombstone: a bare Create carrying

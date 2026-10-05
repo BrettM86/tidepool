@@ -565,7 +565,7 @@ func TestMaterializePostStoresRichText(t *testing.T) {
 		MediaType: "text/markdown",
 	}
 
-	_, err := h.m.MaterializePost(context.Background(), page)
+	_, err := h.m.MaterializePost(context.Background(), page, groupID)
 	require.NoError(t, err)
 
 	record := h.recordFor(t, pageID)
@@ -622,7 +622,7 @@ func TestMaterializeCommentStoresRichText(t *testing.T) {
 		pageID, "> quoted\n\n**bold** reply", "2026-07-07T04:00:00.000000Z")
 	h.serveObject("/comment/9001", c1)
 
-	_, err := h.m.MaterializeComment(context.Background(), objectFromMap(t, c1))
+	_, err := h.m.MaterializeComment(context.Background(), objectFromMap(t, c1), groupID)
 	require.NoError(t, err)
 
 	record := h.recordFor(t, commentID)
@@ -834,7 +834,7 @@ func TestMaterializePostStoresSpoilerFacet(t *testing.T) {
 		MediaType: "text/markdown",
 	}
 
-	_, err := h.m.MaterializePost(context.Background(), page)
+	_, err := h.m.MaterializePost(context.Background(), page, groupID)
 	require.NoError(t, err)
 
 	record := h.recordFor(t, pageID)

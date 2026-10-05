@@ -116,6 +116,20 @@ func IsSkip(err error) bool { return stderrors.Is(err, ErrSkipped) }
 
 func skip(apID, reason string) error { return &SkipError{APID: apID, Reason: reason} }
 
+// errCommunityBindingRaced marks a content commit whose mapping upsert came
+// back bound to a different community than the one the delivery was bound to:
+// a concurrent first materialization of the same object bound it first, and the
+// COALESCE in the upsert kept that binding. Returned from inside the commit
+// transaction so the record write rolls back with it; commitRecord reports it
+// as a skip.
+var errCommunityBindingRaced = stderrors.New("materialize: content was bound to another community concurrently")
+
+// isContentCollection reports whether collection holds community content —
+// posts of either era and comments — as opposed to profiles.
+func isContentCollection(collection string) bool {
+	return collection == CollectionPost || collection == CollectionPostV2 || collection == CollectionComment
+}
+
 // requireSameAuthorityAuthor refuses content that attributes itself to an actor
 // on a DIFFERENT authority than the object's own id.
 //
@@ -356,6 +370,8 @@ type Result struct {
 // for comments the author's repo IS did); communityDID records which
 // community's content it is, for the
 // membership binding announced deletes and announced votes authorize against.
+// For content it is the community THIS delivery was checked against, and a
+// mapping bound to any other community refuses the commit.
 func (m *Materializer) commitRecord(ctx context.Context, did, collection, rkey string, record map[string]any, obj *ap.Object, authorDID, communityDID string) (*Result, error) {
 	// Don't resurrect deleted content. AP delivery is unordered, so a Create
 	// or Update can arrive (or be re-delivered) after a Delete already
@@ -390,9 +406,16 @@ func (m *Materializer) commitRecord(ctx context.Context, did, collection, rkey s
 		if existing.IsDeleted() {
 			return nil, skip(obj.ID, "object was deleted upstream; not resurrecting")
 		}
-		carryForward = collection == CollectionPost ||
-			collection == CollectionPostV2 ||
-			collection == CollectionComment
+		carryForward = isContentCollection(collection)
+		// The caller checked this delivery against communityDID, possibly
+		// while the content was still unmapped. A mapping that has appeared
+		// since, bound elsewhere, is a concurrent first materialization that
+		// won: committing now would carry ITS binding forward and pass as an
+		// edit of content nothing checked this delivery against. A NULL
+		// binding (pre-016 rows) is filled below instead.
+		if carryForward && existing.CommunityDID != "" && existing.CommunityDID != communityDID {
+			return nil, skip(obj.ID, "a concurrent materialization bound it to another community first")
+		}
 		storedCommunityDID = existing.CommunityDID
 		storedThreadRoot = existing.ThreadRootATURI
 	} else if !errors.IsNotFound(err) {
@@ -442,6 +465,16 @@ func (m *Materializer) commitRecord(ctx context.Context, did, collection, rkey s
 			}
 			return fmt.Errorf("materialize: map %s: %w", obj.ID, mapErr)
 		}
+		// The mapping read above can be stale: two first materializations of
+		// one object, bound to different communities, both find no mapping.
+		// The upsert keeps whichever binding landed first, so a stored
+		// binding other than the delivery's means this record would sit under
+		// another community's mapping — refuse it, record write included. The
+		// delivery's community, not mapping.CommunityDID: that one may have
+		// been carried forward from the very binding being checked.
+		if isContentCollection(collection) && stored.CommunityDID != communityDID {
+			return errCommunityBindingRaced
+		}
 		return nil
 	}
 
@@ -452,6 +485,9 @@ func (m *Materializer) commitRecord(ctx context.Context, did, collection, rkey s
 			return nil, err
 		}
 		res, err := m.repos.PutRecordTx(ctx, did, collection, rkey, record, putMapping)
+		if stderrors.Is(err, errCommunityBindingRaced) {
+			return nil, skip(obj.ID, "a concurrent materialization bound it to another community first")
+		}
 		if err != nil {
 			return nil, fmt.Errorf("materialize: put %s/%s/%s for %s: %w", did, collection, rkey, obj.ID, err)
 		}
@@ -478,6 +514,9 @@ func (m *Materializer) commitRecord(ctx context.Context, did, collection, rkey s
 				continue
 			}
 			return nil, fmt.Errorf("materialize: put %s: record kept changing across %d attempts: %w", obj.ID, maxStatsCommitAttempts, err)
+		}
+		if stderrors.Is(err, errCommunityBindingRaced) {
+			return nil, skip(obj.ID, "a concurrent materialization bound it to another community first")
 		}
 		if err != nil {
 			return nil, fmt.Errorf("materialize: put %s/%s/%s for %s: %w", did, collection, rkey, obj.ID, err)

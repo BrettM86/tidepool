@@ -18,7 +18,12 @@ import (
 // and comments flow through the same paths as creation (an Update for a
 // never-seen object simply materializes it), and actor/community updates
 // force a profile refresh regardless of the TTL.
-func (m *Materializer) HandleUpdate(ctx context.Context, obj *ap.Object) (*Result, error) {
+//
+// communityIRI is the AP Group that delivered the update. It binds a Page,
+// Article or Note exactly as MaterializePost and MaterializeComment do (empty
+// is a validation error there), and is ignored for a Person or Group profile
+// refresh, which is not community content.
+func (m *Materializer) HandleUpdate(ctx context.Context, obj *ap.Object, communityIRI string) (*Result, error) {
 	if obj == nil || obj.ID == "" {
 		return nil, errors.NewValidationError("object", "must carry an AP object id")
 	}
@@ -34,9 +39,9 @@ func (m *Materializer) HandleUpdate(ctx context.Context, obj *ap.Object) (*Resul
 		}
 		return m.resultForMapping(ctx, obj.ID)
 	case ap.TypePage, ap.TypeArticle:
-		return m.MaterializePost(ctx, obj)
+		return m.MaterializePost(ctx, obj, communityIRI)
 	case ap.TypeNote:
-		return m.MaterializeComment(ctx, obj)
+		return m.MaterializeComment(ctx, obj, communityIRI)
 	default:
 		return nil, skip(obj.ID, "unsupported Update object type "+obj.Type)
 	}
@@ -291,6 +296,26 @@ func (m *Materializer) deleteMapping(ctx context.Context, mapping *store.APObjec
 	if mapping.Collection == CollectionPostV2 {
 		if err := m.deleteAcceptance(ctx, mapping); err != nil {
 			return err
+		}
+	}
+	// A mapping written before migration 016 has no community_did, and its
+	// community is derived from the very record about to be deleted. Persist
+	// the derived binding first, or a later restore bound to the content's
+	// own community could no longer prove it is that community's. An
+	// underivable one is deleted as before and stays unbound — and so is one
+	// whose records cannot be read, or whose binding cannot be written, right
+	// now: the binding only keeps a later restore possible, and must not block
+	// the delete, nor with it a scrub.
+	if mapping.CommunityDID == "" {
+		communityDID, err := CommunityDIDOf(ctx, m.repos, mapping)
+		if err != nil {
+			m.logger.Warn("community of deleted content could not be derived; deleting without keeping a binding",
+				"ap_id", mapping.APID, "error", err)
+		} else if communityDID != "" {
+			if err := m.objects.SetCommunityDIDIfUnset(ctx, mapping.APID, communityDID); err != nil {
+				m.logger.Warn("community binding could not be kept; deleting without keeping a binding",
+					"ap_id", mapping.APID, "error", err)
+			}
 		}
 	}
 	if _, err := m.repos.DeleteRecord(ctx, mapping.DID, mapping.Collection, mapping.RKey); err != nil && !errors.IsNotFound(err) {

@@ -58,7 +58,7 @@ func TestGoldenPostAndProfiles(t *testing.T) {
 	h := newHarness(t)
 	h.serveLemmyWorldFixtures()
 
-	_, err := h.m.MaterializePost(context.Background(), loadFixtureObject(t, "page_lemmy_world.json"))
+	_, err := h.m.MaterializePost(context.Background(), loadFixtureObject(t, "page_lemmy_world.json"), groupID)
 	require.NoError(t, err)
 
 	assertGolden(t, "community_profile", h.recordFor(t, groupID))
@@ -87,7 +87,7 @@ func TestGoldenPostRichText(t *testing.T) {
 			"```go\nfmt.Println(\"press\")\n```",
 	}
 
-	_, err := h.m.MaterializePost(context.Background(), page)
+	_, err := h.m.MaterializePost(context.Background(), page, groupID)
 	require.NoError(t, err)
 
 	assertGolden(t, "post_richtext", h.recordFor(t, pageID))
@@ -110,7 +110,7 @@ func TestGoldenComment(t *testing.T) {
 		"It has always been this way.",
 		"2026-07-07T05:00:00.000000Z"))
 
-	_, err := h.m.MaterializeComment(context.Background(), loadFixtureObject(t, "note_lemmy_zip.json"))
+	_, err := h.m.MaterializeComment(context.Background(), loadFixtureObject(t, "note_lemmy_zip.json"), groupID)
 	require.NoError(t, err)
 
 	assertGolden(t, "comment", h.recordFor(t, noteID))

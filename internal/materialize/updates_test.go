@@ -22,12 +22,12 @@ func TestUpdateRePutsSameRkey(t *testing.T) {
 	ctx := context.Background()
 	page := loadFixtureObject(t, "page_lemmy_world.json")
 
-	first, err := h.m.MaterializePost(ctx, page)
+	first, err := h.m.MaterializePost(ctx, page, groupID)
 	require.NoError(t, err)
 
 	edited := loadFixtureObject(t, "page_lemmy_world.json")
 	edited.Source = &ap.Source{Content: "edited body text", MediaType: "text/markdown"}
-	second, err := h.m.HandleUpdate(ctx, edited)
+	second, err := h.m.HandleUpdate(ctx, edited, groupID)
 	require.NoError(t, err)
 
 	assert.Equal(t, first.ATURI, second.ATURI, "updates re-put under the same at-uri")
@@ -55,7 +55,7 @@ func TestUpdatePersonRefreshesProfile(t *testing.T) {
 
 	updated := loadFixtureObject(t, "person_lemmy_world.json")
 	updated.Name = "Renamed Neelix"
-	res, err := h.m.HandleUpdate(ctx, updated)
+	res, err := h.m.HandleUpdate(ctx, updated, groupID)
 	require.NoError(t, err)
 
 	record, _, err := h.manager.GetRecord(ctx, res.DID, CollectionActorProfile, ProfileRKey)
@@ -70,7 +70,7 @@ func TestHandleDeleteObject(t *testing.T) {
 	h.serveLemmyWorldFixtures()
 	ctx := context.Background()
 
-	_, err := h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"))
+	_, err := h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"), groupID)
 	require.NoError(t, err)
 	mapping, err := h.objects.GetByAPID(ctx, pageID)
 	require.NoError(t, err)
@@ -97,7 +97,7 @@ func TestDeleteActorScrubsEverything(t *testing.T) {
 	ctx := context.Background()
 
 	// carol authors the leaf comment; the fixture person authors the post.
-	_, err := h.m.MaterializeComment(ctx, leaf)
+	_, err := h.m.MaterializeComment(ctx, leaf, groupID)
 	require.NoError(t, err)
 
 	authorAP := personID // fixture person: authored the post in the community repo
@@ -191,7 +191,7 @@ func TestListByActorDIDSpine(t *testing.T) {
 	h.serveLemmyWorldFixtures()
 	ctx := context.Background()
 
-	_, err := h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"))
+	_, err := h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"), groupID)
 	require.NoError(t, err)
 
 	authorDID := testDIDFor("LeftLeaningFreedomFighters", "lemmy.world")

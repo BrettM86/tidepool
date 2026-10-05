@@ -23,7 +23,10 @@ import (
 // how the two eras coexist: a post first materialized under the deprecated
 // collection keeps being updated there (no migration is planned; Coves
 // indexes both), while everything new is a postv2.
-func (m *Materializer) MaterializePost(ctx context.Context, page *ap.Object) (*Result, error) {
+func (m *Materializer) MaterializePost(ctx context.Context, page *ap.Object, communityIRI string) (*Result, error) {
+	if err := requireBoundCommunityIRI(communityIRI); err != nil {
+		return nil, err
+	}
 	if page == nil || page.ID == "" {
 		return nil, errors.NewValidationError("page", "must carry an AP object id")
 	}
@@ -50,6 +53,28 @@ func (m *Materializer) MaterializePost(ctx context.Context, page *ap.Object) (*R
 	if groupRef == nil {
 		return nil, skip(page.ID, "post names no community (no audience/to group IRI)")
 	}
+	// The delivering community can only speak for itself. Checked before the
+	// Group is bridged, so a Page naming some other Group cannot get it a repo.
+	if groupRef.ID != communityIRI {
+		return nil, skip(page.ID, "post names community "+groupRef.ID+", not the delivering community "+communityIRI)
+	}
+	existing, err := m.objects.GetByAPID(ctx, page.ID)
+	switch {
+	case err == nil:
+		// A post's community is fixed at first materialization, so the
+		// audience above proves nothing about a post already stored: an edit
+		// retargeted at C is still D's post, and C may not re-commit it.
+		stored, storedErr := CommunityDIDOf(ctx, m.repos, existing)
+		if storedErr != nil {
+			return nil, storedErr
+		}
+		if err := m.requireBoundCommunity(ctx, stored, communityIRI, page.ID); err != nil {
+			return nil, err
+		}
+	case errors.IsNotFound(err):
+	default:
+		return nil, fmt.Errorf("materialize: check mapping for %s: %w", page.ID, err)
+	}
 	community, err := m.EnsureCommunity(ctx, groupRef)
 	if err != nil {
 		return nil, err
@@ -60,7 +85,7 @@ func (m *Materializer) MaterializePost(ctx context.Context, page *ap.Object) (*R
 	}
 
 	did, collection, authorDID := author.DID, CollectionPostV2, author.DID
-	if existing, err := m.objects.GetByAPID(ctx, page.ID); err == nil {
+	if existing != nil {
 		did, collection, rkey = existing.DID, existing.Collection, existing.RKey
 		// The repo a postv2 lives in IS its authorship claim, so authorship is
 		// fixed at first materialization. attributedTo on an updated Page is
@@ -72,8 +97,6 @@ func (m *Materializer) MaterializePost(ctx context.Context, page *ap.Object) (*R
 		if existing.AuthorDID != "" {
 			authorDID = existing.AuthorDID
 		}
-	} else if !errors.IsNotFound(err) {
-		return nil, fmt.Errorf("materialize: check mapping for %s: %w", page.ID, err)
 	}
 
 	// The blob DID is the repo the record lands in, not the community: a blob

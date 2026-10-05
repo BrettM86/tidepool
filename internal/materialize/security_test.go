@@ -80,7 +80,7 @@ func TestCommentThreadRootedAtNote_SkipsWithoutPanic(t *testing.T) {
 	child := note("https://lemmy.zip/comment/child", "https://lemmy.zip/u/carol",
 		"https://lemmy.zip/comment/root", "child", "2024-01-02T01:00:00.000000Z")
 
-	res, err := h.m.MaterializeComment(ctx, mustObject(t, child))
+	res, err := h.m.MaterializeComment(ctx, mustObject(t, child), groupID)
 	require.Nil(t, res)
 	require.Error(t, err)
 	assert.True(t, IsSkip(err), "parentless-Note root must be a skip, got %v", err)
@@ -110,7 +110,7 @@ func TestAncestorCrossAuthorityID_Skips(t *testing.T) {
 	child := note("https://lemmy.world/comment/child", personID,
 		"https://lemmy.world/comment/parent", "child", "2024-01-02T01:00:00.000000Z")
 
-	res, err := h.m.MaterializeComment(ctx, mustObject(t, child))
+	res, err := h.m.MaterializeComment(ctx, mustObject(t, child), groupID)
 	require.Nil(t, res)
 	require.Error(t, err)
 	assert.True(t, IsSkip(err), "cross-authority ancestor id must be a skip, got %v", err)
@@ -126,13 +126,13 @@ func TestCreateAfterDelete_DoesNotResurrect(t *testing.T) {
 	ctx := context.Background()
 
 	pageObj := loadFixtureObject(t, "page_lemmy_world.json")
-	_, err := h.m.MaterializePost(ctx, pageObj)
+	_, err := h.m.MaterializePost(ctx, pageObj, groupID)
 	require.NoError(t, err)
 
 	require.NoError(t, h.m.HandleDelete(ctx, pageObj.ID))
 	before := len(h.firehoseEvents())
 
-	res, err := h.m.MaterializePost(ctx, pageObj)
+	res, err := h.m.MaterializePost(ctx, pageObj, groupID)
 	require.Nil(t, res)
 	require.Error(t, err)
 	assert.True(t, IsSkip(err), "re-create after delete must be a skip, got %v", err)
@@ -164,7 +164,7 @@ func TestNobridgeOnRefresh_ScrubsExistingContent(t *testing.T) {
 	h.serveObject("/c/general", group(groupIRI, "general", nil))
 
 	// First pass: bridge + materialize the post (author = scrubme).
-	_, err := h.m.MaterializePost(ctx, mustObject(t, page(pageIRI, personIRI, groupIRI, "hello", "2024-02-01T00:00:00.000000Z")))
+	_, err := h.m.MaterializePost(ctx, mustObject(t, page(pageIRI, personIRI, groupIRI, "hello", "2024-02-01T00:00:00.000000Z")), groupIRI)
 	require.NoError(t, err)
 
 	authorDID := testDIDFor("scrubme", "lemmy.world")
@@ -203,7 +203,7 @@ func TestKnownPersonAsCommunity_Skips(t *testing.T) {
 
 	// A post claiming that person's IRI as its community.
 	pg := page("https://lemmy.world/post/2002", personIRI, personIRI, "x", "2024-02-02T00:00:00.000000Z")
-	res, err := h.m.MaterializePost(ctx, mustObject(t, pg))
+	res, err := h.m.MaterializePost(ctx, mustObject(t, pg), personIRI)
 	require.Nil(t, res)
 	require.Error(t, err)
 	assert.True(t, IsSkip(err), "person-as-community must be a skip, got %v", err)

@@ -27,7 +27,7 @@ func TestSetBridgedStatsStampsRecord(t *testing.T) {
 	h.serveLemmyWorldFixtures()
 	ctx := context.Background()
 
-	created, err := h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"))
+	created, err := h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"), groupID)
 	require.NoError(t, err)
 	require.False(t, created.NoOp)
 
@@ -61,7 +61,7 @@ func TestSetBridgedStatsUnchangedCountsNoOp(t *testing.T) {
 	h.serveLemmyWorldFixtures()
 	ctx := context.Background()
 
-	_, err := h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"))
+	_, err := h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"), groupID)
 	require.NoError(t, err)
 	mapping, err := h.objects.GetByAPID(ctx, pageID)
 	require.NoError(t, err)
@@ -92,7 +92,7 @@ func TestSetBridgedStatsChangedCountsCommits(t *testing.T) {
 	h.serveLemmyWorldFixtures()
 	ctx := context.Background()
 
-	_, err := h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"))
+	_, err := h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"), groupID)
 	require.NoError(t, err)
 	mapping, err := h.objects.GetByAPID(ctx, pageID)
 	require.NoError(t, err)
@@ -123,7 +123,7 @@ func TestSetBridgedStatsRecordDeleted(t *testing.T) {
 	h.serveLemmyWorldFixtures()
 	ctx := context.Background()
 
-	_, err := h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"))
+	_, err := h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"), groupID)
 	require.NoError(t, err)
 	mapping, err := h.objects.GetByAPID(ctx, pageID)
 	require.NoError(t, err)
@@ -144,7 +144,7 @@ func TestEditCarriesBridgedStatsForward(t *testing.T) {
 	ctx := context.Background()
 
 	page := loadFixtureObject(t, "page_lemmy_world.json")
-	_, err := h.m.MaterializePost(ctx, page)
+	_, err := h.m.MaterializePost(ctx, page, groupID)
 	require.NoError(t, err)
 	mapping, err := h.objects.GetByAPID(ctx, pageID)
 	require.NoError(t, err)
@@ -156,7 +156,7 @@ func TestEditCarriesBridgedStatsForward(t *testing.T) {
 	// A later edit rebuilds from AP data with no stats field.
 	edited := loadFixtureObject(t, "page_lemmy_world.json")
 	edited.Source = &ap.Source{Content: "edited body text", MediaType: "text/markdown"}
-	res, err := h.m.HandleUpdate(ctx, edited)
+	res, err := h.m.HandleUpdate(ctx, edited, groupID)
 	require.NoError(t, err)
 	require.False(t, res.NoOp, "an edited body is a real commit")
 
@@ -180,7 +180,7 @@ func TestUnchangedReingestAfterStatsIsNoOp(t *testing.T) {
 	ctx := context.Background()
 
 	page := loadFixtureObject(t, "page_lemmy_world.json")
-	_, err := h.m.MaterializePost(ctx, page)
+	_, err := h.m.MaterializePost(ctx, page, groupID)
 	require.NoError(t, err)
 	mapping, err := h.objects.GetByAPID(ctx, pageID)
 	require.NoError(t, err)
@@ -190,7 +190,7 @@ func TestUnchangedReingestAfterStatsIsNoOp(t *testing.T) {
 	eventsAfterStamp := len(h.firehoseEvents())
 
 	// Re-ingest the identical post (a re-delivery).
-	again, err := h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"))
+	again, err := h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"), groupID)
 	require.NoError(t, err)
 	assert.True(t, again.NoOp, "an unchanged re-ingest after stamping must be a no-op")
 	assert.Equal(t, stamped.CID, again.CID, "carry-forward keeps the CID identical")
@@ -283,13 +283,13 @@ func TestCommentEditCarriesReplyRefsForward(t *testing.T) {
 	h.serveObject("/u/alice", person("https://lemmy.world/u/alice", "alice", nil))
 	ctx := context.Background()
 
-	_, err := h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"))
+	_, err := h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"), groupID)
 	require.NoError(t, err)
 
 	c1 := note("https://lemmy.world/comment/1001", "https://lemmy.world/u/alice",
 		pageID, "original comment", "2026-07-07T04:00:00.000000Z")
 	h.serveObject("/comment/1001", c1)
-	_, err = h.m.MaterializeComment(ctx, objectFromMap(t, c1))
+	_, err = h.m.MaterializeComment(ctx, objectFromMap(t, c1), groupID)
 	require.NoError(t, err)
 
 	c1Mapping, err := h.objects.GetByAPID(ctx, "https://lemmy.world/comment/1001")
@@ -313,7 +313,7 @@ func TestCommentEditCarriesReplyRefsForward(t *testing.T) {
 	// directly (its parent is already mapped), so no re-fetch/re-serve is needed.
 	edited := note("https://lemmy.world/comment/1001", "https://lemmy.world/u/alice",
 		pageID, "edited comment body", "2026-07-07T04:00:00.000000Z")
-	res, err := h.m.HandleUpdate(ctx, objectFromMap(t, edited))
+	res, err := h.m.HandleUpdate(ctx, objectFromMap(t, edited), groupID)
 	require.NoError(t, err)
 	require.False(t, res.NoOp, "an edited body is a real commit")
 

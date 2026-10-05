@@ -146,6 +146,13 @@ type APObjects interface {
 	// PutMapping upserts leave it alone. A missing mapping is an error
 	// satisfying errors.IsNotFound.
 	MarkCommunityAnnounced(ctx context.Context, apID string) error
+
+	// SetCommunityDIDIfUnset records communityDID as the mapping's community
+	// binding only when it has none: a binding already made is never
+	// overwritten. It is how a binding derived from a record is kept before
+	// that record is deleted. Setting an already-bound or missing mapping is
+	// a no-op success.
+	SetCommunityDIDIfUnset(ctx context.Context, apID, communityDID string) error
 }
 
 // BridgedActors registers fediverse actors bridged into atproto and their

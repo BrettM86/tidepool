@@ -117,6 +117,9 @@ type harness struct {
 	mux         *http.ServeMux
 	fixtures    *httptest.Server
 	scrubbed    *recordingScrubber
+	// hits counts GETs per served path (see hitCount).
+	hitsMu sync.Mutex
+	hits   map[string]int
 }
 
 // recordingScrubber records ScrubVoter calls (the task-11 vote-scrub hook).
@@ -185,6 +188,7 @@ func newHarness(t *testing.T) *harness {
 		t: t, m: m, manager: manager,
 		objects: objects, actors: actors, communities: communities,
 		mux: mux, fixtures: fixtures, scrubbed: scrubbed,
+		hits: map[string]int{},
 	}
 	// Every pictrs-style image path serves fixed bytes by extension.
 	mux.HandleFunc("/pictrs/image/", func(w http.ResponseWriter, r *http.Request) {
@@ -217,9 +221,20 @@ func (h *harness) serveObject(path string, obj map[string]any) {
 
 func (h *harness) serveJSON(path string, body []byte) {
 	h.mux.HandleFunc("GET "+path, func(w http.ResponseWriter, r *http.Request) {
+		h.hitsMu.Lock()
+		h.hits[path]++
+		h.hitsMu.Unlock()
 		w.Header().Set("Content-Type", ap.ContentTypeActivityJSON)
 		_, _ = w.Write(body)
 	})
+}
+
+// hitCount is how many times a path registered through serveJSON (and so
+// serveObject/serveFixture) has been fetched.
+func (h *harness) hitCount(path string) int {
+	h.hitsMu.Lock()
+	defer h.hitsMu.Unlock()
+	return h.hits[path]
 }
 
 // serveLemmyWorldFixtures registers the standard page/person/group trio.
@@ -298,7 +313,7 @@ func TestMaterializePostEndToEnd(t *testing.T) {
 	h.serveLemmyWorldFixtures()
 	ctx := context.Background()
 
-	res, err := h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"))
+	res, err := h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"), groupID)
 	require.NoError(t, err)
 	require.False(t, res.NoOp)
 
@@ -363,7 +378,7 @@ func TestEmissionOrdering(t *testing.T) {
 	h := newHarness(t)
 	h.serveLemmyWorldFixtures()
 
-	_, err := h.m.MaterializePost(context.Background(), loadFixtureObject(t, "page_lemmy_world.json"))
+	_, err := h.m.MaterializePost(context.Background(), loadFixtureObject(t, "page_lemmy_world.json"), groupID)
 	require.NoError(t, err)
 
 	seqOf := func(collection string) int64 {
@@ -396,12 +411,12 @@ func TestIdempotentRematerialize(t *testing.T) {
 	ctx := context.Background()
 	page := loadFixtureObject(t, "page_lemmy_world.json")
 
-	first, err := h.m.MaterializePost(ctx, page)
+	first, err := h.m.MaterializePost(ctx, page, groupID)
 	require.NoError(t, err)
 	require.False(t, first.NoOp)
 	eventsBefore := len(h.firehoseEvents())
 
-	second, err := h.m.MaterializePost(ctx, page)
+	second, err := h.m.MaterializePost(ctx, page, groupID)
 	require.NoError(t, err)
 	assert.True(t, second.NoOp, "identical re-materialization must be a repo no-op")
 	assert.Equal(t, first.ATURI, second.ATURI)
@@ -427,7 +442,7 @@ func TestNobridgeActorNeverMaterialized(t *testing.T) {
 	pageObj := loadFixtureObject(t, "page_lemmy_world.json")
 	pageObj.AttributedTo = ap.Refs{ap.Object{ID: "https://lemmy.world/u/optout"}}
 
-	_, err := h.m.MaterializePost(context.Background(), pageObj)
+	_, err := h.m.MaterializePost(context.Background(), pageObj, groupID)
 	require.Error(t, err)
 	assert.True(t, IsSkip(err), "nobridge must be a skip, not a failure: %v", err)
 
@@ -443,7 +458,7 @@ func TestPostWithoutPublishedSkipped(t *testing.T) {
 	pageObj := loadFixtureObject(t, "page_lemmy_world.json")
 	pageObj.Published = nil
 
-	_, err := h.m.MaterializePost(context.Background(), pageObj)
+	_, err := h.m.MaterializePost(context.Background(), pageObj, groupID)
 	require.Error(t, err)
 	assert.True(t, IsSkip(err))
 }
@@ -532,7 +547,7 @@ func TestPublicOnlyAudienceFallsBackToAddressing(t *testing.T) {
 		pageObj.Audience = ap.Audience{spelling}
 		pageObj.To = ap.Audience{groupID, ap.PublicAudience}
 
-		res, err := h.m.MaterializePost(ctx, pageObj)
+		res, err := h.m.MaterializePost(ctx, pageObj, groupID)
 		require.NoError(t, err, "audience %q must not be mistaken for a community", spelling)
 		assert.Equal(t, testDIDFor("LeftLeaningFreedomFighters", "lemmy.world"), res.DID,
 			"the post lands in the author's repo")

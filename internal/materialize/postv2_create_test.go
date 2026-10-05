@@ -4,12 +4,14 @@ import (
 	"context"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"tidepool/internal/ap"
 	"tidepool/internal/errors"
+	"tidepool/internal/store"
 	"tidepool/internal/testutil"
 )
 
@@ -17,12 +19,9 @@ import (
 // shared pageID so each test owns its object graph.
 const (
 	imagePageID        = "https://lemmy.world/post/70001"
-	hijackPageID       = "https://lemmy.world/post/70002"
 	statsPageID        = "https://lemmy.world/post/70003"
 	namePageID         = "https://lemmy.world/post/70004"
 	hijackAuthorPageID = "https://lemmy.world/post/70005"
-	threadPageID       = "https://lemmy.world/post/70010"
-	otherThreadPageID  = "https://lemmy.world/post/70011"
 	otherGroupID       = "https://lemmy.world/c/elsewhere"
 	embedImageURL      = "https://lemmy.world/media/postv2-embed.png"
 )
@@ -77,7 +76,7 @@ func TestPostV2EmbedBlobsLandInAuthorRepo(t *testing.T) {
 		"name":      "a picture",
 	}}
 
-	_, err := h.m.MaterializePost(ctx, mustObject(t, imagePost))
+	_, err := h.m.MaterializePost(ctx, mustObject(t, imagePost), groupID)
 	require.NoError(t, err)
 
 	communityDID := testDIDFor("technology", "lemmy.world")
@@ -136,7 +135,7 @@ func TestPostV2DisplayNameComesFromFetchedActorNotInlineRef(t *testing.T) {
 
 		post := pageAttributedToInline(namePageID, personID, inlineLie, groupID,
 			"a post with a lying inline author", "2026-07-08T13:00:00.000000Z")
-		_, err := h.m.MaterializePost(ctx, mustObject(t, post))
+		_, err := h.m.MaterializePost(ctx, mustObject(t, post), groupID)
 		require.NoError(t, err)
 
 		record := h.recordFor(t, namePageID)
@@ -156,7 +155,7 @@ func TestPostV2DisplayNameComesFromFetchedActorNotInlineRef(t *testing.T) {
 
 		post := pageAttributedToInline(namePageID, "https://lemmy.world/u/nameless", inlineLie,
 			groupID, "a post by a nameless author", "2026-07-08T13:00:00.000000Z")
-		_, err := h.m.MaterializePost(ctx, mustObject(t, post))
+		_, err := h.m.MaterializePost(ctx, mustObject(t, post), groupID)
 		require.NoError(t, err)
 
 		record := h.recordFor(t, namePageID)
@@ -168,52 +167,118 @@ func TestPostV2DisplayNameComesFromFetchedActorNotInlineRef(t *testing.T) {
 	})
 }
 
-// TestPostV2CommunityIsImmutableAcrossUpdates (B2): postv2.community is
-// immutable. Coves' consumers DISCARD any update event that changes it, so a
-// bridge that re-derived the community from a hostile or merely edited
-// `audience` would emit an event Coves throws away — silently freezing the
-// post at its pre-edit version — and, worse, would relocate the record.
-// The stored community must be carried forward from the stored record.
+// TestPostV2CommunityIsImmutableAcrossUpdates (B2): a post's community is
+// decided once, when it is first materialized, and a later delivery cannot
+// move it. postv2.community is immutable to Coves (its consumers DISCARD any
+// update event that changes it), and a post's community is what authorizes
+// announced deletes and votes against it.
+//
+// The community a delivery speaks for is fixed by the delivery itself — the
+// community that announced it — never read off the edited audience. So when C
+// re-delivers a post stored in D, even one whose audience now names C, it is
+// not C's post: the delivery is refused, and the stored record, its CID and
+// its mapping are left exactly as they were. That holds for a postv2, for a
+// postv2 whose mapping predates the community_did column, and for a post
+// written in the deprecated era into D's own repo.
 func TestPostV2CommunityIsImmutableAcrossUpdates(t *testing.T) {
-	h := newHarness(t)
-	h.serveLemmyWorldFixtures()
-	h.serveObject("/c/elsewhere", group(otherGroupID, "elsewhere", nil))
-	ctx := context.Background()
+	const postID = "https://lemmy.zip/post/92001"
+	const title = "a post in D"
+	publishedAt := time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC)
+	const published = "2026-10-01T09:00:00.000000Z"
+	communityD := testDIDFor("elsewhere", "lemmy.world")
 
-	original := page(hijackPageID, personID, groupID, "a post in technology", "2026-07-08T11:00:00.000000Z")
-	_, err := h.m.MaterializePost(ctx, mustObject(t, original))
-	require.NoError(t, err)
+	storedInD := func(t *testing.T, h *harness) {
+		t.Helper()
+		_, err := h.m.MaterializePost(context.Background(),
+			mustObject(t, page(postID, bindingAuthor, bindingCommunityD, title, published)), bindingCommunityD)
+		require.NoError(t, err)
+	}
+	cases := []struct {
+		name    string
+		prepare func(t *testing.T, h *harness)
+	}{
+		{name: "postv2 stored in D", prepare: storedInD},
+		{name: "postv2 stored in D with no community_did column", prepare: func(t *testing.T, h *harness) {
+			storedInD(t, h)
+			clearCommunityColumn(t, postID)
+		}},
+		{name: "legacy community.post in D's repo", prepare: func(t *testing.T, h *harness) {
+			ctx := context.Background()
+			community, err := h.m.EnsureCommunity(ctx, &ap.Object{ID: bindingCommunityD})
+			require.NoError(t, err)
+			author, err := h.m.EnsureActor(ctx, &ap.Object{ID: bindingAuthor})
+			require.NoError(t, err)
+			rkey, err := recordRKey(mustObject(t, page(postID, bindingAuthor, bindingCommunityD, title, published)))
+			require.NoError(t, err)
+			commit, err := h.manager.PutRecord(ctx, community.DID, CollectionPost, rkey, map[string]any{
+				"$type":     CollectionPost,
+				"community": community.DID,
+				"author":    author.DID,
+				"createdAt": recordDatetime(publishedAt),
+				"title":     title,
+			})
+			require.NoError(t, err)
+			// Pre-016: the legacy era never filled community_did.
+			_, err = h.objects.PutMapping(ctx, store.APObjectMapping{
+				APID:           postID,
+				APType:         "Page",
+				OriginInstance: "lemmy.zip",
+				Origin:         store.OriginFediverse,
+				DID:            community.DID,
+				AuthorDID:      author.DID,
+				Collection:     CollectionPost,
+				RKey:           rkey,
+				CID:            commit.RecordCID,
+				PublishedAt:    &publishedAt,
+			})
+			require.NoError(t, err)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			serveBindingWorld(h)
+			ensureCommunities(t, h, bindingCommunityC, bindingCommunityD)
+			ctx := context.Background()
+			tc.prepare(t, h)
 
-	before, err := h.objects.GetByAPID(ctx, hijackPageID)
-	require.NoError(t, err)
+			before, err := h.objects.GetByAPID(ctx, postID)
+			require.NoError(t, err)
+			recordBefore, cidBefore, err := h.manager.GetRecord(ctx, before.DID, before.Collection, before.RKey)
+			require.NoError(t, err)
+			require.Equal(t, communityD, recordBefore["community"], "precondition: the post is stored in D")
+			stateBefore := captureContentState(t, h)
 
-	communityDID := testDIDFor("technology", "lemmy.world")
-	otherCommunityDID := testDIDFor("elsewhere", "lemmy.world")
-	require.NotEqual(t, communityDID, otherCommunityDID)
+			// C re-delivers it, edited, with an audience retargeted at C.
+			retargeted := mustObject(t, page(postID, bindingAuthor, bindingCommunityC, title, published))
+			retargeted.Source = &ap.Source{Content: "edited body text", MediaType: "text/markdown"}
+			res, err := h.m.HandleUpdate(ctx, retargeted, bindingCommunityC)
+			require.Error(t, err, "C may not re-deliver a post that is stored in D")
+			assert.Nil(t, res)
+			assert.True(t, IsSkip(err), "a re-delivery bound to another community is a skip, got %v", err)
 
-	// The upstream edit now names a DIFFERENT group.
-	hijacked := page(hijackPageID, personID, otherGroupID, "a post in technology", "2026-07-08T11:00:00.000000Z")
-	_, err = h.m.HandleUpdate(ctx, mustObject(t, hijacked))
-	require.NoError(t, err, "a retargeted audience must not error — it must simply not retarget the record")
+			after, err := h.objects.GetByAPID(ctx, postID)
+			require.NoError(t, err)
+			assert.Equal(t, before.DID, after.DID, "the record must not be moved")
+			assert.Equal(t, before.Collection, after.Collection)
+			assert.Equal(t, before.RKey, after.RKey)
+			assert.Equal(t, before.CID, after.CID, "the mapping must still name the stored version")
+			assert.Equal(t, before.CommunityDID, after.CommunityDID, "the community binding must not change")
 
-	after, err := h.objects.GetByAPID(ctx, hijackPageID)
-	require.NoError(t, err)
-	assert.Equal(t, before.DID, after.DID, "the record must not be MOVED by an audience change")
-	assert.Equal(t, before.RKey, after.RKey)
+			recordAfter, cidAfter, err := h.manager.GetRecord(ctx, after.DID, after.Collection, after.RKey)
+			require.NoError(t, err)
+			assert.Equal(t, cidBefore, cidAfter, "the stored record must not be re-committed")
+			assert.Equal(t, recordBefore, recordAfter)
+			assert.Equal(t, communityD, recordAfter["community"])
 
-	record, _, err := h.manager.GetRecord(ctx, after.DID, after.Collection, after.RKey)
-	require.NoError(t, err)
-	assert.Equal(t, communityDID, record["community"],
-		"community is immutable: it must be carried forward from the stored record, "+
-			"NOT re-derived from the changed audience (Coves discards any event that changes it)")
+			resolved, err := CommunityDIDOf(ctx, h.manager, after)
+			require.NoError(t, err)
+			assert.Equal(t, communityD, resolved, "the post still belongs to D")
 
-	// And nothing may have been planted in the hijacked community's repo.
-	_, _, err = h.manager.GetRecord(ctx, otherCommunityDID, testPostV2Collection, after.RKey)
-	assert.True(t, errors.IsNotFound(err),
-		"no postv2 record may appear in the retargeted community's repo (err=%v)", err)
-	_, _, err = h.manager.GetRecord(ctx, otherCommunityDID, testLegacyPostCollection, after.RKey)
-	assert.True(t, errors.IsNotFound(err),
-		"no post record of any era may appear in the retargeted community's repo (err=%v)", err)
+			assert.Equal(t, stateBefore, captureContentState(t, h),
+				"a refused re-delivery writes nothing: no record, no acceptance, no mapping change")
+		})
+	}
 }
 
 // TestPostV2EditCarriesBridgedStatsForward (B3): the vote refresher stamps
@@ -235,7 +300,7 @@ func TestPostV2EditCarriesBridgedStatsForward(t *testing.T) {
 	ctx := context.Background()
 
 	original := page(statsPageID, personID, groupID, "a post with votes", "2026-07-08T12:00:00.000000Z")
-	_, err := h.m.MaterializePost(ctx, mustObject(t, original))
+	_, err := h.m.MaterializePost(ctx, mustObject(t, original), groupID)
 	require.NoError(t, err)
 
 	mapping, err := h.objects.GetByAPID(ctx, statsPageID)
@@ -246,7 +311,7 @@ func TestPostV2EditCarriesBridgedStatsForward(t *testing.T) {
 	// The upstream edit changes the body only.
 	edited := mustObject(t, page(statsPageID, personID, groupID, "a post with votes", "2026-07-08T12:00:00.000000Z"))
 	edited.Source = &ap.Source{Content: "edited body text", MediaType: "text/markdown"}
-	res, err := h.m.HandleUpdate(ctx, edited)
+	res, err := h.m.HandleUpdate(ctx, edited, groupID)
 	require.NoError(t, err)
 	require.False(t, res.NoOp, "an edited body is a real commit")
 
@@ -287,7 +352,7 @@ func TestPostV2AuthorIsImmutableAcrossUpdates(t *testing.T) {
 
 	original := page(hijackAuthorPageID, personID, groupID, "a post by its real author",
 		"2026-07-08T14:00:00.000000Z")
-	_, err := h.m.MaterializePost(ctx, mustObject(t, original))
+	_, err := h.m.MaterializePost(ctx, mustObject(t, original), groupID)
 	require.NoError(t, err)
 
 	before, err := h.objects.GetByAPID(ctx, hijackAuthorPageID)
@@ -301,7 +366,7 @@ func TestPostV2AuthorIsImmutableAcrossUpdates(t *testing.T) {
 	// The edit now claims a different author.
 	hijacked := page(hijackAuthorPageID, "https://lemmy.world/u/impostor", groupID,
 		"a post by its real author", "2026-07-08T14:00:00.000000Z")
-	_, err = h.m.HandleUpdate(ctx, mustObject(t, hijacked))
+	_, err = h.m.HandleUpdate(ctx, mustObject(t, hijacked), groupID)
 	require.NoError(t, err,
 		"a retargeted attributedTo must not error — it must simply not retarget the record")
 
@@ -325,68 +390,93 @@ func TestPostV2AuthorIsImmutableAcrossUpdates(t *testing.T) {
 		"no postv2 may appear in the claimed author's repo (err=%v)", err)
 }
 
-// TestCommentCommunityIsImmutableAcrossUpdates (F2): a comment's community is
-// fixed by the thread it was posted in, and an edit may not move it.
+// TestCommentCommunityIsImmutableAcrossUpdates (B5): a comment's community is
+// fixed by the thread it was posted in, and a later delivery may not move it.
 //
-// This is the comment counterpart of B2, and it is a SECURITY property rather
-// than a tidiness one. A comment's community_did is what authorizes announced
-// deletes and binds announced votes: whoever the mapping says owns the comment
-// may moderate it. `inReplyTo` on an updated Note is attacker-influenced, so a
-// rebuild that re-derived the community from it would let a delivery hand
-// community B moderation authority over a comment posted in community A —
-// community A's members' content, moderated by a community they never posted
-// to, with no moderator action on A's side at all.
+// This is a SECURITY property rather than a tidiness one. A comment's
+// community is what authorizes announced deletes and binds announced votes:
+// whoever owns the comment may moderate it. So when C delivers an Update for a
+// comment stored in D's thread — re-parented into a post in C, addressed to C —
+// the comment is still D's, C cannot speak for it, and the delivery is refused
+// with the record, its CID and its mapping unchanged. A comment whose mapping
+// predates the community_did column is just as much D's.
 func TestCommentCommunityIsImmutableAcrossUpdates(t *testing.T) {
-	h := newHarness(t)
-	h.serveLemmyWorldFixtures()
-	h.serveObject("/c/elsewhere", group(otherGroupID, "elsewhere", nil))
-	ctx := context.Background()
+	const (
+		postInC   = "https://lemmy.zip/post/95001"
+		postInD   = "https://lemmy.zip/post/95002"
+		commentID = "https://lemmy.zip/comment/95003"
+		published = "2026-10-01T16:02:00.000000Z"
+	)
+	communityD := testDIDFor("elsewhere", "lemmy.world")
 
-	communityA := testDIDFor("technology", "lemmy.world")
-	communityB := testDIDFor("elsewhere", "lemmy.world")
-	require.NotEqual(t, communityA, communityB)
+	cases := []struct {
+		name         string
+		legacyColumn bool
+	}{
+		{name: "comment in D"},
+		{name: "comment in D with no community_did column", legacyColumn: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			serveBindingWorld(h)
+			ensureCommunities(t, h, bindingCommunityC, bindingCommunityD)
+			ctx := context.Background()
 
-	// A thread in community A, and an unrelated post in community B.
-	postA := page(threadPageID, personID, groupID, "thread root in A", "2026-07-08T15:00:00.000000Z")
-	h.serveObject("/post/70010", postA)
-	_, err := h.m.MaterializePost(ctx, mustObject(t, postA))
-	require.NoError(t, err)
+			// A thread in C, and a thread in D holding the comment.
+			threadC := page(postInC, bindingAuthor, bindingCommunityC, "thread root in C", "2026-10-01T16:00:00.000000Z")
+			h.serveObject("/post/95001", threadC)
+			_, err := h.m.MaterializePost(ctx, mustObject(t, threadC), bindingCommunityC)
+			require.NoError(t, err)
+			threadD := page(postInD, bindingAuthor, bindingCommunityD, "thread root in D", "2026-10-01T16:01:00.000000Z")
+			h.serveObject("/post/95002", threadD)
+			_, err = h.m.MaterializePost(ctx, mustObject(t, threadD), bindingCommunityD)
+			require.NoError(t, err)
+			comment := noteIn(commentID, bindingReplier, postInD, bindingCommunityD, "a comment in D", published)
+			h.serveObject("/comment/95003", comment)
+			_, err = h.m.MaterializeComment(ctx, mustObject(t, comment), bindingCommunityD)
+			require.NoError(t, err)
+			if tc.legacyColumn {
+				clearCommunityColumn(t, commentID)
+			}
 
-	postB := page(otherThreadPageID, personID, otherGroupID, "thread root in B", "2026-07-08T15:01:00.000000Z")
-	h.serveObject("/post/70011", postB)
-	_, err = h.m.MaterializePost(ctx, mustObject(t, postB))
-	require.NoError(t, err)
+			before, err := h.objects.GetByAPID(ctx, commentID)
+			require.NoError(t, err)
+			resolvedBefore, err := CommunityDIDOf(ctx, h.manager, before)
+			require.NoError(t, err)
+			require.Equal(t, communityD, resolvedBefore, "precondition: the comment belongs to D")
+			recordBefore, cidBefore, err := h.manager.GetRecord(ctx, before.DID, before.Collection, before.RKey)
+			require.NoError(t, err)
+			stateBefore := captureContentState(t, h)
 
-	// A comment in A's thread.
-	const commentID = "https://lemmy.world/comment/70012"
-	comment := note(commentID, personID, threadPageID, "a comment in A", "2026-07-08T15:02:00.000000Z")
-	h.serveObject("/comment/70012", comment)
-	_, err = h.m.MaterializeComment(ctx, mustObject(t, comment))
-	require.NoError(t, err)
+			// C delivers an edit re-parenting the comment into C's thread.
+			hijacked := noteIn(commentID, bindingReplier, postInC, bindingCommunityC,
+				"a comment in D (edited)", published)
+			res, err := h.m.HandleUpdate(ctx, mustObject(t, hijacked), bindingCommunityC)
+			require.Error(t, err, "C may not re-deliver a comment that is stored in D")
+			assert.Nil(t, res)
+			assert.True(t, IsSkip(err), "a re-delivery bound to another community is a skip, got %v", err)
 
-	before, err := h.objects.GetByAPID(ctx, commentID)
-	require.NoError(t, err)
-	require.Equal(t, communityA, before.CommunityDID, "precondition: the comment belongs to community A")
+			after, err := h.objects.GetByAPID(ctx, commentID)
+			require.NoError(t, err)
+			assert.Equal(t, before.DID, after.DID)
+			assert.Equal(t, before.RKey, after.RKey)
+			assert.Equal(t, before.CID, after.CID, "the mapping must still name the stored version")
+			assert.Equal(t, before.CommunityDID, after.CommunityDID, "the community binding must not change")
 
-	// The edit re-parents the comment into community B's thread.
-	hijacked := note(commentID, personID, otherThreadPageID, "a comment in A (edited)",
-		"2026-07-08T15:02:00.000000Z")
-	_, err = h.m.HandleUpdate(ctx, mustObject(t, hijacked))
-	require.NoError(t, err, "a re-parented comment must not error — it must simply not be re-parented")
+			recordAfter, cidAfter, err := h.manager.GetRecord(ctx, after.DID, after.Collection, after.RKey)
+			require.NoError(t, err)
+			assert.Equal(t, cidBefore, cidAfter, "the stored record must not be re-committed")
+			assert.Equal(t, recordBefore, recordAfter, "reply refs and content must be untouched")
 
-	after, err := h.objects.GetByAPID(ctx, commentID)
-	require.NoError(t, err)
-	assert.Equal(t, communityA, after.CommunityDID,
-		"the comment's community must stay A: community_did is what authorizes announced deletes "+
-			"and binds announced votes, so moving it hands B moderation authority over A's content")
+			// CommunityDIDOf is what ingest's announced-delete authorization and
+			// votes' announced-vote binding both consult.
+			resolved, err := CommunityDIDOf(ctx, h.manager, after)
+			require.NoError(t, err)
+			assert.Equal(t, communityD, resolved,
+				"the community that may moderate this comment must still be D")
 
-	// CommunityDIDOf is the exact function ingest's announced-delete
-	// authorization and votes' announced-vote binding both consult, so
-	// asserting it here is asserting who may moderate this comment.
-	resolved, err := CommunityDIDOf(ctx, h.manager, after)
-	require.NoError(t, err)
-	assert.Equal(t, communityA, resolved,
-		"the community that may moderate this comment must still be A, not the one the edit named")
-	assert.NotEqual(t, communityB, resolved,
-		"community B must NOT have acquired authority over a comment posted in A")
+			assert.Equal(t, stateBefore, captureContentState(t, h), "a refused re-delivery writes nothing")
+		})
+	}
 }

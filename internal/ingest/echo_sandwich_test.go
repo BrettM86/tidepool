@@ -121,6 +121,7 @@ func setupSandwich(t *testing.T, h *harness) sandwich {
 		ATURI:         csPostATURI,
 		ID:            consume.ActivityID(csUserOrigin, csPostATURI, "create", 0),
 		CommunityAPID: groupID,
+		CommunityDID:  testDIDFor("technology", "lemmy.world"),
 		Snapshot:      csPostSnapshot(t),
 	})
 	mapping, err := h.objects.GetByAPID(ctx, csPostAPID)

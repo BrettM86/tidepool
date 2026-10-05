@@ -284,11 +284,11 @@ func (b *Backfill) materializeOutboxItem(ctx context.Context, item *ap.Object, c
 	// Our own content, walked past. It runs on the UNRESOLVED node, before
 	// resolveEmbedded: our object id is cross-authority with the outbox host,
 	// so resolving would dereference our own origin to fetch back a record we
-	// already hold — and MaterializePost then calls EnsureActor on its
-	// attributedTo BEFORE reading any mapping, minting a bridged actor for our
-	// own persona. A skip, never an error: our post in a community's history is
-	// an expected item, and failing it would leave every run reporting failures
-	// and the community never cleanly backfilled.
+	// already hold — and MaterializePost mints the actor its attributedTo names
+	// without checking whether the object is bridge-origin, minting a bridged
+	// actor for our own persona. A skip, never an error: our post in a
+	// community's history is an expected item, and failing it would leave every
+	// run reporting failures and the community never cleanly backfilled.
 	//
 	// The question is asked of the unwrapped OBJECT, not the outbox envelope:
 	// the community mints its own Announce/Create ids around our content, so
@@ -319,18 +319,16 @@ func (b *Backfill) materializeOutboxItem(ctx context.Context, item *ap.Object, c
 
 	switch obj.Type {
 	case ap.TypePage, ap.TypeArticle:
-		res, err := b.mat.MaterializePost(ctx, obj)
+		res, err := b.mat.MaterializePost(ctx, obj, communityIRI)
 		if err != nil {
 			return false, err
 		}
-		// A community's host is trusted only for its own posts' counts, and
-		// the STORED community binding is the authority on which community a
-		// post lives in. An outbox can list another community's post: on
-		// first materialization it is bound to its own declared community.
-		// An outbox can list a copy whose audience was retargeted at the
-		// walked community: the post stays where it was first stored. Either
-		// way the walked host has no say over its counts. An unknown binding
-		// (empty) seeds nothing.
+		// A community's host is trusted only for its own posts' counts.
+		// MaterializePost is bound to the walked community, so a post it
+		// returns without a skip already belongs to it: another community's
+		// post, or one stored in another community and retargeted at this
+		// one, is refused above. The comparison is defense in depth on that
+		// binding; an unknown binding (empty) seeds nothing.
 		if res.CommunityDID != "" && res.CommunityDID == communityDID {
 			b.seedCounts(ctx, obj.ID, communityIRI)
 		} else {
@@ -346,7 +344,7 @@ func (b *Backfill) materializeOutboxItem(ctx context.Context, item *ap.Object, c
 		}
 		return true, nil
 	case ap.TypeNote:
-		if _, err := b.mat.MaterializeComment(ctx, obj); err != nil {
+		if _, err := b.mat.MaterializeComment(ctx, obj, communityIRI); err != nil {
 			return false, err
 		}
 		return true, nil
@@ -458,7 +456,7 @@ func (b *Backfill) backfillReplies(ctx context.Context, post *ap.Object, communi
 			b.logger.Info("backfill reply skipped", "post", post.ID, "reason", "reply was deleted upstream")
 			return nil
 		}
-		if _, err := b.mat.MaterializeComment(ctx, resolved); err != nil {
+		if _, err := b.mat.MaterializeComment(ctx, resolved, communityIRI); err != nil {
 			if materialize.IsSkip(err) {
 				b.logger.Info("backfill reply skipped", "post", post.ID, "reason", err.Error())
 				return nil

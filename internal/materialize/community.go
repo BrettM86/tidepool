@@ -79,6 +79,58 @@ func CommunityDIDOf(ctx context.Context, records RecordGetter, mapping *store.AP
 	}
 }
 
+// requireBoundCommunity refuses content that does not belong to the community
+// the current delivery is bound to. communityDID is what CommunityDIDOf (or
+// resolveReplyRefs, which asks it) answered for the content or its parent;
+// communityIRI is the AP Group that delivered it.
+//
+// The comparison is by DID, so the bound community has to be looked up, and a
+// missing communities row fails closed: recreating it here would let a
+// delivery mint the very community it is being checked against. An empty
+// communityDID is "cannot be determined" and is refused, never matched — see
+// CommunityDIDOf.
+func (m *Materializer) requireBoundCommunity(ctx context.Context, communityDID, communityIRI, contentID string) error {
+	// A missing communities row, an empty bound DID and an empty content
+	// binding are inconsistent state rather than hostile input, so each of
+	// the three is logged where an operator will see it.
+	bound, err := m.communities.GetByAPGroupID(ctx, communityIRI)
+	switch {
+	case err == nil:
+	case errors.IsNotFound(err):
+		m.logger.Warn("bound community has no communities row; content refused",
+			"ap_id", contentID, "community", communityIRI)
+		return skip(contentID, "bound community "+communityIRI+" is not bridged; its content cannot be verified")
+	default:
+		return fmt.Errorf("materialize: look up bound community %s for %s: %w", communityIRI, contentID, err)
+	}
+	if bound.DID == "" {
+		m.logger.Warn("bound community has an empty DID; content refused",
+			"ap_id", contentID, "community", communityIRI)
+		return skip(contentID, "bound community "+communityIRI+" has no DID; its content cannot be verified")
+	}
+	if communityDID == "" {
+		m.logger.Warn("stored content's community binding is empty and cannot be derived; content refused",
+			"ap_id", contentID, "community", communityIRI)
+		return skip(contentID, "stored community binding is empty and cannot be derived; it cannot be bound to the delivering community "+communityIRI)
+	}
+	if communityDID != bound.DID {
+		return skip(contentID, fmt.Sprintf("content belongs to community %q, not to the delivering community %s",
+			communityDID, communityIRI))
+	}
+	return nil
+}
+
+// requireBoundCommunityIRI is the empty-binding guard every content entry
+// point opens with. A caller that cannot say which community delivered the
+// content has a bug; treating "" as "unbound" would reopen every check the
+// binding exists for.
+func requireBoundCommunityIRI(communityIRI string) error {
+	if communityIRI == "" {
+		return errors.NewValidationError("community_iri", "must name the community that delivered the content")
+	}
+	return nil
+}
+
 // mappingCommunityDID is the WRITE side of CommunityDIDOf: which community a
 // record being committed belongs to, for its mapping's community_did column.
 // The two must agree, so each post era answers from the same thing the read

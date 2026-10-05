@@ -42,7 +42,7 @@ func TestAcceptanceHealsOnRedelivery(t *testing.T) {
 	rkey, err := recordRKey(page)
 	require.NoError(t, err)
 
-	first, err := h.m.MaterializePost(ctx, page)
+	first, err := h.m.MaterializePost(ctx, page, groupID)
 	require.NoError(t, err)
 	require.False(t, first.NoOp)
 
@@ -64,7 +64,7 @@ func TestAcceptanceHealsOnRedelivery(t *testing.T) {
 	}
 
 	// The queue redelivers the same Create.
-	second, err := h.m.MaterializePost(ctx, page)
+	second, err := h.m.MaterializePost(ctx, page, groupID)
 	require.NoError(t, err)
 	assert.True(t, second.NoOp, "an unchanged redelivery is an idempotent no-op at the postv2 commit")
 
@@ -95,7 +95,7 @@ func TestAcceptanceIsNotOnTheMappingSpine(t *testing.T) {
 	rkey, err := recordRKey(page)
 	require.NoError(t, err)
 
-	_, err = h.m.MaterializePost(ctx, page)
+	_, err = h.m.MaterializePost(ctx, page, groupID)
 	require.NoError(t, err)
 
 	communityDID := testDIDFor("technology", "lemmy.world")
@@ -154,7 +154,7 @@ func TestAcceptanceRedeliveryDoesNotChurnCommunityRepo(t *testing.T) {
 	rkey, err := recordRKey(page)
 	require.NoError(t, err)
 
-	first, err := h.m.MaterializePost(ctx, page)
+	first, err := h.m.MaterializePost(ctx, page, groupID)
 	require.NoError(t, err)
 	require.False(t, first.NoOp)
 
@@ -168,7 +168,7 @@ func TestAcceptanceRedeliveryDoesNotChurnCommunityRepo(t *testing.T) {
 	eventsBefore := eventsForDID(t, h, communityDID)
 
 	// Redeliver the identical post.
-	second, err := h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"))
+	second, err := h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"), groupID)
 	require.NoError(t, err)
 	assert.True(t, second.NoOp, "an unchanged redelivery is a no-op at the postv2 commit")
 
@@ -224,7 +224,7 @@ func TestAcceptanceRefusedWhenRemovalLandsAfterTheGuard(t *testing.T) {
 	page := loadFixtureObject(t, "page_lemmy_world.json")
 	rkey, err := recordRKey(page)
 	require.NoError(t, err)
-	_, err = h.m.MaterializePost(ctx, page)
+	_, err = h.m.MaterializePost(ctx, page, groupID)
 	require.NoError(t, err)
 
 	communityDID := testDIDFor("technology", "lemmy.world")
@@ -252,7 +252,7 @@ func TestAcceptanceRefusedWhenRemovalLandsAfterTheGuard(t *testing.T) {
 	}
 
 	// Redelivery of the same post drives acceptPost with the stale answer.
-	_, err = h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"))
+	_, err = h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"), groupID)
 	require.NoError(t, err,
 		"a refused acceptance is not an error: the community's removal simply stands")
 
@@ -281,7 +281,7 @@ func TestAcceptanceRefusedWhenRemovalLandsAfterTheGuard(t *testing.T) {
 	_, err = h.manager.DeleteRecord(ctx, communityDID, CollectionRemoval, acceptanceRKey)
 	require.NoError(t, err)
 
-	_, err = h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"))
+	_, err = h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"), groupID)
 	require.NoError(t, err)
 
 	_, _, err = h.manager.GetRecord(ctx, communityDID, CollectionAcceptance, acceptanceRKey)

@@ -60,7 +60,7 @@ func TestOuterAcceptance_PostV2Flip(t *testing.T) {
 	rkey, err := recordRKey(page)
 	require.NoError(t, err)
 
-	res, err := h.m.MaterializePost(ctx, page)
+	res, err := h.m.MaterializePost(ctx, page, groupID)
 	require.NoError(t, err)
 	require.False(t, res.NoOp)
 

@@ -25,9 +25,9 @@ const echoDropLogInterval = time.Second
 // Materializer is the slice of *materialize.Materializer the dispatcher
 // drives (task 05's entry points).
 type Materializer interface {
-	MaterializePost(ctx context.Context, page *ap.Object) (*materialize.Result, error)
-	MaterializeComment(ctx context.Context, note *ap.Object) (*materialize.Result, error)
-	HandleUpdate(ctx context.Context, obj *ap.Object) (*materialize.Result, error)
+	MaterializePost(ctx context.Context, page *ap.Object, communityIRI string) (*materialize.Result, error)
+	MaterializeComment(ctx context.Context, note *ap.Object, communityIRI string) (*materialize.Result, error)
+	HandleUpdate(ctx context.Context, obj *ap.Object, communityIRI string) (*materialize.Result, error)
 	// HandleDelete branches actor vs content off a FRESH bridged_actors read;
 	// HandleDeleteRecord is the content-only entry that never can. Callers
 	// that already classified the target (handleDelete, SweepDeleted) use the
@@ -550,14 +550,13 @@ func (h *Handler) materializeContent(ctx context.Context, obj *ap.Object, signer
 
 	// Announced content must belong to the announcing community itself: a
 	// followed community may fan out only its own content, never claim
-	// another community's (even one co-hosted on the same instance). Since
-	// the flip the consequence is not a foreign write into a community repo
-	// — a postv2 goes to its author's repo — but a false BINDING: the
-	// materializer derives the target community from the object's own
-	// audience, EnsureCommunity()s it, records it as the mapping's
-	// community_did and writes that community's acceptance. Without this
-	// guard an announcer could name any community it likes and hand it both
-	// visibility over the post and moderation authority over it.
+	// another community's (even one co-hosted on the same instance). The
+	// authoritative check is the materializer's, which binds every post and
+	// comment to the announcer passed below — a post must name it, a comment's
+	// thread must belong to it, and stored content keeps the community it was
+	// first bound to. This guard is an early filter in front of that: an
+	// object naming another community is refused before the materializer
+	// fetches any ancestor or bridges any author.
 	if objCommunity := communityIRIFrom(obj); objCommunity != "" && objCommunity != announcer {
 		return skip(obj.ID, fmt.Sprintf(
 			"announced object names community %s but was announced by %s", objCommunity, announcer))
@@ -566,15 +565,15 @@ func (h *Handler) materializeContent(ctx context.Context, obj *ap.Object, signer
 	switch obj.Type {
 	case ap.TypePage, ap.TypeArticle:
 		if isUpdate {
-			_, err = h.mat.HandleUpdate(ctx, obj)
+			_, err = h.mat.HandleUpdate(ctx, obj, announcer)
 		} else {
-			_, err = h.mat.MaterializePost(ctx, obj)
+			_, err = h.mat.MaterializePost(ctx, obj, announcer)
 		}
 	case ap.TypeNote:
 		if isUpdate {
-			_, err = h.mat.HandleUpdate(ctx, obj)
+			_, err = h.mat.HandleUpdate(ctx, obj, announcer)
 		} else {
-			_, err = h.mat.MaterializeComment(ctx, obj)
+			_, err = h.mat.MaterializeComment(ctx, obj, announcer)
 		}
 	default:
 		return skip(obj.ID, "unsupported content type "+obj.Type)

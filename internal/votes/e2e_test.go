@@ -51,17 +51,17 @@ const (
 // materializer — votes must stay bridge-side.
 type stubMaterializer struct{ t *testing.T }
 
-func (s *stubMaterializer) MaterializePost(context.Context, *ap.Object) (*materialize.Result, error) {
+func (s *stubMaterializer) MaterializePost(context.Context, *ap.Object, string) (*materialize.Result, error) {
 	s.t.Fatal("votes must never reach MaterializePost")
 	return nil, nil
 }
 
-func (s *stubMaterializer) MaterializeComment(context.Context, *ap.Object) (*materialize.Result, error) {
+func (s *stubMaterializer) MaterializeComment(context.Context, *ap.Object, string) (*materialize.Result, error) {
 	s.t.Fatal("votes must never reach MaterializeComment")
 	return nil, nil
 }
 
-func (s *stubMaterializer) HandleUpdate(context.Context, *ap.Object) (*materialize.Result, error) {
+func (s *stubMaterializer) HandleUpdate(context.Context, *ap.Object, string) (*materialize.Result, error) {
 	s.t.Fatal("votes must never reach HandleUpdate")
 	return nil, nil
 }

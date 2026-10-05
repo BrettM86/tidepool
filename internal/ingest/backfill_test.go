@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"tidepool/internal/ap"
 	"tidepool/internal/errors"
 	"tidepool/internal/materialize"
 )
@@ -161,11 +162,12 @@ func TestBackfillSeedsVoteCounts(t *testing.T) {
 }
 
 // TestBackfillDoesNotSeedPostsOfAnotherCommunity: a community's outbox can
-// list a post that declares a DIFFERENT community. The post still lands (in
-// its own declared community), but its counts must not be asked of
-// the walked community's host — that host has no authority over another
-// community's post. The walked community's own post is still seeded, so the
-// test cannot pass by seeding nothing.
+// list a post that declares a DIFFERENT community. A backfill walks one
+// community's history, so content it reaches is bound to that community: the
+// foreign post is not materialized at all (its own community's Announce or
+// backfill is where it lands), and so it is never seeded from the walked
+// community's host either. The walked community's own post is still
+// materialized and seeded, so the test cannot pass by doing nothing.
 func TestBackfillDoesNotSeedPostsOfAnotherCommunity(t *testing.T) {
 	h := newHarness(t)
 	h.subscribeTechnology()
@@ -193,16 +195,153 @@ func TestBackfillDoesNotSeedPostsOfAnotherCommunity(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, b.Run(ctx, community, true))
 
-	// Both posts still materialize.
-	for _, id := range []string{"https://lemmy.world/post/49131386", "https://lemmy.world/post/49122698"} {
-		mapping, err := h.objects.GetByAPID(ctx, id)
-		require.NoError(t, err, "outbox post %s must be materialized", id)
-		assert.Equal(t, materialize.CollectionPostV2, mapping.Collection)
-	}
+	mapping, err := h.objects.GetByAPID(ctx, "https://lemmy.world/post/49131386")
+	require.NoError(t, err, "the walked community's own post must be materialized")
+	assert.Equal(t, materialize.CollectionPostV2, mapping.Collection)
+	_, err = h.objects.GetByAPID(ctx, "https://lemmy.world/post/49122698")
+	assert.True(t, errors.IsNotFound(err),
+		"a post declaring another community must not be materialized by the walk (err=%v)", err)
 	// Only the walked community's own post is seeded.
 	assert.Equal(t, []string{"https://lemmy.world/post/49131386"}, seeder.seeded,
 		"a post declaring another community must not be seeded from the walked community's host")
 	assert.Equal(t, []string{"https://lemmy.world/c/technology"}, seeder.communities)
+}
+
+// TestBackfillBindsContentToTheWalkedCommunity: a backfill of technology
+// materializes only content that belongs to technology. A post whose origin
+// names another community, and a comment — listed in the outbox or in a
+// technology post's replies collection — that replies into a co-hosted
+// community's thread, are not materialized. A post on another instance that
+// names technology still lands, in technology.
+func TestBackfillBindsContentToTheWalkedCommunity(t *testing.T) {
+	const (
+		xAuthorID = "https://sopuli.example/u/xPoster"
+		techPost  = "https://lemmy.world/post/tech-replies-1"
+	)
+	page := func(id, author, audience string) map[string]any {
+		return map[string]any{
+			"type":         "Page",
+			"id":           id,
+			"attributedTo": author,
+			"to":           []any{audience, ap.PublicAudience},
+			"audience":     audience,
+			"name":         "a post at " + id,
+			"source":       map[string]any{"content": "body of " + id, "mediaType": "text/markdown"},
+			"published":    "2026-07-09T14:00:00.000000Z",
+		}
+	}
+	create := func(obj map[string]any) map[string]any {
+		return map[string]any{
+			"type":   "Create",
+			"id":     obj["id"].(string) + "/create",
+			"actor":  obj["attributedTo"],
+			"object": obj,
+		}
+	}
+	techPostWithReplies := page(techPost, personID, groupID)
+	techPostWithReplies["replies"] = techPost + "/replies"
+
+	rows := []struct {
+		name string
+		// items is technology's outbox.
+		items []any
+		// served are the origin documents the walk dereferences.
+		served map[string]map[string]any
+		// fetchedPath must be dereferenced by the walk, so a refusal is the
+		// binding and not a fixture miss.
+		fetchedPath string
+		targetID    string
+		// wantCommunityDID is where the target lands; empty means it must not
+		// be materialized.
+		wantCommunityDID string
+	}{
+		{
+			name:  "outbox post whose origin names linux",
+			items: []any{create(page("https://sopuli.example/post/x-into-linux", xAuthorID, groupID))},
+			served: map[string]map[string]any{
+				"/post/x-into-linux": page("https://sopuli.example/post/x-into-linux", xAuthorID, linuxCommunityID),
+			},
+			fetchedPath: "/post/x-into-linux",
+			targetID:    "https://sopuli.example/post/x-into-linux",
+		},
+		{
+			name: "outbox comment replying to linux's post",
+			items: []any{create(note("https://lemmy.world/comment/outbox-into-linux", personID, linuxPostID,
+				"an outbox reply into linux", "2026-07-09T14:30:00.000000Z"))},
+			fetchedPath: "/c/technology/outbox",
+			targetID:    "https://lemmy.world/comment/outbox-into-linux",
+		},
+		{
+			// The refusal row above, aimed at technology's own post: the same
+			// embedded outbox Note shape does materialize, so that refusal is the
+			// binding and not an outbox shape the walk never processes.
+			name: "outbox comment replying to technology's post",
+			items: []any{create(note("https://lemmy.world/comment/outbox-into-tech", personID, pageID,
+				"an outbox reply into technology", "2026-07-09T14:30:00.000000Z"))},
+			fetchedPath:      "/c/technology/outbox",
+			targetID:         "https://lemmy.world/comment/outbox-into-tech",
+			wantCommunityDID: testDIDFor("technology", "lemmy.world"),
+		},
+		{
+			name:  "replies-collection comment replying to linux's post",
+			items: []any{create(techPostWithReplies)},
+			served: map[string]map[string]any{
+				"/post/tech-replies-1/replies": {
+					"type":       "OrderedCollection",
+					"id":         techPost + "/replies",
+					"totalItems": 1,
+					"orderedItems": []any{note("https://lemmy.world/comment/replies-into-linux", personID,
+						linuxPostID, "a listed reply into linux", "2026-07-09T14:45:00.000000Z")},
+				},
+			},
+			fetchedPath: "/post/tech-replies-1/replies",
+			targetID:    "https://lemmy.world/comment/replies-into-linux",
+		},
+		{
+			name:  "cross-instance post naming technology",
+			items: []any{create(page("https://sopuli.example/post/x-into-tech", xAuthorID, groupID))},
+			served: map[string]map[string]any{
+				"/post/x-into-tech": page("https://sopuli.example/post/x-into-tech", xAuthorID, groupID),
+			},
+			fetchedPath:      "/post/x-into-tech",
+			targetID:         "https://sopuli.example/post/x-into-tech",
+			wantCommunityDID: testDIDFor("technology", "lemmy.world"),
+		},
+	}
+
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.subscribeTechnology()
+			h.serveLemmyWorldContent()
+			h.coHostedCommunityPost()
+			h.serveObject("/u/xPoster", person(xAuthorID, "xPoster", nil))
+			for path, doc := range row.served {
+				h.serveObject(path, doc)
+			}
+			h.serveObject("/c/technology/outbox", map[string]any{
+				"type":         "OrderedCollection",
+				"id":           groupID + "/outbox",
+				"totalItems":   len(row.items),
+				"orderedItems": row.items,
+			})
+			ctx := context.Background()
+			community, err := h.communities.GetByAPGroupID(ctx, groupID)
+			require.NoError(t, err)
+
+			require.NoError(t, newBackfill(t, h, 10).Run(ctx, community, true))
+
+			require.Equal(t, 1, h.hitCount(row.fetchedPath), "the walk dereferences %s", row.fetchedPath)
+			mapping, err := h.objects.GetByAPID(ctx, row.targetID)
+			if row.wantCommunityDID == "" {
+				assert.True(t, errors.IsNotFound(err),
+					"%s must not be materialized by technology's backfill (err=%v)", row.targetID, err)
+				return
+			}
+			require.NoError(t, err, "%s must be materialized", row.targetID)
+			assert.Equal(t, row.wantCommunityDID, mapping.CommunityDID)
+		})
+	}
 }
 
 // newSeededBackfill is newBackfill with a CountSeeder wired in.

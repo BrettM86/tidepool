@@ -63,7 +63,7 @@ func TestMissingParentChainThreeDeep(t *testing.T) {
 	leaf := serveThread(t, h)
 	ctx := context.Background()
 
-	res, err := h.m.MaterializeComment(ctx, leaf)
+	res, err := h.m.MaterializeComment(ctx, leaf, groupID)
 	require.NoError(t, err)
 
 	pageMapping, err := h.objects.GetByAPID(ctx, pageID)
@@ -137,7 +137,7 @@ func TestCommentCycleGuard(t *testing.T) {
 	h.serveObject("/comment/9001", a)
 	h.serveObject("/comment/9002", b)
 
-	_, err := h.m.MaterializeComment(context.Background(), objectFromMap(t, a))
+	_, err := h.m.MaterializeComment(context.Background(), objectFromMap(t, a), groupID)
 	require.Error(t, err)
 	assert.True(t, IsSkip(err), "a cycle must be a skip: %v", err)
 	assert.Empty(t, h.firehoseEvents(), "cycle detection happens before any write")
@@ -165,7 +165,7 @@ func TestCommentDepthCap(t *testing.T) {
 		"https://lemmy.world/u/alice",
 		fmt.Sprintf("https://lemmy.world/comment/d%d", depth-1),
 		"too deep", "2026-07-07T05:00:00.000000Z")
-	_, err := h.m.MaterializeComment(context.Background(), objectFromMap(t, leafBody))
+	_, err := h.m.MaterializeComment(context.Background(), objectFromMap(t, leafBody), groupID)
 	require.Error(t, err)
 	assert.True(t, IsSkip(err), "over-deep chains must be skipped: %v", err)
 	assert.Empty(t, h.firehoseEvents(), "the cap fires before any write")
@@ -179,7 +179,7 @@ func TestTombstonedParentDropsSubtree(t *testing.T) {
 	ctx := context.Background()
 
 	// Materialize the whole thread, then tombstone the middle comment.
-	_, err := h.m.MaterializeComment(ctx, leaf)
+	_, err := h.m.MaterializeComment(ctx, leaf, groupID)
 	require.NoError(t, err)
 	require.NoError(t, h.objects.SoftDelete(ctx, "https://sh.itjust.works/comment/2002"))
 
@@ -191,7 +191,7 @@ func TestTombstonedParentDropsSubtree(t *testing.T) {
 		"https://lemmy.zip/u/carol", "https://sh.itjust.works/comment/2002",
 		"reply to deleted", "2026-07-07T06:00:00.000000Z"))
 
-	_, err = h.m.MaterializeComment(ctx, reply)
+	_, err = h.m.MaterializeComment(ctx, reply, groupID)
 	require.Error(t, err)
 	assert.True(t, IsSkip(err), "tombstoned parent must drop the subtree: %v", err)
 	assert.True(t, errsIsNotFoundFalse(err), "a tombstone is not a missing parent")
@@ -208,7 +208,7 @@ func TestCommentWithUnfetchableParent(t *testing.T) {
 	leaf := objectFromMap(t, note("https://lemmy.zip/comment/5005",
 		"https://lemmy.zip/u/carol", "https://lemmy.world/comment/nowhere",
 		"orphan", "2026-07-07T06:00:00.000000Z"))
-	_, err := h.m.MaterializeComment(context.Background(), leaf)
+	_, err := h.m.MaterializeComment(context.Background(), leaf, groupID)
 	require.Error(t, err)
 	assert.True(t, IsSkip(err), "unfetchable parent must skip the subtree: %v", err)
 }

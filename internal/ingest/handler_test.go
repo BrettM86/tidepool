@@ -47,6 +47,26 @@ func (h *harness) announceCreate(group *remoteActor, activityID string, obj map[
 	h.drain()
 }
 
+// announceUpdate delivers Announce{Update{obj}} from a followed community,
+// attributed to obj's own id, and drains the queue.
+func (h *harness) announceUpdate(group *remoteActor, activityID string, obj map[string]any) {
+	h.t.Helper()
+	require.Equal(h.t, http.StatusAccepted, h.deliver(group, map[string]any{
+		"id":       activityID,
+		"type":     "Announce",
+		"actor":    group.id,
+		"audience": group.id,
+		"object": map[string]any{
+			"id":       activityID + "/update",
+			"type":     "Update",
+			"actor":    obj["id"],
+			"audience": group.id,
+			"object":   obj,
+		},
+	}))
+	h.drain()
+}
+
 // announceDelete delivers Announce{Delete{targetID}} from a followed
 // community, attributed to actor, and drains the queue.
 func (h *harness) announceDelete(group *remoteActor, activityID, actor, targetID string) {
@@ -1032,6 +1052,392 @@ func TestBareProfileUpdateForUnknownActorDropped(t *testing.T) {
 	assert.Equal(t, mintsBefore, h.minter.mintCount(), "no identity minted for an unknown actor")
 	_, err := h.actors.GetByAPActorID(ctx, target)
 	assert.True(t, errors.IsNotFound(err), "the unknown target must not be bridged")
+}
+
+// TestProfileUpdateNamingBridgedContentDropped: the refresh-only gate for
+// bare profile updates must count only an already-bridged ACTOR or COMMUNITY
+// as known. A post's ap_objects mapping is not one: a host that signs a bare
+// Update{Person|Group} naming its own already-bridged post id (and serves a
+// Person/Group document at that IRI) must not mint a new actor or community
+// for it, nor disturb the post. The bare gate drops it before any fetch.
+//
+// The ANNOUNCED rows cover the same id arriving inside the subscribed
+// community's Announce{Update{Person|Group}}. An id that is already a bridged
+// post's is not an actor on that path either: it must not mint, must not
+// create an actor or community row, and must leave the post's mapping and
+// record as they were, and must not fetch the post's IRI either.
+func TestProfileUpdateNamingBridgedContentDropped(t *testing.T) {
+	cases := []struct {
+		name       string
+		objectType string
+		announced  bool
+	}{
+		{name: "Update{Person} naming a bridged post", objectType: "Person"},
+		{name: "Update{Group} naming a bridged post", objectType: "Group"},
+		{name: "announced Update{Person} naming a bridged post", objectType: "Person", announced: true},
+		{name: "announced Update{Group} naming a bridged post", objectType: "Group", announced: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			group := h.subscribeTechnology()
+			h.serveLemmyWorldContent()
+			author := h.newRemoteActor(personID, person(personID, "LeftLeaningFreedomFighters", nil))
+			ctx := context.Background()
+
+			h.announceCreate(group, "https://lemmy.world/activities/announce/create/isbridged-"+tc.objectType,
+				loadFixture(t, "page_lemmy_world.json"))
+			before, err := h.objects.GetByAPID(ctx, pageID)
+			require.NoError(t, err)
+			require.False(t, before.IsDeleted())
+			postHitsBefore := h.hitCount("/post/49131386")
+			mintsBefore := h.minter.mintCount()
+
+			// The origin now serves an actor document at the post's IRI, so a
+			// forced re-fetch of that IRI succeeds and could mint from it.
+			impostor := map[string]any{
+				"type":              tc.objectType,
+				"id":                pageID,
+				"preferredUsername": "postimpostor",
+				"inbox":             pageID + "/inbox",
+				"published":         "2024-01-01T00:00:00.000000Z",
+			}
+			h.serveObject("/post/49131386", impostor)
+
+			update := map[string]any{
+				"id":     "https://lemmy.world/activities/update/isbridged-" + tc.objectType,
+				"type":   "Update",
+				"actor":  personID,
+				"object": impostor,
+			}
+			if tc.announced {
+				require.Equal(t, http.StatusAccepted, h.deliver(group, map[string]any{
+					"id":       "https://lemmy.world/activities/announce/update/isbridged-" + tc.objectType,
+					"type":     "Announce",
+					"actor":    groupID,
+					"audience": groupID,
+					"object":   update,
+				}))
+			} else {
+				require.Equal(t, http.StatusAccepted, h.deliver(author, update))
+			}
+			h.drain()
+
+			assert.Equal(t, postHitsBefore, h.hitCount("/post/49131386"),
+				"a profile update naming a post id must not fetch that IRI")
+			assert.Equal(t, mintsBefore, h.minter.mintCount(),
+				"a profile update naming a post id must not mint an identity")
+			_, err = h.actors.GetByAPActorID(ctx, pageID)
+			assert.True(t, errors.IsNotFound(err),
+				"a profile update naming a post id must not mint a bridged actor")
+			_, err = h.communities.GetByAPGroupID(ctx, pageID)
+			assert.True(t, errors.IsNotFound(err),
+				"a profile update naming a post id must not create a community")
+
+			mapping, err := h.objects.GetByAPID(ctx, pageID)
+			require.NoError(t, err)
+			assert.Equal(t, testDIDFor("LeftLeaningFreedomFighters", "lemmy.world"), mapping.DID)
+			assert.Equal(t, "social.coves.community.postv2", mapping.Collection)
+			assert.Equal(t, before.RKey, mapping.RKey, "the post mapping must be unchanged")
+			assert.False(t, mapping.IsDeleted(), "the post must stay live")
+			record, _, err := h.manager.GetRecord(ctx,
+				testDIDFor("LeftLeaningFreedomFighters", "lemmy.world"), "social.coves.community.postv2", before.RKey)
+			require.NoError(t, err)
+			assert.Equal(t,
+				"Inside the history of DRAM price-fixing lawsuits — how HBM allocations could make a difference after two decades of failed cases",
+				record["title"], "the post record must be unchanged")
+		})
+	}
+}
+
+// TestBareGroupUpdateFromBridgedCommunityApplied: the refresh-only gate lets
+// an already-bridged community refresh itself. The subscribed community signs
+// a bare Update{Group} carrying its renamed document; the embedded document is
+// trusted (self-signed) and the community profile takes the new name. The
+// origin still serves the OLD name, so only the delivered document can make
+// the rename land.
+func TestBareGroupUpdateFromBridgedCommunityApplied(t *testing.T) {
+	h := newHarness(t)
+	group := h.subscribeTechnology()
+	require.Equal(t, "Technology", h.communityProfile(t)["displayName"])
+
+	renamed := loadFixture(t, "group_lemmy_world.json")
+	renamed["name"] = "Technology (renamed by Update)"
+	require.Equal(t, http.StatusAccepted, h.deliver(group, map[string]any{
+		"id":     "https://lemmy.world/activities/update/group-rename",
+		"type":   "Update",
+		"actor":  groupID,
+		"object": renamed,
+	}))
+	h.drain()
+
+	assert.Equal(t, "Technology (renamed by Update)", h.communityProfile(t)["displayName"],
+		"a bare self-signed Update{Group} from a bridged community must refresh its profile")
+}
+
+// TestBarePersonUpdateNamingBridgedCommunityDropped: the gate matches the
+// bridged row's TYPE, not just its existence. A bridged author signs a bare
+// Update{Person} whose id is the bridged community's Group IRI. The id is
+// bridged, but as a Group, so the update is dropped before any fetch of the
+// group IRI, and the community profile keeps its name even though the origin
+// now serves a renamed Group document a re-fetch would pick up.
+func TestBarePersonUpdateNamingBridgedCommunityDropped(t *testing.T) {
+	h := newHarness(t)
+	group := h.subscribeTechnology()
+	h.serveLemmyWorldContent()
+	author := h.newRemoteActor(personID, person(personID, "LeftLeaningFreedomFighters", nil))
+	ctx := context.Background()
+
+	h.announceCreate(group, "https://lemmy.world/activities/announce/create/type-mismatch",
+		loadFixture(t, "page_lemmy_world.json"))
+	authorRow, err := h.actors.GetByAPActorID(ctx, personID)
+	require.NoError(t, err)
+	require.Equal(t, store.ActorTypePerson, authorRow.ActorType)
+
+	renamedAtOrigin := loadFixture(t, "group_lemmy_world.json")
+	renamedAtOrigin["name"] = "Technology (renamed at origin)"
+	h.serveObject("/c/technology", renamedAtOrigin)
+	groupHitsBefore := h.hitCount("/c/technology")
+	mintsBefore := h.minter.mintCount()
+
+	require.Equal(t, http.StatusAccepted, h.deliver(author, map[string]any{
+		"id":     "https://lemmy.world/activities/update/person-as-group",
+		"type":   "Update",
+		"actor":  personID,
+		"object": person(groupID, "technology", map[string]any{"name": "Hijacked"}),
+	}))
+	h.drain()
+
+	assert.Equal(t, groupHitsBefore, h.hitCount("/c/technology"),
+		"a Person update naming a bridged Group must not fetch the group IRI")
+	assert.Equal(t, mintsBefore, h.minter.mintCount())
+	assert.Equal(t, "Technology", h.communityProfile(t)["displayName"],
+		"the community profile must be unchanged")
+	groupRow, err := h.actors.GetByAPActorID(ctx, groupID)
+	require.NoError(t, err)
+	assert.Equal(t, store.ActorTypeGroup, groupRow.ActorType)
+}
+
+// TestBareGroupUpdateFromNonCommunityGroupCreatesNoCommunity: a Group actor
+// can be bridged without being a community (as an author or voter: a
+// bridged_actors row of type group and no communities row). Its own bare
+// self-signed Update{Group} is dropped: it neither refreshes the Group's
+// profile nor turns it into a community. Subscription, not a profile update,
+// is what creates a communities row.
+func TestBareGroupUpdateFromNonCommunityGroupCreatesNoCommunity(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	const otherGroupID = "https://lemmy.world/c/notsubscribed"
+	groupDoc := func(name string) map[string]any {
+		return map[string]any{
+			"type":              "Group",
+			"id":                otherGroupID,
+			"preferredUsername": "notsubscribed",
+			"name":              name,
+			"inbox":             otherGroupID + "/inbox",
+			"published":         "2024-01-01T00:00:00.000000Z",
+		}
+	}
+	other := h.newRemoteActor(otherGroupID, groupDoc("Not Subscribed"))
+
+	// Bridged the way an attributedTo/voter reference bridges it: an actor
+	// row, no communities row.
+	_, err := h.mat.EnsureActor(ctx, &ap.Object{ID: otherGroupID})
+	require.NoError(t, err)
+	row, err := h.actors.GetByAPActorID(ctx, otherGroupID)
+	require.NoError(t, err)
+	require.Equal(t, store.ActorTypeGroup, row.ActorType)
+	_, err = h.communities.GetByAPGroupID(ctx, otherGroupID)
+	require.True(t, errors.IsNotFound(err))
+	otherDID := testDIDFor("notsubscribed", "lemmy.world")
+	require.Equal(t, otherDID, row.DID)
+	profileBefore, profileCIDBefore, err := h.manager.GetRecord(ctx, otherDID,
+		materialize.CollectionCommunityProfile, materialize.ProfileRKey)
+	require.NoError(t, err)
+	require.Equal(t, "Not Subscribed", profileBefore["displayName"])
+
+	require.Equal(t, http.StatusAccepted, h.deliver(other, map[string]any{
+		"id":     "https://lemmy.world/activities/update/notsubscribed-rename",
+		"type":   "Update",
+		"actor":  otherGroupID,
+		"object": groupDoc("Not Subscribed (renamed)"),
+	}))
+	h.drain()
+
+	_, err = h.communities.GetByAPGroupID(ctx, otherGroupID)
+	assert.True(t, errors.IsNotFound(err),
+		"a bare profile update must not create a communities row for a Group bridged only as an actor")
+	profileAfter, profileCIDAfter, err := h.manager.GetRecord(ctx, otherDID,
+		materialize.CollectionCommunityProfile, materialize.ProfileRKey)
+	require.NoError(t, err)
+	assert.Equal(t, "Not Subscribed", profileAfter["displayName"],
+		"the dropped update must not refresh the Group's profile")
+	assert.Equal(t, profileCIDBefore, profileCIDAfter, "the Group's profile record must be unchanged")
+}
+
+// TestAnnouncedProfileUpdateNeverMints: profile updates never mint, announced
+// or bare. A followed community announcing Update{Person|Group} may only
+// refresh an actor the bridge has already bridged, of the same type, and a
+// Group update needs an existing communities row. Every row starts from the
+// same world: the subscribed community has fanned out one post, so its author
+// is bridged as a Person and the community itself as a Group.
+func TestAnnouncedProfileUpdateNeverMints(t *testing.T) {
+	const (
+		strangerID   = "https://other.example/u/stranger"
+		unfollowedID = "https://other.example/c/unfollowed"
+	)
+	groupDoc := func(id, username, name string) map[string]any {
+		return map[string]any{
+			"type":              "Group",
+			"id":                id,
+			"preferredUsername": username,
+			"name":              name,
+			"inbox":             id + "/inbox",
+			"published":         "2024-01-01T00:00:00.000000Z",
+		}
+	}
+	authorProfile := func(t *testing.T, h *harness) map[string]any {
+		t.Helper()
+		record, _, err := h.manager.GetRecord(context.Background(),
+			testDIDFor("LeftLeaningFreedomFighters", "lemmy.world"),
+			materialize.CollectionActorProfile, materialize.ProfileRKey)
+		require.NoError(t, err)
+		return record
+	}
+
+	cases := []struct {
+		name string
+		// update serves whatever the origin should answer and returns the
+		// embedded actor document the community announces.
+		update func(t *testing.T, h *harness, author *remoteActor) map[string]any
+		// unfetchedPath, when set, is an origin path the update must never
+		// fetch: an id the bridge has not bridged is dropped before any fetch.
+		unfetchedPath string
+		check         func(t *testing.T, h *harness, mintsBefore int)
+	}{
+		{
+			name: "announced Update{Person} for an unbridged actor on another host",
+			update: func(t *testing.T, h *harness, _ *remoteActor) map[string]any {
+				h.serveObject("/u/stranger", person(strangerID, "stranger", nil))
+				return person(strangerID, "stranger", nil)
+			},
+			unfetchedPath: "/u/stranger",
+			check: func(t *testing.T, h *harness, mintsBefore int) {
+				ctx := context.Background()
+				assert.Equal(t, mintsBefore, h.minter.mintCount(),
+					"an announced profile update must not mint an identity")
+				_, err := h.actors.GetByAPActorID(ctx, strangerID)
+				assert.True(t, errors.IsNotFound(err),
+					"an announced profile update must not bridge an unknown actor")
+				_, err = h.objects.GetByAPID(ctx, strangerID)
+				assert.True(t, errors.IsNotFound(err),
+					"an announced profile update must not map a profile for an unknown actor")
+			},
+		},
+		{
+			name: "announced Update{Group} for an unbridged, unfollowed Group",
+			update: func(t *testing.T, h *harness, _ *remoteActor) map[string]any {
+				h.serveObject("/c/unfollowed", groupDoc(unfollowedID, "unfollowed", "Unfollowed"))
+				return groupDoc(unfollowedID, "unfollowed", "Unfollowed")
+			},
+			unfetchedPath: "/c/unfollowed",
+			check: func(t *testing.T, h *harness, mintsBefore int) {
+				ctx := context.Background()
+				assert.Equal(t, mintsBefore, h.minter.mintCount(),
+					"an announced Group update must not mint an identity")
+				_, err := h.actors.GetByAPActorID(ctx, unfollowedID)
+				assert.True(t, errors.IsNotFound(err),
+					"an announced Group update must not bridge an unknown Group")
+				_, err = h.communities.GetByAPGroupID(ctx, unfollowedID)
+				assert.True(t, errors.IsNotFound(err),
+					"an announced Group update must not create a communities row")
+			},
+		},
+		{
+			name: "announced Update{Group} naming an id bridged as a Person",
+			update: func(t *testing.T, h *harness, author *remoteActor) map[string]any {
+				hijack := groupDoc(personID, "LeftLeaningFreedomFighters", "Hijacked")
+				h.serveActorDoc(personID, groupDoc(personID, "LeftLeaningFreedomFighters", "Hijacked"),
+					&author.key.PublicKey)
+				return hijack
+			},
+			check: func(t *testing.T, h *harness, mintsBefore int) {
+				ctx := context.Background()
+				assert.Equal(t, mintsBefore, h.minter.mintCount())
+				row, err := h.actors.GetByAPActorID(ctx, personID)
+				require.NoError(t, err)
+				assert.Equal(t, store.ActorTypePerson, row.ActorType,
+					"the bridged row must keep its Person type")
+				_, err = h.communities.GetByAPGroupID(ctx, personID)
+				assert.True(t, errors.IsNotFound(err),
+					"a Group update naming a bridged Person must not create a communities row")
+				assert.Equal(t, "LeftLeaningFreedomFighters", authorProfile(t, h)["displayName"],
+					"the Person's profile must be unchanged")
+			},
+		},
+		{
+			name: "announced Update{Person} naming an id bridged as a Group",
+			update: func(t *testing.T, h *harness, _ *remoteActor) map[string]any {
+				renamedAtOrigin := loadFixture(t, "group_lemmy_world.json")
+				renamedAtOrigin["name"] = "Technology (renamed at origin)"
+				h.serveObject("/c/technology", renamedAtOrigin)
+				return person(groupID, "technology", map[string]any{"name": "Hijacked"})
+			},
+			check: func(t *testing.T, h *harness, mintsBefore int) {
+				ctx := context.Background()
+				assert.Equal(t, mintsBefore, h.minter.mintCount())
+				row, err := h.actors.GetByAPActorID(ctx, groupID)
+				require.NoError(t, err)
+				assert.Equal(t, store.ActorTypeGroup, row.ActorType,
+					"the bridged row must keep its Group type")
+				assert.Equal(t, "Technology", h.communityProfile(t)["displayName"],
+					"a Person update naming a bridged Group must not refresh the community profile")
+			},
+		},
+		{
+			name: "announced Update{Person} for a bridged Person refreshes its profile",
+			update: func(t *testing.T, h *harness, author *remoteActor) map[string]any {
+				renamed := person(personID, "LeftLeaningFreedomFighters", map[string]any{
+					"name": "Left Leaning (renamed)",
+				})
+				h.serveActorDoc(personID, person(personID, "LeftLeaningFreedomFighters", map[string]any{
+					"name": "Left Leaning (renamed)",
+				}), &author.key.PublicKey)
+				return renamed
+			},
+			check: func(t *testing.T, h *harness, mintsBefore int) {
+				assert.Equal(t, mintsBefore, h.minter.mintCount(),
+					"refreshing a bridged actor must not mint")
+				assert.Equal(t, "Left Leaning (renamed)", authorProfile(t, h)["displayName"],
+					"an announced Update{Person} for a bridged actor must refresh its profile")
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			group := h.subscribeTechnology()
+			h.serveLemmyWorldContent()
+			author := h.newRemoteActor(personID, person(personID, "LeftLeaningFreedomFighters", nil))
+			h.announceCreate(group, "https://lemmy.world/activities/announce/create/profile-update-world",
+				loadFixture(t, "page_lemmy_world.json"))
+			authorRow, err := h.actors.GetByAPActorID(context.Background(), personID)
+			require.NoError(t, err)
+			require.Equal(t, store.ActorTypePerson, authorRow.ActorType)
+			require.Equal(t, "LeftLeaningFreedomFighters", authorProfile(t, h)["displayName"])
+			require.Equal(t, "Technology", h.communityProfile(t)["displayName"])
+
+			obj := tc.update(t, h, author)
+			mintsBefore := h.minter.mintCount()
+			h.announceUpdate(group, "https://lemmy.world/activities/announce/update/profile", obj)
+
+			if tc.unfetchedPath != "" {
+				assert.Equal(t, 0, h.hitCount(tc.unfetchedPath),
+					"an announced profile update for an unbridged id must not fetch it")
+			}
+			tc.check(t, h, mintsBefore)
+		})
+	}
 }
 
 // TestAnnouncedObjectForDifferentCommunityDropped (Finding 3): a followed

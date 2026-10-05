@@ -342,6 +342,51 @@ func TestBridgedActors_MarkProfileSynced(t *testing.T) {
 	assert.True(t, errors.IsNotFound(err), "expected IsNotFound, got %v", err)
 }
 
+// TestBridgedActors_DeleteActorRow: the row goes only while it still carries
+// the given DID; a row carrying another DID stays, and a miss either way is
+// errors.IsNotFound.
+func TestBridgedActors_DeleteActorRow(t *testing.T) {
+	cases := []struct {
+		name         string
+		seedRow      bool
+		deleteDID    string
+		wantNotFound bool
+		wantRowAfter bool
+	}{
+		{name: "matching DID deletes the row", seedRow: true, deleteDID: "did:plc:ewvi7nxzyoun6zhxrhs64oiz", wantNotFound: false, wantRowAfter: false},
+		{name: "mismatched DID keeps the row", seedRow: true, deleteDID: "did:plc:000000000000000000000009", wantNotFound: true, wantRowAfter: true},
+		{name: "missing row", seedRow: false, deleteDID: "did:plc:ewvi7nxzyoun6zhxrhs64oiz", wantNotFound: true, wantRowAfter: false},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			repo := NewBridgedActors(testDB(t))
+			ctx := context.Background()
+
+			if testCase.seedRow {
+				_, err := repo.UpsertActor(ctx, testActor())
+				require.NoError(t, err)
+			}
+
+			err := repo.DeleteActorRow(ctx, "https://lemmy.world/u/alice", testCase.deleteDID)
+			if testCase.wantNotFound {
+				assert.True(t, errors.IsNotFound(err), "expected IsNotFound, got %v", err)
+			} else {
+				assert.NoError(t, err)
+			}
+
+			actor, err := repo.GetByAPActorID(ctx, "https://lemmy.world/u/alice")
+			if testCase.wantRowAfter {
+				require.NoError(t, err)
+				assert.Equal(t, "did:plc:ewvi7nxzyoun6zhxrhs64oiz", actor.DID)
+				assert.Equal(t, "alice.lemmy-world.tidepool.example", actor.Handle)
+				assert.Equal(t, ConsentStateOK, actor.ConsentState)
+			} else {
+				assert.True(t, errors.IsNotFound(err), "the row must be gone, got %v", err)
+			}
+		})
+	}
+}
+
 // TestBridgedActors_UpsertValidation is pure input validation: it never
 // touches postgres, so it runs without TIDEPOOL_TEST_DATABASE_URL.
 func TestBridgedActors_UpsertValidation(t *testing.T) {

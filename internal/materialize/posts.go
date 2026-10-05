@@ -58,9 +58,19 @@ func (m *Materializer) MaterializePost(ctx context.Context, page *ap.Object, com
 	if groupRef.ID != communityIRI {
 		return nil, skip(page.ID, "post names community "+groupRef.ID+", not the delivering community "+communityIRI)
 	}
+
+	// The coordinates below are taken from an existing mapping wholesale, so a
+	// Page whose id the bridge holds as something else (a bridged actor's
+	// same-host id, say) would be written over that record: a post committed at
+	// the actor's profile collection and rkey "self". Refused before anything
+	// is ensured, so the refusal costs no community or author a DID.
 	existing, err := m.objects.GetByAPID(ctx, page.ID)
 	switch {
 	case err == nil:
+		if existing.Collection != CollectionPost && existing.Collection != CollectionPostV2 {
+			return nil, skip(page.ID, fmt.Sprintf(
+				"id already maps a %s record; refusing to materialize it as a post", existing.Collection))
+		}
 		// A post's community is fixed at first materialization, so the
 		// audience above proves nothing about a post already stored: an edit
 		// retargeted at C is still D's post, and C may not re-commit it.
@@ -72,9 +82,11 @@ func (m *Materializer) MaterializePost(ctx context.Context, page *ap.Object, com
 			return nil, err
 		}
 	case errors.IsNotFound(err):
+		existing = nil
 	default:
 		return nil, fmt.Errorf("materialize: check mapping for %s: %w", page.ID, err)
 	}
+
 	community, err := m.EnsureCommunity(ctx, groupRef)
 	if err != nil {
 		return nil, err

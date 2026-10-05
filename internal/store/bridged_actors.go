@@ -180,6 +180,22 @@ func (r *postgresBridgedActors) MarkProfileSynced(ctx context.Context, apActorID
 	return nil
 }
 
+func (r *postgresBridgedActors) DeleteActorRow(ctx context.Context, apActorID, did string) error {
+	query := `DELETE FROM bridged_actors WHERE ap_actor_id = $1 AND did = $2`
+	result, err := r.db.ExecContext(ctx, query, apActorID, did)
+	if err != nil {
+		return fmt.Errorf("delete bridged actor row for %q: %w", apActorID, err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("delete bridged actor row for %q: rows affected: %w", apActorID, err)
+	}
+	if affected == 0 {
+		return errors.NewNotFoundError("bridged_actor", apActorID)
+	}
+	return nil
+}
+
 func validateBridgedActor(actor *BridgedActor) error {
 	if actor.APActorID == "" {
 		return errors.NewValidationError("ap_actor_id", "must not be empty")

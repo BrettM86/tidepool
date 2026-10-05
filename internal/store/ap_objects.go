@@ -95,6 +95,12 @@ func (r *postgresAPObjects) putMapping(ctx context.Context, q queryRower, mappin
 			ap_published_at = EXCLUDED.ap_published_at,
 			indexed_at = CURRENT_TIMESTAMP,
 			deleted_at = NULL
+		-- A mapping's collection is fixed by the record it maps: an AP id that
+		-- already maps a record in one collection never moves to another, live
+		-- or soft-deleted. The materializer checks this before the repo write,
+		-- but only this clause is atomic with the upsert; a refused row returns
+		-- nothing.
+		WHERE ap_objects.collection = EXCLUDED.collection
 		RETURNING` + apObjectColumns
 
 	row := q.QueryRowContext(ctx, query,
@@ -105,6 +111,10 @@ func (r *postgresAPObjects) putMapping(ctx context.Context, q queryRower, mappin
 	)
 	stored, err := scanAPObject(row)
 	if err != nil {
+		if stderrors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("put ap_object mapping for %q as %s: %w",
+				mapping.APID, mapping.Collection, errors.ErrCollectionImmutable)
+		}
 		// ap_id conflicts are handled by the upsert, so the only expected
 		// unique violation is the at_uri constraint: a different AP object
 		// already claimed this at-uri. Deterministic rkeys make this a

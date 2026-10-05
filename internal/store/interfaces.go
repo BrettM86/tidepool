@@ -195,6 +195,14 @@ type BridgedActors interface {
 	// (re)materialized.
 	MarkProfileSynced(ctx context.Context, apActorID string, syncedAt time.Time) error
 
+	// DeleteActorRow removes the row for apActorID only while it still
+	// carries did: the compensation for a first bridge whose profile commit
+	// was refused right after it inserted the row. It is not how an actor is
+	// deleted (that is a ConsentStateDeleted tombstone, which keeps the row).
+	// A missing row, or one carrying another DID, is an error satisfying
+	// errors.IsNotFound.
+	DeleteActorRow(ctx context.Context, apActorID, did string) error
+
 	// ListInstanceLabels returns distinct second-label instances under zoneRoot,
 	// including labels whose actors are all deleted (HasLiveActor=false).
 	ListInstanceLabels(ctx context.Context, zoneRoot string) ([]InstanceLabel, error)

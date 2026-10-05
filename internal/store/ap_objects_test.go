@@ -256,3 +256,91 @@ func TestAPObjects_PutMapping_ATURICollisionIsConflict(t *testing.T) {
 	_, err = repo.PutMapping(ctx, collision)
 	assert.True(t, errors.IsAlreadyExists(err), "expected IsAlreadyExists, got %v", err)
 }
+
+// TestAPObjects_PutMapping_CollectionIsImmutable: an AP id maps to one record
+// for life, so the upsert itself refuses to move an existing row into another
+// collection. The materializer's read-time check cannot close the race alone:
+// a commit that read "no conflict" before another worker wrote the row would
+// otherwise take it over at upsert time. Live and soft-deleted rows alike — a
+// deleted post's id is still the post's.
+func TestAPObjects_PutMapping_CollectionIsImmutable(t *testing.T) {
+	cases := []struct {
+		name        string
+		softDeleted bool
+		inTx        bool
+	}{
+		{name: "live row via PutMapping", softDeleted: false, inTx: false},
+		{name: "live row via PutMappingTx", softDeleted: false, inTx: true},
+		{name: "soft-deleted row via PutMapping", softDeleted: true, inTx: false},
+		{name: "soft-deleted row via PutMappingTx", softDeleted: true, inTx: true},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			database := testDB(t)
+			repo := NewAPObjects(database)
+			ctx := context.Background()
+
+			post := testMapping()
+			post.Collection = "social.coves.community.postv2"
+			_, err := repo.PutMapping(ctx, post)
+			require.NoError(t, err)
+			if testCase.softDeleted {
+				require.NoError(t, repo.SoftDelete(ctx, testAPObjectID))
+			}
+
+			takeover := testMapping()
+			takeover.DID = testSecondDID
+			takeover.Collection = "social.coves.actor.profile"
+			takeover.RKey = "self"
+			takeover.CID = testUpdatedCID
+			if testCase.inTx {
+				tx, err := database.BeginTx(ctx, nil)
+				require.NoError(t, err)
+				_, err = repo.PutMappingTx(ctx, tx, takeover)
+				assert.Error(t, err, "a re-put into another collection must be refused")
+				// Commit whatever the call left so the row checks below see it.
+				if err != nil {
+					_ = tx.Rollback()
+				} else {
+					require.NoError(t, tx.Commit())
+				}
+			} else {
+				_, err = repo.PutMapping(ctx, takeover)
+				assert.Error(t, err, "a re-put into another collection must be refused")
+			}
+
+			stored, err := repo.GetByAPID(ctx, testAPObjectID)
+			require.NoError(t, err)
+			assert.Equal(t, "social.coves.community.postv2", stored.Collection)
+			assert.Equal(t, "did:plc:ewvi7nxzyoun6zhxrhs64oiz", stored.DID)
+			assert.Equal(t, "3jzfcijpj2z2a", stored.RKey)
+			assert.Equal(t,
+				"at://did:plc:ewvi7nxzyoun6zhxrhs64oiz/social.coves.community.postv2/3jzfcijpj2z2a",
+				stored.ATURI)
+			assert.Equal(t, "bafyreib2rxk3rybk3aobmv5cjuql3bm2twh4jo5uxgf5kpqrsqxi3jgxte", stored.CID)
+			assert.Equal(t, testCase.softDeleted, stored.IsDeleted(),
+				"a refused re-put must not change the row's deleted state")
+		})
+	}
+
+	// Guard: a re-put in the SAME collection is the ordinary update path and
+	// still lands.
+	t.Run("same collection re-put still updates", func(t *testing.T) {
+		repo := NewAPObjects(testDB(t))
+		ctx := context.Background()
+
+		post := testMapping()
+		post.Collection = "social.coves.community.postv2"
+		_, err := repo.PutMapping(ctx, post)
+		require.NoError(t, err)
+
+		post.CID = testUpdatedCID
+		_, err = repo.PutMapping(ctx, post)
+		require.NoError(t, err)
+
+		stored, err := repo.GetByAPID(ctx, testAPObjectID)
+		require.NoError(t, err)
+		assert.Equal(t, "social.coves.community.postv2", stored.Collection)
+		assert.Equal(t, "bafyreievgu2ty7qbiaaom5zhmkznsnajuzideek3lo7e65dwqlrvrxnmo4", stored.CID)
+	})
+}

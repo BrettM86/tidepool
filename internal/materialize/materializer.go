@@ -99,17 +99,26 @@ const defaultMaxBlobBytes int64 = 5 << 20
 // must never retry the object.
 var ErrSkipped = stderrors.New("materialize: skipped")
 
-// SkipError carries why an object was skipped. Unwraps to ErrSkipped.
+// SkipError carries why an object was skipped. Unwraps to ErrSkipped, and to
+// Cause when one is set.
 type SkipError struct {
 	APID   string
 	Reason string
+	// Cause is the typed condition behind the skip, for a caller that must
+	// tell this refusal from the others without matching Reason.
+	Cause error
 }
 
 func (e *SkipError) Error() string {
 	return fmt.Sprintf("materialize: skipped %s: %s", e.APID, e.Reason)
 }
 
-func (e *SkipError) Unwrap() error { return ErrSkipped }
+func (e *SkipError) Unwrap() []error {
+	if e.Cause == nil {
+		return []error{ErrSkipped}
+	}
+	return []error{ErrSkipped, e.Cause}
+}
 
 // IsSkip reports whether err is (or wraps) a deliberate skip.
 func IsSkip(err error) bool { return stderrors.Is(err, ErrSkipped) }
@@ -371,7 +380,9 @@ type Result struct {
 // community's content it is, for the
 // membership binding announced deletes and announced votes authorize against.
 // For content it is the community THIS delivery was checked against, and a
-// mapping bound to any other community refuses the commit.
+// mapping bound to any other community refuses the commit. It never rewrites
+// a live mapping into a different collection: that is a skip, decided before
+// anything is written.
 func (m *Materializer) commitRecord(ctx context.Context, did, collection, rkey string, record map[string]any, obj *ap.Object, authorDID, communityDID string) (*Result, error) {
 	// Don't resurrect deleted content. AP delivery is unordered, so a Create
 	// or Update can arrive (or be re-delivered) after a Delete already
@@ -403,6 +414,18 @@ func (m *Materializer) commitRecord(ctx context.Context, did, collection, rkey s
 	// edit move a comment out from under its thread's lock.
 	var storedThreadRoot string
 	if existing, err := m.objects.GetByAPID(ctx, obj.ID); err == nil {
+		// An AP id maps to ONE record for life. A mapping in another
+		// collection, live or deleted, means the incoming object claims an id
+		// the bridge already holds as something else (a re-fetched profile
+		// whose id is a post's, say); committing would orphan that record and
+		// hand its id to this one. Refused before the repo write, so nothing is
+		// committed. Checked before the deleted shortcut so a caller can tell
+		// this refusal apart by its ErrCollectionImmutable cause.
+		if existing.Collection != collection {
+			return nil, &SkipError{APID: obj.ID, Reason: fmt.Sprintf(
+				"id already maps a %s record; refusing to remap it as %s", existing.Collection, collection),
+				Cause: errors.ErrCollectionImmutable}
+		}
 		if existing.IsDeleted() {
 			return nil, skip(obj.ID, "object was deleted upstream; not resurrecting")
 		}
@@ -485,6 +508,9 @@ func (m *Materializer) commitRecord(ctx context.Context, did, collection, rkey s
 			return nil, err
 		}
 		res, err := m.repos.PutRecordTx(ctx, did, collection, rkey, record, putMapping)
+		if errors.IsCollectionImmutable(err) {
+			return nil, collectionRaceSkip(obj.ID, collection)
+		}
 		if stderrors.Is(err, errCommunityBindingRaced) {
 			return nil, skip(obj.ID, "a concurrent materialization bound it to another community first")
 		}
@@ -515,6 +541,9 @@ func (m *Materializer) commitRecord(ctx context.Context, did, collection, rkey s
 			}
 			return nil, fmt.Errorf("materialize: put %s: record kept changing across %d attempts: %w", obj.ID, maxStatsCommitAttempts, err)
 		}
+		if errors.IsCollectionImmutable(err) {
+			return nil, collectionRaceSkip(obj.ID, collection)
+		}
 		if stderrors.Is(err, errCommunityBindingRaced) {
 			return nil, skip(obj.ID, "a concurrent materialization bound it to another community first")
 		}
@@ -523,6 +552,17 @@ func (m *Materializer) commitRecord(ctx context.Context, did, collection, rkey s
 		}
 		return &Result{DID: did, ATURI: stored.ATURI, CID: res.RecordCID, NoOp: res.NoOp, CommunityDID: stored.CommunityDID}, nil
 	}
+}
+
+// collectionRaceSkip is the read-time collection refusal for a commit that
+// lost the race to it: another worker mapped the id in another collection
+// after this commit's check, the upsert refused, and the repo write rolled
+// back with the transaction. Like the read-time refusal, it satisfies
+// errors.IsCollectionImmutable as well as IsSkip.
+func collectionRaceSkip(apID, collection string) error {
+	return &SkipError{APID: apID, Reason: fmt.Sprintf(
+		"id already maps a record in another collection; refusing to remap it as %s", collection),
+		Cause: errors.ErrCollectionImmutable}
 }
 
 // carryForwardFields folds the fields a Lemmy rebuild cannot reconstruct out of

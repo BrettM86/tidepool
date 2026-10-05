@@ -59,7 +59,28 @@ func (m *Materializer) ensureActor(ctx context.Context, actorRef *ap.Object, for
 
 // ensureKnownActor applies consent and freshness policy to an actor we have
 // bridged (or refused) before.
+//
+// A row whose id ap_objects maps as content is stranded, and healed first,
+// whatever its consent state: a tombstoned or opted-out row on a post's id
+// still reads that id as a bridged actor. It is healed before any fetch, too
+// (the origin may serve the post itself, which names the same id). The check
+// is skipped only for a synced OK row: an OK row is stamped only after its
+// profile committed (rematerializeProfile), and a committed profile mapping
+// means the id is not content. A non-OK row is checked even when stamped,
+// since the nobridge re-check stamps without committing a profile; such rows
+// are rare, so the fresh OK path still costs no extra read. This relies on
+// every OK-path MarkProfileSynced following a profile commit: a call site that
+// stamps an OK row without one would reopen stranded rows.
 func (m *Materializer) ensureKnownActor(ctx context.Context, stored *store.BridgedActor, actorRef *ap.Object, force bool) (*store.BridgedActor, error) {
+	if stored.ProfileSyncedAt == nil || stored.ConsentState != store.ConsentStateOK {
+		if existing, err := m.objects.GetByAPID(ctx, stored.APActorID); err == nil {
+			if !isProfileCollection(existing.Collection) {
+				return nil, m.healStrandedActorRow(ctx, stored, existing.Collection)
+			}
+		} else if !errors.IsNotFound(err) {
+			return nil, fmt.Errorf("materialize: check mapping for actor %s: %w", stored.APActorID, err)
+		}
+	}
 	switch stored.ConsentState {
 	case store.ConsentStateDeleted:
 		// Terminal: the repo is tombstoned, nothing is ever materialized.
@@ -70,11 +91,13 @@ func (m *Materializer) ensureKnownActor(ctx context.Context, stored *store.Bridg
 		if !force && m.profileFresh(stored) {
 			return nil, skip(stored.APActorID, "actor opted out (#nobridge/#nobot)")
 		}
-		doc, err := m.actorDoc(ctx, actorRef, force)
+		doc, err := m.knownActorDoc(ctx, stored, actorRef, force)
 		if err != nil {
 			return nil, err
 		}
 		if hasNobridgeMarker(doc) {
+			// Stamps without a profile commit; ensureKnownActor still checks
+			// this non-OK row for a stranded id.
 			if err := m.actors.MarkProfileSynced(ctx, stored.APActorID, m.now()); err != nil {
 				return nil, fmt.Errorf("materialize: mark nobridge re-check for %s: %w", stored.APActorID, err)
 			}
@@ -90,7 +113,7 @@ func (m *Materializer) ensureKnownActor(ctx context.Context, stored *store.Bridg
 		if !force && m.profileFresh(stored) {
 			return stored, nil
 		}
-		doc, err := m.actorDoc(ctx, actorRef, force)
+		doc, err := m.knownActorDoc(ctx, stored, actorRef, force)
 		if err != nil {
 			return nil, err
 		}
@@ -144,12 +167,74 @@ func (m *Materializer) bridgeNewActor(ctx context.Context, actorRef *ap.Object, 
 	if instance == "" {
 		return nil, skip(doc.ID, "actor id has no parseable host")
 	}
+	// The fetched document names its own id, bound only to the fetch
+	// authority, so an origin can answer with a Person whose id is one of its
+	// posts'. The profile commit would refuse that id, but too late: the DID is
+	// minted and the bridged_actors row keyed on it by then, and PLC DIDs are
+	// permanent. Live or deleted, a content id is never an actor's.
+	profileCollection := CollectionActorProfile
+	if actorType == store.ActorTypeGroup {
+		profileCollection = CollectionCommunityProfile
+	}
+	if existing, err := m.objects.GetByAPID(ctx, doc.ID); err == nil {
+		if existing.Collection != profileCollection {
+			// A retry of an alias naming a content id lands here, never in
+			// ensureKnownActor, so a row stranded on that id is healed here.
+			if !isProfileCollection(existing.Collection) {
+				if row, err := m.actors.GetByAPActorID(ctx, doc.ID); err == nil {
+					return nil, m.healStrandedActorRow(ctx, row, existing.Collection)
+				} else if !errors.IsNotFound(err) {
+					return nil, fmt.Errorf("materialize: look up actor %s: %w", doc.ID, err)
+				}
+			}
+			return nil, skip(doc.ID, fmt.Sprintf(
+				"id already maps a %s record; refusing to bridge it as an actor", existing.Collection))
+		}
+	} else if !errors.IsNotFound(err) {
+		return nil, fmt.Errorf("materialize: check mapping for actor %s: %w", doc.ID, err)
+	}
+	// The same binding lets an unseen alias IRI answer with an already-bridged
+	// actor's id. That id has its row, so minting would only orphan a DID, and
+	// reusing the row would rewrite that actor's profile from the alias's
+	// document. A same-id row is a concurrent bridge, left to mintAndUpsert.
+	// Refusing is deliberately fail-closed: content attributed to the alias IRI
+	// is dropped rather than attributed to the canonical actor, since nothing
+	// but the alias's own document binds the two.
+	if doc.ID != actorRef.ID {
+		if _, err := m.actors.GetByAPActorID(ctx, doc.ID); err == nil {
+			return nil, skip(actorRef.ID, fmt.Sprintf(
+				"actor document names already-bridged actor %s; refusing to bridge an alias over it", doc.ID))
+		} else if !errors.IsNotFound(err) {
+			return nil, fmt.Errorf("materialize: look up actor %s: %w", doc.ID, err)
+		}
+	}
 
-	stored, err := m.mintAndUpsert(ctx, doc, actorType, instance)
+	stored, inserted, err := m.mintAndUpsert(ctx, doc, actorType, instance)
 	if err != nil {
 		return nil, err
 	}
-	return m.rematerializeProfile(ctx, stored, doc)
+	if !inserted && doc.ID != actorRef.ID {
+		// The alias check above lost a race: doc.ID's row landed after it. The
+		// winner is that actor, not a concurrent bridge of this one, and
+		// reusing it would rewrite its profile from the alias's document.
+		return nil, skip(actorRef.ID, fmt.Sprintf(
+			"actor document names already-bridged actor %s; refusing to bridge an alias over it", doc.ID))
+	}
+	profiled, err := m.rematerializeProfile(ctx, stored, doc)
+	if inserted && errors.IsCollectionImmutable(err) {
+		// The mapping check above lost a race: another worker mapped doc.ID
+		// as content after it, and the profile commit refused. The row this
+		// call inserted would leave a content id reading as a bridged actor
+		// for good, so it goes; the DID cannot. Detached from processing
+		// cancellation, so a cancelled delivery does not leave the row.
+		// A row already gone (healed concurrently) is the same outcome.
+		if delErr := m.removeActorRow(ctx, stored.APActorID, stored.DID); delErr != nil && !errors.IsNotFound(delErr) {
+			return nil, fmt.Errorf("materialize: remove bridged actor %s after refused profile commit: %w", stored.APActorID, delErr)
+		}
+		m.logger.Error("profile commit refused because the id is mapped as content; removed the just-inserted bridged actor row (freshly minted DID is orphaned on the PLC directory)",
+			"ap_actor_id", stored.APActorID, "orphaned_did", stored.DID)
+	}
+	return profiled, err
 }
 
 // mintAndUpsert mints a DID and registers the bridged_actors row, handling
@@ -159,7 +244,10 @@ func (m *Materializer) bridgeNewActor(ctx context.Context, actorRef *ap.Object, 
 //   - another actor grabbed the same handle between the availability check
 //     and the insert → retry the mint once (the suffixer now sees the
 //     winner). Never re-mints in a loop beyond that.
-func (m *Materializer) mintAndUpsert(ctx context.Context, doc *ap.Object, actorType store.ActorType, instance string) (*store.BridgedActor, error) {
+//
+// The bool is true only when the returned row carries the DID this call
+// minted, i.e. this call inserted it; a reused winner is false.
+func (m *Materializer) mintAndUpsert(ctx context.Context, doc *ap.Object, actorType store.ActorType, instance string) (*store.BridgedActor, bool, error) {
 	for attempt := 0; ; attempt++ {
 		minted, err := m.minter.MintActor(ctx, identity.MintRequest{
 			ActorType:         actorType,
@@ -167,7 +255,7 @@ func (m *Materializer) mintAndUpsert(ctx context.Context, doc *ap.Object, actorT
 			Instance:          instance,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("materialize: mint identity for %s: %w", doc.ID, err)
+			return nil, false, fmt.Errorf("materialize: mint identity for %s: %w", doc.ID, err)
 		}
 		stored, err := m.actors.UpsertActor(ctx, store.BridgedActor{
 			APActorID:           doc.ID,
@@ -178,16 +266,16 @@ func (m *Materializer) mintAndUpsert(ctx context.Context, doc *ap.Object, actorT
 			ConsentState:        store.ConsentStateOK,
 		})
 		if err == nil {
-			return stored, nil
+			return stored, stored.DID == minted.DID, nil
 		}
 		if !errors.IsAlreadyExists(err) {
-			return nil, fmt.Errorf("materialize: register bridged actor %s: %w", doc.ID, err)
+			return nil, false, fmt.Errorf("materialize: register bridged actor %s: %w", doc.ID, err)
 		}
 		// Same AP actor already bridged by a concurrent worker? Reuse theirs.
 		if winner, getErr := m.actors.GetByAPActorID(ctx, doc.ID); getErr == nil {
 			m.logger.Error("lost bridging race for actor; reusing winner's identity (freshly minted DID is orphaned on the PLC directory)",
 				"ap_actor_id", doc.ID, "orphaned_did", minted.DID, "winning_did", winner.DID)
-			return winner, nil
+			return winner, false, nil
 		}
 		// Otherwise the collision is on the handle (a different actor won
 		// it). Retry once so the suffixer can pick a free handle; the first
@@ -197,7 +285,7 @@ func (m *Materializer) mintAndUpsert(ctx context.Context, doc *ap.Object, actorT
 				"ap_actor_id", doc.ID, "orphaned_did", minted.DID, "handle", minted.Handle)
 			continue
 		}
-		return nil, fmt.Errorf("materialize: register bridged actor %s after handle-collision retry: %w", doc.ID, err)
+		return nil, false, fmt.Errorf("materialize: register bridged actor %s after handle-collision retry: %w", doc.ID, err)
 	}
 }
 
@@ -230,10 +318,48 @@ func (m *Materializer) rematerializeProfile(ctx context.Context, stored *store.B
 	if _, err := m.commitRecord(ctx, stored.DID, collection, ProfileRKey, record, doc, stored.DID, ""); err != nil {
 		return nil, err
 	}
+	// Stamped only after the commit: ensureKnownActor skips the stranded-row
+	// check for a synced OK row on that basis.
 	if err := m.actors.MarkProfileSynced(ctx, stored.APActorID, m.now()); err != nil {
 		return nil, fmt.Errorf("materialize: mark profile synced for %s: %w", stored.APActorID, err)
 	}
 	return stored, nil
+}
+
+// actorRowRemovalTimeout bounds the detached delete of a bridged_actors row
+// that must not outlive the refusal that found it.
+const actorRowRemovalTimeout = 10 * time.Second
+
+// removeActorRow deletes apActorID's row while it still carries did, on a
+// context detached from processing cancellation: the refusal that calls it
+// has already happened, and a cancelled delivery must not leave the row.
+func (m *Materializer) removeActorRow(ctx context.Context, apActorID, did string) error {
+	removeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), actorRowRemovalTimeout)
+	defer cancel()
+	return m.actors.DeleteActorRow(removeCtx, apActorID, did)
+}
+
+// healStrandedActorRow removes row, a bridged_actors row keyed on an id that
+// ap_objects maps as content (in collection): the leftover of a first bridge
+// that lost the race to that mapping, or whose compensation failed. Content
+// ids are never actors', so the row goes (the DID stays orphaned) and the id
+// is a skip.
+func (m *Materializer) healStrandedActorRow(ctx context.Context, row *store.BridgedActor, collection string) error {
+	err := m.removeActorRow(ctx, row.APActorID, row.DID)
+	switch {
+	case err == nil:
+		m.logger.Error("removed a bridged actor row keyed on an id mapped as content (its DID is orphaned on the PLC directory)",
+			"ap_actor_id", row.APActorID, "did", row.DID)
+	case !errors.IsNotFound(err):
+		return fmt.Errorf("materialize: remove stranded bridged actor %s: %w", row.APActorID, err)
+	}
+	return skip(row.APActorID, fmt.Sprintf("id already maps a %s record; it is not an actor", collection))
+}
+
+// isProfileCollection reports whether collection holds actor or community
+// profiles, the only records an actor's id may map.
+func isProfileCollection(collection string) bool {
+	return collection == CollectionActorProfile || collection == CollectionCommunityProfile
 }
 
 // fetchBlobWithCarryForward fetches profile media like fetchBlob, but when a
@@ -323,6 +449,14 @@ func (m *Materializer) ensureCommunity(ctx context.Context, groupRef *ap.Object,
 			return nil, errors.NewValidationError("group",
 				fmt.Sprintf("object %s has type %q, want Group", apID, doc.Type))
 		}
+		// bridgeNewActor gets doc as its reference, so its alias check cannot
+		// see apID. A Group naming another id is refused here instead: that id
+		// may be a bridged community's, and the communities row would be keyed
+		// on apID while the bridged_actors row is keyed on doc.ID.
+		if doc.ID != apID {
+			return nil, skip(apID, fmt.Sprintf(
+				"group document names a different id %s; refusing to bridge an alias", doc.ID))
+		}
 		if actor, err = m.bridgeNewActor(ctx, doc, store.ActorTypeGroup, true); err != nil {
 			return nil, err
 		}
@@ -385,6 +519,23 @@ func (m *Materializer) actorDoc(ctx context.Context, actorRef *ap.Object, allowE
 	} else if !ap.SameAuthority(doc.ID, actorRef.ID) {
 		return nil, skip(actorRef.ID,
 			fmt.Sprintf("actor document served a cross-authority id %s", doc.ID))
+	}
+	return doc, nil
+}
+
+// knownActorDoc is actorDoc for an actor already bridged: the refreshed
+// document must still name stored's id. One naming another id (another bridged
+// actor's, or a post's) is refused before anything is written, or its profile
+// commit would repoint that id's mapping at stored's repo. Its only caller,
+// ensureKnownActor, has already healed a row stranded on a content id.
+func (m *Materializer) knownActorDoc(ctx context.Context, stored *store.BridgedActor, actorRef *ap.Object, allowEmbedded bool) (*ap.Object, error) {
+	doc, err := m.actorDoc(ctx, actorRef, allowEmbedded)
+	if err != nil {
+		return nil, err
+	}
+	if doc.ID != stored.APActorID {
+		return nil, skip(stored.APActorID,
+			fmt.Sprintf("refreshed document names a different actor %s", doc.ID))
 	}
 	return doc, nil
 }

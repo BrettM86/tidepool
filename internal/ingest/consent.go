@@ -37,22 +37,53 @@ import (
 // Refresh* re-runs the consent-marker scan, so a profile that gained
 // #nobridge is scrubbed and suppressed on this path.
 //
-// A BARE (non-announced) profile Update is refresh-only: it may re-materialize
-// an actor/community the bridge ALREADY bridged, but must never mint or bridge
-// a previously-unknown one. Otherwise any self-signed actor could drive an
-// outbound fetch to an arbitrary target IRI (an SSRF / fetch-oracle) and burn
-// the permanent-PLC mint budget, defeating the subscription-trust model.
-// Announced profile updates ride the followed community's trust (handleAnnounce
-// already authorized the announcer) and may ensure/refresh unknown actors.
-func (h *Handler) applyProfileUpdate(ctx context.Context, actorDoc *ap.Object, signer, announcer string) error {
-	if announcer == "" {
-		known, err := h.isBridged(ctx, actorDoc.ID)
-		if err != nil {
-			return err
-		}
-		if !known {
+// An id the bridge already maps as CONTENT (a post, comment, or any other
+// non-profile collection) is not an actor, whatever the document claims: the
+// update is dropped on both paths before any fetch or mint, so it can neither
+// mint an identity for that IRI nor take the content's mapping over.
+//
+// A profile Update is refresh-only, whoever delivers it (bare or inside a
+// followed community's Announce): it may re-materialize an actor/community the
+// bridge ALREADY bridged, but must never mint or bridge a previously-unknown
+// one. Otherwise any self-signed actor, or any followed community, could drive
+// an outbound fetch to an arbitrary target IRI (an SSRF / fetch-oracle) and
+// burn the permanent-PLC mint budget, defeating the subscription-trust model.
+// The bridged_actors row must carry the type the document claims (the same
+// type that picks RefreshActor or RefreshCommunity below), and an Update{Group}
+// additionally needs an existing communities row: a Group bridged only as an
+// author or voter is not turned into a community by its own profile update.
+func (h *Handler) applyProfileUpdate(ctx context.Context, actorDoc *ap.Object, signer string) error {
+	wantType := store.ActorTypePerson
+	if actorDoc.Type == ap.TypeGroup {
+		wantType = store.ActorTypeGroup
+	}
+	if mapping, err := h.objects.GetByAPID(ctx, actorDoc.ID); err == nil {
+		if mapping.Collection != materialize.CollectionActorProfile &&
+			mapping.Collection != materialize.CollectionCommunityProfile {
 			return skip(actorDoc.ID,
-				"bare profile update for an actor we have not bridged (refresh-only, never mint)")
+				"profile update names an id the bridge maps as content ("+mapping.Collection+")")
+		}
+	} else if !errors.IsNotFound(err) {
+		return fmt.Errorf("ingest: check mapping for profile update %s: %w", actorDoc.ID, err)
+	}
+	bridgedType, found, err := h.bridgedActorType(ctx, actorDoc.ID)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return skip(actorDoc.ID,
+			"profile update for an actor we have not bridged (refresh-only, never mint)")
+	}
+	if bridgedType != wantType {
+		return skip(actorDoc.ID, fmt.Sprintf(
+			"profile update type mismatch: bridged as %s, update claims %s", bridgedType, wantType))
+	}
+	if wantType == store.ActorTypeGroup {
+		if _, err := h.communities.GetByAPGroupID(ctx, actorDoc.ID); errors.IsNotFound(err) {
+			return skip(actorDoc.ID,
+				"Update{Group} for a group that is not a bridged community (refresh-only, never create)")
+		} else if err != nil {
+			return fmt.Errorf("ingest: look up community for profile update %s: %w", actorDoc.ID, err)
 		}
 	}
 	ref := actorDoc
@@ -61,8 +92,7 @@ func (h *Handler) applyProfileUpdate(ctx context.Context, actorDoc *ap.Object, s
 		// re-fetches the document from the actor's own origin.
 		ref = &ap.Object{ID: actorDoc.ID}
 	}
-	var err error
-	if actorDoc.Type == ap.TypeGroup {
+	if wantType == store.ActorTypeGroup {
 		_, err = h.mat.RefreshCommunity(ctx, ref)
 	} else {
 		_, err = h.mat.RefreshActor(ctx, ref)

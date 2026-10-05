@@ -494,7 +494,7 @@ func (h *Handler) handleBareCreateUpdate(ctx context.Context, activity *ap.Objec
 	if obj.ID == "" {
 		return errors.NewValidationError("object", "profile object carries no id")
 	}
-	return h.applyProfileUpdate(ctx, obj, signer, "")
+	return h.applyProfileUpdate(ctx, obj, signer)
 }
 
 // materializeContent is the single content funnel for announced objects: echo
@@ -508,10 +508,10 @@ func (h *Handler) materializeContent(ctx context.Context, obj *ap.Object, signer
 	// The signer of an Announce is the community that announced it.
 	announcer := signer
 
-	// An announced profile update (Announce{Update{Person|Group}}) rides the
-	// same rails but has its own trust rule; nothing below applies.
+	// An announced profile update (Announce{Update{Person|Group}}) takes the
+	// same refresh-only profile path as a bare one; nothing below applies.
 	if obj.Type == ap.TypePerson || obj.Type == ap.TypeGroup {
-		return h.applyProfileUpdate(ctx, obj, signer, announcer)
+		return h.applyProfileUpdate(ctx, obj, signer)
 	}
 
 	// Echo suppression: an activity whose object the bridge itself emitted
@@ -731,19 +731,20 @@ func (h *Handler) followCommunity(_ context.Context, response *ap.Object, signer
 	return communityID, nil
 }
 
-// isBridged reports whether an AP id already has an ap_objects mapping — the
-// "already bridged?" signal used to keep bare profile Updates refresh-only
-// (never mint). Every bridged actor/community has a profile mapping row (rkey
-// "self"), and every bridged post/comment a content mapping, so a hit means
-// the id is known; a miss means it was never materialized.
-func (h *Handler) isBridged(ctx context.Context, apID string) (bool, error) {
-	if _, err := h.objects.GetByAPID(ctx, apID); err == nil {
-		return true, nil
-	} else if errors.IsNotFound(err) {
-		return false, nil
-	} else {
-		return false, fmt.Errorf("ingest: check bridged state for %s: %w", apID, err)
+// bridgedActorType reports the type the bridge bridged apID as: found is
+// false when no bridged_actors row exists for it. applyProfileUpdate compares
+// the type against the one its document claims, the same type that routes the
+// refresh, so the refresh-only gate and the refresh cannot disagree. An
+// ap_objects mapping alone does not count as bridged: content ids have one too.
+func (h *Handler) bridgedActorType(ctx context.Context, apID string) (actorType store.ActorType, found bool, err error) {
+	actor, err := h.actors.GetByAPActorID(ctx, apID)
+	if errors.IsNotFound(err) {
+		return "", false, nil
 	}
+	if err != nil {
+		return "", false, fmt.Errorf("ingest: check bridged actor for %s: %w", apID, err)
+	}
+	return actor.ActorType, true, nil
 }
 
 // refID returns the id of a possibly-nil object reference.

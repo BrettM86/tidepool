@@ -29,6 +29,12 @@ var (
 	// bridged_actor row or signing key — a key-escrow inconsistency to
 	// retry, never to skip). IsNotFound(recordGone) is false.
 	ErrRecordGone = errors.New("bridged record gone")
+	// ErrCollectionImmutable marks a mapping write refused because the AP id
+	// already maps a record in another collection. Deliberately distinct from
+	// ErrAlreadyExists: that one is an at-uri collision (a deterministic-rkey
+	// bug signal), this one is an id claimed as something it is not.
+	// IsAlreadyExists(collectionImmutable) is false.
+	ErrCollectionImmutable = errors.New("mapping collection is immutable")
 )
 
 // ValidationError reports a rejected field value.
@@ -114,3 +120,7 @@ func IsTombstoned(err error) bool { return errors.Is(err, ErrTombstoned) }
 
 // IsRecordGone reports whether err is, wraps, or unwraps to ErrRecordGone.
 func IsRecordGone(err error) bool { return errors.Is(err, ErrRecordGone) }
+
+// IsCollectionImmutable reports whether err is, wraps, or unwraps to
+// ErrCollectionImmutable.
+func IsCollectionImmutable(err error) bool { return errors.Is(err, ErrCollectionImmutable) }

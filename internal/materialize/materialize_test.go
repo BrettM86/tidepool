@@ -71,12 +71,18 @@ func (rt rewriteTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 
 // fakeMinter mints deterministic did:plc identities locally (no PLC
 // directory): the DID is a hash of user@instance, the signing key is real
-// so repo commits sign and verify.
+// so repo commits sign and verify. It counts every mint, so a test can
+// prove a path minted nothing (a PLC DID, once minted, is permanent).
 type fakeMinter struct {
 	custodian *identity.Custodian
+	mu        sync.Mutex
+	mints     int
 }
 
 func (f *fakeMinter) MintActor(_ context.Context, req identity.MintRequest) (*identity.Identity, error) {
+	f.mu.Lock()
+	f.mints++
+	f.mu.Unlock()
 	key, err := atcrypto.GeneratePrivateKeyK256()
 	if err != nil {
 		return nil, err
@@ -101,6 +107,13 @@ func (f *fakeMinter) MintActor(_ context.Context, req identity.MintRequest) (*id
 	}, nil
 }
 
+// mintCount returns how many identities the fake minter has minted so far.
+func (f *fakeMinter) mintCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.mints
+}
+
 // testDIDFor mirrors fakeMinter's DID derivation for assertions.
 func testDIDFor(username, instance string) string {
 	sum := sha256.Sum256([]byte(username + "@" + instance))
@@ -114,6 +127,7 @@ type harness struct {
 	objects     store.APObjects
 	actors      store.BridgedActors
 	communities store.Communities
+	minter      *fakeMinter
 	mux         *http.ServeMux
 	fixtures    *httptest.Server
 	scrubbed    *recordingScrubber
@@ -171,13 +185,14 @@ func newHarness(t *testing.T) *harness {
 	})
 
 	scrubbed := &recordingScrubber{}
+	minter := &fakeMinter{custodian: custodian}
 	m, err := New(Options{
 		Fetcher:          client,
 		Objects:          objects,
 		Actors:           actors,
 		Communities:      communities,
 		Repos:            manager,
-		Minter:           &fakeMinter{custodian: custodian},
+		Minter:           minter,
 		Votes:            scrubbed,
 		ServiceDID:       testServiceDID,
 		StrictValidation: true, // tests always validate against the vendored lexicons
@@ -186,7 +201,7 @@ func newHarness(t *testing.T) *harness {
 
 	h := &harness{
 		t: t, m: m, manager: manager,
-		objects: objects, actors: actors, communities: communities,
+		objects: objects, actors: actors, communities: communities, minter: minter,
 		mux: mux, fixtures: fixtures, scrubbed: scrubbed,
 		hits: map[string]int{},
 	}

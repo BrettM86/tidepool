@@ -84,6 +84,10 @@ services:
     restart: unless-stopped
     ports:
       - "127.0.0.1:8091:80" # host-local ops access (admin API without a round trip through Caddy)
+      # Authoritative DNS for delegated instance subzones. Bound to the public
+      # IPv4 only: systemd-resolved holds 127.0.0.53:53/127.0.0.54:53 on the host.
+      - "51.222.47.2:53:53/udp"
+      - "51.222.47.2:53:53/tcp"
     environment:
       ENVIRONMENT: production
       # DB host is the container NAME, not the `postgres` service alias:
@@ -196,6 +200,20 @@ services:
       # the retry schedule plus the causal wait budget (internal/ingest/
       # divergence.go:72-81), not picked.
       DIVERGENCE_ACCEPTANCE_STALE_AFTER: ${DIVERGENCE_ACCEPTANCE_STALE_AFTER:-12h}
+
+      # Bridged handle resolution over DNS (docs PRD_HANDLE_DNS). Empty
+      # DNS_LISTEN disables the server; the port publish above is then idle.
+      # Cloudflare answers for the tdpl.io zone and delegates each instance
+      # label to ns1/ns2.tdpl.io (A records → this host), which is this server.
+      DNS_LISTEN: ${DNS_LISTEN:-}
+      DNS_PUBLIC_IPV4: ${DNS_PUBLIC_IPV4:-}
+      DNS_PUBLIC_IPV6: ${DNS_PUBLIC_IPV6:-}
+      # Empty CLOUDFLARE_API_TOKEN disables delegation. When set, a pass runs at
+      # startup and every 15 minutes, creates at most 20 NS records per rolling
+      # hour, and stops at DELEGATION_MAX_NS_RECORDS (3,000 under Pro's 3,500).
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
+      CLOUDFLARE_ZONE_ID: ${CLOUDFLARE_ZONE_ID:-}
+      DELEGATION_MAX_NS_RECORDS: ${DELEGATION_MAX_NS_RECORDS:-}
     volumes:
       - ./:/repo:ro
     networks:

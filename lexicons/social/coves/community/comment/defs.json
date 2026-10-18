@@ -4,16 +4,18 @@
   "defs": {
     "commentView": {
       "type": "object",
-      "description": "Base view for a single comment with voting, stats, and viewer state",
+      "description": "Base view for a single comment with voting, stats, and viewer state. For an author-deleted or moderator-removed placeholder, cid is the last indexed version, vote stats are zero, replyCount is preserved, embed and viewer are absent, and author carries only the DID and placeholder handle handle.invalid.",
       "required": [
         "uri",
         "cid",
         "author",
-        "record",
         "post",
         "createdAt",
         "indexedAt",
         "stats"
+      ],
+      "nullable": [
+        "record"
       ],
       "properties": {
         "uri": {
@@ -33,7 +35,7 @@
         },
         "record": {
           "type": "unknown",
-          "description": "The actual comment record verbatim"
+          "description": "The social.coves.community.comment record verbatim for an active comment; absent or null exactly when isDeleted is true"
         },
         "post": {
           "type": "ref",
@@ -74,6 +76,29 @@
           "type": "ref",
           "ref": "#commentViewerState",
           "description": "Viewer-specific state (vote, saved, etc.)"
+        },
+        "isDeleted": {
+          "type": "boolean",
+          "description": "True for an author-deleted or moderator-removed placeholder"
+        },
+        "deletionReason": {
+          "type": "string",
+          "knownValues": [
+            "author",
+            "moderator"
+          ],
+          "description": "Whether the author or a moderator caused deletion",
+          "maxLength": 64
+        },
+        "deletedAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "When the comment was deleted or removed"
+        },
+        "moderation": {
+          "type": "ref",
+          "ref": "social.coves.moderation.defs#moderationView",
+          "description": "Public moderation state for the comment; each source's scope distinguishes instance and community removal"
         }
       }
     },
@@ -191,7 +216,7 @@
             "author",
             "moderator"
           ],
-          "description": "What caused the block: viewer blocked author, or comment was removed by moderators",
+          "description": "What caused the block. The published 'moderator' value is unused and never emitted; moderator removal is represented only by the commentView placeholder.",
           "maxLength": 64
         }
       }
@@ -244,6 +269,20 @@
           "type": "string",
           "format": "at-uri",
           "description": "AT-URI of the viewer's vote record"
+        },
+        "moderation": {
+          "type": "array",
+          "description": "Moderation actions the viewer may take on this comment, using the modlog action tokens. Omitted when there are none.",
+          "items": {
+            "type": "string",
+            "knownValues": [
+              "remove",
+              "restore",
+              "label",
+              "retract-label"
+            ],
+            "maxLength": 64
+          }
         }
       }
     }

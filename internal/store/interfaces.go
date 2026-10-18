@@ -161,10 +161,9 @@ type BridgedActors interface {
 	// UpsertActor idempotently upserts an actor keyed on APActorID and
 	// returns the stored row. ConsentState must be stated explicitly (the
 	// zero value is rejected; there is no fail-open default). On conflict:
-	//   - Handle and SigningKeyEncrypted are sticky: an empty handle or nil
-	//     key on the incoming actor (e.g. a profile refresh built purely
-	//     from AP data) preserves the stored values; non-empty values
-	//     overwrite them.
+	//   - Handle, SigningKeyEncrypted, and PreferredUsername are sticky:
+	//     an empty handle or username, or nil key on the incoming actor,
+	//     preserves the stored value; non-empty values overwrite it.
 	//   - DID, ActorType, ConsentState, and CreatedAt never change.
 	//     Identity is immutable once minted: an upsert whose DID or
 	//     ActorType diverges from the stored row returns an error
@@ -172,7 +171,16 @@ type BridgedActors interface {
 	//   - Tombstoned actors are frozen: upserting an actor whose stored
 	//     ConsentState is ConsentStateDeleted modifies nothing and returns
 	//     the stored row as-is (consent stays deleted).
+	// A new non-empty handle is claimed in the same transaction as its actor
+	// row; changing a handle transfers its claim and releases the old one.
+	// Same-handle, empty-handle and tombstoned upserts leave claims unchanged
+	// (including legacy handles with no claim). A claim or legacy handle held
+	// by another actor returns a handle conflict without changing either row.
 	UpsertActor(ctx context.Context, actor BridgedActor) (*BridgedActor, error)
+	// UpsertActorOnInsert shares UpsertActor's transaction and invokes onInsert
+	// after a newly inserted row and its handle claim are written. A callback
+	// error rolls back both writes; refreshes never invoke the callback.
+	UpsertActorOnInsert(ctx context.Context, actor BridgedActor, onInsert func(ctx context.Context, tx *sql.Tx, stored *BridgedActor) error) (*BridgedActor, error)
 
 	// GetByAPActorID returns the actor for an AP actor id.
 	GetByAPActorID(ctx context.Context, apActorID string) (*BridgedActor, error)
@@ -184,6 +192,57 @@ type BridgedActors interface {
 	// for handle-collision suffixing during minting and for
 	// com.atproto.identity.resolveHandle.
 	GetByHandle(ctx context.Context, handle string) (*BridgedActor, error)
+	// GetByHandleOrPending resolves either assigned or reserved handles.
+	GetByHandleOrPending(ctx context.Context, handle string) (*BridgedActor, error)
+
+	// SetPreferredUsernameByDID saves the raw fetched actor username without
+	// marking the profile synced or changing any other actor fields. It
+	// saves only to a live, non-tombstoned row and returns NotFound when no
+	// such row exists.
+	SetPreferredUsernameByDID(ctx context.Context, did, preferredUsername string) error
+
+	// HandleTaken reports whether a handle has a claim or is held by a
+	// bridged_actors row that predates claims.
+	HandleTaken(ctx context.Context, handle string) (bool, error)
+
+	// SetPendingHandle claims handle for the actor and stores it as
+	// pending_handle in one transaction. Success starts a new attempt and
+	// clears any recorded handle migration error.
+	SetPendingHandle(ctx context.Context, did, handle string) error
+
+	// RecordHandleMigrationError records the last definitive failure of the
+	// current rename attempt without changing the reserved handle or its
+	// claim. SetPendingHandle and FinalizeHandleRename clear it.
+	RecordHandleMigrationError(ctx context.Context, did string, code HandleMigrationErrorCode, message string) error
+
+	// FinalizeHandleRename swaps pending_handle into handle in one
+	// transaction and runs onFinalize last. It refuses a tombstoned actor
+	// (errors.IsTombstoned) and, when pending_handle is not expectedPending,
+	// returns an error satisfying errors.IsAlreadyExists without a change.
+	FinalizeHandleRename(ctx context.Context, did, expectedPending string, onFinalize func(ctx context.Context, tx *sql.Tx, renamed *BridgedActor) error) (*BridgedActor, error)
+
+	// IsForwardRenameCandidate reports whether the actor still needs a
+	// forward rename.
+	IsForwardRenameCandidate(ctx context.Context, did, bridgeHostname, handleZoneRoot string) (bool, error)
+	// ListForwardRenameCandidates lists live old-format actors in insertion order.
+	ListForwardRenameCandidates(ctx context.Context, bridgeHostname, handleZoneRoot string) ([]string, error)
+	ListRollbackCandidates(ctx context.Context, bridgeHostname, handleZoneRoot string, dids []string) ([]string, error)
+	// ListLivePersonAPActorIDs lists the AP actor ids of every bridged
+	// person that is not tombstoned (nobridge actors included), in
+	// insertion order: the user refresh-profile walk's work list.
+	ListLivePersonAPActorIDs(ctx context.Context) ([]string, error)
+	// MarkPendingRevertSubmitted records, before the POST, that a rollback
+	// is about to submit a PLC update back to the current handle while
+	// expectedPending is pending. It fails (errors.IsAlreadyExists) unless a
+	// live actor still has expectedPending pending, so no POST follows.
+	MarkPendingRevertSubmitted(ctx context.Context, did, expectedPending string) error
+	// AbandonPendingHandle clears pending_handle and releases its claim,
+	// keeping handle. It refuses a tombstoned actor (errors.IsTombstoned) and
+	// a pending_handle other than expectedPending (errors.IsAlreadyExists).
+	// onPLCReverted runs last in the transaction, and only when
+	// MarkPendingRevertSubmitted was recorded during this pending handle,
+	// that is when a PLC update back to the handle may have landed.
+	AbandonPendingHandle(ctx context.Context, did, expectedPending string, onPLCReverted func(ctx context.Context, tx *sql.Tx, actor *BridgedActor) error) (*BridgedActor, error)
 
 	// SetConsentState transitions the actor's consent state. Deleted is
 	// terminal: transitioning away from ConsentStateDeleted returns an
@@ -192,16 +251,18 @@ type BridgedActors interface {
 	SetConsentState(ctx context.Context, apActorID string, state ConsentState) error
 
 	// MarkProfileSynced records when the actor's profile record was last
-	// (re)materialized.
-	MarkProfileSynced(ctx context.Context, apActorID string, syncedAt time.Time) error
+	// (re)materialized, and the fetched document's exact preferredUsername in
+	// the same write. An empty preferredUsername leaves the stored name intact.
+	MarkProfileSynced(ctx context.Context, apActorID string, syncedAt time.Time, preferredUsername string) error
 
 	// DeleteActorRow removes the row for apActorID only while it still
 	// carries did: the compensation for a first bridge whose profile commit
 	// was refused right after it inserted the row. It is not how an actor is
 	// deleted (that is a ConsentStateDeleted tombstone, which keeps the row).
 	// A missing row, or one carrying another DID, is an error satisfying
-	// errors.IsNotFound.
-	DeleteActorRow(ctx context.Context, apActorID, did string) error
+	// errors.IsNotFound. onDelete, when non-nil, runs only after a row was
+	// deleted, in the delete's transaction; its error rolls the delete back.
+	DeleteActorRow(ctx context.Context, apActorID, did string, onDelete func(ctx context.Context, tx *sql.Tx) error) error
 
 	// ListInstanceLabels returns distinct second-label instances under zoneRoot,
 	// including labels whose actors are all deleted (HasLiveActor=false).

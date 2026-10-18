@@ -23,8 +23,8 @@
           },
           "content": {
             "type": "string",
-            "maxGraphemes": 10000,
-            "maxLength": 100000,
+            "maxGraphemes": 50000,
+            "maxLength": 500000,
             "description": "Post content - supports rich text via facets"
           },
           "facets": {

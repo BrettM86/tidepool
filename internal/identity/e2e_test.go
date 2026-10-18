@@ -25,7 +25,7 @@ func TestMintedIdentityEndToEnd(t *testing.T) {
 	testutil.Truncate(t, database,
 		"bridged_actors", "blocks", "repo_state", "firehose_events")
 	actors := store.NewBridgedActors(database)
-	minter, custodian, _, _ := testMinter(t, actors) // skips without local PLC
+	minter, custodian, _, bridgeHostname := testMinter(t, actors) // skips without local PLC
 	ctx := t.Context()
 
 	// Mint.
@@ -35,6 +35,7 @@ func TestMintedIdentityEndToEnd(t *testing.T) {
 		Instance:          "lemmy.world",
 	})
 	require.NoError(t, err)
+	assert.Equal(t, "c-technology.lemmy.world.ap."+bridgeHostname, identity.Handle)
 
 	// Persist the bridged actor the way tasks 05/06 will.
 	_, err = actors.UpsertActor(ctx, store.BridgedActor{

@@ -1,0 +1,55 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.notification.listNotifications",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "List the authenticated account's notifications (replies, mentions and upvote groups), newest first. A deleted or removed reference keeps its row as a placeholder with a status and no content.",
+      "parameters": {
+        "type": "params",
+        "properties": {
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 50
+          },
+          "cursor": {
+            "type": "string",
+            "maxLength": 500
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["notifications"],
+          "properties": {
+            "notifications": {
+              "type": "array",
+              "items": {
+                "type": "ref",
+                "ref": "social.coves.notification.defs#notificationView"
+              }
+            },
+            "cursor": {
+              "type": "string",
+              "maxLength": 500
+            },
+            "seenAt": {
+              "type": "string",
+              "format": "datetime"
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "InvalidCursor",
+          "description": "The pagination cursor is invalid."
+        }
+      ]
+    }
+  }
+}

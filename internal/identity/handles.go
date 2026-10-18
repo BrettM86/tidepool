@@ -67,7 +67,7 @@ func (r *StoreResolver) ResolveHandle(ctx context.Context, handle string) (strin
 	if r.serviceDID != "" && handle == r.bridgeHostname {
 		return r.serviceDID, nil
 	}
-	actor, err := r.actors.GetByHandle(ctx, handle)
+	actor, err := r.actors.GetByHandleOrPending(ctx, handle)
 	if err != nil {
 		return "", err
 	}

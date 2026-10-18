@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"time"
 
 	"tidepool/internal/ap"
@@ -138,85 +139,125 @@ func (a *Admin) refreshCommunityProfile(ctx context.Context, groupIRI string) (*
 	return community, nil
 }
 
-// startRefreshProfileWalk lists every bridged community up front (so the
-// response can carry the count) and refreshes them in the background. The
-// list comes from the request context; the walk itself runs under the
-// Admin's base context, not the request's — an operator closing curl must
-// not abort a walk that was accepted, but process shutdown must (see
-// Wait). Detaching from the request also matters for a subtler reason: chi
-// returns the request's route context to a pool when the handler returns,
-// so nothing that outlives the handler may hold r.Context().
+// communityProfileWalk is the all-communities walk's log vocabulary; its
+// plural also keys the 202 response's count.
+var communityProfileWalk = profileWalk{
+	logName: "refresh-profile walk",
+	item:    "community",
+	items:   "communities",
+}
+
+// startRefreshProfileWalk lists every bridged community and hands them to
+// startProfileWalk, gated by walkMu.
 func (a *Admin) startRefreshProfileWalk(ctx context.Context, w http.ResponseWriter) {
-	if !a.walkMu.TryLock() {
-		http.Error(w, "a refresh-profile walk is already running", http.StatusConflict)
-		return
-	}
-	// Every follow state, accepted first: a community we unfollowed still
-	// has a repo the appview serves, and its profile deserves the new
-	// fields as much as an active one. Dead instances surface as per-row
-	// failures in the log, not as a reason to skip the state. The three
-	// queries are not one snapshot — a community whose follow state flips
-	// between them can be listed twice — so dedupe by Group id.
-	var communities []*store.Community
+	a.startProfileWalk(ctx, w, &a.walkMu, communityProfileWalk, a.listWalkCommunities,
+		func(ctx context.Context, groupIRI string) error {
+			if _, err := a.refreshCommunityProfile(ctx, groupIRI); err != nil {
+				return err
+			}
+			return nil
+		})
+}
+
+// listWalkCommunities returns the Group id of every bridged community, in
+// every follow state, accepted first: a community we unfollowed still has a
+// repo the appview serves, and its profile deserves the new fields as much
+// as an active one. Dead instances surface as per-row failures in the log,
+// not as a reason to skip the state. The three queries are not one snapshot
+// — a community whose follow state flips between them can be listed twice —
+// so dedupe by Group id.
+func (a *Admin) listWalkCommunities(ctx context.Context) ([]string, error) {
+	var groupIRIs []string
 	seen := map[string]bool{}
 	for _, state := range []store.FollowState{store.FollowStateAccepted, store.FollowStatePending, store.FollowStateNone} {
 		rows, err := a.communities.ListByFollowState(ctx, state)
 		if err != nil {
-			a.walkMu.Unlock()
 			a.logger.Error("refresh-profile: list communities", "state", state, "error", err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
-			return
+			return nil, err
 		}
 		for _, c := range rows {
 			if !seen[c.APGroupID] {
 				seen[c.APGroupID] = true
-				communities = append(communities, c)
+				groupIRIs = append(groupIRIs, c.APGroupID)
 			}
 		}
 	}
+	return groupIRIs, nil
+}
 
+// profileWalk names one kind of background refresh-profile walk for its
+// log lines and its 202 response.
+type profileWalk struct {
+	logName string // log message prefix, "refresh-profile walk"
+	item    string // log key for one entry, "community"
+	items   string // log and response key for the count, "communities"
+}
+
+// startProfileWalk lists the walk's ids up front (so the response can carry
+// the count) and refreshes them in the background, one walk per gate at a
+// time (409 while one runs). The list comes from the request context; the
+// walk itself runs under the Admin's base context, not the request's — an
+// operator closing curl must not abort a walk that was accepted, but
+// process shutdown must (see Wait). Detaching from the request also matters
+// for a subtler reason: chi returns the request's route context to a pool
+// when the handler returns, so nothing that outlives the handler may hold
+// r.Context(). list logs its own failure; refresh logs each outcome.
+func (a *Admin) startProfileWalk(ctx context.Context, w http.ResponseWriter, gate *sync.Mutex, walk profileWalk,
+	list func(context.Context) ([]string, error), refresh func(context.Context, string) error) {
+	if !gate.TryLock() {
+		http.Error(w, "a "+walk.logName+" is already running", http.StatusConflict)
+		return
+	}
+	ids, err := list(ctx)
+	if err != nil {
+		gate.Unlock()
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	// Counted before the answer so a Wait issued after the 202 always
+	// covers this walk.
+	a.walks.Add(1)
 	// Answer before the first fetch so the 202 is never queued behind a
 	// slow instance.
-	writeJSON(w, http.StatusAccepted, map[string]any{"communities": len(communities)})
-	a.walks.Add(1)
+	writeJSON(w, http.StatusAccepted, map[string]any{walk.items: len(ids)})
 	go func() {
 		defer a.walks.Done()
-		defer a.walkMu.Unlock()
-		a.runRefreshProfileWalk(a.baseCtx, communities)
+		defer gate.Unlock()
+		a.runProfileWalk(a.baseCtx, walk, ids, refresh)
 	}()
 }
 
 // Wait blocks until every background refresh-profile walk has finished.
 // Shutdown cancels the base context first, so a walk stops at its next
-// community; Wait then lets it finish the in-flight refresh and log its
+// entry; Wait then lets it finish the in-flight refresh and log its
 // summary instead of being killed mid-commit.
 func (a *Admin) Wait() { a.walks.Wait() }
 
-// runRefreshProfileWalk refreshes each community in turn, pausing between
-// them, and logs a summary at the end. Consent refusals (422) are counted
-// as skipped — the community's decision, permanent, and expected to recur
-// on every walk — separately from failures (unreachable instance, store
-// error), so a fleet with a few opted-out communities does not report a
-// baseline failure count the operator learns to ignore. Each outcome is
-// logged per community by refreshCommunityProfile; the walk exists to
-// converge the fleet, and one unreachable instance must not leave the rest
-// stale. A panic in one refresh (the walk feeds attacker-controlled
-// documents from every instance the bridge ever touched into the
-// materializer, unattended) is logged and ends the walk without taking the
-// process down: chi's Recoverer covers handler goroutines, not this one.
-func (a *Admin) runRefreshProfileWalk(ctx context.Context, communities []*store.Community) {
-	a.logger.Info("refresh-profile walk started", "communities", len(communities))
+// runProfileWalk refreshes each id in turn, pausing between them, and logs a
+// summary at the end. Skips (materialize.IsSkip: opt-outs, upstream
+// tombstones or 404s, documents that cannot be bridged) are counted
+// separately from failures (unreachable instance, store error), so a fleet
+// with a few opted-out or gone actors does not report a baseline failure
+// count the operator learns to ignore. The walk exists to converge the
+// fleet, and one unreachable instance must not leave the rest stale. A panic in one
+// refresh (the walk feeds attacker-controlled documents from every instance
+// the bridge ever touched into the materializer, unattended) is logged and
+// ends the walk without taking the process down: chi's Recoverer covers
+// handler goroutines, not this one.
+func (a *Admin) runProfileWalk(ctx context.Context, walk profileWalk, ids []string, refresh func(context.Context, string) error) {
+	a.logger.Info(walk.logName+" started", walk.items, len(ids))
 	var done, failed, skipped int
 	defer func() {
 		if r := recover(); r != nil {
-			a.logger.Error("refresh-profile walk panicked",
-				"done", done, "total", len(communities), "panic", r, "stack", string(debug.Stack()))
+			a.logger.Error(walk.logName+" panicked",
+				"done", done, "total", len(ids), "panic", r, "stack", string(debug.Stack()))
 		}
-		a.logger.Info("refresh-profile walk finished",
-			"communities", len(communities), "done", done, "failed", failed, "skipped", skipped,
+		a.logger.Info(walk.logName+" finished",
+			walk.items, len(ids), "done", done, "failed", failed, "skipped", skipped,
 			"aborted", ctx.Err() != nil)
 	}()
-	for i, c := range communities {
+	for i, id := range ids {
 		if i > 0 {
 			select {
 			case <-ctx.Done():
@@ -228,19 +269,21 @@ func (a *Admin) runRefreshProfileWalk(ctx context.Context, communities []*store.
 			return
 		}
 		start := time.Now()
-		if _, err := a.refreshCommunityProfile(ctx, c.APGroupID); err != nil {
-			if err.status == http.StatusUnprocessableEntity {
+		if err := refresh(ctx, id); err != nil {
+			outcome := "failed"
+			if materialize.IsSkip(err) {
 				skipped++
+				outcome = "skipped"
 			} else {
 				failed++
 			}
-			a.logger.Warn("refresh-profile walk: community not refreshed",
-				"community", c.APGroupID, "status", err.status, "elapsed", time.Since(start))
+			a.logger.Warn(walk.logName+": "+walk.item+" not refreshed",
+				walk.item, id, "outcome", outcome, "elapsed", time.Since(start))
 		}
 		done = i + 1
 		if done%25 == 0 {
-			a.logger.Info("refresh-profile walk progress",
-				"done", done, "total", len(communities), "failed", failed, "skipped", skipped)
+			a.logger.Info(walk.logName+" progress",
+				"done", done, "total", len(ids), "failed", failed, "skipped", skipped)
 		}
 	}
 }

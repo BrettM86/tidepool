@@ -105,6 +105,27 @@ func TestRefreshProfileWalk(t *testing.T) {
 	assert.Equal(t, store.FollowStateAccepted, community.FollowState, "a refresh must not touch follow state")
 }
 
+// TestRefreshProfileWalkCountsSkips: a community whose instance now
+// advertises #nobridge is a skip in the walk's summary, not a failure. The
+// community walk's refresh returns an *adminError, so the skip is only
+// visible through its Unwrap.
+func TestRefreshProfileWalkCountsSkips(t *testing.T) {
+	h := newHarness(t)
+	h.subscribeTechnology()
+
+	doc := loadFixture(t, "group_lemmy_world.json")
+	doc["summary"] = "<p>no bridges here #nobridge</p>"
+	h.serveObject("/c/technology", doc)
+
+	rec := h.adminRequest(http.MethodPost, "/admin/communities/refresh-profile",
+		map[string]any{"all": true})
+	require.Equal(t, http.StatusAccepted, rec.Code, rec.Body.String())
+	h.admin.Wait()
+
+	assert.Contains(t, walkSummary(t, h.logs, "refresh-profile walk"),
+		"communities=1 done=1 failed=0 skipped=1 aborted=false")
+}
+
 // TestRefreshProfileWalkConflict: only one walk at a time — a second
 // all=true while one runs is a 409, and the gate is the Admin's own, so the
 // synchronous single-community path is never blocked by it.

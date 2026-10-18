@@ -320,7 +320,10 @@ Two classes, and the difference matters at boot:
 | `DATABASE_URL` | local dev postgres | bridge state |
 | `LISTEN_ADDR` | `:8091` | HTTP bind address |
 | `BRIDGE_HOSTNAME` | `localhost` | public domain of the bridge; anchors handles and the PDS endpoint in minted DID docs |
-| `DNS_LISTEN` | *(empty; disabled)* | UDP and TCP listen address (e.g. `:53`); empty disables DNS; answers handle TXT, SOA/NS at each label apex, and A/AAAA at label apexes and handle names; zone transfers are refused |
+| `HANDLE_ZONE_ROOT` | `ap.<BRIDGE_HOSTNAME>` | DNS zone for new-format bridged handles; must be a valid hostname strictly under `BRIDGE_HOSTNAME` |
+| `HANDLE_MIGRATION_RATE` | `2` | positive number of PLC handle updates per second submitted by the admin handle migration job; each POST, retries included, is sent at least 1/rate after the previous one |
+| `DNS_LISTEN` | *(empty; disabled)* | UDP and TCP listen address (e.g. `:53`); empty disables DNS; serves the `ap` handle zone alongside per-instance subzones (TXT, SOA/NS and A/AAAA); UDP responses are rate limited; zone transfers are refused |
+| `DNS_UDP_RESPONSE_RATE` | `20` | UDP responses per second per client IPv4 /24 or IPv6 /56 prefix; over the limit every second suppressed response is an empty truncated reply, the rest are dropped; TCP is unlimited |
 | `DNS_PUBLIC_IPV4` | *(unset)* | IPv4 address returned in A answers; required when `DNS_LISTEN` is set |
 | `DNS_PUBLIC_IPV6` | *(unset)* | optional IPv6 address returned in AAAA answers when DNS is enabled |
 | `DNS_NAMESERVERS` | `ns1`/`ns2` under `BRIDGE_HOSTNAME` when DNS is enabled | comma-separated nameserver hostnames returned in apex NS answers (first is the SOA primary) |
@@ -385,11 +388,14 @@ through Caddy.
 | `GET /admin/communities` | list subscriptions and their state | — |
 | `POST /admin/communities/backfill` | on-demand outbox backfill | backfill unconfigured (**501**) |
 | `POST /admin/communities/refresh-profile` | force a `community.profile` re-materialization past the profile TTL (backfills new record fields into dormant communities). `{"community":…}` is synchronous; `{"all":true}` answers **202** and walks every bridged community in the background, one at a time with a pause, **409** while a walk is running; progress and the final `done`/`failed`/`skipped` summary go to the log, and shutdown stops the walk at its next community | — |
+| `POST /admin/users/refresh-profile` | force an `actor.profile` re-materialization past the profile TTL for every bridged person (backfills new record fields such as `origin`, `originUsername`, `originUrl`). Body must be exactly `{"all":true}` (anything else, including unknown keys or a trailing value, is **400**); answers **202** with `{"users":N}` and walks every non-tombstoned bridged person in the background, one at a time with a pause, **409** while a user walk is running (independent of the community walk). Consent is re-checked for every user: one still carrying `#nobridge` stays without a profile (counted as skipped), one who removed it is re-bridged, one who added it since is scrubbed. Tombstoned users are never fetched. Progress and the `done`/`failed`/`skipped` summary go to the log, and shutdown stops the walk at its next user | — |
 | `POST /admin/communities/reconcile` | force one follow-list sweep | **501** — `FOLLOW_LIST_PATH` is unset. The reconciler is only built when the path is set, so this is "no follow list configured", not a broken endpoint |
 | `POST /admin/dns/reconcile` | run one delegation pass now and return its result. The call waits behind a running pass, then answers **200** with the result, or **500** with `{error, result}` when the pass fails (including a stop at `DELEGATION_MAX_NS_RECORDS`, a normal operating state). The route extends its own write deadline to 10 minutes, past the server's 30s write timeout, so a long pass still returns its result. The full result is also logged as `delegation pass finished`, including the created and pending label lists | **501** — `CLOUDFLARE_API_TOKEN` is unset |
 | `POST /admin/reemit` | re-emit a repo's records as delete+create pairs (relay cold-start gap) | repo manager unconfigured (**501**) |
 | `POST /admin/objects/sweep-deleted` | origin-verified cleanup of missed deletes | sweeper unconfigured (**501**) |
 | `GET /admin/divergence` | run one reconciliation sweep synchronously and return the report | always wired in a normal deployment |
+| `POST /admin/handles/migrate` | start a paced background forward rename by default, or rollback with `{"rollback":true}`; optional `"dids":["did:plc:…"]` limits either run, while omitted `dids` selects every remaining candidate for that mode. **202** when accepted; **409** while either mode is active. Pending reservations survive failed PLC updates, and an interrupted run resumes in its original mode at the next boot | — |
+| `GET /admin/handles/migrate` | progress JSON: running, mode (`forward`, `rollback`, or null when idle), started_at, did_limited, remaining, rollback_remaining (outstanding rollback candidates), pending, migrated, and per-code errors | — |
 | `GET /admin/outbound` | delivery queue depth by state (`pending`/`poisoned`/`cancelled`/…) | — the store is always wired, so this answers even with the consumer off and workers at 0. An empty queue then is the truth, not a misconfiguration |
 | `POST /admin/outbound/redrive` | reset poisoned deliveries to pending | — |
 | `POST /admin/outbound/cancel` | **terminally** cancel an actor's or a community's pending deliveries (consent withdrawal, community removal). Not a pause: `cancelled` is terminal and `redrive` revives only `poisoned` rows, so this is not the reversible sibling of a kill-switch **park** | — |
@@ -428,6 +434,9 @@ curl -X POST localhost:8091/admin/communities/backfill \
 curl -X POST localhost:8091/admin/communities/refresh-profile \
   -H "Authorization: Bearer dev-admin-token" \
   -d '{"all":true}'                                   # re-materialize every profile (202; 409 if running)
+curl -X POST localhost:8091/admin/users/refresh-profile \
+  -H "Authorization: Bearer dev-admin-token" \
+  -d '{"all":true}'                                   # re-materialize every user profile (202; 409 if running)
 curl -X DELETE localhost:8091/admin/communities \
   -H "Authorization: Bearer dev-admin-token" \
   -d '{"community":"!technology@lemmy.world"}'        # Undo{Follow}
@@ -552,7 +561,10 @@ it as a `subscribeRepos` upstream:
   from the durable event log, then tails live; slow consumers are evicted
   and resume by reconnecting with their last cursor; a cursor older than
   retention gets an `#info OutdatedCursor` frame first). The stream carries
-  `#commit` frames and — on `Delete(Actor)`/consent revocation —
+  `#commit` frames, `#identity` frames when a bridged actor is minted
+  (ordered before its first `#commit`), renamed forward, or rolled back
+  (including a mid-forward PLC update reverted to the old handle), and — on
+  `Delete(Actor)`/consent revocation —
   **`#account {active:false, status:"deleted"}`** frames, appended to the
   same durable log after the scrub delete-commits so relays purge the repo
   instead of inferring its death (bigsky tombstones the account and drops
@@ -737,13 +749,26 @@ survive a rerun — fine for a smoke check, which is all this is.)
 
 ## Handle resolution & DNS (wildcard requirement)
 
-Every bridged actor's atproto handle is a subdomain of `BRIDGE_HOSTNAME`:
-communities get `technology.lemmy-world.<BRIDGE_HOSTNAME>`, users get
-`alice.lemmy-world.<BRIDGE_HOSTNAME>` (dots replace the fediverse `!`/`@`
-separators; dots inside the instance hostname become dashes; colliding
-handles get a `-2`, `-3`, … suffix).
+New bridged atproto handles use `<user label>.<instance host>.<HANDLE_ZONE_ROOT>`
+(for example, `alice.lemmy.world.ap.tdpl.io`). The host is lowercased with
+dots kept and ports dropped. The user label normalizes ASCII names; names
+without ASCII letters or digits use IDNA punycode when valid, otherwise a
+stable hash. Communities (groups) get a `c-` label prefix
+(`c-technology.lemmy.world.ap.tdpl.io`); a user whose label would start with
+`c-` gets `u-` in front (`u-c-technology.lemmy.world.ap.tdpl.io`). The prefix
+counts toward the 63-character label limit. Same-host collisions get `-2`,
+`-3`, … suffixes at the end of the label (`c-technology-2`). Collisions come from
+usernames that normalize alike, and from a `u-` prefixed label meeting a user
+whose own label already reads `u-c-...` (`u_c_tech` and `c_tech` both want
+`u-c-tech`; the later one gets `u-c-tech-2`). A user labelled `c` whose handle
+collides gets `u-c-2`. A punycode label that collides or does not fit
+switches to the hash, since a suffix or truncation breaks its decoding.
+Actors minted earlier keep their `alice.lemmy-world.<BRIDGE_HOSTNAME>`
+handles (instance dots became dashes) until they are renamed.
+[`HANDLE_SCHEME.md`](HANDLE_SCHEME.md) covers the scheme, the rename job, the
+profile origin fields and the rollout order.
 
-For those handles to resolve, the operator **must configure wildcard DNS**:
+For those older handles to resolve, the operator **must configure wildcard DNS**:
 `*.<BRIDGE_HOSTNAME>` → the bridge (a DNS wildcard matches multiple label
 levels, so one record covers `*.lemmy-world.<BRIDGE_HOSTNAME>` and every
 other bridged instance). The bridge then answers both resolution paths:

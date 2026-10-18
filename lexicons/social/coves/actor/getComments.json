@@ -13,8 +13,8 @@
         "properties": {
           "actor": {
             "type": "string",
-            "format": "at-identifier",
-            "description": "DID or handle of the user"
+            "maxLength": 2048,
+            "description": "DID or handle of the user, or a bridged user's fediverse address as name@host or @name@host (e.g. alice@lemmy.world)"
           },
           "community": {
             "type": "string",

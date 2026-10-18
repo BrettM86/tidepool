@@ -2,6 +2,7 @@ package materialize
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"net"
 	"net/url"
@@ -9,11 +10,13 @@ import (
 	"time"
 
 	"github.com/bluesky-social/indigo/atproto/atdata"
+	"github.com/bluesky-social/indigo/atproto/syntax"
 	"github.com/ipfs/go-cid"
 
 	"tidepool/internal/ap"
 	"tidepool/internal/errors"
 	"tidepool/internal/identity"
+	"tidepool/internal/repo"
 	"tidepool/internal/store"
 )
 
@@ -98,7 +101,7 @@ func (m *Materializer) ensureKnownActor(ctx context.Context, stored *store.Bridg
 		if hasNobridgeMarker(doc) {
 			// Stamps without a profile commit; ensureKnownActor still checks
 			// this non-OK row for a stranded id.
-			if err := m.actors.MarkProfileSynced(ctx, stored.APActorID, m.now()); err != nil {
+			if err := m.actors.MarkProfileSynced(ctx, stored.APActorID, m.now(), storablePreferredUsername(doc)); err != nil {
 				return nil, fmt.Errorf("materialize: mark nobridge re-check for %s: %w", stored.APActorID, err)
 			}
 			return nil, skip(stored.APActorID, "actor opted out (#nobridge/#nobot)")
@@ -162,6 +165,12 @@ func (m *Materializer) bridgeNewActor(ctx context.Context, actorRef *ap.Object, 
 	}
 	if doc.PreferredUsername == "" {
 		return nil, skip(doc.ID, "actor has no preferredUsername (cannot derive a handle)")
+	}
+	if strings.ContainsRune(doc.PreferredUsername, 0) {
+		// Refused before minting: the name is stored exactly as received and
+		// Postgres TEXT cannot hold NUL, so the upsert would fail after the PLC
+		// operation and every retry would orphan another DID.
+		return nil, skip(doc.ID, "actor preferredUsername contains a NUL byte")
 	}
 	instance := doc.Host()
 	if instance == "" {
@@ -241,9 +250,9 @@ func (m *Materializer) bridgeNewActor(ctx context.Context, actorRef *ap.Object, 
 // the two races minting can lose:
 //   - another process bridged the same AP actor concurrently → reuse the
 //     winner's row (our freshly minted DID is orphaned; logged loudly);
-//   - another actor grabbed the same handle between the availability check
+//   - another actor claimed the same handle between the availability check
 //     and the insert → retry the mint once (the suffixer now sees the
-//     winner). Never re-mints in a loop beyond that.
+//     claim). Never re-mints in a loop beyond that.
 //
 // The bool is true only when the returned row carries the DID this call
 // minted, i.e. this call inserted it; a reused winner is false.
@@ -257,13 +266,17 @@ func (m *Materializer) mintAndUpsert(ctx context.Context, doc *ap.Object, actorT
 		if err != nil {
 			return nil, false, fmt.Errorf("materialize: mint identity for %s: %w", doc.ID, err)
 		}
-		stored, err := m.actors.UpsertActor(ctx, store.BridgedActor{
+		stored, err := m.actors.UpsertActorOnInsert(ctx, store.BridgedActor{
 			APActorID:           doc.ID,
 			ActorType:           actorType,
 			DID:                 minted.DID,
 			Handle:              minted.Handle,
+			PreferredUsername:   doc.PreferredUsername,
 			SigningKeyEncrypted: minted.SigningKeyEncrypted,
 			ConsentState:        store.ConsentStateOK,
+		}, func(ctx context.Context, tx *sql.Tx, stored *store.BridgedActor) error {
+			_, err := repo.AppendIdentityEventTx(ctx, tx, stored.DID, stored.Handle)
+			return err
 		})
 		if err == nil {
 			return stored, stored.DID == minted.DID, nil
@@ -277,8 +290,8 @@ func (m *Materializer) mintAndUpsert(ctx context.Context, doc *ap.Object, actorT
 				"ap_actor_id", doc.ID, "orphaned_did", minted.DID, "winning_did", winner.DID)
 			return winner, false, nil
 		}
-		// Otherwise the collision is on the handle (a different actor won
-		// it). Retry once so the suffixer can pick a free handle; the first
+		// Otherwise the collision is on the handle (including a raw claim).
+		// Retry once so the suffixer can pick a free handle; the first
 		// mint's DID is orphaned (DID reuse via updateHandle is deferred).
 		if attempt == 0 {
 			m.logger.Error("handle collision while registering bridged actor; re-minting once (previous DID is orphaned on the PLC directory)",
@@ -315,15 +328,34 @@ func (m *Materializer) rematerializeProfile(ctx context.Context, stored *store.B
 	default:
 		record = m.buildActorProfile(doc, stored.CreatedAt, avatar, banner)
 	}
+	// originSoftware is the origin host's self-reported nodeinfo software,
+	// display only; omitted when none is known. Discovery never fails the
+	// profile write.
+	if scheme, host := originSchemeAndHost(doc); host != "" && (scheme == "http" || scheme == "https") {
+		if software := m.software.Software(ctx, scheme, host); software != "" {
+			record["originSoftware"] = software
+		}
+	}
 	if _, err := m.commitRecord(ctx, stored.DID, collection, ProfileRKey, record, doc, stored.DID, ""); err != nil {
 		return nil, err
 	}
 	// Stamped only after the commit: ensureKnownActor skips the stranded-row
 	// check for a synced OK row on that basis.
-	if err := m.actors.MarkProfileSynced(ctx, stored.APActorID, m.now()); err != nil {
+	if err := m.actors.MarkProfileSynced(ctx, stored.APActorID, m.now(), storablePreferredUsername(doc)); err != nil {
 		return nil, fmt.Errorf("materialize: mark profile synced for %s: %w", stored.APActorID, err)
 	}
 	return stored, nil
+}
+
+// storablePreferredUsername is the name MarkProfileSynced records: the
+// document's value exactly as received, or "" (keep the stored value) when it
+// contains a NUL byte, which Postgres TEXT cannot hold. The sync is still
+// stamped so the actor is not refetched on every touch.
+func storablePreferredUsername(doc *ap.Object) string {
+	if strings.ContainsRune(doc.PreferredUsername, 0) {
+		return ""
+	}
+	return doc.PreferredUsername
 }
 
 // actorRowRemovalTimeout bounds the detached delete of a bridged_actors row
@@ -333,10 +365,16 @@ const actorRowRemovalTimeout = 10 * time.Second
 // removeActorRow deletes apActorID's row while it still carries did, on a
 // context detached from processing cancellation: the refusal that calls it
 // has already happened, and a cancelled delivery must not leave the row.
+// The delete commits with a deleted #account for did, so the #identity the
+// mint published is not left as a live DID->handle binding once the row and
+// its handle claim are gone.
 func (m *Materializer) removeActorRow(ctx context.Context, apActorID, did string) error {
 	removeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), actorRowRemovalTimeout)
 	defer cancel()
-	return m.actors.DeleteActorRow(removeCtx, apActorID, did)
+	return m.actors.DeleteActorRow(removeCtx, apActorID, did, func(ctx context.Context, tx *sql.Tx) error {
+		_, err := repo.AppendAccountEventTx(ctx, tx, did, false, repo.AccountStatusDeleted)
+		return err
+	})
 }
 
 // healStrandedActorRow removes row, a bridged_actors row keyed on an id that
@@ -612,6 +650,19 @@ func (m *Materializer) buildActorProfile(doc *ap.Object, fallbackCreatedAt time.
 	}
 	record["description"] = bioWithProvenance(markdownFromSummary(doc),
 		provenanceLine("@", doc.PreferredUsername, doc.Host()), 256, 2560)
+	// origin and originUsername form the user's home address
+	// (Alice_B@lemmy.world). The username is never truncated: a cut
+	// username names a different account, so an oversized one drops the
+	// whole pair rather than assert a wrong address.
+	if doc.PreferredUsername != "" && len(doc.PreferredUsername) <= maxOriginUsernameBytes {
+		if originInstance := originHost(doc); originInstance != "" {
+			record["origin"] = originInstance
+		}
+		record["originUsername"] = doc.PreferredUsername
+	}
+	if link := originURL(doc); link != "" {
+		record["originUrl"] = link
+	}
 	if avatar != nil {
 		record["avatar"] = *avatar
 	}
@@ -670,6 +721,9 @@ func (m *Materializer) buildCommunityProfile(doc *ap.Object, fallbackCreatedAt t
 	// suppression; store.OriginInstance is the field with this meaning.
 	if originInstance := originHost(doc); originInstance != "" {
 		record["origin"] = originInstance
+	}
+	if link := originURL(doc); link != "" {
+		record["originUrl"] = link
 	}
 	record["description"] = bioWithProvenance(markdownFromSummary(doc),
 		provenanceLine("!", doc.PreferredUsername, doc.Host()), 1000, 10000)
@@ -745,16 +799,63 @@ const maxOriginHostLen = 253
 // same reason: the appview refuses them, and an omitted field degrades to
 // today's behaviour while a refused record would not.
 func originHost(doc *ap.Object) string {
+	_, host := originSchemeAndHost(doc)
+	return host
+}
+
+// originSchemeAndHost is originHost plus the id's scheme from the same parse
+// (url.Parse lowercases it). Nodeinfo discovery uses the id's own scheme, so
+// a plain-http instance (the local e2e Lemmy) is reached as it serves.
+func originSchemeAndHost(doc *ap.Object) (scheme, host string) {
 	if doc.ID == "" {
-		return ""
+		return "", ""
 	}
 	u, err := url.Parse(doc.ID)
 	if err != nil || u.Port() != "" {
-		return ""
+		return "", ""
 	}
-	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+	host = strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
 	if host == "" || len(host) > maxOriginHostLen || net.ParseIP(host) != nil {
+		return "", ""
+	}
+	return u.Scheme, host
+}
+
+// maxOriginUsernameBytes is the lexicon's maxLength for
+// actor.profile.originUsername; atproto string maxLength counts UTF-8 bytes.
+const maxOriginUsernameBytes = 256
+
+// originURL derives the profile's originUrl: the actor's own `url` when it
+// is a single absolute https link on the actor id's host (the human-facing
+// profile page, e.g. https://example.social/@alice), otherwise the actor id.
+// A url on another host is self-asserted and could point anywhere, so it is
+// not trusted. Each candidate must also pass the lexicon's `uri` format
+// (syntax.ParseURI) and be http(s); a failing url falls back to the id, and
+// a failing id omits the field, like originHost. Returns "" when the id is
+// not an absolute URL either.
+func originURL(doc *ap.Object) string {
+	id, err := url.Parse(doc.ID)
+	if err != nil || id.Scheme == "" || id.Host == "" {
 		return ""
 	}
-	return host
+	if len(doc.URL) == 1 && doc.URL[0].Href != "" {
+		link, err := url.Parse(doc.URL[0].Href)
+		if err == nil && link.Scheme == "https" && strings.EqualFold(link.Host, id.Host) && isValidOriginURL(doc.URL[0].Href) {
+			return doc.URL[0].Href
+		}
+	}
+	if !isValidOriginURL(doc.ID) {
+		return ""
+	}
+	return doc.ID
+}
+
+// isValidOriginURL reports whether candidate is an http(s) link the
+// lexicon's `uri` format accepts (lowercase scheme, printable ASCII, at most
+// 8192 bytes).
+func isValidOriginURL(candidate string) bool {
+	if _, err := syntax.ParseURI(candidate); err != nil {
+		return false
+	}
+	return isSafeLinkScheme(candidate)
 }

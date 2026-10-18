@@ -1,0 +1,27 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.notification.getUnreadCount",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Get the number of unread notifications for the authenticated account, capped at 101 (101 means more than 100).",
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "count"
+          ],
+          "properties": {
+            "count": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 101,
+              "description": "Number of visible unread notifications, capped at 101 (101 means more than 100)."
+            }
+          }
+        }
+      }
+    }
+  }
+}

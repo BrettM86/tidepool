@@ -119,3 +119,14 @@ func serializeFrame(evt *events.XRPCStreamEvent) ([]byte, error) {
 	}
 	return buf.Bytes(), nil
 }
+
+// identityFrame converts a stored identity event into a #identity frame.
+func identityFrame(ev *repo.Event) *events.XRPCStreamEvent {
+	handle := ev.Handle
+	return &events.XRPCStreamEvent{
+		RepoIdentity: &comatproto.SyncSubscribeRepos_Identity{
+			Did: ev.DID, Seq: ev.Seq,
+			Time: ev.CreatedAt.UTC().Format(frameTimeFormat), Handle: &handle,
+		},
+	}
+}

@@ -23,5 +23,6 @@
   "hostedBy": "did:web:tidepool.test",
   "name": "technology",
   "origin": "lemmy.world",
+  "originUrl": "https://lemmy.world/c/technology",
   "visibility": "public"
 }

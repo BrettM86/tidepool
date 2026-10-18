@@ -31,6 +31,7 @@ import (
 	"tidepool/internal/delegation"
 	"tidepool/internal/dns"
 	"tidepool/internal/echo"
+	"tidepool/internal/handlemigration"
 	"tidepool/internal/identity"
 	"tidepool/internal/ingest"
 	"tidepool/internal/materialize"
@@ -388,6 +389,7 @@ func run(logger *slog.Logger) error {
 	minter, err := identity.NewMinter(identity.MinterOptions{
 		PLCDirectoryURL: cfg.PLCDirectoryURL,
 		BridgeHostname:  cfg.BridgeHostname,
+		HandleZoneRoot:  cfg.HandleZoneRoot,
 		BridgeScheme:    cfg.BridgeScheme,
 		RotationKey:     rotationKey,
 		Custodian:       custodian,
@@ -456,6 +458,11 @@ func run(logger *slog.Logger) error {
 		MaxBlobBytes:      cfg.MaxBlobBytes,
 		StrictValidation:  cfg.IsDevelopment(),
 		Logger:            logger,
+		// Nodeinfo discovery for profiles' originSoftware goes through the
+		// SSRF-guarded client like every other fetch of a remote instance.
+		Instances:      store.NewInstances(database),
+		NodeInfoClient: ap.NewGuardedHTTPClient(cfg.AllowPrivateAddresses, 30*time.Second),
+		UserAgent:      cfg.UserAgent,
 	})
 	if err != nil {
 		return err
@@ -578,14 +585,15 @@ func run(logger *slog.Logger) error {
 		Client:       apClient,
 		Materializer: materializer,
 		Communities:  communities,
+		Actors:       actors,
 		Service:      serviceActor,
 		Backfill:     backfill,
 		Repos:        repoManager,
 		Sweeper:      handler,
 		Deliveries:   store.NewOutboundDeliveries(database),
-		// The refresh-profile walk derives from the run context so it stops
-		// at its next community once shutdown starts; the drain below waits
-		// for it, like the backfill drain.
+		// The refresh-profile walks derive from the run context so they
+		// stop at their next community or user once shutdown starts; the
+		// drain below waits for them, like the backfill drain.
 		BaseContext: ctx,
 		Logger:      logger,
 	})
@@ -596,6 +604,24 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("delegation: %w", err)
 	}
 	admin.Routes(router)
+	renameRunner, err := handlemigration.NewRunner(handlemigration.Options{
+		Actors: actors, Identity: minter, ActorFetcher: apClient, BridgeHostname: cfg.BridgeHostname,
+		HandleZoneRoot: cfg.HandleZoneRoot, Logger: logger, ActorsPerSecond: cfg.HandleMigrationRate,
+	})
+	if err != nil {
+		return err
+	}
+	renameAdmin, err := handlemigration.NewAdmin(handlemigration.AdminOptions{
+		Token: cfg.AdminToken, Runner: renameRunner, BaseContext: ctx, Logger: logger,
+		Runs: store.NewHandleMigrationRuns(database),
+	})
+	if err != nil {
+		return err
+	}
+	if err := renameAdmin.ResumeActiveRun(ctx); err != nil {
+		return fmt.Errorf("resume handle migration: %w", err)
+	}
+	renameAdmin.Routes(router)
 
 	// Declarative follow list (FOLLOW_LIST_PATH): converge subscriptions to
 	// the repo-committed YAML on startup and every FOLLOW_LIST_INTERVAL. A
@@ -774,11 +800,11 @@ func run(logger *slog.Logger) error {
 			// last_backfill_at unset, which is resumable). Wait bounded so a stuck
 			// run can't hold shutdown open past the deadline.
 			drained := make(chan struct{})
-			go func() { backfill.Wait(); admin.Wait(); close(drained) }()
+			go func() { backfill.Wait(); admin.Wait(); renameAdmin.Wait(); close(drained) }()
 			select {
 			case <-drained:
 			case <-shutdownCtx.Done():
-				logger.Warn("backfill/refresh-profile drain timed out; abandoning in-flight run (re-triggerable on restart)")
+				logger.Warn("backfill/refresh-profile/handle-rename drain timed out; abandoning in-flight run (re-triggerable on restart)")
 			}
 			// Wait for the consumer's read loop to exit. Its shutdown path flushes
 			// the cursor on a fresh context, so cutting the process short here
@@ -1030,13 +1056,15 @@ func startDNSServer(ctx context.Context, cfg *config.Config, resolver identity.R
 		return nil, nil
 	}
 	handler, err := dns.NewHandler(dns.Options{
-		ZoneRoot:    cfg.BridgeHostname,
-		Nameservers: cfg.DNSNameservers,
-		PublicIPv4:  cfg.DNSPublicIPv4,
-		PublicIPv6:  cfg.DNSPublicIPv6,
-		Serial:      uint32(time.Now().Unix()),
-		Resolver:    resolver,
-		Logger:      logger,
+		ZoneRoot:        cfg.BridgeHostname,
+		HandleZoneRoot:  cfg.HandleZoneRoot,
+		Nameservers:     cfg.DNSNameservers,
+		PublicIPv4:      cfg.DNSPublicIPv4,
+		PublicIPv6:      cfg.DNSPublicIPv6,
+		Serial:          uint32(time.Now().Unix()),
+		Resolver:        resolver,
+		Logger:          logger,
+		UDPResponseRate: cfg.DNSUDPResponseRate,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("dns server %s: %w", cfg.DNSListen, err)
@@ -1045,7 +1073,7 @@ func startDNSServer(ctx context.Context, cfg *config.Config, resolver identity.R
 	if err != nil {
 		return nil, fmt.Errorf("dns server %s: %w", cfg.DNSListen, err)
 	}
-	logger.Info("dns server listening", "addr", cfg.DNSListen, "zone_root", cfg.BridgeHostname)
+	logger.Info("dns server listening", "addr", cfg.DNSListen, "zone_root", cfg.BridgeHostname, "handle_zone_root", cfg.HandleZoneRoot)
 	return serveErrors, nil
 }
 

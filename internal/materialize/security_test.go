@@ -2,6 +2,7 @@ package materialize
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"tidepool/internal/ap"
 	"tidepool/internal/errors"
 	"tidepool/internal/identity"
+	"tidepool/internal/repo"
 	"tidepool/internal/store"
 )
 
@@ -482,6 +484,24 @@ func (s hiddenMappingObjects) GetByAPID(ctx context.Context, apID string) (*stor
 	return s.APObjects.GetByAPID(ctx, apID)
 }
 
+// assertDIDEndsDeleted asserts the firehose's last event for did is a
+// deleted #account: a removed actor row must not leave a live DID->handle
+// binding (a #identity) as the DID's final word on the firehose.
+func assertDIDEndsDeleted(t *testing.T, h *harness, did string) {
+	t.Helper()
+	var last *repo.Event
+	for _, event := range h.firehoseEvents() {
+		if event.DID == did {
+			last = event
+		}
+	}
+	require.NotNil(t, last, "the removed row's DID %s must have a firehose event", did)
+	assert.Equal(t, repo.EventKindAccount, last.Kind,
+		"the removed row's DID must end on an #account event, got %s", last.Kind)
+	assert.False(t, last.AccountActive)
+	assert.Equal(t, repo.AccountStatusDeleted, last.AccountStatus)
+}
+
 // TestFirstBridgeRacingContentMappingKeepsNoActorRow: the pre-mint mapping
 // check cannot see a content mapping another worker commits right after it.
 // An alias IRI whose origin serves a Person document claiming that content id
@@ -519,6 +539,7 @@ func TestFirstBridgeRacingContentMappingKeepsNoActorRow(t *testing.T) {
 	_, err = h.actors.GetByAPActorID(ctx, aliasID)
 	assert.True(t, errors.IsNotFound(err),
 		"no bridged_actors row may be keyed on the alias, got %v", err)
+	assertDIDEndsDeleted(t, h, testDIDFor("alias", "lemmy.world"))
 
 	after, err := h.objects.GetByAPID(ctx, pageID)
 	require.NoError(t, err)
@@ -585,6 +606,7 @@ func TestFirstBridgeRacingDeletedContentMappingKeepsNoActorRow(t *testing.T) {
 	_, err = h.actors.GetByAPActorID(ctx, aliasID)
 	assert.True(t, errors.IsNotFound(err),
 		"no bridged_actors row may be keyed on the alias, got %v", err)
+	assertDIDEndsDeleted(t, h, testDIDFor("alias", "lemmy.world"))
 
 	after, err := h.objects.GetByAPID(ctx, pageID)
 	require.NoError(t, err)
@@ -598,7 +620,8 @@ func TestFirstBridgeRacingDeletedContentMappingKeepsNoActorRow(t *testing.T) {
 
 // strandActorRowOnPost materializes the lemmy.world fixture post, then inserts
 // a bridged_actors row keyed on the post's id with an identity minted for
-// "alias" and no synced profile: the row a failed compensation strands. The
+// "alias" and no synced profile: the row a failed compensation strands. Like a
+// mint, the insert publishes the row's #identity in its transaction. The
 // caller serves the fixtures. It returns the post's mapping.
 func strandActorRowOnPost(t *testing.T, h *harness) *store.APObjectMapping {
 	t.Helper()
@@ -616,13 +639,16 @@ func strandActorRowOnPost(t *testing.T, h *harness) *store.APObjectMapping {
 		Instance:          "lemmy.world",
 	})
 	require.NoError(t, err)
-	stranded, err := h.actors.UpsertActor(ctx, store.BridgedActor{
+	stranded, err := h.actors.UpsertActorOnInsert(ctx, store.BridgedActor{
 		APActorID:           pageID,
 		ActorType:           store.ActorTypePerson,
 		DID:                 minted.DID,
 		Handle:              minted.Handle,
 		SigningKeyEncrypted: minted.SigningKeyEncrypted,
 		ConsentState:        store.ConsentStateOK,
+	}, func(ctx context.Context, tx *sql.Tx, stored *store.BridgedActor) error {
+		_, err := repo.AppendIdentityEventTx(ctx, tx, stored.DID, stored.Handle)
+		return err
 	})
 	require.NoError(t, err)
 	require.Equal(t, testDIDFor("alias", "lemmy.world"), stranded.DID)
@@ -694,6 +720,7 @@ func TestStrandedActorRowOnContentIDHeals(t *testing.T) {
 			_, _, err = h.manager.GetRecord(ctx, testDIDFor("alias", "lemmy.world"), "social.coves.actor.profile", "self")
 			assert.True(t, errors.IsNotFound(err),
 				"no profile record may be written under the stranded identity, got %v", err)
+			assertDIDEndsDeleted(t, h, testDIDFor("alias", "lemmy.world"))
 
 			assertPostMappingUnchanged(t, h, before)
 		})
@@ -731,7 +758,7 @@ func TestStrandedActorRowOnContentIDHealsInAnyConsentState(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, testCase.consent, stranded.ConsentState)
 			if testCase.stamped {
-				require.NoError(t, h.actors.MarkProfileSynced(ctx, pageID, time.Now()))
+				require.NoError(t, h.actors.MarkProfileSynced(ctx, pageID, time.Now(), ""))
 				stranded, err = h.actors.GetByAPActorID(ctx, pageID)
 				require.NoError(t, err)
 				require.NotNil(t, stranded.ProfileSyncedAt)

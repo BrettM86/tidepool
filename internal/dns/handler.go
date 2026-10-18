@@ -52,26 +52,33 @@ const (
 
 // Options configures an authoritative DNS handler for bridged handles.
 type Options struct {
-	ZoneRoot    string
-	Nameservers []string
-	PublicIPv4  netip.Addr
-	PublicIPv6  netip.Addr
-	Serial      uint32
-	Resolver    identity.Resolver
-	Logger      *slog.Logger
+	ZoneRoot       string
+	HandleZoneRoot string
+	Nameservers    []string
+	PublicIPv4     netip.Addr
+	PublicIPv6     netip.Addr
+	Serial         uint32
+	Resolver       identity.Resolver
+	Logger         *slog.Logger
+	// UDPResponseRate is the number of UDP responses per second per client prefix.
+	UDPResponseRate int
+	// Now is the limiter's clock; nil means time.Now.
+	Now func() time.Time
 }
 
 // Handler answers DNS queries in the configured handle subzones.
 type Handler struct {
-	zoneRoot    string
-	nameservers []string
-	publicIPv4  netip.Addr
-	publicIPv6  netip.Addr
-	serial      uint32
-	resolver    identity.Resolver
-	logger      *slog.Logger
+	zoneRoot       string
+	handleZoneRoot string
+	nameservers    []string
+	publicIPv4     netip.Addr
+	publicIPv6     netip.Addr
+	serial         uint32
+	resolver       identity.Resolver
+	logger         *slog.Logger
 	// lookupSlots holds one token per in-flight handle lookup.
-	lookupSlots chan struct{}
+	lookupSlots  chan struct{}
+	udpRateLimit udpRateLimiter
 }
 
 // NewHandler validates options and constructs a handle DNS handler.
@@ -82,6 +89,13 @@ func NewHandler(options Options) (*Handler, error) {
 	zoneRoot, err := normalizeDomainName(options.ZoneRoot)
 	if err != nil {
 		return nil, fmt.Errorf("zone root: %w", err)
+	}
+	var handleZoneRoot string
+	if strings.TrimSpace(options.HandleZoneRoot) != "" {
+		handleZoneRoot, err = normalizeDomainName(options.HandleZoneRoot)
+		if err != nil {
+			return nil, fmt.Errorf("handle zone root: %w", err)
+		}
 	}
 	if !options.PublicIPv4.Is4() {
 		return nil, fmt.Errorf("public IPv4 address is required")
@@ -103,19 +117,31 @@ func NewHandler(options Options) (*Handler, error) {
 	if options.Resolver == nil {
 		return nil, fmt.Errorf("resolver is required")
 	}
+	if options.UDPResponseRate <= 0 {
+		return nil, fmt.Errorf("UDPResponseRate must be positive")
+	}
+	if options.Now == nil {
+		options.Now = time.Now
+	}
 	logger := options.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &Handler{
-		zoneRoot:    zoneRoot,
-		nameservers: nameservers,
-		publicIPv4:  options.PublicIPv4,
-		publicIPv6:  options.PublicIPv6,
-		serial:      options.Serial,
-		resolver:    options.Resolver,
-		logger:      logger,
-		lookupSlots: make(chan struct{}, maxConcurrentHandleLookups),
+		zoneRoot:       zoneRoot,
+		handleZoneRoot: handleZoneRoot,
+		nameservers:    nameservers,
+		publicIPv4:     options.PublicIPv4,
+		publicIPv6:     options.PublicIPv6,
+		serial:         options.Serial,
+		resolver:       options.Resolver,
+		logger:         logger,
+		lookupSlots:    make(chan struct{}, maxConcurrentHandleLookups),
+		udpRateLimit: udpRateLimiter{
+			rate:     options.UDPResponseRate,
+			now:      options.Now,
+			prefixes: make(map[netip.Prefix]*udpPrefixEntry),
+		},
 	}, nil
 }
 
@@ -162,10 +188,6 @@ func (h *Handler) ServeDNS(writer miekgdns.ResponseWriter, request *miekgdns.Msg
 		return
 	}
 
-	nameLabels := miekgdns.SplitDomainName(name)
-	labels := nameLabels[:len(nameLabels)-miekgdns.CountLabel(h.zoneRoot)]
-	apex := labels[len(labels)-1] + "." + h.zoneRoot
-
 	// Zone transfers are not supported for handle subzones.
 	if question.Qtype == miekgdns.TypeAXFR || question.Qtype == miekgdns.TypeIXFR {
 		response.Rcode = miekgdns.RcodeRefused
@@ -173,33 +195,18 @@ func (h *Handler) ServeDNS(writer miekgdns.ResponseWriter, request *miekgdns.Msg
 		return
 	}
 	response.Authoritative = true
+	if h.handleZoneRoot != "" && (name == h.handleZoneRoot || miekgdns.IsSubDomain(h.handleZoneRoot, name)) {
+		h.serveHandleZone(writer, response, question, name)
+		return
+	}
+
+	nameLabels := miekgdns.SplitDomainName(name)
+	labels := nameLabels[:len(nameLabels)-miekgdns.CountLabel(h.zoneRoot)]
+	apex := labels[len(labels)-1] + "." + h.zoneRoot
 
 	if question.Qtype == miekgdns.TypeTXT && len(labels) == 3 && labels[0] == "_atproto" {
 		handle := labels[1] + "." + labels[2] + "." + strings.TrimSuffix(h.zoneRoot, ".")
-		select {
-		case h.lookupSlots <- struct{}{}:
-		default:
-			h.logger.Debug("DNS handle lookup limit reached", "limit", maxConcurrentHandleLookups)
-			response.Rcode = miekgdns.RcodeServerFailure
-			h.writeResponse(writer, response)
-			return
-		}
-		lookupContext, cancel := context.WithTimeout(context.Background(), handleLookupTimeout)
-		did, err := h.resolver.ResolveHandle(lookupContext, handle)
-		cancel()
-		<-h.lookupSlots
-		switch {
-		case err == nil:
-			response.Answer = []miekgdns.RR{&miekgdns.TXT{
-				Hdr: miekgdns.RR_Header{Name: question.Name, Rrtype: miekgdns.TypeTXT, Class: miekgdns.ClassINET, Ttl: handleTXTTTL},
-				Txt: []string{"did=" + did},
-			}}
-		case internalerrors.IsNotFound(err) || internalerrors.IsValidation(err):
-			h.addSOA(response, apex)
-		default:
-			h.logger.Error("DNS handle lookup failed", "handle", handle, "error", err)
-			response.Rcode = miekgdns.RcodeServerFailure
-		}
+		h.resolveHandleTXT(response, question.Name, handle, apex)
 		h.writeResponse(writer, response)
 		return
 	}
@@ -211,12 +218,7 @@ func (h *Handler) ServeDNS(writer miekgdns.ResponseWriter, request *miekgdns.Msg
 			h.writeResponse(writer, response)
 			return
 		case miekgdns.TypeNS:
-			for _, nameserver := range h.nameservers {
-				response.Answer = append(response.Answer, &miekgdns.NS{
-					Hdr: miekgdns.RR_Header{Name: apex, Rrtype: miekgdns.TypeNS, Class: miekgdns.ClassINET, Ttl: zoneRecordTTL},
-					Ns:  nameserver,
-				})
-			}
+			h.addNSAnswers(response, apex)
 			h.writeResponse(writer, response)
 			return
 		}
@@ -225,18 +227,12 @@ func (h *Handler) ServeDNS(writer miekgdns.ResponseWriter, request *miekgdns.Msg
 	if len(labels) == 1 || len(labels) == 2 {
 		switch question.Qtype {
 		case miekgdns.TypeA:
-			response.Answer = []miekgdns.RR{&miekgdns.A{
-				Hdr: miekgdns.RR_Header{Name: question.Name, Rrtype: miekgdns.TypeA, Class: miekgdns.ClassINET, Ttl: addressRecordTTL},
-				A:   net.IP(h.publicIPv4.AsSlice()),
-			}}
+			h.addAddressAnswer(response, question.Name, question.Qtype)
 			h.writeResponse(writer, response)
 			return
 		case miekgdns.TypeAAAA:
 			if h.publicIPv6.IsValid() {
-				response.Answer = []miekgdns.RR{&miekgdns.AAAA{
-					Hdr:  miekgdns.RR_Header{Name: question.Name, Rrtype: miekgdns.TypeAAAA, Class: miekgdns.ClassINET, Ttl: addressRecordTTL},
-					AAAA: net.IP(h.publicIPv6.AsSlice()),
-				}}
+				h.addAddressAnswer(response, question.Name, question.Qtype)
 				h.writeResponse(writer, response)
 				return
 			}
@@ -244,6 +240,76 @@ func (h *Handler) ServeDNS(writer miekgdns.ResponseWriter, request *miekgdns.Msg
 	}
 	h.addSOA(response, apex)
 	h.writeResponse(writer, response)
+}
+
+func (h *Handler) serveHandleZone(writer miekgdns.ResponseWriter, response *miekgdns.Msg, question miekgdns.Question, name string) {
+	switch {
+	case name == h.handleZoneRoot && question.Qtype == miekgdns.TypeSOA:
+		response.Answer = []miekgdns.RR{h.soa(h.handleZoneRoot)}
+	case name == h.handleZoneRoot && question.Qtype == miekgdns.TypeNS:
+		h.addNSAnswers(response, h.handleZoneRoot)
+	case question.Qtype == miekgdns.TypeTXT && strings.HasPrefix(name, "_atproto.") && name != "_atproto."+h.handleZoneRoot:
+		h.resolveHandleTXT(response, question.Name, strings.TrimSuffix(strings.TrimPrefix(name, "_atproto."), "."), h.handleZoneRoot)
+	case question.Qtype == miekgdns.TypeA || question.Qtype == miekgdns.TypeAAAA:
+		h.addAddressAnswer(response, question.Name, question.Qtype)
+	}
+	// NODATA carries the zone SOA so resolvers cache it (RFC 2308 section 5).
+	if response.Rcode == miekgdns.RcodeSuccess && len(response.Answer) == 0 && len(response.Ns) == 0 {
+		h.addSOA(response, h.handleZoneRoot)
+	}
+	h.writeResponse(writer, response)
+}
+
+func (h *Handler) resolveHandleTXT(response *miekgdns.Msg, owner, handle, apex string) {
+	select {
+	case h.lookupSlots <- struct{}{}:
+	default:
+		h.logger.Debug("DNS handle lookup limit reached", "limit", maxConcurrentHandleLookups)
+		response.Rcode = miekgdns.RcodeServerFailure
+		return
+	}
+	lookupContext, cancel := context.WithTimeout(context.Background(), handleLookupTimeout)
+	did, err := h.resolver.ResolveHandle(lookupContext, handle)
+	cancel()
+	<-h.lookupSlots
+	switch {
+	case err == nil:
+		response.Answer = []miekgdns.RR{&miekgdns.TXT{
+			Hdr: miekgdns.RR_Header{Name: owner, Rrtype: miekgdns.TypeTXT, Class: miekgdns.ClassINET, Ttl: handleTXTTTL},
+			Txt: []string{"did=" + did},
+		}}
+	case internalerrors.IsNotFound(err) || internalerrors.IsValidation(err):
+		h.addSOA(response, apex)
+	default:
+		h.logger.Error("DNS handle lookup failed", "handle", handle, "error", err)
+		response.Rcode = miekgdns.RcodeServerFailure
+	}
+}
+
+func (h *Handler) addNSAnswers(response *miekgdns.Msg, apex string) {
+	for _, nameserver := range h.nameservers {
+		response.Answer = append(response.Answer, &miekgdns.NS{
+			Hdr: miekgdns.RR_Header{Name: apex, Rrtype: miekgdns.TypeNS, Class: miekgdns.ClassINET, Ttl: zoneRecordTTL},
+			Ns:  nameserver,
+		})
+	}
+}
+
+func (h *Handler) addAddressAnswer(response *miekgdns.Msg, owner string, recordType uint16) {
+	switch recordType {
+	case miekgdns.TypeA:
+		response.Answer = []miekgdns.RR{&miekgdns.A{
+			Hdr: miekgdns.RR_Header{Name: owner, Rrtype: miekgdns.TypeA, Class: miekgdns.ClassINET, Ttl: addressRecordTTL},
+			A:   net.IP(h.publicIPv4.AsSlice()),
+		}}
+	case miekgdns.TypeAAAA:
+		if h.publicIPv6.IsValid() {
+			response.Answer = []miekgdns.RR{&miekgdns.AAAA{
+				Hdr:  miekgdns.RR_Header{Name: owner, Rrtype: miekgdns.TypeAAAA, Class: miekgdns.ClassINET, Ttl: addressRecordTTL},
+				AAAA: net.IP(h.publicIPv6.AsSlice()),
+			}}
+		}
+	}
 }
 
 // writeResponse sends response and logs a failure. A response that cannot be
@@ -395,7 +461,7 @@ func serveServer(ctx context.Context, server *miekgdns.Server, closeSocket func(
 // Its channel reports one unexpected transport failure and closes after both
 // transports stop; cancellation shuts both down without reporting an error.
 // TCP accept failures that are retried are logged to logger.
-func Serve(ctx context.Context, address string, handler miekgdns.Handler, logger *slog.Logger) (<-chan error, error) {
+func Serve(ctx context.Context, address string, handler *Handler, logger *slog.Logger) (<-chan error, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -446,9 +512,9 @@ func (handler udpHandler) ServeDNS(writer miekgdns.ResponseWriter, request *miek
 
 // serveConns takes ownership of both sockets and reports the first unexpected
 // stop, closing its channel after both transports have stopped.
-func serveConns(ctx context.Context, packet net.PacketConn, listener net.Listener, handler miekgdns.Handler, logger *slog.Logger) (<-chan error, error) {
+func serveConns(ctx context.Context, packet net.PacketConn, listener net.Listener, handler *Handler, logger *slog.Logger) (<-chan error, error) {
 	serveContext, cancel := context.WithCancel(ctx)
-	udpDone, err := servePacketConn(serveContext, packet, udpHandler{handler})
+	udpDone, err := servePacketConn(serveContext, packet, miekgdns.HandlerFunc(handler.serveUDP))
 	if err != nil {
 		cancel()
 		_ = listener.Close()

@@ -22,6 +22,26 @@
             "maxLength": 2560,
             "description": "User bio/description with rich text support"
           },
+          "origin": {
+            "type": "string",
+            "maxLength": 253,
+            "description": "Bridge-written home instance hostname (e.g. lemmy.world); display only. maxLength counts UTF-8 bytes."
+          },
+          "originUsername": {
+            "type": "string",
+            "maxLength": 256,
+            "description": "Bridge-written username on the home instance; display only. maxLength counts UTF-8 bytes."
+          },
+          "originUrl": {
+            "type": "string",
+            "format": "uri",
+            "description": "Bridge-written URL of the account on its home instance; display only."
+          },
+          "originSoftware": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "Bridge-written home instance software; display only. maxLength counts UTF-8 bytes."
+          },
           "descriptionFacets": {
             "type": "array",
             "maxLength": 50,

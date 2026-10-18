@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/netip"
 	"net/url"
 	"os"
@@ -39,10 +40,14 @@ type Config struct {
 	// BridgeHostname is the public domain the bridge is served from,
 	// e.g. "tidepool.example". Used for WebFinger, actor IDs, and handles.
 	BridgeHostname string
-	DNSListen      string
-	DNSPublicIPv4  netip.Addr
-	DNSPublicIPv6  netip.Addr
-	DNSNameservers []string
+	// HandleZoneRoot is the DNS zone for new bridged handles, under BridgeHostname.
+	HandleZoneRoot      string
+	DNSListen           string
+	DNSUDPResponseRate  int
+	HandleMigrationRate float64
+	DNSPublicIPv4       netip.Addr
+	DNSPublicIPv6       netip.Addr
+	DNSNameservers      []string
 	// CloudflareAPIToken enables delegation passes (at startup and every 15 minutes) when set.
 	CloudflareAPIToken string
 	// DelegationMaxNSRecords caps configured-nameserver NS records in the zone.
@@ -323,7 +328,23 @@ func Load(logger *slog.Logger) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	bridgeHost := strings.ToLower(strings.TrimSpace(cfg.BridgeHostname))
+	bridgeHost, _, _ = strings.Cut(bridgeHost, ":")
+	bridgeHost = strings.TrimSuffix(bridgeHost, ".")
 	cfg.DNSListen = os.Getenv("DNS_LISTEN")
+	cfg.DNSUDPResponseRate, err = intVar(logger, "DNS_UDP_RESPONSE_RATE", 20)
+	if err != nil {
+		return nil, err
+	}
+	if raw := os.Getenv("HANDLE_MIGRATION_RATE"); raw == "" {
+		cfg.HandleMigrationRate = 2
+		logger.Info("HANDLE_MIGRATION_RATE not set, using default", "value", cfg.HandleMigrationRate)
+	} else {
+		cfg.HandleMigrationRate, err = strconv.ParseFloat(raw, 64)
+		if err != nil || cfg.HandleMigrationRate <= 0 || math.IsNaN(cfg.HandleMigrationRate) || math.IsInf(cfg.HandleMigrationRate, 0) {
+			return nil, fmt.Errorf("config: HANDLE_MIGRATION_RATE must be a positive finite number, got %q", raw)
+		}
+	}
 	if cfg.DNSListen != "" {
 		// The zone root and default nameservers derive from BRIDGE_HOSTNAME,
 		// so it must be a DNS name before anything is built from it.
@@ -356,6 +377,27 @@ func Load(logger *slog.Logger) (*Config, error) {
 		} else {
 			cfg.DNSNameservers = []string{"ns1." + root, "ns2." + root}
 		}
+	}
+	cfg.HandleZoneRoot = strings.TrimSpace(os.Getenv("HANDLE_ZONE_ROOT"))
+	if cfg.HandleZoneRoot == "" {
+		cfg.HandleZoneRoot = "ap." + bridgeHost
+	}
+	cfg.HandleZoneRoot = strings.ToLower(strings.TrimSuffix(cfg.HandleZoneRoot, "."))
+	if err := validateDNSName("HANDLE_ZONE_ROOT", cfg.HandleZoneRoot); err != nil {
+		return nil, err
+	}
+	for _, label := range strings.Split(cfg.HandleZoneRoot, ".") {
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return nil, fmt.Errorf("config: HANDLE_ZONE_ROOT must use hostname labels, got %q", cfg.HandleZoneRoot)
+		}
+		for _, character := range label {
+			if (character < 'a' || character > 'z') && (character < '0' || character > '9') && character != '-' {
+				return nil, fmt.Errorf("config: HANDLE_ZONE_ROOT must use hostname labels, got %q", cfg.HandleZoneRoot)
+			}
+		}
+	}
+	if !strings.HasSuffix(cfg.HandleZoneRoot, "."+bridgeHost) {
+		return nil, fmt.Errorf("config: HANDLE_ZONE_ROOT must be strictly under BRIDGE_HOSTNAME, got %q", cfg.HandleZoneRoot)
 	}
 	cfg.CloudflareAPIToken = strings.TrimSpace(os.Getenv("CLOUDFLARE_API_TOKEN"))
 	cfg.CloudflareZoneID = strings.TrimSpace(os.Getenv("CLOUDFLARE_ZONE_ID"))

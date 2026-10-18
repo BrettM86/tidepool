@@ -32,6 +32,505 @@
           "description": "When this ban was indexed by the AppView"
         }
       }
+    },
+    "actionRef": {
+      "type": "object",
+      "description": "Stable reference to an action in a moderation service's log",
+      "required": [
+        "serviceDid",
+        "actionId"
+      ],
+      "properties": {
+        "serviceDid": {
+          "type": "string",
+          "format": "did",
+          "description": "DID of the service whose moderation log contains the action"
+        },
+        "actionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Opaque service-local action identifier, not an AT-URI or CID"
+        }
+      }
+    },
+    "scopeView": {
+      "type": "object",
+      "description": "Public scope in which a moderation decision applies",
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "maxLength": 64,
+          "knownValues": [
+            "instance",
+            "community"
+          ],
+          "description": "Kind of moderation scope"
+        },
+        "communityDid": {
+          "type": "string",
+          "format": "did",
+          "description": "DID of the scoped community; omitted on restricted-subject public projections"
+        }
+      }
+    },
+    "subjectRef": {
+      "type": "object",
+      "description": "Reference to the repository record targeted by moderation",
+      "required": [
+        "uri"
+      ],
+      "properties": {
+        "uri": {
+          "type": "string",
+          "format": "at-uri",
+          "description": "AT-URI of the moderated record"
+        },
+        "cid": {
+          "type": "string",
+          "format": "cid",
+          "description": "CID of the observed record version, never the moderation action's version"
+        },
+        "communityDid": {
+          "type": "string",
+          "format": "did",
+          "description": "DID of the community the record was posted in, recorded when the action was taken"
+        },
+        "rootUri": {
+          "type": "string",
+          "format": "at-uri",
+          "description": "AT-URI of the post at the root of a comment's thread, recorded when the action was taken; absent on actions recorded before 2026-10-13. The public log omits it when the root post has a doxing or illegal-content action or is no longer indexed"
+        }
+      }
+    },
+    "actorRef": {
+      "type": "object",
+      "description": "Public reference to the actor responsible for a moderation action",
+      "required": [
+        "did"
+      ],
+      "properties": {
+        "did": {
+          "type": "string",
+          "format": "did",
+          "description": "DID of the actor responsible for the moderation action"
+        }
+      }
+    },
+    "actionView": {
+      "type": "object",
+      "description": "Public projection of an entry in a moderation action log",
+      "required": [
+        "ref",
+        "action",
+        "authorityDid",
+        "scope",
+        "createdAt",
+        "origin"
+      ],
+      "properties": {
+        "ref": {
+          "type": "ref",
+          "ref": "#actionRef",
+          "description": "Stable reference to this moderation action"
+        },
+        "action": {
+          "type": "string",
+          "maxLength": 64,
+          "knownValues": [
+            "remove",
+            "restore",
+            "apply-removal",
+            "retract-removal",
+            "label",
+            "retract-label"
+          ],
+          "description": "Moderation transition represented by this action"
+        },
+        "authorityDid": {
+          "type": "string",
+          "format": "did",
+          "description": "DID of the authority that issued the action"
+        },
+        "scope": {
+          "type": "ref",
+          "ref": "#scopeView",
+          "description": "Scope in which the action applies"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "Time this moderation log recorded the action on its server"
+        },
+        "origin": {
+          "type": "string",
+          "maxLength": 64,
+          "knownValues": [
+            "local",
+            "inherited"
+          ],
+          "description": "Whether the action originated locally or was inherited from another authority"
+        },
+        "subject": {
+          "type": "ref",
+          "ref": "#subjectRef",
+          "description": "Public subject targeted by the action"
+        },
+        "reason": {
+          "type": "ref",
+          "ref": "#reasonType",
+          "description": "Public reason classification for the action"
+        },
+        "labelValue": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "knownValues": [
+            "nsfw"
+          ],
+          "description": "Content label applied or retracted by a label action"
+        },
+        "actor": {
+          "type": "ref",
+          "ref": "#actorRef",
+          "description": "Public actor responsible for the action"
+        },
+        "reverses": {
+          "type": "ref",
+          "ref": "#actionRef",
+          "description": "Earlier moderation action reversed by this action"
+        },
+        "issuedAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "Source label creation time, not a moderation-log sort key"
+        },
+        "contentSnapshot": {
+          "type": "ref",
+          "ref": "#contentSnapshot",
+          "description": "Text of a removed subject, captured at removal; a restore carries the snapshot of the removal it reverses. Omitted when the subject is withheld or deleted by its author. In listAdminActions, a label or retract-label carries the post's current text, as on adminActionView. Returned by listActions and listAdminActions only, never in a mutation result"
+        }
+      }
+    },
+    "adminActionView": {
+      "type": "object",
+      "description": "Administrative moderation action projection with private operator context",
+      "required": [
+        "action"
+      ],
+      "properties": {
+        "action": {
+          "type": "ref",
+          "ref": "#actionView",
+          "description": "Public moderation action projection"
+        },
+        "actorDid": {
+          "type": "string",
+          "format": "did",
+          "description": "Private DID of the administrator who performed the action"
+        },
+        "privateSubject": {
+          "type": "ref",
+          "ref": "#subjectRef",
+          "description": "Private subject reference retained when the public projection restricts it or withholds its rootUri"
+        },
+        "privateNote": {
+          "type": "string",
+          "maxGraphemes": 1000,
+          "maxLength": 10000,
+          "description": "Private administrative note that is never included in public projections"
+        },
+        "contentSnapshot": {
+          "type": "ref",
+          "ref": "#contentSnapshot",
+          "description": "Text of a removed subject, captured at removal, including when the public projection withholds it; a restore carries the snapshot of the removal it reverses. A label or retract-label carries the post's current text, omitted when the post is deleted, gone, or has a doxing or illegal-content action. Returned by listAdminActions only, never in a mutation result"
+        }
+      }
+    },
+    "contentSnapshot": {
+      "type": "object",
+      "description": "Text of a record: as indexed when it was removed, or for a label or retract-label, as indexed now",
+      "required": [
+        "capturedCid"
+      ],
+      "properties": {
+        "title": {
+          "type": "string",
+          "description": "Post title"
+        },
+        "text": {
+          "type": "string",
+          "description": "Post body or comment text"
+        },
+        "linkUrl": {
+          "type": "string",
+          "format": "uri",
+          "description": "URL of the post's external link embed"
+        },
+        "capturedCid": {
+          "type": "string",
+          "format": "cid",
+          "description": "CID of the record version the snapshot was taken from"
+        }
+      }
+    },
+    "sourceView": {
+      "type": "object",
+      "description": "Public authority source contributing to effective moderation state",
+      "required": [
+        "authorityDid",
+        "scope"
+      ],
+      "properties": {
+        "authorityDid": {
+          "type": "string",
+          "format": "did",
+          "description": "DID of the authority that supplied this moderation source"
+        },
+        "scope": {
+          "type": "ref",
+          "ref": "#scopeView",
+          "description": "Scope in which this source applies"
+        },
+        "action": {
+          "type": "ref",
+          "ref": "#actionRef",
+          "description": "Moderation action that produced this source"
+        },
+        "reason": {
+          "type": "ref",
+          "ref": "#reasonType",
+          "description": "Public reason classification supplied by this source"
+        },
+        "label": {
+          "type": "ref",
+          "ref": "com.atproto.label.defs#label",
+          "description": "atProto label supplied by this source"
+        }
+      }
+    },
+    "moderationView": {
+      "type": "object",
+      "description": "Effective public removal and content-label state for a subject",
+      "required": [
+        "state"
+      ],
+      "properties": {
+        "state": {
+          "type": "string",
+          "maxLength": 64,
+          "knownValues": [
+            "clear",
+            "removed"
+          ],
+          "description": "Effective removal state; clear does not imply the subject is readable or unlabelled"
+        },
+        "sources": {
+          "type": "array",
+          "maxLength": 100,
+          "items": {
+            "type": "ref",
+            "ref": "#sourceView"
+          },
+          "description": "Public sources contributing to the effective removal state"
+        },
+        "sourcesTruncated": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether additional removal sources were omitted from this projection"
+        },
+        "contentLabels": {
+          "type": "array",
+          "maxLength": 100,
+          "items": {
+            "type": "ref",
+            "ref": "#contentLabelView"
+          },
+          "description": "Effective public content labels on the subject"
+        }
+      }
+    },
+    "contentLabelView": {
+      "type": "object",
+      "description": "Effective public content label and its contributing sources",
+      "required": [
+        "value"
+      ],
+      "properties": {
+        "value": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "knownValues": [
+            "nsfw"
+          ],
+          "description": "Public content label value"
+        },
+        "sources": {
+          "type": "array",
+          "maxLength": 100,
+          "items": {
+            "type": "ref",
+            "ref": "#sourceView"
+          },
+          "description": "Public sources contributing to this content label"
+        },
+        "sourcesTruncated": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether additional content-label sources were omitted from this projection"
+        }
+      }
+    },
+    "localLabelView": {
+      "type": "object",
+      "description": "Locally applied content label and the action that established it",
+      "required": [
+        "value",
+        "action"
+      ],
+      "properties": {
+        "value": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "knownValues": [
+            "nsfw"
+          ],
+          "description": "Locally applied content label value"
+        },
+        "action": {
+          "type": "ref",
+          "ref": "#actionRef",
+          "description": "Local moderation action that established the label"
+        }
+      }
+    },
+    "subjectState": {
+      "type": "object",
+      "description": "Versioned moderation and repository state for a subject",
+      "required": [
+        "subject",
+        "version",
+        "moderation",
+        "recordState"
+      ],
+      "properties": {
+        "subject": {
+          "type": "string",
+          "format": "at-uri",
+          "description": "AT-URI identifying the moderated subject"
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Opaque monotonic state token, not a CID"
+        },
+        "moderation": {
+          "type": "ref",
+          "ref": "#moderationView",
+          "description": "Effective public moderation state for the subject"
+        },
+        "recordState": {
+          "type": "string",
+          "maxLength": 64,
+          "knownValues": [
+            "present",
+            "deleted",
+            "unavailable"
+          ],
+          "description": "Repository availability state of the subject record"
+        },
+        "currentSubject": {
+          "type": "ref",
+          "ref": "com.atproto.repo.strongRef",
+          "description": "Current strong reference when the subject record is present"
+        },
+        "localRemoval": {
+          "type": "ref",
+          "ref": "#actionRef",
+          "description": "Local action currently establishing removal"
+        },
+        "localLabels": {
+          "type": "array",
+          "maxLength": 100,
+          "items": {
+            "type": "ref",
+            "ref": "#localLabelView"
+          },
+          "description": "Content labels currently established by local actions"
+        }
+      }
+    },
+    "mutationResult": {
+      "type": "object",
+      "description": "Result of an administrative moderation mutation",
+      "required": [
+        "outcome",
+        "state"
+      ],
+      "properties": {
+        "outcome": {
+          "type": "string",
+          "maxLength": 64,
+          "knownValues": [
+            "applied",
+            "unchanged"
+          ],
+          "description": "Whether the requested mutation changed moderation state"
+        },
+        "state": {
+          "type": "ref",
+          "ref": "#subjectState",
+          "description": "Authoritative subject state after the mutation"
+        },
+        "action": {
+          "type": "ref",
+          "ref": "#adminActionView",
+          "description": "Administrative action created or reused by the mutation"
+        }
+      }
+    },
+    "reasonType": {
+      "type": "string",
+      "description": "Extensible fully-qualified token reference for a public moderation reason",
+      "maxLength": 640,
+      "knownValues": [
+        "social.coves.moderation.defs#reasonSpam",
+        "social.coves.moderation.defs#reasonHarassment",
+        "social.coves.moderation.defs#reasonDoxing",
+        "social.coves.moderation.defs#reasonIllegalContent",
+        "social.coves.moderation.defs#reasonRuleViolation",
+        "social.coves.moderation.defs#reasonModeratorDiscretion"
+      ]
+    },
+    "reasonSpam": {
+      "type": "token",
+      "description": "Unsolicited, repetitive, or deceptive content classified as spam"
+    },
+    "reasonHarassment": {
+      "type": "token",
+      "description": "Targeted abuse, intimidation, or repeated unwanted conduct classified as harassment"
+    },
+    "reasonDoxing": {
+      "type": "token",
+      "description": "Publication or threatened publication of private identifying information"
+    },
+    "reasonIllegalContent": {
+      "type": "token",
+      "description": "Content classified for public projection as violating applicable law"
+    },
+    "reasonRuleViolation": {
+      "type": "token",
+      "description": "Violation of an applicable instance or community rule"
+    },
+    "reasonModeratorDiscretion": {
+      "type": "token",
+      "description": "Moderation decision made under documented moderator discretion"
     }
   }
 }

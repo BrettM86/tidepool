@@ -1,0 +1,144 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.moderation.listAdminActions",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "List moderation actions with private administrative context for authorized administrators. Instance authority and actor identity come from the authenticated service context, never request fields.",
+      "parameters": {
+        "type": "params",
+        "description": "Optional administrative moderation action filters and pagination controls",
+        "properties": {
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 50,
+            "description": "Maximum number of administrative actions to return"
+          },
+          "cursor": {
+            "type": "string",
+            "maxLength": 2048,
+            "description": "Opaque pagination cursor from a previous response"
+          },
+          "subject": {
+            "type": "string",
+            "format": "at-uri",
+            "description": "Return actions for this subject AT-URI"
+          },
+          "collection": {
+            "type": "string",
+            "format": "nsid",
+            "description": "Return actions whose subject URI uses this collection NSID"
+          },
+          "action": {
+            "type": "string",
+            "maxLength": 64,
+            "knownValues": [
+              "remove",
+              "restore",
+              "apply-removal",
+              "retract-removal",
+              "label",
+              "retract-label"
+            ],
+            "description": "Return actions with this moderation transition"
+          },
+          "origin": {
+            "type": "string",
+            "maxLength": 64,
+            "knownValues": [
+              "local",
+              "inherited"
+            ],
+            "description": "Return actions with this local or inherited origin"
+          },
+          "authority": {
+            "type": "string",
+            "format": "at-identifier",
+            "description": "Return actions issued by this authority DID or handle"
+          },
+          "actor": {
+            "type": "string",
+            "format": "at-identifier",
+            "description": "Return actions performed by this actor DID or handle"
+          },
+          "community": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 320,
+            "description": "Community DID, handle, bare name, or name@origin resolved by the community resolver"
+          },
+          "since": {
+            "type": "string",
+            "format": "datetime",
+            "description": "Inclusive lower bound on createdAt"
+          },
+          "until": {
+            "type": "string",
+            "format": "datetime",
+            "description": "Exclusive upper bound on createdAt"
+          },
+          "actionId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "description": "Opaque service-local action identifier for exact lookup"
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#output"
+        }
+      },
+      "errors": [
+        {
+          "name": "AuthRequired",
+          "description": "Authentication is required; authenticate with an authorized service account before retrying."
+        },
+        {
+          "name": "Forbidden",
+          "description": "The authenticated actor lacks permission; do not retry unless its moderation authority changes."
+        },
+        {
+          "name": "InvalidRequest",
+          "description": "A filter or range is invalid; correct the request before retrying."
+        },
+        {
+          "name": "InvalidCursor",
+          "description": "The cursor is invalid or expired; restart pagination without a cursor."
+        },
+        {
+          "name": "ModerationUnavailable",
+          "description": "The moderation service is temporarily unavailable; retry later."
+        }
+      ]
+    },
+    "output": {
+      "type": "object",
+      "description": "Page of moderation actions with private administrative context",
+      "required": [
+        "actions"
+      ],
+      "properties": {
+        "actions": {
+          "type": "array",
+          "maxLength": 100,
+          "items": {
+            "type": "ref",
+            "ref": "social.coves.moderation.defs#adminActionView"
+          },
+          "description": "Administrative moderation actions in server-defined order"
+        },
+        "cursor": {
+          "type": "string",
+          "maxLength": 2048,
+          "description": "Opaque cursor for the next page; absent at the end of pagination"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,119 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.moderation.labelContent",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Apply a local content label to a post. Instance authority and actor identity come from the authenticated service context, never request fields. The effect is URI-scoped while the CID records inspection and concurrency; !takedown and unsupported values return UnsupportedLabel.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#input"
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "social.coves.moderation.defs#mutationResult"
+        }
+      },
+      "errors": [
+        {
+          "name": "AuthRequired",
+          "description": "Authentication is required; authenticate with an authorized service account before retrying."
+        },
+        {
+          "name": "Forbidden",
+          "description": "The authenticated actor lacks permission; do not retry unless its moderation authority changes."
+        },
+        {
+          "name": "InvalidRequest",
+          "description": "The request fields are inconsistent or incomplete; correct the request before retrying."
+        },
+        {
+          "name": "InvalidSubject",
+          "description": "The subject is malformed, unsupported, or not a post; correct the subject before retrying."
+        },
+        {
+          "name": "SubjectNotFound",
+          "description": "The subject cannot be found for inspection; verify the reference before retrying."
+        },
+        {
+          "name": "ContentChanged",
+          "description": "The subject CID changed; refetch getSubjectState and re-inspect the current content before retrying."
+        },
+        {
+          "name": "StateConflict",
+          "description": "expectedVersion is stale; refetch getSubjectState before retrying with the new version."
+        },
+        {
+          "name": "IdempotencyConflict",
+          "description": "The same key was reused with a different request; do not retry with that key."
+        },
+        {
+          "name": "UnsupportedReason",
+          "description": "The reason is not supported for this action; choose a supported reason before retrying."
+        },
+        {
+          "name": "UnsupportedLabel",
+          "description": "The label value is unsupported; use the supported nsfw value before retrying."
+        },
+        {
+          "name": "ModerationUnavailable",
+          "description": "The moderation service is temporarily unavailable; retry later."
+        }
+      ]
+    },
+    "input": {
+      "type": "object",
+      "description": "Request to apply a local content label to an inspected post",
+      "required": [
+        "subject",
+        "labelValue",
+        "expectedVersion",
+        "idempotencyKey"
+      ],
+      "properties": {
+        "subject": {
+          "type": "ref",
+          "ref": "com.atproto.repo.strongRef",
+          "description": "Post reference whose URI receives the label and whose CID establishes inspection concurrency"
+        },
+        "labelValue": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "knownValues": [
+            "nsfw"
+          ],
+          "description": "Supported local content label value"
+        },
+        "expectedVersion": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Opaque subject-state version expected by the caller"
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Opaque key that makes equivalent label requests idempotent"
+        },
+        "reason": {
+          "type": "ref",
+          "ref": "social.coves.moderation.defs#reasonType",
+          "description": "Public reason classification for applying the label"
+        },
+        "privateNote": {
+          "type": "string",
+          "maxGraphemes": 1000,
+          "maxLength": 10000,
+          "description": "Private administrative note retained only on the admin action"
+        }
+      }
+    }
+  }
+}

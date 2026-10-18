@@ -63,6 +63,45 @@ func TestUpdatePersonRefreshesProfile(t *testing.T) {
 	assert.Equal(t, "Renamed Neelix", record["displayName"])
 }
 
+// TestUpdatePersonBackfillsOriginFields: a profile committed before the
+// origin address fields existed gains them on the next Update{Person}.
+func TestUpdatePersonBackfillsOriginFields(t *testing.T) {
+	h := newHarness(t)
+	h.serveLemmyWorldFixtures()
+	ctx := context.Background()
+
+	actor, err := h.m.EnsureActor(ctx, &ap.Object{ID: personID})
+	require.NoError(t, err)
+
+	// Rewrite the stored profile as an older bridge would have left it.
+	stored, _, err := h.manager.GetRecord(ctx, actor.DID, CollectionActorProfile, ProfileRKey)
+	require.NoError(t, err)
+	stale := map[string]any{}
+	for key, value := range stored {
+		switch key {
+		case "origin", "originUsername", "originUrl":
+		default:
+			stale[key] = value
+		}
+	}
+	_, err = h.manager.PutRecord(ctx, actor.DID, CollectionActorProfile, ProfileRKey, stale)
+	require.NoError(t, err)
+	readBack, _, err := h.manager.GetRecord(ctx, actor.DID, CollectionActorProfile, ProfileRKey)
+	require.NoError(t, err)
+	require.NotContains(t, readBack, "origin")
+	require.NotContains(t, readBack, "originUsername")
+	require.NotContains(t, readBack, "originUrl")
+
+	_, err = h.m.HandleUpdate(ctx, loadFixtureObject(t, "person_lemmy_world.json"), groupID)
+	require.NoError(t, err)
+
+	record, _, err := h.manager.GetRecord(ctx, actor.DID, CollectionActorProfile, ProfileRKey)
+	require.NoError(t, err)
+	assert.Equal(t, "lemmy.world", record["origin"])
+	assert.Equal(t, "LeftLeaningFreedomFighters", record["originUsername"])
+	assert.Equal(t, "https://lemmy.world/u/LeftLeaningFreedomFighters", record["originUrl"])
+}
+
 // TestHandleDeleteObject: Delete for a bridged post removes the record and
 // tombstones the mapping; a second delete and an unknown id are no-ops.
 func TestHandleDeleteObject(t *testing.T) {

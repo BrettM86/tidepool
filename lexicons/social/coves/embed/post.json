@@ -30,7 +30,7 @@
         },
         "resolved": {
           "type": "unknown",
-          "description": "Resolved data for the referenced post (e.g., a hydrated Bluesky post), or an unavailable marker with a user-facing message"
+          "description": "Resolved data for the referenced post (e.g., a hydrated Bluesky post), or an unavailable marker with a user-facing message. For a removed Coves subject, the embed resolves to nothing beyond the strongRef: no resolved object, copied body, or media; social.coves.community.post.get on that strongRef returns the tombstone."
         }
       }
     }

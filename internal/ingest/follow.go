@@ -44,6 +44,8 @@ type AdminOptions struct {
 	// record first, PLAN decision 3).
 	Materializer Materializer
 	Communities  store.Communities
+	// Actors lists bridged person actors for the user refresh-profile walk.
+	Actors PersonActorLister
 	// Service is the AP actor the Follow is issued by.
 	Service *ap.ServiceActor
 	// Backfill serves the on-demand backfill endpoint (optional).
@@ -60,7 +62,7 @@ type AdminOptions struct {
 	// /admin/outbound/cancel parks an actor's or community's pending work.
 	Deliveries store.OutboundDeliveries
 	// BaseContext is the root context background admin work (the
-	// refresh-profile walk) runs under. Wiring the server/run context here
+	// refresh-profile walks) runs under. Wiring the server/run context here
 	// lets a walk observe shutdown, as BackfillOptions.BaseContext does for
 	// async backfills. Defaults to context.Background().
 	BaseContext context.Context
@@ -75,6 +77,7 @@ type AdminOptions struct {
 //	GET    /admin/communities
 //	POST   /admin/communities/backfill  {"community":"!tech@lemmy.world"}
 //	POST   /admin/communities/refresh-profile {"community":"!tech@lemmy.world"} (or {"all":true})
+//	POST   /admin/users/refresh-profile {"all":true}
 //	POST   /admin/communities/reconcile (follow list configured only)
 //	POST   /admin/dns/reconcile         (Cloudflare token configured only)
 //	POST   /admin/reemit                {"did":"did:plc:..."} (or {} for all)
@@ -88,6 +91,7 @@ type Admin struct {
 	client      FollowClient
 	mat         Materializer
 	communities store.Communities
+	actors      PersonActorLister
 	service     *ap.ServiceActor
 	backfill    Backfiller
 	repos       RepoReemitter
@@ -106,13 +110,15 @@ type Admin struct {
 	// startup via SetDivergenceReconciler, before the server listens.
 	divergence *DivergenceReconciler
 	// baseCtx roots background admin work; walkMu serializes the
-	// refresh-profile walk (TryLock refuses a second walk while one runs
-	// instead of doubling the fetch rate); walks lets Wait drain it on
-	// shutdown. Per instance, not package-level, so two Admins (or two test
-	// harnesses) never share a gate.
-	baseCtx context.Context
-	walkMu  sync.Mutex
-	walks   sync.WaitGroup
+	// community refresh-profile walk and userWalkMu the user one (TryLock
+	// refuses a second walk of a kind while one runs instead of doubling the
+	// fetch rate); walks lets Wait drain both on shutdown. Per instance, not
+	// package-level, so two Admins (or two test harnesses) never share a
+	// gate.
+	baseCtx    context.Context
+	walkMu     sync.Mutex
+	userWalkMu sync.Mutex
+	walks      sync.WaitGroup
 }
 
 // SetFollowReconciler wires the optional follow-list reconciler in after
@@ -141,6 +147,9 @@ func NewAdmin(opts AdminOptions) (*Admin, error) {
 	if opts.Communities == nil {
 		return nil, errors.NewValidationError("communities", "must not be nil")
 	}
+	if opts.Actors == nil {
+		return nil, errors.NewValidationError("actors", "must not be nil")
+	}
 	if opts.Service == nil {
 		return nil, errors.NewValidationError("service", "must not be nil")
 	}
@@ -157,6 +166,7 @@ func NewAdmin(opts AdminOptions) (*Admin, error) {
 		client:      opts.Client,
 		mat:         opts.Materializer,
 		communities: opts.Communities,
+		actors:      opts.Actors,
 		service:     opts.Service,
 		backfill:    opts.Backfill,
 		repos:       opts.Repos,
@@ -182,6 +192,7 @@ func (a *Admin) Routes(r chi.Router) {
 		r.Post("/communities/backfill", a.handleBackfill)
 		r.Post("/communities/refresh-profile", a.handleRefreshProfile)
 		r.Post("/communities/reconcile", a.handleReconcile)
+		r.Post("/users/refresh-profile", a.handleRefreshUsers)
 		r.Post("/dns/reconcile", a.handleDNSReconcile)
 		r.Post("/reemit", a.handleReemit)
 		r.Post("/objects/sweep-deleted", a.handleSweepDeleted)

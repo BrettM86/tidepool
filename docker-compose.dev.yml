@@ -33,14 +33,20 @@ services:
   postgres-test:
     image: postgres:16
     container_name: tidepool-test-postgres
+    # Durability is off and the data lives in memory: test data is disposable.
+    # Recreating the container discards every database in it, including each
+    # worktree's branch database; the next test run recreates and migrates it.
+    command: ["-c", "fsync=off", "-c", "synchronous_commit=off", "-c", "full_page_writes=off"]
     ports:
       - "${POSTGRES_TEST_PORT:-5443}:5432"
     environment:
       POSTGRES_DB: ${POSTGRES_TEST_DB:-tidepool_test}
       POSTGRES_USER: ${POSTGRES_TEST_USER:-tidepool_test}
       POSTGRES_PASSWORD: ${POSTGRES_TEST_PASSWORD:-tidepool_test}
-    volumes:
-      - postgres-test-data:/var/lib/postgresql/data
+    # Capped so a database-leak regression cannot grow this filesystem to the
+    # uncapped default of half of host RAM.
+    tmpfs:
+      - /var/lib/postgresql/data:size=3g
     networks:
       - tidepool-dev
     healthcheck:
@@ -165,8 +171,6 @@ networks:
 volumes:
   postgres-data:
     name: tidepool-dev-postgres-data
-  postgres-test-data:
-    name: tidepool-test-postgres-data
   postgres-plc-data:
     name: tidepool-dev-postgres-plc-data
   plc-app-data:

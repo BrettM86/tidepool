@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lib/pq"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -96,6 +97,34 @@ func TestFirehoseEventKindShapeCheck(t *testing.T) {
 		INSERT INTO firehose_events (kind, did, account_active, account_status, created_at)
 		VALUES ('account', $1, true, NULL, NOW())`, testDID)
 	require.NoError(t, err, "active account frame with NULL status is valid")
+
+	// Raw writes exercise each identity shape rule independently of the emitter.
+	for _, tc := range []struct {
+		name, query string
+		accepted    bool
+	}{
+		{"identity with did and handle", `INSERT INTO firehose_events (kind, did, identity_handle, created_at) VALUES ('identity', $1, 'alice.lemmy.world.ap.tidepool.test', NOW())`, true},
+		{"identity with NULL handle", `INSERT INTO firehose_events (kind, did, identity_handle, created_at) VALUES ('identity', $1, NULL, NOW())`, false},
+		{"identity with empty handle", `INSERT INTO firehose_events (kind, did, identity_handle, created_at) VALUES ('identity', $1, '', NOW())`, false},
+		{"identity with commit_cid", `INSERT INTO firehose_events (kind, did, identity_handle, commit_cid, created_at) VALUES ('identity', $1, 'alice.lemmy.world.ap.tidepool.test', 'bafyreib2rxk3rybk3aobmv5cjuql3bm2twh4jo5uxgf5kpqrsqxi3jgxte', NOW())`, false},
+		{"identity with prev_data_cid", `INSERT INTO firehose_events (kind, did, identity_handle, prev_data_cid, created_at) VALUES ('identity', $1, 'alice.lemmy.world.ap.tidepool.test', 'bafyreib2rxk3rybk3aobmv5cjuql3bm2twh4jo5uxgf5kpqrsqxi3jgxte', NOW())`, false},
+		{"identity with since_rev", `INSERT INTO firehose_events (kind, did, identity_handle, since_rev, created_at) VALUES ('identity', $1, 'alice.lemmy.world.ap.tidepool.test', 'rev1', NOW())`, false},
+		{"identity with account_active", `INSERT INTO firehose_events (kind, did, identity_handle, account_active, created_at) VALUES ('identity', $1, 'alice.lemmy.world.ap.tidepool.test', false, NOW())`, false},
+		{"commit with identity_handle", `INSERT INTO firehose_events (kind, did, commit_cid, rev, ops, car, identity_handle, created_at) VALUES ('commit', $1, 'bafyreib2rxk3rybk3aobmv5cjuql3bm2twh4jo5uxgf5kpqrsqxi3jgxte', 'rev1', '[]'::jsonb, ''::bytea, 'alice.lemmy.world.ap.tidepool.test', NOW())`, false},
+		{"account with identity_handle", `INSERT INTO firehose_events (kind, did, account_active, identity_handle, created_at) VALUES ('account', $1, true, 'alice.lemmy.world.ap.tidepool.test', NOW())`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := database.Exec(tc.query, testDID)
+			if tc.accepted {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+				var postgresError *pq.Error
+				require.True(t, stderrors.As(err, &postgresError), "expected a postgres check violation, got %v", err)
+				require.Equal(t, "23514", string(postgresError.Code), "expected check_violation")
+			}
+		})
+	}
 }
 
 // TestPutRecordTxSideEffectAtomicity: the side effect and the record write

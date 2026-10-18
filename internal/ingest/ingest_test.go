@@ -102,7 +102,10 @@ func (f *fakeMinter) MintActor(_ context.Context, req identity.MintRequest) (*id
 	if err != nil {
 		return nil, err
 	}
-	handle := strings.ToLower(req.PreferredUsername) + "." +
+	// Underscores become dashes, as the real minter's label normalization
+	// does: an atproto handle label cannot hold '_', and preferredUsername
+	// often does.
+	handle := strings.ReplaceAll(strings.ToLower(req.PreferredUsername), "_", "-") + "." +
 		strings.ReplaceAll(req.Instance, ".", "-") + "." + bridgeHost
 	return &identity.Identity{
 		DID: did, Handle: handle, DIDKey: pub.DIDKey(), SigningKeyEncrypted: sealed,
@@ -273,7 +276,10 @@ func newHarness(t *testing.T) *harness {
 		// invocations, poisoning tests that run BEFORE the ban tests as well as
 		// after. The failure reads as "my post was not accepted", which names
 		// neither bans nor the test that left one.
-		"community_bans")
+		"community_bans",
+		// Nodeinfo discovery results (migration 042): a cached software name
+		// or failure left by one test would decide the next test's fetches.
+		"instances")
 
 	custodian, err := identity.NewCustodian(testKEK)
 	require.NoError(t, err)
@@ -353,6 +359,11 @@ func newHarness(t *testing.T) *harness {
 		Ledger:           accept.NewAdmissions(database),
 		ServiceDID:       testServiceDID,
 		StrictValidation: true,
+		Instances:        store.NewInstances(database),
+		// Nodeinfo discovery goes to the fixture server like every other
+		// outbound request, never the network.
+		NodeInfoClient: &http.Client{Transport: rewriteTransport{target: h.fixtures.Listener.Addr().String()}},
+		UserAgent:      "tidepool-test/1.0",
 	})
 	require.NoError(t, err)
 
@@ -410,15 +421,7 @@ func newHarness(t *testing.T) *harness {
 	})
 	require.NoError(t, err)
 
-	h.admin, err = NewAdmin(AdminOptions{
-		Token:        testAdminToken,
-		Client:       h.client,
-		Materializer: h.mat,
-		Communities:  communities,
-		Service:      h.service,
-		Backfill:     h.backfills,
-		Sweeper:      h.handler,
-	})
+	h.admin, err = NewAdmin(h.adminOptions())
 	require.NoError(t, err)
 
 	router := chi.NewRouter()
@@ -426,6 +429,26 @@ func newHarness(t *testing.T) *harness {
 	h.admin.Routes(router)
 	h.router = router
 	return h
+}
+
+// adminOptions is the harness's Admin wiring, shared by newHarness and by
+// tests that need a second Admin over the same dependencies (a cancellable
+// BaseContext, say). Call it after newHarness has built the materializer,
+// handler, and backfill recorder.
+func (h *harness) adminOptions() AdminOptions {
+	return AdminOptions{
+		Token:        testAdminToken,
+		Client:       h.client,
+		Materializer: h.mat,
+		Communities:  h.communities,
+		Actors:       h.actors,
+		Service:      h.service,
+		Backfill:     h.backfills,
+		Sweeper:      h.handler,
+		// The walks report only through the log (the 202 precedes the
+		// work), so their summaries land in h.logs for tests to assert.
+		Logger: slog.New(slog.NewTextHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+	}
 }
 
 // syncBuffer is a concurrency-safe log sink: the queue worker and the harness

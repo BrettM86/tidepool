@@ -29,13 +29,14 @@
           "properties": {
             "posts": {
               "type": "array",
-              "description": "Array of post views. May include notFound/blocked entries for missing posts.",
+              "description": "Array of post views. May include notFound, blocked, or removed entries for posts that cannot be shown.",
               "items": {
                 "type": "union",
                 "refs": [
                   "social.coves.community.post.defs#postView",
                   "social.coves.community.post.defs#notFoundPost",
                   "social.coves.community.post.defs#removedPost",
+                  "social.coves.community.post.defs#moderatedPost",
                   "social.coves.community.post.defs#blockedPost"
                 ]
               }

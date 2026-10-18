@@ -1,0 +1,75 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.community.getBlockedCommunities",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Enumerates the communities the requesting account is currently blocking. Requires authentication; the list is always the caller's own, though each block is a public record in the caller's repository.",
+      "parameters": {
+        "type": "params",
+        "properties": {
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 50
+          },
+          "cursor": {
+            "type": "string",
+            "maxLength": 500
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "blocks"
+          ],
+          "properties": {
+            "blocks": {
+              "type": "array",
+              "items": {
+                "type": "ref",
+                "ref": "#blockView"
+              }
+            },
+            "cursor": {
+              "type": "string",
+              "maxLength": 500
+            }
+          }
+        }
+      }
+    },
+    "blockView": {
+      "type": "object",
+      "description": "One of the caller's community blocks: the blocked community and the block record that expresses it.",
+      "required": [
+        "communityDid",
+        "recordUri",
+        "recordCid",
+        "blockedAt"
+      ],
+      "properties": {
+        "communityDid": {
+          "type": "string",
+          "format": "did"
+        },
+        "recordUri": {
+          "type": "string",
+          "format": "at-uri"
+        },
+        "recordCid": {
+          "type": "string",
+          "format": "cid"
+        },
+        "blockedAt": {
+          "type": "string",
+          "format": "datetime"
+        }
+      }
+    }
+  }
+}

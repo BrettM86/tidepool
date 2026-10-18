@@ -1,0 +1,112 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.moderation.restoreContent",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Retract an active local removal after review. Instance authority and actor identity come from the authenticated service context, never request fields. An imported source's decision cannot be targeted and returns InvalidDecision.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#input"
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "social.coves.moderation.defs#mutationResult"
+        }
+      },
+      "errors": [
+        {
+          "name": "AuthRequired",
+          "description": "Authentication is required; authenticate with an authorized service account before retrying."
+        },
+        {
+          "name": "Forbidden",
+          "description": "The authenticated actor lacks permission; do not retry unless its moderation authority changes."
+        },
+        {
+          "name": "InvalidRequest",
+          "description": "The request is incomplete, including a missing reviewedSubject when a current record exists; correct it before retrying."
+        },
+        {
+          "name": "DecisionNotFound",
+          "description": "The referenced local removal does not exist; refetch getSubjectState before choosing an action to retry."
+        },
+        {
+          "name": "InvalidDecision",
+          "description": "The target is not an active local removal; select a valid local decision before retrying."
+        },
+        {
+          "name": "ContentChanged",
+          "description": "The reviewed subject CID changed; refetch getSubjectState and re-inspect the current content before retrying."
+        },
+        {
+          "name": "StateConflict",
+          "description": "expectedVersion is stale; refetch getSubjectState before retrying with the new version."
+        },
+        {
+          "name": "IdempotencyConflict",
+          "description": "The same key was reused with a different request; do not retry with that key."
+        },
+        {
+          "name": "UnsupportedReason",
+          "description": "The reason is not supported for this action; choose a supported reason before retrying."
+        },
+        {
+          "name": "ModerationUnavailable",
+          "description": "The moderation service is temporarily unavailable; retry later."
+        }
+      ]
+    },
+    "input": {
+      "type": "object",
+      "description": "Request to retract an active local removal decision",
+      "required": [
+        "actionId",
+        "expectedVersion",
+        "idempotencyKey",
+        "reason"
+      ],
+      "properties": {
+        "actionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Opaque identifier of the local removal to retract; the service qualifier is implicit"
+        },
+        "expectedVersion": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Opaque subject-state version expected by the caller"
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Opaque key that makes equivalent restoration requests idempotent"
+        },
+        "reason": {
+          "type": "ref",
+          "ref": "social.coves.moderation.defs#reasonType",
+          "description": "Public reason classification for restoring the subject"
+        },
+        "reviewedSubject": {
+          "type": "ref",
+          "ref": "com.atproto.repo.strongRef",
+          "description": "Inspected current record; required when one exists and allowed absent when deleted or unavailable"
+        },
+        "privateNote": {
+          "type": "string",
+          "maxGraphemes": 1000,
+          "maxLength": 10000,
+          "description": "Private administrative note retained only on the admin action"
+        }
+      }
+    }
+  }
+}

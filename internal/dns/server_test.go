@@ -120,7 +120,7 @@ func requireBothSocketsAvailable(t *testing.T, address string) {
 	}, 2*time.Second, 10*time.Millisecond, "cancellation must release both UDP and TCP sockets")
 }
 
-func serveOnFreeDNSAddress(t *testing.T, ctx context.Context, handler miekgdns.Handler) (string, <-chan error) {
+func serveOnFreeDNSAddress(t *testing.T, ctx context.Context, handler *Handler) (string, <-chan error) {
 	t.Helper()
 	var (
 		address string
@@ -137,6 +137,99 @@ func serveOnFreeDNSAddress(t *testing.T, ctx context.Context, handler miekgdns.H
 	require.NoError(t, err)
 	require.NotNil(t, done)
 	return address, done
+}
+
+func TestServeUDPRateLimitAndTCPBypass(t *testing.T) {
+	options := handlerOptions(&recordingResolver{})
+	options.UDPResponseRate = 2
+	clock := newUDPRateLimitClock()
+	options.Now = clock.now
+	handler, err := NewHandler(options)
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(t.Context())
+	address, done := serveOnFreeDNSAddress(t, ctx, handler)
+	defer func() {
+		cancel()
+		requireClosedWithoutError(t, done)
+	}()
+
+	conn, err := net.Dial("udp", address)
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
+	require.NoError(t, conn.SetDeadline(time.Now().Add(2*time.Second)))
+	newRequest := func(id uint16) *miekgdns.Msg {
+		request := new(miekgdns.Msg)
+		request.SetQuestion("lemmy-world.tdpl.example.", miekgdns.TypeSOA)
+		request.Id = id
+		return request
+	}
+	send := func(request *miekgdns.Msg) {
+		t.Helper()
+		packed, err := request.Pack()
+		require.NoError(t, err)
+		_, err = conn.Write(packed)
+		require.NoError(t, err)
+	}
+	read := func() *miekgdns.Msg {
+		t.Helper()
+		buffer := make([]byte, 512)
+		count, err := conn.Read(buffer)
+		require.NoError(t, err)
+		response := new(miekgdns.Msg)
+		require.NoError(t, response.Unpack(buffer[:count]))
+		return response
+	}
+	for _, id := range []uint16{101, 102} {
+		send(newRequest(id))
+		response := read()
+		require.Equal(t, id, response.Id)
+		require.Equal(t, miekgdns.RcodeSuccess, response.Rcode)
+		require.False(t, response.Truncated)
+		require.Len(t, response.Answer, 1)
+		_, ok := response.Answer[0].(*miekgdns.SOA)
+		require.True(t, ok)
+	}
+
+	suppressedRequests := map[uint16]*miekgdns.Msg{
+		103: newRequest(103),
+		104: newRequest(104),
+	}
+	suppressedRequests[104].SetQuestion("lemmy-world.tdpl.example.", miekgdns.TypeNS)
+	suppressedRequests[104].Id = 104
+	send(suppressedRequests[103])
+	send(suppressedRequests[104])
+	response := read()
+	require.Contains(t, suppressedRequests, response.Id, "the first suppressed query is dropped; the second slips")
+	require.True(t, response.Response, "a slip reply without the QR bit is discarded by resolvers")
+	require.True(t, response.Truncated)
+	require.Equal(t, miekgdns.RcodeSuccess, response.Rcode)
+	require.Equal(t, suppressedRequests[response.Id].Question, response.Question)
+	require.Empty(t, response.Answer)
+	require.Empty(t, response.Ns)
+	require.Empty(t, response.Extra)
+
+	for connection := range 2 {
+		request := newRequest(uint16(201 + connection*10))
+		tcp, firstResponse := dialTCPAndQuery(t, address, request)
+		require.Equal(t, request.Id, firstResponse.Id)
+		require.False(t, firstResponse.Truncated)
+		require.Len(t, firstResponse.Answer, 1)
+		_, ok := firstResponse.Answer[0].(*miekgdns.SOA)
+		require.True(t, ok)
+		for query := 1; query < 10; query++ {
+			request.Id = uint16(201 + connection*10 + query)
+			require.NoError(t, tcp.WriteMsg(request))
+			response, err := tcp.ReadMsg()
+			require.NoError(t, err)
+			require.Equal(t, request.Id, response.Id)
+			require.Equal(t, miekgdns.RcodeSuccess, response.Rcode)
+			require.False(t, response.Truncated)
+			require.Len(t, response.Answer, 1)
+			_, ok := response.Answer[0].(*miekgdns.SOA)
+			require.True(t, ok)
+		}
+		require.NoError(t, tcp.Close())
+	}
 }
 
 func requireClosedWithoutError(t *testing.T, done <-chan error) {
@@ -417,7 +510,7 @@ func TestServeConnsReportsEitherTransportFailure(t *testing.T) {
 }
 
 // dialTCPAndQuery opens a DNS TCP connection and checks it is served.
-func dialTCPAndQuery(t *testing.T, address string, request *miekgdns.Msg) *miekgdns.Conn {
+func dialTCPAndQuery(t *testing.T, address string, request *miekgdns.Msg) (*miekgdns.Conn, *miekgdns.Msg) {
 	t.Helper()
 	conn, err := miekgdns.Dial("tcp", address)
 	require.NoError(t, err)
@@ -427,7 +520,7 @@ func dialTCPAndQuery(t *testing.T, address string, request *miekgdns.Msg) *miekg
 	response, err := conn.ReadMsg()
 	require.NoError(t, err)
 	require.Equal(t, miekgdns.RcodeSuccess, response.Rcode)
-	return conn
+	return conn, response
 }
 
 func TestServeTCPLimitsConcurrentConnections(t *testing.T) {
@@ -441,7 +534,8 @@ func TestServeTCPLimitsConcurrentConnections(t *testing.T) {
 
 	held := make([]*miekgdns.Conn, 0, maxTCPConnections)
 	for range maxTCPConnections {
-		held = append(held, dialTCPAndQuery(t, address, request))
+		conn, _ := dialTCPAndQuery(t, address, request)
+		held = append(held, conn)
 	}
 
 	extra, err := miekgdns.Dial("tcp", address)

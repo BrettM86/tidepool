@@ -1,0 +1,17 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.notification.getPreferences",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Get notification preferences for the authenticated account.",
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "social.coves.notification.defs#preferences"
+        }
+      }
+    }
+  }
+}

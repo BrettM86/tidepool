@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"tidepool/internal/db"
+	"tidepool/internal/testutil"
 )
 
 // TestMigrations_UpDownUp proves every migration applies cleanly up AND
@@ -17,6 +18,9 @@ import (
 func TestMigrations_UpDownUp(t *testing.T) {
 	database := testDB(t) // already migrated up by the harness
 	ctx := context.Background()
+	// Other packages' tests leave identity events behind, and 035's Down
+	// refuses to drop them; the tables are torn down below anyway.
+	testutil.Truncate(t, database, "firehose_events")
 
 	require.NoError(t, db.MigrateDownTo(ctx, database, 0), "all down migrations must apply")
 
@@ -31,7 +35,9 @@ func TestMigrations_UpDownUp(t *testing.T) {
 		                     'consumer_cursors', 'jetstream_record_revs', 'jetstream_dead_letters',
 		                     'outbound_objects', 'outbound_votes', 'federation_prefs',
 		                     -- task 15 (migration 020): the outbound delivery queue.
-		                     'outbound_activities', 'outbound_deliveries')
+		                     'outbound_activities', 'outbound_deliveries',
+		                     -- migration 042: per-host nodeinfo discovery results.
+		                     'instances')
 	`).Scan(&remaining)
 	require.NoError(t, err)
 	assert.Zero(t, remaining, "down migrations must drop every Tidepool table")
@@ -54,6 +60,7 @@ func TestMigrations_UpDownUp(t *testing.T) {
 		{"federation_prefs", "018"},
 		{"outbound_activities", "020"},
 		{"outbound_deliveries", "020"},
+		{"instances", "042"},
 	} {
 		var exists bool
 		err = database.QueryRowContext(ctx, `
@@ -149,4 +156,44 @@ func TestMigrations_UniqueConstraintNames(t *testing.T) {
 		require.NoError(t, err)
 		assert.True(t, exists, "unique constraint/index %q must exist with exactly this name", name)
 	}
+}
+
+// TestMigration035_DownRefusesWithIdentityEvents pins that rolling 035 back
+// never discards relay-visible identity events: restoring 011's two-kind
+// CHECK is only lossless with no identity rows, so Down must refuse (and its
+// transaction leave the 035 schema intact) rather than delete them.
+func TestMigration035_DownRefusesWithIdentityEvents(t *testing.T) {
+	database := testDB(t) // already migrated up by the harness
+	ctx := context.Background()
+
+	var seq int64
+	err := database.QueryRowContext(ctx, `
+		INSERT INTO firehose_events (kind, did, identity_handle, created_at)
+		VALUES ('identity', $1, 'alice.lemmy.world.ap.tidepool.test', NOW())
+		RETURNING seq`, testDID).Scan(&seq)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		// Later tests share this database: drop the row and make sure the
+		// schema is back at the latest version whatever happened above.
+		_, err := database.ExecContext(ctx, `DELETE FROM firehose_events WHERE seq = $1`, seq)
+		assert.NoError(t, err)
+		assert.NoError(t, db.MigrateUp(ctx, database))
+	})
+
+	// 035 is the newest migration, so DownTo(34) runs exactly its Down.
+	require.Error(t, db.MigrateDownTo(ctx, database, 34),
+		"035 Down must refuse while identity events exist")
+
+	var handle string
+	err = database.QueryRowContext(ctx,
+		`SELECT identity_handle FROM firehose_events WHERE seq = $1 AND kind = 'identity'`, seq).Scan(&handle)
+	require.NoError(t, err, "the identity event must survive the refused Down")
+	assert.Equal(t, "alice.lemmy.world.ap.tidepool.test", handle)
+
+	var version int64
+	err = database.QueryRowContext(ctx, `
+		SELECT version_id FROM goose_db_version
+		WHERE is_applied ORDER BY id DESC LIMIT 1`).Scan(&version)
+	require.NoError(t, err)
+	assert.Equal(t, int64(35), version, "the refused Down must leave the schema at 035")
 }

@@ -89,6 +89,11 @@
           "type": "string",
           "format": "at-uri",
           "description": "AT-URI of the community acceptance record that admitted this post. Present only while an acceptance stands. Optional."
+        },
+        "moderation": {
+          "type": "ref",
+          "ref": "social.coves.moderation.defs#moderationView",
+          "description": "Active instance moderation state. NSFW contentLabels drive sensitivity presentation alongside record self-labels; a post that is only NSFW keeps its verbatim record."
         }
       }
     },
@@ -119,6 +124,21 @@
         "reputation": {
           "type": "integer",
           "description": "Author's reputation in the community"
+        },
+        "origin": {
+          "type": "string",
+          "maxLength": 253,
+          "description": "Bridge-written home instance hostname (e.g. lemmy.world); display only. maxLength counts UTF-8 bytes."
+        },
+        "originUsername": {
+          "type": "string",
+          "maxLength": 256,
+          "description": "Bridge-written username on the home instance; display only. maxLength counts UTF-8 bytes."
+        },
+        "originSoftware": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "Bridge-written home instance software; display only. maxLength counts UTF-8 bytes."
         }
       }
     },
@@ -173,7 +193,7 @@
     },
     "removedPost": {
       "type": "object",
-      "description": "Post was removed by its own community's moderators. Served as a tombstone carrying the removal code — distinct from notFoundPost (which is indistinguishable from 'never existed') so a client can explain the takedown to the author.",
+      "description": "The community's own removal decision. Served as a tombstone carrying the removal code, distinct from notFoundPost (which is indistinguishable from 'never existed'); instance moderation is served as moderatedPost.",
       "required": [
         "uri",
         "removed"
@@ -194,9 +214,44 @@
         }
       }
     },
+    "moderatedPost": {
+      "type": "object",
+      "description": "Instance-scoped or inherited removal tombstone, distinct from removedPost (the community's own decision); carries no content.",
+      "required": [
+        "uri",
+        "moderation"
+      ],
+      "properties": {
+        "uri": {
+          "type": "string",
+          "format": "at-uri",
+          "description": "AT-URI of the removed post"
+        },
+        "moderation": {
+          "type": "ref",
+          "ref": "social.coves.moderation.defs#moderationView",
+          "description": "Public moderation state establishing the instance-scoped or inherited removal"
+        },
+        "authorDid": {
+          "type": "string",
+          "format": "did",
+          "description": "DID of the post author when it can be projected without content"
+        },
+        "community": {
+          "type": "ref",
+          "ref": "#communityRef",
+          "description": "Community context for the removed post when available"
+        },
+        "viewer": {
+          "type": "ref",
+          "ref": "#moderatedPostViewerState",
+          "description": "Viewer-specific state; carries the moderation actions the viewer may take on the removed post"
+        }
+      }
+    },
     "blockedPost": {
       "type": "object",
-      "description": "Post is blocked due to viewer blocking author/community, or community moderation",
+      "description": "Post is hidden from this viewer because the viewer blocked its author. Community blocks mute aggregate feeds only and never produce this member (permalinks stay reachable); the community's own removal decision is served as removedPost, while instance moderation is served as moderatedPost.",
       "required": [
         "uri",
         "blocked"
@@ -217,7 +272,7 @@
             "community",
             "moderator"
           ],
-          "description": "What caused the block: viewer blocked author, viewer blocked community, or post was removed by moderators",
+          "description": "What caused the block. The AppView emits only 'author' (the viewer blocked the post's author). 'community' is reserved and not emitted: a community block mutes aggregate feeds, not permalinks. 'moderator' is not emitted either; the community's own removal decision is served as removedPost, while instance moderation is served as moderatedPost.",
           "maxLength": 64
         },
         "author": {
@@ -325,6 +380,40 @@
             "type": "string",
             "maxGraphemes": 64,
             "maxLength": 640
+          }
+        },
+        "moderation": {
+          "type": "array",
+          "description": "Moderation actions the viewer may take on this post, using the modlog action tokens. Omitted when there are none.",
+          "items": {
+            "type": "string",
+            "knownValues": [
+              "remove",
+              "restore",
+              "label",
+              "retract-label"
+            ],
+            "maxLength": 64
+          }
+        }
+      }
+    },
+    "moderatedPostViewerState": {
+      "type": "object",
+      "description": "Viewer state on a moderatedPost tombstone. Carries only moderation actions; the tombstone has no content to vote on, save or tag.",
+      "properties": {
+        "moderation": {
+          "type": "array",
+          "description": "Moderation actions the viewer may take on the removed post, using the modlog action tokens. Omitted when there are none.",
+          "items": {
+            "type": "string",
+            "knownValues": [
+              "remove",
+              "restore",
+              "label",
+              "retract-label"
+            ],
+            "maxLength": 64
           }
         }
       }

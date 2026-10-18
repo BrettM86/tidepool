@@ -116,7 +116,7 @@ func (d *Dispatcher) applyCommentWrite(ctx context.Context, tx *sql.Tx, did stri
 	// renderer depends on are enforced here, before any state or identity
 	// exists for it. PERMANENT: the record cannot shrink on a retry, and an
 	// update that fails leaves the last accepted snapshot in place.
-	if err := apobject.CheckRecordLimits(commit.Record); err != nil {
+	if err := apobject.CheckCommentRecordLimits(commit.Record); err != nil {
 		return fmt.Errorf("%w: comment %s: %w", ErrPermanentEvent, atURI, err)
 	}
 

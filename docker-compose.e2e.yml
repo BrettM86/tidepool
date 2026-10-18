@@ -106,6 +106,10 @@ services:
       POSTGRES_USER: tidepool
       POSTGRES_PASSWORD: tidepool
     networks: [tidepool-e2e]
+    # Published on loopback for the rename e2e fixture, which reads the sealed
+    # escrow rotation key and rewrites an actor to an old-format handle.
+    ports:
+      - "127.0.0.1:${TIDEPOOL_E2E_PG_PORT:-5453}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U tidepool -d tidepool"]
       interval: 2s
@@ -148,6 +152,7 @@ services:
       ALLOW_PRIVATE_FETCH: "1"
       PLC_DIRECTORY_URL: http://plc:3000
       ADMIN_TOKEN: e2e-admin-token
+      HANDLE_MIGRATION_RATE: "1"
       SEED_COUNTS_FROM_API: "1"
       # Short stats-refresh interval (default 30s) so the vote scenarios
       # actually exercise the bridged-vote-stats refresher: within ~2s of a
@@ -274,6 +279,10 @@ services:
       NODE_ENV: development
       PORT: 3000
     networks: [tidepool-e2e]
+    # Published on loopback so e2e tests can read /log/last and submit the
+    # rename fixture's PLC operation.
+    ports:
+      - "127.0.0.1:${PLC_E2E_PORT:-3012}:3000"
     depends_on:
       plc-postgres:
         condition: service_healthy

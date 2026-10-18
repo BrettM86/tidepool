@@ -89,6 +89,23 @@ sanctioned side-channel XRPC. Nothing ever strongRefs a vote.
    actors for Coves users, key claiming/migration for bridged users
    (escrow the keys, build claiming later), moderation federation, DMs,
    PieFed/Mbin quirk testing (target the FEP; verify against Lemmy only).
+
+New bridged atproto handles use `<user label>.<instance host>.<HANDLE_ZONE_ROOT>`
+(for example, `alice.lemmy.world.ap.tdpl.io`). The instance host is lowercased
+with dots kept and ports dropped. The user label normalizes ASCII names;
+non-ASCII names with no ASCII letters or digits use an IDNA punycode label
+when valid, otherwise a stable hash label. A community (group) label gets a
+`c-` prefix (`c-technology.lemmy.world.ap.tdpl.io`); a user label that would
+start with `c-` gets `u-` in front (`u-c-technology.lemmy.world.ap.tdpl.io`).
+The prefix counts toward the 63-character label limit. Same-host collisions
+get `-2`, `-3`, and so on at the end of the label (`c-technology-2`). Collisions
+come from usernames that normalize alike, and from a `u-` prefixed label
+meeting a user whose own label already reads `u-c-...` (`u_c_tech` and
+`c_tech` both want `u-c-tech`; the later one gets `u-c-tech-2`). A user
+labelled `c` whose handle collides gets `u-c-2`. A punycode label is never
+suffixed or truncated (that breaks its decoding): when it collides or does
+not fit, the hash label is used.
+
 ## v2 — Scope A write-back (added 2026-07-17)
 
 Opted-in Coves users participate in bridged Lemmy communities in both

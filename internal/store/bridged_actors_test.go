@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lib/pq"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -331,14 +332,14 @@ func TestBridgedActors_MarkProfileSynced(t *testing.T) {
 	assert.Nil(t, stored.ProfileSyncedAt)
 
 	syncedAt := time.Date(2026, 6, 1, 8, 30, 0, 0, time.UTC)
-	require.NoError(t, repo.MarkProfileSynced(ctx, testAPActorID, syncedAt))
+	require.NoError(t, repo.MarkProfileSynced(ctx, testAPActorID, syncedAt, ""))
 
 	actor, err := repo.GetByAPActorID(ctx, testAPActorID)
 	require.NoError(t, err)
 	require.NotNil(t, actor.ProfileSyncedAt)
 	assert.True(t, actor.ProfileSyncedAt.Equal(syncedAt))
 
-	err = repo.MarkProfileSynced(ctx, "https://lemmy.world/u/nobody", syncedAt)
+	err = repo.MarkProfileSynced(ctx, "https://lemmy.world/u/nobody", syncedAt, "")
 	assert.True(t, errors.IsNotFound(err), "expected IsNotFound, got %v", err)
 }
 
@@ -367,7 +368,7 @@ func TestBridgedActors_DeleteActorRow(t *testing.T) {
 				require.NoError(t, err)
 			}
 
-			err := repo.DeleteActorRow(ctx, "https://lemmy.world/u/alice", testCase.deleteDID)
+			err := repo.DeleteActorRow(ctx, "https://lemmy.world/u/alice", testCase.deleteDID, nil)
 			if testCase.wantNotFound {
 				assert.True(t, errors.IsNotFound(err), "expected IsNotFound, got %v", err)
 			} else {
@@ -405,6 +406,8 @@ func TestBridgedActors_UpsertValidation(t *testing.T) {
 		// Consent must never default: the zero value failing open to
 		// "consented" would be a consent bug.
 		{"empty consent_state", func(a *BridgedActor) { a.ConsentState = "" }},
+		// Postgres TEXT cannot hold NUL; stored exactly as received or not at all.
+		{"NUL in preferred_username", func(a *BridgedActor) { a.PreferredUsername = "ali\x00ce" }},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -491,6 +494,41 @@ func TestBridgedActors_ListInstanceLabels(t *testing.T) {
 		{Label: "c", HasLiveActor: true},
 		{Label: "n", HasLiveActor: true},
 	}, labels)
+}
+
+func TestBridgedActors_NewFormatHandlesDoNotEnterInstanceLabels(t *testing.T) {
+	f := newQualificationFixture(t)
+	created := qualificationTime(t, "2026-09-01T09:00:00Z")
+	indexed := qualificationTime(t, "2026-09-01T10:00:00Z")
+	cutoff := qualificationTime(t, "2026-09-01T10:40:00Z")
+	f.community(qualificationCommunityDID, FollowStateAccepted)
+	for _, tc := range []struct {
+		handle, did, key string
+	}{
+		{"alice.lemmy-world.tdpl.example", qualificationAuthorDID, "oldformat"},
+		{"bob.lemmy.world.ap.tdpl.example", qualificationOtherDID, "deepnewformat"},
+		{"carol.lemmy-world.ap.tdpl.example", qualificationRootAuthorDID, "shallownewformat"},
+	} {
+		f.actor(tc.handle, tc.did, ConsentStateOK, created, ActorTypePerson)
+		f.mapping(qualificationMapping{
+			name: tc.key, authorDID: tc.did, did: tc.did,
+			collection: "social.coves.community.postv2", communityDID: qualificationCommunityDID,
+			indexedAt: indexed,
+		})
+	}
+
+	labels, err := f.actors.ListInstanceLabels(f.ctx, "tdpl.example")
+	require.NoError(t, err)
+	require.Equal(t, []InstanceLabel{{Label: "lemmy-world", HasLiveActor: true}}, labels)
+
+	apRows, err := f.actors.ListLabelContributions(f.ctx, "tdpl.example", "ap", cutoff, ContributionCursor{}, 100)
+	require.NoError(t, err)
+	require.Empty(t, apRows)
+
+	legacyRows, err := f.actors.ListLabelContributions(f.ctx, "tdpl.example", "lemmy-world", cutoff, ContributionCursor{}, 100)
+	require.NoError(t, err)
+	require.Len(t, legacyRows, 1)
+	require.Equal(t, "at://did:plc:000000000000000000000001/social.coves.community.postv2/oldformat", legacyRows[0].ATURI)
 }
 
 func TestBridgedActors_ListLabelContributionsFilters(t *testing.T) {
@@ -751,4 +789,171 @@ func TestBridgedActors_ListOutrightQualifiedLabelsGrandfather(t *testing.T) {
 			assert.True(t, got[0].QualifiedAt.Equal(want), "qualified_at: got %s, want %s", got[0].QualifiedAt, want)
 		})
 	}
+}
+
+const testPendingHandle = "alice.lemmy.world.ap.tidepool.example"
+
+func TestBridgedActors_HandleMigrationErrorConstraint(t *testing.T) {
+	for _, tc := range []struct {
+		code    string
+		allowed bool
+	}{
+		{code: "username_unavailable", allowed: true},
+		{code: "not_a_code", allowed: false},
+	} {
+		t.Run(tc.code, func(t *testing.T) {
+			db := testDB(t)
+			_, err := NewBridgedActors(db).UpsertActor(t.Context(), testActor())
+			require.NoError(t, err)
+			_, err = db.ExecContext(t.Context(),
+				`UPDATE bridged_actors SET handle_migration_error = $1 WHERE did = $2`, tc.code, testDID)
+			if tc.allowed {
+				require.NoError(t, err)
+				var stored string
+				require.NoError(t, db.QueryRowContext(t.Context(),
+					`SELECT handle_migration_error FROM bridged_actors WHERE did = $1`, testDID).Scan(&stored))
+				require.Equal(t, "username_unavailable", stored)
+				return
+			}
+			var postgresError *pq.Error
+			require.ErrorAs(t, err, &postgresError)
+			require.Equal(t, "23514", string(postgresError.Code))
+		})
+	}
+}
+
+func TestBridgedActors_SetPreferredUsernameByDIDSkipsTombstonedActor(t *testing.T) {
+	ctx := t.Context()
+	db := testDB(t)
+	repo := NewBridgedActors(db)
+	_, err := repo.UpsertActor(ctx, testActor())
+	require.NoError(t, err)
+
+	require.NoError(t, repo.SetPreferredUsernameByDID(ctx, testDID, "alice"))
+	live, err := repo.GetByDID(ctx, testDID)
+	require.NoError(t, err)
+	require.Equal(t, "alice", live.PreferredUsername)
+
+	require.NoError(t, repo.SetConsentState(ctx, testAPActorID, ConsentStateDeleted))
+	err = repo.SetPreferredUsernameByDID(ctx, testDID, "mallory")
+	require.Error(t, err)
+	require.True(t, errors.IsNotFound(err), "got %v", err)
+
+	var stored string
+	require.NoError(t, db.QueryRowContext(ctx,
+		`SELECT preferred_username FROM bridged_actors WHERE did = $1`, testDID).Scan(&stored))
+	require.Equal(t, "alice", stored)
+}
+
+type pendingRenameRow struct {
+	Handle, PendingHandle, PreviousHandle string
+	Migrated                              bool
+}
+
+func readPendingRenameRow(t *testing.T, db *sql.DB, did string) pendingRenameRow {
+	t.Helper()
+	var row pendingRenameRow
+	require.NoError(t, db.QueryRowContext(context.Background(), `SELECT COALESCE(handle, ''), COALESCE(pending_handle, ''),
+		COALESCE(previous_handle, ''), handle_migrated_at IS NOT NULL FROM bridged_actors WHERE did = $1`, did).
+		Scan(&row.Handle, &row.PendingHandle, &row.PreviousHandle, &row.Migrated))
+	return row
+}
+
+func pendingClaimCount(t *testing.T, db *sql.DB, handle string) int {
+	t.Helper()
+	var count int
+	require.NoError(t, db.QueryRowContext(context.Background(), `SELECT count(*) FROM handle_claims WHERE handle = $1`, handle).Scan(&count))
+	return count
+}
+
+func TestBridgedActors_SetPendingHandleRefusesDeletedActor(t *testing.T) {
+	db := testDB(t)
+	repo := NewBridgedActors(db)
+	ctx := context.Background()
+	_, err := repo.UpsertActor(ctx, testActor())
+	require.NoError(t, err)
+	require.NoError(t, repo.SetConsentState(ctx, testAPActorID, ConsentStateDeleted))
+
+	err = repo.SetPendingHandle(ctx, testDID, testPendingHandle)
+	assert.True(t, errors.IsTombstoned(err), "a deleted actor must not reserve a new handle, got %v", err)
+	assert.Empty(t, readPendingRenameRow(t, db, testDID).PendingHandle)
+	assert.Zero(t, pendingClaimCount(t, db, testPendingHandle))
+}
+
+func TestBridgedActors_SetPendingHandleClearsRecordedMigrationError(t *testing.T) {
+	db := testDB(t)
+	repo := NewBridgedActors(db)
+	ctx := context.Background()
+	_, err := repo.UpsertActor(ctx, testActor())
+	require.NoError(t, err)
+	require.NoError(t, repo.SetPendingHandle(ctx, testDID, testPendingHandle))
+	require.NoError(t, repo.RecordHandleMigrationError(ctx, testDID, HandleMigrationPLCRejected, "handle rejected by PLC"))
+
+	// The runner re-reserves the stored pending handle on every later attempt.
+	require.NoError(t, repo.SetPendingHandle(ctx, testDID, testPendingHandle))
+
+	var code, message sql.NullString
+	require.NoError(t, db.QueryRowContext(ctx, `SELECT handle_migration_error, handle_migration_message
+		FROM bridged_actors WHERE did = $1`, testDID).Scan(&code, &message))
+	assert.False(t, code.Valid, "a new reservation must clear the previous attempt's error code, got %q", code.String)
+	assert.False(t, message.Valid, "a new reservation must clear the previous attempt's error message, got %q", message.String)
+	assert.Equal(t, testPendingHandle, readPendingRenameRow(t, db, testDID).PendingHandle)
+}
+
+func TestBridgedActors_FinalizeHandleRenameClearsRecordedMigrationError(t *testing.T) {
+	db := testDB(t)
+	repo := NewBridgedActors(db)
+	ctx := context.Background()
+	_, err := repo.UpsertActor(ctx, testActor())
+	require.NoError(t, err)
+	require.NoError(t, repo.SetPendingHandle(ctx, testDID, testPendingHandle))
+	require.NoError(t, repo.RecordHandleMigrationError(ctx, testDID, HandleMigrationPLCRejected, "handle rejected by PLC"))
+
+	_, err = repo.FinalizeHandleRename(ctx, testDID, testPendingHandle, func(context.Context, *sql.Tx, *BridgedActor) error { return nil })
+	require.NoError(t, err)
+
+	var code, message sql.NullString
+	require.NoError(t, db.QueryRowContext(ctx, `SELECT handle_migration_error, handle_migration_message
+		FROM bridged_actors WHERE did = $1`, testDID).Scan(&code, &message))
+	assert.False(t, code.Valid, "a finalized rename must clear the error code, got %q", code.String)
+	assert.False(t, message.Valid, "a finalized rename must clear the error message, got %q", message.String)
+}
+
+func TestBridgedActors_FinalizeHandleRenameRefusesDeletedActor(t *testing.T) {
+	db := testDB(t)
+	repo := NewBridgedActors(db)
+	ctx := context.Background()
+	_, err := repo.UpsertActor(ctx, testActor())
+	require.NoError(t, err)
+	require.NoError(t, repo.SetPendingHandle(ctx, testDID, testPendingHandle))
+	require.NoError(t, repo.SetConsentState(ctx, testAPActorID, ConsentStateDeleted))
+	before := readPendingRenameRow(t, db, testDID)
+
+	called := false
+	renamed, err := repo.FinalizeHandleRename(ctx, testDID, testPendingHandle, func(context.Context, *sql.Tx, *BridgedActor) error {
+		called = true
+		return nil
+	})
+	assert.True(t, errors.IsTombstoned(err), "a deleted actor must not finalize a rename, got %v", err)
+	assert.Nil(t, renamed)
+	assert.False(t, called, "the finalize callback must not run for a deleted actor")
+	assert.Equal(t, before, readPendingRenameRow(t, db, testDID))
+	assert.Equal(t, 1, pendingClaimCount(t, db, testActor().Handle), "the live handle claim must be kept")
+}
+
+func TestBridgedActors_PendingHandleMustDifferFromHandle(t *testing.T) {
+	db := testDB(t)
+	repo := NewBridgedActors(db)
+	ctx := context.Background()
+	actor, err := repo.UpsertActor(ctx, testActor())
+	require.NoError(t, err)
+
+	err = repo.SetPendingHandle(ctx, testDID, actor.Handle)
+	assert.True(t, errors.IsValidation(err), "pending handle equal to the live handle must be rejected, got %v", err)
+	assert.Empty(t, readPendingRenameRow(t, db, testDID).PendingHandle)
+
+	_, err = db.ExecContext(ctx, `UPDATE bridged_actors SET pending_handle = handle WHERE did = $1`, testDID)
+	require.Error(t, err, "the schema must refuse a pending handle equal to the live handle")
+	assert.Contains(t, err.Error(), "check constraint")
+	assert.Equal(t, 1, pendingClaimCount(t, db, actor.Handle), "the live handle claim must be kept")
 }

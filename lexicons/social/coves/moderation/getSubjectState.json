@@ -1,0 +1,63 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.moderation.getSubjectState",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Get administrative moderation state without retained raw content. A syntactically valid URI in a supported collection has state even when never indexed, using recordState unavailable and an initial version; malformed or unsupported subjects return InvalidSubject, never SubjectNotFound. Instance authority and actor identity come from the authenticated service context, never request fields.",
+      "parameters": {
+        "type": "params",
+        "description": "Subject whose current moderation and repository state is requested",
+        "required": [
+          "subject"
+        ],
+        "properties": {
+          "subject": {
+            "type": "string",
+            "format": "at-uri",
+            "description": "AT-URI of the subject in a supported collection"
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#output"
+        }
+      },
+      "errors": [
+        {
+          "name": "AuthRequired",
+          "description": "Authentication is required; authenticate with an authorized service account before retrying."
+        },
+        {
+          "name": "Forbidden",
+          "description": "The authenticated actor lacks permission; do not retry unless its moderation authority changes."
+        },
+        {
+          "name": "InvalidSubject",
+          "description": "The subject URI is malformed or uses an unsupported collection; correct it before retrying."
+        },
+        {
+          "name": "ModerationUnavailable",
+          "description": "The moderation service is temporarily unavailable; retry later."
+        }
+      ]
+    },
+    "output": {
+      "type": "object",
+      "description": "Current moderation and repository state without retained raw subject content",
+      "required": [
+        "state"
+      ],
+      "properties": {
+        "state": {
+          "type": "ref",
+          "ref": "social.coves.moderation.defs#subjectState",
+          "description": "Authoritative current state for the requested subject"
+        }
+      }
+    }
+  }
+}

@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"tidepool/internal/ap"
+	"tidepool/internal/apobject"
 	"tidepool/internal/errors"
 	"tidepool/internal/store"
 )
@@ -166,7 +167,7 @@ func (m *Materializer) buildPostV2Record(ctx context.Context, page *ap.Object, c
 		"community": communityDID,
 		"createdAt": recordDatetime(page.Published.Time),
 	}
-	m.fillPostContent(ctx, record, page, repoDID)
+	m.fillPostContent(ctx, record, page, repoDID, apobject.MaximumPostContentGraphemes, apobject.MaximumPostContentBytes)
 	record["originalAuthor"] = originalAuthorOf(author, authorDoc)
 	record["federatedFrom"] = federatedFromOf(page)
 	return record
@@ -278,15 +279,18 @@ func (m *Materializer) buildPostRecord(ctx context.Context, page *ap.Object, com
 		"author":    authorDID,
 		"createdAt": recordDatetime(page.Published.Time),
 	}
-	m.fillPostContent(ctx, record, page, repoDID)
+	// The deprecated community.post lexicon keeps the 10000-grapheme /
+	// 100000-byte body limit postv2 has outgrown.
+	m.fillPostContent(ctx, record, page, repoDID, 10000, 100000)
 	return record
 }
 
 // fillPostContent adds the fields both post eras share — title, body and
-// facets, langs, self-labels, embed. Embed media is fetched into repoDID's
-// blob store (the repo holding the record); media failures degrade to a post
-// without the affected embed.
-func (m *Materializer) fillPostContent(ctx context.Context, record map[string]any, page *ap.Object, repoDID string) {
+// facets, langs, self-labels, embed. The body is truncated to the era's
+// lexicon limits. Embed media is fetched into repoDID's blob store (the repo
+// holding the record); media failures degrade to a post without the affected
+// embed.
+func (m *Materializer) fillPostContent(ctx context.Context, record map[string]any, page *ap.Object, repoDID string, maximumContentGraphemes, maximumContentBytes int) {
 	if page.Name != "" {
 		record["title"] = truncateText(page.Name, 300, 3000)
 	}
@@ -294,7 +298,7 @@ func (m *Materializer) fillPostContent(ctx context.Context, record map[string]an
 		// bridgedRichText can reduce an HTML-only body to nothing once tags
 		// are stripped; a post is still valid without content (title/embed
 		// carry it), so the field is simply omitted.
-		if body, facets := bridgedRichText(content, 10000, 100000); body != "" {
+		if body, facets := bridgedRichText(content, maximumContentGraphemes, maximumContentBytes); body != "" {
 			record["content"] = body
 			if len(facets) > 0 {
 				record["facets"] = facets

@@ -40,6 +40,16 @@
           "maxLength": 253,
           "description": "Instance this community actually lives on (hostname only, e.g. lemmy.world). Validated by the AppView at index time."
         },
+        "originUrl": {
+          "type": "string",
+          "format": "uri",
+          "description": "Bridge-written URL of the community on its home instance; display only."
+        },
+        "originSoftware": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "Bridge-written home instance software; display only. maxLength counts UTF-8 bytes."
+        },
         "avatar": {
           "type": "string",
           "format": "uri",
@@ -81,6 +91,10 @@
             "member": {
               "type": "boolean",
               "description": "Whether the viewer has membership status"
+            },
+            "blocked": {
+              "type": "boolean",
+              "description": "Whether the viewer blocks this community from aggregate feeds"
             }
           }
         }
@@ -123,6 +137,16 @@
           "type": "string",
           "maxLength": 253,
           "description": "Instance this community actually lives on (hostname only, e.g. lemmy.world). Validated by the AppView at index time."
+        },
+        "originUrl": {
+          "type": "string",
+          "format": "uri",
+          "description": "Bridge-written URL of the community on its home instance; display only."
+        },
+        "originSoftware": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "Bridge-written home instance software; display only. maxLength counts UTF-8 bytes."
         },
         "description": {
           "type": "string",
@@ -268,6 +292,10 @@
         "member": {
           "type": "boolean",
           "description": "Whether the viewer has membership status (AppView-computed)"
+        },
+        "blocked": {
+          "type": "boolean",
+          "description": "Whether the viewer blocks this community from aggregate feeds"
         },
         "reputation": {
           "type": "integer",

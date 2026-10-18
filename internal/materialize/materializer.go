@@ -24,6 +24,7 @@ import (
 	"expvar"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"time"
 
 	"github.com/bluesky-social/indigo/atproto/atdata"
@@ -33,6 +34,7 @@ import (
 	"tidepool/internal/ap"
 	"tidepool/internal/errors"
 	"tidepool/internal/identity"
+	"tidepool/internal/nodeinfo"
 	"tidepool/internal/repo"
 	"tidepool/internal/store"
 	"tidepool/lexicons"
@@ -214,7 +216,7 @@ type ModerationLedger interface {
 }
 
 // Options configures New. Fetcher, Objects, Actors, Communities, Repos,
-// Minter, and ServiceDID are required.
+// Minter, ServiceDID, Instances, and NodeInfoClient are required.
 type Options struct {
 	Fetcher     Fetcher
 	Objects     store.APObjects
@@ -257,6 +259,15 @@ type Options struct {
 	// validator disagreement, but it must be visible.
 	StrictValidation bool
 	Logger           *slog.Logger
+	// Instances stores per-host nodeinfo discovery results (required).
+	Instances store.Instances
+	// NodeInfoClient fetches nodeinfo documents (required).
+	NodeInfoClient *http.Client
+	// UserAgent is sent on nodeinfo requests.
+	UserAgent string
+	// NodeInfoDiscoveryDeadline bounds one host's discovery cycle
+	// (0 = nodeinfo.DefaultDiscoveryDeadline).
+	NodeInfoDiscoveryDeadline time.Duration
 }
 
 // Materializer translates AP objects into social.coves.* records.
@@ -276,7 +287,10 @@ type Materializer struct {
 	strict      bool
 	catalog     *lexicon.BaseCatalog
 	logger      *slog.Logger
-	now         func() time.Time // test seam for profile TTL
+	// software serves each origin host's nodeinfo software name for
+	// profiles' originSoftware.
+	software *nodeinfo.Cache
+	now      func() time.Time // test seam for profile TTL
 	// deleteBlob deletes one blob by (did, cid); defaults to repos.DeleteBlob.
 	// A test seam so the scrub's retryable-error path can be exercised
 	// without a real storage failure.
@@ -313,6 +327,12 @@ func New(opts Options) (*Materializer, error) {
 	if _, err := syntax.ParseDID(opts.ServiceDID); err != nil {
 		return nil, errors.NewValidationError("service_did", err.Error())
 	}
+	if opts.Instances == nil {
+		return nil, errors.NewValidationError("instances", "must not be nil")
+	}
+	if opts.NodeInfoClient == nil {
+		return nil, errors.NewValidationError("node_info_client", "must not be nil")
+	}
 	catalog, err := lexicons.Catalog()
 	if err != nil {
 		return nil, err
@@ -320,6 +340,19 @@ func New(opts Options) (*Materializer, error) {
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.Default()
+	}
+	nodeInfoFetcher, err := nodeinfo.NewFetcher(opts.NodeInfoClient, opts.UserAgent)
+	if err != nil {
+		return nil, err
+	}
+	software, err := nodeinfo.NewCache(nodeinfo.CacheOptions{
+		Fetcher:           nodeInfoFetcher,
+		Store:             opts.Instances,
+		DiscoveryDeadline: opts.NodeInfoDiscoveryDeadline,
+		Logger:            logger,
+	})
+	if err != nil {
+		return nil, err
 	}
 	m := &Materializer{
 		fetcher:     opts.Fetcher,
@@ -337,6 +370,7 @@ func New(opts Options) (*Materializer, error) {
 		strict:      opts.StrictValidation,
 		catalog:     catalog,
 		logger:      logger,
+		software:    software,
 		now:         time.Now,
 	}
 	m.deleteBlob = m.repos.DeleteBlob

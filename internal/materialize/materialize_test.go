@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/bluesky-social/indigo/atproto/atcrypto"
 	"github.com/bluesky-social/indigo/atproto/atdata"
@@ -134,6 +135,45 @@ type harness struct {
 	// hits counts GETs per served path (see hitCount).
 	hitsMu sync.Mutex
 	hits   map[string]int
+	// requests logs every request the fixture server received, matched or
+	// not (see fixtureRequests); nodeInfo maps a Host to its nodeinfo
+	// fixture (see serveNodeInfo).
+	requestsMu sync.Mutex
+	requests   []*fixtureRequest
+	nodeInfoMu sync.Mutex
+	nodeInfo   map[string]http.Handler
+}
+
+// fixtureRequest is one request seen at the fixture server boundary.
+// Status stays 0 while the handler is still running.
+type fixtureRequest struct {
+	Host, Path string
+	Status     int
+}
+
+// statusRecorder captures the status a fixture handler wrote.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	if s.status == 0 {
+		s.status = code
+	}
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusRecorder) Write(b []byte) (int, error) {
+	if s.status == 0 {
+		s.status = http.StatusOK
+	}
+	return s.ResponseWriter.Write(b)
+}
+
+// withNodeInfoDiscoveryDeadline sets the materializer's nodeinfo deadline.
+func withNodeInfoDiscoveryDeadline(d time.Duration) func(*Options) {
+	return func(o *Options) { o.NodeInfoDiscoveryDeadline = d }
 }
 
 // recordingScrubber records ScrubVoter calls (the task-11 vote-scrub hook).
@@ -157,12 +197,13 @@ func (r *recordingScrubber) calls() []string {
 
 // newHarness wires the full materialization stack over the real test
 // database and a local fixture server standing in for the fediverse.
-func newHarness(t *testing.T) *harness {
+// configure adjusts the materializer options before New.
+func newHarness(t *testing.T, configure ...func(*Options)) *harness {
 	t.Helper()
 	database := testutil.DB(t)
 	testutil.Truncate(t, database,
 		"ap_objects", "bridged_actors", "communities",
-		"blocks", "repo_state", "firehose_events", "blobs")
+		"blocks", "repo_state", "firehose_events", "blobs", "instances")
 
 	custodian, err := identity.NewCustodian(testKEK)
 	require.NoError(t, err)
@@ -173,8 +214,26 @@ func newHarness(t *testing.T) *harness {
 	require.NoError(t, err)
 
 	mux := http.NewServeMux()
-	fixtures := httptest.NewServer(mux)
+	h := &harness{t: t, mux: mux, hits: map[string]int{}, nodeInfo: map[string]http.Handler{}}
+	// Every request is logged at the server boundary, including the ones
+	// the mux answers with its default 404.
+	fixtures := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		entry := &fixtureRequest{Host: r.Host, Path: r.URL.Path}
+		h.requestsMu.Lock()
+		h.requests = append(h.requests, entry)
+		h.requestsMu.Unlock()
+		recorder := &statusRecorder{ResponseWriter: w}
+		mux.ServeHTTP(recorder, r)
+		status := recorder.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		h.requestsMu.Lock()
+		entry.Status = status
+		h.requestsMu.Unlock()
+	}))
 	t.Cleanup(fixtures.Close)
+	h.fixtures = fixtures
 
 	client := ap.NewClient(ap.ClientOptions{
 		HTTPClient:            &http.Client{Transport: rewriteTransport{target: fixtures.Listener.Addr().String()}},
@@ -186,7 +245,7 @@ func newHarness(t *testing.T) *harness {
 
 	scrubbed := &recordingScrubber{}
 	minter := &fakeMinter{custodian: custodian}
-	m, err := New(Options{
+	options := Options{
 		Fetcher:          client,
 		Objects:          objects,
 		Actors:           actors,
@@ -196,15 +255,35 @@ func newHarness(t *testing.T) *harness {
 		Votes:            scrubbed,
 		ServiceDID:       testServiceDID,
 		StrictValidation: true, // tests always validate against the vendored lexicons
-	})
+		Instances:        store.NewInstances(database),
+		// Same rewrite as the AP client: nodeinfo discovery for any host
+		// lands on the fixture server, never the network.
+		NodeInfoClient: &http.Client{Transport: rewriteTransport{target: fixtures.Listener.Addr().String()}},
+		UserAgent:      "tidepool-test/1.0",
+	}
+	for _, apply := range configure {
+		apply(&options)
+	}
+	m, err := New(options)
 	require.NoError(t, err)
 
-	h := &harness{
-		t: t, m: m, manager: manager,
-		objects: objects, actors: actors, communities: communities, minter: minter,
-		mux: mux, fixtures: fixtures, scrubbed: scrubbed,
-		hits: map[string]int{},
+	h.m, h.manager = m, manager
+	h.objects, h.actors, h.communities, h.minter = objects, actors, communities, minter
+	h.scrubbed = scrubbed
+	// Nodeinfo fixtures are per Host, but mux patterns are path-only: one
+	// dispatcher serves both nodeinfo paths and 404s hosts with no fixture.
+	nodeInfoDispatch := func(w http.ResponseWriter, r *http.Request) {
+		h.nodeInfoMu.Lock()
+		handler, ok := h.nodeInfo[r.Host]
+		h.nodeInfoMu.Unlock()
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		handler.ServeHTTP(w, r)
 	}
+	mux.HandleFunc("/.well-known/nodeinfo", nodeInfoDispatch)
+	mux.HandleFunc(nodeInfoDocumentPath, nodeInfoDispatch)
 	// Every pictrs-style image path serves fixed bytes by extension.
 	mux.HandleFunc("/pictrs/image/", func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, ".jpeg") || strings.HasSuffix(r.URL.Path, ".jpg") {
@@ -250,6 +329,73 @@ func (h *harness) hitCount(path string) int {
 	h.hitsMu.Lock()
 	defer h.hitsMu.Unlock()
 	return h.hits[path]
+}
+
+// nodeInfoDocumentPath is where nodeinfo fixtures serve the linked
+// schema-2.0 document.
+const nodeInfoDocumentPath = "/nodeinfo/2.0"
+
+// nodeInfoFixture answers nodeinfo discovery the way a Lemmy instance
+// does: the well-known listing links a 2.0 document naming software.
+func nodeInfoFixture(software string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/.well-known/nodeinfo":
+			_ = json.NewEncoder(w).Encode(map[string]any{"links": []any{map[string]any{
+				"rel":  "http://nodeinfo.diaspora.software/ns/schema/2.0",
+				"href": "https://" + r.Host + nodeInfoDocumentPath,
+			}}})
+		default:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"version":   "2.0",
+				"software":  map[string]any{"name": software, "version": "0.19.0"},
+				"protocols": []any{"activitypub"},
+			})
+		}
+	})
+}
+
+// serveNodeInfo makes host answer nodeinfo discovery with software,
+// replacing any earlier nodeinfo fixture for host.
+func (h *harness) serveNodeInfo(host, software string) {
+	h.serveNodeInfoHandler(host, nodeInfoFixture(software))
+}
+
+// serveNodeInfoHandler routes both nodeinfo paths for host to handler.
+func (h *harness) serveNodeInfoHandler(host string, handler http.Handler) {
+	h.nodeInfoMu.Lock()
+	defer h.nodeInfoMu.Unlock()
+	h.nodeInfo[host] = handler
+}
+
+// fixtureRequests is every request the fixture server has received so
+// far, in arrival order.
+func (h *harness) fixtureRequests() []fixtureRequest {
+	h.requestsMu.Lock()
+	defer h.requestsMu.Unlock()
+	out := make([]fixtureRequest, 0, len(h.requests))
+	for _, entry := range h.requests {
+		out = append(out, *entry)
+	}
+	return out
+}
+
+// requestCount is how many requests for path arrived with Host host.
+func (h *harness) requestCount(host, path string) int {
+	count := 0
+	for _, entry := range h.fixtureRequests() {
+		if entry.Host == host && entry.Path == path {
+			count++
+		}
+	}
+	return count
+}
+
+// nodeInfoRequestCount is how many nodeinfo requests (well-known listing
+// plus linked document) arrived for host.
+func (h *harness) nodeInfoRequestCount(host string) int {
+	return h.requestCount(host, "/.well-known/nodeinfo") + h.requestCount(host, nodeInfoDocumentPath)
 }
 
 // serveLemmyWorldFixtures registers the standard page/person/group trio.

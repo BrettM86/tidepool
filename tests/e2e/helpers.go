@@ -27,7 +27,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base32"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -49,7 +52,13 @@ import (
 	"github.com/bluesky-social/indigo/atproto/syntax"
 	indigoevents "github.com/bluesky-social/indigo/events"
 	"github.com/gorilla/websocket"
+	"github.com/ipfs/go-cid"
+	_ "github.com/lib/pq"
+	"github.com/miekg/dns"
+	"github.com/multiformats/go-multihash"
 
+	"tidepool/internal/identity"
+	"tidepool/internal/store"
 	"tidepool/lexicons"
 )
 
@@ -67,6 +76,7 @@ func envOr(name, fallback string) string {
 func tidepoolURL() string { return envOr("TIDEPOOL_E2E_URL", "http://localhost:8092") }
 func lemmyURL() string    { return envOr("LEMMY_E2E_URL", "http://localhost:8541") }
 func relayURL() string    { return envOr("RELAY_E2E_URL", "http://localhost:2480") }
+func plcE2EURL() string   { return "http://127.0.0.1:" + envOr("PLC_E2E_PORT", "3012") }
 func dnsAddress() string  { return "127.0.0.1:" + envOr("TIDEPOOL_E2E_DNS_PORT", "5380") }
 
 // dnsPublicIPv4 is the A answer the e2e Tidepool serves. It must match
@@ -998,8 +1008,17 @@ func (h *harness) bridgeGetRepoStatus(did string) (repoStatus, xrpcResult, error
 // subscribeRepos (live tail — no cursor), for asserting frames Jetstream's
 // JSON view abstracts away. The caller reads with readBridgeAccountFrame.
 func (h *harness) dialBridgeFirehose(t *testing.T) *websocket.Conn {
+	return h.dialBridgeFirehoseCursor(t, "")
+}
+
+// dialBridgeFirehoseCursor replays the bridge's own subscribeRepos from a
+// cursor; cursor "0" includes the complete retained history.
+func (h *harness) dialBridgeFirehoseCursor(t *testing.T, cursor string) *websocket.Conn {
 	t.Helper()
 	wsURL := "ws" + strings.TrimPrefix(tidepoolURL(), "http") + "/xrpc/com.atproto.sync.subscribeRepos"
+	if cursor != "" {
+		wsURL += "?" + url.Values{"cursor": {cursor}}.Encode()
+	}
 	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	if resp != nil && resp.Body != nil {
 		defer func() { _ = resp.Body.Close() }()
@@ -1011,20 +1030,34 @@ func (h *harness) dialBridgeFirehose(t *testing.T) *websocket.Conn {
 	return conn
 }
 
-// readBridgeAccountFrame consumes the bridge's CBOR event stream until an
-// #account frame for did arrives (skipping #commit and #info frames), or
-// fails the test at the deadline. Uses indigo's frame decoder — the exact
-// bytes a relay consumes.
-func readBridgeAccountFrame(t *testing.T, conn *websocket.Conn, did string, timeout time.Duration) *comatproto.SyncSubscribeRepos_Account {
+func (h *harness) dialRelayFirehoseCursor(t *testing.T, cursor string) *websocket.Conn {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
+	u := "ws" + strings.TrimPrefix(relayURL(), "http") + "/xrpc/com.atproto.sync.subscribeRepos"
+	if cursor != "" {
+		u += "?" + url.Values{"cursor": {cursor}}.Encode()
+	}
+	conn, response, err := websocket.DefaultDialer.Dial(u, nil)
+	if response != nil && response.Body != nil {
+		defer response.Body.Close()
+	}
+	if err != nil {
+		t.Fatalf("dial relay firehose %s: %v", u, err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return conn
+}
+
+// readBridgeFrame reads one decoded binary frame under the caller's absolute
+// deadline, so unrelated replayed events cannot extend the wait indefinitely.
+func readBridgeFrame(t *testing.T, conn *websocket.Conn, deadline time.Time) *indigoevents.XRPCStreamEvent {
+	t.Helper()
 	for {
 		if err := conn.SetReadDeadline(deadline); err != nil {
 			t.Fatalf("bridge firehose: set read deadline: %v", err)
 		}
 		msgType, payload, err := conn.ReadMessage()
 		if err != nil {
-			t.Fatalf("bridge firehose: no #account frame for %s within %s: %v", did, timeout, err)
+			t.Fatalf("bridge firehose: no frame before deadline: %v", err)
 		}
 		if msgType != websocket.BinaryMessage {
 			continue
@@ -1033,6 +1066,40 @@ func readBridgeAccountFrame(t *testing.T, conn *websocket.Conn, did string, time
 		if err := evt.Deserialize(bytes.NewReader(payload)); err != nil {
 			t.Fatalf("bridge firehose: undecodable frame: %v", err)
 		}
+		return &evt
+	}
+}
+
+func awaitIdentityFrames(t *testing.T, conn *websocket.Conn, handles map[string]string, after map[string]int64) map[string]int64 {
+	t.Helper()
+	seen := make(map[string]int64, len(handles))
+	deadline := time.Now().Add(eventTimeout)
+	for len(seen) < len(handles) {
+		frame := readBridgeFrame(t, conn, deadline)
+		if frame.Error != nil {
+			t.Fatalf("identity firehose error: %s", frame.Error.Error)
+		}
+		if frame.RepoInfo != nil && frame.RepoInfo.Name == "OutdatedCursor" {
+			t.Fatal("identity firehose cursor was pruned")
+		}
+		if identity := frame.RepoIdentity; identity != nil && identity.Handle != nil {
+			if wanted, ok := handles[identity.Did]; ok && wanted == *identity.Handle && identity.Seq > after[identity.Did] {
+				seen[identity.Did] = identity.Seq
+			}
+		}
+	}
+	return seen
+}
+
+// readBridgeAccountFrame consumes the bridge's CBOR event stream until an
+// #account frame for did arrives (skipping #commit and #info frames), or
+// fails the test at the deadline. Uses indigo's frame decoder — the exact
+// bytes a relay consumes.
+func readBridgeAccountFrame(t *testing.T, conn *websocket.Conn, did string, timeout time.Duration) *comatproto.SyncSubscribeRepos_Account {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		evt := readBridgeFrame(t, conn, deadline)
 		if evt.RepoAccount != nil && evt.RepoAccount.Did == did {
 			return evt.RepoAccount
 		}
@@ -1099,12 +1166,10 @@ func (h *harness) bridgeResolveHandle(t *testing.T, handle string) (did string, 
 	return did, res
 }
 
-// bridgedHandle predicts the bridge handle (task-03 shape:
-// name.instance.BRIDGE_HOSTNAME) for a uniqueName-generated Lemmy username
-// ONLY — [a-z0-9_], ≤20 chars. Its sanitizer is a simplification of
-// production normalizeLabel (which additionally collapses dash runs, trims
-// edge dashes, and truncates to 63 chars); the two agree on uniqueName's
-// output but NOT on arbitrary usernames — do not feed it any other input.
+// bridgedHandle predicts the bridge handle (normalized-name.lemmy.ap.BRIDGE_HOSTNAME)
+// for a uniqueName-generated Lemmy username ONLY — [a-z0-9_], ≤20 chars.
+// Its sanitizer agrees with production on those names; longer or non-ASCII
+// usernames require additional normalization and are outside this helper.
 // The suite's uniqueName usernames also make collision suffixes (-2, -3…)
 // impossible within a run.
 func bridgedHandle(username string) string {
@@ -1112,7 +1177,7 @@ func bridgedHandle(username string) string {
 	dash := false
 	for _, r := range strings.ToLower(username) {
 		switch {
-		case (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-':
+		case (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'):
 			b.WriteRune(r)
 			dash = false
 		default:
@@ -1122,7 +1187,14 @@ func bridgedHandle(username string) string {
 			}
 		}
 	}
-	return b.String() + ".lemmy." + bridgeHostname()
+	return strings.Trim(b.String(), "-") + ".lemmy.ap." + bridgeHostname()
+}
+
+// bridgedCommunityHandle predicts a bridged Lemmy community's handle: the
+// bridgedHandle label with the "c-" community prefix. Same input limits as
+// bridgedHandle.
+func bridgedCommunityHandle(name string) string {
+	return "c-" + bridgedHandle(name)
 }
 
 // bridgeRecord is one record read back from the bridge's repo surface.
@@ -1403,18 +1475,17 @@ func (h *harness) relayGetLatestCommit(did string) (cid, rev string, err error) 
 
 // ── Jetstream WebSocket listener ───────────────────────────────────────────
 
-// jsEvent is Jetstream's JSON event shape. Only the "commit" kind is
-// decoded in full: the bridge still emits no identity/account frames, but
-// the reference PDS does — registering the native account puts #identity and
-// #account on the firehose (plus a #sync frame Jetstream does not surface as
-// a kind of its own) — so a listener can no longer assume every frame is a
-// commit. Commit is a POINTER for exactly that reason: it is nil on those
-// kinds, vetEvent returns early on them, and await skips them.
+// jsEvent is Jetstream's JSON event shape. Commit is a pointer because
+// identity and account frames carry no commit; await still matches only
+// commits, while awaitIdentity reads the relay's identity payload.
 type jsEvent struct {
-	Did    string    `json:"did"`
-	TimeUs int64     `json:"time_us"`
-	Kind   string    `json:"kind"`
-	Commit *jsCommit `json:"commit"`
+	Did      string    `json:"did"`
+	TimeUs   int64     `json:"time_us"`
+	Kind     string    `json:"kind"`
+	Commit   *jsCommit `json:"commit"`
+	Identity *struct {
+		Handle string `json:"handle"`
+	} `json:"identity"`
 }
 
 type jsCommit struct {
@@ -1807,7 +1878,7 @@ func bridgedStatsAsOfParses(record json.RawMessage) bool {
 func (l *jsListener) await(desc string, pred func(*jsEvent) bool) *jsEvent {
 	l.t.Helper()
 	for i, ev := range l.pending {
-		if pred(ev) {
+		if ev.Kind == kindCommit && ev.Commit != nil && pred(ev) {
 			copy(l.pending[i:], l.pending[i+1:])
 			l.pending[len(l.pending)-1] = nil // let the shifted-out *jsEvent GC
 			l.pending = l.pending[:len(l.pending)-1]
@@ -1842,6 +1913,210 @@ func (l *jsListener) await(desc string, pred func(*jsEvent) bool) *jsEvent {
 			l.t.Fatalf("await %s: no matching jetstream event within %s", desc, eventTimeout)
 			return nil
 		}
+	}
+}
+
+// awaitIdentity keeps commit predicates in await untouched while allowing a
+// caller to consume identity events twice on the same connection.
+func (l *jsListener) awaitIdentity(desc, did, handle string, after int64) *jsEvent {
+	l.t.Helper()
+	match := func(ev *jsEvent) bool {
+		return ev.Did == did && ev.Kind == "identity" && ev.Identity != nil &&
+			ev.Identity.Handle == handle && ev.TimeUs > after
+	}
+	for i, ev := range l.pending {
+		if match(ev) {
+			l.pending = append(l.pending[:i], l.pending[i+1:]...)
+			return ev
+		}
+	}
+	timer := time.NewTimer(eventTimeout)
+	defer timer.Stop()
+	for {
+		select {
+		case ev, ok := <-l.events:
+			if !ok {
+				l.t.Fatalf("await %s: jetstream closed: %v", desc, l.readError())
+				return nil
+			}
+			l.vetEvent(ev)
+			if match(ev) {
+				return ev
+			}
+			if ev.Kind == kindCommit && ev.Commit != nil || ev.Kind == "identity" {
+				l.pending = append(l.pending, ev)
+			}
+		case <-timer.C:
+			l.t.Fatalf("await %s: no matching jetstream identity within %s", desc, eventTimeout)
+			return nil
+		}
+	}
+}
+
+func queryHandleTXT(t *testing.T, handle string) *dns.Msg {
+	t.Helper()
+	request := new(dns.Msg)
+	request.SetQuestion("_atproto."+handle+".", dns.TypeTXT)
+	response, _, err := (&dns.Client{Net: "udp", Timeout: 2 * time.Second}).Exchange(request, dnsAddress())
+	if err != nil {
+		t.Fatalf("TXT query for %s: %v", handle, err)
+	}
+	return response
+}
+
+func (h *harness) wellKnownDID(t *testing.T, handle string) (int, string) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, tidepoolURL()+"/.well-known/atproto-did", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = handle
+	response, err := h.http.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return response.StatusCode, strings.TrimSpace(string(body))
+}
+
+func (h *harness) plcLastOperation(t *testing.T, did string) map[string]any {
+	t.Helper()
+	response, err := h.http.Get(plcE2EURL() + "/" + did + "/log/last")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("PLC last op for %s: status %d", did, response.StatusCode)
+	}
+	var operation map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&operation); err != nil {
+		t.Fatal(err)
+	}
+	return operation
+}
+
+func plcOperationCID(t *testing.T, operation map[string]any) string {
+	t.Helper()
+	encoded, err := atdata.MarshalCBOR(operation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := (cid.Prefix{Version: 1, Codec: cid.DagCBOR, MhType: multihash.SHA2_256, MhLength: 32}).Sum(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id.String()
+}
+
+// prepareOldFormatActor rewinds an already-minted actor on the real local PLC
+// and in Tidepool's DB. The signed update is deliberately built by the test.
+func (h *harness) prepareOldFormatActor(t *testing.T, did string) string {
+	t.Helper()
+	db, err := sql.Open("postgres", "postgres://tidepool:tidepool@127.0.0.1:"+envOr("TIDEPOOL_E2E_PG_PORT", "5453")+"/tidepool?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx, cancel := context.WithTimeout(t.Context(), eventTimeout)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var username, actorType, newHandle string
+	err = db.QueryRowContext(ctx, `SELECT preferred_username, actor_type, handle FROM bridged_actors WHERE did = $1`, did).Scan(&username, &actorType, &newHandle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if actorType != string(store.ActorTypePerson) && actorType != string(store.ActorTypeGroup) {
+		t.Fatalf("unsupported actor type %q", actorType)
+	}
+	// Lemmy permits '_' in names; the old DNS label replaced it with '-'.
+	old := strings.ReplaceAll(username, "_", "-") + ".lemmy." + bridgeHostname()
+	h.submitPLCHandleUpdate(t, db, did, old)
+	transaction, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer transaction.Rollback()
+	actorUpdate, err := transaction.ExecContext(ctx, `UPDATE bridged_actors SET handle = $1 WHERE did = $2`, old, did)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimUpdate, err := transaction.ExecContext(ctx, `UPDATE handle_claims SET handle = $1 WHERE handle = $2`, old, newHandle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actorCount, err := actorUpdate.RowsAffected()
+	if err != nil || actorCount != 1 {
+		t.Fatalf("fixture actor rows updated = %d, err = %v", actorCount, err)
+	}
+	claimCount, err := claimUpdate.RowsAffected()
+	if err != nil || claimCount != 1 {
+		t.Fatalf("fixture claim rows updated = %d, err = %v", claimCount, err)
+	}
+	if err = transaction.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	return old
+}
+
+// submitPLCHandleUpdate signs against the current local PLC head using the
+// bridge's escrow rotation key, then submits the operation to the real PLC.
+func (h *harness) submitPLCHandleUpdate(t *testing.T, db *sql.DB, did, handle string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), eventTimeout)
+	defer cancel()
+	kek, err := hex.DecodeString("9a80812a2a5e298fe6b36ba6ba99f33ca42a7a5b1cae7ff43a4b338bbbdd6a34")
+	if err != nil {
+		t.Fatal(err)
+	}
+	custodian, err := identity.NewCustodian(kek)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := store.NewServiceKeys(db)
+	if _, err := keys.Get(ctx, identity.RotationKeyName); err != nil {
+		t.Fatalf("rotation key must already exist for a minted actor: %v", err)
+	}
+	rotationKey, err := identity.LoadOrCreateRotationKey(ctx, db, keys, custodian)
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := h.plcLastOperation(t, did)
+	update := map[string]any{
+		"type": last["type"], "rotationKeys": last["rotationKeys"],
+		"verificationMethods": last["verificationMethods"], "services": last["services"],
+		"alsoKnownAs": []any{"at://" + handle}, "prev": plcOperationCID(t, last),
+	}
+	unsigned, err := atdata.MarshalCBOR(update)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signature, err := rotationKey.HashAndSign(unsigned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	update["sig"] = base64.RawURLEncoding.EncodeToString(signature)
+	body, err := json.Marshal(update)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := h.http.Post(plcE2EURL()+"/"+did, "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseBody, readErr := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if response.StatusCode/100 != 2 {
+		t.Fatalf("PLC fixture update: status %d: %s", response.StatusCode, truncate(responseBody, 300))
 	}
 }
 

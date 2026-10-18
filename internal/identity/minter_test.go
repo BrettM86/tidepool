@@ -25,45 +25,6 @@ import (
 	"tidepool/internal/testutil"
 )
 
-func TestHandleLabels(t *testing.T) {
-	tests := []struct {
-		name         string
-		username     string
-		instance     string
-		wantName     string
-		wantInstance string
-		wantErr      bool
-	}{
-		{name: "community", username: "technology", instance: "lemmy.world", wantName: "technology", wantInstance: "lemmy-world"},
-		{name: "user", username: "alice", instance: "lemmy.world", wantName: "alice", wantInstance: "lemmy-world"},
-		{name: "underscores become dashes", username: "cool_user", instance: "lemmy.world", wantName: "cool-user", wantInstance: "lemmy-world"},
-		{name: "uppercase lowered", username: "Alice", instance: "Lemmy.World", wantName: "alice", wantInstance: "lemmy-world"},
-		{name: "multi-label instance", username: "news", instance: "lemmy.sdf.org", wantName: "news", wantInstance: "lemmy-sdf-org"},
-		{name: "weird chars collapse", username: "a__b!!c", instance: "lemmy.world", wantName: "a-b-c", wantInstance: "lemmy-world"},
-		{name: "trailing junk trimmed", username: "alice_", instance: "lemmy.world", wantName: "alice", wantInstance: "lemmy-world"},
-		// Usernames with no representable characters fall back to a
-		// deterministic hash label instead of failing the mint.
-		{name: "unrepresentable username", username: "___", instance: "lemmy.world", wantName: fallbackLabel("___"), wantInstance: "lemmy-world"},
-		{name: "cjk username", username: "日本語ユーザー", instance: "lemmy.world", wantName: fallbackLabel("日本語ユーザー"), wantInstance: "lemmy-world"},
-		{name: "emoji username", username: "🦀🦀", instance: "lemmy.world", wantName: fallbackLabel("🦀🦀"), wantInstance: "lemmy-world"},
-		{name: "empty username", username: "", instance: "lemmy.world", wantErr: true},
-		{name: "empty instance", username: "alice", instance: "", wantErr: true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			name, instance, err := handleLabels(tt.username, tt.instance)
-			if tt.wantErr {
-				require.Error(t, err)
-				assert.True(t, errors.IsValidation(err))
-				return
-			}
-			require.NoError(t, err)
-			assert.Equal(t, tt.wantName, name)
-			assert.Equal(t, tt.wantInstance, instance)
-		})
-	}
-}
-
 func TestNormalizeLabel_TruncatesTo63(t *testing.T) {
 	long := normalizeLabel(bytesRepeat('a', 80))
 	assert.Len(t, long, 63)
@@ -195,6 +156,7 @@ func testMinter(t *testing.T, actors store.BridgedActors) (*Minter, *Custodian, 
 	minter, err := NewMinter(MinterOptions{
 		PLCDirectoryURL: plcURL,
 		BridgeHostname:  bridgeHostname,
+		HandleZoneRoot:  "ap." + bridgeHostname,
 		RotationKey:     rotationKey,
 		Custodian:       custodian,
 		Actors:          actors,
@@ -221,7 +183,7 @@ func TestMintActor_AgainstRealPLC(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Regexp(t, `^did:plc:[a-z2-7]{24}$`, identity.DID)
-	assert.Equal(t, "technology.lemmy-world."+bridgeHostname, identity.Handle)
+	assert.Equal(t, "c-technology.lemmy.world.ap."+bridgeHostname, identity.Handle)
 
 	// The sealed signing key must decrypt back to the key registered as the
 	// verification key.
@@ -271,7 +233,7 @@ func TestMintActor_HandleCollisionSuffixes(t *testing.T) {
 
 	first, err := minter.MintActor(ctx, req)
 	require.NoError(t, err)
-	assert.Equal(t, "alice.lemmy-world."+bridgeHostname, first.Handle)
+	assert.Equal(t, "alice.lemmy.world.ap."+bridgeHostname, first.Handle)
 
 	// Persist the first identity so its handle is taken (the minter's
 	// availability check reads bridged_actors).
@@ -289,7 +251,7 @@ func TestMintActor_HandleCollisionSuffixes(t *testing.T) {
 	// alice@lemmy.world vs Alice@lemmy.world after a rename) gets -2.
 	second, err := minter.MintActor(ctx, req)
 	require.NoError(t, err)
-	assert.Equal(t, "alice-2.lemmy-world."+bridgeHostname, second.Handle)
+	assert.Equal(t, "alice-2.lemmy.world.ap."+bridgeHostname, second.Handle)
 	assert.NotEqual(t, first.DID, second.DID)
 }
 
@@ -364,6 +326,7 @@ func TestNewMinter_PDSEndpointScheme(t *testing.T) {
 	base := MinterOptions{
 		PLCDirectoryURL: "https://plc.invalid",
 		BridgeHostname:  "Bridge.Example",
+		HandleZoneRoot:  "ap.bridge.example",
 		RotationKey:     rotationKey,
 		Custodian:       testCustodian(t),
 		Actors:          struct{ store.BridgedActors }{},

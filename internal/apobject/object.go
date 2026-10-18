@@ -24,33 +24,47 @@ import (
 // mediaType, audience), so the plain context is sufficient for Lemmy 0.19.20.
 const ContextActivityStreams = "https://www.w3.org/ns/activitystreams"
 
-// The lexicon limits on a native record's rendered body, shared by
-// social.coves.community.comment and social.coves.community.postv2 (content,
-// facets) and social.coves.richtext.facet (features). A string maxLength counts
-// UTF-8 bytes.
+// The lexicon limits on a native record's rendered body: content per record
+// type (social.coves.community.postv2 and social.coves.community.comment),
+// facets shared by both, and features per social.coves.richtext.facet. A string
+// maxLength counts UTF-8 bytes.
 const (
-	MaximumContentBytes     = 100000
-	MaximumContentGraphemes = 10000
-	MaximumFacets           = 200
-	MaximumFeaturesPerFacet = 20
+	MaximumPostContentBytes        = 500000
+	MaximumPostContentGraphemes    = 50000
+	MaximumCommentContentBytes     = 100000
+	MaximumCommentContentGraphemes = 10000
+	MaximumFacets                  = 200
+	MaximumFeaturesPerFacet        = 20
 )
 
-// CheckRecordLimits rejects a native record whose content or facets exceed the
+// CheckPostRecordLimits rejects a postv2 record whose content or facets exceed
+// the postv2 lexicon limits. See checkRecordLimits.
+func CheckPostRecordLimits(record map[string]any) error {
+	return checkRecordLimits(record, MaximumPostContentBytes, MaximumPostContentGraphemes)
+}
+
+// CheckCommentRecordLimits rejects a comment record whose content or facets
+// exceed the comment lexicon limits. See checkRecordLimits.
+func CheckCommentRecordLimits(record map[string]any) error {
+	return checkRecordLimits(record, MaximumCommentContentBytes, MaximumCommentContentGraphemes)
+}
+
+// checkRecordLimits rejects a native record whose content or facets exceed the
 // lexicon limits. A postv2 is lexicon-validated by the acceptance engine before
 // it is ever snapshotted; a comment is not validated anywhere upstream, so every
 // render path checks this before rendering. An over-limit record is REJECTED,
 // never rendered with facets dropped: dropping a spoiler facet would publish the
 // text it hides. Only the shape the lexicon bounds is counted here — a facets
 // value that is not an array is left to the renderer, which ignores it.
-func CheckRecordLimits(record map[string]any) error {
+func checkRecordLimits(record map[string]any, maximumContentBytes, maximumContentGraphemes int) error {
 	content, _ := record["content"].(string)
-	if len(content) > MaximumContentBytes {
+	if len(content) > maximumContentBytes {
 		return errors.NewValidationError("record.content",
-			fmt.Sprintf("exceeds the lexicon maximum of %d bytes", MaximumContentBytes))
+			fmt.Sprintf("exceeds the lexicon maximum of %d bytes", maximumContentBytes))
 	}
-	if uniseg.GraphemeClusterCount(content) > MaximumContentGraphemes {
+	if uniseg.GraphemeClusterCount(content) > maximumContentGraphemes {
 		return errors.NewValidationError("record.content",
-			fmt.Sprintf("exceeds the lexicon maximum of %d graphemes", MaximumContentGraphemes))
+			fmt.Sprintf("exceeds the lexicon maximum of %d graphemes", maximumContentGraphemes))
 	}
 	facets, _ := record["facets"].([]any)
 	if len(facets) > MaximumFacets {
@@ -73,7 +87,7 @@ func CheckRecordLimits(record map[string]any) error {
 // cc (the Note half of the Page/Note addressing split), to ⊇ as:Public,
 // attributedTo as a SINGLE STRING, and HTML content alongside its markdown
 // source. inReplyTo is emitted only when a parent is known. The caller runs
-// CheckRecordLimits first; BuildNote does not.
+// CheckCommentRecordLimits first; BuildNote does not.
 func BuildNote(actorID, communityAPID, parentAPID, objectURL string, record map[string]any) map[string]any {
 	source, _ := record["content"].(string)
 	markdown, content := renderBody(source, record["facets"])
@@ -110,7 +124,7 @@ func BuildPage(actorID, communityAPID, objectURL string, record map[string]any) 
 	if title == "" {
 		return nil, errors.NewValidationError("title", "a Page requires a name (Lemmy rejects a titleless post)")
 	}
-	if err := CheckRecordLimits(record); err != nil {
+	if err := CheckPostRecordLimits(record); err != nil {
 		return nil, err
 	}
 	source, _ := record["content"].(string)
@@ -234,7 +248,7 @@ func RenderObject(userOrigin string, snapshot []byte) (map[string]any, error) {
 			return nil, err
 		}
 	} else {
-		if err := CheckRecordLimits(record); err != nil {
+		if err := CheckCommentRecordLimits(record); err != nil {
 			return nil, err
 		}
 		object = BuildNote(actorID, community, parentAPID, objectURL, record)

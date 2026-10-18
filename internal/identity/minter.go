@@ -11,13 +11,18 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
+	"unicode"
 
 	"github.com/bluesky-social/indigo/atproto/atcrypto"
 	"github.com/bluesky-social/indigo/atproto/atdata"
 	"github.com/bluesky-social/indigo/atproto/syntax"
+	"golang.org/x/net/idna"
+	"golang.org/x/text/unicode/norm"
 
 	"tidepool/internal/errors"
 	"tidepool/internal/store"
@@ -30,16 +35,17 @@ const maxHandleAttempts = 50
 // back for the error message.
 const maxPLCErrorBody = 4 << 10
 
-// MintRequest describes the fediverse actor an identity is minted for.
+// MintRequest describes the fediverse actor whose handle is minted as
+// <user label>.<instance host>.<handle zone root>.
 type MintRequest struct {
-	// ActorType selects person or group; the handle scheme is the same for
-	// both (name.instance-with-dashes.bridge-hostname), the type only
-	// drives logging.
+	// ActorType selects person or group. A group's user label gets the "c-"
+	// prefix; a person's label that would start with "c-" gets "u-" instead.
 	ActorType store.ActorType
 	// PreferredUsername is the AP preferredUsername (e.g. "alice",
 	// "technology").
 	PreferredUsername string
-	// Instance is the actor's home host (e.g. "lemmy.world").
+	// Instance is the actor's home DNS hostname without a port (e.g.
+	// "lemmy.world"); a port or an IP address is a validation error.
 	Instance string
 }
 
@@ -67,20 +73,26 @@ type Identity struct {
 type Minter struct {
 	plcURL         string
 	bridgeHostname string
+	handleZoneRoot string
 	// bridgeScheme is the URL scheme of the advertised PDS endpoint
 	// ("https" everywhere real; "http" only under the local e2e harness).
 	bridgeScheme string
 	rotationKey  *atcrypto.PrivateKeyK256
 	custodian    *Custodian
-	actors       store.BridgedActors
+	actors       interface {
+		HandleTaken(context.Context, string) (bool, error)
+	}
 	httpClient   *http.Client
 	userAgent    string
 	logger       *slog.Logger
+	plcRetryWait func(context.Context, time.Duration) error
 }
 
 // MinterOptions configures NewMinter. All fields except HTTPClient are
 // required.
 type MinterOptions struct {
+	// HandleZoneRoot anchors newly minted handles (e.g. ap.tdpl.io).
+	HandleZoneRoot string
 	// PLCDirectoryURL is the directory ops are POSTed to
 	// (config.PLCDirectoryURL, e.g. https://plc.directory).
 	PLCDirectoryURL string
@@ -97,8 +109,12 @@ type MinterOptions struct {
 	RotationKey *atcrypto.PrivateKeyK256
 	// Custodian seals the per-actor signing keys.
 	Custodian *Custodian
+	// PLCRetryWait waits between PLC retry attempts; nil uses a timer.
+	PLCRetryWait func(ctx context.Context, delay time.Duration) error
 	// Actors is consulted for handle-collision suffixing.
-	Actors store.BridgedActors
+	Actors interface {
+		HandleTaken(context.Context, string) (bool, error)
+	}
 	// HTTPClient makes the directory requests. Production wires
 	// ap.NewGuardedHTTPClient(cfg.AllowPrivateAddresses, 0) so PLC egress
 	// shares the AP client's SSRF guard; tests hitting 127.0.0.1 pass a
@@ -120,6 +136,9 @@ func NewMinter(opts MinterOptions) (*Minter, error) {
 	}
 	if opts.BridgeHostname == "" {
 		return nil, errors.NewValidationError("bridge_hostname", "must not be empty")
+	}
+	if opts.HandleZoneRoot == "" {
+		return nil, errors.NewValidationError("handle_zone_root", "must not be empty")
 	}
 	scheme := opts.BridgeScheme
 	switch scheme {
@@ -154,6 +173,7 @@ func NewMinter(opts MinterOptions) (*Minter, error) {
 	return &Minter{
 		plcURL:         strings.TrimRight(opts.PLCDirectoryURL, "/"),
 		bridgeHostname: strings.ToLower(opts.BridgeHostname),
+		handleZoneRoot: strings.ToLower(opts.HandleZoneRoot),
 		bridgeScheme:   scheme,
 		rotationKey:    opts.RotationKey,
 		custodian:      opts.Custodian,
@@ -161,6 +181,7 @@ func NewMinter(opts MinterOptions) (*Minter, error) {
 		httpClient:     opts.HTTPClient,
 		userAgent:      userAgent,
 		logger:         logger,
+		plcRetryWait:   opts.PLCRetryWait,
 	}, nil
 }
 
@@ -170,7 +191,7 @@ func NewMinter(opts MinterOptions) (*Minter, error) {
 //
 // It does NOT write bridged_actors: callers upsert the returned Identity
 // themselves (they own consent state). A concurrent mint racing the same
-// handle is caught by the bridged_actors handle unique index at that point.
+// handle is caught by the store's transactional handle claim at that point.
 //
 // Failure semantics: the DID is derived locally and the signing key is
 // sealed BEFORE the operation is submitted, so a key-custody failure can
@@ -181,10 +202,7 @@ func NewMinter(opts MinterOptions) (*Minter, error) {
 // handle so they can be found; making a retry after the resulting handle
 // collision reuse the registered DID is deferred to tasks 05/06.
 func (m *Minter) MintActor(ctx context.Context, req MintRequest) (*Identity, error) {
-	if !req.ActorType.Valid() {
-		return nil, errors.NewValidationError("actor_type", fmt.Sprintf("unknown actor type %q", req.ActorType))
-	}
-	handle, err := m.availableHandle(ctx, req.PreferredUsername, req.Instance)
+	handle, err := m.availableHandle(ctx, req.ActorType, req.PreferredUsername, req.Instance)
 	if err != nil {
 		return nil, err
 	}
@@ -202,7 +220,7 @@ func (m *Minter) MintActor(ctx context.Context, req MintRequest) (*Identity, err
 		return nil, fmt.Errorf("identity: derive rotation public key: %w", err)
 	}
 
-	op, err := m.signGenesisOp(genesisOperation(
+	op, err := m.signOperation(genesisOperation(
 		rotationPub.DIDKey(), signingPub.DIDKey(), handle, m.pdsEndpoint()))
 	if err != nil {
 		return nil, err
@@ -246,28 +264,54 @@ func (m *Minter) pdsEndpoint() string {
 }
 
 // availableHandle builds the bridged handle and suffixes it (-2, -3, ...)
-// until it does not collide with an already-assigned handle.
-func (m *Minter) availableHandle(ctx context.Context, username, instance string) (string, error) {
-	base, instanceLabel, err := handleLabels(username, instance)
+// until it does not collide with a claim or an already-assigned handle.
+// It rejects an unknown actor type before any lookup.
+// The user label is <prefix><base label><suffix>: the prefix is "c-" for a
+// group, "u-" for a person whose label would otherwise start with "c-" once
+// suffixed and truncated (so no person can hold a community-shaped label,
+// e.g. "c" suffixed to "c-2" becomes "u-c-2"), and empty otherwise. The
+// prefix counts toward the 63-byte label limit and the 253-byte handle
+// limit; truncation trims the base label, never the prefix or the suffix.
+// A punycode (xn--) base label is never suffixed or truncated: punycode
+// reads the label's last '-' as its delimiter, so either edit yields a label
+// that no longer decodes or decodes to other text. When an xn-- label needs
+// a suffix or does not fit after the prefix, the username's hash label is
+// used instead.
+func (m *Minter) availableHandle(ctx context.Context, actorType store.ActorType, username, instance string) (string, error) {
+	if !actorType.Valid() {
+		return "", errors.NewValidationError("actor_type", fmt.Sprintf("unknown actor type %q", actorType))
+	}
+	base, host, err := handleLabels(username, instance)
 	if err != nil {
 		return "", err
 	}
+	maxUserLength := min(63, 253-len(host)-len(m.handleZoneRoot)-2)
+	if maxUserLength < len(labelPrefix(actorType, base))+1 {
+		return "", errors.NewValidationError("instance", "host and handle zone leave no room for a user label")
+	}
 	for attempt := 1; attempt <= maxHandleAttempts; attempt++ {
-		name := base
+		suffix := ""
 		if attempt > 1 {
-			name = suffixLabel(base, fmt.Sprintf("-%d", attempt))
+			suffix = fmt.Sprintf("-%d", attempt)
 		}
-		candidate := fmt.Sprintf("%s.%s.%s", name, instanceLabel, m.bridgeHostname)
+		name, fits := fitUserLabel("", base, username, suffix, maxUserLength)
+		if prefix := labelPrefix(actorType, name); fits && prefix != "" {
+			name, fits = fitUserLabel(prefix, base, username, suffix, maxUserLength)
+		}
+		if !fits {
+			return "", errors.NewValidationError("handle", "no room for a collision suffix")
+		}
+		candidate := fmt.Sprintf("%s.%s.%s", name, host, m.handleZoneRoot)
 		if _, err := syntax.ParseHandle(candidate); err != nil {
 			return "", errors.NewValidationError("handle",
 				fmt.Sprintf("derived handle %q is not a valid atproto handle: %v", candidate, err))
 		}
-		_, err := m.actors.GetByHandle(ctx, candidate)
-		if errors.IsNotFound(err) {
-			return candidate, nil
-		}
+		taken, err := m.actors.HandleTaken(ctx, candidate)
 		if err != nil {
 			return "", fmt.Errorf("identity: check handle availability for %q: %w", candidate, err)
+		}
+		if !taken {
+			return candidate, nil
 		}
 		// Taken; try the next suffix.
 	}
@@ -275,29 +319,128 @@ func (m *Minter) availableHandle(ctx context.Context, username, instance string)
 		fmt.Sprintf("no free handle for %s@%s after %d attempts", username, instance, maxHandleAttempts))
 }
 
-// handleLabels normalizes the AP username and instance host into DNS labels
-// per the locked handle scheme: dots separate what @/! separated on the
-// fediverse side, and the instance's own dots become dashes
-// (alice@lemmy.world → alice.lemmy-world.<bridge>). Characters that cannot
-// appear in a handle label (Lemmy allows underscores in usernames) map to
-// dashes too.
-func handleLabels(username, instance string) (name string, instanceLabel string, err error) {
-	name = normalizeLabel(username)
+// fitUserLabel builds <prefix><base label><suffix> within maxUserLength
+// bytes, swapping an xn-- base label for the username's hash label when it
+// needs a suffix or does not fit, and truncating the base label otherwise.
+// It reports false when the prefix and suffix alone leave no room.
+func fitUserLabel(prefix, base, username, suffix string, maxUserLength int) (string, bool) {
+	if maxUserLength <= len(prefix)+len(suffix) {
+		return "", false
+	}
+	label := base
+	if strings.HasPrefix(label, "xn--") && (suffix != "" || len(prefix)+len(label) > maxUserLength) {
+		label = fallbackLabel(username)
+	}
+	name := prefix + suffixLabel(label, suffix)
+	if len(name) > maxUserLength {
+		name = prefix + strings.TrimRight(label[:maxUserLength-len(prefix)-len(suffix)], "-") + suffix
+	}
+	return name, true
+}
+
+// labelPrefix returns the user-label prefix for an actor: "c-" for a group;
+// "u-" for a person whose label starts with "c-", which reserves the "c-"
+// label space for communities; otherwise none.
+func labelPrefix(actorType store.ActorType, base string) string {
+	if actorType == store.ActorTypeGroup {
+		return "c-"
+	}
+	if strings.HasPrefix(base, "c-") {
+		return "u-"
+	}
+	return ""
+}
+
+// handleLabels forms the base user label and host for
+// <user label>.<instance host>.<handle zone root>. The host is lowercased
+// and keeps its dots; it must be a bare hostname (callers pass
+// url.Hostname()), so a host with a ':' (a port or an IPv6 literal) or an IP
+// address is a validation error. The username is NFC-normalized before ASCII
+// label normalization; names without ASCII letters or digits use an IDNA2008
+// punycode label when valid, or a hash of the original bytes otherwise.
+// availableHandle swaps a punycode label for the hash when it collides or
+// does not fit.
+func handleLabels(username, instance string) (name string, host string, err error) {
+	name = normalizeLabel(norm.NFC.String(username))
 	if name == "" && username != "" {
-		// All-CJK/emoji usernames normalize to nothing; fall back to a
-		// deterministic hash-derived label so those actors still bridge.
-		name = fallbackLabel(username)
+		name = idnaLabel(username)
+		if name == "" {
+			name = fallbackLabel(username)
+		}
 	}
 	if name == "" {
 		return "", "", errors.NewValidationError("preferred_username",
 			fmt.Sprintf("%q normalizes to an empty handle label", username))
 	}
-	instanceLabel = normalizeLabel(strings.ReplaceAll(instance, ".", "-"))
-	if instanceLabel == "" {
+	host = strings.ToLower(instance)
+	if host == "" {
 		return "", "", errors.NewValidationError("instance",
-			fmt.Sprintf("%q normalizes to an empty handle label", instance))
+			fmt.Sprintf("%q has an empty host", instance))
 	}
-	return name, instanceLabel, nil
+	if strings.Contains(host, ":") || net.ParseIP(host) != nil {
+		return "", "", errors.NewValidationError("instance",
+			fmt.Sprintf("%q is not a bare DNS hostname", instance))
+	}
+	return name, host, nil
+}
+
+var usernameIDNAProfile = idna.New(
+	idna.MapForLookup(), idna.Transitional(false), idna.BidiRule(),
+	idna.StrictDomainName(true), idna.ValidateLabels(true), idna.CheckJoiners(true),
+)
+
+// idnaLabel accepts only a single punycode label whose mapped code points
+// are PVALID under RFC 5892. The lookup profile alone also accepts symbols
+// that IDNA2008 disallows, so its mapping must be checked separately.
+func idnaLabel(username string) string {
+	mapped, err := usernameIDNAProfile.ToUnicode(norm.NFC.String(username))
+	if err != nil || strings.Contains(mapped, ".") {
+		return ""
+	}
+	for _, character := range mapped {
+		if !idnaPVALID(character) {
+			return ""
+		}
+	}
+	label, err := usernameIDNAProfile.ToASCII(mapped)
+	if err != nil || len(label) > 63 || !strings.HasPrefix(label, "xn--") {
+		return ""
+	}
+	return label
+}
+
+// oldHangulJamo is the RFC 5892 §2.9 OldHangulJamo category: conjoining
+// Jamo that are Lo but DISALLOWED under IDNA2008.
+var oldHangulJamo = &unicode.RangeTable{R16: []unicode.Range16{
+	{Lo: 0x1100, Hi: 0x11ff, Stride: 1},
+	{Lo: 0xa960, Hi: 0xa97f, Stride: 1},
+	{Lo: 0xd7b0, Hi: 0xd7ff, Stride: 1},
+}}
+
+// idnaPVALID approximates RFC 5892 PVALID: the LetterDigits categories
+// (§2.1) plus '-', minus the Arabic-Indic digits (CONTEXTO), the
+// OldHangulJamo ranges (§2.9), and the §2.6 Exceptions listed in the switch
+// (first case PVALID, second case DISALLOWED or CONTEXTO).
+func idnaPVALID(character rune) bool {
+	// Arabic-Indic digit ranges are CONTEXTO, not PVALID, despite being Nd.
+	if character >= 0x0660 && character <= 0x0669 ||
+		character >= 0x06f0 && character <= 0x06f9 {
+		return false
+	}
+	if unicode.Is(oldHangulJamo, character) {
+		return false
+	}
+	switch character {
+	case 0x00df, 0x03c2, 0x06fd, 0x06fe, 0x0f0b, 0x3007:
+		return true
+	case 0x0640, 0x07fa, 0x302e, 0x302f, 0x3031, 0x3032, 0x3033, 0x3034, 0x3035, 0x303b:
+		return false
+	}
+	return character == '-' || unicode.Is(unicode.Ll, character) ||
+		unicode.Is(unicode.Lu, character) || unicode.Is(unicode.Lo, character) ||
+		unicode.Is(unicode.Lm, character) || unicode.Is(unicode.Lt, character) ||
+		unicode.Is(unicode.Mn, character) || unicode.Is(unicode.Mc, character) ||
+		unicode.Is(unicode.Nd, character)
 }
 
 // fallbackLabel derives a stable DNS label for a string with no characters
@@ -366,10 +509,10 @@ func genesisOperation(rotationDIDKey, signingDIDKey, handle, pdsEndpoint string)
 	}
 }
 
-// signGenesisOp signs the operation with the escrow rotation key: the
+// signOperation signs an unsigned operation with the escrow rotation key: the
 // signature is over the DAG-CBOR encoding of the op without its sig field,
 // base64url (no padding) encoded, per the PLC spec.
-func (m *Minter) signGenesisOp(op map[string]any) (map[string]any, error) {
+func (m *Minter) signOperation(op map[string]any) (map[string]any, error) {
 	unsigned, err := atdata.MarshalCBOR(op)
 	if err != nil {
 		return nil, fmt.Errorf("identity: encode PLC op: %w", err)

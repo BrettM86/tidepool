@@ -1,0 +1,106 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.moderation.removeContent",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Remove a repository record from the local AppView. Instance authority and actor identity come from the authenticated service context, never request fields. The inspected CID establishes content concurrency while removal applies to the subject URI.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#input"
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "social.coves.moderation.defs#mutationResult"
+        }
+      },
+      "errors": [
+        {
+          "name": "AuthRequired",
+          "description": "Authentication is required; authenticate with an authorized service account before retrying."
+        },
+        {
+          "name": "Forbidden",
+          "description": "The authenticated actor lacks permission; do not retry unless its moderation authority changes."
+        },
+        {
+          "name": "InvalidRequest",
+          "description": "The request fields are inconsistent or incomplete; correct the request before retrying."
+        },
+        {
+          "name": "InvalidSubject",
+          "description": "The subject reference is malformed or unsupported; correct the subject before retrying."
+        },
+        {
+          "name": "SubjectNotFound",
+          "description": "The subject cannot be found for inspection; verify the reference before retrying."
+        },
+        {
+          "name": "ContentChanged",
+          "description": "The subject CID changed; refetch getSubjectState and re-inspect the current content before retrying."
+        },
+        {
+          "name": "StateConflict",
+          "description": "expectedVersion is stale; refetch getSubjectState before retrying with the new version."
+        },
+        {
+          "name": "IdempotencyConflict",
+          "description": "The same key was reused with a different request; do not retry with that key."
+        },
+        {
+          "name": "UnsupportedReason",
+          "description": "The reason is not supported for this action; choose a supported reason before retrying."
+        },
+        {
+          "name": "ModerationUnavailable",
+          "description": "The moderation service is temporarily unavailable; retry later."
+        }
+      ]
+    },
+    "input": {
+      "type": "object",
+      "description": "Request to remove the inspected version of a repository record",
+      "required": [
+        "subject",
+        "expectedVersion",
+        "idempotencyKey",
+        "reason"
+      ],
+      "properties": {
+        "subject": {
+          "type": "ref",
+          "ref": "com.atproto.repo.strongRef",
+          "description": "Strong reference whose CID is the inspected version; removal applies to its URI"
+        },
+        "expectedVersion": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Opaque subject-state version expected by the caller"
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Opaque key that makes equivalent removal requests idempotent"
+        },
+        "reason": {
+          "type": "ref",
+          "ref": "social.coves.moderation.defs#reasonType",
+          "description": "Public reason classification for the removal"
+        },
+        "privateNote": {
+          "type": "string",
+          "maxGraphemes": 1000,
+          "maxLength": 10000,
+          "description": "Private administrative note retained only on the admin action"
+        }
+      }
+    }
+  }
+}

@@ -143,15 +143,21 @@ type ModeratedObject struct {
 // BridgedActor is a fediverse actor (person or group) that Tidepool has
 // minted an atproto identity for.
 type BridgedActor struct {
-	ID                  int64
-	APActorID           string // canonical AP actor id (URL)
-	ActorType           ActorType
-	DID                 string
-	Handle              string // bridged handle; empty until assigned
+	ID        int64
+	APActorID string // canonical AP actor id (URL)
+	ActorType ActorType
+	DID       string
+	Handle    string // bridged handle; empty until assigned
+	// PreferredUsername is the actor document's preferredUsername exactly as
+	// received, not normalized. Empty means it has not been recorded.
+	PreferredUsername   string
 	SigningKeyEncrypted []byte // escrowed signing key; AES-GCM ciphertext from task 03 on
 	ConsentState        ConsentState
 	ProfileSyncedAt     *time.Time
 	CreatedAt           time.Time
+	PendingHandle       string
+	PreviousHandle      string
+	HandleMigratedAt    *time.Time
 }
 
 // Community is an AP group the bridge follows (or is in the process of

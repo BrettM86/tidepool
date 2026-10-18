@@ -1,0 +1,47 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.notification.putPreferences",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Update the authenticated account's notification preferences.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "postReply": {
+              "type": "boolean",
+              "description": "Enable or disable replies to your posts."
+            },
+            "commentReply": {
+              "type": "boolean",
+              "description": "Enable or disable replies to your comments."
+            },
+            "mention": {
+              "type": "boolean",
+              "description": "Enable or disable mentions."
+            },
+            "upvote": {
+              "type": "boolean",
+              "description": "Enable or disable upvote group notifications."
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "social.coves.notification.defs#preferences"
+        }
+      },
+      "errors": [
+        {
+          "name": "AccountNotIndexed",
+          "description": "The authenticated account has not been indexed by this AppView yet, so its preferences cannot be stored."
+        }
+      ]
+    }
+  }
+}

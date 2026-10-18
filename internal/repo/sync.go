@@ -35,11 +35,12 @@ import (
 const FirehoseNotifyChannel = "tidepool_firehose"
 
 // Event kinds (firehose_events.kind). Commit rows carry the #commit frame
-// payload; account rows carry an #account frame (active/status) and no
-// commit columns.
+// payload; account rows carry an #account frame (active/status), and identity
+// rows carry a #identity frame (handle).
 const (
-	EventKindCommit  = "commit"
-	EventKindAccount = "account"
+	EventKindCommit   = "commit"
+	EventKindAccount  = "account"
+	EventKindIdentity = "identity"
 )
 
 // Account status tokens for #account frames (the com.atproto.sync.defs
@@ -55,13 +56,15 @@ const (
 // serving. For Kind == EventKindCommit the field semantics match the
 // #commit frame of com.atproto.sync.subscribeRepos (see migration 006 for
 // the storage notes); for EventKindAccount only Seq, DID, CreatedAt,
-// AccountActive, and AccountStatus are meaningful.
+// AccountActive, and AccountStatus are meaningful; for EventKindIdentity only
+// Seq, DID, CreatedAt, and Handle are meaningful.
 type Event struct {
 	// Seq is the firehose cursor (bigserial; gapless in visibility order,
 	// though individual integers may be skipped by rolled-back writes).
 	Seq int64
-	// Kind discriminates commit vs account rows (EventKind*).
-	Kind string
+	// Kind discriminates commit, account, and identity rows (EventKind*).
+	Kind   string
+	Handle string
 	// DID is the repo the commit belongs to (the frame's `repo` field).
 	DID string
 	// CommitCID is the signed commit block's CID.
@@ -97,7 +100,7 @@ func (m *Manager) ListEvents(ctx context.Context, sinceSeq int64, limit int) ([]
 	}
 	rows, err := m.db.QueryContext(ctx, `
 		SELECT seq, kind, did, commit_cid, prev_data_cid, since_rev, rev, ops, car, created_at,
-		       account_active, account_status
+		       account_active, account_status, identity_handle
 		FROM firehose_events
 		WHERE seq > $1
 		ORDER BY seq
@@ -111,17 +114,18 @@ func (m *Manager) ListEvents(ctx context.Context, sinceSeq int64, limit int) ([]
 	for rows.Next() {
 		var ev Event
 		var opsJSON []byte
-		var commitCID, rev, accountStatus sql.NullString
+		var commitCID, rev, accountStatus, identityHandle sql.NullString
 		var accountActive sql.NullBool
 		if err := rows.Scan(&ev.Seq, &ev.Kind, &ev.DID, &commitCID, &ev.PrevDataCID,
 			&ev.SinceRev, &rev, &opsJSON, &ev.CAR, &ev.CreatedAt,
-			&accountActive, &accountStatus); err != nil {
+			&accountActive, &accountStatus, &identityHandle); err != nil {
 			return nil, fmt.Errorf("repo: scan firehose event: %w", err)
 		}
 		ev.CommitCID = commitCID.String
 		ev.Rev = rev.String
 		ev.AccountActive = accountActive.Bool
 		ev.AccountStatus = accountStatus.String
+		ev.Handle = identityHandle.String
 		if len(opsJSON) > 0 {
 			if err := json.Unmarshal(opsJSON, &ev.Ops); err != nil {
 				return nil, fmt.Errorf("repo: decode ops for seq %d: %w", ev.Seq, err)

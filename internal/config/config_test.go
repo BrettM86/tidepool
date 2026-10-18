@@ -20,7 +20,7 @@ func clearConfigEnv(t *testing.T) {
 	t.Helper()
 	for _, name := range []string{
 		"ENVIRONMENT", "DATABASE_URL", "LISTEN_ADDR", "BRIDGE_HOSTNAME",
-		"DNS_LISTEN", "DNS_PUBLIC_IPV4", "DNS_PUBLIC_IPV6", "DNS_NAMESERVERS",
+		"DNS_LISTEN", "DNS_PUBLIC_IPV4", "DNS_PUBLIC_IPV6", "DNS_NAMESERVERS", "HANDLE_ZONE_ROOT", "DNS_UDP_RESPONSE_RATE", "HANDLE_MIGRATION_RATE",
 		"CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ZONE_ID", "DELEGATION_MAX_NS_RECORDS",
 		"PLC_DIRECTORY_URL", "BRIDGE_SERVICE_DID", "USER_AGENT", "BRIDGE_KEK",
 		"BRIDGE_KEK_PREVIOUS",
@@ -104,6 +104,78 @@ func TestLoad_DNSEnabledConfiguration(t *testing.T) {
 			require.Equal(t, netip.MustParseAddr("192.0.2.1"), cfg.DNSPublicIPv4)
 			require.Equal(t, tc.wantIPv6, cfg.DNSPublicIPv6)
 			require.Equal(t, tc.wantNameservers, cfg.DNSNameservers)
+		})
+	}
+}
+
+func TestLoad_DNSUDPResponseRate(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		value     string
+		unset     bool
+		wantRate  int
+		wantError bool
+	}{
+		{name: "unset defaults to 20", unset: true, wantRate: 20},
+		{name: "custom rate", value: "7", wantRate: 7},
+		{name: "zero", value: "0", wantError: true},
+		{name: "negative", value: "-1", wantError: true},
+		{name: "not numeric", value: "abc", wantError: true},
+		{name: "fractional", value: "1.5", wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearConfigEnv(t)
+			t.Setenv("BRIDGE_HOSTNAME", "tdpl.example")
+			t.Setenv("DNS_LISTEN", "127.0.0.1:5353")
+			t.Setenv("DNS_PUBLIC_IPV4", "192.0.2.1")
+			if tc.unset {
+				require.NoError(t, os.Unsetenv("DNS_UDP_RESPONSE_RATE"))
+			} else {
+				t.Setenv("DNS_UDP_RESPONSE_RATE", tc.value)
+			}
+			cfg, err := Load(discardLogger())
+			if tc.wantError {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), "DNS_UDP_RESPONSE_RATE")
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.wantRate, cfg.DNSUDPResponseRate)
+		})
+	}
+}
+
+func TestLoad_HandleMigrationRate(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		value     string
+		unset     bool
+		wantRate  float64
+		wantError bool
+	}{
+		{name: "unset defaults to 2", unset: true, wantRate: 2},
+		{name: "fractional rate", value: "0.5", wantRate: 0.5},
+		{name: "zero", value: "0", wantError: true},
+		{name: "negative", value: "-1", wantError: true},
+		{name: "not numeric", value: "abc", wantError: true},
+		{name: "NaN", value: "NaN", wantError: true},
+		{name: "infinity", value: "+Inf", wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearConfigEnv(t)
+			if tc.unset {
+				require.NoError(t, os.Unsetenv("HANDLE_MIGRATION_RATE"))
+			} else {
+				t.Setenv("HANDLE_MIGRATION_RATE", tc.value)
+			}
+			cfg, err := Load(discardLogger())
+			if tc.wantError {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), "HANDLE_MIGRATION_RATE")
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.wantRate, cfg.HandleMigrationRate)
 		})
 	}
 }
@@ -211,6 +283,47 @@ func TestLoad_BridgeHostnameWithPortLoadsWhenDNSDisabled(t *testing.T) {
 	require.Equal(t, "tdpl.io:443", cfg.BridgeHostname)
 	require.Empty(t, cfg.DNSListen)
 	require.Empty(t, cfg.DNSNameservers)
+}
+
+func TestLoad_HandleZoneRoot(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		bridgeHostname string
+		handleZoneRoot string
+		wantRoot       string
+		wantError      bool
+	}{
+		{name: "default", bridgeHostname: "tdpl.io", wantRoot: "ap.tdpl.io"},
+		{name: "lowercase default", bridgeHostname: "TDPL.io", wantRoot: "ap.tdpl.io"},
+		{name: "custom root", bridgeHostname: "tdpl.io", handleZoneRoot: "Handles.TDPL.io", wantRoot: "handles.tdpl.io"},
+		{name: "default without bridge port", bridgeHostname: "tdpl.io:443", wantRoot: "ap.tdpl.io"},
+		{name: "outside bridge domain", bridgeHostname: "tdpl.io", handleZoneRoot: "ap.example.com", wantError: true},
+		{name: "equal to bridge domain", bridgeHostname: "tdpl.io", handleZoneRoot: "tdpl.io", wantError: true},
+		{name: "suffix without label boundary", bridgeHostname: "tdpl.io", handleZoneRoot: "evil-tdpl.io", wantError: true},
+		{name: "empty label", bridgeHostname: "tdpl.io", handleZoneRoot: "ap..tdpl.io", wantError: true},
+		{name: "port", bridgeHostname: "tdpl.io", handleZoneRoot: "ap.tdpl.io:53", wantError: true},
+		{name: "underscore", bridgeHostname: "tdpl.io", handleZoneRoot: "_ap.tdpl.io", wantError: true},
+		{name: "leading hyphen", bridgeHostname: "tdpl.io", handleZoneRoot: "-ap.tdpl.io", wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearConfigEnv(t)
+			t.Setenv("BRIDGE_HOSTNAME", tc.bridgeHostname)
+			if tc.handleZoneRoot == "" {
+				require.NoError(t, os.Unsetenv("HANDLE_ZONE_ROOT"))
+			} else {
+				t.Setenv("HANDLE_ZONE_ROOT", tc.handleZoneRoot)
+			}
+
+			cfg, err := Load(discardLogger())
+			if tc.wantError {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), "HANDLE_ZONE_ROOT")
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.wantRoot, cfg.HandleZoneRoot)
+		})
+	}
 }
 
 // setProductionEnv sets every variable production requires, so a test about

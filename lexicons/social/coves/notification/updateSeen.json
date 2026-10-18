@@ -1,0 +1,32 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.notification.updateSeen",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Advance the authenticated account's notification seen time.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "seenAt"
+          ],
+          "properties": {
+            "seenAt": {
+              "type": "string",
+              "format": "datetime",
+              "description": "The largest sortAt the client displayed, echoed verbatim. Future times are clamped to server time."
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "AccountNotIndexed",
+          "description": "The authenticated account has not been indexed by this AppView yet, so its seen time cannot be stored."
+        }
+      ]
+    }
+  }
+}

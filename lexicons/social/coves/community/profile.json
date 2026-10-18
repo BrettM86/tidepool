@@ -23,6 +23,16 @@
             "maxLength": 253,
             "description": "Instance this community actually lives on (hostname only, e.g. lemmy.world). Self-asserted; appviews must validate against the verified handle."
           },
+          "originUrl": {
+            "type": "string",
+            "format": "uri",
+            "description": "Bridge-written URL of the community on its home instance; display only."
+          },
+          "originSoftware": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "Bridge-written home instance software; display only. maxLength counts UTF-8 bytes."
+          },
           "displayName": {
             "type": "string",
             "maxGraphemes": 128,

@@ -143,28 +143,9 @@ func (m *Manager) AppendAccountEvent(ctx context.Context, did string, active boo
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if _, err := tx.ExecContext(ctx,
-		`SELECT pg_advisory_xact_lock($1)`, commitAdvisoryLockKey); err != nil {
-		return 0, fmt.Errorf("repo: take commit advisory lock: %w", err)
-	}
-
-	var statusValue any
-	if !active && status != "" {
-		statusValue = status
-	}
-	var seq int64
-	// clock_timestamp() for the same reason as commit events: stamp
-	// visibility time, not transaction start (see appendFirehoseEvent).
-	if err := tx.QueryRowContext(ctx, `
-		INSERT INTO firehose_events (kind, did, account_active, account_status, created_at)
-		VALUES ('account', $1, $2, $3, clock_timestamp())
-		RETURNING seq`,
-		did, active, statusValue).Scan(&seq); err != nil {
-		return 0, fmt.Errorf("repo: append account event for %s: %w", did, err)
-	}
-	if _, err := tx.ExecContext(ctx,
-		`SELECT pg_notify($1, $2)`, FirehoseNotifyChannel, strconv.FormatInt(seq, 10)); err != nil {
-		return 0, fmt.Errorf("repo: notify account event %d: %w", seq, err)
+	seq, err := AppendAccountEventTx(ctx, tx, did, active, status)
+	if err != nil {
+		return 0, err
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("repo: commit account event for %s: %w", did, err)
@@ -387,4 +368,65 @@ func forEachBlock(ctx context.Context, src *txBlockSource, cids []cid.Cid, fn fu
 		}
 	}
 	return nil
+}
+
+// AppendAccountEventTx appends an #account event in the caller's transaction,
+// with AppendAccountEvent's semantics. The global commit lock serializes its
+// seq with record and identity events; the caller owns the commit (and
+// therefore the notification's visibility).
+func AppendAccountEventTx(ctx context.Context, tx *sql.Tx, did string, active bool, status string) (int64, error) {
+	if _, err := syntax.ParseDID(did); err != nil {
+		return 0, errors.NewValidationError("did", err.Error())
+	}
+	if _, err := tx.ExecContext(ctx,
+		`SELECT pg_advisory_xact_lock($1)`, commitAdvisoryLockKey); err != nil {
+		return 0, fmt.Errorf("repo: take commit advisory lock: %w", err)
+	}
+
+	var statusValue any
+	if !active && status != "" {
+		statusValue = status
+	}
+	var seq int64
+	// clock_timestamp() for the same reason as commit events: stamp
+	// visibility time, not transaction start (see appendFirehoseEvent).
+	if err := tx.QueryRowContext(ctx, `
+		INSERT INTO firehose_events (kind, did, account_active, account_status, created_at)
+		VALUES ('account', $1, $2, $3, clock_timestamp())
+		RETURNING seq`,
+		did, active, statusValue).Scan(&seq); err != nil {
+		return 0, fmt.Errorf("repo: append account event for %s: %w", did, err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`SELECT pg_notify($1, $2)`, FirehoseNotifyChannel, strconv.FormatInt(seq, 10)); err != nil {
+		return 0, fmt.Errorf("repo: notify account event %d: %w", seq, err)
+	}
+	return seq, nil
+}
+
+// AppendIdentityEventTx appends a #identity event in the caller's transaction.
+// The global commit lock serializes its seq with record and account events;
+// the caller owns the commit (and therefore the notification's visibility).
+func AppendIdentityEventTx(ctx context.Context, tx *sql.Tx, did, handle string) (int64, error) {
+	if _, err := syntax.ParseDID(did); err != nil {
+		return 0, errors.NewValidationError("did", err.Error())
+	}
+	if _, err := syntax.ParseHandle(handle); err != nil {
+		return 0, errors.NewValidationError("handle", err.Error())
+	}
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, commitAdvisoryLockKey); err != nil {
+		return 0, fmt.Errorf("repo: take commit advisory lock: %w", err)
+	}
+	var seq int64
+	if err := tx.QueryRowContext(ctx, `
+		INSERT INTO firehose_events (kind, did, identity_handle, created_at)
+		VALUES ('identity', $1, $2, clock_timestamp())
+		RETURNING seq`, did, handle).Scan(&seq); err != nil {
+		return 0, fmt.Errorf("repo: append identity event for %s: %w", did, err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`SELECT pg_notify($1, $2)`, FirehoseNotifyChannel, strconv.FormatInt(seq, 10)); err != nil {
+		return 0, fmt.Errorf("repo: notify identity event %d: %w", seq, err)
+	}
+	return seq, nil
 }

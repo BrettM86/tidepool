@@ -151,7 +151,7 @@ func (s *Server) readPump(cancel context.CancelFunc, conn *websocket.Conn) {
 
 // streamEvents is the outbox loop described on handleSubscribeRepos.
 //
-// The stream carries #commit and #account frames. Delete(Actor)/consent
+// The stream carries #commit, #account, and #identity frames. Delete(Actor)/consent
 // revocation appends an #account{active:false, status:"deleted"} event to
 // the durable log (repo.AppendAccountEvent) after the scrub delete-commits,
 // so consumers purge the repo instead of inferring its death. A tombstoned
@@ -250,6 +250,8 @@ func (s *Server) streamEvents(ctx context.Context, conn *websocket.Conn, cursor 
 			switch ev.Kind {
 			case repo.EventKindAccount:
 				frame = accountFrame(ev)
+			case repo.EventKindIdentity:
+				frame = identityFrame(ev)
 			default:
 				// EventKindCommit — and legacy rows written before the kind
 				// column existed, which default to it.

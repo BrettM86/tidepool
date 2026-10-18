@@ -149,7 +149,9 @@ type BridgedActor struct {
 	DID       string
 	Handle    string // bridged handle; empty until assigned
 	// PreferredUsername is the actor document's preferredUsername exactly as
-	// received, not normalized. Empty means it has not been recorded.
+	// received, not normalized. Empty means it has not been recorded. The
+	// rename job may instead store a label-confirmed name from the actor URL
+	// when the origin gave no answer (HANDLE_SCHEME.md "Username fetch").
 	PreferredUsername   string
 	SigningKeyEncrypted []byte // escrowed signing key; AES-GCM ciphertext from task 03 on
 	ConsentState        ConsentState

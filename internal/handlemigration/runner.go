@@ -7,9 +7,11 @@ import (
 	"database/sql"
 	stderrors "errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"net"
+	"net/http"
 	"net/url"
 	"strings"
 	"time"
@@ -173,6 +175,17 @@ func (r *Runner) Run(ctx context.Context, dids []string) error {
 			case strings.ContainsRune(document.PreferredUsername, 0):
 				reason = "actor document has invalid preferredUsername"
 			}
+			username := ""
+			if reason == "" {
+				username = document.PreferredUsername
+			} else if fetchErr != nil && originGaveNoAnswer(fetchErr) {
+				if name, ok := usernameFromActorID(actor.APActorID, actor.Handle); ok {
+					// The name comes from the actor URL, so neither is logged.
+					r.logger.Warn("rename username taken from actor id", "did", did, "username_source", "actor_id", "reason", reason)
+					username = name
+					reason = ""
+				}
+			}
 			if reason != "" {
 				if loggedErr != nil {
 					r.logger.Warn("rename username fetch failed", "did", did, "reason", reason, "error", loggedErr)
@@ -182,14 +195,14 @@ func (r *Runner) Run(ctx context.Context, dids []string) error {
 				r.recordError(ctx, did, store.HandleMigrationUsernameUnavailable, reason)
 				continue
 			}
-			if err := r.actors.SetPreferredUsernameByDID(ctx, did, document.PreferredUsername); err != nil {
+			if err := r.actors.SetPreferredUsernameByDID(ctx, did, username); err != nil {
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
 				r.logger.Error("save rename preferred username failed", "did", did, "error", err)
 				continue
 			}
-			actor.PreferredUsername = document.PreferredUsername
+			actor.PreferredUsername = username
 		}
 		reserved := false
 		for attempt := 0; attempt < maxReservationAttempts; attempt++ {
@@ -369,6 +382,28 @@ func actorFetchFailureReason(err error) string {
 		return "actor fetch refused: redirect left origin or downgraded"
 	default:
 		return "actor fetch failed"
+	}
+}
+
+// originGaveNoAnswer reports whether a fetch failed without the origin
+// answering about the actor: a timeout, transport error, body cut short,
+// HTTP 429 or 5xx, or 401/403/404 (mapped to not found). Every other failure
+// is an answer and returns false: a tombstone, a refused fetch, another 4xx,
+// or a response that could not be decoded.
+func originGaveNoAnswer(err error) bool {
+	var httpErr ap.HTTPError
+	var validationErr errors.ValidationError
+	var networkErr net.Error
+	switch {
+	// This case must stay before the net.Error check: *url.Error satisfies
+	// net.Error, and the egress guard's refusal arrives inside one.
+	case errors.IsTombstoned(err), stderrors.As(err, &validationErr):
+		return false
+	case stderrors.As(err, &httpErr):
+		return httpErr.StatusCode == http.StatusTooManyRequests || httpErr.StatusCode >= 500
+	default:
+		return errors.IsNotFound(err) || stderrors.Is(err, context.DeadlineExceeded) ||
+			stderrors.Is(err, io.ErrUnexpectedEOF) || stderrors.As(err, &networkErr)
 	}
 }
 

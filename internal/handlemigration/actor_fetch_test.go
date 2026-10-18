@@ -207,17 +207,22 @@ func TestRunner_StoredPendingHandleNeedsNoActorFetch(t *testing.T) {
 
 func TestRunner_UnavailableActorUsernameKeepsOldHandleAndContinues(t *testing.T) {
 	const (
-		firstDID  = "did:plc:ewvi7nxzyoun6zhxrhs64oiz"
-		secondDID = "did:plc:44ybard66vv44zksje25o7dz"
-		firstOld  = "alice.my-lemmy-org.tidepool.test"
-		secondOld = "bob.my-lemmy-org.tidepool.test"
-		secondNew = "bob.my-lemmy.org.ap.tidepool.test"
-		actorPath = "/u/alice"
+		firstDID        = "did:plc:ewvi7nxzyoun6zhxrhs64oiz"
+		secondDID       = "did:plc:44ybard66vv44zksje25o7dz"
+		defaultFirstOld = "alice.my-lemmy-org.tidepool.test"
+		secondOld       = "bob.my-lemmy-org.tidepool.test"
+		secondNew       = "bob.my-lemmy.org.ap.tidepool.test"
+		actorPath       = "/u/alice"
+		// Rows whose failure allows the actor-ID fallback use an old label
+		// that does not match /u/alice, so the fallback is refused and the
+		// row still owns its failure message.
+		unmatchedOld = "zed.my-lemmy-org.tidepool.test"
 	)
 	const notFoundOrRefused = "actor document not found or access refused (HTTP 401/403/404)"
 	for _, tc := range []struct {
 		name               string
 		actorID            string
+		oldHandle          string
 		body               string
 		status             int
 		redirectTo         string
@@ -228,15 +233,15 @@ func TestRunner_UnavailableActorUsernameKeepsOldHandleAndContinues(t *testing.T)
 		loggedErrorPattern string
 		messageExcludes    string
 	}{
-		{name: "HTTP 500", status: http.StatusInternalServerError,
+		{name: "HTTP 500", status: http.StatusInternalServerError, oldHandle: unmatchedOld,
 			message: "actor fetch failed: HTTP 500", loggedError: "unexpected status 500"},
-		{name: "HTTP 404", status: http.StatusNotFound, message: notFoundOrRefused, loggedError: "not found"},
-		{name: "HTTP 401", status: http.StatusUnauthorized, message: notFoundOrRefused, loggedError: "not found"},
-		{name: "HTTP 403", status: http.StatusForbidden, message: notFoundOrRefused, loggedError: "not found"},
+		{name: "HTTP 404", status: http.StatusNotFound, oldHandle: unmatchedOld, message: notFoundOrRefused, loggedError: "not found"},
+		{name: "HTTP 401", status: http.StatusUnauthorized, oldHandle: unmatchedOld, message: notFoundOrRefused, loggedError: "not found"},
+		{name: "HTTP 403", status: http.StatusForbidden, oldHandle: unmatchedOld, message: notFoundOrRefused, loggedError: "not found"},
 		{name: "HTTP 410", status: http.StatusGone, message: "actor document tombstoned", loggedError: "tombstoned"},
 		// net/http reports a client timeout as "Client.Timeout exceeded" or as a
 		// bare "context deadline exceeded", depending on which deadline fires first.
-		{name: "timeout", timeout: true, message: "actor fetch timed out",
+		{name: "timeout", timeout: true, oldHandle: unmatchedOld, message: "actor fetch timed out",
 			loggedErrorPattern: `Client\.Timeout exceeded|context deadline exceeded`},
 		{name: "different document id", body: `{"type":"Person","id":"https://my-lemmy.org/u/someone-else","preferredUsername":"alice"}`,
 			message: "actor document id mismatch", messageExcludes: "someone-else"},
@@ -259,6 +264,10 @@ func TestRunner_UnavailableActorUsernameKeepsOldHandleAndContinues(t *testing.T)
 			firstActorID := tc.actorID
 			if firstActorID == "" {
 				firstActorID = "https://my-lemmy.org/u/alice"
+			}
+			firstOld := tc.oldHandle
+			if firstOld == "" {
+				firstOld = defaultFirstOld
 			}
 			first := h.insertOldActor(t, firstDID, firstActorID, firstOld, "")
 			h.insertOldActor(t, secondDID, "https://my-lemmy.org/u/bob", secondOld, "bob")
@@ -370,7 +379,8 @@ func TestRunner_RetriesUnavailableActorUsername(t *testing.T) {
 		did       = "did:plc:ewvi7nxzyoun6zhxrhs64oiz"
 		oldHandle = "carol.my-lemmy-org.tidepool.test"
 		newHandle = "carol.my-lemmy.org.ap.tidepool.test"
-		actorPath = "/u/Carol"
+		// An opaque id, so the actor-ID fallback cannot supply the username.
+		actorPath = "/users/8f2c"
 	)
 	h := newRenameHarness(t)
 	h.insertOldActor(t, did, "https://my-lemmy.org"+actorPath, oldHandle, "")
@@ -384,7 +394,7 @@ func TestRunner_RetriesUnavailableActorUsername(t *testing.T) {
 	h.actorDocs.mutex.Lock()
 	h.actorDocs.handlers[actorPath] = func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/activity+json")
-		_, _ = w.Write([]byte(`{"type":"Person","id":"https://my-lemmy.org/u/Carol","preferredUsername":"Carol"}`))
+		_, _ = w.Write([]byte(`{"type":"Person","id":"https://my-lemmy.org/users/8f2c","preferredUsername":"Carol"}`))
 	}
 	h.actorDocs.mutex.Unlock()
 	require.NoError(t, h.runner.Run(t.Context(), []string{did}))
@@ -399,4 +409,94 @@ func TestRunner_RetriesUnavailableActorUsername(t *testing.T) {
 	require.NoError(t, h.db.QueryRowContext(t.Context(),
 		`SELECT COALESCE(preferred_username, '') FROM bridged_actors WHERE did = $1`, did).Scan(&preferred))
 	require.Equal(t, "Carol", preferred)
+}
+
+func TestRunner_FallsBackToActorIDUsernameWhenOriginGivesNoAnswer(t *testing.T) {
+	const (
+		did       = "did:plc:ewvi7nxzyoun6zhxrhs64oiz"
+		actorPath = "/u/Lost_My_Mind"
+		oldHandle = "lost-my-mind.my-lemmy-org.tidepool.test"
+		newHandle = "lost-my-mind.my-lemmy.org.ap.tidepool.test"
+	)
+	for _, tc := range []struct {
+		name    string
+		status  int
+		timeout bool
+	}{
+		{name: "HTTP 500", status: http.StatusInternalServerError},
+		{name: "HTTP 404", status: http.StatusNotFound},
+		// The actor client's own 2s timeout fires; the run context stays alive.
+		{name: "timeout", timeout: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newRenameHarness(t)
+			var logs bytes.Buffer
+			h.logger = slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+			actor := h.insertOldActor(t, did, "https://my-lemmy.org"+actorPath, oldHandle, "")
+			unblock := make(chan struct{})
+			t.Cleanup(func() { close(unblock) })
+			h.actorDocs.handlers[actorPath] = func(w http.ResponseWriter, r *http.Request) {
+				if tc.timeout {
+					select {
+					case <-r.Context().Done():
+					case <-unblock:
+					}
+					return
+				}
+				w.WriteHeader(tc.status)
+			}
+			// Fetch first: the actor GET arrives before any PLC request.
+			h.actorDocs.onArrival = func(request actorRequest) error {
+				if request.Method != http.MethodGet || request.Path != actorPath {
+					return nil
+				}
+				if requests, _ := h.plc.snapshot(); len(requests) != 0 {
+					return fmt.Errorf("PLC requests at actor GET: %v", requests)
+				}
+				return nil
+			}
+			h.reservationAtPLC(did, newHandle, actor.ID)
+			require.NoError(t, h.runnerWithActors(t, h.actors).Run(t.Context(), []string{did}))
+			actorRequests, actorHookErrors := h.actorDocs.snapshot()
+			require.Empty(t, actorHookErrors)
+			require.Equal(t, []actorRequest{{Method: http.MethodGet, Path: actorPath}}, actorRequests)
+			plcRequests, plcHookErrors := h.plc.snapshot()
+			require.Empty(t, plcHookErrors)
+			posts := plcRequestsFor(plcRequests, http.MethodPost, "/"+did)
+			require.Len(t, posts, 1)
+			require.Equal(t, []any{"at://" + newHandle}, posts[0].Body["alsoKnownAs"])
+			assertFinalizedRename(t, h, did, oldHandle, newHandle)
+			code, message := migrationFailure(t, h, did)
+			require.False(t, code.Valid, "a fallback rename records no handle_migration_error")
+			require.False(t, message.Valid)
+			var preferred string
+			require.NoError(t, h.db.QueryRowContext(t.Context(),
+				`SELECT COALESCE(preferred_username, '') FROM bridged_actors WHERE did = $1`, did).Scan(&preferred))
+			require.Equal(t, "Lost_My_Mind", preferred)
+			requireUsernameFallbackRecord(t, logs.Bytes(), did, "Lost_My_Mind")
+		})
+	}
+}
+
+// requireUsernameFallbackRecord finds the record that reports the actor-ID
+// username fallback: "did" is the actor and "username_source" is "actor_id".
+// No field of that record, message included, may carry the username, in any case.
+func requireUsernameFallbackRecord(t *testing.T, logs []byte, did, username string) {
+	t.Helper()
+	decoder := json.NewDecoder(bytes.NewReader(logs))
+	for decoder.More() {
+		var record map[string]any
+		require.NoError(t, decoder.Decode(&record))
+		if record["did"] != did || record["username_source"] != "actor_id" {
+			continue
+		}
+		for key, value := range record {
+			encoded, err := json.Marshal(value)
+			require.NoError(t, err)
+			require.NotContains(t, strings.ToLower(string(encoded)), strings.ToLower(username),
+				"fallback record attribute %q carries the username", key)
+		}
+		return
+	}
+	t.Fatalf("no record with did %q and username_source \"actor_id\" in logs:\n%s", did, logs)
 }

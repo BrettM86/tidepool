@@ -361,7 +361,7 @@ func labelPrefix(actorType store.ActorType, base string) string {
 // availableHandle swaps a punycode label for the hash when it collides or
 // does not fit.
 func handleLabels(username, instance string) (name string, host string, err error) {
-	name = normalizeLabel(norm.NFC.String(username))
+	name = NormalizeLabel(username)
 	if name == "" && username != "" {
 		name = idnaLabel(username)
 		if name == "" {
@@ -458,6 +458,13 @@ func suffixLabel(base, suffix string) string {
 		base = strings.TrimRight(base[:max], "-")
 	}
 	return base + suffix
+}
+
+// NormalizeLabel is the ASCII user-label rule: the NFC form of username
+// through normalizeLabel. It returns "" for a name with no ASCII letters or
+// digits; handleLabels then picks a punycode or hash label instead.
+func NormalizeLabel(username string) string {
+	return normalizeLabel(norm.NFC.String(username))
 }
 
 // normalizeLabel lowercases and maps a string into the DNS-label alphabet

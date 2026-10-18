@@ -195,7 +195,8 @@ type BridgedActors interface {
 	// GetByHandleOrPending resolves either assigned or reserved handles.
 	GetByHandleOrPending(ctx context.Context, handle string) (*BridgedActor, error)
 
-	// SetPreferredUsernameByDID saves the raw fetched actor username without
+	// SetPreferredUsernameByDID saves the raw fetched actor username (or the
+	// rename job's label-confirmed actor-URL name) without
 	// marking the profile synced or changing any other actor fields. It
 	// saves only to a live, non-tombstoned row and returns NotFound when no
 	// such row exists.

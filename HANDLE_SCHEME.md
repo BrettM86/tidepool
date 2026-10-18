@@ -33,7 +33,8 @@ example `alice.lemmy.world.ap.tdpl.io`. `HANDLE_ZONE_ROOT` defaults to
   as an IP address are refused before any PLC call.
 - User label: built from `bridged_actors.preferred_username` (the raw
   `preferredUsername`, written at mint and on every profile sync, never
-  derived from the old handle or the actor URL). ASCII names are normalized
+  derived from the old handle or the actor URL, except by the rename job's
+  fallback under "Username fetch"). ASCII names are normalized
   to `[a-z0-9-]`. Other names are NFC-normalized and IDNA-mapped to a
   punycode `xn--` label. Anything IDNA2008 rejects, and any punycode label
   that would need a suffix or truncation, falls back to a stable
@@ -107,7 +108,19 @@ transaction swaps `handle` and `previous_handle`, releases the old claim, sets
   stays a candidate for the next run.
 - Username fetch: an actor with an empty `preferred_username` is fetched
   through the guarded AP client (same-authority redirects only) before a
-  target is reserved; failure records `username_unavailable`.
+  target is reserved. When the origin gives no answer (timeout, transport
+  error, body cut short, HTTP 429, 5xx, 401, 403 or 404), the username is
+  read from an actor URL of the form `https://<host>/{u,c,m,users}/<name>`,
+  accepted only when `<name>` is valid UTF-8 without NUL and the user-label
+  rule maps it to the old handle's first label, or to that label without one
+  `-<digits>` collision suffix. The check refuses, as safe false negatives, a
+  name whose old label was truncated before a collision suffix and one that
+  differs from the minted name only by Unicode normalization, and every name
+  with no ASCII letters or digits (its old label was a hash). Because a 404
+  counts as no answer, a deleted actor on software that serves its tombstone
+  with 404 (Mastodon) can still be renamed through the fallback; a 410
+  cannot. A 410, a refused redirect, a document that fails validation, or a
+  name that fails the check records `username_unavailable`.
 - Bulk runs: a body without `dids` selects every candidate. PLC POSTs are
   spaced at `HANDLE_MIGRATION_RATE` per second (default 2). The run is stored
   in `handle_migration_runs` with one active row at a time; a run interrupted

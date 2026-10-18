@@ -27,6 +27,8 @@ type plcRequest struct {
 	Method string
 	Path   string
 	Body   map[string]any
+	// Arrived is the fixture clock's time when the request arrived.
+	Arrived time.Time
 }
 
 type plcFixture struct {
@@ -47,6 +49,12 @@ type plcFixture struct {
 	heads              map[string][]map[string]any
 	getCounts          map[string]int
 	last               map[string]any
+	// now stamps each request's arrival; the harness sets the virtual clock.
+	now func() time.Time
+	// postHeaders and getHeaders are set on every POST and /log/last
+	// response for a DID path.
+	postHeaders map[string]map[string]string
+	getHeaders  map[string]map[string]string
 }
 
 func (p *plcFixture) serve(w http.ResponseWriter, r *http.Request) {
@@ -58,6 +66,9 @@ func (p *plcFixture) serve(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	p.mutex.Lock()
+	if p.now != nil {
+		request.Arrived = p.now()
+	}
 	p.requests = append(p.requests, request)
 	hook := p.onArrival
 	requestHook := p.onRequest
@@ -109,6 +120,9 @@ func (p *plcFixture) serve(w http.ResponseWriter, r *http.Request) {
 			getStatus = sequence[min(index, len(sequence)-1)]
 		}
 		getBody := p.getBodies[path]
+		for name, value := range p.getHeaders[path] {
+			w.Header().Set(name, value)
+		}
 		if p.getStatusAfterPost[path] != 0 {
 			for _, prior := range p.requests[:len(p.requests)-1] {
 				if prior.Method == http.MethodPost && prior.Path == path {
@@ -136,6 +150,9 @@ func (p *plcFixture) serve(w http.ResponseWriter, r *http.Request) {
 				p.heads = make(map[string][]map[string]any)
 			}
 			p.heads[r.URL.Path] = []map[string]any{request.Body}
+		}
+		for name, value := range p.postHeaders[r.URL.Path] {
+			w.Header().Set(name, value)
 		}
 		p.mutex.Unlock()
 		w.WriteHeader(status)
@@ -310,6 +327,7 @@ func newRenameHarnessWithTransport(t *testing.T, wrap func(store.BridgedActors) 
 	}
 	h := &renameHarness{db: database, actors: actors, plc: plc, rotationKey: rotationKey, clock: newVirtualClock(),
 		actorDocs: actorDocs, actorTarget: actorServer.Listener.Addr().String()}
+	plc.now = h.clock.Now
 	h.actorClient = h.actorFetcher(true)
 	minter, err := identity.NewMinter(identity.MinterOptions{
 		PLCDirectoryURL: server.URL, RotationKey: rotationKey, Custodian: custodian,

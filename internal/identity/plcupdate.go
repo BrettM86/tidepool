@@ -88,7 +88,8 @@ var errPLCHeadNotOperation = errors.New("identity: PLC head is not a plc_operati
 
 // UpdateHandle submits a signed PLC update operation setting newHandle.
 // beforeSubmit, when not nil, runs right before each POST attempt; an error
-// from it aborts the update without sending that POST.
+// from it aborts the update without sending that POST. A request whose final
+// attempt is answered 429 returns an error wrapping *PLCRateLimitedError.
 func (m *Minter) UpdateHandle(ctx context.Context, did, newHandle string, beforeSubmit func(context.Context) error) (HandleUpdateResult, error) {
 	first, err := m.readLastOperation(ctx, did)
 	if errors.Is(err, errPLCHeadNotOperation) {
@@ -178,6 +179,7 @@ func operationShowsHandle(head, expected map[string]any, handle, rotationDIDKey 
 }
 
 // readLastOperation fetches the DID's PLC head, backing off on 429 and 5xx.
+// A final 429 wraps *PLCRateLimitedError.
 // A head of another type wraps errPLCHeadNotOperation.
 func (m *Minter) readLastOperation(ctx context.Context, did string) (map[string]any, error) {
 	for attempt := 1; ; attempt++ {
@@ -201,9 +203,15 @@ func (m *Minter) readLastOperation(ctx context.Context, did string) (map[string]
 			return last, err
 		}
 		_ = response.Body.Close()
+		transient := ErrPLCTransient
+		if status == http.StatusTooManyRequests {
+			headers := rateLimitHeaders(response.Header)
+			m.logPLCRateLimit(did, "get", headers)
+			transient = &PLCRateLimitedError{Headers: headers}
+		}
 		if attempt == maxPLCUpdateAttempts {
 			return nil, fmt.Errorf("identity: GET PLC last operation for %s: %w: status %d after %d attempts",
-				did, ErrPLCTransient, status, attempt)
+				did, transient, status, attempt)
 		}
 		delay := plcUpdateRetryBaseDelay * time.Duration(1<<(attempt-1))
 		if err := m.waitForPLCRetry(ctx, delay); err != nil {
@@ -301,8 +309,14 @@ func (m *Minter) postHandleUpdate(ctx context.Context, did, newHandle, rotationD
 		case status == http.StatusBadRequest:
 			return m.reconcileHandleUpdate(ctx, did, newHandle, rotationDIDKey, signed, status, strings.TrimSpace(string(message)))
 		case status == http.StatusTooManyRequests || status >= 500:
+			transient := ErrPLCTransient
+			if status == http.StatusTooManyRequests {
+				headers := rateLimitHeaders(response.Header)
+				m.logPLCRateLimit(did, "post", headers)
+				transient = &PLCRateLimitedError{Headers: headers}
+			}
 			if attempt == maxPLCUpdateAttempts {
-				return HandleUpdateResult{}, fmt.Errorf("identity: POST PLC handle update for %s: %w: status %d after %d attempts", did, ErrPLCTransient, status, attempt)
+				return HandleUpdateResult{}, fmt.Errorf("identity: POST PLC handle update for %s: %w: status %d after %d attempts", did, transient, status, attempt)
 			}
 			delay := plcUpdateRetryBaseDelay * time.Duration(1<<(attempt-1))
 			if err := m.waitForPLCRetry(ctx, delay); err != nil {

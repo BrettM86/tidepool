@@ -122,9 +122,19 @@ transaction swaps `handle` and `previous_handle`, releases the old claim, sets
   cannot. A 410, a refused redirect, a document that fails validation, or a
   name that fails the check records `username_unavailable`.
 - Bulk runs: a body without `dids` selects every candidate. PLC POSTs are
-  spaced at `HANDLE_MIGRATION_RATE` per second (default 2). The run is stored
-  in `handle_migration_runs` with one active row at a time; a run interrupted
-  by shutdown resumes in the same mode at boot.
+  spaced at `HANDLE_MIGRATION_RATE` per second (default 0.1). The run is
+  stored in `handle_migration_runs` with one active row at a time; a run
+  interrupted by shutdown resumes in the same mode at boot.
+- PLC rate limits: each 429 from plc.directory (POST or `/log/last`) logs a
+  Warn with the DID and the `Retry-After`, `RateLimit`, `RateLimit-*`,
+  `X-RateLimit` and `X-RateLimit-*` headers (only the first `Retry-After`
+  value; repeated values of the others joined with `, `; values cut to 128
+  bytes, at most 16 headers besides `Retry-After`; no other headers). When an actor's
+  request is still 429 after its 5 attempts, the whole run (forward or
+  rollback) pauses for `Retry-After` (seconds or HTTP-date), or 1 hour
+  without one, then retries the same actor; it never moves on to the next
+  DID while rate limited. Cancelling during the pause stops the run with the
+  actor still pending.
 - Rollback: `{"rollback": true}` targets `previous_handle` for renamed
   actors. An actor caught mid-forward has its PLC head moved back to the old
   handle if it already lists the new one, its pending handle and claim

@@ -113,6 +113,9 @@ services:
       # so a smoother rate only defers identity creation, never loses it.
       MINT_RATE_PER_MINUTE: ${MINT_RATE_PER_MINUTE:-10}
       MINT_BURST: ${MINT_BURST:-20}
+      # PLC handle updates per second for the rename job; empty means the
+      # config default (0.1). Mints share the same plc.directory limit.
+      HANDLE_MIGRATION_RATE: ${HANDLE_MIGRATION_RATE:-}
       # Announced for WIDER-NETWORK visibility only (and quota-limited
       # there — see the relay service below). The app path into Coves is
       # the self-hosted relay + jetstream services in this file. The

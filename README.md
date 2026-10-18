@@ -321,7 +321,7 @@ Two classes, and the difference matters at boot:
 | `LISTEN_ADDR` | `:8091` | HTTP bind address |
 | `BRIDGE_HOSTNAME` | `localhost` | public domain of the bridge; anchors handles and the PDS endpoint in minted DID docs |
 | `HANDLE_ZONE_ROOT` | `ap.<BRIDGE_HOSTNAME>` | DNS zone for new-format bridged handles; must be a valid hostname strictly under `BRIDGE_HOSTNAME` |
-| `HANDLE_MIGRATION_RATE` | `2` | positive number of PLC handle updates per second submitted by the admin handle migration job; each POST, retries included, is sent at least 1/rate after the previous one |
+| `HANDLE_MIGRATION_RATE` | `0.1` | positive number of PLC handle updates per second submitted by the admin handle migration job; each POST, retries included, is sent at least 1/rate after the previous one. A PLC 429 pauses the whole run (see HANDLE_SCHEME.md) |
 | `DNS_LISTEN` | *(empty; disabled)* | UDP and TCP listen address (e.g. `:53`); empty disables DNS; serves the `ap` handle zone alongside per-instance subzones (TXT, SOA/NS and A/AAAA); UDP responses are rate limited; zone transfers are refused |
 | `DNS_UDP_RESPONSE_RATE` | `20` | UDP responses per second per client IPv4 /24 or IPv6 /56 prefix; over the limit every second suppressed response is an empty truncated reply, the rest are dropped; TCP is unlimited |
 | `DNS_PUBLIC_IPV4` | *(unset)* | IPv4 address returned in A answers; required when `DNS_LISTEN` is set |

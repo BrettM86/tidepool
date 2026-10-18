@@ -153,7 +153,7 @@ func TestLoad_HandleMigrationRate(t *testing.T) {
 		wantRate  float64
 		wantError bool
 	}{
-		{name: "unset defaults to 2", unset: true, wantRate: 2},
+		{name: "unset defaults to 0.1", unset: true, wantRate: 0.1},
 		{name: "fractional rate", value: "0.5", wantRate: 0.5},
 		{name: "zero", value: "0", wantError: true},
 		{name: "negative", value: "-1", wantError: true},

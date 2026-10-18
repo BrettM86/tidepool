@@ -337,7 +337,7 @@ func Load(logger *slog.Logger) (*Config, error) {
 		return nil, err
 	}
 	if raw := os.Getenv("HANDLE_MIGRATION_RATE"); raw == "" {
-		cfg.HandleMigrationRate = 2
+		cfg.HandleMigrationRate = 0.1
 		logger.Info("HANDLE_MIGRATION_RATE not set, using default", "value", cfg.HandleMigrationRate)
 	} else {
 		cfg.HandleMigrationRate, err = strconv.ParseFloat(raw, 64)

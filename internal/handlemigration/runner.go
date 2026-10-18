@@ -267,70 +267,83 @@ type plcHooks struct {
 // processPLC is common to both directions. finish runs only after PLC is
 // confirmed at target.
 func (r *Runner) processPLC(ctx context.Context, did, target string, lastSubmission *time.Time, hooks plcHooks, finish func(context.Context) error) error {
-	// The PLC operation cannot be undone, so re-check the tombstone right
-	// before it. FinalizeHandleRename refuses a tombstone that lands later.
-	current, err := r.actors.GetByDID(ctx, did)
-	if err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		r.logger.Error("re-read rename actor failed", "did", did, "error", err)
-		return nil
-	}
-	if current.ConsentState == store.ConsentStateDeleted {
-		r.logger.Warn("rename skipped: actor tombstoned before PLC update", "did", did)
-		return nil
-	}
-	// The gate spaces PLC submissions, not actor starts, so a slow actor
-	// adds no delay of its own and there is no catch-up burst.
-	var pacingErr, beforeSubmitErr error
-	submitted := false
-	paceSubmission := func(ctx context.Context) error {
-		if !lastSubmission.IsZero() {
-			if remaining := r.interval - r.now().Sub(*lastSubmission); remaining > 0 {
-				if err := r.wait(ctx, remaining); err != nil {
-					pacingErr = fmt.Errorf("pace handle migration: %w", err)
-					return pacingErr
-				}
-			}
-		}
-		if err := ctx.Err(); err != nil {
-			pacingErr = fmt.Errorf("pace handle migration: %w", err)
-			return pacingErr
-		}
-		if hooks.beforeSubmit != nil {
-			if err := hooks.beforeSubmit(ctx); err != nil {
-				beforeSubmitErr = err
-				return err
-			}
-		}
-		*lastSubmission = r.now()
-		submitted = true
-		return nil
-	}
-	result, err := r.identity.UpdateHandle(ctx, did, target, paceSubmission)
-	if err != nil {
-		if pacingErr != nil && !submitted {
-			// The gate stopped the run before any POST for this actor was sent.
-			return pacingErr
-		}
-		if beforeSubmitErr != nil {
+	// A PLC rate limit applies to every DID the run would send, so the run
+	// pauses and retries this actor instead of moving on.
+	var result identity.HandleUpdateResult
+	for {
+		// The PLC operation cannot be undone, so re-check the tombstone right
+		// before it. FinalizeHandleRename refuses a tombstone that lands later.
+		current, err := r.actors.GetByDID(ctx, did)
+		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			r.logger.Error("PLC handle update not sent: pre-submit step failed", "did", did, "error", beforeSubmitErr)
+			r.logger.Error("re-read rename actor failed", "did", did, "error", err)
 			return nil
 		}
-		if ctx.Err() != nil {
-			r.logger.Error("PLC result unknown: handle update cancelled", "did", did, "pending_handle", target)
-			return ctx.Err()
+		if current.ConsentState == store.ConsentStateDeleted {
+			r.logger.Warn("rename skipped: actor tombstoned before PLC update", "did", did)
+			return nil
 		}
-		if stderrors.Is(err, identity.ErrPLCTransient) {
-			r.logger.Error("PLC handle update transient failure", "did", did, "error", err)
-		} else {
-			r.logger.Error("PLC handle update failed", "did", did, "error", err)
+		// The gate spaces PLC submissions, not actor starts, so a slow actor
+		// adds no delay of its own and there is no catch-up burst.
+		var pacingErr, beforeSubmitErr error
+		submitted := false
+		paceSubmission := func(ctx context.Context) error {
+			if !lastSubmission.IsZero() {
+				if remaining := r.interval - r.now().Sub(*lastSubmission); remaining > 0 {
+					if err := r.wait(ctx, remaining); err != nil {
+						pacingErr = fmt.Errorf("pace handle migration: %w", err)
+						return pacingErr
+					}
+				}
+			}
+			if err := ctx.Err(); err != nil {
+				pacingErr = fmt.Errorf("pace handle migration: %w", err)
+				return pacingErr
+			}
+			if hooks.beforeSubmit != nil {
+				if err := hooks.beforeSubmit(ctx); err != nil {
+					beforeSubmitErr = err
+					return err
+				}
+			}
+			*lastSubmission = r.now()
+			submitted = true
+			return nil
 		}
-		return nil
+		result, err = r.identity.UpdateHandle(ctx, did, target, paceSubmission)
+		if err != nil {
+			if pacingErr != nil && !submitted {
+				// The gate stopped the run before any POST for this actor was sent.
+				return pacingErr
+			}
+			if beforeSubmitErr != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				r.logger.Error("PLC handle update not sent: pre-submit step failed", "did", did, "error", beforeSubmitErr)
+				return nil
+			}
+			if ctx.Err() != nil {
+				r.logger.Error("PLC result unknown: handle update cancelled", "did", did, "pending_handle", target)
+				return ctx.Err()
+			}
+			var rateLimited *identity.PLCRateLimitedError
+			if stderrors.As(err, &rateLimited) {
+				if err := r.pauseForRateLimit(ctx, did, rateLimited); err != nil {
+					return err
+				}
+				continue
+			}
+			if stderrors.Is(err, identity.ErrPLCTransient) {
+				r.logger.Error("PLC handle update transient failure", "did", did, "error", err)
+			} else {
+				r.logger.Error("PLC handle update failed", "did", did, "error", err)
+			}
+			return nil
+		}
+		break
 	}
 	switch result.Outcome {
 	case identity.HandleUpdateNotControlled:
@@ -352,6 +365,23 @@ func (r *Runner) processPLC(ctx context.Context, did, target string, lastSubmiss
 	}
 	if err := finish(ctx); err != nil {
 		r.logger.Error("PLC accepted, finalize not committed", "did", did, "target_handle", target, "error", err)
+	}
+	return nil
+}
+
+// pauseForRateLimit waits out a PLC 429 before the same actor is retried.
+// Cancellation stops the run with the actor left pending.
+func (r *Runner) pauseForRateLimit(ctx context.Context, did string, rateLimited *identity.PLCRateLimitedError) error {
+	retryAfter := rateLimited.Headers["Retry-After"]
+	now := r.now()
+	pause := rateLimitPause(retryAfter, now)
+	r.logger.Warn("PLC rate limited: pausing handle migration", "did", did, "pause", pause.String(),
+		"resume_at", now.Add(pause), "retry_after", retryAfter, "headers", rateLimited.Headers)
+	if err := r.wait(ctx, pause); err != nil {
+		return fmt.Errorf("pause handle migration for PLC rate limit: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("pause handle migration for PLC rate limit: %w", err)
 	}
 	return nil
 }

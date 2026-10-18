@@ -455,7 +455,7 @@ func TestBanExpiryReadsBothSpellings(t *testing.T) {
 		expiry := block(t, `, "expires": "`+valid+`"`).BanExpiry()
 		require.NotNil(t, expiry, "Lemmy 0.19's spelling must be read")
 		require.True(t, expiry.Valid)
-		assert.True(t, expiry.Time.Equal(validTime))
+		assert.True(t, expiry.Equal(validTime))
 	})
 
 	t.Run("endTime alone is read", func(t *testing.T) {
@@ -469,7 +469,7 @@ func TestBanExpiryReadsBothSpellings(t *testing.T) {
 				"a nil here turns every timed ban from those versions into a permanent one that "+
 				"no later activity can ever lift")
 		require.True(t, expiry.Valid)
-		assert.True(t, expiry.Time.Equal(validTime))
+		assert.True(t, expiry.Equal(validTime))
 	})
 
 	t.Run("unparseable expires alone is refusable", func(t *testing.T) {
@@ -495,7 +495,7 @@ func TestBanExpiryReadsBothSpellings(t *testing.T) {
 		expiry := block(t, `, "expires": "`+other+`", "endTime": "`+valid+`"`).BanExpiry()
 		require.NotNil(t, expiry)
 		require.True(t, expiry.Valid)
-		assert.True(t, expiry.Time.Equal(otherTime),
+		assert.True(t, expiry.Equal(otherTime),
 			"`expires` takes precedence when both spellings are present")
 	})
 
@@ -520,6 +520,6 @@ func TestBanExpiryReadsBothSpellings(t *testing.T) {
 		require.NotNil(t, expiry)
 		require.True(t, expiry.Valid,
 			"garbage in the spelling that LOST precedence must not poison the readable one")
-		assert.True(t, expiry.Time.Equal(validTime))
+		assert.True(t, expiry.Equal(validTime))
 	})
 }

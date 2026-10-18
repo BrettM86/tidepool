@@ -64,7 +64,9 @@ func startConnector(t *testing.T, c *Connector) *runningConnector {
 	ctx, cancel := context.WithCancel(context.Background())
 	running := &runningConnector{connector: c, cancel: cancel, done: make(chan error, 1)}
 	go func() { running.done <- c.Start(ctx) }()
-	t.Cleanup(func() { running.stop(t) })
+	// Cleanup only guarantees shutdown; tests that care about Start's result
+	// call stop explicitly and assert on it.
+	t.Cleanup(func() { _ = running.stop(t) })
 	return running
 }
 

@@ -155,12 +155,6 @@ func (s *tpSender) fail(err error) {
 	s.err = err
 }
 
-func (s *tpSender) succeed() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.err = nil
-}
-
 func (s *tpSender) kinds() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -1049,7 +1049,7 @@ func TestContainsHashtag(t *testing.T) {
 func TestTruncateText_ByteCap(t *testing.T) {
 	// Family emoji: 1 grapheme, 25 bytes. 100 of them = 100 graphemes but
 	// 2500 bytes — inside a 200-grapheme cap yet over a 300-byte cap.
-	emoji := "\U0001F468‍\U0001F469‍\U0001F467‍\U0001F466"
+	emoji := "\U0001F468\u200D\U0001F469\u200D\U0001F467\u200D\U0001F466"
 	s := strings.Repeat(emoji, 100)
 	got := truncateText(s, 200, 300)
 	assert.LessOrEqual(t, len(got), 300, "must satisfy the byte cap")

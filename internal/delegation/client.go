@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -43,7 +44,7 @@ type CloudflareClient struct {
 // NewCloudflareClient validates options and creates a Cloudflare DNS client.
 func NewCloudflareClient(options CloudflareOptions) (*CloudflareClient, error) {
 	if strings.TrimSpace(options.BaseURL) == "" || strings.TrimSpace(options.Token) == "" || strings.TrimSpace(options.ZoneID) == "" || options.HTTPClient == nil {
-		return nil, fmt.Errorf("Cloudflare base URL, token, zone ID and HTTP client are required")
+		return nil, errors.New("base URL, token, zone ID and HTTP client are required")
 	}
 	return &CloudflareClient{
 		baseURL: strings.TrimRight(options.BaseURL, "/"),
@@ -95,7 +96,7 @@ func (c *CloudflareClient) request(ctx context.Context, method, endpoint string,
 		return response, fmt.Errorf("read Cloudflare DNS response: %w", err)
 	}
 	if len(data) > maximumResponseBytes {
-		return response, fmt.Errorf("Cloudflare DNS response exceeds %d bytes", maximumResponseBytes)
+		return response, fmt.Errorf("read Cloudflare DNS response: exceeds %d bytes", maximumResponseBytes)
 	}
 	if err := json.Unmarshal(data, &response); err != nil {
 		return response, fmt.Errorf("decode Cloudflare DNS response (HTTP %d): %w", result.StatusCode, err)
@@ -108,9 +109,9 @@ func (c *CloudflareClient) request(ctx context.Context, method, endpoint string,
 			}
 		}
 		if len(messages) == 0 {
-			return response, fmt.Errorf("Cloudflare DNS request failed (HTTP %d)", result.StatusCode)
+			return response, fmt.Errorf("unsuccessful Cloudflare DNS request (HTTP %d)", result.StatusCode)
 		}
-		return response, fmt.Errorf("Cloudflare DNS request failed (HTTP %d): %s", result.StatusCode, strings.Join(messages, "; "))
+		return response, fmt.Errorf("unsuccessful Cloudflare DNS request (HTTP %d): %s", result.StatusCode, strings.Join(messages, "; "))
 	}
 	return response, nil
 }

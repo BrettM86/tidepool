@@ -47,6 +47,8 @@ jobs:
         run: go build ./...
       - name: Vet
         run: go vet ./... && go vet -tags e2e ./tests/e2e/...
+      - name: Lint
+        run: make lint
       - name: Check out current Coves lexicons
         # Tidepool vendors Coves' schemas. Comparing only against the local
         # manifest cannot detect a Coves-only lexicon change, so CI checks the

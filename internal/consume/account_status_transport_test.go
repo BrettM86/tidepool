@@ -138,8 +138,8 @@ func newPDSWorld(t *testing.T) *pdsWorld {
 			// document is mid-rewrite or hosting is moving.
 			service = `{"id":"#atproto_labeler","type":"AtprotoLabeler","serviceEndpoint":"https://labeler.example"}`
 		}
-		_, _ = w.Write([]byte(fmt.Sprintf(
-			`{"id":%q,"alsoKnownAs":["at://alice.example"],"service":[%s]}`, asDID, service)))
+		_, _ = fmt.Fprintf(w,
+			`{"id":%q,"alsoKnownAs":["at://alice.example"],"service":[%s]}`, asDID, service)
 	})
 
 	world.server = httptest.NewServer(mux)

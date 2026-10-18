@@ -468,9 +468,9 @@ func TestHostRouter_HostAgnosticPaths(t *testing.T) {
 	require.NoError(t, err)
 
 	for _, host := range []string{
-		"tidepool",          // the compose service name — production's actual ask Host
-		"tidepool:80",       // with the port the ask URL names
-		"anything.example",  // any other name the proxy might be told to use
+		"tidepool",         // the compose service name — production's actual ask Host
+		"tidepool:80",      // with the port the ask URL names
+		"anything.example", // any other name the proxy might be told to use
 	} {
 		t.Run("ask via "+host, func(t *testing.T) {
 			rec := routeHost(t, router, "http", host, askPath+"?domain=alice.lemmy-world."+serviceHost)

@@ -617,7 +617,7 @@ func TestRestart_ReplayIsIdempotent(t *testing.T) {
 	gapKey := ""
 	sawNew, sawGap := false, false
 	deadline := time.Now().Add(eventTimeout)
-	for !(sawNew && sawGap) && time.Now().Before(deadline) {
+	for (!sawNew || !sawGap) && time.Now().Before(deadline) {
 		for _, ev := range l2.drain(time.Second) {
 			if ev.Kind != kindCommit || ev.Commit == nil {
 				continue

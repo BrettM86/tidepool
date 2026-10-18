@@ -188,7 +188,7 @@ communities:
 	deliveriesBefore := len(h.inboxLog)
 	for _, broken := range []string{
 		"communities:\n  - \"technology@lemmy.world\"\n", // missing the leading '!'
-		"communites:\n  - \"!technology@lemmy.world\"\n", // typo'd key (KnownFields)
+		"communites:\n  - \"!technology@lemmy.world\"\n", //nolint:misspell // deliberately typo'd key (KnownFields)
 		"",               // truncated to empty ≠ empty list
 		"{}\n",           // no communities key ≠ empty list
 		"communities:\n", // present-but-null key ≠ empty list
@@ -333,7 +333,7 @@ communities:
 		"URL without host":                "communities:\n  - \"https://\"\n",
 		"entry with whitespace":           "communities:\n  - \"!tech @lemmy.world\"\n",
 		"blank entry":                     "communities:\n  - \"\"\n",
-		"unknown key":                     "communites:\n  - \"!technology@lemmy.world\"\n",
+		"unknown key":                     "communites:\n  - \"!technology@lemmy.world\"\n", //nolint:misspell // deliberate typo fixture
 		"malformed yaml":                  "communities: [unclosed\n",
 	} {
 		t.Run(name, func(t *testing.T) {

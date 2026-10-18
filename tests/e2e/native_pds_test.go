@@ -278,7 +278,7 @@ func TestNativePDS_RecordTransitsRelayToJetstream(t *testing.T) {
 func (h *harness) awaitRelayHead(t *testing.T, did, minRev, hint string) string {
 	t.Helper()
 	deadline := time.Now().Add(eventTimeout)
-	lastErr := "the poll never completed an attempt"
+	var lastErr string
 	for {
 		headCID, rev, err := h.relayGetLatestCommit(did)
 		switch {

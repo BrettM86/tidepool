@@ -138,7 +138,7 @@ func NewWorker(opts WorkerOptions) (*Worker, error) {
 	if votes == nil {
 		votes = store.NewOutboundVotes(opts.DB)
 	}
-	var switches Switches = opts.Switches
+	switches := opts.Switches
 	if switches == nil {
 		switches = AllowAll{}
 	}

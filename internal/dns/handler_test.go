@@ -419,7 +419,7 @@ func TestHandlerAddressAnswersAndTransferRefusal(t *testing.T) {
 				soa, ok := response.Ns[0].(*miekgdns.SOA)
 				require.True(t, ok, "authority must be SOA, got %T", response.Ns[0])
 				require.Equal(t, "lemmy-world.tdpl.example.", soa.Hdr.Name)
-				require.Equal(t, uint16(miekgdns.TypeSOA), soa.Hdr.Rrtype)
+				require.Equal(t, miekgdns.TypeSOA, soa.Hdr.Rrtype)
 				return
 			}
 

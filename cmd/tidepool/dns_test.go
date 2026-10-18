@@ -122,7 +122,7 @@ func TestStartDNSServerReleasesUDPWhenTCPBindFails(t *testing.T) {
 		}
 	}
 	require.NotNil(t, listener)
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 	address := listener.Addr().String()
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()

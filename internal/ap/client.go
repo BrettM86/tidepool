@@ -161,7 +161,7 @@ type Client struct {
 	keyCacheTTL        time.Duration
 	guard              *egressGuard
 	// requestBudget bounds a deduped fetch's detached lifetime (see
-	// getDeduped): the shared request outlives the initiating caller's
+	// getDedupedMode): the shared request outlives the initiating caller's
 	// context, so it needs its own upper bound.
 	requestBudget time.Duration
 
@@ -837,7 +837,7 @@ func sameAuthority(a, b string) bool {
 		strings.EqualFold(ua.Host, ub.Host)
 }
 
-// getDeduped collapses concurrent GETs for the same IRI into one request.
+// getDedupedMode collapses concurrent GETs for the same IRI into one request.
 //
 // The shared fetch runs on a context DETACHED from the initiating caller's
 // context (with its own budget), so that if the initiator cancels, the fetch
@@ -845,10 +845,6 @@ func sameAuthority(a, b string) bool {
 // others. Each caller still selects on its own ctx.Done, so an individual
 // caller that cancels stops waiting immediately; it just doesn't poison the
 // shared request. Values from the caller's ctx are preserved for the fetch.
-func (c *Client) getDeduped(ctx context.Context, iri string) ([]byte, error) {
-	return c.getDedupedMode(ctx, iri, fetchModeObject)
-}
-
 func (c *Client) getDedupedMode(ctx context.Context, iri string, mode fetchMode) ([]byte, error) {
 	// The dedupe key includes the mode: a pinned-authority fetch must never
 	// share the result of a plain fetch for the same IRI (the plain fetch may

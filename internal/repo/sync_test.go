@@ -304,7 +304,7 @@ func TestFirehoseNotify(t *testing.T) {
 	dsn := os.Getenv("TIDEPOOL_TEST_DATABASE_URL")
 	require.NotEmpty(t, dsn, "testutil.DB already validated this")
 	listener := pq.NewListener(dsn, 100*time.Millisecond, time.Second, nil)
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 	require.NoError(t, listener.Listen(FirehoseNotifyChannel))
 
 	res, err := manager.PutRecord(ctx, testDID, testCollection, testRKey(0), testRecord("notify me"))

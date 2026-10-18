@@ -28,3 +28,4 @@ coverage.out
 # the SSH target stays out of git history)
 .claude/*
 !.claude/commands/
+!.claude/settings.json

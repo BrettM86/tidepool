@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r '.tool_input.file_path' | { read -r f; case \"$f\" in *.go) ;; *) exit 0 ;; esac; [ -f \"$f\" ] || exit 0; root=$(git -C \"$(dirname \"$f\")\" rev-parse --show-toplevel 2>/dev/null) || exit 0; grep -q 'GO_FMT_FILE' \"$root/Makefile\" 2>/dev/null || exit 0; GO_FMT_FILE=\"$f\" make -s -C \"$root\" fmt >&2 || { echo \"format hook: make fmt failed for $f\" >&2; exit 2; }; }"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -71,7 +71,7 @@ func TestServe(t *testing.T) {
 	t.Run("occupied UDP address fails synchronously", func(t *testing.T) {
 		packet, err := net.ListenPacket("udp", "127.0.0.1:0")
 		require.NoError(t, err)
-		defer packet.Close()
+		defer func() { _ = packet.Close() }()
 		handler, err := NewHandler(handlerOptions(&recordingResolver{}))
 		require.NoError(t, err)
 		ctx, cancel := context.WithCancel(t.Context())
@@ -111,7 +111,7 @@ func requireBothSocketsAvailable(t *testing.T, address string) {
 		if err != nil {
 			return false
 		}
-		defer packet.Close()
+		defer func() { _ = packet.Close() }()
 		listener, err := net.Listen("tcp", address)
 		if err != nil {
 			return false
@@ -185,7 +185,7 @@ func rawUDPQuery(t *testing.T, address string, request *miekgdns.Msg) (*miekgdns
 	require.NoError(t, err)
 	conn, err := net.Dial("udp", address)
 	require.NoError(t, err)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	require.NoError(t, conn.SetDeadline(time.Now().Add(time.Second)))
 	_, err = conn.Write(packed)
 	require.NoError(t, err)
@@ -373,10 +373,10 @@ func TestServeConnsReportsEitherTransportFailure(t *testing.T) {
 		t.Run(network, func(t *testing.T) {
 			packet, err := net.ListenPacket("udp", "127.0.0.1:0")
 			require.NoError(t, err)
-			defer packet.Close()
+			defer func() { _ = packet.Close() }()
 			listener, err := net.Listen("tcp", "127.0.0.1:0")
 			require.NoError(t, err)
-			defer listener.Close()
+			defer func() { _ = listener.Close() }()
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			var fail chan struct{}

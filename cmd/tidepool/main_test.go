@@ -113,7 +113,7 @@ func TestRunDNSBindFailurePrecedesHTTP(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			httpListener, err := net.Listen("tcp", "127.0.0.1:0")
 			require.NoError(t, err)
-			defer httpListener.Close()
+			defer func() { _ = httpListener.Close() }()
 			httpAddress := httpListener.Addr().String()
 			_, httpPort, err := net.SplitHostPort(httpAddress)
 			require.NoError(t, err)
@@ -129,7 +129,7 @@ func TestRunDNSBindFailurePrecedesHTTP(t *testing.T) {
 				}
 				require.NoError(t, dnsSocket.Close())
 			}
-			defer dnsSocket.Close()
+			defer func() { _ = dnsSocket.Close() }()
 			dnsAddress := dnsSocket.LocalAddr().String()
 
 			t.Setenv("ENVIRONMENT", "development")

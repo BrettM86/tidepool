@@ -118,14 +118,14 @@ func newFakeIdentity(t *testing.T) *fakeIdentity {
 			http.NotFound(w, r)
 			return
 		}
-		_, _ = w.Write([]byte(fmt.Sprintf(`{
+		_, _ = fmt.Fprintf(w, `{
 			"@context": ["https://www.w3.org/ns/did/v1"],
 			"id": %q,
 			"alsoKnownAs": ["at://%s"],
 			"verificationMethod": [],
 			"service": [{"id":"#atproto_pds","type":"AtprotoPersonalDataServer",
 			             "serviceEndpoint":"https://pds.example"}]
-		}`, did, handle)))
+		}`, did, handle)
 	})
 
 	fake.server = httptest.NewServer(mux)

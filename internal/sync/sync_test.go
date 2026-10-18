@@ -546,7 +546,7 @@ func TestSubscribeRepos_SlowConsumerEvicted(t *testing.T) {
 	if resp != nil && resp.Body != nil {
 		_ = resp.Body.Close()
 	}
-	defer slow.Close()
+	defer func() { _ = slow.Close() }()
 
 	healthy := h.dial(t, "")
 	waitForSubscribers(t, h, 2)

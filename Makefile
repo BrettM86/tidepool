@@ -1,3 +1,6 @@
+GOLANGCI_LINT_VERSION := v2.13.2
+GOLANGCI_LINT := go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
+
 .PHONY: help build run test test-db-up test-db-down db-migrate db-migrate-down dev-up dev-down plc-up plc-down jetstream-up jetstream-down lint fmt fmt-check clean e2e e2e-up e2e-test e2e-logs e2e-down check-lexicons
 
 .DEFAULT_GOAL := help
@@ -134,24 +137,18 @@ e2e-down: ## Tear down the e2e stack and its volumes
 check-lexicons: ## Verify vendored lexicons match the manifest (and ~/Code/coves when present)
 	@./scripts/check-lexicons.sh
 
-fmt: ## Format all Go code
-	@echo "$(GREEN)Formatting Go code...$(RESET)"
-	@gofmt -w ./cmd ./internal
-	@echo "$(GREEN)✓ Formatting complete$(RESET)"
+GO_FMT_PATHS ?= .
 
-fmt-check: ## Check formatting without writing
-	@unformatted=$$(gofmt -l ./cmd ./internal); \
-	if [ -n "$$unformatted" ]; then \
-		echo "$(RED)✗ Unformatted files:$(RESET)"; \
-		echo "$$unformatted"; \
-		echo "$(YELLOW)Run 'make fmt' to fix$(RESET)"; \
-		exit 1; \
-	fi
+fmt: ## Format Go code with the .golangci.yml formatters (GO_FMT_FILE=path formats one file)
+	@if [ -n "$$GO_FMT_FILE" ]; then $(GOLANGCI_LINT) fmt -- "$$GO_FMT_FILE"; else $(GOLANGCI_LINT) fmt $(GO_FMT_PATHS); fi
+
+fmt-check: ## Check Go formatting against the .golangci.yml formatters
+	@$(GOLANGCI_LINT) fmt --diff $(GO_FMT_PATHS) || { echo "$(YELLOW)Run 'make fmt' to fix$(RESET)"; exit 1; }
 	@echo "$(GREEN)✓ All files formatted$(RESET)"
 
 lint: fmt-check ## Run golangci-lint (includes format check)
 	@echo "$(GREEN)Running linter...$(RESET)"
-	@golangci-lint run ./...
+	@$(GOLANGCI_LINT) run ./...
 	@echo "$(GREEN)✓ Linting complete$(RESET)"
 
 ##@ Cleanup

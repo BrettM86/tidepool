@@ -460,6 +460,7 @@ func TestDeleteMaterializedObject(t *testing.T) {
 	h.drain()
 	mapping, err := h.objects.GetByAPID(ctx, pageID)
 	require.NoError(t, err)
+	require.False(t, mapping.IsDeleted(), "the mapping must be live before the Delete")
 
 	require.Equal(t, http.StatusAccepted, h.deliver(author, loadFixture(t, "delete_page.json")))
 	h.drain()

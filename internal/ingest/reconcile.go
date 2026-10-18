@@ -51,7 +51,7 @@ func ParseFollowList(path string) ([]string, error) {
 		return nil, fmt.Errorf("follow list %s: %w", path, err)
 	}
 	dec := yaml.NewDecoder(bytes.NewReader(raw))
-	dec.KnownFields(true) // catch "communites:" and friends
+	dec.KnownFields(true) //nolint:misspell // catch typo'd keys such as "communites:"
 	var doc followListDoc
 	if err := dec.Decode(&doc); err != nil {
 		if stderrors.Is(err, io.EOF) {

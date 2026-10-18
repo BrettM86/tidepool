@@ -8,8 +8,17 @@ linters:
   settings:
     errcheck:
       check-blank: false
+      # Errors these return carry no signal at the call site: rows.Err()
+      # reports iteration failures, Rollback after Commit returns ErrTxDone,
+      # and closing a read response body cannot lose data.
+      exclude-functions:
+        - (*database/sql.Rows).Close
+        - (*database/sql.Tx).Rollback
+        - (io.ReadCloser).Close
     staticcheck:
-      checks: ["all"]
+      # staticcheck's own default set: everything except the stylistic checks
+      # it disables upstream (package comments, initialisms, comment forms).
+      checks: ["all", "-ST1000", "-ST1003", "-ST1016", "-ST1020", "-ST1021", "-ST1022"]
 
 formatters:
   enable:
@@ -24,4 +33,7 @@ formatters:
 
 run:
   timeout: 5m
+  # The e2e suite is behind this tag; without it it is never linted.
+  build-tags:
+    - e2e
   tests: true

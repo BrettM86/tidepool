@@ -16,11 +16,11 @@
               "maxLength": 640,
               "description": "Optional display name"
             },
-            "bio": {
+            "description": {
               "type": "string",
               "maxGraphemes": 256,
               "maxLength": 2560,
-              "description": "User bio. Stored as the `description` field of the social.coves.actor.profile record."
+              "description": "User bio, stored as the `description` field of the social.coves.actor.profile record."
             },
             "avatarBlob": {
               "type": "string",

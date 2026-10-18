@@ -376,8 +376,10 @@ func TestMaterializePostEndToEnd(t *testing.T) {
 	require.NoError(t, err)
 	profile, _, err := h.manager.GetRecord(ctx, authorDID, CollectionActorProfile, ProfileRKey)
 	require.NoError(t, err)
-	assert.Contains(t, profile["bio"], "bridged from @LeftLeaningFreedomFighters@lemmy.world",
-		"actor bios carry the provenance line")
+	assert.Contains(t, profile["description"], "bridged from @LeftLeaningFreedomFighters@lemmy.world",
+		"actor bios carry the provenance line in the lexicon's description field")
+	assert.NotContains(t, profile, "bio",
+		"social.coves.actor.profile has no bio property; the AppView reads description")
 
 	// The communities row tracks the bridged group.
 	community, err := h.communities.GetByAPGroupID(ctx, groupID)

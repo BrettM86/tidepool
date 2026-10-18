@@ -309,9 +309,9 @@ func TestValidationFailureMetric(t *testing.T) {
 
 	// A valid record does not move the counter.
 	valid := map[string]any{
-		"$type":     CollectionActorProfile,
-		"bio":       "hello",
-		"createdAt": "2026-01-01T00:00:00.000Z",
+		"$type":       CollectionActorProfile,
+		"description": "hello",
+		"createdAt":   "2026-01-01T00:00:00.000Z",
 	}
 	require.NoError(t, h.m.validateRecord(valid))
 	assert.Equal(t, before+2, ValidationFailures.Value())

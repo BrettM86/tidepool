@@ -610,7 +610,7 @@ func (m *Materializer) buildActorProfile(doc *ap.Object, fallbackCreatedAt time.
 	if displayName != "" {
 		record["displayName"] = truncateText(displayName, 64, 640)
 	}
-	record["bio"] = bioWithProvenance(markdownFromSummary(doc),
+	record["description"] = bioWithProvenance(markdownFromSummary(doc),
 		provenanceLine("@", doc.PreferredUsername, doc.Host()), 256, 2560)
 	if avatar != nil {
 		record["avatar"] = *avatar

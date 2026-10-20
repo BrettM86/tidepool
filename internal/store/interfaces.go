@@ -547,6 +547,15 @@ type InboxEvents interface {
 
 	// GetEvent returns the event for an activity id.
 	GetEvent(ctx context.Context, activityID string) (*InboxEvent, error)
+
+	// ListRecordedBans returns every FINISHED event that may carry a ban —
+	// processed, or poisoned (failed and never processed) — that is a directly
+	// delivered Block or an Announce whose payload names a Block, in id order,
+	// with payload, verified actor and received_at intact. The match
+	// on Announce payloads is deliberately loose (the bytes contain "Block"):
+	// the caller parses each payload and decides, so a malformed legacy row
+	// cannot fail the listing.
+	ListRecordedBans(ctx context.Context) ([]*InboxEvent, error)
 }
 
 // OutboundObjects persists the state every outbound Delete and Update is

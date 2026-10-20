@@ -445,6 +445,7 @@ func (h *harness) adminOptions() AdminOptions {
 		Service:      h.service,
 		Backfill:     h.backfills,
 		Sweeper:      h.handler,
+		BanReplayer:  NewBanReplayer(h.handler, h.events),
 		// The walks report only through the log (the 202 precedes the
 		// work), so their summaries land in h.logs for tests to assert.
 		Logger: slog.New(slog.NewTextHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug})),

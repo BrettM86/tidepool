@@ -584,6 +584,75 @@ func (c *lemmyClient) deletePost(t *testing.T, postID int) {
 	}
 }
 
+// lemmyPerson is a Lemmy user as the local instance knows it.
+type lemmyPerson struct {
+	ID      int
+	ActorID string
+}
+
+// person looks a local Lemmy user up by name (GET /api/v3/user).
+func (c *lemmyClient) person(t *testing.T, username string) lemmyPerson {
+	t.Helper()
+	var out struct {
+		PersonView struct {
+			Person struct {
+				ID      int    `json:"id"`
+				ActorID string `json:"actor_id"`
+			} `json:"person"`
+		} `json:"person_view"`
+	}
+	if err := c.do(http.MethodGet, "/api/v3/user?username="+url.QueryEscape(username), nil, &out); err != nil {
+		t.Fatalf("look up lemmy user %s: %v", username, err)
+	}
+	if out.PersonView.Person.ID == 0 || out.PersonView.Person.ActorID == "" {
+		t.Fatalf("look up lemmy user %s: no id or actor_id in response", username)
+	}
+	return lemmyPerson{ID: out.PersonView.Person.ID, ActorID: out.PersonView.Person.ActorID}
+}
+
+// siteActorID is the local Lemmy site's actor id (GET /api/v3/site) — the
+// target of a site ban's Block.
+func (c *lemmyClient) siteActorID(t *testing.T) string {
+	t.Helper()
+	var out struct {
+		SiteView struct {
+			Site struct {
+				ActorID string `json:"actor_id"`
+			} `json:"site"`
+		} `json:"site_view"`
+	}
+	if err := c.do(http.MethodGet, "/api/v3/site", nil, &out); err != nil {
+		t.Fatalf("read lemmy site: %v", err)
+	}
+	if out.SiteView.Site.ActorID == "" {
+		t.Fatal("read lemmy site: no actor_id in response")
+	}
+	return out.SiteView.Site.ActorID
+}
+
+// banFromSite is a SITE ADMIN action: ban personID from the whole instance,
+// removing their content (remove_data). Lemmy federates a home-instance site
+// ban as a DIRECT Block{target: site actor, removeData: true}.
+func (c *lemmyClient) banFromSite(t *testing.T, personID int, reason string) {
+	t.Helper()
+	if err := c.do(http.MethodPost, "/api/v3/user/ban", map[string]any{
+		"person_id": personID, "ban": true, "remove_data": true, "reason": reason,
+	}, nil); err != nil {
+		t.Fatalf("site-ban person %d: %v", personID, err)
+	}
+}
+
+// purgePost is a SITE ADMIN action: permanently delete postID from the Lemmy
+// database (POST /api/v3/admin/purge/post).
+func (c *lemmyClient) purgePost(t *testing.T, postID int, reason string) {
+	t.Helper()
+	if err := c.do(http.MethodPost, "/api/v3/admin/purge/post", map[string]any{
+		"post_id": postID, "reason": reason,
+	}, nil); err != nil {
+		t.Fatalf("purge post %d: %v", postID, err)
+	}
+}
+
 // likePost casts a vote: score 1 (up), -1 (down), 0 (retract).
 func (c *lemmyClient) likePost(t *testing.T, postID, score int) {
 	t.Helper()
@@ -2011,6 +2080,23 @@ func plcOperationCID(t *testing.T, operation map[string]any) string {
 		t.Fatal(err)
 	}
 	return id.String()
+}
+
+// openTidepoolDB opens Tidepool's own database in the local stack (closed at
+// test end).
+func openTidepoolDB(t *testing.T) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("postgres", "postgres://tidepool:tidepool@127.0.0.1:"+envOr("TIDEPOOL_E2E_PG_PORT", "5453")+"/tidepool?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	ctx, cancel := context.WithTimeout(t.Context(), eventTimeout)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatal(err)
+	}
+	return db
 }
 
 // prepareOldFormatActor rewinds an already-minted actor on the real local PLC

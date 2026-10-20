@@ -61,6 +61,9 @@ type AdminOptions struct {
 	// POST /admin/outbound/redrive resets poisoned rows, POST
 	// /admin/outbound/cancel parks an actor's or community's pending work.
 	Deliveries store.OutboundDeliveries
+	// BanReplayer serves POST /admin/inbox/replay-bans (optional; the
+	// endpoint answers 501 when nil). See upstream_ban.go.
+	BanReplayer *BanReplayer
 	// BaseContext is the root context background admin work (the
 	// refresh-profile walks) runs under. Wiring the server/run context here
 	// lets a walk observe shutdown, as BackfillOptions.BaseContext does for
@@ -82,6 +85,7 @@ type AdminOptions struct {
 //	POST   /admin/dns/reconcile         (Cloudflare token configured only)
 //	POST   /admin/reemit                {"did":"did:plc:..."} (or {} for all)
 //	POST   /admin/objects/sweep-deleted {"ap_ids":["https://..."]}
+//	POST   /admin/inbox/replay-bans     {"dry_run":true} (or false)
 //	GET    /admin/divergence            (reconciliation report; READ-ONLY)
 //	GET    /admin/metrics               (tidepool's own expvar counters)
 //
@@ -97,6 +101,7 @@ type Admin struct {
 	repos       RepoReemitter
 	sweeper     DeleteSweeper
 	deliveries  store.OutboundDeliveries
+	banReplayer *BanReplayer
 	logger      *slog.Logger
 	// reconciler serves POST /admin/communities/reconcile; nil (the
 	// endpoint answers 501) unless a follow list is configured. Set once
@@ -172,6 +177,7 @@ func NewAdmin(opts AdminOptions) (*Admin, error) {
 		repos:       opts.Repos,
 		sweeper:     opts.Sweeper,
 		deliveries:  opts.Deliveries,
+		banReplayer: opts.BanReplayer,
 		logger:      logger,
 		baseCtx:     baseCtx,
 	}, nil
@@ -196,6 +202,7 @@ func (a *Admin) Routes(r chi.Router) {
 		r.Post("/dns/reconcile", a.handleDNSReconcile)
 		r.Post("/reemit", a.handleReemit)
 		r.Post("/objects/sweep-deleted", a.handleSweepDeleted)
+		r.Post("/inbox/replay-bans", a.handleReplayBans)
 		r.Get("/divergence", a.handleDivergence)
 		r.Get("/outbound", a.handleOutboundInspect)
 		r.Post("/outbound/redrive", a.handleOutboundRedrive)

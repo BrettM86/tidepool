@@ -274,6 +274,32 @@ func (r *postgresInboxEvents) GetEvent(ctx context.Context, activityID string) (
 	return event, nil
 }
 
+func (r *postgresInboxEvents) ListRecordedBans(ctx context.Context) ([]*InboxEvent, error) {
+	query := `SELECT ` + eventColumns + ` FROM inbox_events
+		WHERE (processed_at IS NOT NULL OR failed_at IS NOT NULL)
+		  AND (type = $1 OR (type = $2 AND position($3::bytea IN payload) > 0))
+		ORDER BY id`
+
+	rows, err := r.db.QueryContext(ctx, query, "Block", "Announce", []byte(`"Block"`))
+	if err != nil {
+		return nil, fmt.Errorf("list recorded ban events: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var events []*InboxEvent
+	for rows.Next() {
+		event, err := scanInboxEvent(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan recorded ban event: %w", err)
+		}
+		events = append(events, event)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list recorded ban events: %w", err)
+	}
+	return events, nil
+}
+
 func scanInboxEvent(row rowScanner) (*InboxEvent, error) {
 	var event InboxEvent
 	err := row.Scan(

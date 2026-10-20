@@ -59,6 +59,11 @@ const (
 	outboundWorkerIdle = time.Second
 )
 
+// ingest.NewHandler finds the banned-content surface by asserting it on the
+// Materializer it is handed, so a drifted method set would leave it nil and
+// make every removeData ban fail with a retryable error. Fail the build instead.
+var _ ingest.BannedContentRemover = (*materialize.Materializer)(nil)
+
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	slog.SetDefault(logger)
@@ -591,6 +596,7 @@ func run(logger *slog.Logger) error {
 		Repos:        repoManager,
 		Sweeper:      handler,
 		Deliveries:   store.NewOutboundDeliveries(database),
+		BanReplayer:  ingest.NewBanReplayer(handler, inboxEvents),
 		// The refresh-profile walks derive from the run context so they
 		// stop at their next community or user once shutdown starts; the
 		// drain below waits for them, like the backfill drain.

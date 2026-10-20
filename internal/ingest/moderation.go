@@ -34,17 +34,22 @@ type AuthorModerator interface {
 // and a ban for somebody who is not our user — where a single number would read
 // as "bans are not arriving".
 var (
-	// BlockDirectIgnored counts Blocks delivered DIRECTLY to the banned user's
-	// inbox rather than announced by the community. Lemmy sends both; only the
-	// announced one can be authorized (see ignoreDirectBlock).
+	// BlockDirectIgnored counts Blocks delivered DIRECTLY rather than announced
+	// by the community — every direct Block except a home instance's site ban
+	// of its own bridged user with removeData (see decideSiteBan). Lemmy sends
+	// a community ban both ways; only the announced one can be authorized (see
+	// ignoreDirectBlock).
 	BlockDirectIgnored = expvar.NewInt("tidepool_block_direct_ignored")
 	// BlockUnscopedTarget counts announced Blocks whose `target` is not a
-	// community this bridge follows — an instance-wide (Site actor) ban, which
-	// this scope does not model.
+	// community this bridge follows — an announced instance-wide (Site actor)
+	// ban, which this scope does not model. A home site ban arrives directly
+	// instead and is decided by decideSiteBan.
 	BlockUnscopedTarget = expvar.NewInt("tidepool_block_unscoped_target")
 	// BlockForeignSubject counts announced Blocks naming somebody who is not one
-	// of our personas. A Lemmy user banned from a Lemmy community is entirely
-	// their instance's business; we hold no state that could apply it.
+	// of our personas and that remove nothing: e.g. an unknown actor, or a
+	// bridged Lemmy user banned without removeData (or unbanned). The ban itself is
+	// enforced on their instance and we hold no state that could apply it; only
+	// its removeData reaches content we host (see decideCommunityBan).
 	BlockForeignSubject = expvar.NewInt("tidepool_block_foreign_subject")
 	// BlockLapsedIgnored counts announced Blocks whose expiry had already passed
 	// when they arrived — a description of a ban that is over, applied to
@@ -68,9 +73,12 @@ var (
 // variable so a test can hold time still; production never replaces it.
 var timeNow = time.Now
 
-// ignoreDirectBlock is the DECIDED non-action at the other door.
+// ignoreDirectBlock is the DECIDED non-action at the other door, for every
+// direct Block that is not a home instance's site ban of its own bridged user
+// (decideSiteBan takes that one first: Lemmy never announces a site ban, and
+// the user's own instance is the origin of the content it removes).
 //
-// Lemmy sends a ban twice: announced through the community, and delivered
+// Lemmy sends a community ban twice: announced through the community, and delivered
 // directly to the banned user's inbox. They are not redundant copies — they are
 // signed by different actors, and only one of them can be authorized.
 // BlockUser's actor is the MODERATOR's Person, so on this path decision 18's
@@ -87,18 +95,27 @@ var timeNow = time.Now
 // The refusal holds even when the activity CLAIMS actor = the Group: the inbox
 // binds the VERIFIED signer and never the claim (SEC-1), so a Person-signed
 // Block is a Person-signed Block whatever it says about itself.
-func (h *Handler) ignoreDirectBlock(block *ap.Object, signer string) error {
+//
+// reason is the skip's reason: directBlockIgnoredReason, or a narrower one for
+// a Block shaped as a home site ban whose subject is not a bridged Person.
+func (h *Handler) ignoreDirectBlock(block *ap.Object, signer, reason string) error {
 	BlockDirectIgnored.Add(1)
 	h.logger.Info("ignoring a directly delivered Block",
 		"activity", block.ID, "signer", signer, "target", refID(block.Target))
-	return skip(block.ID,
-		"a directly delivered Block is signed by the moderator's Person, which can never be "+
-			"the community that owns the ban: the community's own announced copy is the "+
-			"authoritative one and is the only path that records it")
+	return skip(block.ID, reason)
 }
 
+// directBlockIgnoredReason is the skip reason for a direct Block that is not
+// shaped as a home site ban with removeData.
+const directBlockIgnoredReason = "a directly delivered Block other than a home site ban with " +
+	"removeData authorizes nothing here"
+
 // handleBlock applies an announced Block — a community banning a native author —
-// and, with banned=false, the Undo that lifts it.
+// and, with banned=false, the Undo that lifts it. An announced ban of a BRIDGED
+// Lemmy user with removeData removes their content published before the ban
+// time (the Block's `published` when earlier than receipt, else receivedAt) from
+// this community, and records no ban (see decideCommunityBan); an unban of one
+// restores nothing.
 //
 // A BAN IS AN INTERSECTION: this author, in this community. Both halves are
 // recorded, because both readers need one each — the admission gate holds a
@@ -113,12 +130,16 @@ func (h *Handler) ignoreDirectBlock(block *ap.Object, signer string) error {
 // community, and the ban is FOR that community — collapse into one comparison
 // against the verified announcer. A target that names a community we follow but
 // is not the announcer is one moderator team excluding somebody from another's
-// space; a target that names no community we follow is an instance-wide ban this
-// scope does not model. They are different findings and get different reasons.
-func (h *Handler) handleBlock(ctx context.Context, block *ap.Object, announcer *store.Community, banned bool) error {
+// space; a target that names no community we follow is an announced
+// instance-wide ban this scope does not model (a home site ban arrives directly
+// and is decided by decideSiteBan). They are different findings and get
+// different reasons.
+//
+// activityID is the id of the Announce that carried a ban; an unban passes "".
+func (h *Handler) handleBlock(ctx context.Context, block *ap.Object, announcer *store.Community, banned bool, activityID string, receivedAt time.Time) error {
 	if announcer == nil {
-		// Unreachable from the dispatch (a bare Block is taken by
-		// ignoreDirectBlock before it can get here), and refused anyway: without
+		// Unreachable from the dispatch (a bare Block is taken by Process's
+		// direct-Block branch before it can get here), and refused anyway: without
 		// a verified community there is nothing to authorize against.
 		return skip(block.ID, "a Block with no announcing community authorizes nothing")
 	}
@@ -144,11 +165,20 @@ func (h *Handler) handleBlock(ctx context.Context, block *ap.Object, announcer *
 		return fmt.Errorf("ingest: identify ban subject %s: %w", subjectAPID, err)
 	}
 	if identity.Class != echo.ClassLocalActor || identity.DID == "" {
+		if banned {
+			ban, err := h.decideCommunityBan(ctx, block, announcer, activityID, receivedAt)
+			if err != nil {
+				return err
+			}
+			if ban != nil {
+				return h.removeBannedContent(ctx, ban)
+			}
+		}
 		BlockForeignSubject.Add(1)
 		return skip(block.ID,
-			"announced Block names an actor that is not one of our personas: a Lemmy user's ban "+
-				"from a Lemmy community is enforced entirely on their instance, and we hold no "+
-				"state that could apply it")
+			"announced Block names an actor that is not one of our personas and removes nothing "+
+				"we host: a Lemmy user's ban from a Lemmy community is enforced entirely on their "+
+				"instance, and only its removeData reaches bridged content")
 	}
 
 	if !banned {
@@ -167,20 +197,21 @@ func (h *Handler) handleBlock(ctx context.Context, block *ap.Object, announcer *
 func (h *Handler) refuseBlockTarget(ctx context.Context, block *ap.Object, target string, announcer *store.Community) error {
 	_, err := h.communities.GetByAPGroupID(ctx, target)
 	if errors.IsNotFound(err) {
-		// An instance-wide ban (target = the Site actor) or a community we do
-		// not federate. Either way the scope is not one we model: recording it
-		// against the announcing community would UNDERSTATE it — the author is
-		// excluded from every community on that instance and we would enforce it
-		// in one — and dropping it silently leaves them posting into that
-		// instance collecting 403s until their deliveries poison, with nothing
-		// naming the cause.
+		// An announced instance-wide ban (target = the Site actor) or a
+		// community we do not federate; a home site ban never reaches here, it
+		// arrives directly (see decideSiteBan). Either way the scope is not one
+		// we model: recording it against the announcing community would
+		// UNDERSTATE it — the author is excluded from every community on that
+		// instance and we would enforce it in one — and dropping it silently
+		// leaves them posting into that instance collecting 403s until their
+		// deliveries poison, with nothing naming the cause.
 		BlockUnscopedTarget.Add(1)
 		h.logger.Warn("announced Block targets a scope this bridge does not model",
 			"activity", block.ID, "target", target, "announcer", announcer.APGroupID)
 		return skip(block.ID,
 			"announced Block targets "+target+", which is not a community this bridge follows: "+
-				"an instance-wide ban is a scope Tidepool does not model, so it is recorded nowhere "+
-				"and the author keeps posting into that instance")
+				"an announced instance-wide ban is a scope Tidepool does not model, so it is "+
+				"recorded nowhere and the author keeps posting into that instance")
 	}
 	if err != nil {
 		return fmt.Errorf("ingest: resolve block target %s: %w", target, err)

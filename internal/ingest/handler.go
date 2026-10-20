@@ -137,10 +137,13 @@ type Handler struct {
 	moderation  store.ObjectModeration
 	bans        store.CommunityBans
 	authorMod   AuthorModerator
-	classifier  EchoClassifier
-	echoLog     *ratelimit.Sampler
-	serviceID   string
-	logger      *slog.Logger
+	// bannedContent acts on upstream bans of BRIDGED Lemmy users (see
+	// BannedContentRemover); read off the Materializer like authorMod.
+	bannedContent BannedContentRemover
+	classifier    EchoClassifier
+	echoLog       *ratelimit.Sampler
+	serviceID     string
+	logger        *slog.Logger
 }
 
 // NewHandler validates options and builds a Handler.
@@ -214,23 +217,27 @@ func NewHandler(opts HandlerOptions) (*Handler, error) {
 	// dispatcher already drives rather than a second option, because a
 	// deployment cannot coherently have one and not the other.
 	authorMod, _ := opts.Materializer.(AuthorModerator)
+	// Same value, same reason: bridged content is selected from ap_objects and
+	// removed by the materializer that wrote it.
+	bannedContent, _ := opts.Materializer.(BannedContentRemover)
 	return &Handler{
-		mat:         opts.Materializer,
-		fetcher:     opts.Fetcher,
-		objects:     opts.Objects,
-		actors:      opts.Actors,
-		communities: opts.Communities,
-		tombstones:  opts.Tombstones,
-		records:     opts.Records,
-		votes:       opts.Votes,
-		backfill:    opts.Backfill,
-		moderation:  moderation,
-		bans:        bans,
-		authorMod:   authorMod,
-		classifier:  opts.Echo,
-		echoLog:     ratelimit.NewSampler(echoDropLogInterval),
-		serviceID:   opts.ServiceActorID,
-		logger:      logger,
+		mat:           opts.Materializer,
+		fetcher:       opts.Fetcher,
+		objects:       opts.Objects,
+		actors:        opts.Actors,
+		communities:   opts.Communities,
+		tombstones:    opts.Tombstones,
+		records:       opts.Records,
+		votes:         opts.Votes,
+		backfill:      opts.Backfill,
+		moderation:    moderation,
+		bans:          bans,
+		authorMod:     authorMod,
+		bannedContent: bannedContent,
+		classifier:    opts.Echo,
+		echoLog:       ratelimit.NewSampler(echoDropLogInterval),
+		serviceID:     opts.ServiceActorID,
+		logger:        logger,
 	}, nil
 }
 
@@ -255,7 +262,7 @@ func (h *Handler) Process(ctx context.Context, event *store.InboxEvent) error {
 
 	switch activity.Type {
 	case ap.TypeAnnounce:
-		return h.handleAnnounce(ctx, activity, signer)
+		return h.handleAnnounce(ctx, activity, signer, event.ReceivedAt)
 	case ap.TypeCreate, ap.TypeUpdate:
 		return h.handleBareCreateUpdate(ctx, activity, signer)
 	case ap.TypeDelete:
@@ -287,10 +294,22 @@ func (h *Handler) Process(ctx context.Context, event *store.InboxEvent) error {
 	case ap.TypeReject:
 		return h.handleReject(ctx, activity, signer)
 	case ap.TypeBlock:
-		// A Block delivered DIRECTLY to the banned user's inbox. Lemmy sends one
-		// of these alongside every announced ban, and it is the copy we cannot
-		// authorize: see ignoreDirectBlock.
-		return h.ignoreDirectBlock(activity, signer)
+		// A Block delivered DIRECTLY. One shape is acted on: a home instance's
+		// site ban of its own bridged user with removeData, which Lemmy never
+		// announces (see decideSiteBan). Every other direct Block is ignored: see
+		// ignoreDirectBlock.
+		ban, err := h.decideSiteBan(ctx, activity, signer, event.ReceivedAt)
+		if err != nil {
+			return err
+		}
+		if ban == nil && isSiteBanShape(activity, signer) {
+			return h.ignoreDirectBlock(activity, signer,
+				"site ban of an actor that is not a bridged Person: "+refID(activity.Object))
+		}
+		if ban == nil {
+			return h.ignoreDirectBlock(activity, signer, directBlockIgnoredReason)
+		}
+		return h.removeBannedContent(ctx, ban)
 	case ap.TypeLike, ap.TypeDislike:
 		// A vote counts only inside the community's own Announce, which is
 		// also where the aggregator checks the subject belongs to that
@@ -345,8 +364,9 @@ func (h *Handler) dropBareContent(activity, obj *ap.Object, signer, reason strin
 }
 
 // handleAnnounce unwraps FEP-1b12 group fan-out: Announce{Create|Update|
-// Delete|Undo|Like|Dislike|...} from a community we follow.
-func (h *Handler) handleAnnounce(ctx context.Context, announce *ap.Object, signer string) error {
+// Delete|Undo|Like|Dislike|...} from a community we follow. receivedAt is when
+// the inbox received it, the ban time of a Block that carries no `published`.
+func (h *Handler) handleAnnounce(ctx context.Context, announce *ap.Object, signer string, receivedAt time.Time) error {
 	// Only communities the bridge subscribed to may push content. pending is
 	// accepted too: Lemmy can start announcing before we processed its
 	// Accept (both arrive on the same ordering key, but a re-delivered
@@ -420,10 +440,11 @@ func (h *Handler) handleAnnounce(ctx context.Context, announce *ap.Object, signe
 		// TypeUndo branch above and lands in the same handler with locked=false.
 		return h.handleLock(ctx, inner, community, true)
 	case ap.TypeBlock:
-		// A community banning a native author. This is the AUTHORITATIVE copy —
+		// A community banning a native author, or a bridged Lemmy author with
+		// removeData (see handleBlock). This is the AUTHORITATIVE copy —
 		// the direct one, delivered to the banned user's inbox, is signed by the
 		// moderator's Person and cannot satisfy decision 18 by construction.
-		return h.handleBlock(ctx, inner, community, true)
+		return h.handleBlock(ctx, inner, community, true, announce.ID, receivedAt)
 	default:
 		// Add, Remove, Flag, ... — moderation activities the bridge does not
 		// translate yet. Remove in particular is NOT content removal in Lemmy
@@ -444,9 +465,9 @@ func (h *Handler) handleAnnounce(ctx context.Context, announce *ap.Object, signe
 // echo, calling it "ours" drops real Lemmy content permanently, and only the
 // retry the wrapped error buys is honest.
 func (h *Handler) suppressEcho(ctx context.Context, activityID string, envelope *ap.Object) error {
-	identity, err := h.classifier.Classify(ctx, envelope)
+	identity, err := h.classifyEcho(ctx, activityID, envelope)
 	if err != nil {
-		return fmt.Errorf("ingest: echo classification for %s: %w", activityID, err)
+		return err
 	}
 	if identity.Class == echo.ClassNone {
 		return nil
@@ -465,6 +486,18 @@ func (h *Handler) suppressEcho(ctx context.Context, activityID string, envelope 
 			"at_uri", identity.ATURI)
 	}
 	return skip(activityID, "echo of our own "+string(identity.Class))
+}
+
+// classifyEcho is suppressEcho's read-only half: whether the envelope resolves
+// to one of our own entities, with nothing counted, logged or skipped. The ban
+// replay asks it of a recorded Announce so it drops exactly the echoes the live
+// dispatch dropped.
+func (h *Handler) classifyEcho(ctx context.Context, activityID string, envelope *ap.Object) (echo.Identity, error) {
+	identity, err := h.classifier.Classify(ctx, envelope)
+	if err != nil {
+		return echo.Identity{}, fmt.Errorf("ingest: echo classification for %s: %w", activityID, err)
+	}
+	return identity, nil
 }
 
 // handleBareCreateUpdate processes a Create/Update delivered directly by a

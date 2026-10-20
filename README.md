@@ -81,7 +81,7 @@ docker compose -f docker-compose.prod.yml up -d --build tidepool
 The repo-committed deploy runbook is
 [.claude/commands/deploy.md](.claude/commands/deploy.md).
 
-Requires Go 1.25+, Docker, and (for `make db-migrate`) the `goose` CLI.
+Requires Go 1.26+, Docker, and (for `make db-migrate`) the `goose` CLI.
 `make lint` and `make fmt` run a pinned golangci-lint through `go run`; it
 needs Go 1.26, which the go command downloads automatically. Store tests need a real postgres: they
 skip with a clear message when `TIDEPOOL_TEST_DATABASE_URL` is unset.

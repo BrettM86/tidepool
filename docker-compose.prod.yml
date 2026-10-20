@@ -274,6 +274,13 @@ services:
         # indigo's Dockerfile runs `git describe`; git-URL contexts strip
         # .git unless BuildKit is told to keep it.
         BUILDKIT_CONTEXT_KEEP_GIT_DIR: 1
+      # Replaces the Dockerfile's builder image (golang:1.26-alpine3.22 is
+      # frozen at go1.26.4) with a patched Go. alpine3.23 keeps the musl
+      # (1.2.5) of the alpine:3.22 run stage the binary is linked against.
+      # The key must match the upstream FROM line exactly, or BuildKit
+      # ignores it without a warning: recheck it whenever the SHA moves.
+      additional_contexts:
+        golang:1.26-alpine3.22: docker-image://golang:1.26.10-alpine3.23
     image: tidepool-relay:prod
     container_name: tidepool-prod-relay
     restart: unless-stopped
@@ -339,6 +346,11 @@ services:
       # Pinned to the checkout whose /subscribe (v1) behavior was verified
       # against the Coves consumers on 2026-07-16.
       context: https://github.com/bluesky-social/jetstream.git#f6d220f3551efd32bfc1a8757abc93f51a713c12
+      # Replaces the Dockerfile's pinned builder (go1.26.4) with a patched Go.
+      # The key must match the upstream FROM line exactly, or BuildKit
+      # ignores it without a warning: recheck it whenever the SHA moves.
+      additional_contexts:
+        golang:1.26.4-bookworm: docker-image://golang:1.26.10-bookworm
     image: tidepool-jetstream:prod
     container_name: tidepool-prod-jetstream
     restart: unless-stopped

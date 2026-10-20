@@ -439,20 +439,23 @@ func serveServer(ctx context.Context, server *miekgdns.Server, closeSocket func(
 	done := make(chan error, 1)
 	go func() {
 		defer close(done)
+		var err error
 		select {
 		case <-ctx.Done():
 			// Shutdown only fails when the server was never started.
 			_ = server.Shutdown()
-			<-stopped
-		case err := <-stopped:
-			if ctx.Err() != nil {
-				return
-			}
-			if err == nil {
-				err = errors.New("DNS server stopped unexpectedly")
-			}
-			done <- fmt.Errorf("serve DNS on %s: %w", address, err)
+			// Wait for the serve goroutine; a stop after cancellation is not
+			// reported (the ctx.Err check below returns first).
+			err = <-stopped
+		case err = <-stopped:
 		}
+		if ctx.Err() != nil {
+			return
+		}
+		if err == nil {
+			err = errors.New("DNS server stopped unexpectedly")
+		}
+		done <- fmt.Errorf("serve DNS on %s: %w", address, err)
 	}()
 	return done, nil
 }

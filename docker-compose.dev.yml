@@ -94,7 +94,7 @@ services:
   # First start clones and builds did-method-plc (several minutes); the
   # volume caches it for later runs.
   plc-directory:
-    image: node:18-alpine
+    image: node:22-alpine
     container_name: tidepool-dev-plc
     ports:
       - "${PLC_PORT:-3002}:3000"

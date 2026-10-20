@@ -24,7 +24,7 @@ var files embed.FS
 
 var (
 	once    sync.Once
-	catalog lexicon.BaseCatalog
+	catalog *lexicon.BaseCatalog
 	loadErr error
 )
 
@@ -38,5 +38,5 @@ func Catalog() (*lexicon.BaseCatalog, error) {
 	if loadErr != nil {
 		return nil, fmt.Errorf("lexicons: load embedded catalog: %w", loadErr)
 	}
-	return &catalog, nil
+	return catalog, nil
 }

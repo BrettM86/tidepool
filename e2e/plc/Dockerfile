@@ -11,7 +11,7 @@
 # update PLC_COMMIT below, and rebuild
 #   (docker compose -f docker-compose.e2e.yml build plc).
 
-FROM node:18-alpine
+FROM node:22-alpine
 
 RUN apk add --no-cache git python3 make g++
 

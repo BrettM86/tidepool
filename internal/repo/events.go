@@ -315,7 +315,10 @@ func walkReachable(ctx context.Context, src *txBlockSource, node cid.Cid, seen m
 			if err != nil {
 				return fmt.Errorf("repo: decode MST node %s: %w", c, err)
 			}
-			n := nd.Node(&c)
+			n, err := nd.Node(&c)
+			if err != nil {
+				return fmt.Errorf("repo: invalid MST node %s: %w", c, err)
+			}
 			for i := range n.Entries {
 				e := &n.Entries[i]
 				if e.IsValue() && e.Value != nil {

@@ -448,10 +448,10 @@ services:
   # #identity and #account frames around it are consumed normally, the
   # handle verifies, and every #commit that follows is indexed.
   pds:
-    # Pinned by digest — the SAME digest Coves' CI stack pins
-    # (coves/docker-compose.ci.yml), so both repos exercise one PDS build.
-    # sha256:1fa8bbce… was resolved 2026-07-28 from ghcr.io/bluesky-social/pds:latest.
-    image: ghcr.io/bluesky-social/pds@sha256:1fa8bbceabb65d8e1710749b1ea92c1c20a7489ca38da4a0a5f64c0c10a70c29
+    # Pinned by tag and digest: sha256:3a8feb34… is ghcr.io/bluesky-social/pds:0.4.5037
+    # (resolved 2026-10-20). Coves' CI stack (coves/docker-compose.ci.yml)
+    # pins its own PDS release; recheck both when bumping either.
+    image: ghcr.io/bluesky-social/pds:0.4.5037@sha256:3a8feb3415e319dbcc13372293b7ef1fb05a318a6ff1d55968cf99ba6633c5d4
     network_mode: "service:relay"
     environment:
       # localhost:3001 is a claim about the relay's namespace, not a
@@ -535,7 +535,7 @@ services:
   # Runs in its own namespace on the compose network, so the PDS is
   # relay:3001 from here — the same listener, seen from outside.
   pds-bootstrap:
-    image: ghcr.io/bluesky-social/pds@sha256:1fa8bbceabb65d8e1710749b1ea92c1c20a7489ca38da4a0a5f64c0c10a70c29
+    image: ghcr.io/bluesky-social/pds:0.4.5037@sha256:3a8feb3415e319dbcc13372293b7ef1fb05a318a6ff1d55968cf99ba6633c5d4
     entrypoint: ["/bin/sh", "-ec"]
     command:
       - |

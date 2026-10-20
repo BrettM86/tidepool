@@ -309,16 +309,17 @@ func runConnector(
 	}
 	if !settled {
 		cancel()
-		<-done
+		startErr := <-done
 		t.Fatalf("timed out after 5s: the connector never accounted for the scripted event "+
-			"(want cursor >= %d, got %d; dials=%d). The consumer must dial the Jetstream "+
+			"(want cursor >= %d, got %d; dials=%d; Start returned %v). The consumer must dial the Jetstream "+
 			"URL, read frames, dispatch them, and advance its cursor.",
-			lastEventTimeUS, connector.Status().CursorTimeUS, fake.Dials())
+			lastEventTimeUS, connector.Status().CursorTimeUS, fake.Dials(), startErr)
 	}
 
 	cancel()
 	select {
-	case <-done: // the shutdown path flushes the cursor with a fresh context
+	case err := <-done: // the shutdown path flushes the cursor with a fresh context
+		require.NoError(t, err, "a cancelled connector stops cleanly")
 	case <-time.After(5 * time.Second):
 		t.Fatal("connector did not shut down within 5s of context cancellation")
 	}

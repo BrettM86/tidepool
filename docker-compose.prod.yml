@@ -268,19 +268,12 @@ services:
       # Pinned upstream checkout, built with indigo's own Dockerfile.
       # Bump the SHA deliberately; rebuild with:
       #   docker compose -f docker-compose.prod.yml build relay
-      context: https://github.com/bluesky-social/indigo.git#dfe5578fd537e71dd1ed884dd09b876dd768dfd5
+      context: https://github.com/bluesky-social/indigo.git#bdacece3f80ef8bc79676a005616b9a802895356
       dockerfile: cmd/relay/Dockerfile
       args:
         # indigo's Dockerfile runs `git describe`; git-URL contexts strip
         # .git unless BuildKit is told to keep it.
         BUILDKIT_CONTEXT_KEEP_GIT_DIR: 1
-      # Replaces the Dockerfile's builder image (golang:1.26-alpine3.22 is
-      # frozen at go1.26.4) with a patched Go. alpine3.23 keeps the musl
-      # (1.2.5) of the alpine:3.22 run stage the binary is linked against.
-      # The key must match the upstream FROM line exactly, or BuildKit
-      # ignores it without a warning: recheck it whenever the SHA moves.
-      additional_contexts:
-        golang:1.26-alpine3.22: docker-image://golang:1.26.10-alpine3.23
     image: tidepool-relay:prod
     container_name: tidepool-prod-relay
     restart: unless-stopped
@@ -338,19 +331,27 @@ services:
   #   ws://tidepool-prod-jetstream:8080/subscribe
   # over the shared coves-prod-network. Not publicly exposed.
   #
-  # First boot performs a bootstrap backfill (listRepos + repo downloads
-  # from the relay) — minutes at our scale; watch `docker logs` before
-  # wiring consumers.
+  # First boot on an EMPTY volume performs a bootstrap backfill: listHosts
+  # on the relay, then listRepos + getRepo directly against each PDS over
+  # https (minutes at our scale); /subscribe answers 503 until it finishes,
+  # so watch `docker logs` before wiring consumers. A volume already in
+  # steady state goes straight to live tailing.
   jetstream:
     build:
-      # Pinned to the checkout whose /subscribe (v1) behavior was verified
-      # against the Coves consumers on 2026-07-16.
-      context: https://github.com/bluesky-social/jetstream.git#f6d220f3551efd32bfc1a8757abc93f51a713c12
-      # Replaces the Dockerfile's pinned builder (go1.26.4) with a patched Go.
-      # The key must match the upstream FROM line exactly, or BuildKit
-      # ignores it without a warning: recheck it whenever the SHA moves.
-      additional_contexts:
-        golang:1.26.4-bookworm: docker-image://golang:1.26.10-bookworm
+      # v0.4.5. Reviewed 2026-10-20 against f6d220f3 (the checkout verified
+      # with the Coves consumers on 2026-07-16): the v1 /subscribe query
+      # params (wantedCollections, wantedDids, cursor), event JSON and v1
+      # zstd dictionary are unchanged; a time cursor inside the active
+      # segment now replays from that time rather than from the segment
+      # start. The env names below are unchanged; unknown JETSTREAM_* vars
+      # stop the server at boot. An f6d220f3 data dir is read as is (one
+      # sequence-lease record is added on first start).
+      #
+      # Rollback is NOT a SHA revert: once this version has run, f6d220f3
+      # on the same volume drops every reconnect that carries a cursor.
+      # Copy the jetstream-data volume before the first start and restore
+      # that copy to roll back.
+      context: https://github.com/bluesky-social/jetstream.git#2b2bf447c3fd995de975dc21dc4d491347a6a6b6
     image: tidepool-jetstream:prod
     container_name: tidepool-prod-jetstream
     restart: unless-stopped

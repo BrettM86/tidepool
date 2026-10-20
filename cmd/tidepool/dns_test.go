@@ -195,7 +195,10 @@ func TestStartDNSServerReleasesUDPWhenTCPBindFails(t *testing.T) {
 		cancel()
 		if done != nil {
 			select {
-			case <-done:
+			case err := <-done:
+				if err != nil {
+					t.Errorf("DNS server stopped with an error after cancellation: %v", err)
+				}
 			case <-time.After(2 * time.Second):
 				t.Error("DNS server did not stop after cancellation")
 			}

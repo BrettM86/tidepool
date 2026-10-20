@@ -317,7 +317,10 @@ func mstPathToRecord(ctx context.Context, src *txBlockSource, dataRoot cid.Cid, 
 		if err != nil {
 			return nil, cid.Undef, fmt.Errorf("repo: decode MST node %s for %s: %w", cur, did, err)
 		}
-		node := nd.Node(&cur)
+		node, err := nd.Node(&cur)
+		if err != nil {
+			return nil, cid.Undef, fmt.Errorf("repo: invalid MST node %s for %s: %w", cur, did, err)
+		}
 
 		found := false
 		for i := range node.Entries {

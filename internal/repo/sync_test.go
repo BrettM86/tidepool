@@ -205,7 +205,8 @@ func TestGetRecordProof(t *testing.T) {
 			require.True(t, ok, "proof missing MST node %s on path", cur)
 			nd, err := mst.NodeDataFromCBOR(bytes.NewReader(nodeBytes))
 			require.NoError(t, err)
-			node := nd.Node(&cur)
+			node, err := nd.Node(&cur)
+			require.NoError(t, err)
 			for j := range node.Entries {
 				e := &node.Entries[j]
 				if e.IsValue() && bytes.Equal(e.Key, key) {

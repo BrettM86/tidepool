@@ -103,8 +103,10 @@ On the box (`/opt/tidepool`), after `git pull`:
    docker compose -f docker-compose.prod.yml up -d jetstream
    ```
 
-   First boot bootstrap-backfills every repo from the relay (minutes at
-   our scale). Watch `docker logs -f tidepool-prod-jetstream` until it
+   First boot on an empty volume bootstrap-backfills: `listHosts` on the
+   relay, then `listRepos`/`getRepo` directly against each PDS over https
+   (public addresses only), with `/subscribe` answering 503 until it
+   finishes (minutes at our scale). Watch `docker logs -f tidepool-prod-jetstream` until it
    settles into live tailing.
 
 6. End-to-end proof (verified at deploy, 2026-07-17). Jetstream is not
@@ -147,7 +149,10 @@ On the box (`/opt/tidepool`), after `git pull`:
   The relay having only our hosts is a property the whole design leans
   on (unlimited account quota is safe ONLY because of it).
 - Upgrades: bump the pinned SHA in the compose `build.context`, then
-  `up -d --build relay` (or `jetstream`). Treat like any dependency bump.
+  `build` and `up -d --no-deps relay` (or `jetstream`). For Jetstream,
+  stop it and copy `jetstream-data` before the new version first starts:
+  a newer Jetstream can change the data dir so the old one no longer
+  resumes, and the copy is the only rollback.
 - Disk: relay keeps a 72 h replay window under `relay-data`; jetstream
   keeps its own store under `jetstream-data`. Both are trivial at two
   hosts' volume.

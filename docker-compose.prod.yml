@@ -90,6 +90,8 @@ services:
       - "51.222.47.2:53:53/tcp"
     environment:
       ENVIRONMENT: production
+      # Soft heap limit under the 8G cap: makes the GC collect before AVIF decode buffers stack up.
+      GOMEMLIMIT: 6GiB
       # DB host is the container NAME, not the `postgres` service alias:
       # this service also joins coves-prod-network, where the Coves stack
       # exposes its own container under the alias `postgres` — the bare

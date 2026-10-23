@@ -18,7 +18,7 @@ RUN --mount=type=cache,target=/go/pkg/mod go mod download
 COPY . .
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/tidepool ./cmd/tidepool
+    CGO_ENABLED=0 go build -tags nodynamic -trimpath -ldflags='-s -w' -o /out/tidepool ./cmd/tidepool
 
 FROM alpine:3.21
 

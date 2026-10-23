@@ -86,6 +86,10 @@ Requires Go 1.26+, Docker, and (for `make db-migrate`) the `goose` CLI.
 needs Go 1.26, which the go command downloads automatically. Store tests need a real postgres: they
 skip with a clear message when `TIDEPOOL_TEST_DATABASE_URL` is unset.
 
+Builds and tests use `-tags nodynamic` (the Makefile passes it). The tag keeps
+AVIF decoding inside the WASM sandbox; the server refuses to start if
+gen2brain/avif loaded a system libavif.
+
 The identity-minting tests additionally need a **local** PLC directory
 (`make plc-up`, port 3002; the first start clones and builds
 [did-method-plc](https://github.com/did-method-plc/did-method-plc), which
@@ -133,7 +137,7 @@ real Jetstream decoding the **relay's** firehose — in one compose network:
        host (127.0.0.1 only): tidepool :8092, DNS :5380 UDP/TCP, │
              lemmy :8541, relay :2480, pds :3081,               │
              jetstream :6028 ◀───────────────────────────────────┘
-                    tests/e2e (go test -tags e2e)
+                    tests/e2e (go test -tags e2e,nodynamic)
 ```
 
 Every event the suite consumes has therefore survived the strictest consumer
@@ -740,7 +744,7 @@ make jetstream-up    # Jetstream container → ws://host.docker.internal:8091
 websocat 'ws://localhost:6018/subscribe?wantedCollections=social.coves.*'
 
 # in another shell, generate commits (any repo test that writes):
-TIDEPOOL_TEST_DATABASE_URL="$TEST_DB" go test -run TestPutRecord -count=1 ./internal/repo/
+TIDEPOOL_TEST_DATABASE_URL="$TEST_DB" go test -tags nodynamic -run TestPutRecord -count=1 ./internal/repo/
 ```
 
 Each commit appears on the Jetstream socket as decoded JSON with the repo

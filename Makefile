@@ -32,11 +32,11 @@ help: ## Show this help message
 
 build: ## Build the tidepool binary
 	@echo "$(GREEN)Building tidepool...$(RESET)"
-	@go build -o tidepool ./cmd/tidepool
+	@go build -tags nodynamic -o tidepool ./cmd/tidepool
 	@echo "$(GREEN)✓ Build complete: ./tidepool$(RESET)"
 
 run: ## Run tidepool against the dev database (requires: make dev-up)
-	@go run ./cmd/tidepool
+	@go run -tags nodynamic ./cmd/tidepool
 
 ##@ Local Development
 
@@ -93,7 +93,7 @@ test-db-down: ## Stop the test database
 
 test: test-db-up ## Run the test suite against real postgres (migrations run in-process)
 	@echo "$(GREEN)Running tests (store tests migrate the test database themselves)...$(RESET)"
-	@TIDEPOOL_TEST_DATABASE_URL="$(TEST_DATABASE_URL)" go test ./...
+	@TIDEPOOL_TEST_DATABASE_URL="$(TEST_DATABASE_URL)" go test -tags nodynamic ./...
 	@echo "$(GREEN)✓ Tests complete$(RESET)"
 
 ##@ End-to-end (real Lemmy + PLC + Jetstream)
@@ -109,7 +109,7 @@ e2e: ## Full e2e run: build + start the stack, run the suite, tear down (-v)
 		exit $$up_status; \
 	fi; \
 	echo "$(GREEN)Stack healthy; running e2e suite...$(RESET)"; \
-	status=0; go test -tags e2e -count=1 -timeout 20m ./tests/e2e/... || status=$$?; \
+	status=0; go test -tags e2e,nodynamic -count=1 -timeout 20m ./tests/e2e/... || status=$$?; \
 	echo "$(YELLOW)Tearing down e2e stack...$(RESET)"; \
 	down_status=0; $(E2E_COMPOSE) down -v --remove-orphans || down_status=$$?; \
 	if [ $$down_status -ne 0 ]; then \
@@ -123,7 +123,7 @@ e2e-up: ## Start the e2e stack and leave it running (for iterating on tests)
 	@echo "$(GREEN)✓ e2e stack up: tidepool 127.0.0.1:8092, DNS 127.0.0.1:$(or $(TIDEPOOL_E2E_DNS_PORT),5380) (UDP/TCP), lemmy 127.0.0.1:8541, relay 127.0.0.1:2480, reference pds 127.0.0.1:3081, jetstream 127.0.0.1:6028$(RESET)"
 
 e2e-test: ## Run the e2e suite against an already-running stack (make e2e-up)
-	@go test -tags e2e -count=1 -v -timeout 20m ./tests/e2e/...
+	@go test -tags e2e,nodynamic -count=1 -v -timeout 20m ./tests/e2e/...
 
 e2e-logs: ## Tail all e2e stack logs
 	@$(E2E_COMPOSE) logs -f

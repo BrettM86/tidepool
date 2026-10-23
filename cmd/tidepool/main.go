@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gen2brain/avif"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
@@ -35,6 +36,7 @@ import (
 	"tidepool/internal/identity"
 	"tidepool/internal/ingest"
 	"tidepool/internal/materialize"
+	"tidepool/internal/media"
 	"tidepool/internal/optout"
 	"tidepool/internal/outbound"
 	"tidepool/internal/personas"
@@ -50,6 +52,9 @@ const (
 	writeTimeout      = 30 * time.Second
 	idleTimeout       = 2 * time.Minute
 	shutdownTimeout   = 15 * time.Second
+	// avifDecoderCheckTimeout bounds the startup decoder check, whose WASM
+	// compile takes about half a second.
+	avifDecoderCheckTimeout = 30 * time.Second
 
 	// outboundInboxTTL memoizes a community's resolved delivery inbox; a
 	// rotation is caught by the worker's cache-bypassing re-resolve on a 4xx.
@@ -226,8 +231,22 @@ func runMigrations(logger *slog.Logger) error {
 }
 
 func run(logger *slog.Logger) error {
+	if err := requireIsolatedAVIFDecoder(avif.Dynamic); err != nil {
+		return err
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Compile the AVIF decoder now: a broken decoder must refuse startup
+	// rather than make every AVIF undecodable, and the compile should not
+	// spend the first ingest worker's lease.
+	checkCtx, cancelCheck := context.WithTimeout(ctx, avifDecoderCheckTimeout)
+	err := media.CheckDecoder(checkCtx)
+	cancelCheck()
+	if err != nil {
+		return fmt.Errorf("avif decoder check failed: %w", err)
+	}
 
 	cfg, err := config.Load(logger)
 	if err != nil {

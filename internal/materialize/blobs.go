@@ -2,6 +2,7 @@ package materialize
 
 import (
 	"context"
+	"errors"
 	"mime"
 	"net/http"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"github.com/bluesky-social/indigo/atproto/atdata"
 
 	"tidepool/internal/ap"
+	"tidepool/internal/media"
 )
 
 // blobSlot describes the lexicon slot a fetched image will fill: its
@@ -33,9 +35,11 @@ var (
 
 // fetchBlob downloads remote media through the SSRF-guarded AP client and
 // stores it as a blob in the DID's repo, returning the blob ref for the
-// record. Media is always optional: every failure (unreachable, oversize,
-// wrong content type) logs a reason and returns nil so the caller omits the
-// image rather than dropping the record.
+// record. AVIF is transcoded to JPEG, or PNG when it has transparency,
+// because no lexicon slot accepts it. Media is always optional: every
+// failure (unreachable, oversize, wrong content type, failed transcode) logs
+// a reason and returns nil so the caller omits the image rather than
+// dropping the record.
 func (m *Materializer) fetchBlob(ctx context.Context, did, url string, slot blobSlot) *atdata.Blob {
 	blob, _ := m.fetchBlobClassified(ctx, did, url, slot)
 	return blob
@@ -46,8 +50,10 @@ func (m *Materializer) fetchBlob(ctx context.Context, did, url string, slot blob
 // for 404/401/403, IsTombstoned for 410 — the image is gone at the source)
 // from a transient failure (timeout/5xx/dial — the image is probably still
 // there). Only the download error is surfaced; unusable-media outcomes
-// (wrong content type, oversize, blob-store failure) return (nil, nil) — the
-// origin gave no removal signal, so the image is simply omitted this pass.
+// (wrong content type, oversize, failed AVIF transcode — including a busy
+// decoder — or blob-store failure) return (nil, nil), meaning no removal
+// signal: a post image is omitted this pass, and profile media carries the
+// stored blob forward.
 func (m *Materializer) fetchBlobClassified(ctx context.Context, did, url string, slot blobSlot) (*atdata.Blob, error) {
 	if url == "" {
 		return nil, nil
@@ -63,6 +69,23 @@ func (m *Materializer) fetchBlobClassified(ctx context.Context, did, url string,
 		return nil, err
 	}
 	mimeType := normalizeImageMime(contentType, data)
+	// No slot accepts AVIF, and servers mislabel it, so it is detected from
+	// the header or the bytes and transcoded under the same budget.
+	if mimeType == "image/avif" || media.IsAVIF(data) {
+		data, mimeType, err = media.TranscodeAVIF(ctx, data, budget)
+		if err != nil {
+			// A busy decoder or a cancelled ingest says nothing about the
+			// media, so it is logged apart from bad media.
+			if reason := transcodeSkipReason(err); reason != "" {
+				m.logger.Warn("media transcode skipped; omitting image",
+					"slot", slot.name, "url", url, "reason", reason, "error", err)
+				return nil, nil
+			}
+			m.logger.Warn("media transcode failed; omitting image",
+				"slot", slot.name, "url", url, "error", err)
+			return nil, nil
+		}
+	}
 	if !slotAccepts(slot, mimeType) {
 		m.logger.Warn("media has unacceptable content type; omitting image",
 			"slot", slot.name, "url", url, "content_type", mimeType)
@@ -75,6 +98,20 @@ func (m *Materializer) fetchBlobClassified(ctx context.Context, did, url string,
 		return nil, nil
 	}
 	return blob, nil
+}
+
+// transcodeSkipReason names why a transcode never looked at the media (the
+// decoder was busy, or the context ended), or returns "" when the error is
+// about the media itself.
+func transcodeSkipReason(err error) string {
+	switch {
+	case errors.Is(err, media.ErrDecoderBusy):
+		return "decoder busy"
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return "context ended"
+	default:
+		return ""
+	}
 }
 
 // normalizeImageMime parses the server's Content-Type; when it is absent,

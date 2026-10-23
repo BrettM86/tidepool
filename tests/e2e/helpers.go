@@ -15,9 +15,9 @@
 // spec, and a misreading shared by both ends is invisible.
 //
 // Coves-style: E2E tests test REAL infrastructure, not mocks. Run them with
-// `make e2e` (compose up --build → wait for health → go test -tags e2e →
+// `make e2e` (compose up --build → wait for health → go test -tags e2e,nodynamic →
 // compose down -v), or against an already-running stack with
-// `go test -tags e2e ./tests/e2e/...`.
+// `go test -tags e2e,nodynamic ./tests/e2e/...`.
 //
 // Everything here is LOCAL-ONLY: the stack never touches plc.directory,
 // public relays, or public Lemmy instances.

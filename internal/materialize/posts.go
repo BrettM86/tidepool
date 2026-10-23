@@ -423,7 +423,7 @@ func isImageAttachment(link *ap.Link) bool {
 	if href == "" {
 		href = strings.ToLower(link.URL)
 	}
-	for _, ext := range []string{".png", ".jpg", ".jpeg", ".webp", ".gif"} {
+	for _, ext := range []string{".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif"} {
 		if strings.HasSuffix(href, ext) {
 			return true
 		}

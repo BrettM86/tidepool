@@ -44,9 +44,9 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Build
-        run: go build ./...
+        run: go build -tags nodynamic ./...
       - name: Vet
-        run: go vet ./... && go vet -tags e2e ./tests/e2e/...
+        run: go vet -tags nodynamic ./... && go vet -tags e2e,nodynamic ./tests/e2e/...
       - name: Lint
         run: make lint
       - name: Check out current Coves lexicons
@@ -59,7 +59,7 @@ jobs:
       - name: Unit & integration tests
         env:
           TIDEPOOL_TEST_DATABASE_URL: postgres://tidepool_test:tidepool_test@localhost:5443/tidepool_test?sslmode=disable
-        run: go test ./...
+        run: go test -tags nodynamic ./...
 
   e2e:
     # Heavy and on-demand: manual dispatch, or label a PR `run-e2e`.

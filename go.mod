@@ -7,6 +7,7 @@ toolchain go1.26.10
 require (
 	github.com/JohannesKaufmann/html-to-markdown/v2 v2.5.2
 	github.com/bluesky-social/indigo v0.0.0-20261020053033-bdacece3f80e
+	github.com/gen2brain/avif v0.6.0
 	github.com/go-chi/chi/v5 v5.5.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/ipfs/go-block-format v0.2.4
@@ -20,6 +21,7 @@ require (
 	github.com/rivo/uniseg v0.4.7
 	github.com/stretchr/testify v1.12.1
 	github.com/yuin/goldmark v1.8.6
+	golang.org/x/image v0.47.0
 	golang.org/x/net v0.61.0
 	golang.org/x/sync v0.24.0
 	golang.org/x/text v0.43.0
@@ -33,6 +35,7 @@ require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/earthboundkid/versioninfo/v2 v2.24.1 // indirect
+	github.com/ebitengine/purego v0.10.1 // indirect
 	github.com/felixge/httpsnoop v1.1.0 // indirect
 	github.com/gammazero/chanqueue v1.1.2 // indirect
 	github.com/gammazero/deque v1.2.1 // indirect
@@ -79,6 +82,7 @@ require (
 	github.com/prometheus/procfs v0.22.0 // indirect
 	github.com/sethvargo/go-retry v0.5.0 // indirect
 	github.com/spaolacci/murmur3 v1.1.0 // indirect
+	github.com/tetratelabs/wazero v1.12.0 // indirect
 	github.com/whyrusleeping/cbor-gen v0.3.1 // indirect
 	gitlab.com/yawning/secp256k1-voi v0.0.0-20230925100816-f2616030848b // indirect
 	gitlab.com/yawning/tuplehash v0.0.0-20230713102510-df83abbf9a02 // indirect

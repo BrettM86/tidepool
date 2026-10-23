@@ -33,7 +33,9 @@ formatters:
 
 run:
   timeout: 5m
-  # The e2e suite is behind this tag; without it it is never linted.
+  # The e2e suite is behind the e2e tag; without it it is never linted.
+  # nodynamic matches the shipped build: AVIF decoding stays in WASM.
   build-tags:
     - e2e
+    - nodynamic
   tests: true

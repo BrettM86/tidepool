@@ -213,6 +213,7 @@ services:
       DNS_LISTEN: ${DNS_LISTEN:-}
       DNS_PUBLIC_IPV4: ${DNS_PUBLIC_IPV4:-}
       DNS_PUBLIC_IPV6: ${DNS_PUBLIC_IPV6:-}
+      DNS_UDP_RESPONSE_RATE: ${DNS_UDP_RESPONSE_RATE:-}
       # Empty CLOUDFLARE_API_TOKEN disables delegation. When set, a pass runs at
       # startup and every 15 minutes, creates at most 20 NS records per rolling
       # hour, and stops at DELEGATION_MAX_NS_RECORDS (3,000 under Pro's 3,500).

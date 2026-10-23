@@ -332,7 +332,7 @@ func Load(logger *slog.Logger) (*Config, error) {
 	bridgeHost, _, _ = strings.Cut(bridgeHost, ":")
 	bridgeHost = strings.TrimSuffix(bridgeHost, ".")
 	cfg.DNSListen = os.Getenv("DNS_LISTEN")
-	cfg.DNSUDPResponseRate, err = intVar(logger, "DNS_UDP_RESPONSE_RATE", 20)
+	cfg.DNSUDPResponseRate, err = intVar(logger, "DNS_UDP_RESPONSE_RATE", 200)
 	if err != nil {
 		return nil, err
 	}

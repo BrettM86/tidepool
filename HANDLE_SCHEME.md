@@ -72,9 +72,12 @@ behaviour). Handles with a `pending_handle` resolve under both names, so DNS
 and `/.well-known/atproto-did` answer for the new handle before PLC lists it.
 
 UDP responses are rate limited per client prefix (IPv4 /24, IPv6 /56),
-`DNS_UDP_RESPONSE_RATE` per second (default 20). Over the limit every second
+`DNS_UDP_RESPONSE_RATE` per second (default 200). Over the limit every second
 response is an empty truncated reply and the rest are dropped. TCP is not
-limited. There is no aggregate cap by decision.
+limited. There is no aggregate cap by decision. A large shared resolver sends
+many clients' lookups from one prefix: at the old default of 20, a Coves
+handle sweep through OVH's resolver lost 16 to 75 responses a second, and
+handles that resolved fine afterwards came back unverified.
 
 ## Identity firehose events
 

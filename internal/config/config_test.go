@@ -116,7 +116,7 @@ func TestLoad_DNSUDPResponseRate(t *testing.T) {
 		wantRate  int
 		wantError bool
 	}{
-		{name: "unset defaults to 20", unset: true, wantRate: 20},
+		{name: "unset defaults to 200", unset: true, wantRate: 200},
 		{name: "custom rate", value: "7", wantRate: 7},
 		{name: "zero", value: "0", wantError: true},
 		{name: "negative", value: "-1", wantError: true},

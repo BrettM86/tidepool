@@ -339,7 +339,7 @@ Two classes, and the difference matters at boot:
 | `BRIDGE_KEK` | fixed public dev key | 32-byte key-encryption key (64 hex chars or base64) sealing per-actor signing keys and the escrow rotation key at rest (AES-256-GCM) |
 | `BRIDGE_KEK_PREVIOUS` | *(unset)* | the KEK being rotated away from, same encodings. Set only during a rotation: sealed material opens under either key while it is set, nothing new is sealed under it, and `tidepool rotate-kek` moves every blob onto `BRIDGE_KEK` so it can be unset again (runbook: `DEPLOY.md` §6) |
 | `BRIDGE_SERVICE_DID` | *(optional)* | pre-provisioned service DID for the bridge's own actor |
-| `USER_AGENT` | derived | outbound HTTP user agent |
+| `USER_AGENT` | `tidepool/0.1 (Coves bridge; +https://<BRIDGE_HOSTNAME>)` | user agent for bridge traffic (signed fetches, media, relay `requestCrawl`, PLC). Deliveries made as Coves users always send `coves/0.1 (+<AP_USER_ORIGIN>)`, which this does not override |
 | `ALLOW_PRIVATE_FETCH` | off | dev-only: disables the SSRF egress guard (AP fetches **and** PLC directory requests) so localhost targets work |
 | `FIREHOSE_RETENTION` | `72h` | how long `firehose_events` rows are kept for `subscribeRepos` cursor replay (Go duration; a background pruner trims older events hourly) |
 | `MAX_BLOB_BYTES` | `5242880` (5 MiB) | outer transport budget for remote media (avatars, banners, post images) the materializer downloads per blob. Individual lexicon slots impose tighter caps (avatars 1 MB); this is the ceiling over all of them. Fails closed — oversized media is dropped, never truncated |
@@ -514,7 +514,7 @@ its send-to-all-instances activities, account deletions above all, ONLY to
 the inbox that document advertises; without it those activities are
 silently skipped), WebFinger for the service actor at
 `/.well-known/webfinger`, and a minimal nodeinfo 2.0 (`software.name:
-"tidepool"` — what Lemmy instance allowlists match against).
+"tidepool"` — how remote servers and directories identify the bridge).
 
 ## Consent policy (#nobridge / #nobot)
 
@@ -711,7 +711,7 @@ What the user origin serves:
 | `GET /ap/actor/{did}/outbox` | empty `OrderedCollection` — Lemmy requires the field, and a missing outbox rejects the whole actor |
 | `POST /ap/inbox` | shared inbox; dispatched **verbatim** to the existing ingest pipeline (one verification, dedupe, and refusal taxonomy — never a second copy), so bare content sent here is dropped like any other |
 | `GET /` | the origin's instance (`Application`) actor, republishing the bridge's key — Lemmy delivers `Delete{Person}` and other send-to-all-instances activities only to the inbox on that row |
-| `GET /.well-known/nodeinfo`, `GET /nodeinfo/2.0` | software identification (`software.name: tidepool`) |
+| `GET /.well-known/nodeinfo`, `GET /nodeinfo/2.0` | software identification (`software.name: coves`, `metadata.nodeName: Coves`) |
 
 An actor is minted lazily on a user's first federating interaction. Its local
 part is derived once and then **frozen**: a native handle

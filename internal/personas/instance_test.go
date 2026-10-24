@@ -195,12 +195,16 @@ func TestServeNodeInfo(t *testing.T) {
 	assert.Equal(t, "2.0", info["version"])
 	software, ok := info["software"].(map[string]any)
 	require.True(t, ok, "software block is required, got %v", info["software"])
-	assert.Equal(t, "tidepool", software["name"],
-		"Lemmy admins allowlist by this exact string")
+	assert.Equal(t, "coves", software["name"],
+		"the user origin identifies as Coves, not as the bridge")
 	assert.NotEmpty(t, software["version"])
 	protocols, ok := info["protocols"].([]any)
 	require.True(t, ok, "protocols is required, got %v", info["protocols"])
 	assert.Contains(t, protocols, "activitypub")
 	assert.Equal(t, false, info["openRegistrations"],
 		"accounts are minted from atproto identities, never registered here")
+	metadata, ok := info["metadata"].(map[string]any)
+	require.True(t, ok, "metadata block is required, got %v", info["metadata"])
+	assert.Equal(t, "Coves", metadata["nodeName"])
+	assert.Equal(t, "Community platform built on atproto", metadata["nodeDescription"])
 }

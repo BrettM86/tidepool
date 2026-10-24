@@ -710,6 +710,62 @@ func TestSendActivity_RequiresSigner(t *testing.T) {
 	assert.True(t, errors.IsValidation(err))
 }
 
+// Requests made as a Coves user (SendActivityAs) identify as Coves; every
+// other request from the same client identifies as the bridge. Sending as a
+// user first proves the user agent does not stick to the client afterwards.
+func TestClient_UserAgentPerRequestOrigin(t *testing.T) {
+	var mu sync.Mutex
+	userAgentByPath := map[string]string{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		userAgentByPath[r.URL.Path] = r.Header.Get("User-Agent")
+		mu.Unlock()
+		switch r.URL.Path {
+		case "/user-inbox", "/bridge-inbox":
+			w.WriteHeader(http.StatusAccepted)
+		case "/post/49131386":
+			w.Header().Set("Content-Type", ContentTypeActivityJSON)
+			_, _ = w.Write(loadFixture(t, "page_lemmy_world.json"))
+		case "/avatar.png":
+			w.Header().Set("Content-Type", "image/png")
+			_, _ = w.Write([]byte("\x89PNG\r\n\x1a\nimage-bytes"))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, ClientOptions{
+		UserAgent:           "bridge-agent/1",
+		UserOriginUserAgent: "user-agent/1",
+	})
+	userAgentFor := func(path string) string {
+		mu.Lock()
+		defer mu.Unlock()
+		return userAgentByPath[path]
+	}
+	activity := map[string]any{"type": TypeFollow, "actor": testActorID}
+
+	userSigner := NewSigner(testKeyID, testRSAKey(t))
+	require.NoError(t, client.SendActivityAs(context.Background(), userSigner, server.URL+"/user-inbox", activity))
+	assert.Equal(t, "user-agent/1", userAgentFor("/user-inbox"),
+		"a delivery signed as a Coves user carries the Coves user agent")
+
+	require.NoError(t, client.SendActivity(context.Background(), server.URL+"/bridge-inbox", activity))
+	assert.Equal(t, "bridge-agent/1", userAgentFor("/bridge-inbox"),
+		"a bridge-signed delivery carries the bridge user agent")
+
+	_, err := client.FetchObject(context.Background(), server.URL+"/post/49131386")
+	require.NoError(t, err)
+	assert.Equal(t, "bridge-agent/1", userAgentFor("/post/49131386"),
+		"a signed GET carries the bridge user agent")
+
+	_, _, err = client.FetchMedia(context.Background(), server.URL+"/avatar.png", 0)
+	require.NoError(t, err)
+	assert.Equal(t, "bridge-agent/1", userAgentFor("/avatar.png"),
+		"a media fetch carries the bridge user agent")
+}
+
 func TestResolveKey_FetchesAndCaches(t *testing.T) {
 	// Serve an actor document that publishes our test public key.
 	key := testRSAKey(t)

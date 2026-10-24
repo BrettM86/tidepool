@@ -375,7 +375,7 @@ func run(logger *slog.Logger) error {
 				// Reached only under ALLOW_DEV_REQUEST_CRAWL: local relays only.
 				crawlClient = ap.NewPrivateOnlyHTTPClient(30 * time.Second)
 			}
-			go tidepoolsync.RequestCrawlAll(ctx, crawlClient, cfg.RelayHosts, cfg.BridgeHostname, logger)
+			go tidepoolsync.RequestCrawlAll(ctx, crawlClient, cfg.RelayHosts, cfg.BridgeHostname, cfg.UserAgent, logger)
 		}
 	}
 
@@ -388,8 +388,9 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 	apClient := ap.NewClient(ap.ClientOptions{
-		UserAgent: cfg.UserAgent,
-		Signer:    serviceActor.Signer(),
+		UserAgent:           cfg.UserAgent,
+		UserOriginUserAgent: cfg.UserOriginUserAgent,
+		Signer:              serviceActor.Signer(),
 		// MAX_BLOB_BYTES governs media downloads only; the JSON-object cap
 		// keeps its own (smaller) default.
 		MaxMediaBytes:         cfg.MaxBlobBytes,

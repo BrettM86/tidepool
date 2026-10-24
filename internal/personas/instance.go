@@ -95,7 +95,7 @@ func (s *Service) handleNodeInfo(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, "application/json", map[string]any{
 		"version": "2.0",
 		"software": map[string]any{
-			"name":    ap.SoftwareName,
+			"name":    ap.UserOriginSoftwareName,
 			"version": ap.SoftwareVersion,
 		},
 		"protocols": []any{"activitypub"},
@@ -103,6 +103,9 @@ func (s *Service) handleNodeInfo(w http.ResponseWriter, _ *http.Request) {
 		// Accounts here are minted from atproto identities, never registered.
 		"openRegistrations": false,
 		"usage":             map[string]any{"users": map[string]any{}},
-		"metadata":          map[string]any{},
+		"metadata": map[string]any{
+			"nodeName":        "Coves",
+			"nodeDescription": "Community platform built on atproto",
+		},
 	})
 }

@@ -432,7 +432,7 @@ curl -s -H 'Accept:' https://coves.social/ | jq '.type'
 
 curl -s 'https://coves.social/.well-known/webfinger?resource=acct:alice@coves.social' | jq .
 curl -s https://coves.social/.well-known/nodeinfo | jq .
-curl -s https://coves.social/nodeinfo/2.0 | jq '.software.name'   # "tidepool"
+curl -s https://coves.social/nodeinfo/2.0 | jq '.software.name'   # "coves"
 ```
 
 A 421 from any of these means the `Host` header was rewritten on the way

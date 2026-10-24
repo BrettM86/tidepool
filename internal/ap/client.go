@@ -109,6 +109,8 @@ func (e HTTPError) Error() string {
 type ClientOptions struct {
 	// UserAgent is sent on every request (config.UserAgent).
 	UserAgent string
+	// UserOriginUserAgent is sent on requests made as Coves users.
+	UserOriginUserAgent string
 	// Signer signs outbound requests. Optional: nil sends unsigned requests
 	// (many instances require authorized fetch, so production always sets
 	// it; tests may not).
@@ -148,18 +150,19 @@ type ClientOptions struct {
 // signed POSTs (task 06 uses this for Follow) and implements KeyResolver for
 // signature verification.
 type Client struct {
-	httpClient         *http.Client
-	userAgent          string
-	signer             *Signer
-	maxResponseBytes   int64
-	maxMediaBytes      int64
-	perHostRPS         rate.Limit
-	perHostBurst       int
-	maxAttempts        int
-	retryBaseDelay     time.Duration
-	maxCollectionPages int
-	keyCacheTTL        time.Duration
-	guard              *egressGuard
+	httpClient          *http.Client
+	userAgent           string
+	userOriginUserAgent string
+	signer              *Signer
+	maxResponseBytes    int64
+	maxMediaBytes       int64
+	perHostRPS          rate.Limit
+	perHostBurst        int
+	maxAttempts         int
+	retryBaseDelay      time.Duration
+	maxCollectionPages  int
+	keyCacheTTL         time.Duration
+	guard               *egressGuard
 	// requestBudget bounds a deduped fetch's detached lifetime (see
 	// getDedupedMode): the shared request outlives the initiating caller's
 	// context, so it needs its own upper bound.
@@ -216,23 +219,24 @@ func NewClient(opts ClientOptions) *Client {
 	httpClient.Transport = guardedTransport(httpClient.Transport, guard)
 
 	c := &Client{
-		httpClient:         &httpClient,
-		userAgent:          opts.UserAgent,
-		signer:             opts.Signer,
-		maxResponseBytes:   opts.MaxResponseBytes,
-		maxMediaBytes:      opts.MaxMediaBytes,
-		perHostRPS:         rate.Limit(opts.PerHostRPS),
-		perHostBurst:       opts.PerHostBurst,
-		maxAttempts:        opts.MaxAttempts,
-		retryBaseDelay:     opts.RetryBaseDelay,
-		maxCollectionPages: opts.MaxCollectionPages,
-		keyCacheTTL:        opts.KeyCacheTTL,
-		guard:              guard,
-		limiters:           make(map[string]*limiterEntry),
-		keyCache:           make(map[string]cachedKey),
-		maxKeyCacheEntries: defaultMaxKeyCacheEntries,
-		maxLimiters:        defaultMaxLimiters,
-		now:                time.Now,
+		httpClient:          &httpClient,
+		userAgent:           opts.UserAgent,
+		userOriginUserAgent: opts.UserOriginUserAgent,
+		signer:              opts.Signer,
+		maxResponseBytes:    opts.MaxResponseBytes,
+		maxMediaBytes:       opts.MaxMediaBytes,
+		perHostRPS:          rate.Limit(opts.PerHostRPS),
+		perHostBurst:        opts.PerHostBurst,
+		maxAttempts:         opts.MaxAttempts,
+		retryBaseDelay:      opts.RetryBaseDelay,
+		maxCollectionPages:  opts.MaxCollectionPages,
+		keyCacheTTL:         opts.KeyCacheTTL,
+		guard:               guard,
+		limiters:            make(map[string]*limiterEntry),
+		keyCache:            make(map[string]cachedKey),
+		maxKeyCacheEntries:  defaultMaxKeyCacheEntries,
+		maxLimiters:         defaultMaxLimiters,
+		now:                 time.Now,
 		sleep: func(ctx context.Context, d time.Duration) error {
 			timer := time.NewTimer(d)
 			defer timer.Stop()
@@ -246,6 +250,9 @@ func NewClient(opts ClientOptions) *Client {
 	}
 	if c.userAgent == "" {
 		c.userAgent = "tidepool/0.1"
+	}
+	if c.userOriginUserAgent == "" {
+		c.userOriginUserAgent = "coves/0.1"
 	}
 	if c.maxResponseBytes <= 0 {
 		c.maxResponseBytes = DefaultMaxResponseBytes
@@ -607,7 +614,9 @@ func (c *Client) SendActivity(ctx context.Context, inboxURL string, activity any
 // SendActivityAs signed-POSTs an activity to a remote inbox using the GIVEN
 // per-actor signer, not the client's configured Signer (which stays reserved
 // for the service actor's Follow/Undo). Task 15's delivery worker signs each
-// activity as the persona that authored the record.
+// activity as the persona that authored the record. It sends the user-origin
+// User-Agent (UserOriginUserAgent), because these requests are made as Coves
+// users; every other request carries the bridge User-Agent.
 //
 // Unlike SendActivity, this is a SINGLE POST with no internal retry loop: the
 // task-15 Worker owns retry, backoff and the poison/attempt-cap policy, and it
@@ -632,7 +641,7 @@ func (c *Client) SendActivityAs(ctx context.Context, signer *Signer, inboxURL st
 	if err != nil {
 		return fmt.Errorf("ap: build POST %s: %w", inboxURL, err)
 	}
-	req.Header.Set("User-Agent", c.userAgent)
+	req.Header.Set("User-Agent", c.userOriginUserAgent)
 	req.Header.Set("Content-Type", ContentTypeActivityJSON)
 	if err := signer.SignRequest(req, payload); err != nil {
 		return err

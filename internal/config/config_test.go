@@ -357,7 +357,9 @@ func TestLoad_DevelopmentDefaults(t *testing.T) {
 	assert.Equal(t, "http://localhost:3002", cfg.PLCDirectoryURL,
 		"the dev default PLC directory must be LOCAL, never the live plc.directory")
 	assert.Empty(t, cfg.BridgeServiceDID, "service DID is optional")
-	assert.Equal(t, "tidepool/0.1 (+https://localhost)", cfg.UserAgent)
+	assert.Equal(t, "tidepool/0.1 (Coves bridge; +https://localhost)", cfg.UserAgent)
+	assert.Equal(t, "coves/0.1 (+http://localhost:8091)", cfg.UserOriginUserAgent,
+		"user-origin requests identify as Coves, pointing at the dev user origin")
 	assert.Len(t, cfg.BridgeKEK, 32, "dev-default KEK decodes to 32 bytes")
 }
 
@@ -369,6 +371,7 @@ func TestLoad_ExplicitValuesWin(t *testing.T) {
 	t.Setenv("PLC_DIRECTORY_URL", "https://plc.directory")
 	t.Setenv("BRIDGE_SERVICE_DID", "did:plc:ewvi7nxzyoun6zhxrhs64oiz")
 	t.Setenv("USER_AGENT", "custom-agent/1.0")
+	t.Setenv("AP_USER_ORIGIN", "https://people.example")
 
 	cfg, err := Load(discardLogger())
 	require.NoError(t, err)
@@ -379,6 +382,8 @@ func TestLoad_ExplicitValuesWin(t *testing.T) {
 	assert.Equal(t, "https://plc.directory", cfg.PLCDirectoryURL)
 	assert.Equal(t, "did:plc:ewvi7nxzyoun6zhxrhs64oiz", cfg.BridgeServiceDID)
 	assert.Equal(t, "custom-agent/1.0", cfg.UserAgent)
+	assert.Equal(t, "coves/0.1 (+https://people.example)", cfg.UserOriginUserAgent,
+		"USER_AGENT overrides only the bridge agent; the user-origin agent stays derived")
 }
 
 func TestLoad_ProductionRequiresValues(t *testing.T) {
@@ -396,8 +401,10 @@ func TestLoad_ProductionWithAllValues(t *testing.T) {
 	cfg, err := Load(discardLogger())
 	require.NoError(t, err)
 	assert.False(t, cfg.IsDevelopment())
-	assert.Equal(t, "tidepool/0.1 (+https://tidepool.example)", cfg.UserAgent,
+	assert.Equal(t, "tidepool/0.1 (Coves bridge; +https://tidepool.example)", cfg.UserAgent,
 		"user agent default derives from the bridge hostname")
+	assert.Equal(t, "coves/0.1 (+https://coves.social)", cfg.UserOriginUserAgent,
+		"user-origin agent derives from AP_USER_ORIGIN")
 	assert.Len(t, cfg.BridgeKEK, 32, "base64 KEK decodes to 32 bytes")
 	assert.Equal(t, "prod-admin-token", cfg.AdminToken)
 	assert.Equal(t, 100, cfg.BackfillMaxPosts, "tuning knobs default in every environment")

@@ -531,15 +531,14 @@ func (ib *Inbox) handleNodeInfoDiscovery(w http.ResponseWriter, _ *http.Request)
 	})
 }
 
-// handleNodeInfo serves a minimal nodeinfo 2.0 document. Lemmy reads
-// software.name for its instance allow/block lists, so the bridge must
-// identify itself here.
+// handleNodeInfo serves a minimal nodeinfo 2.0 document. Nodeinfo is how
+// remote servers and directories identify the bridge's software.
 func (ib *Inbox) handleNodeInfo(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"version": "2.0",
 		"software": map[string]any{
-			"name":    ap.SoftwareName,
+			"name":    ap.BridgeSoftwareName,
 			"version": ap.SoftwareVersion,
 		},
 		"protocols":         []any{"activitypub"},

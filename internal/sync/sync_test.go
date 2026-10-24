@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	gosync "sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1033,10 +1034,11 @@ func TestListReposPagination(t *testing.T) {
 }
 
 func TestRequestCrawl(t *testing.T) {
-	var gotPath string
+	var gotPath, gotUserAgent string
 	var gotBody comatproto.SyncRequestCrawl_Input
 	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
+		gotUserAgent = r.Header.Get("User-Agent")
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&gotBody))
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -1046,18 +1048,19 @@ func TestRequestCrawl(t *testing.T) {
 	defer cancel()
 	client := &http.Client{Timeout: 5 * time.Second}
 
-	require.NoError(t, RequestCrawl(ctx, client, relay.URL, testHostname))
+	require.NoError(t, RequestCrawl(ctx, client, relay.URL, testHostname, "crawl-agent/1"))
 	assert.Equal(t, "/xrpc/com.atproto.sync.requestCrawl", gotPath)
 	assert.Equal(t, testHostname, gotBody.Hostname)
+	assert.Equal(t, "crawl-agent/1", gotUserAgent, "requestCrawl carries the supplied user agent")
 
 	failing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "nope", http.StatusInternalServerError)
 	}))
 	defer failing.Close()
-	assert.Error(t, RequestCrawl(ctx, client, failing.URL, testHostname))
+	assert.Error(t, RequestCrawl(ctx, client, failing.URL, testHostname, "crawl-agent/1"))
 
-	assert.Error(t, RequestCrawl(ctx, client, relay.URL, ""), "empty hostname must be rejected")
-	assert.Error(t, RequestCrawl(ctx, nil, relay.URL, testHostname), "nil client must be rejected")
+	assert.Error(t, RequestCrawl(ctx, client, relay.URL, "", "crawl-agent/1"), "empty hostname must be rejected")
+	assert.Error(t, RequestCrawl(ctx, nil, relay.URL, testHostname, "crawl-agent/1"), "nil client must be rejected")
 }
 
 // testLogger returns a discard logger: the crawl tests assert outcomes via
@@ -1081,7 +1084,12 @@ func TestRequestCrawlAll_RetriesTransientFailures(t *testing.T) {
 	// The relay fails twice before accepting — the startup race in miniature
 	// (relay booting / bridge listener not yet up when the relay probes back).
 	var calls atomic.Int64
+	var userAgentsMutex gosync.Mutex
+	var userAgents []string
 	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		userAgentsMutex.Lock()
+		userAgents = append(userAgents, r.Header.Get("User-Agent"))
+		userAgentsMutex.Unlock()
 		if calls.Add(1) <= 2 {
 			http.Error(w, "still booting", http.StatusServiceUnavailable)
 			return
@@ -1092,8 +1100,12 @@ func TestRequestCrawlAll_RetriesTransientFailures(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	RequestCrawlAll(ctx, &http.Client{Timeout: time.Second}, []string{relay.URL}, testHostname, testLogger(t))
+	RequestCrawlAll(ctx, &http.Client{Timeout: time.Second}, []string{relay.URL}, testHostname, "crawl-agent/1", testLogger(t))
 	assert.EqualValues(t, 3, calls.Load(), "two failures then the success — no extra attempts after that")
+	userAgentsMutex.Lock()
+	defer userAgentsMutex.Unlock()
+	assert.Equal(t, []string{"crawl-agent/1", "crawl-agent/1", "crawl-agent/1"}, userAgents,
+		"every retry attempt carries the supplied user agent")
 }
 
 func TestRequestCrawlAll_BudgetExhaustionAndIndependence(t *testing.T) {
@@ -1114,7 +1126,7 @@ func TestRequestCrawlAll_BudgetExhaustionAndIndependence(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	RequestCrawlAll(ctx, &http.Client{Timeout: time.Second}, []string{dead.URL, live.URL}, testHostname, testLogger(t))
+	RequestCrawlAll(ctx, &http.Client{Timeout: time.Second}, []string{dead.URL, live.URL}, testHostname, "crawl-agent/1", testLogger(t))
 	assert.EqualValues(t, 3, deadCalls.Load(), "the dead relay gets exactly its budget")
 	assert.EqualValues(t, 1, liveCalls.Load(), "a dead relay must not block or repeat the healthy one")
 }
@@ -1131,7 +1143,7 @@ func TestRequestCrawlAll_ContextCancelStopsRetrying(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		RequestCrawlAll(ctx, &http.Client{Timeout: time.Second}, []string{relay.URL}, testHostname, testLogger(t))
+		RequestCrawlAll(ctx, &http.Client{Timeout: time.Second}, []string{relay.URL}, testHostname, "crawl-agent/1", testLogger(t))
 	}()
 	cancel()
 	select {
@@ -1158,7 +1170,7 @@ func TestRequestCrawlAll_ValidationErrorNotRetried(t *testing.T) {
 	go func() {
 		defer close(done)
 		// Empty hostname is a caller bug (validation error): terminal, no retry.
-		RequestCrawlAll(context.Background(), &http.Client{Timeout: time.Second}, []string{relay.URL}, "", testLogger(t))
+		RequestCrawlAll(context.Background(), &http.Client{Timeout: time.Second}, []string{relay.URL}, "", "crawl-agent/1", testLogger(t))
 	}()
 	select {
 	case <-done:
@@ -1188,7 +1200,7 @@ func TestRequestCrawlAll_BadRequestIsRetried(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	RequestCrawlAll(ctx, &http.Client{Timeout: time.Second}, []string{relay.URL}, testHostname, testLogger(t))
+	RequestCrawlAll(ctx, &http.Client{Timeout: time.Second}, []string{relay.URL}, testHostname, "crawl-agent/1", testLogger(t))
 	assert.EqualValues(t, 3, calls.Load(), "two 400s then the success — 4xx must be retried, and success must stop the loop")
 }
 
@@ -1213,7 +1225,7 @@ func TestRequestCrawlAll_AttemptTimeoutBoundsHangingRelay(t *testing.T) {
 	start := time.Now()
 	// The client's own timeout (10s) is far above the attempt cap: only the
 	// per-attempt context can keep this fast.
-	RequestCrawlAll(context.Background(), &http.Client{Timeout: 10 * time.Second}, []string{relay.URL}, testHostname, testLogger(t))
+	RequestCrawlAll(context.Background(), &http.Client{Timeout: 10 * time.Second}, []string{relay.URL}, testHostname, "crawl-agent/1", testLogger(t))
 	elapsed := time.Since(start)
 	assert.EqualValues(t, 2, calls.Load(), "a hanging relay still gets its full attempt budget")
 	assert.Less(t, elapsed, 5*time.Second, "attempts must be bounded by crawlAttemptTimeout, not the client timeout")

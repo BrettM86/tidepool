@@ -45,7 +45,7 @@ var (
 // The caller supplies the HTTP client so production keeps the SSRF-guarded
 // egress transport (ap.NewGuardedHTTPClient) and tests can hit httptest
 // servers.
-func RequestCrawl(ctx context.Context, client *http.Client, relay, hostname string) error {
+func RequestCrawl(ctx context.Context, client *http.Client, relay, hostname, userAgent string) error {
 	if err := validateRequestCrawlInput(client, relay, hostname); err != nil {
 		return err
 	}
@@ -64,6 +64,7 @@ func RequestCrawl(ctx context.Context, client *http.Client, relay, hostname stri
 		return fmt.Errorf("sync: build requestCrawl request for %s: %w", base, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", userAgent)
 
 	// Everything past this point touches the wire; failures here may be
 	// transient and are retried by requestCrawlWithRetry.
@@ -107,7 +108,7 @@ func validateRequestCrawlInput(client *http.Client, relay, hostname string) erro
 // only invoked under ALLOW_DEV_REQUEST_CRAWL (the e2e stack's local relay);
 // otherwise dev logs the would-be request, because dev hosts are not
 // publicly reachable and must never poke real relays.
-func RequestCrawlAll(ctx context.Context, client *http.Client, relays []string, hostname string, logger *slog.Logger) {
+func RequestCrawlAll(ctx context.Context, client *http.Client, relays []string, hostname, userAgent string, logger *slog.Logger) {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -116,7 +117,7 @@ func RequestCrawlAll(ctx context.Context, client *http.Client, relays []string, 
 		wg.Add(1)
 		go func(relay string) {
 			defer wg.Done()
-			requestCrawlWithRetry(ctx, client, relay, hostname, logger)
+			requestCrawlWithRetry(ctx, client, relay, hostname, userAgent, logger)
 		}(relay)
 	}
 	wg.Wait()
@@ -125,7 +126,7 @@ func RequestCrawlAll(ctx context.Context, client *http.Client, relays []string, 
 // requestCrawlWithRetry drives one relay's announcement to a terminal
 // outcome: success, a pre-flight validation error (caller bug — retrying
 // cannot fix it), context cancellation, or budget exhaustion.
-func requestCrawlWithRetry(ctx context.Context, client *http.Client, relay, hostname string, logger *slog.Logger) {
+func requestCrawlWithRetry(ctx context.Context, client *http.Client, relay, hostname, userAgent string, logger *slog.Logger) {
 	// Pre-flight caller-bug checks run once, before the loop, and are the
 	// ONLY terminal errors. Everything that comes back from an actual HTTP
 	// attempt is retried within the budget — deliberately including
@@ -144,7 +145,7 @@ func requestCrawlWithRetry(ctx context.Context, client *http.Client, relay, host
 		// the arithmetic documented on crawlMaxAttempts (the injected
 		// client's own timeout is typically longer, e.g. 30s in main).
 		attemptCtx, cancel := context.WithTimeout(ctx, crawlAttemptTimeout)
-		err := RequestCrawl(attemptCtx, client, relay, hostname)
+		err := RequestCrawl(attemptCtx, client, relay, hostname, userAgent)
 		cancel()
 		if err == nil {
 			logger.Info("requested crawl", "relay", relay, "hostname", hostname, "attempt", attempt)

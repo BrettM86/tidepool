@@ -82,8 +82,12 @@ type Config struct {
 	// the service actor; until then an empty value is handled gracefully
 	// (the bridge hostname simply does not resolve to a DID).
 	BridgeServiceDID string
-	// UserAgent is sent on all outbound HTTP requests (signed fetches etc.).
+	// UserAgent is sent on all outbound bridge traffic (signed fetches,
+	// service-actor deliveries, relay crawl requests etc.).
 	UserAgent string
+	// UserOriginUserAgent is sent on outbound requests made as Coves users.
+	// It is always derived from AP_USER_ORIGIN; USER_AGENT does not change it.
+	UserOriginUserAgent string
 	// FirehoseRetention is how long firehose events are kept for
 	// subscribeRepos cursor replay (FIREHOSE_RETENTION, a Go duration,
 	// default 72h). Consumers reconnecting with a cursor older than the
@@ -745,12 +749,13 @@ func Load(logger *slog.Logger) (*Config, error) {
 		return nil, err
 	}
 
-	defaultUserAgent := fmt.Sprintf("tidepool/0.1 (+https://%s)", cfg.BridgeHostname)
+	defaultUserAgent := fmt.Sprintf("tidepool/0.1 (Coves bridge; +https://%s)", cfg.BridgeHostname)
 	cfg.UserAgent = os.Getenv("USER_AGENT")
 	if cfg.UserAgent == "" {
 		cfg.UserAgent = defaultUserAgent
 		logger.Info("USER_AGENT not set, using default", "value", defaultUserAgent)
 	}
+	cfg.UserOriginUserAgent = fmt.Sprintf("coves/0.1 (+%s)", cfg.APUserOrigin)
 
 	return cfg, nil
 }

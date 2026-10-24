@@ -19,14 +19,15 @@ const ServiceKeyName = "service-actor"
 // from (the HTTP route itself lands with the inbox in task 06).
 const ServiceActorPath = "/actor"
 
-// SoftwareName and SoftwareVersion identify this implementation in every
-// nodeinfo document the deployment serves. Lemmy admins allowlist by the
-// exact name string, and both of the bridge's origins describe the SAME
-// deployment — so the pair lives here rather than once per surface, where
-// the two could drift into claiming to be different software.
+// Each origin names itself in the nodeinfo document it serves. The bridge
+// origin (BRIDGE_HOSTNAME) is the tidepool bridge, so it reports
+// BridgeSoftwareName. The user origin (AP_USER_ORIGIN) is where Coves users
+// federate from, so it identifies as Coves with UserOriginSoftwareName. Both
+// origins run the same deployment and share SoftwareVersion.
 const (
-	SoftwareName    = "tidepool"
-	SoftwareVersion = "0.1.0"
+	BridgeSoftwareName     = "tidepool"
+	UserOriginSoftwareName = "coves"
+	SoftwareVersion        = "0.1.0"
 )
 
 // serviceActorContext is the JSON-LD context for the service actor document:

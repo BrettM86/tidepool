@@ -617,6 +617,10 @@ func run(logger *slog.Logger) error {
 		Sweeper:      handler,
 		Deliveries:   store.NewOutboundDeliveries(database),
 		BanReplayer:  ingest.NewBanReplayer(handler, inboxEvents),
+		// The operator purge (POST /admin/actors/purge); its purger is wired
+		// below with the consumer.
+		APActors:      store.NewAPActors(database),
+		OutboundVotes: store.NewOutboundVotes(database),
 		// The refresh-profile walks derive from the run context so they
 		// stop at their next community or user once shutdown starts; the
 		// drain below waits for them, like the backfill drain.
@@ -726,10 +730,12 @@ func run(logger *slog.Logger) error {
 	var consumerDone <-chan struct{}
 	if cfg.ConsumerEnabled {
 		var acceptEngine *accept.Engine
-		consumerDone, acceptEngine, err = startConsumer(ctx, cfg, database, repoManager, personasService, apClient, personasService, logger)
+		var purger *outbound.Purger
+		consumerDone, acceptEngine, purger, err = startConsumer(ctx, cfg, database, repoManager, personasService, apClient, personasService, logger)
 		if err != nil {
 			return err
 		}
+		admin.SetActorPurger(purger)
 		// The acceptance-engine admin surface (task 16): list admissions with
 		// their reasons + force re-admit. It shares the /admin bearer and mounts
 		// only WITH the consumer, because a force re-admit needs the engine. A
@@ -857,7 +863,8 @@ func run(logger *slog.Logger) error {
 
 // startConsumer wires the Jetstream consumer (task 14) and starts its read
 // loop. The returned channel closes when the connector's loop has exited, so
-// shutdown can wait for the final cursor flush instead of racing it.
+// shutdown can wait for the final cursor flush instead of racing it. The
+// returned purger also serves the operator purge (POST /admin/actors/purge).
 //
 // Outbound delivery (task 15) is fully wired here:
 //
@@ -886,7 +893,7 @@ func startConsumer(
 	apClient *ap.Client,
 	signers outbound.SignerProvider,
 	logger *slog.Logger,
-) (<-chan struct{}, *accept.Engine, error) {
+) (<-chan struct{}, *accept.Engine, *outbound.Purger, error) {
 	// The most SSRF-exposed egress in the bridge: the well-known host comes
 	// from a DID document a stranger controls, so it shares the AP client's
 	// guard rather than using a bare http.Client.
@@ -900,7 +907,7 @@ func startConsumer(
 		Logger:    logger,
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("consumer: handle resolver: %w", err)
+		return nil, nil, nil, fmt.Errorf("consumer: handle resolver: %w", err)
 	}
 
 	// The outbound delivery pipe (task 15). Because this function runs ONLY when
@@ -920,7 +927,7 @@ func startConsumer(
 		Logger:     logger,
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("consumer: outbound enqueuer: %w", err)
+		return nil, nil, nil, fmt.Errorf("consumer: outbound enqueuer: %w", err)
 	}
 
 	var worker *outbound.Worker
@@ -942,7 +949,7 @@ func startConsumer(
 			Logger: logger,
 		})
 		if err != nil {
-			return nil, nil, fmt.Errorf("consumer: outbound worker: %w", err)
+			return nil, nil, nil, fmt.Errorf("consumer: outbound worker: %w", err)
 		}
 	}
 
@@ -969,7 +976,7 @@ func startConsumer(
 		Logger:                   logger,
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("consumer: acceptance engine: %w", err)
+		return nil, nil, nil, fmt.Errorf("consumer: acceptance engine: %w", err)
 	}
 
 	// The DESTRUCTIVE tier (decision 11's second tier): one Delete{Person,
@@ -991,7 +998,7 @@ func startConsumer(
 		Logger:    logger,
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("consumer: account terminator: %w", err)
+		return nil, nil, nil, fmt.Errorf("consumer: account terminator: %w", err)
 	}
 
 	dispatcher, err := consume.NewDispatcher(consume.Options{
@@ -1012,7 +1019,7 @@ func startConsumer(
 		Logger:     logger,
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("consumer: dispatcher: %w", err)
+		return nil, nil, nil, fmt.Errorf("consumer: dispatcher: %w", err)
 	}
 
 	// The collection filter is load-bearing: without wantedCollections this
@@ -1020,7 +1027,7 @@ func startConsumer(
 	// by record.
 	subscribeURL, err := consume.SubscribeURL(cfg.JetstreamURL, consume.WantedCollections())
 	if err != nil {
-		return nil, nil, fmt.Errorf("consumer: %w", err)
+		return nil, nil, nil, fmt.Errorf("consumer: %w", err)
 	}
 
 	state := consume.NewPostgresStateStore(database, consume.CursorSchemaVersion)
@@ -1071,7 +1078,7 @@ func startConsumer(
 		close(done)
 	}()
 	logger.Info("jetstream consumer started", "url", subscribeURL)
-	return done, engine, nil
+	return done, engine, purger, nil
 }
 
 // startDNSServer serves handle DNS over UDP and TCP when DNS_LISTEN is set. The

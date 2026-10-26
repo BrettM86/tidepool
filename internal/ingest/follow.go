@@ -64,6 +64,12 @@ type AdminOptions struct {
 	// BanReplayer serves POST /admin/inbox/replay-bans (optional; the
 	// endpoint answers 501 when nil). See upstream_ban.go.
 	BanReplayer *BanReplayer
+	// APActors are the native (Coves-user) actors POST /admin/actors/purge
+	// looks up (optional; the endpoint answers 501 when nil).
+	APActors store.APActors
+	// OutboundVotes counts an actor's standing votes for POST
+	// /admin/actors/purge (optional; the endpoint answers 501 when nil).
+	OutboundVotes store.OutboundVotes
 	// BaseContext is the root context background admin work (the
 	// refresh-profile walks) runs under. Wiring the server/run context here
 	// lets a walk observe shutdown, as BackfillOptions.BaseContext does for
@@ -86,6 +92,7 @@ type AdminOptions struct {
 //	POST   /admin/reemit                {"did":"did:plc:..."} (or {} for all)
 //	POST   /admin/objects/sweep-deleted {"ap_ids":["https://..."]}
 //	POST   /admin/inbox/replay-bans     {"dry_run":true} (or false)
+//	POST   /admin/actors/purge          {"did":"did:plc:...","dryRun":true} (or false)
 //	GET    /admin/divergence            (reconciliation report; READ-ONLY)
 //	GET    /admin/metrics               (tidepool's own expvar counters)
 //
@@ -102,6 +109,8 @@ type Admin struct {
 	sweeper     DeleteSweeper
 	deliveries  store.OutboundDeliveries
 	banReplayer *BanReplayer
+	apActors    store.APActors
+	votes       store.OutboundVotes
 	logger      *slog.Logger
 	// reconciler serves POST /admin/communities/reconcile; nil (the
 	// endpoint answers 501) unless a follow list is configured. Set once
@@ -114,6 +123,10 @@ type Admin struct {
 	// 501) unless the reconciliation sweep is wired. Set once during
 	// startup via SetDivergenceReconciler, before the server listens.
 	divergence *DivergenceReconciler
+	// purger serves POST /admin/actors/purge; nil (the endpoint answers
+	// 501) unless the consumer is enabled. Set once during startup via
+	// SetActorPurger, before the server listens.
+	purger ActorPurger
 	// baseCtx roots background admin work; walkMu serializes the
 	// community refresh-profile walk and userWalkMu the user one (TryLock
 	// refuses a second walk of a kind while one runs instead of doubling the
@@ -134,6 +147,16 @@ func (a *Admin) SetFollowReconciler(r *FollowReconciler) { a.reconciler = r }
 // SetDivergenceReconciler wires the optional reconciliation sweep in after
 // construction, as SetFollowReconciler does for the follow list.
 func (a *Admin) SetDivergenceReconciler(r *DivergenceReconciler) { a.divergence = r }
+
+// ActorPurger withdraws a native actor's federated content: the destructive
+// opt-out tier, reached from POST /admin/actors/purge.
+type ActorPurger interface {
+	DeleteRemoteContent(ctx context.Context, did string) error
+}
+
+// SetActorPurger wires the optional actor purger in after construction (it is
+// built with the consumer).
+func (a *Admin) SetActorPurger(p ActorPurger) { a.purger = p }
 
 // SetDNSReconciler wires the optional DNS delegation reconciler during startup.
 func (a *Admin) SetDNSReconciler(r *delegation.Reconciler) { a.dnsReconciler = r }
@@ -178,6 +201,8 @@ func NewAdmin(opts AdminOptions) (*Admin, error) {
 		sweeper:     opts.Sweeper,
 		deliveries:  opts.Deliveries,
 		banReplayer: opts.BanReplayer,
+		apActors:    opts.APActors,
+		votes:       opts.OutboundVotes,
 		logger:      logger,
 		baseCtx:     baseCtx,
 	}, nil
@@ -203,6 +228,7 @@ func (a *Admin) Routes(r chi.Router) {
 		r.Post("/reemit", a.handleReemit)
 		r.Post("/objects/sweep-deleted", a.handleSweepDeleted)
 		r.Post("/inbox/replay-bans", a.handleReplayBans)
+		r.Post("/actors/purge", a.handleActorPurge)
 		r.Get("/divergence", a.handleDivergence)
 		r.Get("/outbound", a.handleOutboundInspect)
 		r.Post("/outbound/redrive", a.handleOutboundRedrive)

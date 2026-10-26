@@ -259,6 +259,38 @@ curl -s -H "$T" localhost:8091/admin/metrics             # tidepool* expvars
 curl -s -H "$T" 'localhost:8091/admin/admissions?status=rejected'
 ```
 
+### Purging a native actor (spammer)
+
+`POST /admin/actors/purge` sends `Delete{Person, removeData:true}` for a
+Coves user's persona to every inbox that received its content, undoes its
+standing votes, and tombstones it: the actor document answers 410 forever and
+the actor can never be re-enabled. **Irreversible.** Peers that honour the
+Delete drop the content and cannot restore it. A disabled or paused actor
+still gets the Delete delivered. Only `person` actors are purgeable (a group
+answers 422); the route answers 501 when the consumer is off. Removing the
+content on the Coves side is separate (`social.coves.moderation.removeContent`).
+
+Run `scripts/purge-actor.sh` on the box: it is in `/opt/tidepool/scripts` once
+the deploy that added it has been pulled (otherwise `scp` it to the host and
+`ssh` in). It reads `ADMIN_TOKEN` from `/opt/tidepool/.env` without echoing it.
+Dry run first, check `inboxes` and `standingVotes`, then execute:
+
+```sh
+/opt/tidepool/scripts/purge-actor.sh did:plc:...            # dry run: changes nothing
+/opt/tidepool/scripts/purge-actor.sh did:plc:... --execute  # the purge
+```
+
+A real run pauses and disables the actor first, so nothing admitted while
+the purge prepares is delivered after its targets are read; retractions still
+go out. The `inboxes` and `standingVotes` in a real run's answer are that
+pre-purge snapshot. The log line WARN `purge committed with no federation
+preference to mark` is expected on an operator purge (the user never wrote a
+deleteRemote preference).
+
+A failed or interrupted run is safe to repeat: the purge is idempotent. Run
+one purge per actor at a time: two simultaneous runs can each send an Undo
+for the same standing vote. A sequential rerun is safe.
+
 ---
 
 ## 4. coves.social Caddy — a CROSS-REPO change

@@ -89,6 +89,11 @@ type moderationWorld struct {
 	communityBDID string
 	dispatcher    *consume.Dispatcher
 	digestRKey    string
+	// purger is the destructive tier the consumer is wired with, and personas
+	// the user origin that signs for native actors: the operator purge drives
+	// the same purger, and a real delivery worker needs the same signer.
+	purger   *outbound.Purger
+	personas *personas.Service
 }
 
 // newModerationWorld builds that world. The variadic hooks mutate the
@@ -154,6 +159,7 @@ func newModerationWorld(t *testing.T, h *harness, mutate ...func(*consume.Option
 		UserOrigin:  mtUserOrigin,
 	})
 	require.NoError(t, err)
+	purger := outbound.NewPurger(h.db, mtUserOrigin, enqueuer)
 	consumerOpts := consume.Options{
 		DB:       h.db,
 		Actors:   userOrigin,
@@ -164,7 +170,7 @@ func newModerationWorld(t *testing.T, h *harness, mutate ...func(*consume.Option
 		// A nil deleter makes deleteRemote=true a Warn and a no-op, which would
 		// let every destructive-tier assertion pass against a tier that was
 		// never reached.
-		RemoteDeleter: outbound.NewPurger(h.db, mtUserOrigin, enqueuer),
+		RemoteDeleter: purger,
 		UserOrigin:    mtUserOrigin,
 	}
 	for _, apply := range mutate {
@@ -198,6 +204,7 @@ func newModerationWorld(t *testing.T, h *harness, mutate ...func(*consume.Option
 		groupA: groupA, groupB: groupB,
 		communityADID: communityADID, communityBDID: communityBDID,
 		dispatcher: dispatcher, digestRKey: digest,
+		purger: purger, personas: userOrigin,
 	}
 }
 

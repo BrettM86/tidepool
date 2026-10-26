@@ -446,6 +446,11 @@ func (h *harness) adminOptions() AdminOptions {
 		Backfill:     h.backfills,
 		Sweeper:      h.handler,
 		BanReplayer:  NewBanReplayer(h.handler, h.events),
+		// The outbound stores production wires (the operator purge and the
+		// task-15 queue endpoints read them).
+		Deliveries:    store.NewOutboundDeliveries(h.db),
+		APActors:      store.NewAPActors(h.db),
+		OutboundVotes: store.NewOutboundVotes(h.db),
 		// The walks report only through the log (the 202 precedes the
 		// work), so their summaries land in h.logs for tests to assert.
 		Logger: slog.New(slog.NewTextHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug})),

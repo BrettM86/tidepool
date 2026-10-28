@@ -296,7 +296,7 @@ func run(logger *slog.Logger) error {
 
 	// Handle resolution for the bridged handle space (task 03). Bridged
 	// handles are subdomains of BRIDGE_HOSTNAME; wildcard DNS routes them
-	// all here (see README, "Handle resolution & DNS").
+	// all here (see HANDLE_SCHEME.md, "DNS").
 	actors := store.NewBridgedActors(database)
 	resolver := identity.NewStoreResolver(actors, cfg.BridgeHostname, serviceDID)
 	dnsErrors, err := startDNSServer(ctx, cfg, resolver, logger)

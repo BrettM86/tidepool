@@ -1,5 +1,5 @@
 // Consent enforcement (PLAN.md locked decision 6, mirroring Bridgy Fed
-// norms — the policy is documented in README "Consent policy"):
+// norms — the policy is documented in docs/PROTOCOL.md "Consent policy"):
 //
 //   - #nobridge / #nobot in an actor's summary or tags blocks
 //     materialization. The materializer scans on FIRST SIGHT (an opted-out

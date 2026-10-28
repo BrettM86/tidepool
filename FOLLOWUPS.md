@@ -1,870 +1,395 @@
 # Follow-ups
 
-Open work, accepted limitations, and operational caveats remaining after the
-v1.1 hardening and performance passes. Completed task history belongs in the
-task documents and git history rather than this list.
+Known open work, accepted limits, and operational caveats. Finished work is in
+git history, not here.
+
+## Not built yet
+
+- Communities created on Coves do not federate to the fediverse. This is the
+  planned "Scope B". Today only fediverse communities are bridged, and native Coves
+  users federate only into those.
+- Image embeds on native posts do not federate. `social.coves.embed.images`
+  is dropped in `internal/apobject/object.go` (`linkAttachment`). The blobs live
+  on the author's PDS, and there is no design yet for turning a blob into a
+  public URL for the `attachment [{type: Image, url}]` Lemmy expects. Text,
+  links, NSFW, titles and facets do federate.
+- Bridged fediverse users cannot claim their DID keys or migrate their account.
+- When a PLC mint fails after submission, the DID can be left registered with no
+  `bridged_actors` row (`internal/identity/minter.go` logs it at error level).
+  The next attempt mints another DID. The fix is to reuse the orphaned DID with
+  a PLC `updateHandle` operation.
+- DMs are not bridged. Moderation decisions made on Coves do not federate to
+  Lemmy; only Lemmy's removals, locks and bans flow in.
+- There is no rate limit on outbound actor announcements. `MINT_RATE_PER_MINUTE`
+  and `MINT_BURST` limit inbound mints only. The only levers are
+  `OUTBOUND_WORKERS` and the scoped kill switches.
+
+## Other platforms
+
+- PieFed, Mbin and Pylova are untested. Mbin is partly handled: `communityRef`
+  (`internal/materialize/posts.go`) reads `audience` first, which Mbin sets, and
+  Mbin's bare-URL `source` parses. If `audience` is missing, the `to`/`cc`
+  fallback only recognises Lemmy's `/c/` paths (`containsCommunityPath` in
+  `internal/ingest/handler.go` has the same rule), so Mbin's `/m/` groups are
+  missed. PieFed and Pylova have no captured fixtures.
+- Lemmy 1.0 (API v4) is untested. The harness, seeder and WebFinger code target
+  Lemmy 0.19.x (API v3), pinned at 0.19.20.
+- Lemmy does not federate a post author's own automatic upvote. A newly bridged
+  post can show one upvote fewer than Lemmy until a backfill re-seed.
+- Lemmy 0.19.x does not federate profile edits. A user who adds `#nobridge` is
+  noticed only when `PROFILE_REFRESH_TTL` has expired and another activity
+  makes Tidepool re-fetch the actor. An inactive user's opt-out is never noticed
+  unless an operator runs `POST /admin/users/refresh-profile {"all":true}`. Add
+  a periodic consent re-scan.
+- Lemmy peers that federated with Tidepool before it served its instance actor
+  at `GET /` may need to re-fetch the actor, and restart their federation
+  worker, before they accept account deletions.
+- Self-delete confirmation accepts a 410 or an ActivityPub `Tombstone`, not a
+  plain 404. That fits Lemmy. A platform that answers 404 for a deleted actor
+  will need a change.
+- Lemmy's `Image` attachments have no `mediaType`; only `type` and the URL
+  extension mark them as images. `Link` attachments carry no alt text, so alt
+  text is lost when the metadata fetch fails.
+- The service actor uses type `Service` because Lemmy rejects `Application`.
+  Revisit only if another platform rejects `Service`.
+- Production WebFinger is HTTPS only. HTTP fallback exists only with the dev/e2e
+  SSRF relaxation.
+
+## Relay and Jetstream
+
+- A new self-hosted BigSky refuses non-admin `requestCrawl` calls because its
+  daily new-PDS limit defaults to zero. Raise it with the admin
+  `setPerDayLimit` call, as `relay-bootstrap` does in the e2e stack.
+- The pinned BigSky image ignores `BGS_CRAWL_INSECURE_WS`, `BGS_PORT` and
+  `LOG_LEVEL`. Use the `--crawl-insecure-ws` argument and `BSKYLOG_LOG_LEVEL`.
+  Set `ATP_PLC_HOST` and `RESOLVE_ADDRESS` when the public PLC directory and the
+  `1.1.1.1` resolver are wrong for the deployment. Check `--help` when bumping
+  the image.
+- The pinned BigSky image has no arm64 build. Apple Silicon runs it under amd64
+  emulation.
+- Jetstream replays its whole retained store when given a cursor between its
+  newest stored event and the current time. Consumers must be idempotent and
+  must not use a wall-clock cursor as a dedupe boundary.
+- Indigo's slurper stops retrying a PDS after about three minutes of failed
+  dials and marks it unregistered. Tidepool re-announces itself on startup, but
+  a long Tidepool outage with the relay still up needs a manual `requestCrawl`.
+
+## Outbound delivery
+
+- A claim that is abandoned (lease lapses, or a crash between `ClaimNext` and
+  settling) keeps the attempt it was charged. Each one costs the delivery one
+  real retry, and is why a poisoned row can show more than `maxAttempts`. A park
+  the fence refused logs `park did not apply: claim lost or row terminal` at
+  Warn in `internal/outbound/worker.go`.
+- A park writes `last_status_code = 0`, overwriting a real status from an
+  earlier attempt. The divergence sweep reads 0 as "the peer never answered"
+  (`internal/store/divergence.go`), so a 502 followed by a park reads as
+  silence. Fix only if the per-row answered/silent split needs to be exact.
+- `ClaimNext` on `outbound_deliveries` re-checks rows by `seq`, which has no
+  index of its own (the primary key is `(activity_id, target_inbox)`). If the
+  claim path shows up in profiles, add `UNIQUE INDEX (seq)` in a new migration
+  (next free number is 043). Editing an applied migration does nothing under
+  goose.
+- The `OutboundDeliveries` interface has 17 methods. The worker uses the
+  claim/mark subset and the admin API uses inspect/redrive/cancel. If it grows,
+  split it at the consumer packages.
+- The enqueuer resolves a community's inbox inside the consumer's gate
+  transaction. On a cache miss (1h TTL) that is a network fetch, so a slow
+  Group document holds gate row locks and blocks the consumer. Resolve before
+  the transaction, or give the resolve a short timeout.
+- If a vote record is deleted and re-created with the same rkey, the vote never
+  federates and nothing is logged. The activity id is derived from
+  (at-uri, "create", seq), and seq restarts at 1, so the new vote reproduces the
+  first vote's id and `InsertTx` no-ops on it. Coves' own vote service mints a
+  fresh TID for each vote (`coves/internal/core/votes/service_impl.go`), so this
+  needs a client that writes vote records directly with a reused rkey. Fix by
+  deriving the id from something that does not restart.
+- The operator purge (`POST /admin/actors/purge`) has two known gaps: two
+  concurrent purges of one actor can each send an Undo for its votes (the
+  runbook says run one at a time), and a real run restamps `disabled_at` on an
+  actor that was already disabled.
+
+## Community bans and moderation
+
+- The ban re-check inside the acceptance transaction narrows the race with a
+  new ban but does not close it. Under READ COMMITTED a ban can commit between
+  the check and the acceptance commit. Closing it needs SERIALIZABLE or a lock
+  shared with the ban path.
+- A delivery claimed just before a ban commits can still be sent. The row then
+  reads `cancelled` for content the peer accepted, and the vote re-seed (which
+  subtracts only `delivered`) misses it.
+- When a temporary ban expires, nothing re-queues the deliveries it cancelled.
+  The posts stay accepted on Coves, and Lemmy never receives them. `cancelled`
+  is terminal; `RedrivePoisoned` revives only poisoned rows.
+- `outbound_deliveries` does not record why a delivery was cancelled. Ban,
+  consent, community and actor cancels all write `cancelled`. An operator can
+  get the ban reason by joining `community_bans` on
+  `(community_did, subject_did)` with `expires_at IS NULL OR expires_at > now()`.
+- Bans on native authors are stored only in a private table. A
+  `social.coves.moderation.ban` lexicon exists, but nothing publishes to it, so
+  Coves' moderation surface shows no ban while the author's posts are refused.
+- The community `Block` that bans a native author is only covered by
+  hand-written unit fixtures. Tidepool reads both `expires` and `endTime`; a
+  different spelling or `target` shape from real Lemmy would go unnoticed. The
+  site-ban `Block` is captured from real Lemmy in
+  `tests/e2e/upstream_ban_test.go`.
+- Nothing reads a native comment's removal (`object_moderation.removed_at`). A
+  comment a moderator removed still federates the author's later edits and
+  still accepts native replies. Fix by gating child enqueues and edit
+  federation on the parent's removal, as the thread lock already does.
+- Comments materialized before migration 026 have no `thread_root_at_uri`, so
+  a lock on the post above them does not refuse native replies under them. Each
+  heals when re-materialized; an admin backfill of the affected communities
+  fixes them all.
+- A lock reaches native replies only through reply chains the bridge
+  materialized.
+- `walkThreadRoot` can still hit a dead end for native content whose outbound
+  state predates the root column. If the community has a lock, the event is
+  refused as retryable and the error names the at-uri where the chain stopped.
+- The re-materialization test does not cover `storedThreadRoot` on its own:
+  setting it to `""` still passes because `carryForward` restores the reply
+  refs. Isolating it needs a stored record with no reply refs.
+
+## Votes and counts
+
+- Nothing re-seeds vote counts on a schedule. `SeedPostCounts` runs only behind
+  `SEED_COUNTS_FROM_API`, and is skipped within a 1h window unless an admin
+  forces a backfill. Drift that "heals on the next re-seed" may never heal in a
+  quiet community.
+- The re-seed baseline clamp (`GREATEST(0, …)`) fires only when the deficit is
+  larger than the subject's whole fediverse tally. It does not detect Lemmy
+  discarding our votes. Compare `tidepool_vote_seed_ours_subtracted` with a
+  sample from Lemmy to audit that.
+- Voters known only from the baseline can drift: a later flip or clear has no
+  per-voter row to retract. A re-seed fixes the total, but see above.
+- Migration 023's cleanup `DELETE` matches `voter_ap_id` by exact string, while
+  `echo.identifyActor` normalises host and scheme. A legacy row with a
+  non-canonical spelling of one of our actor ids would be subtracted twice.
+  Accepted: no such rows exist in production.
+- Rolling back migration 023 leaves baselines understated until a forced
+  backfill.
+- While a re-cast vote is in flight, `delivered_state` is still `delivered` but
+  `direction` is already the new one. A re-seed in that window subtracts the
+  wrong direction. It shows up only if it pushes a baseline below zero
+  (`SeedBaselineClamped` and a Warn). If the new delivery poisons, the error
+  repeats on every re-seed until the vote is undone; `RecastDivergence` reports
+  it. `TestReseedDuringARecastWindowMisreadsBothDirections` pins the cost.
+- When an old vote's delivery lands after a re-cast, `voteCallback`
+  (`internal/outbound/worker.go`) finds no row for the old activity id and does
+  nothing. The peer then holds a vote no `outbound_votes` row records. The
+  divergence sweep reads the delivery ledger for this reason. The same path
+  explains the next item.
+- Deleting a vote and re-casting it with the same rkey before the Undo settles
+  leaves the row `delivered` for a vote the peer no longer holds, until the next
+  delivery or undo.
+- An update that points an existing vote rkey at a different subject overwrites
+  `subject_at_uri`. The peer keeps the vote on the old subject. Coves never does
+  this. Fix: refuse a subject change for a live vote in `applyVoteWrite`.
+- Deleting a vote after a poisoned re-cast sends an Undo naming the new,
+  never-delivered activity. This relies on Lemmy matching Undo by
+  `(actor, object)`, as the purge path also does. Verify with an outbound-vote
+  e2e test against real Lemmy.
+- A stale queued vote event can race an actor purge and overwrite `undone` with
+  `pending`, sending new work after the purge. Not reachable at current scale.
+  Candidate fix: make `undone` terminal in the upsert, test-first, since it
+  reverses an earlier decision.
+- `ScrubVoter` takes aggregate locks in a fixed subject order to avoid
+  deadlocks, but no concurrency test checks it.
+- Vote subject resolution runs outside the mutation transaction, leaving a
+  small race with deletion.
+
+## Echo suppression
+
+- `ClassAncestorShortCircuit` counts normal threading, not a dropped echo. It
+  fires on every comment whose ancestor `ResolveStrongRef` already anchored, yet
+  it sits in the `tidepool_echo_drops_*` metrics. Rename it out of that family or
+  move it to a place where a fetch was actually skipped. It also re-reads the
+  row `ResolveStrongRef` just read.
+- Echo classification adds up to 4 indexed reads per node on the busiest
+  inbound path. An envelope with `/ap/object/`-shaped ids on foreign hosts
+  forces reads at every probe, up to `MaxDepth` deep. Accepted because the inbox
+  is signature-checked and rate-limited.
+- No e2e test drives an inbound announce for a vanity-origin persona. `Identify`
+  is unit-tested both ways.
+- `identifyObject` and `identifyActor` check only the id. A followed community
+  can send one of our public object or actor ids to get content dropped as an
+  echo. Limited to followed communities, and closing it needs a different
+  mechanism.
+- `materializeContent`'s legacy `mapping.Origin == store.OriginBridge` check is
+  now covered entirely by `suppressEcho`. Decide whether to delete it.
+- `echo.Drops()` is exported but has no production caller, and the tests keep
+  their own copy of the class list. Adding a class would weaken every "only
+  this class moved" test. Export the class list instead.
+- A typed "refusing to fetch our own id" error in `bindFetch`
+  (`internal/ingest/handler.go`) would cover the ancestor walk, bare-IRI
+  announce, `resolveDelivered` and `handleUndoDelete`'s restore in one place.
+
+## Opt-out and erasure
+
+- After an opt-out, the actor answers 410 before the `Delete{Person}` has been
+  delivered. A peer that re-fetches the actor to check the Delete's signature
+  gets 410. The 410 body is a `Tombstone` that carries the public key, so a
+  peer that reads the body can still verify. A peer that looks only at the
+  status code cannot. Act only if Lemmy is seen dropping our person-deletes.
+- A delivery mid-POST at purge time is neither delivered nor held, so the purge
+  cannot tell whether the peer has it.
+- Instances that found a user through search or WebFinger, and never received a
+  delivery, are not reached by an erasure. The delivery history is the only
+  record of who holds a user's content. Accepted: logging every requester would
+  be a surveillance log.
+
+## Divergence sweep
+
+The sweep reports divergence and never repairs it.
+
+- There is no off switch. It always runs at startup, and
+  `DIVERGENCE_INTERVAL=0` is refused. The only lever is a long interval.
+- Two legs scan `outbound_activities` in full. The undelivered-acceptance leg
+  joins on `payload -> 'object' ->> 'id'`, which no index serves; `EXPLAIN` with
+  `enable_seqscan = off` still picks a sequential scan. The re-cast leg's outer
+  driver also scans in full. Each leg also runs an exact `COUNT(*)`, so the
+  acceptance scan runs twice per sweep. Candidate indexes, once production
+  volume justifies the write cost:
 
-## Relay pipeline
-
-- A fresh self-hosted BigSky refuses non-admin `requestCrawl` calls because
-  its new-PDS daily limit defaults to zero. Bootstrap it with the admin
-  `setPerDayLimit` call (as `relay-bootstrap` does in the e2e compose stack).
-- Verify BigSky configuration against `--help`: the pinned image does not
-  recognize `BGS_CRAWL_INSECURE_WS`, `BGS_PORT`, or `LOG_LEVEL`.
-  `--crawl-insecure-ws` is a command argument and the log variable is
-  `BSKYLOG_LOG_LEVEL`. Also set `ATP_PLC_HOST` and `RESOLVE_ADDRESS` when the
-  public PLC directory and `1.1.1.1` resolver are inappropriate.
-- The pinned BigSky image has no arm64 manifest. Apple Silicon uses amd64
-  emulation; revisit when bumping the image.
-- **Jetstream has surprising quiet-stream cursor behavior.** A cursor between
-  its newest stored event and server-now replays the full retained store.
-  Consumers must be idempotent and must not treat a wall-clock "now" cursor as
-  a dedupe boundary.
-- Indigo's slurper stops retrying after roughly three minutes of continuous
-  dial failure and marks the PDS unregistered. Tidepool re-announces on its own
-  startup, but a long Tidepool outage while the relay remains up requires a
-  fresh `requestCrawl`.
-
-## Federation and interop
-
-- Lemmy's local author auto-upvote is not federated, so a newly bridged post
-  can show one fewer upvote than Lemmy until a backfill re-seed.
-- Lemmy 0.19.x does not federate profile edits. A new `#nobridge` marker is
-  discovered only after `PROFILE_REFRESH_TTL` expires and another activity
-  triggers an actor fetch; an inactive actor's opt-out is not discovered.
-  Add a periodic consent re-scan of active bridged actors.
-- Existing Lemmy peers that federated before Tidepool served its instance
-  actor at `GET /` may need an actor re-fetch and Lemmy federation-worker
-  restart before account deletions are delivered.
-- Tombstoned self-delete confirmation accepts a 410 response or ActivityPub
-  Tombstone, not a plain 404. This is correct for the currently supported
-  Lemmy target but must be revisited for platforms that return 404 on actor
-  deletion.
-- Lemmy's AP `Image` attachment omits `mediaType`; only its `type` and the URL
-  extension identify it as an image. `Link` attachments omit alt text, so alt
-  text is lost if metadata fetching fails.
-- PieFed and Mbin are untested. `communityRef` currently uses Lemmy's `/c/`
-  URL heuristic; Mbin uses `/m/`.
-- Lemmy 1.0/API v4 is untested. The harness, seeder, and WebFinger assumptions
-  target pinned Lemmy 0.19.x/API v3.
-- The ActivityPub service actor uses type `Service` because Lemmy rejects
-  `Application` for Person actors. Revisit only if another supported platform
-  proves incompatible.
-- Production WebFinger is HTTPS-only by design. HTTP fallback exists only with
-  the dev/e2e SSRF relaxation.
-
-## Write side and product scope
-
-- Outbound Coves-to-Lemmy federation and ActivityPub actors for Coves users.
-- Key claiming/migration for bridged users. Handle-collision recovery should
-  eventually reuse an orphaned minted DID via a PLC `updateHandle` operation
-  rather than minting another DID.
-- Moderation federation and DMs.
-
-## Outbound delivery (task 15)
-
-- **Parks are attempt-neutral — the design that was chosen, and the two limits
-  it leaves open.** `ClaimNext` charges an attempt to every claim
-  (`internal/store/outbound_deliveries.go:143`), which is right for a delivery
-  that was TRIED and wrong for one that was HELD. The fix is a SIBLING of
-  `Release`, not a flag on it: `ReleaseParked` (`:276`) runs the same fenced
-  statement from the same template (`releaseStatement`, `:224`) with one slot
-  filled, `attempts = GREATEST(attempts - 1, 0)` (`:243-244`), and `park` /
-  `parkCausal` settle through it (`internal/outbound/worker.go:572`, `:592`).
-  The fence — `state = 'pending' AND claimed_until = $token` — is what makes the
-  give-back safe: only the holder of the claim that added an increment can
-  subtract one, so a park can never un-count an attempt another claim spent.
-
-  *The rejected candidate, recorded because it reads cheaper than it is.*
-  "Reset on unpark" — leave the increment, clear `attempts` when the delivery
-  next passes the switch gate — keeps `Release` single-purpose but cannot tell a
-  park's attempts from real failures that preceded the park, so it erases
-  genuine failure history instead of handing back a hold; the only signal
-  available to it is `last_error_class`, which would make an error-class string
-  load-bearing for a correctness decision; and it repairs late, so `attempts`
-  reads inflated on the admin surface for the whole duration of the park.
-
-  *Two residual limits, both pre-existing and neither closed by this.*
-  - **An abandoned claim still leaks its `+1` forever.** A lapsed lease, or a
-    crash between `ClaimNext` and any settle, leaves an increment with nobody
-    holding the fence to hand it back — so `attempts` counts claims CHARGED AND
-    NEVER HANDED BACK: deliveries genuinely tried, plus abandoned claims. Each
-    leak permanently costs the delivery one retry of real poison budget; the
-    lease bounds only how soon the row is re-claimable, not the loss. Rare and
-    bounded at **at most one lost retry per abandoned claim**, and shared with
-    the real-failure path, so it is not a park defect — but it is the reason a
-    poisoned row can read above `maxAttempts`. A park that the fence REFUSED now
-    logs at Warn (`park did not apply: claim lost or row terminal`,
-    `internal/outbound/worker.go`) and is not counted in
-    `tidepool_outbound_parked`, which is what makes such a leak diagnosable
-    rather than merely visible in the column.
-  - **A park writes `last_status_code = 0`,** clobbering a real status a PRIOR
-    failed attempt recorded. The divergence sweep reads that column as its
-    answered-or-silent discriminator (`COALESCE(d.last_status_code, 0) > 0`,
-    `internal/store/divergence.go:791`), where 0 means the peer never answered —
-    so a 502 overwritten by a later park leaves no trace of the peer having
-    spoken. Unchanged by this fix (a park has no status to write) and worth
-    revisiting only if the refused/unanswered split has to be trusted per-row.
-
-- **outbound_deliveries.ClaimNext lacks a standalone `seq` index.** The
-  loose-scan CTE builds the head set via the `(ordering_key, seq)` partial
-  index, but the outer `c.seq = ANY(ARRAY(...)) FOR UPDATE` re-check has no
-  index on `seq` alone (`seq` is BIGSERIAL, not the PK `(activity_id,
-  target_inbox)`). Unlike inbox_events (where `id` IS the PK), this is not a
-  point-fetch. A dedicated `UNIQUE INDEX (seq)` in its OWN migration (the next
-  free number — 023 as of this writing; amending an already-applied migration
-  is a silent no-op under goose) would
-  restore O(keys × log N); add it if the claim path profiles hot.
-- **OutboundDeliveries is a 12-method interface** (go-proverbs SHOULD). It
-  is one cohesive repository seam but the worker uses only the
-  claim/mark subset and the admin API only inspect/redrive/cancel. If it
-  grows, split into a `deliveryClaimer` (worker) + `deliveryAdmin`
-  (admin) at the consumer packages.
-- **DeliveredStateUndone is reserved but never written** — task 15 deletes
-  the outbound_votes row on Undo-delivery success rather than transitioning
-  to 'undone'. Kept in the enum + CHECK against a future keep-the-record
-  policy; nothing consumes it today.
-- **Image embeds don't federate outbound yet** — `social.coves.embed.images`
-  → `attachment [{Image,url}]` and external-embed thumbnails need a
-  blob→author-PDS-getBlob-URL seam not yet designed (decision 13: native
-  blobs live on the author's PDS, never Tidepool). Link embeds + text +
-  nsfw + name + content/source all federate; images are dropped with a
-  documented gap in apobject/translator.
-- **Enqueuer resolves the inbox (a network fetch on cache miss) inside the
-  consumer's rev-gate tx** — a slow/hanging community Group doc head-of-line
-  blocks the consumer's hot path (gate row locks held for fetch latency).
-  Rare (1h TTL), but consider pre-resolving before the gate tx or a short
-  distinct resolve timeout.
-
-## Postv2 flip (task 19)
-
-- **Legacy-set migration is deferred deliberately** (product decision
-  2026-08-11): pre-flip bridged posts stay on the deprecated
-  `social.coves.community.post` collection in community repos forever;
-  every era-sensitive path dispatches on the mapping's collection. A
-  future migration needs Coves' PRD §11 remap decision (comment/vote
-  refs point at the old URIs) plus an old→new ledger. Recorded
-  consequence: Coves' legacy-drain gate never fires while bridged
-  legacy posts exist.
-- **postv2 provenance costs one extra actor fetch per post
-  create/edit**: `originalAuthor.displayName` is read from the fetched,
-  authority-bound actor document on every materialization (deterministic
-  records; inline `attributedTo` is never trusted). The zero-extra-fetch
-  alternative is persisting the display name on `bridged_actors`,
-  refreshed with the profile — a migration plus plumbing. Revisit if
-  actor-fetch egress on post paths matters at scale.
-- **`SetBridgedStats`' NoOp result carries `mapping.CID`**, which can be
-  stale relative to the record the unchanged-counts read just observed.
-  Callers currently ignore it; worth aligning with the read's CID.
-- **No standalone acceptance-reconcile sweep**: every acceptance heal is
-  driven by an event on the post (redelivery, edit, stats sweep). A
-  quiet community's crash-window acceptance gap persists until any such
-  event. The decision-19 reconciliation job (task 18) is the natural
-  home for a periodic acceptance-vs-record pin audit.
-
-## Community bans (task 17c-3)
-
-- **The in-transaction ban re-check NARROWS the race, it does not close
-  it.** `accept()`'s side effect asks `StandingTx` on the acceptance
-  transaction before writing, so the common ordering is covered — but
-  under READ COMMITTED a ban committing between that read and the commit
-  is still possible. Closing it needs SERIALIZABLE or a keyed lock shared
-  with the ban path, which is a heavier change than the exposure
-  warrants; the code says so where it happens.
-- **A delivery claimed a moment before the ban commits can still be
-  POSTed.** Cancellation reaches the row, not the socket: the worker's
-  claim transaction has already committed, and the fencing correctly
-  discards its settlement afterwards. So the row can read `cancelled`
-  for something the peer accepted — and the vote reseed subtracts
-  exactly the `delivered` state. A worker-side ban re-check immediately
-  before `SendActivityAs` would shrink the window to the send itself; it
-  was deliberately NOT added, because the escape it was meant to close
-  (new comments and votes) is now closed at the source, and it would be
-  defence-in-depth with no test behind it plus a new index. 17e's
-  reconciliation is the natural place to detect the divergence.
-- **A temporary ban that lapses leaves state divergent.** Posts accepted
-  before the ban keep their acceptance records in the community repo,
-  but their deliveries were cancelled, and `cancelled` is terminal
-  (`RedrivePoisoned` revives only poisoned rows). So the community
-  renders content on Coves that Lemmy will never receive, and nothing
-  re-queues it when the exclusion ends. Exactly the atproto-vs-outbound
-  divergence 17e is meant to report.
-- **No e2e Block coverage.** The wire keys are hand-written in unit
-  fixtures, so nothing exercises a real Lemmy's spelling. Both `expires`
-  and AS2 `endTime` are read, but a third spelling — or a shape
-  difference in `target` — would be invisible until production. Task 18's
-  moderation scenario is the place for a captured Block.
-- **A ban is recorded only in a private table.** A
-  `social.coves.moderation.ban` lexicon exists, and every other
-  moderation decision here is published into the community repo
-  (acceptance, removal) where Coves' surfaces read it. As landed, a
-  banned native author sees their posts rejected and the community's own
-  moderation surface shows no ban. Deliberate scope cut for Scope A;
-  recorded so it is a decision rather than an omission.
-
-## Moderation state (task 17c-2)
-
-- **Bridge-side comment removal is WRITE-ONLY.** Nothing reads
-  `object_moderation.removed_at`, so a moderator-removed native comment
-  still federates the author's later edits and still accepts native
-  replies beneath it. That is the deliberate consequence of the unlanded
-  comment-subject removal lexicon (the state is recorded so it can be
-  honored the moment there is somewhere to publish it), but it is the
-  same asymmetry the lock's own doc warns about: holding state is worth
-  nothing unless something reads it. Closing it means gating child
-  enqueues and edit federation on the parent's removal state, the way
-  the lock already gates them.
-- **The re-materialization test pins a COMPOSITE invariant.** Biting
-  `storedThreadRoot` to `""` leaves it green, because `carryForward`
-  restores the comment's original reply refs so the record still names
-  the right thread and the mapping follows. `storedThreadRoot` is
-  therefore single-covered, not double-covered — isolating it needs a
-  stored record with no reply refs at all, which is repo-record surgery.
-  Recorded so nobody reads that green as proof of the belt when it is
-  proof of the brace.
-
-## Thread locks (task 17c-2)
-
-- **Comments materialized before migration 026 carry no
-  `thread_root_at_uri`**, so they resolve to themselves and a lock on the
-  post above them will not refuse native replies hanging under them. It
-  degrades to the pre-lock behaviour rather than to the community-wide
-  park, and it heals the moment each comment is next materialized — an
-  admin backfill of the affected communities is the deliberate fix. A
-  record-read fallback (reading `reply.root` back through `RecordGetter`
-  when the column is empty) would close it for the existing corpus, but
-  the consumer holds no repo manager and wiring one to read a fact the
-  materializer already computes is the wrong trade on the hot path.
-- **The lock read is per-object, keyed by at-uri.** A lock recorded on a
-  Lemmy post reaches native replies anywhere in that thread; it does NOT
-  reach replies whose chain the bridge never materialized. That is the
-  boundary of what the bridge can know, not a policy choice.
-- **`walkThreadRoot`'s dead-end branch remains reachable for native
-  content** whose outbound state predates the root column (legacy rows
-  only, and self-healing on the next successful edit). When it fires and
-  the community holds a standing lock, the event is refused retryably and
-  the error names the at-uri the chain stopped at. If dead ends ever
-  become common, that branch parks traffic — the two fediverse controls in
-  `moderation_lock_test.go` go red the moment it becomes reachable from
-  fediverse resolution, which is what keeps it honest.
-
-## Vote accounting (task 17b)
-
-- **The re-seed baseline clamp is a FLOOR BREACH, not a discard
-  detector.** `GREATEST(0, …)` fires only where the deficit exceeds a
-  subject's entire fediverse tally, so on any post with a real score a
-  Lemmy `FederationMode` silently discarding our written-back votes
-  understates the served total with the raw baseline still positive and
-  the counter at zero. `tidepool_vote_seed_ours_subtracted` is the
-  signal that advances on healthy subjects; comparing it against a
-  Lemmy-side sample is the actual audit.
-- **Nothing re-seeds periodically.** `SeedPostCounts` has one caller,
-  behind `SEED_COUNTS_FROM_API`, skipped inside a 1h window unless an
-  admin forces a backfill. Any claim that drift "heals on the next
-  re-seed" may mean never for a quiet community.
-- **Migration 023's cleanup DELETE is narrower than the runtime guard
-  it backfills.** It matches `voter_ap_id` by exact string equality
-  while `echo.identifyActor` matches normalized host + scheme, so a
-  legacy row carrying a non-canonical spelling of one of our actor ids
-  would survive and then be counted in BOTH subtrahends — the one
-  reachable way they double-subtract the same human. Accepted because
-  the set is empty in production (write-back never shipped) and no code
-  path here ever wrote non-canonical ids; a normalizing DELETE would
-  mean re-implementing the probe in SQL.
-- **A `Down` of migration 023 leaves baselines understated
-  indefinitely.** Anything seeded while 023 was applied is net of our
-  delivered votes, the pre-023 code does not re-derive it, and with no
-  periodic re-seed only a forced backfill corrects it.
-
-## Echo suppression (task 17a)
-
-- **`ClassAncestorShortCircuit` counts ordinary threading, not a
-  suppression.** It fires on the branch where `ResolveStrongRef` already
-  anchored — no fetch was going to happen, identical control flow to a
-  fediverse parent — so it rides inbound-comment volume while the other
-  three classes are rare by construction, and it sits in the
-  `tidepool_echo_drops_*` family though nothing is dropped. Flagged by
-  three reviewers. Either rename it out of the drops family (an
-  ancestor-anchor gauge) or move the counter to a site where a fetch was
-  actually declined. It also costs a second point read of the row
-  `ResolveStrongRef` just read, on the hot comment path.
-- **Echo classification adds up to 4 indexed point reads per node to the
-  highest-volume inbound path.** The 17a plan ruling asked for a cheap
-  authority short-circuit before entity existence; the route-prefix test
-  substitutes for it and is vanity-origin-safe, but an envelope crafted
-  with `/ap/object/`-shaped ids on foreign hosts still forces reads at
-  every probe, `MaxDepth` nodes deep. The inbox is signature-gated and
-  rate-limited, so this is recorded rather than fixed.
-- **No end-to-end vanity-origin announce test.** `Identify` is unit-covered
-  in both directions (a positive case on the vanity origin, negatives for
-  a DID whose `NormalizedOrigin` differs), but no inbound announce is
-  driven for a vanity-origin persona through the full path.
-- **`identifyObject`/`identifyActor` corroborate nothing.** Only
-  `identifyActivity` binds the id to the activity we stored (verb + carried
-  object). Object and actor ids are public and derivable, so a followed
-  community can wear one to have content dropped as our echo. Bounded by
-  the followed-community gate, and the announcer could simply not announce
-  the content instead — but there is no per-entity payload to corroborate
-  against, so closing it needs a different mechanism.
-- **`materializeContent`'s legacy `origin=bridge` check is now a strict
-  subset of `suppressEcho`.** Bare content no longer reaches
-  `materializeContent` (bare Create/Update of content is dropped in
-  `handleBareCreateUpdate`), so the only path left is the Announce path,
-  where `suppressEcho` has already run and catches every id the legacy check
-  would plus ids it misses (outbound_objects-only ids, activity ids, our own
-  actor). The open question is only whether to delete it.
-- **`Drops()` is exported with no production caller** and the tests keep a
-  parallel class list; adding a fifth class would silently under-assert
-  every "only this class moved" test. Export the class list instead.
-- **`echo.normalizeHost` is a hand-copy of `personas.normalizeHost`.** The
-  classifier is deliberately the read-side mirror of the serving surface,
-  so divergence between the two copies is the named risk. Now covered by
-  its own tests on both sides, but not by a test asserting the two agree.
-
-## Production rollout
-
-RESOLVED — Bluesky's public-relay account cap (100 accounts, 50 ev/s) is no
-longer load-bearing: the self-hosted relay + Jetstream in
-`docker-compose.prod.yml` are the app's ingest path and carry only our two PDS
-hosts with an effectively unlimited account limit. `bsky.network` remains the
-wider-visibility path only. Runbook: `SELF_HOSTED_RELAY.md`.
-
-RESOLVED — **the `BRIDGE_KEK` rotation path is built.** A KEK can now be
-changed without orphaning the three sets of sealed material
-(`bridged_actors.signing_key`, `service_keys.key_material` row `plc-rotation`,
-`ap_actors.rsa_key_sealed`). Runbook: `DEPLOY.md` §6, "Runbook: rotating
-BRIDGE_KEK".
-
-- *Design chosen:* **dual-read by trial, plus an offline re-seal walk.**
-  `NewCustodianWithPrevious` opens under the current KEK then the previous one;
-  `identity.Reseal` (driven by `tidepool rotate-kek`) walks all three domains
-  and uses the same trial to classify every blob — opens under current (leave
-  the bytes alone), opens under previous (re-seal and write back under an
-  optimistic guard), opens under neither (report, never write). Re-run until it
-  reports zero re-seals and zero failures, then unset `BRIDGE_KEK_PREVIOUS`.
-- *Rejected candidate:* **a persisted key-version selector on each sealed
-  blob**, which this list previously called the first requirement. It buys
-  nothing here: GCM authentication already answers "which key sealed this?"
-  definitively (a wrong key fails the tag; ~2⁻¹²⁸), and unlike a column the
-  ciphertext cannot be *wrong* about it — a stored version can be left stale by
-  a half-finished rotation or a mismatched restore, and would then send the
-  reader to a key that does not open the bytes. Rejecting it also removed the
-  migration on `bridged_actors` and `service_keys` that the earlier plan
-  required. **`ap_actors.rsa_key_version` was never that selector**, though it
-  reads like one: it versions the *actor's RSA key* — an independent, still
-  unbuilt rotation — not the KEK the key is wrapped in.
-- *Residual limits, still open:* **per-actor RSA key rotation itself is
-  unbuilt** (republishing `publicKey` and getting peers to re-fetch, with no
-  two-key grace overlap in the code; `rsa_key_version` is stamped and never
-  read), and **the bridge's own service-actor RSA key is still plaintext PEM**
-  in `service_keys`, outside the KEK entirely — the walk deliberately refuses
-  to touch that row, so rotating it remains a separate unbuilt procedure.
-
-RESOLVED — **backup and restore is built.** `scripts/pg-backup.sh` (host cron,
-custom-format dump into the existing `./backups` mount, archive verified with
-`pg_restore --list` before rename, `chmod 600` on the dump, retention) plus
-`scripts/pg-restore-drill.sh` (restore into a throwaway `--network none`
-container, then gates: goose version derived from `internal/db/migrations/`,
-the irreplaceable-table inventory including the `outbound_*`/`admissions` set,
-the **existence** of exactly one non-empty `plc-rotation` row whenever
-`bridged_actors` is populated, and zero-length sealed blobs in
-`bridged_actors.signing_key` / `ap_actors.rsa_key_sealed`; nonzero on any gap).
-Both were run end-to-end before landing and again after each review wave — the
-drill's first run caught its own wrong table name, and the zero-length check
-caught a real zero-length `signing_key` row in the local test corpus on its
-first run, which is the drill working twice. `BRIDGE_KEK`/`.env` remain outside
-any database backup by nature; the backup script warns whenever `.env` is newer
-than its recorded offsite copy (`backups/.env-backed-up` marker), deliberately
-on ANY `.env` change rather than only a KEK change. Residual limits: dumps stay
-on the host they protect (no offsite replication yet), no WAL/PITR at this
-scale, RPO 24h on the default schedule, and nothing runs the drill
-automatically. Runbook: `DEPLOY.md` § "Backup and restore".
-
-DOCUMENTED, not resolved — the v2 deploy gaps below now have a written home in
-`DEPLOY.md` (§6 "Not implemented") with their blast radius. Writing them down
-is not building them; they stay open here:
-
-- **No divergence off switch.** The sweep is wired unconditionally, sweeps once
-  at startup, and `DIVERGENCE_INTERVAL=0` is refused by `durationVar`. The only
-  lever is a large interval. Defensible while the sweep stays read-only; revisit
-  if it is ever implicated in lock pressure.
-- **No outbound announcement rate limiter.** Decision 19 asks for "deliberate
-  throttling of initial actor announcements"; `internal/outbound` has no rate
-  limiter, and `MINT_RATE_PER_MINUTE`/`MINT_BURST` gate the **inbound** mint
-  path only (`ingest.NewMintGate`, materializer-only consumer). Today the
-  throttle is the canary itself: `OUTBOUND_WORKERS=1` plus a one-community
-  scope.
-- **Kill switches and every other knob are boot-time only.** Config is read once
-  at `cmd/tidepool/main.go:109` with no reload signal, so engaging a kill switch
-  during an incident requires a container recreate. A SIGHUP reload (or an
-  admin-write switch table) would cut that latency.
-- **Scoped kill switches are denylist-only.** There is no allowlist form, so a
-  one-community canary must enumerate every *other* subscribed community — and
-  adding a community to `communities.yaml` silently escapes an existing canary.
-
-Found while planning the KEK re-seal drill (NOT a defect of that work):
-
-- **A MISSING `plc-rotation` row on a populated database boots clean and
-  silently orphans every bridged DID.** `LoadOrCreateRotationKey` is
-  create-on-absence by design — that is what makes first boot and the
-  bootstrap race safe — but it cannot tell "first boot" from "the row is gone".
-  Restore a backup taken before the row existed, restore `bridged_actors`
-  without `service_keys`, or point `DATABASE_URL` at the wrong database, and
-  the bridge mints a **fresh** escrow key, seals it, stores it, and comes up
-  green. Nothing is logged as unusual. Every already-minted did:plc document
-  still names the OLD rotation key, so the bridge now holds an authority over
-  nothing while the only key that could recover ~950 DIDs is the one that just
-  went missing — and the clean boot is exactly what stops anyone from looking.
-  The KEK drill sharpened this: `rotate-kek` reports `service_keys` counts, so
-  an operator can see the row is there, but only if they run it.
-  *Candidate guard:* refuse to create when `bridged_actors` is non-empty — a
-  populated bridge with no rotation key is never a legitimate first boot — and
-  fail startup with a message that says which restore went wrong.
-
-Left open by the KEK / backup review waves (small, none of them urgent):
-
-- **Two near-duplicate keyset pagination loops in `internal/identity/reseal.go`**
-  — the `bridged_actors` walk and the `ap_actors` walk differ only in table,
-  key column and the AAD the blob is opened under. Not deduped when written,
-  because the shared shape was not yet proven by a second caller and a
-  premature walker abstraction would have been harder to review than the copy.
-  It is proven now: dedupe them into one parameterised walker **the next time
-  either is touched**, rather than as a standalone refactor of code that is
-  working and covered.
-- **`rotate-kek` needs a `Quiescent()` (or a distinct exit code) BEFORE anyone
-  automates the runbook.** Today the runbook is manual and the operator reads
-  the per-table counts, which is why exit codes alone are sufficient in
-  practice. The moment a script drives it, that stops being true: run one exits
-  **0** having re-sealed 948 rows, and a script keying on the exit code alone
-  would read that as clearance to unset `BRIDGE_KEK_PREVIOUS` — retiring the
-  old key while the second run has not yet proven nothing was written under it.
-  The fix is to make "zero run" machine-readable rather than an inference:
-  either a `Quiescent()` predicate on the report (`resealed == 0 && failed == 0`
-  across all tables) or a distinct exit code for "moved things, not yet
-  quiescent". `DEPLOY.md` §6 states the contract in prose in the meantime.
-- **No CI smoke harness for `scripts/pg-backup.sh` and
-  `scripts/pg-restore-drill.sh`.** Both are verified by hand against the local
-  test postgres each time they change, which leaves a drift window as wide as
-  the quarterly drill cadence: a migration that renames or drops a table the
-  drill checks by name turns the drill into a permanent red (or, worse, its
-  table-missing branch into noise) and nobody learns until the next manual run.
-  A CI job that dumps the migrated test database, runs both scripts, and asserts
-  PASS — plus one induced failure — closes it, and is the natural home for the
-  induced-failure cases the manual verification does today.
-- **`DEPLOY.md`'s `file.go:NNN` references drift, and the KEK stack proved it**
-  — inserting ~100 lines into `cmd/tidepool/main.go` falsified every later
-  `main.go` line number in the file at once. The KEK section's own references
-  were converted to symbol names; the rest were deliberately NOT re-indexed,
-  because re-indexing buys one correct snapshot and no durability. **Symbol
-  names are the fix** (`personas.New in run()`, `durationVar`, a constant's
-  name) — apply them section by section as those sections are next edited.
-
-Still open, unchanged:
-
-- `ENVIRONMENT=production` has not been exercised end-to-end. The harness uses
-  development mode for migrations-on-start, HTTP/private fetching, and strict
-  lexicon validation.
-- Production lexicon validation currently records a metric and writes the
-  record instead of failing it. A strict-first rollout should happen only
-  after `tidepool_lexicon_validation_failures` remains zero in production.
-
-## Sync surface
-
-- `SigningKeys` could become a `SignCommit` capability so private key material
-  stays inside the identity package and a future KMS implementation is easier.
-- `getRepo` ignores the optional `since` optimization and returns a full
-  reachable-set CAR, which the spec permits. A real diff export would require
-  retaining historical blocks and revisiting the blocks-GC invariant.
-
-## Ingestion and rate limiting
-
-- All in-process IP limiters use `RemoteAddr` and ignore
-  `X-Forwarded-For`. A deployment behind a proxy/load balancer must rate-limit
-  at the edge or all clients share the proxy's bucket. A future opt-in
-  `TRUSTED_PROXY` setting should trust forwarded addresses only from an
-  allowlisted hop.
-- A shutdown-interrupted queue attempt still consumes its `ClaimNext` attempt
-  increment (cosmetic).
-- The mint gate is covered only by unit tests; the e2e harness has no
-  low-`MINT_RATE_PER_MINUTE` compose variant.
-- The `activityID` random-source failure path is untestable without injecting
-  the reader (Go 1.24+ treats `crypto/rand` failure as fatal).
-
-## Votes
-
-- `ScrubVoter` takes aggregate locks in deterministic subject order, but this
-  deadlock-avoidance property has no true concurrency test.
-- Vote subject resolution occurs outside the mutation transaction, leaving a
-  narrow race with deletion.
-- Baseline-only voters can drift: a later flip or clear lacks a per-voter
-  baseline row to retract. A re-seed heals the aggregate — but nothing
-  re-seeds on a schedule (see "Nothing re-seeds periodically" above), so for a
-  quiet community that is never backfilled again the drift is permanent and
-  unreported. "Temporarily" was the wrong word.
-
-## Materializer and storage
-
-- A stale actor document behind a temporarily forbidden/unavailable instance
-  can drop content instead of serving the last known actor state. Media blobs
-  already carry forward on transient fetch failure; actor documents do not.
-- Blobs are content-addressed per DID without refcounts. Two records in one
-  repo can share a blob row, so scrubbing one record can remove media still
-  referenced by another. Add a refcount/junction table if this occurs in
-  practice.
-- A consent change racing an in-flight commit can allow that one commit to
-  land because consent is read outside the commit transaction.
-
-## E2E harness and CI
-
-- The PLC directory image is pinned by commit in `e2e/plc/Dockerfile`; bump it
-  deliberately when upstream fixes are needed.
-- **The stack now carries a reference PDS** (`ghcr.io/bluesky-social/pds`,
-  digest-pinned to the same build Coves' CI pins; host port 127.0.0.1:3081,
-  published on the `relay` service because the PDS shares its network
-  namespace). One smoke scenario uses it —
-  `tests/e2e/native_pds_test.go` writes a `community.postv2` into the native
-  account's own repo and follows it through relay → Jetstream — which buys
-  the wire, not the record: a repo host we did not write, crossing the same
-  infrastructure, so a misreading of the spec shared by our commit writer and
-  our commit reader can no longer stay invisible. The task-18 scenarios
-  (native posts, acceptance records, votes both ways, Lemmy-side visibility)
-  are still open; this is deliverable 1 only.
-- **TRIPWIRE — the collection whitelist is repo-class-blind, and it cuts both
-  ways.** `vetEvent` (`tests/e2e/helpers.go`) checks every event on the
-  firehose against a single `expectedCollections` allowlist with no notion of
-  which repo the record came from. It therefore fails CLOSED on a collection
-  outside the list — a scenario writing, say, a vote record into the native
-  repo fails its own test and, deterministically, the `zz_sweep` replay that
-  re-vets every retained event — and fails OPEN on one inside it: a
-  `social.coves.actor.profile` written into the native repo is
-  indistinguishable, to the whitelist, from the bridge writing that same
-  collection into a repo it owns. `community.postv2` being allowlisted is the
-  only reason the native repo passes today; the fails-open half is the real
-  argument for rescoping by repo CLASS (bridge-hosted author DIDs /
-  bridge-hosted community DIDs / native-PDS DIDs, each with its own allowlist
-  and independent rev tracking) — task 18's sweep item, deliberately left out
-  of the reference-PDS landing. Related: the e2e stack leaves
-  `CONSUMER_ENABLED` at its default of false, so the acceptance engine never
-  reacts to native records — a scenario that needs an acceptance record must
-  turn the consumer on and point `JETSTREAM_URL` at the compose Jetstream
-  first.
-- The relay does not survive being recreated on its own: its disk persister
-  records log-file refs in `relay-postgres` (which persists) while the files
-  live in the container's writable layer (which does not), so bigsky exits at
-  boot with `open /data/persister/evts-0: no such file or directory`. Any
-  edit to the `relay` service in `docker-compose.e2e.yml` triggers exactly
-  that on the next `up`; `make e2e-down` and start clean. A named volume for
-  the relay's `/data` would remove the trap, at the cost of one more thing
-  `down -v` has to take away in lockstep with the databases.
-- Jetstream exits when its upstream disconnects; compose's
-  `restart: unless-stopped` supplies recovery. Remove the workaround if
-  Jetstream gains reconnect support.
-- The suite-end replay sweep is bounded by Jetstream's 24-hour event TTL.
-  Recreate the stack/volume per run, as `make e2e` does, or old events cannot
-  be revalidated.
-- The e2e suite has not yet completed on GitHub Actions. It cold-builds Lemmy
-  from source and may exceed practical runner time/disk limits. Prefer a
-  prebuilt pinned Lemmy debug image in GHCR, or persist a buildx GHA cache.
-- The declarative follow list (FOLLOW_LIST_PATH) has no e2e coverage: an
-  end-to-end convergence test would mount a follow-list YAML into the
-  tidepool compose service, restart it, and poll GET /admin/communities
-  until the listed community turns `accepted`, then remove the entry and
-  assert an Undo lands at Lemmy. The reconciler is unit-tested against the
-  ingest harness (real Postgres + fake Lemmy inbox) and was smoke-tested
-  live (startup fail-fast, sweep, POST /admin/communities/reconcile);
-  compose plumbing for the file mount is the missing piece.
-- Cold-start visibility gap (observed at the 2026-07-13 production launch):
-  records committed before a relay's first subscription never re-emit as
-  live commit frames, so a Jetstream-fed AppView misses them — the initial
-  community backfill ran ~25 minutes before bsky.network accepted the
-  crawl, and none of those posts indexed in Coves despite the relay
-  serving the repos (crawl imports state, not per-op events). Live records
-  heal organically (any bridgedStats vote sweep or upstream edit re-emits
-  the record as an update commit, which the AppView upserts), but quiet
-  posts stay invisible. RESOLVED: `POST /admin/reemit` walks a repo (or
-  all repos) and re-emits every record as a delete+create commit pair —
-  honest diffs, unchanged at-uris/CIDs (a same-value "touch" update was
-  rejected as the design: its op list would not match the empty MST diff,
-  which sync-v1.1-validating relays may refuse). Remaining follow-up: the
-  e2e harness has no scenario covering it.
-
-## Opt-out lifecycle (17d)
-
-- **The withdrawal's 410 is observable before the withdrawal is delivered.**
-  The destructive tier commits the actor tombstone together with the
-  `Delete{Person}` enqueues, but the worker POSTs minutes later. A peer that
-  re-dereferences the actor to verify the signature on that Delete therefore
-  gets `410 Gone` — for the message announcing the very deletion it is trying
-  to authenticate. The tier can revoke its own precondition.
-
-  MITIGATED, not closed: both actor routes (and `handleOutbox`, which would
-  otherwise invite the re-fetch loop the 410 exists to end) now answer 410
-  with an AS2 `Tombstone` carrying `formerType: Person`, `deleted`, and **the
-  public key** — so a peer that reads the body can still verify.
-
-  RULED against the "complete" fix of keeping the actor document served until
-  every person-delete delivery is terminal. That keeps an erased user's
-  document published for as long as any peer is down — potentially forever —
-  which is a worse failure for an erasure tier than the one it fixes. The
-  Tombstone hands over verification material and none of the profile, which is
-  the better trade, and it is why the committed test pinning "410 immediately,
-  with no worker run" was deliberately left standing.
-
-  RESIDUAL, and it is genuinely not ours to close: a peer that branches on the
-  status code alone, without reading the body, still cannot verify the
-  withdrawal. Revisit only if a real implementation (Lemmy specifically) is
-  observed dropping our person-deletes for this reason — the fix would then be
-  peer-shaped (retry after the delete, cached-key acceptance), not a change to
-  when we serve the tombstone.
-
-- **A delivery claimed and mid-POST at purge time is indistinguishable from
-  one that will never be sent.** The purge enumerates what the peer holds
-  (delivered, plus held-for-settlement), but a delivery the worker has claimed
-  and is POSTing right now is neither. Detecting it needs the peer's state,
-  not ours. Belongs to 17e (reconciliation).
-
-## Deferred by 17e (reconciliation scoped to detect-only)
-
-17e reports divergence and never repairs it (decision 19). These are the repairs
-and the comparisons it deliberately did not build. Leg 1 has since been built
-and is kept here, marked CLOSED, for the design record rather than as work
-outstanding.
-
-- **CLOSED — the re-cast race, leg 1: the upsert no longer clobbers a delivered
-  vote.** The write path hardcoded `pending`
-  (`internal/consume/votes.go`) over an `ON CONFLICT` that took
-  `delivered_state = EXCLUDED.delivered_state`, so re-casting a DELIVERED vote
-  reset the row to pending while Lemmy still held the OLD vote in the OLD
-  direction — the vote was then invisible to the reseed (which subtracts only
-  `delivered`) and to the erasure purge (which enumerates only standing votes),
-  permanently if the new delivery poisoned. The chosen design is the model 17d
-  already set: a guard in the STATEMENT rather than in Go, as a `CASE` inside
-  the `ON CONFLICT` `SET` (`internal/store/outbound_votes.go`), defending
-  exactly one transition — `pending` may not overwrite a stored `delivered`.
-  Every other column still updates, `activity_seq` still bumps, `RETURNING`
-  reflects the kept state, and the purge's `undone` and `applyVoteDelete`'s
-  re-stated `delivered` still write straight through (the settlement callback
-  writes via `SetDeliveredState` and never touches the guard). It is SQL and
-  not Go because the
-  consumer's state read is non-transactional and would race the delivery
-  worker's settlement; the `CASE` evaluates under the row lock `ON CONFLICT`
-  already holds.
-
-  *The rejected candidate, recorded so it is not re-proposed.* Freezing
-  `direction` alongside `delivered_state` — keeping every fact about the
-  delivered vote together — is wrong in the same way the "what the peer holds"
-  vs "what the user wants" column pair below is wrong, and for a sharper
-  reason: `consume.applyVoteWrite` builds the OUTGOING intent from the row the
-  upsert RETURNS, so a frozen direction would federate the flip in the
-  direction the user just abandoned, leaving the peer counting the vote they
-  changed away from. The row states the newest intent and the older delivery
-  together, deliberately.
-
-  *Two residual limits, both accepted.*
-  - **Direction incoherence inside the re-cast window.** `delivered_state` now
-    survives the flip while `direction` is already the new one, so a reseed
-    landing in the window subtracts the wrong side: the direction the peer
-    holds stays in the baseline, the direction it does not hold is subtracted
-    from a total that never contained it. One directional error was traded for
-    a different one — but the new one is SIGNALLED, where the old one was
-    silent — but signalled ONLY when the mis-subtraction breaches the zero
-    floor: `SeedOursSubtracted` counts the row (and every healthy vote), and
-    the negative baseline trips `SeedBaselineClamped` and the sampled clamp
-    `Warn`; unrelated votes in the same direction can absorb the error with no
-    distinguishing signal, and the two errors can cancel in the served number.
-    Heals when the flip delivers or the vote is undone — and if the flip's
-    delivery POISONS, neither ever comes: the misread then recurs on every
-    re-seed until an undo, with the standing divergence reported by
-    `RecastDivergence`. The clamping arithmetic is pinned by
-    `TestReseedDuringARecastWindowMisreadsBothDirections`
-    (`internal/votes/reseed_recast_cost_test.go`).
-  - **Delete then re-cast the same rkey before the Undo settles.** The late Undo
-    callback resolves the OLD activity id, misses (`GetByActivityID` → NotFound
-    → no-op), and the row keeps `delivered` for a vote the peer no longer holds
-    until the next flip delivery or undo. Narrow and known, and chosen over the
-    pre-fix behaviour where that same sequence left the vote invisible to both
-    the purge and the reseed rather than merely stale to one of them. This is
-    leg 2's mechanism, below, reached from the opposite direction.
-
-- **Found by the guard's multi-model review — three PRE-EXISTING gaps, none
-  introduced or widened by the fix, all verified unchanged against the
-  pre-guard code:**
-  - *Subject mutation on a live vote is unaccounted.* An update commit
-    re-pointing the same vote rkey at a DIFFERENT subject overwrites
-    `subject_at_uri` in place; the peer keeps the old subject's vote while the
-    row describes the new one (pre-guard it went `pending` and the vote was
-    simply invisible). Coves never re-points vote records, and the 17e report
-    still names the stranded activity (its exclusion joins on subject + id).
-    Candidate fix: refuse a subject change for an existing live vote in
-    `applyVoteWrite`, with a same-rkey-different-subject regression test.
-  - *An ordinary delete after a poisoned re-cast sends an Undo naming the
-    never-delivered activity* (`applyVoteDelete` embeds
-    `stored.CurrentActivityID` — the NEW id). Identical pre-guard; it rides
-    the same unverified assumption the purge path documents (Lemmy matching
-    the inner object on `(actor, object)`), without the documentation. Covered
-    by the same verification below.
-  - *A purge racing a stale queued vote event can resurrect `undone`.* A vote
-    commit that passes `mayFederate` before a concurrent purge commits can
-    upsert `pending` over `undone` and enqueue outward work past the purge's
-    cancellation snapshot — the terminality invariant rests on an upstream
-    gate outside the state writer (same class as 17c-3's recorded ban race).
-    Unreachable in practice at current scale; before scale, the candidate fix
-    is making `undone` terminal in the upsert too (a purged actor never
-    legitimately votes again), as its own test-first subtask — it reverses a
-    recorded matrix decision, so it needs its own RED tests, not a quiet edit.
-  - *Shared verification for the first two:* an outbound-vote e2e against a
-    real Lemmy asserting an Undo whose inner id/direction mismatch the held
-    vote still retracts it — the `(actor, object)` assumption is now
-    load-bearing for the purge path. The production canary doubles as this
-    check at current scale.
-
-- **The re-cast race, leg 2 — the settlement silently forgets the old vote.
-  Recorded nowhere before now.** `internal/outbound/worker.go` `voteCallback`
-  resolves via `GetByActivityID(activity.ActivityID)` and returns `nil` on
-  NotFound. After a re-cast the OLD Like's activity id no longer matches
-  `current_activity_id`, so when that in-flight old delivery lands the callback
-  no-ops and the delivery is marked delivered. The peer then demonstrably holds
-  a vote that NO `outbound_votes` column records at all. This is why 17e reads
-  divergence out of the delivery ledger (`outbound_activities` joined to
-  `outbound_deliveries`) rather than out of the vote row: the vote row is
-  exactly what the bug erases.
-
-- **REJECTED, with reasons, so it is not re-proposed: the "what the peer holds"
-  vs "what the user wants" column pair.** It changes the write path that feeds
-  a number users read — 17b's binding ruling pins `delivered_state = 'delivered'`
-  as a positive equality in `SeedAggregates`, and 17d made that correct only
-  because `undone` is terminal; a second pair forces the seeder, the purge's
-  `ListStandingForActor`, `voteCallback` and `CancelOutwardForActorTx` to each
-  re-decide which column they meant. It also relocates the uncertainty rather
-  than removing it: the pair's only honest maintainer is the delivery callback,
-  which is where leg 2 already lives — two things that can be wrong instead of
-  one, and then reconciliation has to reconcile *them*. Detection needs none of
-  it; `outbound_activities` is append-only and already durable.
-
-- **Instances that learned of an actor via search/WebFinger are unreachable by
-  any local comparison.** `DistinctInboxesForActor` is, in its own words, the
-  only record of which instances hold a user's content. Building the other side
-  would mean logging the requesting host of every WebFinger and actor-document
-  GET — a new surveillance log built to serve a deletion, which is the wrong
-  trade for an erasure feature. 17e's report states its own coverage bound
-  instead: the fan-out set is the delivery history. A reconciler reporting zero
-  here would be asserting completeness it cannot have.
-
-- **A delivery cancelled while mid-POST cannot be distinguished locally, and
-  the evidence is erased on purpose.** Every cancel statement writes
-  `claimed_until = NULL`, so after the cancel commits a row cancelled mid-flight
-  is byte-identical to one cancelled while idle. Recovering it needs a new
-  column plus edits to the five most safety-critical cancel statements in the
-  outbound package — to record a fact that still would not say whether the POST
-  landed. If ever wanted, the cheap version is `RETURNING` a count of rows with
-  `claimed_until > now()` at each cancel site, bumping a counter where the
-  decision is actually taken rather than reconstructing it later.
-
-- **A ban-caused cancellation is indistinguishable from a consent cancellation**
-  in `outbound_deliveries` — `cancelForActor`, the community cancel, the ban's
-  intersection cancel and the consent cancel all write the same `cancelled`
-  with no reason column. 17e reports the count rather than inventing the column.
-  `community_bans` is joinable on `(community_did, subject_did)` with
-  `expires_at IS NULL OR expires_at > now()`, so the reason is expressible
-  read-side today if an operator needs it.
-
-- **`bindFetch` own-id belt (noted in 17a, still unimplemented).** A typed
-  "refusing to fetch our own id" error in `internal/ingest/handler.go` would
-  cover the ancestor walk, bare-IRI announce, `resolveDelivered`, and
-  `handleUndoDelete`'s restore in ONE place. Explicitly NOT 17e's: it changes
-  what the inbound path processes, and a sub-run whose constraint is "report,
-  never act" should not ship a new drop site — on the highest-volume inbound
-  path, which already carries a recorded perf concern.
-
-- **TWO legs of the divergence sweep scan `outbound_activities` in full, not
-  one.** This entry previously said the re-cast driver was the only unindexed
-  leg and that "every other leg is index-served". THAT WAS WRONG, and wrong in
-  the direction that stops the next person looking: the undelivered-acceptance
-  leg joins `outbound_activities` on a JSONB EXPRESSION, and no index in
-  `internal/db/migrations/` can serve it. `outbound_activities` carries exactly
-  two indexes — `outbound_activities_pkey (activity_id)` and
-  `idx_outbound_activities_actor (actor_did)` — and neither is on
-  `payload -> 'object' ->> 'id'`.
-
-  Re-confirmed by `EXPLAIN` against the migrated test schema. The
-  acceptance leg:
-
-      ->  Hash Right Join
-            Hash Cond: (((a.payload -> 'object'::text) ->> 'id'::text) = o.ap_object_id)
-            ->  Seq Scan on outbound_activities a
-            ->  Hash
-                  ->  Seq Scan on outbound_objects o
-                        Filter: (accepted_at IS NULL)
-
-  and the proof that it is unindexed rather than merely cheap here: with
-  `SET enable_seqscan = off` — which prices a sequential scan at 1e10 — the
-  planner STILL chooses `Seq Scan on outbound_activities a` for that condition,
-  because there is nothing else it could use.
-
-  The re-cast leg's original finding stands: its three exclusion subqueries are
-  index-served (the Undo and superseding-vote subqueries ride
-  `idx_outbound_activities_actor`, the delivered-delivery joins ride
-  `idx_outbound_deliveries_activity`, the ledger exclusion rides
-  `outbound_votes_actor_delivered_idx`), while the outer driver is a full scan
-  filtered on `kind IN ('Like','Dislike') AND parent_at_uri <> ''`.
-
-  COST NOTE, so the next profile is not a surprise: bounding the sweep put an
-  exact `COUNT(*)` beside each limited read, so the acceptance leg's full scan
-  of `outbound_activities` now happens TWICE per sweep rather than once. That is
-  the price of a count an operator can size an incident from; it is also the
-  strongest argument for the expression index below, since indexing that join
-  fixes both statements at once.
-
-  Deliberately NOT fixed here — an index is a migration whose write cost lands
-  on the delivery worker's hot path, and the sweep runs every 15 minutes against
-  tables that are currently small. The two candidates, when it is needed:
-
-      -- serves the re-cast driver, and tightens the Undo subquery
       CREATE INDEX outbound_activities_vote_subject_idx
           ON outbound_activities (actor_did, parent_at_uri, created_at)
           WHERE kind IN ('Like','Dislike');
 
-      -- serves the undelivered-acceptance join, which has nothing today
       CREATE INDEX outbound_activities_object_id_idx
           ON outbound_activities ((payload -> 'object' ->> 'id'))
           WHERE payload -> 'object' ->> 'id' IS NOT NULL;
 
-  The first also tightens the Undo subquery, which today index-scans by
-  `actor_did` and applies kind/parent_at_uri/created_at as residuals; a sibling
-  partial index on `kind = 'Undo'` finishes that half. The second is an
-  EXPRESSION index and must be spelled with exactly the operators the query uses
-  (`->` then `->>`) or the planner will not match it — and it is the one whose
-  write cost is least predictable, because every outbound activity has a payload
-  and the extraction runs on every insert.
+  The expression index must use exactly `->` then `->>` or the planner will not
+  use it. Profile against production volumes first; test-database row counts
+  mean nothing.
+- An acceptance with no delivery row at all is not reported. It should be
+  unreachable because all four writes share one transaction. If it is ever
+  seen, give it its own class.
+- A delivery cancelled mid-POST looks the same as one cancelled while idle,
+  because every cancel clears `claimed_until`. If needed, return a count of rows
+  with `claimed_until > now()` from each cancel statement and bump a counter.
+- There is no periodic sweep that checks acceptance records against the posts
+  they pin. Acceptance gaps from a crash heal only when another event touches
+  the post, which in a quiet community may not happen.
 
-  ROW ESTIMATES FROM A NEAR-EMPTY TEST DATABASE ARE MEANINGLESS. Every cost and
-  row number in the plans above is noise; the plan SHAPE — a full scan of
-  `outbound_activities` per sweep leg, per statement — is the entire finding.
-  Re-profile against production volumes before choosing either index.
+## Keys and identity
 
-- **An acceptance with NO delivery row at all is not reported by the
-  acceptance-undelivered classes**, and this is stated in the query rather than
-  swallowed. All three classes are delivery states, and a row with no delivery
-  has none; folding it into the nearest class would misdescribe it. It should
-  not be reachable going forward — the acceptance record, the
-  `outbound_objects` row, the delivery enqueue and the `admissions` ledger row
-  all land in ONE transaction — so a test asserting it today would be vacuous.
-  If it is ever observed, it wants its own class, not a widened existing one.
+- A missing `plc-rotation` row on a populated database boots cleanly and mints
+  a new escrow key. Every existing did:plc document still names the old key, so
+  the bridge can no longer rotate any of them. This happens if a backup without
+  the row is restored, or `bridged_actors` is restored without `service_keys`,
+  or `DATABASE_URL` points at the wrong database. The KEK canary
+  (`VerifyKEKAgainstSealedMaterial`) checks only that the KEK opens existing
+  blobs. Fix: in `LoadOrCreateRotationKey`, refuse to create the row when
+  `bridged_actors` is non-empty, and name the likely bad restore in the error.
+- Per-actor RSA key rotation is not built. `ap_actors.rsa_key_version` is
+  written and never read, and there is no two-key overlap for peers to
+  re-fetch.
+- The service actor's RSA key is stored as plaintext PEM in `service_keys`,
+  outside the KEK. `rotate-kek` deliberately skips it, and there is no procedure
+  to rotate it.
+- `rotate-kek` reports success with exit code 0 even when it re-sealed rows.
+  The runbook requires a second run that re-seals nothing before unsetting
+  `BRIDGE_KEK_PREVIOUS`. Before anyone scripts this, add a `Quiescent()` check
+  on the report or a distinct exit code for "moved rows".
+- `internal/identity/reseal.go` has two near-identical pagination loops
+  (`bridgedActors` and `apActors`). Merge them the next time either changes.
+- `SigningKeys` (`internal/repo/repo.go`) hands out key material. A
+  `SignCommit` method would keep private keys inside the identity package and
+  make a KMS backend easier.
 
-## Found while building 17e's fixtures (NOT a 17e defect)
+## Operations and configuration
 
-- **Re-using a deleted vote record's rkey silently never federates.** The
-  outbound activity id derives from (at-uri, "create", seq). Delete a vote row
-  and the seq restarts at 1, so a vote re-created under the SAME rkey
-  reproduces the FIRST vote's activity id. `InsertTx` then no-ops on the
-  existing id, `EnqueueTx` reads back the standing **delivered** row (correctly
-  — that is the idempotency that makes the fan-out safe), and nothing goes out.
-  Observed on the wire as `["Dislike","Undo"]` with the third vote simply
-  missing, no error anywhere.
+- Config is read once at startup, so changing a kill switch during an incident
+  means recreating the container. A SIGHUP reload or an admin-writable switch
+  table would fix this.
+- Scoped kill switches are deny lists only. A one-community canary has to list
+  every other community, and adding a community to `communities.yaml` silently
+  puts it outside the canary.
+- Backups (`scripts/pg-backup.sh`, nightly systemd timer) stay on the host they
+  protect. There is no offsite copy, no WAL/point-in-time recovery, a 24h
+  recovery point, and nothing runs `scripts/pg-restore-drill.sh` automatically.
+  `BRIDGE_KEK` and `.env` are outside the database backup; the backup script
+  warns when `.env` is newer than its offsite marker.
+- No CI job runs the backup and restore-drill scripts. A migration that renames
+  a table the drill checks would break the drill unnoticed until the next
+  manual run. Add a job that dumps the migrated test database, runs both
+  scripts, and checks one induced failure.
+- Production lexicon validation records `tidepool_lexicon_validation_failures`
+  and writes the record anyway. Make it strict only after the counter has stayed
+  at zero in production.
+- The e2e harness runs in development mode (migrations on start, HTTP and
+  private fetching, strict lexicon validation). `ENVIRONMENT=production` is
+  exercised only by the production deployment.
+- All in-process IP rate limiters use `RemoteAddr` and ignore
+  `X-Forwarded-For`. Behind a proxy every client shares the proxy's bucket, so
+  rate-limit at the edge. A future opt-in `TRUSTED_PROXY` setting could trust
+  forwarded addresses from listed hops.
 
-  Whether this is reachable depends on Coves' rkey policy for re-created votes.
-  If rkeys are ever reused after a delete, a user's vote silently does not
-  federate and no signal is produced. Worth confirming against Coves before
-  deciding whether it needs a fix here; the candidate fix is to derive the
-  activity id from something that does not restart (the row's create timestamp,
-  or a monotonic per-actor counter that survives deletion).
+## Materializer and storage
+
+- An actor document behind an instance that is temporarily forbidden or down
+  can cause content to be dropped instead of using the last known actor. Media
+  blobs already keep their last copy on transient failure; actors do not.
+- Blobs are stored per DID with no reference counts. Ban removal
+  (`internal/materialize/banremoval.go`) checks for other live references before
+  deleting an image, but the general record scrub
+  (`internal/materialize/updates.go`) does not, so scrubbing one record can delete
+  media another record in the same repo still uses.
+- Consent is read outside the commit transaction, so a consent change racing an
+  in-flight commit can let that one commit land.
+- Bridged posts written before the postv2 switch stay on the deprecated
+  `social.coves.community.post` collection permanently (product decision,
+  2026-08-11). Every era-sensitive path dispatches on the mapping's collection.
+  As a result, Coves' legacy-drain gate never fires while those posts exist. A
+  migration would need Coves to decide how comment and vote refs to the old URIs
+  are remapped.
+- Every postv2 create or edit fetches the author's actor document once more to
+  read `originalAuthor.displayName`. Storing the display name on
+  `bridged_actors` would remove the fetch. Revisit if actor-fetch traffic on
+  post paths matters.
+- `SetBridgedStats`' NoOp result returns `mapping.CID`, which can be older than
+  the record the read just saw. Callers ignore it today.
+
+## Sync and ingest
+
+- `getRepo` ignores `since` and always returns the full repo CAR, which the
+  spec allows. A real diff would need historical blocks and a change to the
+  block GC rule.
+- A queue attempt interrupted by shutdown still uses up its `ClaimNext` attempt.
+  Cosmetic.
+- The mint gate has only unit tests. The e2e stack has no low
+  `MINT_RATE_PER_MINUTE` variant.
+- The failure path for the `activityID` random source cannot be tested without
+  injecting the reader, because Go 1.24+ treats a `crypto/rand` failure as fatal.
+
+## E2E harness and CI
+
+- Native e2e coverage is thin. `tests/e2e/native_facets_test.go` sends a
+  native post through the reference PDS, relay, Jetstream and acceptance engine
+  to real Lemmy. There are no e2e tests yet for native comments, native votes
+  reaching Lemmy, or Lemmy votes on native posts.
+- `vetEvent` (`tests/e2e/helpers.go`) checks every firehose event against one
+  `expectedCollections` list without knowing which repo it came from. A
+  collection the bridge may write passes even when it appears in the native
+  repo. Give each repo class (bridged authors, bridged communities, native PDS)
+  its own allowlist and rev tracking.
+- Recreating the `relay` service alone breaks it: its disk persister keeps file
+  refs in `relay-postgres` while the files live in the container layer, so
+  bigsky exits with `open /data/persister/evts-0: no such file or directory`.
+  Any edit to the `relay` service triggers this; run `make e2e-down` first. A
+  named volume for `/data` would remove the trap.
+- Jetstream exits when its upstream disconnects, and compose's
+  `restart: unless-stopped` brings it back. Remove the workaround if Jetstream
+  learns to reconnect.
+- The suite-end replay sweep only sees Jetstream's last 24 hours. Recreate the
+  stack per run, as `make e2e` does.
+- The e2e job on GitHub Actions compiles Lemmy from source on every run and may
+  exceed runner time or disk. Publish a prebuilt pinned Lemmy debug image to
+  GHCR, or use the buildx `gha` cache.
+- The declarative follow list (`FOLLOW_LIST_PATH`) has no e2e test. The missing
+  piece is mounting a follow-list file into the compose `tidepool` service, then
+  checking the community turns `accepted` and that removing it sends an Undo.
+- `POST /admin/reemit` has no e2e test.
+- The PLC directory image is pinned by commit in `e2e/plc/Dockerfile`. Bump it
+  on purpose when an upstream fix is needed.

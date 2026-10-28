@@ -1,36 +1,38 @@
-# Tidepool — ActivityPub → atproto bridge for Coves
+# Tidepool architecture and design decisions
 
-Tidepool bridges the threadiverse (Lemmy, PieFed, Mbin — anything speaking
-FEP-1b12 group federation) into atproto as `social.coves.*` records, so the
-Coves AppView indexes fediverse communities exactly as it indexes native ones.
+Tidepool is a two-way bridge between the threadiverse (Lemmy, PieFed, Mbin, and
+anything else that speaks FEP-1b12 group federation) and Coves.
 
-**v1 scope is READ-ONLY**: Lemmy content flows in; nothing Coves users write
-flows out. No AP representation of Coves users exists. The only outbound AP
-activities are `Follow` (community subscription, sent by the bridge's own
-service actor) and signed `GET` fetches.
+- Inbound: fediverse communities, users, posts and comments become
+  `social.coves.*` records in repos Tidepool hosts, so the Coves AppView indexes
+  them the same way it indexes native content.
+- Outbound: native Coves users take part in bridged communities. Their posts,
+  comments, votes, edits and deletes go back to the origin instance, and they
+  appear on the fediverse as `@name@coves.social`. The outbound side lives in
+  `internal/consume` (Jetstream consumer), `internal/accept` (acceptance
+  engine) and `internal/outbound` (translation and delivery queue).
+- Not yet built: communities created natively on Coves do not federate. Making
+  them followable AP Groups is Scope B. Decisions 10 to 20 are written so that
+  Scope B adds code without migrating schemas or URLs.
 
-**v2 (Scope A, added 2026-07-17) makes the bridge two-way**: Coves users
-(federation default-on, opt-out honored — decision 11) participate in
-bridged Lemmy communities — posts, comments, votes,
-edits, deletes flow back to Lemmy, and those users appear on the fediverse
-as `@name@coves.social`. See §v2 below. Scope B (Coves-native communities
-as followable AP Groups) stays deferred, but every v2 design choice must
-remain Scope-B-compatible.
+Decisions are numbered. Code comments and other docs cite them by number, so
+the numbers stay fixed even when a decision is superseded.
 
 ## The materialization principle
 
-Materialize as PDS records exactly the things other records may need to
-reference (communities, author profiles, posts, comments). Keep things that
-are only ever aggregated (votes) as bridge-side state exposed through one
-sanctioned side-channel XRPC. Nothing ever strongRefs a vote.
+Materialize as PDS records the things other records may need to reference:
+communities, author profiles, posts and comments. Keep things that are only
+ever counted (votes) as bridge-side state. Nothing ever strongRefs a vote.
 
 ## Architecture
+
+Inbound:
 
 ```
  Lemmy / PieFed                     Tidepool                            Coves
 ┌──────────────┐   Announce   ┌──────────────────┐  subscribeRepos  ┌─────────┐
-│ community    │─────────────▶│ inbox + sig      │────────────────▶│Jetstream│
-│ Group actor  │   (push)     │ verify           │   (CBOR frames) │         │
+│ community    │─────────────▶│ inbox + sig      │────────────────▶│ relay + │
+│ Group actor  │   (push)     │ verify           │   (CBOR frames) │Jetstream│
 │              │              │        │         │                 └────┬────┘
 │ outbox/API   │◀─────────────│ fetcher (signed  │                      │ JSON
 │              │  backfill    │ GET, webfinger)  │                 ┌────▼────┐
@@ -44,459 +46,434 @@ sanctioned side-channel XRPC. Nothing ever strongRefs a vote.
                               └──────────────────┘
 ```
 
-## Design decisions (locked)
+The relay and Jetstream are self-hosted and carry only Tidepool's and Coves'
+own PDS hosts. See [SELF_HOSTED_RELAY.md](SELF_HOSTED_RELAY.md) for why.
 
-1. **Go**, module `tidepool`, using `github.com/bluesky-social/indigo` for
-   repo/MST/CAR/TID/DID primitives. bridgy-fed + arroba + granary (CC0,
-   cloned as siblings in `~/Code/`) are the compat encyclopedia — port their
-   Lemmy quirk handling, don't rediscover it.
-2. **Virtual PDS, not a stock PDS**: Tidepool signs commits and serves
-   `com.atproto.sync.*` itself (the arroba model). One deployment, no
-   per-account ceremony, full control of emission order.
-3. **Posts are written into the community's repo** with `author` set to the
-   bridged user's DID — this is what the Coves post consumer validates
-   (repo DID must equal `record.community`). Comments are written into the
-   bridged user's repo. Profiles (`actor.profile`, `community.profile`,
-   rkey `self`) are written before any content that references them, since
-   the AppView rejects content whose community/author isn't indexed yet.
-   **[SUPERSEDED 2026-08-11 by decision 20 / task 19: Coves flipped to
-   author-owned posts (`postv2` in the author's repo + a community-signed
-   `acceptance` record; PRD_AUTHOR_OWNED_POSTS.md, merged 2026-08-09).
-   NEW posts go to the bridged AUTHOR's repo like comments; the community
-   repo holds acceptance/removal records. Existing legacy posts stay put —
-   both collections coexist in Coves indefinitely (no migration planned).]**
-4. **Deterministic rkeys**: TID whose timestamp half comes from the AP
-   object's `published` time and whose clock-ID bits come from a hash of the
-   canonical AP id. Sortable, format-valid, and idempotent re-ingestion
-   produces the same at-uri.
-5. **`ap_objects` mapping table is the spine**: `ap_id ↔ (did, collection,
-   rkey, at_uri, cid)`. Every materialization writes it; every strongRef
-   resolution reads it. Missing parents trigger recursive fetch-and-
-   materialize of the ancestor chain (parents first).
-6. **Consent from day one**: `#nobridge`/`#nobot` in an AP actor's summary
-   blocks materialization of that actor's content; `Delete(Actor)` tombstones
-   their bridged repo. Bridged profiles are visibly labeled with a bio line
-   linking to the origin ("bridged from lemmy.world by Tidepool") and
-   `hostedBy` = the bridge's service DID.
-7. **Votes never become records.** Like/Dislike activities update bridge-side
-   aggregate counts served over a small versioned XRPC
-   (`social.coves.bridge.getVoteAggregates`) that the AppView may poll.
-8. **Coves conventions apply**: goose migrations, raw `database/sql` +
-   `lib/pq`, chi router, `log/slog`, typed sentinel errors wrapped with `%w`,
-   env-var config with logged dev defaults, `context.Context` everywhere,
-   interfaces per domain package, real-infrastructure integration tests.
-9. **Deferred (explicitly out of v1)**: outbound Coves→Lemmy direction, AP
-   actors for Coves users, key claiming/migration for bridged users
-   (escrow the keys, build claiming later), moderation federation, DMs,
-   PieFed/Mbin quirk testing (target the FEP; verify against Lemmy only).
-
-New bridged atproto handles use `<user label>.<instance host>.<HANDLE_ZONE_ROOT>`
-(for example, `alice.lemmy.world.ap.tdpl.io`). The instance host is lowercased
-with dots kept and ports dropped. The user label normalizes ASCII names;
-non-ASCII names with no ASCII letters or digits use an IDNA punycode label
-when valid, otherwise a stable hash label. A community (group) label gets a
-`c-` prefix (`c-technology.lemmy.world.ap.tdpl.io`); a user label that would
-start with `c-` gets `u-` in front (`u-c-technology.lemmy.world.ap.tdpl.io`).
-The prefix counts toward the 63-character label limit. Same-host collisions
-get `-2`, `-3`, and so on at the end of the label (`c-technology-2`). Collisions
-come from usernames that normalize alike, and from a `u-` prefixed label
-meeting a user whose own label already reads `u-c-...` (`u_c_tech` and
-`c_tech` both want `u-c-tech`; the later one gets `u-c-tech-2`). A user
-labelled `c` whose handle collides gets `u-c-2`. A punycode label is never
-suffixed or truncated (that breaks its decoding): when it collides or does
-not fit, the hash label is used.
-
-## v2 — Scope A write-back (added 2026-07-17)
-
-Opted-in Coves users participate in bridged Lemmy communities in both
-directions. Their identity on the fediverse is `@name@coves.social` —
-coves.social reverse-proxies the AP surface (WebFinger, actors, objects,
-inboxes) to Tidepool. Scope B (Coves-native communities as AP Groups so
-Lemmy users can follow/post) is still deferred; decisions 10–20 are written
-so Scope B is purely additive. NOTE (2026-08-11): the author-owned-posts
-flip DISSOLVED Scope B's hardest blocker — a Lemmy user's post into a
-native community is now just a postv2 in the bridged author's repo (which
-Tidepool already signs) admitted by that community's OWN acceptance
-engine on its own host; no one ever writes into a foreign community repo.
-Scope B shrinks to the Group-actor AP surface + admission-policy wiring.
-
-### v2 architecture
+Outbound:
 
 ```
  Native user PDS ─────────┐
  (postv2, comments, votes │ subscribeRepos          Coves
-  ALL in the author's     ▼                    ┌────────────┐
-  own repo)         ┌──────────┐   Jetstream   │  AppView   │
+  in the author's own     ▼                    ┌────────────┐
+  repo)             ┌──────────┐   Jetstream   │  AppView   │
                     │  relay   │──────────────▶│  postgres  │
                     └──────────┘               └────────────┘
-                          ▲   (acceptance/removal records from
-         subscribeRepos   │    tidepool's community repos ride
-                    ┌─────┴────────────────────┐  the same firehose)
+                          ▲   (acceptance and removal records from
+         subscribeRepos   │    Tidepool's community repos travel
+                    ┌─────┴────────────────────┐  the same path)
                     │        Tidepool          │
-                    │  virtual PDS + ACCEPTANCE│◀── Jetstream (postv2 →
-                    │  engine │ consumer       │    bridged communities,
-                    │  outbound queue          │    comments, votes,
-                    │  AP person actors        │    profiles, opt-outs)
+                    │  virtual PDS, acceptance │◀── Jetstream (postv2 into
+                    │  engine, consumer,       │    bridged communities,
+                    │  outbound queue,         │    comments, votes,
+                    │  AP Person actors        │    profiles, opt-outs)
                     └───────────┬──────────────┘
-           Create{Page|Note}    │      ▲  Announce (echo — suppressed),
-           Like/Dislike/Undo    ▼      │  replies, mod actions
+           Create{Page|Note}    │      ▲  Announce (our own echoes are
+           Like/Dislike/Undo    ▼      │  suppressed), replies, mod actions
                     ┌──────────────────┴───────┐
                     │      Lemmy / PieFed      │
                     └──────────────────────────┘
 ```
 
-REVISED 2026-08-11: Coves' author-owned-posts flip (postv2 + acceptance,
-merged 2026-08-09) landed after the 2026-07-30 codex revision of this
-section. Decision 13's write surface is DELETED (nothing writes posts
-into community repos anymore — on either side); decision 20 and task 19
-add the inbound flip (new posts only — no migration; decision 20);
-decisions 12/14/18 are amended in place.
+## Core decisions
 
-### v2 design decisions (locked)
+1. Go, module `tidepool`, using `github.com/bluesky-social/indigo` for repo,
+   MST, CAR, TID and DID primitives. bridgy-fed, arroba and granary (CC0) are
+   the reference for Lemmy quirk handling. Port their handling; do not
+   rediscover it.
+2. Tidepool is a virtual PDS. It signs commits and serves `com.atproto.sync.*`
+   itself (the arroba model) instead of running a stock PDS. That gives one
+   deployment, no per-account setup, and full control of the order records are
+   emitted in.
+3. Superseded by decision 20. Posts were first written into the community's
+   repo with `author` set to the bridged user's DID, because the Coves post
+   consumer required the repo DID to equal `record.community`. Coves then moved
+   to author-owned posts. New posts now go into the author's repo. Posts written
+   the old way stay in community repos. The rest of this decision still holds:
+   comments go into the bridged user's repo, and profiles
+   (`actor.profile`, `community.profile`, rkey `self`) are written before any
+   content that references them, because the AppView rejects content whose
+   community or author is not indexed yet.
+4. Record keys are deterministic. Each rkey is a TID whose timestamp half comes
+   from the AP object's `published` time and whose clock-ID bits come from a
+   hash of the canonical AP id. Keys sort by time, are valid TIDs, and
+   re-ingesting the same object produces the same at-uri.
+5. The `ap_objects` mapping table is the spine:
+   `ap_id ↔ (did, collection, rkey, at_uri, cid)`. Every materialization writes
+   it and every strongRef resolution reads it. A missing parent triggers a
+   recursive fetch and materialization of the ancestor chain, parents first.
+6. Consent applies from the first record. `#nobridge` or `#nobot` in an AP
+   actor's summary blocks materialization of that actor's content.
+   `Delete(Actor)` tombstones their bridged repo. Bridged profiles carry a bio
+   line naming the origin ("bridged from @alice@lemmy.world by Tidepool") and
+   set `hostedBy` to the bridge's service DID.
+7. Votes never become records. Inbound Like and Dislike activities update
+   bridge-side tallies (`internal/votes`). Tidepool exposes them two ways: it
+   folds the counts onto the bridged post or comment record as the optional
+   `bridgedStats` field (`{upvotes, downvotes, asOf}`), and it serves them over
+   the `social.coves.bridge.getVoteAggregates` XRPC for the AppView to poll.
+8. Coves conventions apply: goose migrations, raw `database/sql` with `lib/pq`,
+   chi router, `log/slog`, typed sentinel errors wrapped with `%w`, env-var
+   config with logged dev defaults, `context.Context` everywhere, interfaces
+   per domain package, and integration tests against real infrastructure.
+9. Out of scope. Outbound federation for native users was deferred here at
+   first and is now built (decisions 10 to 20). Still out of scope: key claiming
+   or migration for bridged users (their keys are held in escrow so claiming
+   can be built later), DMs, and Scope B. Software other than Lemmy is
+   targeted through the FEP and tested only as decision 19's support matrix
+   describes.
 
-10. **coves.social is the DEFAULT user-facing AP origin.** AP has no
-    portable identity layer: fediverse software derives "the instance"
-    from the HTTP origin of the actor id, so a bridge must serve every
-    actor from an origin it controls — domain collapse is a protocol
-    constraint, not a choice (bridgy-fed collapses to brid.gy the same
-    way). We collapse to coves.social but preserve provenance in the
-    local part, and we keep per-user vanity origins additive:
-    - Local part: a native handle `alice.coves.social` federates as
-      `alice`; any other handle federates as the FULL handle —
-      `bretton.dev` → `@bretton.dev@coves.social`,
-      `alice.bsky.social` → `@alice.bsky.social@coves.social`
-      (bridgy-fed precedent; provenance survives in the name).
-      VERIFIED (2026-07-30, Lemmy 0.19.20 source): remote webfinger
-      resolution applies no charset restriction and Lemmy's mention
-      regex accepts dots — dotted local parts stand. Hyphenated parts
-      resolve via search/webfinger but are NOT matched by Lemmy's
-      in-text mention regex (display nit only); remote
-      preferredUsername is varchar(255) Lemmy-side — cap local parts
-      accordingly. Collisions get deterministic `-2`/`-3` suffixes.
-      The local part is FROZEN at actor creation — the DID's first
-      federating interaction (product decision 2026-07-30, mint
-      trigger updated 2026-08-12): handle changes update the served
-      display name
-      only, so remote mentions and search stay stable; a user who
-      wants a new fediverse name deletes and re-creates their
-      presence.
-    - `ap_actors` stores each actor's FULL actor id, origin included;
-      serving, webfinger, keyIds, and outbound signing all derive from
-      the stored id, never from a global origin constant. Per-user
-      custom-domain federation (`@alice@bretton.dev`, for a user who
-      proxies `/.well-known/webfinger` + `/ap/*` from their domain to
-      the bridge; TLS via the existing on-demand tls-ask path) is then
-      a deferred ADDITIVE feature — new rows with a different origin,
-      zero migration. Deferred deliberately: it needs user-side web
-      config, and changing an EXISTING actor's origin is an AP
-      identity change (remote instances see a new account), so
-      default-origin assignments are forever either way.
-    Local parts are unique per `(normalized_origin, local_part)` —
-    NOT globally — in one namespace shared with future Group actors
-    (Scope B); every lookup carries the origin, and actor/object/
-    activity URLs derive from the stored actor row, never from a
-    global origin constant, so vanity origins stay purely additive.
-    Actors are `Person` documents with ids keyed by
-    DID (stable across handle changes): actor
-    `{origin}/ap/actor/{did}`, objects
-    `{origin}/ap/object/{did}/{collection}/{rkey}`, one shared inbox
-    `{origin}/ap/inbox`.
-    Caddy on coves.social proxies `/.well-known/webfinger`,
-    `/.well-known/nodeinfo`, `/ap/*`, and Accept-negotiated apex `GET /`
-    (the instance/Site actor — type `Application`, the Lemmy Instance-enum
-    trap from task 10) to the tidepool container. tdpl.io stays the
-    service origin for the inbound direction, unchanged. Tidepool serves
-    both origins from one listener, routed by Host header.
-11. **Federation is DEFAULT-ON for native users; opt-OUT as a repo
-    record, in two tiers.** [REVERSED 2026-08-12 from opt-in —
-    product decision: Coves users come expecting to browse and reply
-    across networks, and ONLY bridged-community interactions ever
-    federate — posting into a community that visibly lives on Lemmy
-    IS the consent act, unlike whole-account mirroring (the Bridgy
-    Fed case), so no separate ceremony is owed. The UI obligation
-    becomes DISCLOSURE, not consent collection.] Mechanics: any
-    non-Tidepool-minted DID interacting with a bridged community
-    federates unless it has opted out. The AP actor is minted LAZILY
-    on the DID's first federating interaction (first postv2/comment/
-    vote touching a bridged community) — no interaction, no fediverse
-    identity, ever. `social.coves.bridge.federation` (rkey `self`,
-    `{enabled: bool, deleteRemote?: bool}`, user's own repo —
-    user-signed, portable, firehose-visible) now expresses the
-    EXCEPTION: absence of the record = enabled (the default);
-    `enabled=false` → SOFT DISABLE (new federation stops, pending
-    outbound cancelled atomically, actor doc stays served);
-    `enabled=true` or deleting the record → (re-)enabled. The
-    destructive tier (`enabled=false, deleteRemote: true`, behind an
-    explicit UI warning) → `Delete{Person}` carrying Lemmy's
-    `removeData: true` so remote content purges; documented
-    irreversible (Lemmy un-deletes on actor refetch; other software
-    may not). Account deletion → the same terminal path once
-    confirmed (decision 19). Content authored while opted out is
-    NEVER retroactively federated on re-enable. Posts by opted-out
-    authors are REJECTED at admission (decision 13 — no acceptance,
-    invisible in the community view on both sides, visible via
-    Coves' post.getStatus); opted-out users' comments index in Coves
-    but do not federate — the split-thread case is now scoped to
-    users who explicitly chose it. Consent is re-checked at DELIVERY
-    time, not only at enqueue; already-in-flight HTTP is the one
-    unavoidable race (documented, reconciled by the decision-19
-    job).
-12. **atproto-first, echo-suppressed.** Native content commits to the
-    repo first (Coves indexes instantly via the existing firehose); AP
-    delivery is async from a durable outbound queue. `ap_objects.origin`
-    (fediverse|bridge — the column reserved in task 01) is the loop
-    discriminator: origin=bridge objects are never re-materialized when
-    the community Announces them back. Outbound activity ids are
-    DETERMINISTIC — derived from (at-uri, operation, per-object seq)
-    and PERSISTED in outbound state, never derived from record CID
-    (Jetstream delete events carry no CID) — so Lemmy-side dedupe
-    (its `received_activity` table, keyed by activity ap_id; verified
-    0.19.20) makes redelivery idempotent and our own echoes are
-    recognizable. Deterministic ids are NOT a substitute for state:
-    deletes and Undo are built from the persisted outbound state row
-    (decision 14), and Lemmy matches Undo{vote} by actor+object with
-    the full inner vote EMBEDDED — not by activity id. Delivery
-    workers classify Lemmy's duplicate-activity error response as
-    success (a crash between deliver and mark-delivered redelivers).
-13. **Tidepool is the acceptance engine for bridged communities.**
-    [REWRITTEN 2026-08-11 — the prior write-surface design (sessions,
-    community credentials, createRecord forwarding) died with Coves'
-    author-owned-posts flip; see git history for the old text.]
-    Under PRD_AUTHOR_OWNED_POSTS: a native user posts to a bridged
-    community by writing `social.coves.community.postv2` into their
-    OWN repo via their own OAuth session — Tidepool never sees the
-    write. It arrives via the Jetstream consumer (decision 14), and
-    Tidepool — as the community's key holder — runs admission and
-    writes the `social.coves.community.acceptance` record into the
-    bridged community's repo through repo.Manager, natively signed.
-    Community surfaces render from acceptance records only, so
-    acceptance IS the visibility gate on both sides:
-    - Admission policy for bridged communities: author is a
-      non-opted-out, non-paused native DID (decision 11 — an
-      opted-out author's post is REJECTED and stays invisible in
-      Coves too, coherent by construction, surfaced via Coves'
-      post.getStatus; the actor mints lazily on first acceptance);
-      author not banned in the community (decision 18's Block state);
-      parent not locked; title present (Lemmy requires `name`; postv2
-      title is optional — media-only posts are REJECTED with a
-      distinct recorded reason until a title-derivation product
-      decision says otherwise) and ≤200 chars post-truncation rules.
-    - Acceptance mechanics MATCH Coves' engine exactly: deterministic
-      rkey = unpadded lowercase base32 of SHA-256 of the canonical
-      subject at-uri (52 chars); strongRef pins URI + CID; author
-      edit → CID mismatch → re-run admission → repin same rkey with
-      the new CID (post editing is now REAL — the deferred-editing
-      product decision of 2026-07-30 is VOID; Coves shipped the edit
-      path) → enqueue `Update{Page}`; bridgedStats-only diffs repin
-      synchronously without re-admission (the PRD §5.5 exception —
-      applies to our own inbound vote sweeps, decision 20).
-    - Outbound delivery for posts is enqueued via the PutRecordTx
-      side-effect ON THE ACCEPTANCE COMMIT — acceptance and
-      Create{Page} enqueue are atomic, and un-accepted posts never
-      reach Lemmy. `DeleteRecordTx`/`DeleteRecordCAS` are still NEW
-      in v2 (v1's DeleteRecord commits with a nil hook — verified)
-      and land here, along with a MULTI-OP commit primitive
-      (delete-acceptance + write-removal in ONE commit — Coves does
-      this via applyWrites so the firehose never carries a
-      half-completed moderation action; our repo layer must match).
-    - Author deletes their post (Jetstream tombstone) → delete the
-      acceptance (removal record NOT written — author deletion is
-      not moderation, per the PRD) → enqueue Delete to Lemmy from
-      outbound state.
-    - No write surface, no sessions, no community credentials, no
-      rkey rollout dependency — all obsolete. Blobs in native posts
-      live on the AUTHOR's PDS; outbound Image attachments carry a
-      URL resolved from the author PDS's getBlob (or the AppView
-      CDN), not a Tidepool-served blob.
-    Comments and votes are unchanged: users' own repos, via
-    Jetstream. Convergence: Coves' acceptance consumer direct-fetches
-    an unindexed subject from the author's PDS via
-    `com.atproto.repo.getRecord` with pinned-CID verification —
-    Tidepool already serves that endpoint for its hosted repos
-    (sync/server.go), which is what makes bridged-author posts
-    converge without full relay coverage.
-14. **One Jetstream consumer + durable outbound state.** The consumer
-    (cursor persisted per consumer-version, idempotent against the
-    known quiet-stream full-replay quirk, and porting the Coves
-    connector's FULL discipline — record-revision gates and a
-    persistent dead-letter store with redrive, not just the cursor)
-    handles: federation opt-out lifecycle (+ lazy actor minting on a
-    DID's first federating interaction), `actor.profile` → served-actor-doc
-    refresh ONLY (Lemmy has NO Update{Person} handler — verified
-    0.19.20 and 1.0 main; remote profiles refresh via its lazy ≤24h
-    actor refetch, and we do not deliver an activity that 400s),
-    `community.postv2` targeting a bridged community → the acceptance
-    engine (decision 13: admission → acceptance write → Create/Update
-    {Page} enqueue rides the acceptance commit; author-delete
-    tombstones → acceptance delete + Delete enqueue) [ADDED
-    2026-08-11 — posts now arrive here like everything else],
-    `community.comment` in bridged communities by non-opted-out
-    authors → `Create/Update/Delete{Note}`, `feed.vote` on bridged
-    subjects (same opt-out gate) → `Like/Dislike/Undo`, and #account
-    lifecycle events → decision 19. Because Jetstream DELETE events
-    carry no record body or CID, every create/update handler persists
-    an outbound state row keyed by at-uri (AP object id, last CID,
-    community target, translated snapshot, last activity id) — and
-    votes get their own state keyed `(actor_did, subject_at_uri)`
-    (direction, current activity id, delivered status). Deletes and
-    Undo are built from that state, transactionally. The consumer
-    skips all Tidepool-hosted repos — their outbound is enqueued at
-    write time by decision 13.
-15. **The outbound queue mirrors the inbound queue's discipline —
-    split into canonical activities and per-inbox deliveries.**
-    `outbound_activities` (one canonical payload per activity id) +
-    `outbound_deliveries` (one row per (activity, target inbox) with
-    independent claim/attempt/poison state) — the fan-out that task
-    17's Delete{Person} and Scope B need; a single globally-unique
-    activity row cannot represent it. Semantics are AT-LEAST-ONCE
-    with stable receiver-visible ids, never exactly-once. Ordering
-    key = community, plus EXPLICIT causal parent dependencies: a
-    child is ineligible until its parent's mapping and delivery state
-    exist; a poisoned parent poisons descendants with a distinct
-    reason. claimed_until fencing, exp backoff, poison taxonomy,
-    per-host rate limiting. Target inboxes are DISCOVERED from the
-    community Group's actor document (cached with TTL; refreshed once
-    on 401/404/410 before poisoning — endpoint rotation must not
-    become poison); community deletion/unfollow cancels pending work.
-    Per-actor RSA signing — keys sealed under BRIDGE_KEK via a NEW
-    custodian surface with key metadata (version, created/retired)
-    so rotation is definable (v1's custodian is K256-only and the v1
-    service RSA key is stored in the CLEAR — verified; task 13 fixes
-    this for all new keys). Wire contract per the pinned-Lemmy
-    verification (0.19.20): draft-cavage RSA-SHA256 with
-    `(request-target) host date digest` signed and Digest required,
-    1h expiry window; every Page/Note carries `to: [group,
-    as:Public]`, `audience: group`, single-string `attributedTo`,
-    HTML `content` AND markdown `source`; our Person actors MUST
-    include `outbox` and be type Person (Service actors' votes are
-    rejected as bots). Delivery is FEP-1b12: activities go to the
-    community Group's inbox; Lemmy fans out the Announce — and
-    inbound Announce delivery back to us exists ONLY because the v1
-    service actor follows every bridged community (that Follow is
-    v2's inbound channel too; keep the invariant).
-16. **Votes write back per-actor and still never become atproto records**
-    (decision 7 stands). The live outbound vote state (decision 14's
-    `(actor_did, subject_at_uri)` table — updated on delivery
-    success, cleared/flipped only when the corresponding Undo or
-    replacement vote succeeds) is the single source of truth: the
-    aggregator drops echoes of our own outbound Like/Dislike activity
-    ids, outbound Undo embeds the full inner vote reconstructed from
-    state (Lemmy matches by actor+object and requires the embedded
-    object — a bare-URL Undo fails to parse; verified), and the Lemmy
-    API count seeder subtracts the live delivered tallies under the
-    same aggregate-lock discipline as inbound votes, so re-seeds
-    never double-count (FOLLOWUPS item closed by design here).
-    Queue-history arithmetic ("delivered Likes minus Undos") is
-    explicitly NOT the mechanism — it cannot model flips, poison, or
-    multi-destination. Known 1.0 risk: per-instance FederationMode
-    can silently drop remote votes (even upvotes); surface divergence
-    in metrics, don't fight it.
-17. **Scope B guardrails.** Everything reverse-direction is kind-agnostic:
-    `ap_actors` carries kind (person|group), AP URL shapes and the shared
-    inbox don't encode kind, the webfinger local-part namespace is shared,
-    the acceptance engine's admission policy is per-community-kind
-    configuration rather than person-only assumptions, and outbound
-    translation dispatches on collection. Adding
-    Group actors for Coves-native communities must require no schema or
-    URL migration.
-18. **Inbound moderation of native content is a new contract, not
-    reuse.** v1 authorizes an announced Delete by REPO MEMBERSHIP in the
-    announcing community — posts by `mapping.DID`, comments by their
-    thread root's repo, plus a curated-follow allowance for targets it
-    has no mapping for (verified `internal/ingest/consent.go`); host
-    authority (`SameAuthority`) survives only on the BARE delete path.
-    Neither can authorize a Lemmy Group moderating a coves.social-origin
-    object: a native object has no Lemmy-community mapping to be a member
-    of, and its host is ours, not the moderator's — so the membership
-    rule has nothing to match and the unmapped allowance must NOT be
-    extended to it (that allowance exists to close the
-    delete-before-create race for content the community already owns).
-    Scope B therefore rests on explicit checks, never on host equality:
-    bridge-origin moderation gets its OWN rule — the verified Announce
-    signer must be the followed community Group that owns the target's
-    community mapping. New vocabulary is parsed explicitly —
-    `Remove`/`Undo{Remove}`, `Lock`/`Undo{Lock}`, `Block`/`Undo{Block}`
-    (v1 silently skips all of these) — plus Lemmy's Delete-summary
-    convention: a PRESENT `summary` (even empty) means mod-removal,
-    absent means self-delete; our outbound self-deletes must OMIT
-    `summary` or Lemmy verifies us as a failed mod action (verified
-    0.19.20). [AMENDED 2026-08-11 for author-owned posts:] Moderated
-    native POSTS are no longer deleted from anywhere — the post lives
-    in the AUTHOR's repo, untouchable, and moderation acts on the
-    ACCEPTANCE state Tidepool owns: one MULTI-OP commit in the
-    community repo deletes the acceptance and writes the REAL
-    `social.coves.community.removal` record (deterministic digest
-    rkey, `code` from its open knownValues set — e.g.
-    `moderator-discretion`, `author-banned`), mirroring Coves'
-    applyWrites atomicity so the firehose never carries a
-    half-completed action. Removal is URI-scoped and TERMINAL across
-    author edits; `Undo{Remove}` restore = one atomic commit deleting
-    the removal and writing a fresh acceptance (no pre-removal
-    snapshot machinery needed — the post record never moved).
-    Moderated native COMMENTS keep the removal-record materialization
-    into the community repo (the removal lexicon is post-scoped
-    today; extending it to comment subjects is a named cross-repo
-    item, not an invention here) — the Coves AppView hides them from
-    the community view; the author's own profile keeps them.
-19. **Account lifecycle, support matrix, rollout safety.** #account
-    events carry a status that is NOT proof of deletion:
-    transient/local states (deactivated, suspended, takendown,
-    throttled) PAUSE the actor's outbound; only confirmed permanent
-    deletion (status=deleted, re-verified against the DID's current
-    PDS/PLC state) triggers the terminal Delete{Person}. Support
-    matrix: Lemmy 0.19.20 is the pinned strictness ceiling and e2e
-    target; PieFed is best-effort behind captured-wire conformance
-    (its votes arrive from anonymous per-user actors — fine for
-    tallies); Lemmy 1.0-beta is tracked, not targeted (vote
-    FederationMode, inbox collapsing, NoteWrapper). Rollout safety:
-    global / per-host / per-community / per-actor outbound kill
-    switches, a dry-run translation mode, queue inspect / redrive /
-    cancel admin surface, a reconciliation job comparing atproto
-    state against outbound state, staged canary (one community
-    first), and deliberate throttling of initial actor announcements
-    — each new actor costs Lemmy a webfinger + actor fetch back at
-    coves.social, so a mass backfill from one host is a self-inflicted
-    thundering herd. DEFEDERATION COUPLING (added 2026-08-12): Lemmy
-    blocks are per-domain and v2 presents two domains with different
-    jobs — users at coves.social, the community-following reader at
-    tdpl.io — so a block of one leaves a silent half-federated split
-    (e.g. coves.social blocked: reads keep flowing while users' posts
-    vanish from their POV). Policy: a DETECTED block of either origin
-    (delivery rejections, Rejected follows, inbox 403 spikes — Lemmy
-    does not federate its blocklist, so detection is empirical via
-    the decision-19 reconciliation metrics) stands down BOTH
-    directions for that host via the per-host kill switch, loudly in
-    metrics — a bridge that half-honors defederation reads as block
-    evasion, and that perception is the real defederation risk.
-20. **Inbound posts flip to postv2 + acceptance for NEW posts; the
-    legacy set is frozen, not migrated (added 2026-08-11; supersedes
-    decision 3's post placement; task 19 executes it FIRST).** The
-    materializer writes new bridged Lemmy posts as
-    `social.coves.community.postv2` into the bridged AUTHOR's repo
-    (same placement as comments; deterministic TID rkeys unchanged)
-    — there is no in-record `author` field (authorship = repo), and
-    Tidepool populates `originalAuthor`/`federatedFrom` (both
-    deliberately unconstrained lexicon-side; WE define the first
-    real shape — document it in the lexicon README as the bridge's
-    published convention) plus `bridgedStats` as today. Every post
-    materialization then writes the acceptance record into the
-    community repo (digest rkey, strongRef with CID) — parents-first
-    ordering gains a step: author profile → postv2 → acceptance.
-    Lemmy mod removals of fediverse content switch from
-    record-delete to the decision-18 acceptance-delete + removal
-    multi-op commit; upstream edits repin acceptance; Tidepool's own
-    bridgedStats vote sweeps use the PRD §5.5 bridgedStats-only
-    synchronous repin (no re-admission). Coves-side trust: the
-    BridgeTrust gate re-keys to the AUTHOR repo's PDS — Tidepool's
-    hosts must be in TRUSTED_BRIDGE_PDS_HOSTS as author-repo hosts
-    (config check, cross-repo). NO MIGRATION of existing bridged
-    posts (product decision 2026-08-11): the deprecated and postv2
-    collections coexist in Coves indefinitely; every era-sensitive
-    path (edit, delete, moderation, vote sweep) dispatches on the
-    mapping's collection PERMANENTLY, and no legacy record is ever
-    rewritten. Recorded consequence: Coves' legacy-drain gate never
-    fires while bridged legacy posts exist — its legacy consumer
-    branch stays live, which Coves has accepted. A future migration
-    (needs Coves' §11 remap decision + an old→new ledger) is
-    deferred with rationale in FOLLOWUPS; nothing in v2 depends on
-    it.
+## Handles
+
+Bridged atproto handles have the form
+`<user label>.<instance host>.<HANDLE_ZONE_ROOT>`, for example
+`alice.lemmy.world.ap.tdpl.io`. Tidepool's own DNS server (`internal/dns`)
+answers for the zone. [HANDLE_SCHEME.md](HANDLE_SCHEME.md) has the full rules.
+In short:
+
+- The instance host is lowercased, dots kept, port dropped.
+- ASCII user names are normalized. A non-ASCII name with no ASCII letters or
+  digits uses an IDNA punycode label when valid, otherwise a stable hash label.
+- A community label gets a `c-` prefix (`c-technology.lemmy.world.ap.tdpl.io`).
+  A user label that would start with `c-` gets `u-` in front
+  (`u-c-technology.lemmy.world.ap.tdpl.io`). The prefix counts toward the
+  63-character label limit.
+- Same-host collisions get `-2`, `-3` and so on at the end of the label
+  (`c-technology-2`). Collisions come from user names that normalize alike, and
+  from a `u-` prefixed label meeting a user whose own label already reads
+  `u-c-...` (`u_c_tech` and `c_tech` both want `u-c-tech`; the later one gets
+  `u-c-tech-2`). A user labelled `c` whose handle collides gets `u-c-2`.
+- A punycode label is never suffixed or truncated, because that breaks its
+  decoding. When it collides or does not fit, the hash label is used.
+
+Older bridged actors have handles in the form `alice.lemmy-world.tdpl.io`.
+`internal/handlemigration` renames them into the handle zone.
+
+## Outbound decisions
+
+Native Coves users take part in bridged communities in both directions. Their
+fediverse identity is `@name@coves.social`. coves.social reverse-proxies the AP
+surface (WebFinger, actors, objects, inboxes) to Tidepool.
+
+Coves' move to author-owned posts made Scope B much smaller. A Lemmy user's
+post into a native community would be a `postv2` in the bridged author's repo,
+which Tidepool already signs, admitted by that community's own acceptance
+engine on its own host. Nobody writes into a foreign community's repo. Scope B
+is left with the Group-actor AP surface and the admission-policy wiring.
+
+10. coves.social is the default AP origin for native users. AP has no portable
+    identity layer. Fediverse software takes "the instance" from the HTTP origin
+    of the actor id, so a bridge must serve every actor from an origin it
+    controls. bridgy-fed collapses to brid.gy for the same reason. Tidepool
+    collapses to coves.social and keeps provenance in the local part:
+    - A native handle `alice.coves.social` federates as `alice`. Any other
+      handle federates as the full handle: `bretton.dev` becomes
+      `@bretton.dev@coves.social`, and `alice.bsky.social` becomes
+      `@alice.bsky.social@coves.social` (the bridgy-fed precedent).
+      Lemmy 0.19.20 applies no charset restriction to remote WebFinger
+      resolution, and its mention regex accepts dots, so dotted local parts
+      work. Hyphenated local parts resolve through search and WebFinger, but
+      Lemmy's in-text mention regex does not match them; this only affects
+      display. Lemmy stores a remote `preferredUsername` as `varchar(255)`, so
+      local parts are capped to fit. Collisions get deterministic `-2`, `-3`
+      suffixes.
+    - The local part is fixed when the actor is created, which is the DID's
+      first federating interaction. A later handle change updates only the
+      served display name, so remote mentions and search keep working. There
+      is no way to change an existing address. `ap_actors` holds one row per
+      DID, and a destructive withdrawal cannot be undone, so deleting the
+      presence does not free the name for a new one.
+    - `ap_actors` stores each actor's full actor id, origin included. Serving,
+      WebFinger, keyIds and outbound signing all derive from the stored id,
+      never from a global origin constant. Per-user custom-domain federation
+      (`@alice@bretton.dev`, for a user who proxies `/.well-known/webfinger` and
+      `/ap/*` from their domain to the bridge) can therefore be added later as
+      new rows with a different origin and no migration. It is deferred because
+      it needs web configuration on the user's side, and moving an existing
+      actor to a new origin is an AP identity change: remote instances see a
+      new account. Default-origin assignments are permanent either way.
+    - Local parts are unique per `(normalized_origin, local_part)`, not
+      globally, in one namespace shared with future Group actors (Scope B).
+      Every lookup carries the origin.
+    - Actors are `Person` documents with ids keyed by DID, so they stay stable
+      across handle changes: actor `{origin}/ap/actor/{did}`, objects
+      `{origin}/ap/object/{did}/{collection}/{rkey}`, one shared inbox
+      `{origin}/ap/inbox` (`internal/personas`).
+    - Caddy on coves.social proxies `/.well-known/webfinger`,
+      `/.well-known/nodeinfo`, `/ap/*`, and Accept-negotiated `GET /` (the
+      instance actor, type `Application`, which avoids Lemmy's Instance-enum
+      parsing trap) to the Tidepool container. tdpl.io stays the service origin
+      for the inbound direction. Tidepool serves both origins from one listener
+      and routes by Host header.
+11. Federation is on by default for native users, with a two-tier opt-out
+    stored as a repo record. Only interactions with bridged communities ever
+    federate. Posting into a community that visibly lives on Lemmy is the
+    consent act, unlike whole-account mirroring (the Bridgy Fed case), so the
+    UI's job is disclosure rather than collecting consent. Mechanics:
+    - Any DID that Tidepool did not mint federates when it interacts with a
+      bridged community, unless it has opted out.
+    - The AP actor is created lazily on the DID's first federating interaction
+      (first postv2, comment or vote touching a bridged community). No
+      interaction means no fediverse identity.
+    - The opt-out is `social.coves.bridge.federation` (rkey `self`,
+      `{enabled: bool, deleteRemote?: bool}`) in the user's own repo, so it is
+      user-signed, portable and visible on the firehose. No record means
+      enabled. `enabled=false` is a soft disable: new federation stops, pending
+      outbound work is cancelled in the same transaction, and the actor document
+      stays served. `enabled=true` or deleting the record re-enables.
+    - `enabled=false, deleteRemote: true`, behind an explicit UI warning, sends
+      `Delete{Person}` with Lemmy's `removeData: true` so remote content is
+      purged. This is irreversible in practice (Lemmy restores an actor if it
+      refetches it; other software may not). A confirmed account deletion takes
+      the same path (decision 19).
+    - Content written while opted out is never federated after re-enabling.
+    - Posts by opted-out authors are rejected at admission (decision 13). They
+      have no acceptance, so they are invisible in the community view on both
+      sides, and Coves' `post.getStatus` reports the rejection. Comments by
+      opted-out users are indexed in Coves but not federated, so a split thread
+      only happens to users who chose it.
+    - Consent is checked again at delivery time, not only at enqueue. An HTTP
+      request already in flight is the one race that cannot be closed; the
+      decision 19 reconciliation job reports it.
+12. atproto first, with echo suppression. Native content commits to the user's
+    repo first, so Coves indexes it at once through the firehose. AP delivery
+    runs later from a durable outbound queue.
+    - `ap_objects.origin` (`fediverse` or `bridge`) breaks the loop: objects
+      with origin `bridge` are never re-materialized when the community
+      Announces them back (`internal/echo`).
+    - Outbound activity ids are deterministic. They derive from
+      `(at-uri, operation, per-object sequence)` and are stored in outbound
+      state. They never derive from the record CID, because Jetstream delete
+      events carry no CID. Lemmy dedupes on activity id (its
+      `received_activity` table, verified on 0.19.20), so redelivery is
+      idempotent and our own echoes are recognizable.
+    - Deterministic ids do not replace state. Deletes and Undo are built from
+      the stored outbound state row (decision 14). Lemmy matches `Undo{vote}`
+      by actor and object and requires the full inner vote embedded, not the
+      activity id.
+    - Delivery workers treat Lemmy's duplicate-activity error as success, since
+      a crash between delivery and marking it delivered causes a redelivery.
+13. Tidepool is the acceptance engine for bridged communities
+    (`internal/accept`, `internal/acceptrec`). A native user posts to a bridged
+    community by writing `social.coves.community.postv2` into their own repo
+    through their own OAuth session. Tidepool never sees the write directly. It
+    arrives through the Jetstream consumer (decision 14). Tidepool holds the
+    community's key, runs admission, and writes a
+    `social.coves.community.acceptance` record into the bridged community's
+    repo. Community views render from acceptance records only, so acceptance is
+    the visibility gate on both sides.
+    - Admission policy for bridged communities: the author is a native DID that
+      has not opted out and is not paused (decision 11; the actor is created on
+      first acceptance); the author is not banned in the community (decision
+      18's Block state); the parent is not locked; a title is present and fits
+      200 characters after truncation rules. Lemmy requires `name`, while the
+      postv2 title is optional, so media-only posts without a title are
+      rejected with their own recorded reason.
+    - Acceptance mechanics match Coves' engine. The rkey is the unpadded
+      lowercase base32 of SHA-256 of the canonical subject at-uri (52
+      characters). The strongRef pins URI and CID. When the author edits, the
+      CID changes, admission runs again, the same rkey is repinned to the new
+      CID, and `Update{Page}` is enqueued. A diff that touches only
+      `bridgedStats` is repinned at once without re-admission (Coves' PRD
+      §5.5 exception; Tidepool's own inbound vote sweeps use it, decision 20).
+    - The `Create{Page}` enqueue runs as a transactional side effect of the
+      acceptance commit (`PutRecordTx`), so acceptance and enqueue are atomic
+      and posts that were not accepted never reach Lemmy. Moderation uses a
+      multi-op commit (`ApplyOpsTx`): deleting the acceptance and writing the
+      removal happen in one commit, as Coves does with `applyWrites`, so the
+      firehose never carries a half-finished moderation action.
+    - When the author deletes their post (Jetstream tombstone), Tidepool
+      deletes the acceptance without writing a removal, because an author's
+      deletion is not moderation, and enqueues a Delete to Lemmy from outbound
+      state.
+    - Blobs in native posts live on the author's PDS. Outbound image
+      attachments are not built: image embeds are dropped
+      (`internal/apobject/object.go` `linkAttachment`). See FOLLOWUPS.md.
+    - Comments and votes stay in users' own repos and also arrive through
+      Jetstream.
+    - Coves' acceptance consumer fetches an unindexed subject directly from the
+      author's PDS with `com.atproto.repo.getRecord` and verifies the pinned
+      CID. Tidepool serves that endpoint for its hosted repos
+      (`internal/sync`), which lets bridged-author posts reach Coves without
+      full relay coverage.
+14. One Jetstream consumer with durable outbound state (`internal/consume`).
+    The consumer persists its cursor per consumer version, tolerates
+    Jetstream's full replay on a quiet stream, and ports the Coves connector's
+    discipline: record-revision gates and a persistent dead-letter store with
+    redrive. It handles:
+    - the federation opt-out lifecycle, plus lazy actor creation on a DID's
+      first federating interaction;
+    - `actor.profile`, which only refreshes the served actor document. Lemmy
+      has no `Update{Person}` handler (verified on 0.19.20 and 1.0 main) and
+      refreshes remote profiles through its own refetch within 24 hours, so
+      Tidepool does not deliver an activity Lemmy would reject;
+    - `community.postv2` targeting a bridged community, which goes to the
+      acceptance engine (decision 13);
+    - `community.comment` in bridged communities by authors who have not opted
+      out, which becomes `Create`, `Update` or `Delete{Note}`;
+    - `feed.vote` on bridged subjects, with the same opt-out gate, which
+      becomes `Like`, `Dislike` or `Undo`;
+    - `#account` lifecycle events (decision 19).
+
+    Jetstream delete events carry no record body or CID, so every create and
+    update handler stores an outbound state row keyed by at-uri (AP object id,
+    last CID, community target, translated snapshot, last activity id). Votes
+    have their own state keyed by `(actor_did, subject_at_uri)` (direction,
+    current activity id, delivered status). Deletes and Undo are built from
+    that state inside a transaction. The consumer skips all Tidepool-hosted
+    repos, because their outbound work is enqueued at write time (decision 13).
+15. The outbound queue follows the inbound queue's discipline and is split into
+    canonical activities and per-inbox deliveries (`internal/outbound`).
+    - `outbound_activities` holds one canonical payload per activity id.
+      `outbound_deliveries` holds one row per `(activity, target inbox)` with
+      its own claim, attempt and poison state. A single globally unique
+      activity row could not represent the fan-out that `Delete{Person}` and
+      Scope B need.
+    - Delivery is at-least-once with stable ids the receiver can see.
+    - Ordering is per community, plus explicit causal parent dependencies. A
+      child is not eligible until its parent's mapping and delivery state
+      exist. A poisoned parent poisons its descendants with a distinct reason.
+    - Claims are fenced with `claimed_until`. Retries use exponential backoff.
+      Failures are classified into a poison taxonomy. A 429 is retried with
+      backoff; outbound has no per-host rate limiter of its own.
+    - Target inboxes come from the community Group's actor document, cached
+      with a TTL and refreshed once on 404 or 410 before a delivery is
+      poisoned, so an endpoint change does not become poison. A 401 is retried
+      as an auth failure. Unfollowing a community does not cancel its pending
+      deliveries; cancel them with `POST /admin/outbound/cancel` or park them
+      with the per-community kill switch.
+    - Each native actor signs with its own RSA key, sealed under `BRIDGE_KEK`
+      (`internal/identity/actor_rsa.go`). The key version columns exist, but
+      rotating one actor's key is not built. The inbound service actor's RSA key
+      is still stored as plaintext PEM.
+    - The wire format follows pinned Lemmy 0.19.20: draft-cavage RSA-SHA256
+      signing `(request-target) host date digest`, Digest required, a one-hour
+      expiry window. A Page is addressed `to: [group, as:Public]`; a Note is
+      addressed `to: [as:Public]`, `cc: [group]`. Both carry
+      `audience: group`, a single-string `attributedTo`, HTML `content` and
+      markdown `source`. Person actors include `outbox` and are type `Person`,
+      because Lemmy rejects votes from `Service` actors as bots.
+    - Delivery is FEP-1b12: activities go to the community Group's inbox, and
+      Lemmy fans out the Announce. Announces come back to Tidepool only because
+      the inbound service actor follows every bridged community. That Follow is
+      also the outbound side's return channel, so it must stay in place.
+16. Native votes are `social.coves.feed.vote` records in users' repos, read
+    from Jetstream and sent out per actor. Inbound fediverse votes still never
+    become records (decision 7). The outbound vote row from decision 14, keyed
+    `(actor_did, subject_at_uri)`, holds the current intended vote and its
+    delivery state. The direction changes when the new vote is queued, not
+    when it is delivered; FOLLOWUPS.md lists the recast and reseed gaps this
+    leaves.
+    - The aggregator drops echoes of our own outbound Like and Dislike ids.
+    - Outbound Undo embeds the full inner vote rebuilt from state. Lemmy
+      matches by actor and object and fails to parse an Undo whose object is a
+      bare URL (verified).
+    - The Lemmy API count seeder subtracts the delivered tallies under the
+      same aggregate lock as inbound votes, so a re-seed does not count our
+      own votes twice in the normal case.
+    - Counting queue history ("delivered Likes minus Undos") is not the
+      mechanism, because it cannot model flips, poison or multiple
+      destinations.
+    - Known Lemmy 1.0 risk: per-instance `FederationMode` can silently drop
+      remote votes, upvotes included. Divergence is reported in metrics rather
+      than worked around.
+17. Scope B guardrails. Everything in the reverse direction is kind-agnostic:
+    `ap_actors` carries a kind (person or group), AP URL shapes and the shared
+    inbox do not encode kind, the WebFinger local-part namespace is shared, the
+    acceptance engine's admission policy is configured per community kind, and
+    outbound translation dispatches on collection. Adding Group actors for
+    Coves-native communities must not need a schema or URL migration.
+18. Inbound moderation of native content uses its own authorization rule.
+    For fediverse content, an announced Delete is authorized by repo membership
+    in the announcing community: posts by `mapping.DID`, comments by their
+    thread root's repo, plus a curated-follow allowance for targets with no
+    mapping yet (`internal/ingest/consent.go`). Host authority
+    (`SameAuthority`) applies only on the bare-delete path.
+    Neither rule can authorize a Lemmy Group moderating an object from
+    coves.social. A native object has no Lemmy community mapping to be a member
+    of, and its host is ours, not the moderator's. The unmapped allowance must
+    not be extended to it; that allowance exists to close the
+    delete-before-create race for content the community already owns.
+    - Native content gets its own rule: the verified Announce signer must be
+      the followed community Group that owns the target's community mapping.
+    - The moderation activities handled are a `Delete` with a `summary` and
+      its `Undo`, `Lock`/`Undo{Lock}`, and `Block`/`Undo{Block}`. `Remove` is
+      not handled.
+    - Lemmy's Delete-summary convention applies: a `summary` that is present,
+      even empty, means a moderator removal; an absent one means a self-delete.
+      Tidepool's outbound self-deletes omit `summary`, or Lemmy would check them
+      as a failed moderator action (verified on 0.19.20).
+    - A moderated native post is not deleted anywhere. The post lives in the
+      author's repo, which Tidepool cannot touch. Moderation acts on the
+      acceptance state Tidepool owns: one multi-op commit in the community repo
+      deletes the acceptance and writes a `social.coves.community.removal`
+      record (digest rkey, `code` from its open knownValues set such as
+      `moderator-discretion` or `author-banned`). A removal is scoped to the
+      URI and stands across author edits. `Undo{Delete}` restores the post with
+      one commit that deletes the removal and writes a fresh acceptance.
+    - A moderated native comment is recorded bridge-side under the same removal
+      code (`internal/ingest/moderation.go`). Nothing is written to the
+      community repo, because the removal lexicon covers posts only. Extending
+      it to comments is a cross-repo item with Coves.
+19. Account lifecycle, support matrix and rollout safety.
+    - An `#account` event's status is not proof of deletion. Temporary states
+      (deactivated, suspended, takendown, throttled) pause the actor's
+      outbound work. Only a confirmed permanent deletion (status `deleted`,
+      re-checked against the DID's current PDS and PLC state) triggers the
+      terminal `Delete{Person}` (`internal/optout`).
+    - Support matrix. Lemmy 0.19.20 is the pinned strictness ceiling and the
+      e2e target. Mbin is covered by hand-built fixtures for link posts only.
+      PieFed is untested: there are no captured fixtures. Its votes arrive from
+      anonymous per-user actors, which is fine for tallies. Pylova is untested.
+      Lemmy 1.0-beta is tracked but not targeted (vote `FederationMode`, inbox
+      collapsing, NoteWrapper).
+    - Rollout safety. Outbound has global, per-host, per-community and
+      per-actor kill switches and a dry-run mode that claims and logs each
+      delivery without sending (`internal/outbound/switches.go`). Translation
+      already happened when the activity was queued. These are read at
+      boot. The admin API can inspect, redrive and cancel the outbound queue
+      (`/admin/outbound`). A reconciliation job compares atproto state with
+      outbound state and reports divergence without changing anything
+      (`/admin/divergence`).
+    - Initial actor announcements need deliberate throttling: each new actor
+      costs Lemmy a WebFinger and actor fetch back at coves.social, so a mass
+      backfill from one host would flood it. Outbound has no announcement rate
+      limiter. The levers are `OUTBOUND_WORKERS` and the scoped kill
+      switches.
+    - Defederation coupling. Lemmy blocks are per domain, and the bridge
+      presents two domains with different jobs: users at coves.social and the
+      community-following reader at tdpl.io. Blocking one leaves a silent
+      half-federated split; for example, with coves.social blocked, reads keep
+      flowing while users' posts disappear from their own view. Policy: when
+      a block of either origin is detected, stop both directions for that
+      host. The per-host kill switch only stops outbound; stopping inbound
+      means unfollowing that host's communities. A bridge that
+      half-honors defederation looks like block evasion, and that perception is
+      the real defederation risk. Lemmy does not federate its blocklist, so
+      detection is empirical: delivery rejections, rejected follows, and inbox
+      403 spikes in the reconciliation metrics. Detection does not engage the
+      switch automatically; an operator sets it.
+20. Inbound posts are written as `postv2` plus acceptance; older posts are left
+    in place. This supersedes decision 3's post placement.
+    - The materializer writes each new bridged post as
+      `social.coves.community.postv2` into the bridged author's repo, the same
+      placement as comments, with the same deterministic TID rkeys. The record
+      has no `author` field; the repo is the author. Tidepool fills
+      `originalAuthor` and `federatedFrom` (both unconstrained in the lexicon,
+      so Tidepool defines their shape) and `bridgedStats`.
+    - Every post materialization then writes the acceptance record into the
+      community repo (digest rkey, strongRef with CID). Parents-first ordering
+      becomes: author profile, then postv2, then acceptance.
+    - Lemmy moderator removals of fediverse posts use decision 18's
+      acceptance-delete plus removal commit instead of deleting the record.
+      Upstream edits repin the acceptance. Tidepool's `bridgedStats` vote
+      sweeps use the bridgedStats-only repin with no re-admission.
+    - Coves trusts bridged posts by the author repo's PDS, so Tidepool's hosts
+      must be listed in Coves' `TRUSTED_BRIDGE_PDS_HOSTS`.
+    - Existing bridged posts in the legacy `social.coves.community.post`
+      collection are not migrated. Both collections coexist in Coves, every
+      path that depends on the era (edit, delete, moderation, vote sweep)
+      dispatches on the mapping's collection, and no legacy record is
+      rewritten. As a result, Coves' legacy consumer branch stays live while
+      bridged legacy posts exist, which Coves has accepted. A migration would
+      need a remap decision from Coves and an old-to-new ledger; it is
+      recorded in [FOLLOWUPS.md](FOLLOWUPS.md), and nothing depends on it.

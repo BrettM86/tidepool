@@ -30,7 +30,7 @@
 # half-configured. The staged-rollout order, the kill switches and the
 # coves.social Caddy changes are in DEPLOY.md.
 #
-# Ops note (README "Sync surface"): the bridge's per-IP rate limiters key on
+# Ops note (docs/PROTOCOL.md "Sync surface"): the bridge's per-IP rate limiters key on
 # RemoteAddr and see only Caddy's container IP from behind the proxy —
 # per-IP limits degrade to global ones until rate limiting exists at the
 # Caddy edge. Tracked in FOLLOWUPS.md; acceptable at current scale.
@@ -143,14 +143,14 @@ services:
       # --- v2 (tasks 13-17): the native-user surface and the outbound half ---
       #
       # REQUIRED IN PRODUCTION. config.stringVar refuses an unset value outside
-      # development (internal/config/config.go:797-806), so a HEAD deploy onto
+      # development (internal/config/config.go), so a HEAD deploy onto
       # an env file without this dies at boot with
       #   config: AP_USER_ORIGIN is required in production
       # — fail-closed, and deliberately so: this origin is baked into every
       # actor_id this deployment mints, so a wrong value is not a restart away
       # from fixed, it is a set of federated identities pointing at the wrong
-      # place forever. Must be https in production (config.go:782-784) and must
-      # not be BRIDGE_HOSTNAME or a subdomain of it (config.go:786-790), which
+      # place forever. Must be https in production (validateUserOrigin) and must
+      # not be BRIDGE_HOSTNAME or a subdomain of it (also validateUserOrigin), which
       # would shadow the bridged-handle namespace.
       #
       # Serving derives every URL from the stored actor_id, never from this
@@ -160,7 +160,7 @@ services:
 
       # The Jetstream consumer: native Coves users' records flowing OUTWARD.
       # Default off. Staged here ahead of the flag on purpose — JETSTREAM_URL is
-      # validated whenever it is set (config.go:481-489), not only when the
+      # validated whenever it is set (config.Load), not only when the
       # consumer is on, so a typo is a boot failure with a clear message today
       # rather than a silent reconnect loop on the day someone flips the switch.
       #
@@ -173,7 +173,7 @@ services:
       JETSTREAM_URL: ${JETSTREAM_URL:-ws://tidepool-prod-jetstream:8080/subscribe}
 
       # Delivery workers. 0 = OFF, and it is AND-gated on CONSUMER_ENABLED
-      # (cmd/tidepool/main.go:716, 843) — there is no OUTBOUND_ENABLED. With the
+      # (run and startConsumer in cmd/tidepool/main.go) — there is no OUTBOUND_ENABLED. With the
       # consumer on and workers at 0 the real enqueuer still writes
       # outbound_activities/deliveries, so intent accumulates durably and starts
       # draining the moment workers are raised. That is the intended staging
@@ -185,12 +185,12 @@ services:
       # :236-242) — never poisoned, never cancelled, so engaging one loses
       # nothing. DRY_RUN parks too, after translating and logging.
       #
-      # ALL OF THESE ARE READ ONCE AT BOOT (config.Load, main.go:109); there is
+      # ALL OF THESE ARE READ ONCE AT BOOT (config.Load); there is
       # no reload signal. Changing one means editing /opt/tidepool/.env and
       # recreating the service.
       #
       # HOSTS is lowercased on load; COMMUNITIES and ACTORS are matched EXACTLY
-      # and case-sensitively (config.go:519-525). Communities are AP ids
+      # and case-sensitively (parseHostSet and parseSet). Communities are AP ids
       # ("https://lemmy.world/c/comicstrips"), matched against the delivery's
       # ordering key; actors are DIDs. There is no allowlist form — a canary is
       # expressed by disabling every community except the one under test.
@@ -206,16 +206,16 @@ services:
       ADMISSION_MAX_PER_AUTHOR_PER_COMMUNITY: ${ADMISSION_MAX_PER_AUTHOR_PER_COMMUNITY:-50}
 
       # The reconciliation sweep (task 17e). It is wired UNCONDITIONALLY
-      # (main.go:491-506) and sweeps once at startup before its first tick, so
+      # (ingest.NewDivergenceReconciler in run) and sweeps once at startup before its first tick, so
       # this interval is not an on/off switch — durationVar refuses 0 or
-      # negative (config.go:666-668). It writes nothing, to peers or to our own
+      # negative (durationVar). It writes nothing, to peers or to our own
       # tables, which is what makes an always-on schedule safe. The only way to
       # quiet it is a large interval; see DEPLOY.md "Not implemented".
       DIVERGENCE_INTERVAL: ${DIVERGENCE_INTERVAL:-15m}
       # How long a pending delivery may sit before the sweep calls its
       # acceptance stale. The report's one crying-wolf knob; 12h is derived from
       # the retry schedule plus the causal wait budget (internal/ingest/
-      # divergence.go:72-81), not picked.
+      # divergence.go), not picked.
       DIVERGENCE_ACCEPTANCE_STALE_AFTER: ${DIVERGENCE_ACCEPTANCE_STALE_AFTER:-12h}
 
       # Bridged handle resolution over DNS (docs PRD_HANDLE_DNS). Empty

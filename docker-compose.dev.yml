@@ -137,7 +137,7 @@ services:
       - plc
 
   # Jetstream pointed at the bridge's own firehose — the task-04 integration
-  # proof (`make jetstream-up`; runbook in README "Verifying with Jetstream").
+  # proof (`make jetstream-up`; runbook in docs/E2E.md "Manual Jetstream check").
   # The bridge runs on the HOST (make run), so Jetstream reaches it via
   # host.docker.internal (mapped for Linux too via extra_hosts).
   jetstream:

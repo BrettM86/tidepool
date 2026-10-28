@@ -1,57 +1,59 @@
-# Self-hosted relay + Jetstream (the app's ingest path)
+# Self-hosted relay and Jetstream
 
-## Why this exists
+Production runs its own indigo relay and Jetstream so that every commit from
+our two PDS hosts reaches Coves, whatever quota bsky.network applies. This
+file is the runbook for that ingest path. The full deploy (config gate,
+`CONSUMER_ENABLED`/`OUTBOUND_WORKERS` staging order, coves.social Caddy
+change, rollout and rollback) is in [`DEPLOY.md`](DEPLOY.md). The reasons
+behind individual settings are comments on the compose services.
 
-Diagnosed 2026-07-16: bsky.network caps a new PDS at **100 accounts**
-(plus ~50 ev/s per-host stream consumption). tdpl.io mints one repo per
-bridged fediverse user and was at ~950 repos; every account past the
-quota reports `{"active":false,"status":"throttled"}` from the public
-relay and its commits are **silently dropped** — they never reach the
-Bluesky-run Jetstream instances the Coves AppView consumes. Symptom
-that surfaced it: a bridged thread showing "1 comment" (an orphaned
-reply from one of the ~90 active accounts) with an empty comment tree —
-28 of 29 commenters were throttled. Even active accounts lagged ~1.3 h
-behind the PDS due to the consumption throttle.
+## Why
 
-The fix: Coves' completeness must not depend on a third party's quota.
-The `relay` and `jetstream` services in `docker-compose.prod.yml` form a
-private ingest path that carries ONLY our two PDS hosts:
+bsky.network caps a new PDS at 100 accounts and about 50 events per second
+of stream consumption (diagnosed 2026-07-16). tdpl.io mints one repo per
+bridged fediverse user and had about 950 repos. Every account past the quota
+reports `{"active":false,"status":"throttled"}` on the public relay, and its
+commits never reach the Bluesky-run Jetstream instances. The symptom was a
+bridged thread showing "1 comment" with an empty comment tree: 28 of its 29
+commenters were throttled. Active accounts also lagged about 1.3 hours behind
+the PDS because of the consumption throttle.
+
+`pds.coves.me` is included because it has its own 100-account cap at
+bsky.network. Without it, native Coves signup number 101 would disappear from
+the app the same way.
+
+## Layout
+
+The `relay` and `jetstream` services in `docker-compose.prod.yml` carry only
+our two PDS hosts:
 
 ```
 tdpl.io ──────────┐
-                  ├─► relay (:2470, host-local) ─► jetstream (:8080, internal) ─► Coves @self consumers
+                  ├─► relay (:2470, host-local) ─► jetstream (:8080, internal) ─► Coves "self" feed
 pds.coves.me ─────┘
 
-tdpl.io / pds.coves.me ─► bsky.network ─► jetstream2.us-east ─► Coves @bsky consumers   (unchanged; public visibility + third-party PDS records)
+tdpl.io / pds.coves.me ─► bsky.network ─► jetstream2.us-east ─► Coves "bsky" feed
+whole network ─► relay.fire.hose.cam ─► jetstream.fire.hose.cam ─► Coves "fire" feed
 ```
 
-`pds.coves.me` is included deliberately: it has its own 100-account cap
-at bsky.network, so native Coves signup #101 would silently vanish from
-the app exactly like the bridged commenters did.
+Coves reads all three feeds through `JETSTREAM_FEEDS` in its
+`docker-compose.prod.yml`
+(`self=ws://tidepool-prod-jetstream:8080` over `coves-prod-network`). Coves
+rev-gates each repo's commits, so the overlapping feeds do not reorder or
+resurrect records. Expect `rev-gate: skipped stale` lines in Coves logs for
+whichever copy arrives later.
 
-Design decisions and their reasons live as comments on the compose
-services; this file is the runbook for the **ingest** path only. The v2
-deploy — config gate, the `CONSUMER_ENABLED`/`OUTBOUND_WORKERS` staging
-order, the coves.social Caddy change, rollout and rollback — is
-[`DEPLOY.md`](DEPLOY.md).
+Tidepool's own consumer reads the same Jetstream over `JETSTREAM_URL`
+(`ws://tidepool-prod-jetstream:8080/subscribe`). Port 8080 is
+`JETSTREAM_ADDR`. Port 6060 is the debug listener and serves no `/subscribe`.
 
-Note the direction: this file describes the relay and Jetstream that feed
-**Coves**. Tidepool's own consumer reads the same Jetstream from the other
-side, over `JETSTREAM_URL`
-(`ws://tidepool-prod-jetstream:8080/subscribe`, :8080 = `JETSTREAM_ADDR`;
-:6060 is the debug listener and serves no `/subscribe`).
+| Service | Container | Ports | Volume |
+| --- | --- | --- | --- |
+| `relay` | `tidepool-prod-relay` | `127.0.0.1:2470` (API, admin UI), `:2471` metrics on the internal network | `relay-data` |
+| `jetstream-init` | `tidepool-prod-jetstream-init` | none; one-shot `chown` of the volume to uid 65532 | `jetstream-data` |
+| `jetstream` | `tidepool-prod-jetstream` | `:8080` `/subscribe`, `:6060` debug, both internal only | `jetstream-data` |
 
-## Not in scope here (Phase 2+, Coves repo)
-
-- Pointing Coves' consumers at `ws://tidepool-prod-jetstream:8080/subscribe`
-  (second consumer set, distinct consumer names).
-- **Rev-gating in the consumers must land first** — dual feeds break the
-  per-repo ordering the handlers assume; without gating on the commit
-  `rev`, a stale cross-feed create resurrects deleted comments and a
-  stale update clobbers newer content.
-- `POST /admin/reemit` backfill of records the public relay discarded.
-
-## Deploy (first time)
+## First deploy
 
 On the box (`/opt/tidepool`), after `git pull`:
 
@@ -61,18 +63,19 @@ On the box (`/opt/tidepool`), after `git pull`:
    RELAY_ADMIN_PASSWORD=<openssl rand -hex 32>
    ```
 
-2. Build + start (targeted services only — never bare `up -d`):
+2. Build and start the relay. Start only the named service. Never run a bare
+   `up -d`.
 
    ```
    docker compose -f docker-compose.prod.yml up -d --build relay
    ```
 
-   The build context is a pinned upstream git SHA; docker fetches it
-   directly. Wait for healthy: `docker inspect -f '{{.State.Health.Status}}' tidepool-prod-relay`
+   The build context is a pinned upstream git SHA, which docker fetches
+   directly. Wait until it is healthy:
+   `docker inspect -f '{{.State.Health.Status}}' tidepool-prod-relay`
 
-3. One-time host bootstrap (this replaces a RELAY_HOSTS announcement —
-   Tidepool's production requestCrawl egress is SSRF-guarded and
-   correctly refuses the relay's private address):
+3. Add the two hosts by hand. Tidepool's `requestCrawl` announcement cannot
+   do this, because its SSRF guard refuses the relay's private address.
 
    ```
    curl -s -X POST localhost:2470/xrpc/com.atproto.sync.requestCrawl \
@@ -81,21 +84,22 @@ On the box (`/opt/tidepool`), after `git pull`:
      -H 'Content-Type: application/json' -d '{"hostname":"pds.coves.me"}'
    ```
 
-   The relay validates each host by calling back into its public
-   `describeServer` over https (hairpin through Caddy), then subscribes.
-   The host table persists in the `relay-data` volume — restarts do NOT
-   need re-announcement, only a volume wipe does.
+   The relay checks each host by calling its public `describeServer` over
+   https (back through Caddy), then subscribes. The host table lives in the
+   `relay-data` volume. Restarts do not need this step again. A volume wipe
+   does.
 
-4. Verify the relay is consuming both hosts:
+4. Check that the relay is consuming both hosts:
 
    ```
    curl -s 'localhost:2470/xrpc/com.atproto.sync.listHosts' | jq .
    curl -s 'localhost:2470/xrpc/com.atproto.sync.getHostStatus?hostname=tdpl.io' | jq .
    ```
 
-   Expect both hosts `active` with advancing `seq`, and accountCount
-   ≈ the PDS's repo count (NOT capped at 100 — `RELAY_DEFAULT_ACCOUNT_LIMIT`
-   is set effectively unlimited; only our own hosts can ever be added).
+   Both hosts should be `active` with an advancing `seq`, and `accountCount`
+   should be close to the PDS's repo count, not capped at 100.
+   `RELAY_DEFAULT_ACCOUNT_LIMIT` is 10000000. That is safe only because the
+   relay holds no hosts but ours.
 
 5. Start Jetstream:
 
@@ -103,18 +107,19 @@ On the box (`/opt/tidepool`), after `git pull`:
    docker compose -f docker-compose.prod.yml up -d jetstream
    ```
 
-   First boot on an empty volume bootstrap-backfills: `listHosts` on the
-   relay, then `listRepos`/`getRepo` directly against each PDS over https
-   (public addresses only), with `/subscribe` answering 503 until it
-   finishes (minutes at our scale). Watch `docker logs -f tidepool-prod-jetstream` until it
-   settles into live tailing.
+   On an empty volume, Jetstream first backfills. It calls `listHosts` on
+   the relay, then `listRepos` and `getRepo` against each PDS over https
+   (public addresses only). `/subscribe` answers 503 until the backfill
+   finishes, which takes minutes at our scale. Watch
+   `docker logs -f tidepool-prod-jetstream` until it switches to live
+   tailing.
 
-6. End-to-end proof (verified at deploy, 2026-07-17). Jetstream is not
-   on a host port; probe from a throwaway container on the internal
-   network. Two gotchas learned the hard way: websocat's `-E` exits on
-   stdin EOF — over non-interactive SSH that's instantly, making a
-   healthy stream look empty (use `-U`); and a `cursor` older than the
-   stored window replays nothing (pick one inside it).
+6. Check end to end (done at the first deploy, 2026-07-17). Jetstream has no
+   host port, so probe it from a throwaway container on the internal
+   network. Use websocat's `-U`. Its `-E` exits on stdin EOF, which over
+   non-interactive SSH happens at once and makes a healthy stream look
+   empty. Pick a `cursor` inside the stored window. An older cursor replays
+   nothing.
 
    ```
    # replay recent events (cursor is µs since epoch)
@@ -122,40 +127,40 @@ On the box (`/opt/tidepool`), after `git pull`:
    docker run --rm --network tidepool-prod-internal solsson/websocat \
      -U "ws://jetstream:8080/subscribe?cursor=$cursor" | head -c 2000
 
-   # relay-side truth: events received from PDSs vs sent to jetstream
+   # relay side: events received from PDSs vs sent to jetstream
    docker run --rm --network tidepool-prod-internal curlimages/curl -s \
      http://relay:2471/metrics | grep -E "events_(received|sent)_counter"
 
-   # jetstream-side: subscriber gauge + its own metrics
+   # jetstream side: subscriber gauge and its own metrics
    docker run --rm --network tidepool-prod-internal curlimages/curl -s \
      http://jetstream:6060/metrics | grep jetstream_subscribe
    ```
 
-   The clincher: pick a `did` from the replayed events and check
-   `bsky.network/xrpc/com.atproto.sync.getRepoStatus?did=...` — for a
-   throttled account, that event is provably absent from the public
-   path, so seeing it here proves the quota bypass works. (At deploy,
-   a live bridged comment from a throttled account came through within
-   minutes of starting the tap.)
+   To prove the quota bypass, take a `did` from the replayed events and
+   check `bsky.network/xrpc/com.atproto.sync.getRepoStatus?did=...`. If that
+   account is throttled there, its event is missing from the public path,
+   so seeing it here shows this path works. At the first deploy, a bridged
+   comment from a throttled account came through within minutes.
 
-   Note the relay live-tails the PDSs from "now" — it does NOT replay
-   history that predates its first subscription (the same cold-start
-   property bsky.network has). Pre-existing records reach Coves via
-   `POST /admin/reemit` in Phase 3, not via this pipeline's backlog.
+   The relay tails the PDSs from the moment it subscribes. It does not
+   replay older history, the same as bsky.network on a cold start. Records
+   that predate the subscription reach Coves through `POST /admin/reemit`
+   (see the [admin API](docs/ADMIN_API.md)), not through this path.
 
 ## Ongoing ops
 
-- **Never** expose 2470/8080 publicly; never run `relay pull-hosts`.
-  The relay having only our hosts is a property the whole design leans
-  on (unlimited account quota is safe ONLY because of it).
-- Upgrades: bump the pinned SHA in the compose `build.context`, then
-  `build` and `up -d --no-deps relay` (or `jetstream`). For Jetstream,
-  stop it and copy `jetstream-data` before the new version first starts:
-  a newer Jetstream can change the data dir so the old one no longer
-  resumes, and the copy is the only rollback.
-- Disk: relay keeps a 72 h replay window under `relay-data`; jetstream
-  keeps its own store under `jetstream-data`. Both are trivial at two
-  hosts' volume.
-- Debug surface: `localhost:2470` also serves the relay admin web UI
-  (login with `RELAY_ADMIN_PASSWORD`) and `/metrics` on the internal
-  `:2471`.
+- Never expose 2470 or 8080 publicly. Never run `relay pull-hosts`. The
+  unlimited account quota is safe only while the relay holds just our hosts.
+- Upgrades: bump the pinned SHA in the service's `build.context`, then run
+  `docker compose -f docker-compose.prod.yml build relay` and
+  `docker compose -f docker-compose.prod.yml up -d --no-deps relay` (or the
+  same for `jetstream`). Before a new Jetstream version first starts, stop
+  Jetstream and copy the `jetstream-data` volume. A newer Jetstream can
+  change the data dir so the old version no longer resumes from it, and the
+  copy is the only rollback.
+- Disk: the relay keeps a 72-hour replay window (`RELAY_REPLAY_WINDOW`) in
+  `relay-data`. Jetstream keeps its own store in `jetstream-data`. Both are
+  small at two hosts' volume.
+- Debugging: `localhost:2470` also serves the relay admin web UI (log in
+  with `RELAY_ADMIN_PASSWORD`). Relay metrics are on `:2471` inside the
+  internal network.

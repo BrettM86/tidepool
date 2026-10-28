@@ -27,7 +27,7 @@ import (
 //     lands here because of the wildcard DNS, and WellKnownDIDHandler answers
 //     from the Host header.
 //
-// The DNS requirement is documented in the README.
+// The DNS requirement is documented in HANDLE_SCHEME.md.
 
 // Resolver answers "which DID owns this bridged handle". Implemented by
 // StoreResolver; an interface so the HTTP handlers are testable without

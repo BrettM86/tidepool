@@ -26,7 +26,7 @@ type RepoReemitter interface {
 // AppView consuming the re-emitted stream needs a community's profile
 // indexed before its posts arrive (and an author's profile before their
 // comments), or the content lands with dangling references. Cross-repo
-// order is relay-dependent regardless (see README), so this is best-effort
+// order is relay-dependent regardless (see docs/E2E.md), so this is best-effort
 // within one repo, not a delivery guarantee.
 //
 // The tiers are what references what: profiles are referenced by everything,

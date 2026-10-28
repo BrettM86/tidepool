@@ -1,62 +1,59 @@
 # Deploying Tidepool v2
 
-The production runbook for the v2 surface: native Coves users federating
-outward (tasks 13–17), on top of the v1 inbound bridge that is already running.
+The production runbook for outbound federation: native Coves users posting,
+commenting and voting into bridged Lemmy communities. It runs on top of the
+inbound bridge. The outbound path is fully built (Jetstream consumer, delivery
+workers, acceptance engine, moderation, erasure) and is gated by
+`CONSUMER_ENABLED` and `OUTBOUND_WORKERS`.
 
-**This document describes what is in the code, not what was planned.** Where a
-lever does not exist, it says so under [Not implemented](#not-implemented)
-rather than describing a plausible one. A runbook that names a knob nobody
-built is worse than one admitting the knob is missing, because it sends an
-operator hunting for it during an incident. Every claim below cites the file it
-came from; if you change the code, change the citation.
+Communities created natively on Coves do not federate yet. That is planned
+work ("Scope B"); nothing in this runbook turns it on.
 
-Related: [`SELF_HOSTED_RELAY.md`](SELF_HOSTED_RELAY.md) (the relay + Jetstream
-ingest path), [`README.md`](README.md#configuration) (the full config table and
-admin route table).
+This document describes only what is in the code. Where a lever does not
+exist, [Not implemented](#6-not-implemented) says so. Claims cite the file and
+symbol they come from; if you change the code, change the citation.
+
+Related: [`SELF_HOSTED_RELAY.md`](SELF_HOSTED_RELAY.md) (relay and Jetstream
+ingest), [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) (every config
+variable), [`docs/ADMIN_API.md`](docs/ADMIN_API.md) (every admin route).
 
 ---
 
 ## 1. Read this before deploying HEAD
 
-**A HEAD deploy onto a pre-v2 `/opt/tidepool/.env` does not start.** It exits
-during `config.Load` with:
+A HEAD deploy onto a pre-v2 `/opt/tidepool/.env` does not start. It exits in
+`config.Load` with:
 
 ```
 config: AP_USER_ORIGIN is required in production
 ```
 
-`AP_USER_ORIGIN` is read through `stringVar`, which falls back to a dev default
-in development and returns an error in production
-(`internal/config/config.go:797-806`, read at `:414`). The pre-v2 env file has
-no such variable.
+`AP_USER_ORIGIN` is read through `stringVar`, which uses a dev default in
+development and returns an error in production (`internal/config/config.go`).
+The pre-v2 env file has no such variable.
 
-**This is correct behaviour and must not be "fixed" by defaulting it away.**
-The origin is baked into every `actor_id` this deployment mints; serving then
-derives every URL from the *stored* `actor_id` and never from config
-(`internal/personas/serving.go:20-23`). A wrong value is therefore not a
-restart away from repaired — it is a set of federated identities pointing at
-the wrong place, permanently. Two further boot-time guards exist for the same
-reason: it must be `https` in production (`config.go:782-784`), and its host
-must not be `BRIDGE_HOSTNAME` or a subdomain of it, which would shadow the
-bridged-handle namespace (`config.go:786-790`).
+Do not fix this by adding a default. The origin is baked into every
+`actor_id` this deployment mints, and serving derives every URL from the
+stored `actor_id`, never from config (`internal/personas/serving.go`). A wrong
+value cannot be repaired by restarting: it leaves federated identities
+pointing at the wrong place permanently. Boot also refuses an origin that:
 
-**It must also be a bare origin — no trailing slash.**
-`personas.CanonicalizeOrigin` refuses any path, query, fragment, or userinfo
-(`internal/personas/origin.go:42-46`), and `https://coves.social/` has a path
-of `/`. That is a boot failure, not a normalization.
+- is not `https` in production;
+- has a host equal to `BRIDGE_HOSTNAME` or a subdomain of it, which would
+  shadow the bridged-handle namespace;
+- has a path, query, fragment or userinfo (`personas.CanonicalizeOrigin`,
+  `internal/personas/origin.go`). `https://coves.social/` has the path `/`
+  and fails boot. Write it with no trailing slash.
 
-`docker-compose.prod.yml` enforces this at the edge too: it interpolates
-`${AP_USER_ORIGIN:?…}`, so with the variable unset or empty the deploy fails
-at `docker compose` time — before any container starts — with a message
-pointing here. There is deliberately **no compose default**: a defaulted
-origin on a fork of this compose file would silently mint permanent
-identities under someone else's domain. Add the line to `.env` (below) as
-part of the deploy.
+`docker-compose.prod.yml` interpolates `${AP_USER_ORIGIN:?…}`, so an unset or
+empty value fails at `docker compose` time, before any container starts. The
+compose file has no default on purpose: a fork of it with a default would mint
+permanent identities under someone else's domain.
 
 ### Minimum `.env` delta
 
-Nothing else is *required* — every other v2 variable has a real default in
-every environment. See `.env.prod.example` for the full annotated set.
+Every other v2 variable has a safe default. See `.env.prod.example` for the
+full annotated set.
 
 ```sh
 # required; the rest of the v2 knobs default safely
@@ -65,19 +62,20 @@ AP_USER_ORIGIN=https://coves.social
 
 ### Deploy command
 
-Unchanged, and still targeted — never a bare `up -d`:
+Always name the service. Never run a bare `up -d`:
 
 ```sh
 cd /opt/tidepool && git pull
 docker compose -f docker-compose.prod.yml up -d --build tidepool
 ```
 
-The migrate one-shot and the server share one locally-built image and the
-server only starts after `service_completed_successfully` on the migration, so
-a failed migration holds the old container up rather than starting a new one
-against an unmigrated schema.
+The migrate one-shot and the server share one locally built image. The server
+starts only after the migration reports `service_completed_successfully`, so a
+failed migration leaves the old container running instead of starting a new one
+against an unmigrated schema. The production server never migrates on start;
+outside compose, run `tidepool migrate` before starting it.
 
-Confirm the boot actually got past config:
+Confirm the boot got past config:
 
 ```sh
 docker logs --tail 50 tidepool-prod | grep -E 'listening|config:'
@@ -88,264 +86,246 @@ curl -sf localhost:8091/xrpc/_health
 
 ## 2. The v2 flag topology
 
-Everything v2 is off by default and turns on in one order. Nothing here is a
-runtime toggle: **config is read exactly once**, at
-`cmd/tidepool/main.go:109`, and there is no reload signal — changing any value
-means editing `.env` and recreating the service.
+All of v2 is off by default and turns on in this order. Config is read once,
+in `run()` (`cmd/tidepool/main.go`), and there is no reload signal. Changing
+any value means editing `.env` and recreating the service.
 
 ```
-CONSUMER_ENABLED=false                    ← nothing v2 runs. Today's state.
+CONSUMER_ENABLED=false                    ← default: nothing v2 runs.
         │
-        │  ON: the Jetstream consumer dials JETSTREAM_URL. The REAL enqueuer
-        │      persists outbound intent; the acceptance engine admits postv2
-        │      and writes community-signed acceptances; opt-out deleteRemote
-        │      and confirmed account deletions purge at peers.
-        │      /admin/admissions* comes into existence.
+        │  true: the Jetstream consumer dials JETSTREAM_URL (required when on).
+        │      The enqueuer persists outbound intent; the acceptance engine
+        │      admits postv2 and writes community-signed acceptances; opt-out
+        │      deleteRemote and confirmed account deletions purge at peers.
+        │      /admin/admissions* and /admin/actors/purge start working.
         ▼
 OUTBOUND_WORKERS=0                        ← intent accumulates, nothing is POSTed.
         │
         │  >0: delivery workers drain the queue onto the wire.
         ▼
 OUTBOUND_DISABLED / _HOSTS / _COMMUNITIES / _ACTORS / OUTBOUND_DRY_RUN
-                                          ← per-scope parking, applied per delivery.
+                                          ← per-scope parking, checked per delivery.
 ```
 
-Three properties of that diagram are load-bearing and are the ones operators
-get wrong:
+Operators most often get these points wrong:
 
-**There is no `OUTBOUND_ENABLED`.** Delivery starts only when
-`OUTBOUND_WORKERS > 0` **AND** `CONSUMER_ENABLED`
-(`cmd/tidepool/main.go:716` and `:843`, inside `startConsumer`, which is only
-called under the consumer flag at `:537`). `OUTBOUND_WORKERS` also defaults to
-**0**, via `intVarNonNegative` rather than `intVar`, precisely so that 0 is a
-legal value and not a config error (`config.go:501`, `:688-702`).
+**There is no `OUTBOUND_ENABLED`.** Delivery runs only when
+`OUTBOUND_WORKERS > 0` and `CONSUMER_ENABLED=true`. `outbound.NewWorker` is
+called only inside `if cfg.OutboundWorkers > 0` in `startConsumer`, and
+`startConsumer` runs only under `if cfg.ConsumerEnabled` (`cmd/tidepool/main.go`).
+`OUTBOUND_WORKERS` defaults to 0 and is read with `intVarNonNegative`, so 0 is
+a legal value.
 
-**Consumer-on / workers-0 is a designed staging step, not a broken state.**
-With the consumer running, the real persisting enqueuer is always wired — it
-writes `outbound_activities`/`outbound_deliveries` inside the consumer's gate
-transaction, so intent past the gate is never dropped
-(`cmd/tidepool/main.go:695-713`). Raising `OUTBOUND_WORKERS` later drains
-whatever accumulated, immediately. Budget for that.
+**Consumer on with workers at 0 is a staging step.** With the consumer
+running, the enqueuer writes `outbound_activities` and `outbound_deliveries`
+inside the consumer's gate transaction, so no intent past the gate is dropped.
+Raising `OUTBOUND_WORKERS` later drains everything that accumulated, at once.
+Plan for that burst.
 
-**`OUTBOUND_DISABLED` parks, it does not fail — and a park costs writes, not
-retries.** A blocked delivery stays `pending` and resumes when the switch
-clears; `park`
-itself never poisons and never cancels (`internal/outbound/worker.go:242-244`,
-`internal/outbound/switches.go:5-12`). `OUTBOUND_DRY_RUN` parks the same way,
-before any signing or POST (`worker.go:245-249`).
+**A kill switch parks deliveries and costs no retries.** A blocked delivery
+stays `pending` and resumes when the switch clears. `park` never poisons and
+never cancels (`internal/outbound/worker.go`, `internal/outbound/switches.go`).
+`OUTBOUND_DRY_RUN` parks the same way, before any signing or POST.
 
-**A park costs the delivery no retries.** `ClaimNext` does
-`attempts = attempts + 1` on every claim
-(`internal/store/outbound_deliveries.go:143`), but `park` and `parkCausal`
-settle through `ReleaseParked`, not `Release` (`worker.go:572`, `:592`), whose
-one difference is `attempts = GREATEST(attempts - 1, 0)`
-(`outbound_deliveries.go:243-244`) applied under the same claim fence. A full
-claim/park cycle therefore leaves the ledger where it found it: an hour-long
-global kill switch spends nothing, and once it clears the **first** retryable
-failure is a retry, not a poison. `DefaultMaxDeliveryAttempts = 8`
-(`worker.go:78`) counts attempts a delivery actually made.
+Why it costs no retries: `ClaimNext` increments `attempts` on every claim
+(`internal/store/outbound_deliveries.go`). `park` and `parkCausal` settle
+through `ReleaseParked`, which differs from `Release` only by setting
+`attempts = GREATEST(attempts - 1, 0)` under the same claim fence. A
+claim-and-park cycle leaves `attempts` unchanged. An hour-long global kill
+switch spends nothing, and the first failure after it clears is a retry, not a
+poison. `DefaultMaxDeliveryAttempts = 8` counts only attempts a delivery
+actually made.
 
-⚠️ **It is a continuous write load, though.** A parked head is re-claimed and
-re-parked every `parkDelay = 5 * time.Second` (`worker.go:560`), so a held
-switch costs one claim plus one `UPDATE` per parked ordering-key head per ~5s,
-for as long as it is engaged — indefinitely, since nothing ends the cycle on its
-own. That churn is the remaining argument for **preferring
-`OUTBOUND_WORKERS=0` to park everything** — see [Rollback](#rollback) — and it
-is a cost argument, not a safety one.
+⚠️ **A held switch is a continuous write load.** The worker re-claims and
+re-parks each parked ordering-key head every `parkDelay` (5 seconds). That is
+one claim plus one `UPDATE` per parked head every 5 seconds, for as long as the
+switch is held. This is why [Rollback](#rollback) prefers `OUTBOUND_WORKERS=0`
+for stopping everything. The reason is cost, not safety.
 
-`POST /admin/outbound/redrive` is the repair for **poisoned** deliveries, not
-for parked ones: `RedrivePoisoned` sets `attempts = 0` with `state = 'pending'`
-(`internal/store/outbound_deliveries.go:665-666`) and matches
-`state = 'poisoned'` only (`:667`). A parked delivery is still `pending`, so it
-is neither reached by a redrive nor in need of one — it resumes on its own when
-the switch clears.
+`POST /admin/outbound/redrive` repairs poisoned deliveries, not parked ones.
+`RedrivePoisoned` matches only `state = 'poisoned'` and resets those rows to
+`pending` with `attempts = 0`. A parked delivery is already `pending`, so a
+redrive does not reach it and it does not need one.
 
-Scope matching, from `config.go:519-525`:
+Scope matching (`internal/config/config.go`, `parseHostSet` and `parseSet`):
 
 | Switch | Matching |
 |---|---|
-| `OUTBOUND_DISABLED_HOSTS` | inbox host, **lowercased** on load and compared case-insensitively — a kill switch must fail closed on case |
-| `OUTBOUND_DISABLED_COMMUNITIES` | community **AP id**, e.g. `https://lemmy.world/c/comicstrips`, **exact and case-sensitive**, compared against the delivery's ordering key (`worker.go:237-240`) |
-| `OUTBOUND_DISABLED_ACTORS` | actor **DID**, exact and case-sensitive |
+| `OUTBOUND_DISABLED_HOSTS` | inbox host, lowercased on load and compared case-insensitively, so case mistakes still block |
+| `OUTBOUND_DISABLED_COMMUNITIES` | community ActivityPub id, such as `https://lemmy.world/c/comicstrips`. Exact and case-sensitive, compared against the delivery's ordering key |
+| `OUTBOUND_DISABLED_ACTORS` | actor DID, exact and case-sensitive |
 
-There is no allowlist form of any of these. See
-[Staged rollout](#5-staged-rollout) for what that means for a canary.
+None of these has an allowlist form. See [Staged rollout](#5-staged-rollout)
+for how that shapes a canary.
 
-**Every switch in that table — and `OUTBOUND_DISABLED` and `OUTBOUND_DRY_RUN`
-with them — is INERT while `OUTBOUND_WORKERS=0`.** `ConfigSwitches` is only
-constructed inside `if cfg.OutboundWorkers > 0`
-(`cmd/tidepool/main.go:716-736`), so with no worker there is nothing holding a
-switch and nothing consulting one. Setting `OUTBOUND_DISABLED=true` while
-workers are 0 changes nothing and confirms nothing; it is not a second belt.
-Conversely, that is also why `OUTBOUND_WORKERS=0` costs nothing: no worker
-exists to claim, park, or write anything.
+**Every switch, including `OUTBOUND_DISABLED` and `OUTBOUND_DRY_RUN`, does
+nothing while `OUTBOUND_WORKERS=0`.** `ConfigSwitches` is built only inside
+`if cfg.OutboundWorkers > 0`, so with no worker nothing reads a switch. Setting
+`OUTBOUND_DISABLED=true` with workers at 0 adds no protection. It is also why
+`OUTBOUND_WORKERS=0` costs nothing: no worker exists to claim, park or write.
 
-### Confirming a switch actually engaged
+### Confirming a switch engaged
 
-`internal/outbound/metrics.go:10-13` publishes four counters, all under
-`/admin/metrics`:
+`internal/outbound/metrics.go` publishes four counters on `/admin/metrics`:
 
-| Metric | Bumped when |
+| Metric | Increments when |
 |---|---|
-| `tidepool_outbound_delivered` | a delivery reached the peer (incl. Lemmy's duplicate-ack) |
+| `tidepool_outbound_delivered` | a delivery reached the peer, including Lemmy's duplicate acknowledgement |
 | `tidepool_outbound_poisoned` | a delivery hit a terminal failure |
-| `tidepool_outbound_cancelled` | the **worker** cancelled a claimed delivery on consent state — its only call site (`worker.go:292`) |
-| `tidepool_outbound_parked` | a kill-switch, dry-run, **or causal-wait** deferral |
+| `tidepool_outbound_cancelled` | the worker cancelled a claimed delivery because of consent state (its only increment site) |
+| `tidepool_outbound_parked` | a kill switch, dry run, or causal wait deferred a delivery |
 
-`tidepool_outbound_parked` is the only **positive** confirmation that a kill
-switch engaged: `by_state` still reads `pending` for a parked delivery, exactly
-as it does for one merely waiting its turn, so the queue view cannot tell you.
-Read it as a rate, not a level — a parked head is re-parked every ~5s, so the
-counter climbs continuously while a switch is held. That climb is the write load
-of the hold, not retries being spent.
+`tidepool_outbound_parked` is the only positive sign that a kill switch
+engaged. `by_state` reads `pending` for a parked delivery and for one waiting
+its turn, so the queue view cannot tell them apart. Read the counter as a rate.
+It climbs steadily while a switch is held because each head is re-parked every
+5 seconds. That climb is write load, not retries.
 
-Two caveats on it. It is shared with `parkCausal`, so a nonzero `parked` with no
-switch engaged means causal waits, not an operator action. And
-`tidepool_outbound_cancelled` rises **on its own** during rollout: the worker
-cancels a claimed delivery whenever the actor is disabled, delivery-paused, or
-opted out (`internal/outbound/worker.go:281-296`). That is the counter's only
-increment site, so a climbing `cancelled` is consent doing its job and is never
-evidence that somebody ran `POST /admin/outbound/cancel` — the admin cancel does
-not touch this metric, and shows up only in `by_state`.
+Two caveats:
+
+- `parkCausal` also increments `parked`. A nonzero `parked` with no switch set
+  means causal waits.
+- `cancelled` rises on its own during rollout. The worker cancels a claimed
+  delivery when the actor is disabled, delivery-paused or opted out
+  (`consentBlocked` in `internal/outbound/worker.go`). `POST
+  /admin/outbound/cancel` does not touch this counter; its effect shows only in
+  `by_state`.
 
 ---
 
 ## 3. The admin surface at incident time
 
-Full route table with request bodies: [README](README.md#the-admin-api). All
-routes are bearer-authenticated (`Authorization: Bearer $ADMIN_TOKEN`) behind
-one middleware group (`internal/ingest/follow.go:148-162`,
-`internal/accept/admin.go:65-71`). Production publishes `127.0.0.1:8091` on the
-box so admin calls skip Caddy entirely.
+The full route table with request bodies is in
+[docs/ADMIN_API.md](docs/ADMIN_API.md). Every route requires
+`Authorization: Bearer $ADMIN_TOKEN` (`Admin.Routes` in
+`internal/ingest/follow.go`, `Admin.Routes` in `internal/accept/admin.go`).
+Production publishes `127.0.0.1:8091` on the host, so run admin calls there.
+The Coves Caddy answers 404 for `/admin*` on every public Tidepool hostname
+(`tidepool_no_public_admin` in the Coves `Caddyfile`).
 
-Four behaviours worth knowing *before* you need them, because each one reads
-like a fault and is not:
+Responses that look like faults but are not:
 
-**`POST /admin/communities/reconcile` → 501 means `FOLLOW_LIST_PATH` is
-unset.** The follow reconciler is only constructed when the path is configured
-(`cmd/tidepool/main.go:468-483`), and the handler nil-checks it
-(`internal/ingest/follow.go:575-579`). Production *does* set
-`FOLLOW_LIST_PATH=/repo/communities.yaml`, so a 501 there means the env changed,
-not that reconciliation broke.
+**`POST /admin/communities/reconcile` returns 501 when `FOLLOW_LIST_PATH` is
+unset.** The follow reconciler exists only when the path is configured.
+Production sets `FOLLOW_LIST_PATH=/repo/communities.yaml`, so a 501 there means
+the environment changed.
 
-**`/admin/admissions` and `/admin/admissions/readmit` → 404 means the consumer
-is off.** Those routes are registered inside the `if cfg.ConsumerEnabled` block
-(`cmd/tidepool/main.go:537-556`) because a force re-admit needs the acceptance
-engine, which only exists there. A 404 is "the consumer is not running", never
-"the endpoint is broken". Every other `/admin` route answers regardless.
+**`/admin/admissions` and `/admin/admissions/readmit` return 404 when the
+consumer is off.** They are registered inside the `if cfg.ConsumerEnabled`
+block because a forced re-admit needs the acceptance engine. Every other
+`/admin` route is registered regardless.
+
+**`POST /admin/actors/purge` returns 501 when the consumer is off.** The
+purger is created by `startConsumer`.
 
 **`POST /admin/outbound/redrive` refuses an unscoped redrive.** With no
-`activity`, no `community`, and no explicit `{"all":true}` it returns 400
-(`internal/ingest/follow.go:210-213`) — an unscoped redrive would re-attempt
-every poisoned delivery at once, and a malformed body must not become a silent
-fleet-wide replay. `POST /admin/outbound/cancel` likewise demands exactly one
-of `actor` or `community` (`follow.go:236-239`).
+`activity`, no `community` and no explicit `{"all":true}`, it returns 400, so a
+malformed body cannot replay every poisoned delivery at once.
+`POST /admin/outbound/cancel` requires exactly one of `actor` or `community`.
 
-**`GET /admin/outbound` answers even with the consumer off.** The deliveries
-store is wired unconditionally (`cmd/tidepool/main.go:454`), so an empty
-`by_state` map is the truth about the queue, not a symptom of misconfiguration.
+**`GET /admin/outbound` answers with the consumer off.** The deliveries store
+is wired unconditionally, so an empty `by_state` map is the real queue state.
 
-**It is also the whole route.** `by_state` counts are *all* it returns
-(`internal/ingest/follow.go:172-183`) — no rows, no ids, no reasons. There is
-no admin endpoint that exposes `last_error_class` or `response_excerpt`, so
-"inspect, fix, then redrive" means psql on the box; the query is in
-[Step 3](#step-3--widen). Plan for that before the incident, not during it.
+**`GET /admin/outbound` returns only `by_state` counts.** It returns no rows,
+ids or reasons (`handleOutboundInspect`). No admin route exposes
+`last_error_class` or `response_excerpt`, so diagnosing a poisoned delivery
+means psql on the host. The query is in [Step 3](#step-3-widen).
 
 ```sh
 T="Authorization: Bearer $ADMIN_TOKEN"
 curl -s -H "$T" localhost:8091/admin/outbound            # queue depth by state
 curl -s -H "$T" localhost:8091/admin/divergence          # one sweep, synchronously
-curl -s -H "$T" localhost:8091/admin/metrics             # tidepool* expvars
+curl -s -H "$T" localhost:8091/admin/metrics             # tidepool_* expvars
 curl -s -H "$T" 'localhost:8091/admin/admissions?status=rejected'
 ```
 
 ### Purging a native actor (spammer)
 
-`POST /admin/actors/purge` sends `Delete{Person, removeData:true}` for a
-Coves user's persona to every inbox that received its content, undoes its
-standing votes, and tombstones it: the actor document answers 410 forever and
-the actor can never be re-enabled. **Irreversible.** Peers that honour the
-Delete drop the content and cannot restore it. A disabled or paused actor
-still gets the Delete delivered. Only `person` actors are purgeable (a group
-answers 422); the route answers 501 when the consumer is off. Removing the
-content on the Coves side is separate (`social.coves.moderation.removeContent`).
+`POST /admin/actors/purge` (`internal/ingest/admin_actor_purge.go`):
 
-Run `scripts/purge-actor.sh` on the box: it is in `/opt/tidepool/scripts` once
-the deploy that added it has been pulled (otherwise `scp` it to the host and
-`ssh` in). It reads `ADMIN_TOKEN` from `/opt/tidepool/.env` without echoing it.
-Dry run first, check `inboxes` and `standingVotes`, then execute:
+- sends `Delete{Person, removeData:true}` for the Coves user's persona to every
+  inbox that received its content;
+- undoes its standing votes;
+- tombstones the actor. The actor document answers 410 from then on, and the
+  actor can never be re-enabled.
+
+⚠️ **This is irreversible.** Peers that honour the Delete drop the content and
+cannot restore it. A disabled or paused actor still gets the Delete delivered.
+
+The body is `{"did":"did:...","dryRun":true|false}`; `dryRun` is required.
+The route answers 404 if no native actor has that DID, 422 for a community
+(`group`) actor, and 501 when the consumer is off. Removing the content on the
+Coves side is a separate step (`social.coves.moderation.removeContent`).
+
+Use `scripts/purge-actor.sh` on the host. It is in `/opt/tidepool/scripts`
+once you have pulled the deploy that added it; otherwise `scp` it to the host
+and `ssh` in. It reads `ADMIN_TOKEN` from `/opt/tidepool/.env` (override with
+`COMPOSE_DIR`) and never echoes it or puts it in argv. Run the dry run first,
+check `inboxes` and `standingVotes` in the answer, then execute:
 
 ```sh
 /opt/tidepool/scripts/purge-actor.sh did:plc:...            # dry run: changes nothing
 /opt/tidepool/scripts/purge-actor.sh did:plc:... --execute  # the purge
 ```
 
-A real run pauses and disables the actor first, so nothing admitted while
-the purge prepares is delivered after its targets are read; retractions still
-go out. The `inboxes` and `standingVotes` in a real run's answer are that
-pre-purge snapshot. The log line WARN `purge committed with no federation
-preference to mark` is expected on an operator purge (the user never wrote a
-deleteRemote preference).
+A real run pauses and disables the actor before it reads the purge targets.
+Content admitted while the purge prepares is therefore not delivered after the
+Delete; retractions still go out. The `inboxes` and `standingVotes` counts in a
+real run's answer are that pre-purge snapshot. The response deadline is
+extended to 10 minutes for large purges.
 
-A failed or interrupted run is safe to repeat: the purge is idempotent. Run
-one purge per actor at a time: two simultaneous runs can each send an Undo
-for the same standing vote. A sequential rerun is safe.
+The log line WARN `purge committed with no federation preference to mark` is
+expected on an operator purge, because the user never wrote a deleteRemote
+preference.
+
+A failed or interrupted run is safe to repeat; the purge is idempotent. Run
+one purge per actor at a time: two simultaneous runs can each send an Undo for
+the same standing vote. A sequential rerun is safe.
 
 ---
 
-## 4. coves.social Caddy — a CROSS-REPO change
+## 4. coves.social Caddy (a Coves-repo change)
 
-**There is no Caddyfile in this repository.** TLS for both `tdpl.io` and
-`coves.social` terminates in the **Coves** Caddy (`coves-prod-caddy`), which
-reaches this stack over the shared external `coves-prod-network`. The work
-below is an edit to the Coves repo's `Caddyfile` — a Coves-repo change, deployed on
-the Coves side.
+This repository has no Caddyfile. TLS for `tdpl.io` and `coves.social`
+terminates in the Coves Caddy (`coves-prod-caddy`), which reaches this stack
+over the shared external `coves-prod-network`. The routes below live in the
+Coves repo's `Caddyfile` and deploy from the Coves side.
 
-### Why Caddy has to do this at all
+Production Caddy serves these routes today, and production runs with
+`CONSUMER_ENABLED=true`. The steps in this section and in section 5 are for a
+fresh deploy or a re-rollout. After a Caddy change, check that the running
+Caddy has the routes with the `grep` in the inode section below.
 
-`AP_USER_ORIGIN=https://coves.social` puts the native users' ActivityPub surface
-on the **Coves** hostname, served by the Tidepool process. Tidepool's Host
-router sends requests whose `Host` is `coves.social` to the persona surface, and
-everything under `tdpl.io` to the bridge (`internal/personas/hostrouter.go:89-115`).
-**None of those AP paths reach Tidepool today** — but not because Caddy sends
-the whole hostname to the AppView. The existing `coves.social` site block
-(the Coves repo's `Caddyfile`, block opens at `:70`; routing runs `:72-117`)
-already splits the hostname four ways:
+### Why Caddy routes these paths
 
-| Path | Today's handler |
-|---|---|
-| `/.well-known/*` | static `file_server` over `/srv` (`Caddyfile:72`) |
-| `/client-metadata.json` | static `file_server` over `/srv` (`Caddyfile:79`) |
-| `/img/*` | 301 to `img.coves.social` (`Caddyfile:97`) |
-| everything else | catch-all `reverse_proxy appview:8080` (`Caddyfile:102`) |
+`AP_USER_ORIGIN=https://coves.social` puts native users' ActivityPub surface
+on the Coves hostname, served by Tidepool. Tidepool's Host router sends
+`Host: coves.social` to the persona surface and `tdpl.io` to the bridge, and
+answers 421 for an unrecognized Host (`internal/personas/hostrouter.go`).
+Caddy must send the ActivityPub paths on `coves.social` to Tidepool. Without
+them, `GET /.well-known/webfinger` returns a 404 from the static
+`/.well-known/*` file server, and `/nodeinfo/2.0` and `/ap/*` go to the web
+stack.
 
-Only the catch-all reaches the AppView. That matters for the before/after diff:
-`GET /.well-known/webfinger` today returns a **static-file-server 404** from
-`/srv`, not an AppView response, and `GET /nodeinfo/2.0` and `/ap/*` fall to the
-AppView. So the signature to look for before the change is a bare 404 on
-webfinger — and after it, a Tidepool JRD.
+The apex needs an `Accept`-based split, and only the edge can do it. Tidepool
+does no content negotiation (`handleInstanceActor` in
+`internal/personas/instance.go`): a peer sending `ld+json`, `activity+json` or
+no `Accept` header must get the instance actor. Peers fetch `GET /` to find
+the instance actor; browsers fetch `GET /` to get the web app.
 
-The apex needs a content-negotiated split, and Tidepool deliberately cannot do
-it itself: `internal/personas/instance.go:32-34` states in its own comment that
-content negotiation is absent *because Caddy owns it in production*, and that a
-peer sending `ld+json`, `activity+json`, or no `Accept` at all must still get
-the actor. Peers fetch `GET /` to find the instance actor; browsers fetch
-`GET /` to find the web app. Only the edge can tell them apart.
-
-### ⚠️ The Caddyfile inode trap — read this first
+### ⚠️ The Caddyfile inode trap
 
 **Edit the Caddyfile in place. Never replace the file.** The production Caddy
-mounts the Caddyfile as a single-file bind mount, and Docker pins a single-file
-mount to the **inode present when the container started**. Anything that
-replaces the file rather than writing through it — `git checkout`, `mv`,
-`sed -i`, most editors' atomic-save, `scp` of a new file — leaves the container
-serving the **old** contents forever, while `cat` on the host shows the new
-ones. This has bitten this project before. It is the same trap that made
-Tidepool's own `communities.yaml` a *directory* mount
-(`docker-compose.prod.yml:18-24`).
+bind-mounts the Caddyfile as a single file, and Docker pins a single-file mount
+to the inode present when the container started. Anything that replaces the
+file (`git checkout`, `mv`, `sed -i`, most editors' atomic save, `scp` of a new
+file) leaves the container serving the old contents while `cat` on the host
+shows the new ones. This has happened on this project before, and it is why
+Tidepool's own `communities.yaml` is a directory mount
+(`docker-compose.prod.yml`).
 
-Safe edits: `nano`/`vim` with backupcopy=yes, `cat > file`, `tee`. After any
-edit, confirm the container sees it:
+Safe edits: `nano`, `vim` with `backupcopy=yes`, `cat > file`, `tee`. After
+any edit, confirm the container sees it, then validate and reload:
 
 ```sh
 docker exec coves-prod-caddy cat /etc/caddy/Caddyfile | grep -c '/ap/'
@@ -355,29 +335,22 @@ docker exec coves-prod-caddy caddy reload --config /etc/caddy/Caddyfile \
   --adapter caddyfile
 ```
 
-If the container's copy does not show your change, the inode moved: recreate
-the Caddy container (`docker compose -f docker-compose.prod.yml up -d
---force-recreate caddy` in `/opt/coves`).
+If the container's copy does not show your change, the inode moved. Recreate
+the Caddy container from `/opt/coves`:
+`docker compose -f docker-compose.prod.yml up -d --force-recreate caddy`.
 
-### The change
+### The routes
 
-Inside the **existing `coves.social { … }` site block** — do not add a second
-block for the same hostname — add the AP routes. `handle` blocks in one site
-are mutually exclusive and sorted by path specificity, so
-`/.well-known/webfinger` wins over the existing `/.well-known/*` static block,
-and `/ap/*` is disjoint from everything already there.
+All of these sit inside the one existing `coves.social { … }` site block. Do
+not add a second block for the same hostname. `handle` blocks with a single
+path are sorted by specificity, so `/.well-known/webfinger` wins over the
+`/.well-known/*` static block.
 
 ```caddyfile
 coves.social {
-    # ── Tidepool's native-user AP surface (AP_USER_ORIGIN) ──────────────
-    # These paths belong to the bridge, not the AppView. More specific than
-    # the /.well-known/* static block below, so they win the handle sort.
-    #
-    # NOTE: no `header_up Host` on these proxies. Caddy v2 forwards the
-    # original Host by default, and Tidepool's Host router keys on it to
-    # choose the persona surface over the bridge surface
-    # (internal/personas/hostrouter.go). Rewriting Host to the upstream
-    # address would 421 every one of these requests.
+    # No `header_up Host` on these proxies. Caddy forwards the original Host by
+    # default, and Tidepool's Host router needs it. Rewriting Host to the
+    # upstream address makes every one of these requests return 421.
     handle /.well-known/webfinger {
         reverse_proxy tidepool:80 {
             header_up X-Real-IP {remote_host}
@@ -394,53 +367,39 @@ coves.social {
         }
     }
     # /ap/actor/{did}, /ap/actor/{did}/outbox, /ap/object/*, /ap/activity/*,
-    # and POST /ap/inbox — the shared inbox for this origin.
+    # and POST /ap/inbox (the shared inbox for this origin).
     handle /ap/* {
         reverse_proxy tidepool:80 {
             header_up X-Real-IP {remote_host}
         }
     }
 
-    # ── Apex: split by Accept ───────────────────────────────────────────
-    # `handle /` matches the apex EXACTLY (a Caddy path matcher is exact
-    # unless it ends in *), so this replaces only the bare "/" case that
-    # the catch-all used to serve. Same-name directives run in Caddyfile
-    # order, so the matched reverse_proxy is tried before the fallback.
-    #
-    # The split is inverted on purpose: EXPLICIT text/html goes to the web
-    # app; everything else — activity+json, ld+json, AND a request with no
-    # Accept header at all — falls through to Tidepool. instance.go:32-34
-    # requires that a peer sending no Accept still gets the instance
-    # actor, and a positive @ap matcher can never satisfy that (an absent
-    # header matches nothing). Browsers always send text/html at the
-    # apex, so they are unaffected; the one visible consequence is that a
-    # bare `curl /` (Accept: */*) now gets the actor JSON, which is the
-    # AS2-conventional answer for a non-browser client.
+    # Apex. `handle /` matches only the bare "/". Requests that explicitly
+    # accept text/html go to the web app; everything else, including a request
+    # with no Accept header, goes to Tidepool's instance actor. A positive
+    # match on the ActivityPub types cannot catch the no-Accept case.
     handle / {
         @html header Accept *text/html*
-        # The web app, with the SAME upstream options as the catch-all
-        # below — copy them verbatim, header_up Host included (DPoP htu
-        # matching depends on it).
-        reverse_proxy @html appview:8080 {
-            health_uri /xrpc/_health
-            health_interval 30s
-            health_timeout 5s
-            header_up Host {host}
+        # Same upstream options as the frontend catch-all in the block.
+        reverse_proxy @html coves-prod-frontend:3000 {
             header_up X-Real-IP {remote_host}
             header_up X-Forwarded-For {remote_host}
             header_up X-Forwarded-Proto {scheme}
             header_up X-Forwarded-Host {host}
         }
-        # Fallback: the instance actor (peers, absent-Accept fetchers).
         reverse_proxy tidepool:80 {
             header_up X-Real-IP {remote_host}
         }
     }
 
-    # … existing handle /.well-known/*, /client-metadata.json, /img/*,
-    #   catch-all handle, headers, CSP, encode — all unchanged …
+    # … /.well-known/* static, /img/* redirect, @appview allowlist,
+    #   frontend catch-all, headers, CSP, encode …
 }
 ```
+
+One visible consequence: a bare `curl https://coves.social/` (which sends
+`Accept: */*`) gets the instance actor JSON. Browsers always send `text/html`
+and are unaffected.
 
 ### Verify from outside
 
@@ -449,16 +408,14 @@ coves.social {
 curl -s -H 'Accept: application/activity+json' https://coves.social/ | jq '.type,.id'
 # expect: "Application"  "https://coves.social/"
 
-# the AS2 spelling must reach the same document
+# the ActivityStreams ld+json spelling must reach the same document
 curl -s -H 'Accept: application/ld+json; profile="https://www.w3.org/ns/activitystreams"' \
   https://coves.social/ | jq '.type'
 
 # a browser must still get the web app
 curl -sI -H 'Accept: text/html' https://coves.social/ | head -1
 
-# a peer sending NO Accept header must still get the instance actor
-# (instance.go's stated requirement; this is why the split routes
-# explicit-HTML to the AppView and falls through to Tidepool)
+# a peer sending no Accept header must still get the instance actor
 curl -s -H 'Accept:' https://coves.social/ | jq '.type'
 # expect: "Application"
 
@@ -467,39 +424,38 @@ curl -s https://coves.social/.well-known/nodeinfo | jq .
 curl -s https://coves.social/nodeinfo/2.0 | jq '.software.name'   # "coves"
 ```
 
-A 421 from any of these means the `Host` header was rewritten on the way
-through. A 404 on webfinger for a user who has never federated is correct —
-actors are minted lazily on first federating interaction.
+A 421 from any of these means something rewrote the `Host` header. A 404 on
+webfinger for a user who has never federated is correct: actors are minted on
+their first federating interaction.
 
-### Not changing
+### Unchanged by v2
 
-`tdpl.io`, the per-instance wildcard blocks, and the on-demand catch-all are
-untouched by v2. The `on_demand_tls ask` gate still points at
-`http://tidepool:80/.well-known/tidepool-tls-ask` — but note that URL names
-the CONTAINER, so the request arrives carrying `Host: tidepool`, a name the
-v2 host router recognizes as neither surface. The gate only keeps working
-because the router serves `identity.TLSAskPath` host-agnostically, before any
-Host judgment (`HostAgnosticPaths`, `internal/personas/hostrouter.go`). An
-earlier revision of this section claimed the gate was "unaffected" by the
-host router; it was not — the 421s it produced denied issuance for every new
-handle cert and renewal until the exemption landed (2026-08-22).
+`tdpl.io`, the per-instance wildcard blocks and the on-demand catch-all. The
+`on_demand_tls ask` gate still points at
+`http://tidepool:80/.well-known/tidepool-tls-ask`. That URL names the
+container, so the request arrives with `Host: tidepool`, which the host router
+recognizes as neither surface. The gate works only because the router serves
+`identity.TLSAskPath` regardless of Host (`HostAgnosticPaths` in
+`internal/personas/hostrouter.go`). If that exemption is removed, the gate
+returns 421 and Caddy denies every new handle certificate and renewal.
 
 ---
 
 ## 5. Staged rollout
 
-Decision 19's canary. Each step is a separate `.env` edit plus
+Each step is a separate `.env` edit plus
 `docker compose -f docker-compose.prod.yml up -d tidepool`, because config is
 read once at boot.
 
-### Step 0 — Caddy first
+### Step 0: Caddy first
 
-Do section 4 **before** enabling the consumer. A native actor that federates
-outward triggers Lemmy to fetch its webfinger, its actor document, and the
-origin apex, all at `coves.social`. If Caddy is not routing those to Tidepool
-yet, Lemmy gets the web app or a 404 and caches the failure.
+Do [section 4](#4-covessocial-caddy-a-coves-repo-change) before enabling the
+consumer. When a native actor federates, Lemmy fetches its webfinger, its actor
+document and the origin apex, all on `coves.social`. If Caddy does not yet
+route those to Tidepool, Lemmy gets the web app or a 404 and caches the
+failure.
 
-### Step 1 — consumer on, delivery off
+### Step 1: consumer on, delivery off
 
 ```
 CONSUMER_ENABLED=true
@@ -521,114 +477,99 @@ curl -s -H "$T" 'localhost:8091/admin/admissions?status=rejected' | jq
 ```
 
 `tidepool_consumer_cursor_age_seconds` and
-`tidepool_consumer_last_event_age_seconds` are what make a *stalled* consumer
-visible: the process stays up and the healthcheck stays green while events
-quietly stop arriving (`cmd/tidepool/main.go:827-830`). A climbing
-`tidepool_consumer_dead_letters` means events are failing and being parked for
-the redriver, not lost.
+`tidepool_consumer_last_event_age_seconds` show a stalled consumer. When the
+consumer stalls, the process stays up and the healthcheck stays green while
+events stop arriving. A climbing `tidepool_consumer_dead_letters` means events
+are failing and waiting for the dead-letter redriver; they are not lost.
 
-Two reading rules for those keys:
+How to read these keys:
 
-- **The whole `tidepool_consumer_*` family only exists while the consumer
-  runs** — `PublishMetrics` is called inside `startConsumer`
-  (`cmd/tidepool/main.go:830`). Absent keys mean the consumer is off, not that
-  it is broken and silent. The `tidepool_divergence_*` gauges are the opposite:
-  registered at package init, so they are always present.
-- **`tidepool_consumer_dead_letters: -1` is not a count.** It is the sentinel
-  for "storage could not be read" (`internal/consume/metrics.go:26-30`), chosen
-  because a `0` would claim the backlog is empty at exactly the moment nobody
-  can tell.
-- **The `tidepool_divergence_*` gauges use the same `-1` convention**, for the
-  same reason (`internal/ingest/divergence.go:166-175`, `divergenceUnswept`).
-  Because they are published at package init, they are present from process
-  start — reading `-1` until the startup sweep completes, and again for any
-  class a failed sweep never wrote. `-1` is "never measured", `0` is "measured,
-  nothing diverging"; do not alert on them as if both meant healthy.
-- **The four `tidepool_outbound_*` counters are absent until the first delivery
-  worker touches them** — they are `expvar.NewInt` at package init in
-  `internal/outbound/metrics.go:10-13`, so the keys exist once the package is
-  linked, but they sit at 0 while `OUTBOUND_WORKERS=0`. A flat 0 across all four
-  at this step is exactly right.
+- The `tidepool_consumer_*` gauges exist only while the consumer runs.
+  `consume.PublishMetrics` is called inside `startConsumer`. Missing gauges
+  mean the consumer is off. The exception is
+  `tidepool_consumer_unclaimed_skips`, which is registered at startup and is
+  always present.
+- `tidepool_consumer_dead_letters: -1` means the dead-letter table could not
+  be read (`deadLetterDepthUnavailable` in `internal/consume/metrics.go`). It is
+  not a count.
+- The `tidepool_divergence_*` gauges are registered at package init, so they
+  are always present. They read `-1` (`divergenceUnswept` in
+  `internal/ingest/divergence.go`) until the startup sweep completes, and for
+  any class a failed sweep never wrote. `-1` means never measured; `0` means
+  measured and nothing diverging. Do not alert on both as healthy.
+- The four `tidepool_outbound_*` counters are registered at package init and
+  stay at 0 while `OUTBOUND_WORKERS=0`. All four at 0 is correct at this step.
 
 Check the rejections before letting anything out. A misconfigured
-`ADMISSION_MAX_PER_AUTHOR_PER_COMMUNITY`, a stale community mapping, or a
-consent state you did not expect all surface here as `decisionCode`s while the
-blast radius is still zero.
+`ADMISSION_MAX_PER_AUTHOR_PER_COMMUNITY` (default 50), a stale community
+mapping, or an unexpected consent state all show up here as `decisionCode`s
+while nothing has reached a peer.
 
-### Step 2 — one community
+Translation happens at enqueue time, inside the consumer's gate transaction,
+and the worker POSTs the stored payload unchanged. This step is where you check
+translator output: read `outbound_activities.payload` in psql.
 
-There is **no allowlist**, so a one-community canary is spelled as a denylist
-over the rest of `communities.yaml`. With today's four entries, canarying
-`!comicstrips@lemmy.world` means:
+### Step 2: one community
 
-```
-OUTBOUND_WORKERS=1
-OUTBOUND_DISABLED_COMMUNITIES=https://lemmy.world/c/selfhosted,https://lemmy.world/c/fediverse,https://lemmy.ml/c/linux
-```
-
-AP ids, exact case — not the `!name@host` spelling `communities.yaml` uses.
-Confirm the ids you are about to paste rather than constructing them; the
-`community` field of the list response **is** the AP group id
-(`internal/ingest/follow.go:283-300`):
+There is no allowlist, so a one-community canary is a denylist of every other
+community the bridge follows. Use the AP ids, exact case, not the `!name@host`
+form `communities.yaml` uses. The `community` field of the list response is
+the AP group id. Build the list from it rather than typing ids by hand:
 
 ```sh
 curl -s -H "$T" localhost:8091/admin/communities | jq -r '.communities[].community'
+
+# every community except the canary, comma-separated:
+CANARY=https://lemmy.world/c/comicstrips
+curl -s -H "$T" localhost:8091/admin/communities \
+  | jq -r --arg c "$CANARY" '[.communities[].community | select(. != $c)] | join(",")'
 ```
 
-**Adding a community to `communities.yaml` later does not add it to this
-denylist.** The reconciler will subscribe it and it will start federating on
-the next sweep. Whenever the follow list grows during a canary, extend
+```
+OUTBOUND_WORKERS=1
+OUTBOUND_DISABLED_COMMUNITIES=<the comma-separated list from above>
+```
+
+⚠️ **Adding a community to `communities.yaml` later does not add it to this
+denylist.** The reconciler subscribes it and it starts federating on the next
+sweep. Whenever the follow list grows during a canary, extend
 `OUTBOUND_DISABLED_COMMUNITIES` in the same change.
 
-**`OUTBOUND_DRY_RUN=true` is a weaker instrument than it sounds, and it is not
-free.** What it does: the worker claims a delivery, logs it, and parks before
-signing or POSTing (`internal/outbound/worker.go:245-249`). What it does **not**
-do is validate the translator. **Translation happens at ENQUEUE time**, inside
-the consumer's gate transaction (`cmd/tidepool/main.go:703-710`), and the worker
-POSTs the stored payload verbatim (`worker.go:309`, `:319`). By the time a
-delivery is claimable its payload has already been translated and persisted — so
-the moment `CONSUMER_ENABLED=true`, the translator has already run on everything,
-dry run or not. Step 1 is where you check its output (read
-`outbound_activities.payload` in psql), not here.
+**`OUTBOUND_DRY_RUN=true` does not test the translator.** The worker claims a
+delivery, logs it, and parks before signing or POSTing. The payload was already
+translated and stored at enqueue time, so the translator has run on everything
+since `CONSUMER_ENABLED=true`, dry run or not. Check translator output in
+Step 1. Dry run also carries the write load of any park (see
+[section 2](#2-the-v2-flag-topology)), costs no retries, and needs no redrive
+afterwards.
 
-And because dry-run parks, it carries the same cost as any other park — which
-is write load, not retries: each head delivery is re-claimed and re-parked every
-~5s for as long as it is engaged, and the attempt it spends doing so is handed
-back (see [§2](#2-the-v2-flag-topology)). Nothing needs redriving afterwards.
+### Announcement throttling
 
-### On announcement throttling — what actually exists
+There is no outbound rate limiter. `MINT_RATE_PER_MINUTE` and `MINT_BURST`
+look like the right knob but are not. Production sets them to 10 and 20
+(`docker-compose.prod.yml`) because the public `plc.directory` returns 429 on
+mint bursts during community backfill. They feed `ingest.NewMintGate`, which
+only the inbound materializer uses, when an unseen Lemmy author gets an
+atproto DID. Persona actors minted by the consumer do not pass through it:
+`run()` hands `personasService` straight to `startConsumer`.
 
-Decision 19 asks for "deliberate throttling of initial actor announcements".
-**Read this carefully, because the obvious knob is the wrong one.**
+`internal/outbound` has no rate limiter, sleep or throttle. The only levers on
+outbound volume are:
 
-`MINT_RATE_PER_MINUTE` / `MINT_BURST` (production overrides them to **10/20**,
-`docker-compose.prod.yml`, because the public `plc.directory` 429s mint bursts
-during community backfill) gate **inbound** DID minting only. They are wired
-into `ingest.NewMintGate`, whose sole consumer is the materializer's minter
-(`cmd/tidepool/main.go:271-276`, `:315`) — the path where an unseen *Lemmy*
-author gets an atproto DID.
+- `OUTBOUND_WORKERS`, which sets worker concurrency, not a rate. Idle workers
+  poll every second (`outboundWorkerIdle`); with a full queue they run flat out.
+- The scoped kill switches, which decide which communities, actors and hosts
+  may deliver at all.
 
-**There is no rate limiter on the outbound side.** `internal/outbound` contains
-no `rate.Limiter`, no sleep, and no throttle of any kind; the persona actors
-the consumer mints do not pass through `mintGate` (`main.go:539` hands
-`personasService` directly to `startConsumer`). The only levers on outbound
-volume are:
+`OUTBOUND_WORKERS=1` plus a one-community scope is the throttle.
 
-- `OUTBOUND_WORKERS` — worker **concurrency**, not a rate. Workers poll with a
-  1s idle interval (`main.go:53`); with a full queue they run flat out.
-- the scoped kill switches — which communities/actors/hosts may deliver at all.
+### Step 3: widen
 
-So the canary *is* the throttle: `OUTBOUND_WORKERS=1` plus a one-community
-scope. Do not go looking for an announcement rate knob; nobody built one, and
-this is filed under [Not implemented](#not-implemented).
-
-### Step 3 — widen
-
-Remove entries from `OUTBOUND_DISABLED_COMMUNITIES` one at a time, raising
-`OUTBOUND_WORKERS` as the queue justifies. Before each widening:
+Remove entries from `OUTBOUND_DISABLED_COMMUNITIES` one at a time, and raise
+`OUTBOUND_WORKERS` as the queue requires. Before each widening:
 
 ```sh
-# poison depth — the queue's own verdict
+# poison depth
 curl -s -H "$T" localhost:8091/admin/outbound | jq .by_state
 
 # echo suppression: bridge-origin content must never re-materialize
@@ -643,16 +584,11 @@ curl -s -H "$T" localhost:8091/admin/metrics | jq '{
 curl -s -H "$T" localhost:8091/admin/divergence | jq '{counts, truncated}'
 ```
 
-What each one means:
+What to look for:
 
-- **`by_state.poisoned` climbing** — deliveries exhausting their retries.
-  Inspect, fix, then `redrive` **scoped** to the affected community.
-
-  **There is no admin inspect surface for the "why".** `GET /admin/outbound`
-  returns `by_state` and nothing else (`internal/ingest/follow.go:172-183`) — a
-  count, no rows, no reasons. The columns that carry the diagnosis,
-  `last_error_class` and `response_excerpt`, are written by the worker but
-  exposed on no route; reading them means psql on the box:
+- **`by_state.poisoned` climbing**: deliveries are exhausting their retries.
+  Find the cause, fix it, then `redrive` scoped to the affected community.
+  The reason is only in the database:
 
   ```sh
   docker exec -i tidepool-prod-postgres psql -U tidepool -d tidepool -c "
@@ -663,177 +599,139 @@ What each one means:
      ORDER BY updated_at DESC LIMIT 50;"
   ```
 
-  `attempts` in that output counts claims that were TRIED — a park hands its own
-  claim's increment back (see [§2](#2-the-v2-flag-topology)) — so a poisoned row
-  should read about 8. A materially higher number is not extra peer rejections:
-  it is claims that never settled, since a lapsed lease or a crashed worker
-  leaves its increment behind with nobody to return it.
+  `attempts` counts claims that were tried, since a park returns its claim's
+  increment. A poisoned row should read about 8. A higher number means claims
+  that never settled (a lapsed lease or a crashed worker), not extra peer
+  rejections.
 
   **`last_error_class = 'kek_misconfigured'` with `attempts = 1` is a
-  configuration incident, not a peer one.** The actor's sealed signing key did
-  not open under the configured `BRIDGE_KEK`, so the worker poisons on the first
-  attempt instead of spending eight (`internal/outbound/worker.go`): retrying
-  cannot change the answer, and the fast poison is what puts the cause in front
-  of an operator in minutes rather than hours. Expect it in bulk and expect it
-  to spare newly minted actors — anything sealed *since* the wrong key was
-  configured opens fine, which is why half the bridge keeps working. Fix
-  `BRIDGE_KEK` (§6 runbook), restart, then `redrive`.
-- **echo drop counters rising steadily** — expected and healthy: our own
-  content arriving back from Lemmy and being correctly refused. A counter at
-  **zero** while native content is flowing is the alarming case; it means
-  classification is not firing and re-materialization is possible.
-- **`tidepool_divergence_*` gauges** — the read-only reconciliation sweep
-  (`GET /admin/divergence` runs one synchronously). Watch
-  `acceptance_undelivered_stale` (a delivery pending past
+  configuration incident.** The actor's sealed signing key did not open under
+  the configured `BRIDGE_KEK`, so the worker poisons on the first attempt
+  (`store.PoisonClassKEKMisconfigured`). Retrying cannot help. Expect it in
+  bulk, and expect actors minted after the wrong key was configured to work,
+  because their keys are sealed under it. Fix `BRIDGE_KEK` (see the
+  [rotation runbook](#runbook-rotating-bridge_kek)), restart, then `redrive`.
+- **Echo drop counters rising steadily**: healthy. This is our own content
+  coming back from Lemmy and being refused. A counter at 0 while native content
+  is flowing is the alarm: classification is not firing and re-materialization
+  is possible.
+- **`tidepool_divergence_*` gauges**: the read-only reconciliation sweep.
+  Watch `acceptance_undelivered_stale` (a delivery pending longer than
   `DIVERGENCE_ACCEPTANCE_STALE_AFTER`, default 12h),
-  `acceptance_undelivered_poisoned`, and `vote_recast_undelivered`. Also watch
+  `acceptance_undelivered_poisoned` and `vote_recast_undelivered`. Also watch
   `tidepool_divergence_sweep_failures` and
-  `tidepool_divergence_sweep_age_seconds`: a failed sweep publishes **nothing**
-  and the gauges keep their previous values
-  (`internal/ingest/divergence.go:584-591`), so a stale age with quiet gauges
-  is a *silent* failure mode. The sweep never repairs anything — it reports.
+  `tidepool_divergence_sweep_age_seconds`. A failed sweep publishes nothing and
+  the gauges keep their previous values, so a growing sweep age with quiet
+  gauges is a silent failure. The sweep only reports; it never repairs.
 
 ### Rollback
 
-Rollback is a **kill switch, not an un-deploy**. In escalation order, each
-step being one `.env` edit plus `up -d tidepool`:
+Roll back with kill switches, not by un-deploying. In escalation order, each
+step is one `.env` edit plus `up -d tidepool`:
 
-1. **`OUTBOUND_DISABLED_COMMUNITIES=<the bad one>`** — park one community.
-   Everything else keeps flowing; the parked deliveries resume with their retry
-   budget intact when you clear it, and want no redrive. First because it is the
-   *narrowest*. Its only cost is the same ~5s re-claim/re-park write cycle as
-   (3), on that community's head delivery alone.
-2. **`OUTBOUND_WORKERS=0`** — stop the workers entirely. This is the big red
-   button for delivery. The consumer keeps running and keeps recording intent;
-   nothing reaches any peer. `NewWorker` is only called inside
-   `if cfg.OutboundWorkers > 0` (`cmd/tidepool/main.go:716`), so at 0 there is
-   no worker to claim anything: nothing is re-claimed, no `attempts` are spent,
-   and no rows are written. It costs nothing and it is genuinely lossless.
-3. **`OUTBOUND_DISABLED=true`** — park everything outbound. Same *observable*
-   effect as (2) — nothing reaches any peer — and the deliveries keep their
-   retries: a park hands its claim's increment back (see
-   [§2](#2-the-v2-flag-topology)), so this is safe to hold for as long as you
-   need. It is **ranked below (2) on cost, not on risk**: the workers keep
-   running, so every ordering key's head delivery is re-claimed and re-parked
-   every ~5s — a claim and an `UPDATE` per key per 5s, indefinitely, against a
-   database you may be trying to leave alone during an incident. Reach for it
-   when you need the *scope* it gives you and a whole-worker stop is too blunt.
-   What (3) buys over (2) is that each parked row carries a recorded
-   `last_error_class` / `response_excerpt` saying why it is held; a stopped
-   worker records nothing.
-4. **`CONSUMER_ENABLED=false`** — stop consuming. Intent stops being recorded.
-   The consumer resumes from its stored cursor when re-enabled, so this is
-   recoverable, but it is the only step that stops *observing*, and
-   `/admin/admissions` disappears with it — taking your triage view down at the
-   moment you most want it. Prefer 1–3.
+1. **`OUTBOUND_DISABLED_COMMUNITIES=<the bad one>`** parks one community.
+   Everything else keeps flowing. The parked deliveries keep their retry budget
+   and resume when you clear the entry, with no redrive needed. Use this first
+   because it is the narrowest. Its only cost is the 5-second re-claim and
+   re-park cycle on that community's head delivery.
+2. **`OUTBOUND_WORKERS=0`** stops the delivery workers. This is the main stop
+   button. The consumer keeps running and recording intent; nothing reaches any
+   peer. With no worker, nothing is claimed, no `attempts` are spent and no rows
+   are written. It costs nothing and loses nothing.
+3. **`OUTBOUND_DISABLED=true`** parks everything outbound. Nothing reaches any
+   peer, and deliveries keep their retries, so it is safe to hold. It ranks
+   below (2) on cost, not risk: the workers keep running, so every ordering
+   key's head is re-claimed and re-parked every 5 seconds, against a database
+   you may want quiet during an incident. Its advantage over (2) is that each
+   parked row records a `last_error_class` and `response_excerpt` saying why it
+   is held; a stopped worker records nothing.
+4. **`CONSUMER_ENABLED=false`** stops consuming, and intent stops being
+   recorded. The consumer resumes from its stored cursor when re-enabled, so
+   this is recoverable. It also removes `/admin/admissions`, your triage view,
+   when you most need it. Prefer steps 1 to 3.
 
-Do **not** roll back by cancelling deliveries. `POST /admin/outbound/cancel`
-is for consent withdrawal and community removal; a cancelled delivery is not
-resumable the way a parked one is.
+Do not roll back by cancelling deliveries. `POST /admin/outbound/cancel` is
+for consent withdrawal and community removal, and a cancelled delivery cannot
+be resumed the way a parked one can.
 
-Only redeploy the previous image if the failure is a code defect rather than a
-federation outcome. The kill switches address the latter faster and without a
-schema-version question.
+Redeploy the previous image only if the failure is a code defect. For a
+federation problem the kill switches act faster and raise no schema-version
+question.
 
 ---
 
 ## 6. Not implemented
 
-Everything in this section is a real operational gap, with **two** exceptions
-kept here on purpose: **`BRIDGE_KEK` rotation** and **backup and restore** were
-both headline gaps and are both now built, so their entries have become
-runbooks rather than being deleted — an operator who comes here looking for
-either gap finds the procedure instead of a stale warning. Both are marked
-BUILT in their headings. Everything else below has no mechanism in the code
-today. It is written down because an operator who assumes one of these exists
-will look for it during the exact incident where looking costs the most.
+Everything here is an operational gap, except two entries that are now built
+and kept as runbooks: `BRIDGE_KEK` rotation and backup and restore. Their
+headings say BUILT.
 
-### Key rotation — `BRIDGE_KEK` (BUILT) and per-actor RSA keys (not)
+### Key rotation: `BRIDGE_KEK` (BUILT) and per-actor RSA keys (not built)
 
-**`BRIDGE_KEK` rotation exists: a dual-read custodian plus a `rotate-kek`
-re-seal walk, runbook below.** Per-actor **RSA** key rotation still does not
-exist, and neither does a rotation for the plaintext service-actor key; both
-are at the end of this entry.
+`BRIDGE_KEK` rotation exists: a dual-read custodian plus a `rotate-kek`
+re-seal walk (`identity.Reseal` in `internal/identity/reseal.go`). Per-actor
+RSA key rotation and rotation of the plaintext service-actor key do not exist;
+see the end of this entry.
 
-What the KEK seals — **three** places, not two, and the walk covers all three:
+The KEK seals three columns, and the walk covers all three:
 
-1. **`bridged_actors.signing_key`** — the escrowed **secp256k1 atproto** repo
+1. **`bridged_actors.signing_key`**: the escrowed secp256k1 atproto repo
    signing key of every bridged (Lemmy-origin) identity
-   (`internal/db/migrations/002_create_bridged_actors.sql:14`; sealed and
-   opened by `Custodian.EncryptActorKey`/`DecryptActorKey` in
-   `internal/identity/keys.go`). Approximately 950 of them.
-2. **`service_keys.key_material`, row `plc-rotation`** — the PLC **escrow
-   rotation key** (`RotationKeyName` / `LoadOrCreateRotationKey` in
-   `internal/identity/keys.go`), the one thing that
-   could recover the DIDs, and itself sealed under the KEK — which is why the
-   boot canary in step 2 of the runbook is a real test of the rotation. Note
-   the column is `key_material`, not `private_key_pem`; migration 013 renamed
-   it precisely because only this row is ciphertext — the sibling
-   `service-actor` row is **plaintext** PKCS#8 PEM and is *not* KEK-sealed
+   (`internal/db/migrations/002_create_bridged_actors.sql`;
+   `Custodian.EncryptActorKey` and `DecryptActorKey` in
+   `internal/identity/keys.go`). About 950 rows.
+2. **`service_keys.key_material`, row `plc-rotation`**: the PLC escrow
+   rotation key (`RotationKeyName`, `LoadOrCreateRotationKey` in
+   `internal/identity/keys.go`). It is the one key that can recover the DIDs,
+   and the boot canary in step 2 of the runbook opens it. The sibling
+   `service-actor` row is plaintext PKCS#8 PEM and is not KEK-sealed
    (`internal/db/migrations/013_rename_service_key_column.sql`).
-3. **`ap_actors.rsa_key_sealed`** — **every NATIVE Coves user's ActivityPub RSA
-   signing key**, sealed under the same KEK under its own AAD prefix
-   (`internal/db/migrations/017_ap_actors.sql:46`; `actorRSAKeyAADPrefix` in
-   `internal/identity/keys.go`, used by `EncryptActorRSAKey` in
-   `internal/identity/actor_rsa.go`). Written at mint time by the persona
-   create path, through the same `identity.Custodian` handed to `personas.New`
-   in `run()` (`cmd/tidepool/main.go`).
+3. **`ap_actors.rsa_key_sealed`**: every native Coves user's ActivityPub RSA
+   signing key, sealed under its own AAD prefix
+   (`internal/db/migrations/017_ap_actors.sql`; `actorRSAKeyAADPrefix` in
+   `internal/identity/keys.go`; `EncryptActorRSAKey` in
+   `internal/identity/actor_rsa.go`). Written at mint time through the same
+   `identity.Custodian` that `run()` hands to `personas.New`.
 
-**(3) is the v2 one, and it is the one a rotation plan will forget**, because
-it did not exist when this section was first written. A rotation that handled
-only `bridged_actors` and `service_keys` would leave every native user unable
-to sign a single outbound activity — the exact population v2 exists to serve.
-The walk covers it; anything hand-rolled must too.
+Any hand-rolled rotation must also cover (3). Skipping it leaves every native
+user unable to sign an outbound activity.
 
-*Naming trap:* `LoadOrCreateRotationKey` is **not** KEK rotation. It loads or
-generates the did:plc escrow/recovery key — an atproto identity concept —
-which is itself sealed under the KEK. Do not read that symbol as evidence that
-KEK rotation lives there; it lives in `internal/identity/reseal.go`.
+`LoadOrCreateRotationKey` is not KEK rotation. It loads or generates the
+did:plc escrow key, which is sealed under the KEK. KEK rotation lives in
+`internal/identity/reseal.go`.
 
 #### Why there is no key-version column
 
-This section used to say a rotation would need "a key-version column or KEK-id
-alongside each sealed blob", and a migration for the two tables that lack one.
-**That claim is retired. The shipped design needs no schema change and no
-stored selector**, and anyone designing an extension should know why before
-re-proposing one.
+The design needs no schema change and no stored key selector. AES-GCM
+authentication tells you which key sealed a blob: opening under the wrong key
+fails the tag check (a false match has odds of about 2⁻¹²⁸). So the code tries
+the keys. A stored column could be wrong (written by a crashed half-rotation,
+restored from a mismatched backup); the ciphertext cannot.
+`NewCustodianWithPrevious` (`internal/identity/keys.go`) tries both keys on
+read. `identity.Reseal` classifies each blob the same way:
 
-GCM authentication is a *definitive* discriminator. Opening a blob under the
-wrong key does not return plausible garbage — it fails the tag check, and the
-odds of a wrong key authenticating are about 2⁻¹²⁸. So the KEK a blob is
-sealed under can simply be **tried**, and the answer is as trustworthy as any
-column would have been — while a column can be wrong (written by a crashed
-half-rotation, restored from a mismatched backup) in a way the ciphertext
-cannot. `NewCustodianWithPrevious` (`internal/identity/keys.go`) is that trial
-on the read path; `identity.Reseal` (`internal/identity/reseal.go`) is the same
-trial used to classify: opens under current → already moved, leave the bytes
-alone; opens under previous → re-seal and write back; opens under neither →
-report it and **never** write.
+- opens under current: already moved, left alone;
+- opens under previous: re-sealed and written back;
+- opens under neither: reported and never written.
 
-`ap_actors.rsa_key_version` was never the missing selector, despite looking
-like one. It versions **the actor's RSA key** — a different, still-unbuilt
-rotation (below) — not the KEK the key is wrapped in. Reading it as a KEK
-selector is the trap this paragraph exists to close. Likewise the one-byte
-prefix on every ciphertext (`internal/identity/keys.go`) is the *envelope
-format* version, checked for equality and rejected otherwise; it is not a key
-id either.
+`ap_actors.rsa_key_version` is not a KEK selector. It versions the actor's RSA
+key, a different rotation that is not built. The one-byte prefix on every
+ciphertext is the envelope format version, not a key id.
 
 #### Runbook: rotating `BRIDGE_KEK`
 
-The old key stays load-bearing for the whole of this procedure. Do not delete
-it from anywhere until step 6.
+Keep the old key everywhere it is stored until step 6.
 
-1. **Put both keys in `/opt/tidepool/.env`** — the new one current, the old one
-   previous. Generate the new one with `openssl rand -hex 32`.
+1. **Put both keys in `/opt/tidepool/.env`**: the new one as current, the old
+   one as previous. Generate the new one with `openssl rand -hex 32`.
 
    ```sh
    BRIDGE_KEK=<new key>
    BRIDGE_KEK_PREVIOUS=<the key that is in there right now>
    ```
 
-   Both are forwarded to the `tidepool` service in
-   `docker-compose.prod.yml`; `BRIDGE_KEK_PREVIOUS` is empty in steady state
-   and the bridge treats empty as unset.
+   `docker-compose.prod.yml` forwards both to the `tidepool` service.
+   `BRIDGE_KEK_PREVIOUS` is empty in steady state, and empty means unset.
 
 2. **Restart the bridge.**
 
@@ -841,11 +739,10 @@ it from anywhere until step 6.
    docker compose -f docker-compose.prod.yml up -d tidepool
    ```
 
-   It must come up clean. The boot canary opens the `plc-rotation` key under
-   the KEK before serving traffic, and at this point it only opens under the
-   *previous* one — so a clean boot is proof the dual read is working, and a
-   failed boot means one of the two values is wrong. Fix it here, where
-   nothing has been rewritten yet.
+   It must come up clean. The boot canary opens the `plc-rotation` key before
+   serving traffic, and at this point that key opens only under the previous
+   KEK. A clean boot proves the dual read works. A failed boot means one of the
+   two values is wrong; fix it now, before anything has been rewritten.
 
 3. **Run the walk.**
 
@@ -853,12 +750,10 @@ it from anywhere until step 6.
    docker compose -f docker-compose.prod.yml run --rm tidepool rotate-kek
    ```
 
-   Not the `tidepool-migrate` one-shot: that service is deliberately wired
-   with `DATABASE_URL` alone, so it has no KEKs at all and `rotate-kek` there
-   would fail naming a variable that container is never meant to carry.
+   Do not use the `tidepool-migrate` service. It carries only `DATABASE_URL`,
+   so `rotate-kek` there fails for lack of a KEK.
 
-4. **Read the inventory.** One line per table, plus one line per row that
-   could not be moved:
+4. **Read the inventory.** One line per table:
 
    ```
    level=INFO msg="kek re-seal table" table=bridged_actors resealed=948 already_current=0 skipped=3 failed=0
@@ -866,28 +761,24 @@ it from anywhere until step 6.
    level=INFO msg="kek re-seal table" table=service_keys resealed=1 already_current=0 skipped=0 failed=0
    ```
 
-   A row that could not be moved gets its own line, at ERROR, naming the table,
-   the row, and the class:
+   Each row that could not be moved gets an ERROR line naming the table, the
+   row and the reason:
 
    ```
    level=ERROR msg="kek re-seal failure" table=ap_actors id=did:plc:7iza… reason=malformed
    ```
 
-   `skipped` is most often a bridged actor with no escrowed key (`signing_key
-   IS NULL`) — normal, not a problem. It is not only that, and not only
-   `bridged_actors`: on **any** table a row that vanishes between the walk's
-   read and its write-back is skipped too, because the guarded update matches
-   nothing. That is also normal (a deleted actor), but it means a nonzero
-   `skipped` on `ap_actors` or `service_keys` is a row that disappeared
-   mid-walk rather than a NULL key. The plaintext `service-actor` row is not
-   counted anywhere, by design: the walk selects `plc-rotation` by name and
-   never reads its plaintext sibling.
+   `skipped` is usually a bridged actor with no escrowed key
+   (`signing_key IS NULL`), which is normal. On any table, a row deleted
+   between the walk's read and its write-back is also skipped. So a nonzero
+   `skipped` on `ap_actors` or `service_keys` means a row disappeared
+   mid-walk (a deleted actor), not a NULL key. The plaintext `service-actor`
+   row is never read or counted.
 
-5. **Re-run until the zero-run gate opens**, i.e. every table reports
-   `resealed=0 failed=0` and the command exits 0. That re-run is the only
-   evidence that nothing is still sealed under the old key — the first run's
-   own counts are not, because a row written between its read and its finish
-   would not be in them.
+5. **Re-run until a zero run**: every table reports `resealed=0 failed=0` and
+   the command exits 0. Only the zero run proves nothing is still sealed under
+   the old key. The first run's counts do not, because rows written during it
+   are not in them.
 
 6. **Only then remove `BRIDGE_KEK_PREVIOUS`** from `/opt/tidepool/.env` and
    restart:
@@ -897,230 +788,208 @@ it from anywhere until step 6.
    ```
 
    The boot canary now runs on the new key alone. If it fails, put the old key
-   back immediately and go to step 3 — the material is still intact at that
-   point, because the walk never overwrites what it cannot open.
+   back immediately and go to step 3. The data is still intact, because the
+   walk never overwrites what it cannot open.
 
-**Warnings.**
+**Warnings**
 
-- **Never start a second rotation before the first has shown its zero run.**
-  This tool moves blobs from *one* previous key to *one* current key. Introduce
-  a third key while blobs are still under the first and those blobs open under
-  neither: `rotate-kek` reports them `wrong-key` and exits non-zero (the walk
-  completes its inventory first), and nothing in this repository can recover
-  them without the missing key itself.
-- **`failed=... reason=wrong-key` is a key-history question first.** The blob
-  is well formed and simply not sealed under either key you supplied. The class
-  means the blob failed authentication under **both** keys, which is almost
-  always a key-history answer — but not only: rare ciphertext corruption that
-  preserves the envelope (version byte and length intact, bytes altered), or a
-  blob copied into a row under a different AAD, lands in this class too,
-  because GCM cannot distinguish "wrong key" from "right key, wrong bytes".
-  Check key history first (an older `.env`, a restored volume, another
-  deployment), integrity second. **Do not rotate again**, which only adds a key
-  to the search.
-- **`reason=malformed` is data corruption, not a key problem.** The blob is
-  truncated or carries an unknown version byte; it was never decrypted under
-  either key, so no KEK is implicated. Restore that single row from backup.
-  Rotating again cannot help and buries the evidence.
-- **`reason=missing` on `service_keys`/`plc-rotation` is the restore-went-wrong
-  hazard, and it outranks everything else here.** The row is not unreadable —
-  it is *gone*, on a database that still holds bridged identities, so the key
-  every one of those DIDs names as its rotation authority is absent. Almost
-  always a restore that missed `service_keys`. **Stop. Do not restart the
-  bridge**: `LoadOrCreateRotationKey` is create-on-absence and the next boot
-  mints a *replacement*, after which those DIDs are permanently beyond
-  recovery. Restore `service_keys` from a backup that has the row (the restore
-  drill's plc-rotation gate exists to catch exactly this before it is deployed)
-  and only then continue.
-- **`reason=contended` means only that another writer kept touching the row.**
-  Nothing is wrong. Re-run `rotate-kek`.
-- **A failed walk exits non-zero and finishes the inventory anyway.** Both are
-  deliberate: the full inventory means one pass tells the operator how much is
-  affected rather than stopping at the first bad row, and the exit code is the
-  gate on retiring the old key. Read it in one direction only:
+- **Do not start a second rotation before the first has had its zero run.** The
+  tool moves blobs from one previous key to one current key. If you introduce a
+  third key while blobs are still under the first, those blobs open under
+  neither key. `rotate-kek` reports them `wrong-key` and exits non-zero after
+  finishing its inventory. Nothing in this repository can recover them without
+  the missing key.
+- **`reason=wrong-key`: check key history first.** The blob is well formed but
+  failed authentication under both keys you supplied. Usually that is a
+  key-history problem: look at an older `.env`, a restored volume, or another
+  deployment. Less often it is corruption that kept the envelope intact, or a
+  blob copied into a row with a different AAD; GCM cannot tell these apart.
+  Check integrity second. Do not rotate again; that only adds a key to the
+  search.
+- **`reason=malformed` is data corruption.** The blob is truncated or has an
+  unknown version byte, so no KEK is involved. Restore that row from backup.
+  Rotating again cannot help and hides the evidence.
+- ⚠️ **`reason=missing` on `service_keys`/`plc-rotation` is the most dangerous
+  result.** The row is gone on a database that still holds bridged identities,
+  so the key every one of those DIDs names as its rotation authority is absent.
+  This is almost always a restore that missed `service_keys`. **Stop. Do not
+  restart the bridge.** `LoadOrCreateRotationKey` creates a key when none
+  exists, and the next boot would mint a replacement, after which those DIDs
+  can never be recovered. Restore `service_keys` from a backup that has the row
+  (the restore drill checks for it), then continue.
+- **`reason=contended`** means another writer kept changing the row. Nothing is
+  wrong. Re-run `rotate-kek`.
+- **A failed walk exits non-zero and still finishes the inventory**, so one
+  pass shows how much is affected. Use the exit code only to refuse:
+  - Non-zero: do not unset `BRIDGE_KEK_PREVIOUS`. Something is still unmoved
+    or unreadable, and retiring the old key makes it unrecoverable.
+  - Zero: unset it only on the zero run, where every table reported
+    `resealed=0 failed=0`. A first run that exits zero with `resealed=948` is
+    progress. It does not prove nothing was written under the old key while the
+    walk ran; that is why step 5 asks for another run.
+  - An aborted walk still logs an inventory, but it covers only the rows it
+    reached. Never treat its `resealed=0` as a zero run. The ERROR line tells
+    you the run failed.
 
-  - **Non-zero forbids unsetting `BRIDGE_KEK_PREVIOUS`.** Something is still
-    unmoved or unreadable; retiring the old key now is what makes it
-    unrecoverable.
-  - **Zero permits it only on the ZERO run** — the run where every table
-    reported `resealed=0 failed=0`. A first run that exits zero with
-    `resealed=948` is *progress, not clearance*: it says the walk moved
-    everything it saw, not that nothing was written under the old key while it
-    was looking. That is the whole reason step 5 asks for a second run.
-  - **An aborted walk still logs an inventory, and that inventory is
-    PARTIAL.** Counts from a run that ended early describe the rows it reached,
-    not the table; never read a `resealed=0` out of one as a zero run. The
-    error line is the discriminator, not the counts.
+  A script may use the exit code to refuse retiring the key. Permitting it
+  needs the zero-run counts as well.
 
-  So a script may key on the exit code to *refuse*, but nothing may key on the
-  exit code alone to *permit* — permission needs the zero-run counts as well.
+#### Not built: per-actor RSA rotation
 
-#### Still not implemented: per-actor RSA rotation
+Rotating one actor's RSA key is not defined. It would mean republishing
+`publicKey` in the actor document and having every peer that cached it
+re-fetch, and the code has no way to publish two keys during an overlap.
+`ap_actors.rsa_key_version` exists for this rotation
+(`internal/db/migrations/017_ap_actors.sql`); the code stores it but nothing
+acts on it.
 
-Rotating an individual actor's **RSA** key is undefined. It means republishing
-`publicKey` in that actor's document and having every peer that cached it
-re-fetch, with no grace-overlap mechanism in the code to publish two keys at
-once. `ap_actors.rsa_key_version` exists for exactly this rotation
-(`internal/db/migrations/017_ap_actors.sql`) and nothing reads it yet.
+The bridge's own service-actor RSA key is stored as plaintext PKCS#8 PEM
+(`service_keys`, row `service-actor`), outside the KEK. Rotating it is a
+separate procedure that is not built, and the KEK walk does not touch it.
 
-The bridge's own **service-actor** RSA key is also still stored as plaintext
-PKCS#8 PEM (`service_keys`, row `service-actor`), so it is outside the KEK
-entirely — rotating it is a separate, unbuilt procedure, and the KEK walk
-correctly refuses to touch it.
+⚠️ **Back up `BRIDGE_KEK` somewhere that survives losing the server.** It can
+now be rotated, but losing it with no previous key to fall back on is still
+unrecoverable.
 
-**Back up `BRIDGE_KEK` somewhere that survives the loss of the server.**
-Rotation is no longer a reason to treat it as immutable, but losing it — with
-no previous key to fall back to — is still unrecoverable.
+### Backup and restore (BUILT)
 
-### Backup and restore
+A nightly `pg_dump` plus a restore drill in a throwaway container. Both
+scripts have been run end to end (backup, archive check, restore, inventory
+gates).
 
-**BUILT: nightly `pg_dump` + a throwaway-container restore drill.** Two
-scripts, both exercised end-to-end before landing (backup → archive
-verification → restore → inventory gates):
+**`scripts/pg-backup.sh`** runs from a host systemd timer. It:
 
-- `scripts/pg-backup.sh` — run by a host systemd timer. Dumps custom-format into the
-  `./backups` mount the compose file already provides, verifies the archive
-  with a full `pg_restore -f /dev/null` read **before** it gets its final name
-  (a dump that cannot be read end to end is not a backup; `--list` reads only
-  the TOC and would pass a truncated dump), `chmod 600`s it, then ages out completed
-  dumps older than `RETENTION_DAYS` (default 14). A failed run keeps only the
-  most recent failed partial, under the fixed name
-  `backups/tidepool-last-failed.dump.partial`, so retries overwrite it rather
-  than pile up ~2GB files; partials are not aged out, and ones older than a day
-  are warned about, because a partial is the corpse of a failed run and worth
-  seeing. The production host has no cron
-  daemon, so it runs from the systemd units in `scripts/systemd/` (02:17 UTC,
-  as root, output in the journal). A failed run retries every 5 minutes, up to
-  4 starts in 2 hours, which covers a boot-time catch-up run that fires before
-  the containers are up. The unit runs a root-owned copy at
-  `/usr/local/sbin/tidepool-pg-backup`, not the checkout's script: a checkout
-  writable by a non-root user should not supply code that runs as root.
-  Install, from `/opt/tidepool`, and re-run the `install` line after any change
-  to `scripts/pg-backup.sh`:
+- dumps in custom format into the `./backups` mount from the compose file;
+- checks the archive with a full `pg_restore -f /dev/null` read before giving
+  it its final name (`--list` reads only the table of contents and would pass a
+  truncated dump);
+- sets the dump to mode 600;
+- deletes completed dumps older than `RETENTION_DAYS` (default 14).
 
-      sudo install -m 755 scripts/pg-backup.sh /usr/local/sbin/tidepool-pg-backup
-      sudo cp scripts/systemd/tidepool-pg-backup.{service,timer} /etc/systemd/system/
-      sudo systemctl daemon-reload
-      sudo systemctl enable --now tidepool-pg-backup.timer
-      sudo systemctl start tidepool-pg-backup.service    # first backup now
-      journalctl -u tidepool-pg-backup.service            # its output
+A failed run keeps only its most recent partial file, as
+`backups/tidepool-last-failed.dump.partial`, so retries overwrite it instead
+of piling up ~2GB files. Partials are not aged out, and the script warns about
+any older than a day.
 
-  **Provisioning: `chmod 700 /opt/tidepool/backups` once, by hand.** The script
-  can only fix the files it creates. Every dump in that directory contains the
-  plaintext service-actor PEM and every sealed blob in the database; the
-  directory's own mode is the operator's to set.
+The production host has no cron daemon, so the script runs from the units in
+`scripts/systemd/`: daily at 02:17 UTC, as root, with output in the journal. A
+failed run retries every 5 minutes, up to 4 starts in 2 hours, which covers a
+catch-up run at boot that fires before the containers are up. The unit runs a
+root-owned copy at `/usr/local/sbin/tidepool-pg-backup`, because a checkout
+writable by a non-root user should not supply code that runs as root.
 
-- `scripts/pg-restore-drill.sh` — restores the newest dump (or `$1`) into a
-  **throwaway** `postgres:16` container (no published ports, `--network none`,
-  reached only by `docker exec`), prints the row inventory, exits nonzero on
-  any gap, and removes the container. It never touches the production
-  container, volume, or network. What it gates on:
+Install from `/opt/tidepool`. Re-run the `install` line after any change to
+`scripts/pg-backup.sh`:
 
-  - **The migration version**, against the `internal/db/migrations/*.sql` in
-    the checkout the script sits in — so a dump that restores cleanly but
-    predates migrations the running code needs fails as a stale dump instead of
-    passing. Copied out of the repo, the gate degrades to a warning plus the
-    old any-nonzero check.
-  - **The irreplaceable tables below**, present and (for `service_keys`)
-    non-empty: `bridged_actors`, `service_keys`, `ap_actors`, `blocks`,
-    `repo_state`, `blobs`, and the in-flight federation set —
-    `outbound_deliveries`, `outbound_activities`, `outbound_objects`,
-    `outbound_votes`, `admissions`.
-  - **The `plc-rotation` row must EXIST**, exactly once and non-empty, whenever
-    `bridged_actors` restored non-empty. An *absent* row is the dangerous case,
-    not a present-but-empty one: it boots clean and mints a replacement key
-    (see `reason=missing` above). When `bridged_actors` is empty too, absence
-    is tolerated with a printed note — that is a fresh-install dump.
-  - **Zero-length sealed blobs**, in `bridged_actors.signing_key` and
-    `ap_actors.rsa_key_sealed`. A column that can only hold ciphertext holding
-    nothing is corruption, distinct from NULL (which is a legitimately
-    key-less actor).
+    sudo install -m 755 scripts/pg-backup.sh /usr/local/sbin/tidepool-pg-backup
+    sudo cp scripts/systemd/tidepool-pg-backup.{service,timer} /etc/systemd/system/
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now tidepool-pg-backup.timer
+    sudo systemctl start tidepool-pg-backup.service    # first backup now
+    journalctl -u tidepool-pg-backup.service            # its output
 
-RPO with the default schedule is 24 hours of database state. The drill
-validates data presence, not KEK correctness: sealed columns are checked
-**present and non-zero-length — never opened, and never checked row by row for
-plausibility** (a restore drill must not need to read the KEK). The full proof
-is drill + boot canary: restore, point a bridge at it with the real
-`BRIDGE_KEK`, and a wrong pairing fails at startup — the same canary as step 2
-of the KEK runbook above. That holds **even when the restore lost the
-`plc-rotation` row itself**: with nothing sealed to read back, the canary proves
-the KEK against the actor keys that *are* there (`ap_actors.rsa_key_sealed`,
+⚠️ **Run `chmod 700 /opt/tidepool/backups` once, by hand.** The script sets
+modes only on files it creates. Every dump contains the plaintext service-actor
+PEM and every sealed blob in the database.
+
+**`scripts/pg-restore-drill.sh`** restores the newest dump (or `$1`) into a
+throwaway `postgres:16` container (no published ports, `--network none`,
+reached only by `docker exec`), prints the row inventory, exits non-zero on any
+gap, and removes the container. It never touches the production container,
+volume or network. It fails when:
+
+- **The migration version is behind** the `internal/db/migrations/*.sql` in
+  the checkout the script sits in. A dump that restores cleanly but predates
+  migrations the running code needs fails as stale. Run from outside the repo,
+  this check falls back to a warning plus an any-nonzero check.
+- **An irreplaceable table is missing** (and `service_keys` must be
+  non-empty): `bridged_actors`, `service_keys`, `ap_actors`, `blocks`,
+  `repo_state`, `blobs`, and the in-flight federation tables
+  `outbound_deliveries`, `outbound_activities`, `outbound_objects`,
+  `outbound_votes`, `admissions`.
+- **The `plc-rotation` row is not present exactly once with non-empty
+  material** while `bridged_actors` is non-empty. A missing row is the
+  dangerous case: the bridge boots and mints a replacement key (see
+  `reason=missing` above). If `bridged_actors` is also empty, a missing row is
+  allowed with a printed note; that is a fresh-install dump.
+- **A sealed blob is zero-length** in `bridged_actors.signing_key` or
+  `ap_actors.rsa_key_sealed`. Zero-length ciphertext is corruption. NULL is a
+  legitimate actor without a key.
+
+With the default schedule you can lose up to 24 hours of database state. The
+drill checks that data is present, not that the KEK is right: sealed columns
+are checked present and non-zero-length, never opened, because the drill must
+not need the KEK. The full proof is drill plus boot canary: restore, point a
+bridge at it with the real `BRIDGE_KEK`, and a wrong pairing fails at startup
+(the same canary as step 2 of the KEK runbook). This holds even when the
+restore lost the `plc-rotation` row: the canary then checks the KEK against the
+actor keys that are present (`ap_actors.rsa_key_sealed`,
 `bridged_actors.signing_key`) and refuses to mint a replacement rotation key
 over a populated database it cannot read. Only a database with no sealed
-material anywhere — a genuinely fresh install — is allowed to mint on an
-unproven key.
+material at all (a fresh install) may mint on an unproven key.
 
-**Retention and drill cadence interact, and not in your favour.** Retention
-ages dumps out on `pg-backup.sh`'s own criteria, which is a full `pg_restore`
-read succeeding; a dump that reads cleanly but would fail the drill therefore keeps
-refreshing the retention window for up to `RETENTION_DAYS` while the last
-*drilled* dump ages out from under it. The drill is the deeper check and
-nothing runs it automatically: **run it after the first backup, after any
-restore, and quarterly.**
+**Retention can outlive your last drilled dump.** Retention keeps any dump
+that passed `pg-backup.sh`'s full read. A dump that reads cleanly but would
+fail the drill keeps refreshing the 14-day window while the last drilled dump
+ages out. Nothing runs the drill automatically. **Run it after the first
+backup, after any restore, and quarterly.**
 
-**`BRIDGE_KEK` and `.env` are NOT in any database backup.** Keep an offsite
-copy of `.env` (password manager or sealed storage, not this server), and
-`touch backups/.env-backed-up` after each copy — `pg-backup.sh` warns on every
-run where `.env` is newer than that marker, so a rotated or edited KEK that
-was never re-escrowed shows up in the backup's journal output instead of in an incident.
+⚠️ **`BRIDGE_KEK` and `.env` are not in any database backup.** Keep an offsite
+copy of `.env` (a password manager or sealed storage, not this server), and
+run `touch backups/.env-backed-up` after each copy. `pg-backup.sh` warns on
+every run where `.env` is newer than that marker, so an edited or rotated KEK
+that was never copied offsite shows up in the backup's journal output.
 
-Residual limits, stated rather than implied: dumps live on the same host they
-protect (no offsite replication of `./backups` yet — copying them into the
-same offsite routine as `.env` is the obvious next step), and WAL archiving /
-point-in-time recovery is deliberately not built at this scale.
+Remaining limits: dumps live on the host they protect (`./backups` is not
+replicated offsite; copying it with the same routine as `.env` is the next
+step), and there is no WAL archiving or point-in-time recovery.
 
-What is at risk, in order of irreplaceability:
+What is at risk, most irreplaceable first:
 
-1. **`BRIDGE_KEK`** — lives in `/opt/tidepool/.env`, not in Postgres, and is
-   not covered by any database backup. Losing it is unrecoverable (above).
-2. **`bridged_actors` / `service_keys` / `ap_actors`** — the sealed signing
-   keys, for bridged identities, the PLC escrow key, **and every native Coves
-   user** respectively. Losing these loses the identities even if the KEK
-   survives. `ap_actors` is easy to omit from a v1-era backup scope; it is the
-   whole native-user population.
-3. **Repo blocks and commits** — the atproto repos themselves. Re-derivable
-   from upstream only by re-bridging, which mints new DIDs; the old at-uris do
-   not come back.
-4. **`outbound_*`, `admissions`** — in-flight federation state. Losing it
+1. **`BRIDGE_KEK`**: lives in `/opt/tidepool/.env`, not in Postgres, and no
+   database backup covers it. Losing it is unrecoverable.
+2. **`bridged_actors`, `service_keys`, `ap_actors`**: the sealed signing keys
+   for bridged identities, the PLC escrow key, and every native Coves user.
+   Losing these loses the identities even if the KEK survives. `ap_actors` is
+   the whole native-user population and is easy to leave out of an older
+   backup scope.
+3. **Repo blocks and commits**: the atproto repos. They can be rebuilt only by
+   re-bridging, which mints new DIDs; the old at-uris do not come back.
+4. **`outbound_*`, `admissions`**: in-flight federation state. Losing it
    double-sends or drops deliveries.
 
 ### A divergence off switch
 
-**There is none.** The reconciliation sweep is wired unconditionally — the
-constructor and `go divergence.Run(ctx)` sit outside every flag at
-`cmd/tidepool/main.go:485-506` — and `Run` performs one sweep **immediately**,
-before its first tick (`internal/ingest/divergence.go:561-565`). Setting
-`DIVERGENCE_INTERVAL=0` does not disable it: `durationVar` rejects zero and
-negative values and the process refuses to start
-(`internal/config/config.go:666-668`).
+There is none. The reconciliation sweep is wired outside every flag in
+`run()`, and `DivergenceReconciler.Run` sweeps once immediately, before its
+first tick (`internal/ingest/divergence.go`). `DIVERGENCE_INTERVAL=0` does not
+disable it: `durationVar` rejects zero and negative values and the process
+refuses to start.
 
-The only available lever is a **large interval** — `DIVERGENCE_INTERVAL=8760h`
-quiets the background pass. The startup sweep still runs, once, on every boot,
-and `GET /admin/divergence` still works.
+The only lever is a long interval. `DIVERGENCE_INTERVAL=8760h` quiets the
+background pass. The startup sweep still runs once per boot, and
+`GET /admin/divergence` still works.
 
-This is defensible: the sweep writes nothing, to peers or to our own tables,
-which is exactly what makes an always-on schedule safe. But if a sweep is ever
-implicated in an incident (lock pressure, a long multi-table scan — two of its
-legs scan `outbound_activities` in full, per `FOLLOWUPS.md`), **the runbook
-answer is "raise the interval and restart", not "disable it", because disabling
-is not possible.**
+The sweep writes nothing, to peers or to our own tables, so running it always
+is safe. If a sweep is implicated in an incident (lock pressure, or a long
+scan: two of its legs scan `outbound_activities` in full, per `FOLLOWUPS.md`),
+raise the interval and restart.
 
 ### Periodic vote re-seed
 
-**Nothing re-seeds vote aggregates on a schedule.** `SeedPostCounts` has one
-caller, on the community-backfill path.
+Nothing re-seeds vote aggregates on a schedule. `SeedPostCounts` has one
+caller, on the community-backfill path (`internal/ingest/backfill.go`).
 
-This makes one documented self-healing claim conditional in a way that matters:
-baseline-only voters can drift when a later flip or clear has no per-voter
-baseline row to retract, and the standing note is that "a re-seed heals the
-aggregate" (`FOLLOWUPS.md`, *Votes*). For a **quiet community that is never
-backfilled again, the next re-seed is never.** The drift is permanent, silently,
-and nothing reports it — the divergence sweep compares atproto state against
-outbound state, not vote aggregates against the origin instance.
+Baseline-only voters can drift when a later flip or clear has no per-voter
+baseline row to retract. `FOLLOWUPS.md` (*Votes*) says a re-seed heals the
+aggregate, but for a quiet community that is never backfilled again, no re-seed
+ever runs. The drift is permanent and nothing reports it: the divergence sweep
+compares atproto state with outbound state, not vote aggregates with the origin
+instance.
 
-The manual lever is a backfill of the affected community
-(`POST /admin/communities/backfill`), which re-seeds as a side effect. That is
-a workaround, not a scheduled heal, and it does other work besides.
+The manual fix is a backfill of the affected community
+(`POST /admin/communities/backfill`), which re-seeds as a side effect and also
+does other work.
 
 ---
 
@@ -1128,37 +997,30 @@ a workaround, not a scheduled heal, and it does other work besides.
 
 | Peer | Status | Notes |
 |---|---|---|
-| **Lemmy 0.19.20** | **Targeted.** Strictness ceiling and e2e target | Pinned in `e2e/lemmy/Dockerfile:35`, matching decision 19 |
-| **PieFed** | Best-effort | No pinned instance in the harness; conformance is held by captured-wire fixtures. Its votes arrive from anonymous per-user actors, which is fine for tallies but means no per-voter identity |
-| **Lemmy 1.0-beta** | Tracked, **not targeted** | Vote `FederationMode`, inbox collapsing, and `NoteWrapper` all change behaviour we depend on. No harness coverage |
+| **Lemmy 0.19.20** | Targeted. The strictness ceiling and the only peer the e2e suite runs against | Pinned as `ARG LEMMY_VERSION=0.19.20` in `e2e/lemmy/Dockerfile`; `make e2e` builds and tests against it |
+| **Mbin** | Best-effort, lightly tested | No harness instance. Hand-built fixtures cover link posts and backfill only (`internal/ap/vocab_mbin_test.go`, `internal/ingest/backfill_mbin_test.go`) |
+| **PieFed** | Best-effort, untested | No harness instance and no captured post, comment or vote fixture. Its votes are expected to arrive from anonymous per-user actors, which works for tallies but gives no per-voter identity |
+| **Pylova** | Expected to work, untested | No harness instance and no fixtures |
+| **Lemmy 1.0-beta** | Tracked, not targeted | Vote `FederationMode`, inbox collapsing and `NoteWrapper` all change behaviour we depend on. No harness coverage |
 | **Mastodon** | Incidental | The `security/v1` context is published so its parser accepts our `publicKey`, and its hosts appear in production handle subdomains. Not a target; not tested |
-
-### Version pin — resolved
-
-`e2e/lemmy/Dockerfile:35` pins **`ARG LEMMY_VERSION=0.19.20`**, matching
-PLAN.md decision 19 ("Lemmy 0.19.20 is the pinned strictness ceiling and e2e
-target"). The behaviours verified against 0.19.20 source during the v2 build —
-the `Delete`-summary convention, the `check_bot_account` rule, `Instance`-enum
-strictness — are the behaviours `make e2e` actually builds and tests against. (An earlier draft of this
-section described a 0.19.19/0.19.20 discrepancy; it was resolved by bumping
-the Dockerfile to 0.19.20.)
 
 ---
 
-## 8. Known operational gaps carried forward
+## 8. Known operational gaps
 
-Not new, but they shape what the runbook above can promise:
+These limit what the runbook above can promise:
 
-- **Per-IP rate limits degrade to global ones behind Caddy.** Every in-process
-  limiter keys on `RemoteAddr` and ignores `X-Forwarded-For`, so from behind
-  the proxy they see only Caddy's container IP. Rate limiting at the edge is
+- **Per-IP rate limits act as global limits behind Caddy.** Every in-process
+  limiter keys on `RemoteAddr` and ignores `X-Forwarded-For`, so behind the
+  proxy every request has Caddy's container IP. Rate limiting at the edge is
   the fix; tracked in `FOLLOWUPS.md`.
-- **`ENVIRONMENT=production` has never been exercised end to end.** The e2e
-  harness runs in development mode (migrations-on-start, HTTP, private fetch,
-  strict lexicon validation). The production-only refusals — `BRIDGE_SCHEME=http`,
-  `ALLOW_PRIVATE_FETCH`, `AP_HOST_FALLTHROUGH_DEV`, and the `AP_USER_ORIGIN`
-  https rule — are unit-covered, not harness-covered. Section 1 exists because
-  of this.
-- **Production lexicon validation records and writes rather than failing.**
-  A strict-first rollout should wait until
-  `tidepool_lexicon_validation_failures` stays at zero in production.
+- **The e2e harness never runs with `ENVIRONMENT=production`.** It runs in
+  development mode (migrations on start, HTTP, private fetch, strict lexicon
+  validation; `docker-compose.e2e.yml`). The production-only refusals
+  (`BRIDGE_SCHEME=http`, `ALLOW_PRIVATE_FETCH`, `AP_HOST_FALLTHROUGH_DEV`, and
+  the `AP_USER_ORIGIN` https rule) have unit tests only.
+- **Production lexicon validation logs and writes instead of failing.** Strict
+  validation is on only in development (`StrictValidation:
+  cfg.IsDevelopment()` in `run()`). Wait until
+  `tidepool_lexicon_validation_failures` stays at 0 in production before
+  making it strict.

@@ -39,10 +39,20 @@ x-tidepool-image: &tidepool-image
   build: .
   image: tidepool:prod
 
+# journald keeps container logs across recreates (json-file logs are deleted
+# with the container); rotation is journald's SystemMaxUse. `docker logs`
+# shows only the current container; for history across recreates use
+# `journalctl CONTAINER_NAME=<name>`.
+x-logging: &journald-logging
+  driver: journald
+  options:
+    tag: "{{.Name}}"
+
 services:
   postgres:
     image: postgres:16
     container_name: tidepool-prod-postgres
+    logging: *journald-logging
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-tidepool}
@@ -68,6 +78,7 @@ services:
   tidepool-migrate:
     <<: *tidepool-image
     container_name: tidepool-prod-migrate
+    logging: *journald-logging
     command: ["migrate"]
     restart: "no"
     environment:
@@ -81,6 +92,7 @@ services:
   tidepool:
     <<: *tidepool-image
     container_name: tidepool-prod
+    logging: *journald-logging
     restart: unless-stopped
     ports:
       - "127.0.0.1:8091:80" # host-local ops access (admin API without a round trip through Caddy)
@@ -279,6 +291,7 @@ services:
         BUILDKIT_CONTEXT_KEEP_GIT_DIR: 1
     image: tidepool-relay:prod
     container_name: tidepool-prod-relay
+    logging: *journald-logging
     restart: unless-stopped
     ports:
       - "127.0.0.1:2470:2470" # host-local ops: requestCrawl bootstrap, getHostStatus, admin UI
@@ -323,6 +336,7 @@ services:
   jetstream-init:
     image: alpine:3.22
     container_name: tidepool-prod-jetstream-init
+    logging: *journald-logging
     command: ["chown", "-R", "65532:65532", "/data"]
     restart: "no"
     volumes:
@@ -357,6 +371,7 @@ services:
       context: https://github.com/bluesky-social/jetstream.git#2b2bf447c3fd995de975dc21dc4d491347a6a6b6
     image: tidepool-jetstream:prod
     container_name: tidepool-prod-jetstream
+    logging: *journald-logging
     restart: unless-stopped
     environment:
       JETSTREAM_RELAY_URL: http://relay:2470

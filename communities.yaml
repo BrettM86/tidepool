@@ -74,3 +74,9 @@ communities:
   - "https://mander.xyz/c/science_memes"
   # added 2026-09-13 on request: climate coverage from slrpnk.net.
   - "https://slrpnk.net/c/climate"
+instances:
+  # added 2026-11-03 on request: first whole instance, for general-interest
+  # content beyond programming. 339 local communities (310 publicly listed),
+  # 2.3k monthly active users. Its 10 NSFW-flagged communities were reviewed
+  # and none are explicit, so nothing is excluded.
+  - host: "lemmy.zip"

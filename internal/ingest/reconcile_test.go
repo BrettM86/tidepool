@@ -744,7 +744,7 @@ func TestParseFollowList_RepoFile(t *testing.T) {
 	list, err := ParseFollowList("../../communities.yaml")
 	require.NoError(t, err)
 	assert.Len(t, list.Communities, 13)
-	assert.Empty(t, list.Instances)
+	assert.Equal(t, []InstanceEntry{{Host: "lemmy.zip"}}, list.Instances)
 	assert.Empty(t, list.OutboundDisabledHosts)
 	assert.Empty(t, list.OutboundDisabledCommunities)
 }

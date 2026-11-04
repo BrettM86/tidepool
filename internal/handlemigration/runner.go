@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -28,6 +27,9 @@ const (
 	finalizeTimeout        = 10 * time.Second
 )
 
+// errActorTombstoned stops a PLC update whose actor was tombstoned before the POST.
+var errActorTombstoned = stderrors.New("handle migration: actor tombstoned")
+
 // Identity is the PLC side of a rename.
 type Identity interface {
 	HandleFor(ctx context.Context, actorType store.ActorType, preferredUsername, instance string) (string, error)
@@ -41,19 +43,16 @@ type ActorFetcher interface {
 	FetchActorSameAuthority(ctx context.Context, iri string) (*ap.Object, error)
 }
 
-// Options configures a Runner. ActorsPerSecond paces PLC handle update
-// submissions: each POST, retries included, is sent at least
-// 1/ActorsPerSecond after the previous one in the same run.
+// Options configures a Runner. Budget is required: it is the PLC write budget
+// shared with the Minter, and every POST, retries included, passes it.
 type Options struct {
-	Actors          store.BridgedActors
-	Identity        Identity
-	ActorFetcher    ActorFetcher
-	BridgeHostname  string
-	HandleZoneRoot  string
-	Logger          *slog.Logger
-	ActorsPerSecond float64
-	Now             func() time.Time
-	Wait            func(ctx context.Context, delay time.Duration) error
+	Actors         store.BridgedActors
+	Identity       Identity
+	ActorFetcher   ActorFetcher
+	BridgeHostname string
+	HandleZoneRoot string
+	Logger         *slog.Logger
+	Budget         *identity.PLCWriteBudget
 }
 
 // Runner renames named actors one at a time.
@@ -64,9 +63,7 @@ type Runner struct {
 	bridgeHostname string
 	handleZoneRoot string
 	logger         *slog.Logger
-	interval       time.Duration
-	now            func() time.Time
-	wait           func(context.Context, time.Duration) error
+	budget         *identity.PLCWriteBudget
 }
 
 // NewRunner builds a Runner.
@@ -82,35 +79,17 @@ func NewRunner(opts Options) (*Runner, error) {
 		return nil, errors.NewValidationError("bridge_hostname", "must not be empty")
 	case opts.HandleZoneRoot == "":
 		return nil, errors.NewValidationError("handle_zone_root", "must not be empty")
-	case opts.ActorsPerSecond <= 0 || math.IsNaN(opts.ActorsPerSecond) || math.IsInf(opts.ActorsPerSecond, 0):
-		return nil, errors.NewValidationError("actors_per_second", "must be a positive finite number")
+	case opts.Budget == nil:
+		return nil, errors.NewValidationError("budget", "must not be nil")
 	}
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
-	now := opts.Now
-	if now == nil {
-		now = time.Now
-	}
-	wait := opts.Wait
-	if wait == nil {
-		wait = func(ctx context.Context, delay time.Duration) error {
-			timer := time.NewTimer(delay)
-			defer timer.Stop()
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-timer.C:
-				return ctx.Err()
-			}
-		}
-	}
 	return &Runner{
 		actors: opts.Actors, identity: opts.Identity, actorFetcher: opts.ActorFetcher,
 		bridgeHostname: opts.BridgeHostname, handleZoneRoot: opts.HandleZoneRoot,
-		logger: logger, interval: time.Duration(float64(time.Second) / opts.ActorsPerSecond),
-		now: now, wait: wait,
+		logger: logger, budget: opts.Budget,
 	}, nil
 }
 
@@ -123,7 +102,6 @@ func (r *Runner) Run(ctx context.Context, dids []string) error {
 			return fmt.Errorf("list forward rename candidates: %w", err)
 		}
 	}
-	var lastSubmission time.Time
 	for _, did := range dids {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -244,7 +222,7 @@ func (r *Runner) Run(ctx context.Context, dids []string) error {
 			r.logger.Error("reserve rename handle failed", "did", did, "error", err)
 			continue
 		}
-		if err := r.processPLC(ctx, did, target, &lastSubmission, plcHooks{}, func(ctx context.Context) error {
+		if err := r.processPLC(ctx, did, target, plcHooks{}, func(ctx context.Context) error {
 			return r.finalize(ctx, did, target)
 		}); err != nil {
 			return err
@@ -256,8 +234,9 @@ func (r *Runner) Run(ctx context.Context, dids []string) error {
 // plcHooks are the direction-specific steps of processPLC. The zero value
 // suits a rename that finalizes pending_handle.
 type plcHooks struct {
-	// beforeSubmit runs after pacing, right before each POST. An error sends
-	// no POST and moves on to the next actor.
+	// beforeSubmit runs after any pause and the tombstone check, and before
+	// the budget wait of each POST, so a failure charges no token. An error
+	// sends no POST and moves on to the next actor.
 	beforeSubmit func(context.Context) error
 	// notControlled, when set, handles a PLC head Tidepool does not control
 	// in place of recording plc_not_controlled.
@@ -266,13 +245,13 @@ type plcHooks struct {
 
 // processPLC is common to both directions. finish runs only after PLC is
 // confirmed at target.
-func (r *Runner) processPLC(ctx context.Context, did, target string, lastSubmission *time.Time, hooks plcHooks, finish func(context.Context) error) error {
+func (r *Runner) processPLC(ctx context.Context, did, target string, hooks plcHooks, finish func(context.Context) error) error {
 	// A PLC rate limit applies to every DID the run would send, so the run
 	// pauses and retries this actor instead of moving on.
 	var result identity.HandleUpdateResult
 	for {
-		// The PLC operation cannot be undone, so re-check the tombstone right
-		// before it. FinalizeHandleRename refuses a tombstone that lands later.
+		// This check saves the PLC reads for a tombstoned actor. paceSubmission
+		// repeats it before each POST.
 		current, err := r.actors.GetByDID(ctx, did)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -285,22 +264,39 @@ func (r *Runner) processPLC(ctx context.Context, did, target string, lastSubmiss
 			r.logger.Warn("rename skipped: actor tombstoned before PLC update", "did", did)
 			return nil
 		}
-		// The gate spaces PLC submissions, not actor starts, so a slow actor
+		// The budget spaces PLC submissions, not actor starts, so a slow actor
 		// adds no delay of its own and there is no catch-up burst.
-		var pacingErr, beforeSubmitErr error
+		//
+		// The PLC operation cannot be undone and a pause can last an hour, so
+		// the tombstone check runs after the pause. A tombstone that lands after
+		// the check can still be followed by the POST; FinalizeHandleRename
+		// refuses it.
+		//
+		// The budget wait comes last: the hook's database write can block on a
+		// row lock, and a token taken before it would be held past a pause and
+		// wasted on a hook failure.
+		var pacingErr, beforeSubmitErr, actorReadErr error
 		submitted := false
 		paceSubmission := func(ctx context.Context) error {
-			if !lastSubmission.IsZero() {
-				if remaining := r.interval - r.now().Sub(*lastSubmission); remaining > 0 {
-					if err := r.wait(ctx, remaining); err != nil {
-						pacingErr = fmt.Errorf("pace handle migration: %w", err)
-						return pacingErr
-					}
-				}
-			}
 			if err := ctx.Err(); err != nil {
 				pacingErr = fmt.Errorf("pace handle migration: %w", err)
 				return pacingErr
+			}
+			if err := r.budget.WaitForResume(ctx); err != nil {
+				pacingErr = fmt.Errorf("pace handle migration: %w", err)
+				return pacingErr
+			}
+			current, err := r.actors.GetByDID(ctx, did)
+			if err != nil {
+				if ctx.Err() != nil {
+					pacingErr = fmt.Errorf("pace handle migration: %w", err)
+					return pacingErr
+				}
+				actorReadErr = err
+				return err
+			}
+			if current.ConsentState == store.ConsentStateDeleted {
+				return errActorTombstoned
 			}
 			if hooks.beforeSubmit != nil {
 				if err := hooks.beforeSubmit(ctx); err != nil {
@@ -308,14 +304,29 @@ func (r *Runner) processPLC(ctx context.Context, did, target string, lastSubmiss
 					return err
 				}
 			}
-			*lastSubmission = r.now()
+			if err := r.budget.Wait(ctx); err != nil {
+				pacingErr = fmt.Errorf("pace handle migration: %w", err)
+				return pacingErr
+			}
 			submitted = true
 			return nil
 		}
 		result, err = r.identity.UpdateHandle(ctx, did, target, paceSubmission)
 		if err != nil {
-			if pacingErr != nil && !submitted {
-				// The gate stopped the run before any POST for this actor was sent.
+			if stderrors.Is(err, errActorTombstoned) {
+				r.logger.Warn("rename skipped: actor tombstoned before PLC update", "did", did)
+				return nil
+			}
+			if actorReadErr != nil {
+				r.logger.Error("re-read rename actor failed", "did", did, "error", actorReadErr)
+				return nil
+			}
+			if pacingErr != nil {
+				if submitted {
+					// An earlier attempt's outcome may be unknown, so this does
+					// not claim the POST failed.
+					r.logger.Warn("PLC handle update stopped between attempts: the next run reconciles the PLC head", "did", did, "pending_handle", target)
+				}
 				return pacingErr
 			}
 			if beforeSubmitErr != nil {
@@ -331,8 +342,11 @@ func (r *Runner) processPLC(ctx context.Context, did, target string, lastSubmiss
 			}
 			var rateLimited *identity.PLCRateLimitedError
 			if stderrors.As(err, &rateLimited) {
-				if err := r.pauseForRateLimit(ctx, did, rateLimited); err != nil {
-					return err
+				// The 429 can come from a read that runs before paceSubmission,
+				// so this wait stops the retry from spinning. Cancellation
+				// stops the run with the actor left pending.
+				if err := r.budget.WaitForResume(ctx); err != nil {
+					return fmt.Errorf("pause handle migration for PLC rate limit: %w", err)
 				}
 				continue
 			}
@@ -365,23 +379,6 @@ func (r *Runner) processPLC(ctx context.Context, did, target string, lastSubmiss
 	}
 	if err := finish(ctx); err != nil {
 		r.logger.Error("PLC accepted, finalize not committed", "did", did, "target_handle", target, "error", err)
-	}
-	return nil
-}
-
-// pauseForRateLimit waits out a PLC 429 before the same actor is retried.
-// Cancellation stops the run with the actor left pending.
-func (r *Runner) pauseForRateLimit(ctx context.Context, did string, rateLimited *identity.PLCRateLimitedError) error {
-	retryAfter := rateLimited.Headers["Retry-After"]
-	now := r.now()
-	pause := rateLimitPause(retryAfter, now)
-	r.logger.Warn("PLC rate limited: pausing handle migration", "did", did, "pause", pause.String(),
-		"resume_at", now.Add(pause), "retry_after", retryAfter, "headers", rateLimited.Headers)
-	if err := r.wait(ctx, pause); err != nil {
-		return fmt.Errorf("pause handle migration for PLC rate limit: %w", err)
-	}
-	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("pause handle migration for PLC rate limit: %w", err)
 	}
 	return nil
 }
@@ -471,7 +468,6 @@ func (r *Runner) Rollback(ctx context.Context, dids []string) error {
 		handle = strings.ToLower(handle)
 		return strings.HasSuffix(handle, bridge) && !strings.HasSuffix(handle, zone)
 	}
-	var lastSubmission time.Time
 	for _, did := range candidates {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -489,7 +485,7 @@ func (r *Runner) Rollback(ctx context.Context, dids []string) error {
 		}
 		switch {
 		case isOld(actor.PendingHandle):
-			if err := r.processPLC(ctx, did, actor.PendingHandle, &lastSubmission, plcHooks{}, func(ctx context.Context) error {
+			if err := r.processPLC(ctx, did, actor.PendingHandle, plcHooks{}, func(ctx context.Context) error {
 				return r.finalize(ctx, did, actor.PendingHandle)
 			}); err != nil {
 				return err
@@ -508,7 +504,7 @@ func (r *Runner) Rollback(ctx context.Context, dids []string) error {
 				// stops claiming N.
 				notControlled: abandon,
 			}
-			if err := r.processPLC(ctx, did, actor.Handle, &lastSubmission, hooks, abandon); err != nil {
+			if err := r.processPLC(ctx, did, actor.Handle, hooks, abandon); err != nil {
 				return err
 			}
 		case actor.PendingHandle == "" && isNew(actor.Handle) && isOld(actor.PreviousHandle):
@@ -527,7 +523,7 @@ func (r *Runner) Rollback(ctx context.Context, dids []string) error {
 				}
 				continue
 			}
-			if err := r.processPLC(ctx, did, target, &lastSubmission, plcHooks{}, func(ctx context.Context) error {
+			if err := r.processPLC(ctx, did, target, plcHooks{}, func(ctx context.Context) error {
 				return r.finalize(ctx, did, target)
 			}); err != nil {
 				return err

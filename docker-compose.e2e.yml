@@ -88,6 +88,7 @@
 #                   own ports); 3081 rather than the PDS's natural 3001
 #                   because the Coves dev stack already owns 3001 here
 #   127.0.0.1:6028  Jetstream WebSocket (/subscribe)
+#   127.0.0.1:3013  PLC fixture control API (PLC_FIXTURE_E2E_PORT overrides)
 #
 # LOCAL-ONLY: nothing here talks to plc.directory, public relays, or public
 # Lemmy instances — the reference PDS mints its DIDs against the compose PLC
@@ -150,9 +151,12 @@ services:
       # The compose network is private address space; the SSRF guard must let
       # the bridge fetch lemmy/plc (dev-only, refused in production).
       ALLOW_PRIVATE_FETCH: "1"
-      PLC_DIRECTORY_URL: http://plc:3000
+      # Through the fixture, so tests can answer tidepool's PLC POSTs 429.
+      PLC_DIRECTORY_URL: http://plc-fixture:3000
       ADMIN_TOKEN: e2e-admin-token
-      HANDLE_MIGRATION_RATE: "1"
+      # The budget's burst is 1, so a low rate refuses concurrent authors'
+      # mints and stalls the suite.
+      PLC_WRITES_PER_MINUTE: "600000"
       SEED_COUNTS_FROM_API: "1"
       # Short stats-refresh interval (default 30s) so the vote scenarios
       # actually exercise the bridged-vote-stats refresher: within ~2s of a
@@ -231,7 +235,7 @@ services:
         condition: service_healthy
       handle-tls:
         condition: service_healthy
-      plc:
+      plc-fixture:
         condition: service_healthy
       # The relay must be up AND willing to accept new PDS subscriptions
       # (see relay-bootstrap) before the bridge's startup requestCrawl fires,
@@ -292,6 +296,27 @@ services:
       timeout: 5s
       retries: 30
       start_period: 30s
+
+  # Pass-through proxy in front of `plc`, for tidepool only: the relay and the
+  # PDS use plc:3000 directly. The local PLC has no rate limit, so the
+  # loopback-published control port arms 429s and lists every POST. Its only
+  # upstream is the compose `plc`.
+  plc-fixture:
+    build: e2e/plc-fixture
+    environment:
+      PLC_UPSTREAM_URL: http://plc:3000
+    networks: [tidepool-e2e]
+    ports:
+      - "127.0.0.1:${PLC_FIXTURE_E2E_PORT:-3013}:3001"
+    depends_on:
+      plc:
+        condition: service_healthy
+    healthcheck:
+      # Through the proxy, so healthy means it reaches the PLC.
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/_health"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
 
   # ── BigSky relay (indigo) ───────────────────────────────────────────────
   relay-postgres:

@@ -77,11 +77,14 @@ func newRealMinterHarnessCountingPLCRequests(t *testing.T) (*harness, *atomic.In
 	require.NoError(t, err)
 	custodian, err := identity.NewCustodian(testKEK)
 	require.NoError(t, err)
+	budget, err := identity.NewPLCWriteBudget(identity.PLCWriteBudgetOptions{WritesPerMinute: 600000})
+	require.NoError(t, err)
 	minter, err := identity.NewMinter(identity.MinterOptions{
 		BridgeHostname: "tidepool.test", HandleZoneRoot: "ap.tidepool.test",
 		PLCDirectoryURL: plc.URL,
 		HTTPClient:      ap.NewGuardedHTTPClient(true, 10*time.Second),
 		Actors:          h.actors, RotationKey: rotationKey, Custodian: custodian,
+		Budget: budget,
 	})
 	require.NoError(t, err)
 	h.m.minter = minter
@@ -98,6 +101,8 @@ func TestHandleClaims_MaterializeRetriesReservedHandle(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newRealMinterHarness(t)
+			// An ungated Minter reports a wait, so the mint reads the document.
+			h.serveObject("/u/alice", person("https://lemmy.world/u/alice", "alice", nil))
 			db := testutil.DB(t)
 			ctx := context.Background()
 			owner, err := h.actors.UpsertActor(ctx, store.BridgedActor{

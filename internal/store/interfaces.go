@@ -507,9 +507,9 @@ type InboxEvents interface {
 	// returns an error satisfying errors.IsNotFound.
 	//
 	// The returned event's ClaimedUntil is the fencing/claim token for this
-	// claim: MarkProcessed/Release/MarkPoisoned require it so a worker whose
-	// lease expired and was re-claimed by another cannot overwrite the newer
-	// attempt's outcome.
+	// claim: MarkProcessed/Release/ReleaseParked/MarkPoisoned require it so a
+	// worker whose lease expired and was re-claimed by another cannot overwrite
+	// the newer attempt's outcome.
 	ClaimNext(ctx context.Context, lease time.Duration) (*InboxEvent, error)
 
 	// MarkProcessed stamps the event as successfully processed and clears any
@@ -528,6 +528,16 @@ type InboxEvents interface {
 	// the event already completed, so the release was discarded. A missing
 	// event is an error satisfying errors.IsNotFound.
 	Release(ctx context.Context, activityID, message string, nextAttempt time.Time, claimToken time.Time) (applied bool, err error)
+
+	// ReleaseParked is Release for an event that was throttled, not failed: the
+	// same reschedule, except that it hands back the attempt its own claim took,
+	// so a wait costs the event none of its retry budget. Same fence as Release,
+	// which is what stops a stale park from un-counting a newer claim's attempt.
+	// claimToken must equal the claim's ClaimedUntil. It returns applied=true
+	// when the park was written; applied=false (no error) means the claim was
+	// stale or the event already completed, so the park was discarded. A missing
+	// event is an error satisfying errors.IsNotFound.
+	ReleaseParked(ctx context.Context, activityID, message string, nextAttempt time.Time, claimToken time.Time) (applied bool, err error)
 
 	// MarkPoisoned permanently fails the event: failed_at stamped, error
 	// recorded, lease cleared. Poisoned events are skipped by ClaimNext and

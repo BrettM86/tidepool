@@ -24,9 +24,23 @@ const secondPageID = "https://lemmy.world/post/49122698"
 // newBackfill builds a real Backfill over the harness stack.
 func newBackfill(t *testing.T, h *harness, maxPosts int) *Backfill {
 	t.Helper()
-	b, err := NewBackfill(BackfillOptions{
+	return newBackfillOver(t, h, h.mat, maxPosts)
+}
+
+// newBackfillOver is newBackfill over another materializer.
+func newBackfillOver(t *testing.T, h *harness, materializer Materializer, maxPosts int) *Backfill {
+	t.Helper()
+	b, err := NewBackfill(h.backfillOptions(materializer, maxPosts))
+	require.NoError(t, err)
+	return b
+}
+
+// backfillOptions is the harness's Backfill wiring, for a rig that swaps one
+// dependency.
+func (h *harness) backfillOptions(materializer Materializer, maxPosts int) BackfillOptions {
+	return BackfillOptions{
 		Fetcher:      h.client,
-		Materializer: h.mat,
+		Materializer: materializer,
 		Communities:  h.communities,
 		Tombstones:   h.tombstones,
 		// The same guard the dispatcher runs, and required for the same reason:
@@ -35,9 +49,7 @@ func newBackfill(t *testing.T, h *harness, maxPosts int) *Backfill {
 		// in front of it.
 		Echo:     h.classifier,
 		MaxPosts: maxPosts,
-	})
-	require.NoError(t, err)
-	return b
+	}
 }
 
 // serveOutboxFixtures registers the outbox fixture plus everything its
@@ -564,15 +576,12 @@ func TestBackfillTruncatedWalkLeavesResumable(t *testing.T) {
 		"an un-forced re-trigger must re-walk when last_backfill_at is unset")
 }
 
-// TestBackfillPartialFailureLeavesResumable: a hard (non-skip) item failure
-// leaves last_backfill_at unset so the next trigger retries the walk.
-func TestBackfillPartialFailureLeavesResumable(t *testing.T) {
-	h := newHarness(t)
-	h.subscribeTechnology()
-	serveOutboxFixtures(t, h)
-	// One good item (the real fixture's fully-embedded page) plus one broken
-	// item whose cross-authority object 500s: a hard failure (not a skip), so
-	// failures>0.
+// serveBrokenItemOutbox re-serves the group outbox as one good item (the real
+// fixture's fully-embedded page) plus one broken item whose cross-authority
+// object 500s: a hard failure (not a skip), so failures>0. Requires
+// serveOutboxFixtures to have registered the good item's author.
+func serveBrokenItemOutbox(t *testing.T, h *harness) {
+	t.Helper()
 	outboxRaw, err := os.ReadFile(filepath.Join("..", "ap", "testdata", "outbox_lemmy_world.json"))
 	require.NoError(t, err)
 	var outbox map[string]any
@@ -598,6 +607,15 @@ func TestBackfillPartialFailureLeavesResumable(t *testing.T) {
 			},
 		},
 	})
+}
+
+// TestBackfillPartialFailureLeavesResumable: a hard (non-skip) item failure
+// leaves last_backfill_at unset so the next trigger retries the walk.
+func TestBackfillPartialFailureLeavesResumable(t *testing.T) {
+	h := newHarness(t)
+	h.subscribeTechnology()
+	serveOutboxFixtures(t, h)
+	serveBrokenItemOutbox(t, h)
 	b := newBackfill(t, h, 100)
 	ctx := context.Background()
 

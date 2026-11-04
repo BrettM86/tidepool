@@ -20,8 +20,8 @@ git history, not here.
   a PLC `updateHandle` operation.
 - DMs are not bridged. Moderation decisions made on Coves do not federate to
   Lemmy; only Lemmy's removals, locks and bans flow in.
-- There is no rate limit on outbound actor announcements. `MINT_RATE_PER_MINUTE`
-  and `MINT_BURST` limit inbound mints only. The only levers are
+- There is no rate limit on outbound actor announcements.
+  `PLC_WRITES_PER_MINUTE` limits PLC POSTs only. The only levers are
   `OUTBOUND_WORKERS` and the scoped kill switches.
 
 ## Other platforms
@@ -300,9 +300,11 @@ The sweep reports divergence and never repairs it.
 
 ## Operations and configuration
 
-- Config is read once at startup, so changing a kill switch during an incident
-  means recreating the container. A SIGHUP reload or an admin-writable switch
-  table would fix this.
+- Config is read once at startup, so changing `OUTBOUND_DISABLED`,
+  `OUTBOUND_DISABLED_ACTORS` or `OUTBOUND_DRY_RUN` during an incident means
+  recreating the container. A SIGHUP reload or an admin-writable switch table
+  would fix this. The host and community switches live in the follow list and
+  need no restart.
 - Scoped kill switches are deny lists only. A one-community canary has to list
   every other community, and adding a community to `communities.yaml` silently
   puts it outside the canary.
@@ -358,8 +360,6 @@ The sweep reports divergence and never repairs it.
   block GC rule.
 - A queue attempt interrupted by shutdown still uses up its `ClaimNext` attempt.
   Cosmetic.
-- The mint gate has only unit tests. The e2e stack has no low
-  `MINT_RATE_PER_MINUTE` variant.
 - The failure path for the `activityID` random source cannot be tested without
   injecting the reader, because Go 1.24+ treats a `crypto/rand` failure as fatal.
 
@@ -387,9 +387,14 @@ The sweep reports divergence and never repairs it.
 - The e2e job on GitHub Actions compiles Lemmy from source on every run and may
   exceed runner time or disk. Publish a prebuilt pinned Lemmy debug image to
   GHCR, or use the buildx `gha` cache.
-- The declarative follow list (`FOLLOW_LIST_PATH`) has no e2e test. The missing
-  piece is mounting a follow-list file into the compose `tidepool` service, then
-  checking the community turns `accepted` and that removing it sends an Undo.
+- The e2e suite covers the follow list's host switch and an `instances` entry.
+  An entry under `communities` is not subscribed from the file in any e2e test.
+  The `instances` test reaches `accepted` through the suite's own
+  `POST /admin/communities`, and its cleanup checks a removed entry against
+  `GET /admin/communities` only. `installFollowList` in
+  `tests/e2e/follow_list_test.go` mounts the file, so the missing piece is
+  checking that a sweep's add alone turns `accepted` and that Lemmy receives the
+  Undo.
 - `POST /admin/reemit` has no e2e test.
 - The PLC directory image is pinned by commit in `e2e/plc/Dockerfile`. Bump it
   on purpose when an upstream fix is needed.

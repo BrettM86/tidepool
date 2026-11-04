@@ -31,6 +31,11 @@ const maxAncestorDepth = 50
 // checked only when that record is committed, so a record refused for its
 // author still drops the subtree from there down, but the older ancestors
 // already committed stay.
+//
+// Result.Ancestors names the ancestors this call committed. A commit cannot be
+// undone here and the caller may need to act on each one, so an error comes
+// with a Result holding only Ancestors when any committed, and with nil when
+// none did.
 func (m *Materializer) MaterializeComment(ctx context.Context, note *ap.Object, communityIRI string) (*Result, error) {
 	if err := requireBoundCommunityIRI(communityIRI); err != nil {
 		return nil, err
@@ -66,15 +71,34 @@ func (m *Materializer) MaterializeComment(ctx context.Context, note *ap.Object, 
 	if err != nil {
 		return nil, err
 	}
+	var committed []string
 	for _, ancestor := range ancestors {
-		if err := m.materializeAncestor(ctx, ancestor, communityIRI); err != nil {
+		res, err := m.materializeAncestor(ctx, ancestor, communityIRI)
+		if res != nil {
+			committed = append(committed, ancestor.object.ID)
+		}
+		if err != nil {
 			// A skipped ancestor (nobridge/deleted author) takes the rest of
 			// the subtree with it — placeholder-free by design — but the
 			// older ancestors committed before it stay.
-			return nil, err
+			return committedAncestors(committed), err
 		}
 	}
-	return m.commitCommentLeaf(ctx, note, draft, communityIRI)
+	res, err := m.commitCommentLeaf(ctx, note, draft, communityIRI)
+	if err != nil {
+		return committedAncestors(committed), err
+	}
+	res.Ancestors = committed
+	return res, nil
+}
+
+// committedAncestors is the Result of a comment that failed after committing
+// ancestors, and nil when it committed none.
+func committedAncestors(ancestors []string) *Result {
+	if len(ancestors) == 0 {
+		return nil
+	}
+	return &Result{Ancestors: ancestors}
 }
 
 // countAncestorShortCircuit records the anchor as an echo suppression when the
@@ -266,14 +290,14 @@ func (m *Materializer) storedCommentMapping(ctx context.Context, commentID, comm
 
 // materializeAncestor writes one fetched ancestor: the root Page through the
 // post path, Notes as comment leaves from the draft the walk made (their own
-// parents are guaranteed mapped — the chain is processed oldest-first).
-func (m *Materializer) materializeAncestor(ctx context.Context, ancestor unmappedAncestor, communityIRI string) error {
+// parents are guaranteed mapped — the chain is processed oldest-first). A
+// non-nil Result means the ancestor committed, even beside an error: see
+// MaterializePost.
+func (m *Materializer) materializeAncestor(ctx context.Context, ancestor unmappedAncestor, communityIRI string) (*Result, error) {
 	if ancestor.draft == nil {
-		_, err := m.MaterializePost(ctx, ancestor.object, communityIRI)
-		return err
+		return m.MaterializePost(ctx, ancestor.object, communityIRI)
 	}
-	_, err := m.commitCommentLeaf(ctx, ancestor.object, ancestor.draft, communityIRI)
-	return err
+	return m.commitCommentLeaf(ctx, ancestor.object, ancestor.draft, communityIRI)
 }
 
 // commentDraft is what a Note yields on its own, before anything is read or

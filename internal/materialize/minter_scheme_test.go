@@ -40,14 +40,16 @@ func TestRealMinter_MaterializeActorsOnSameHostWithDifferentPorts(t *testing.T) 
 
 func TestRealMinter_MintUpsertStoresOriginalPreferredUsername(t *testing.T) {
 	for _, tc := range []struct {
-		name, id, username string
-		actorType          store.ActorType
+		name, id, path, username string
+		actorType                store.ActorType
 	}{
-		{"person", "https://lemmy.world/u/Alice_B", "Alice_B", store.ActorTypePerson},
-		{"group", "https://lemmy.world/c/Rust_Lang", "Rust_Lang", store.ActorTypeGroup},
+		{"person", "https://lemmy.world/u/Alice_B", "/u/Alice_B", "Alice_B", store.ActorTypePerson},
+		{"group", "https://lemmy.world/c/Rust_Lang", "/c/Rust_Lang", "Rust_Lang", store.ActorTypeGroup},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newRealMinterHarness(t)
+			// An ungated Minter reports a wait, so the mint reads the document.
+			h.serveObject(tc.path, person(tc.id, tc.username, nil))
 			bridged, inserted, err := h.m.mintAndUpsert(t.Context(), &ap.Object{
 				ID: tc.id, PreferredUsername: tc.username,
 			}, tc.actorType, "lemmy.world")

@@ -2,7 +2,11 @@ package ingest
 
 import (
 	"context"
+	"database/sql"
 	stderrors "errors"
+	"fmt"
+	"log/slog"
+	"slices"
 	"testing"
 	"time"
 
@@ -10,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"tidepool/internal/errors"
+	"tidepool/internal/identity"
 	"tidepool/internal/store"
 	"tidepool/internal/testutil"
 )
@@ -17,14 +22,15 @@ import (
 // queueHarness is a lighter setup for queue-semantics tests: real
 // inbox_events store, scriptable processor.
 type queueHarness struct {
-	events store.InboxEvents
+	database *sql.DB
+	events   store.InboxEvents
 }
 
 func newQueueHarness(t *testing.T) *queueHarness {
 	t.Helper()
 	database := testutil.DB(t)
 	testutil.Truncate(t, database, "inbox_events")
-	return &queueHarness{events: store.NewInboxEvents(database)}
+	return &queueHarness{database: database, events: store.NewInboxEvents(database)}
 }
 
 func (qh *queueHarness) enqueue(t *testing.T, id, orderingKey string) {
@@ -420,4 +426,271 @@ func TestQueueSuccessDuringShutdownIsAcked(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotNil(t, stored.ProcessedAt, "completed work must be acked despite shutdown")
 	assert.Empty(t, stored.Error)
+}
+
+// claimScriptedProcessor returns results[i] from its i-th claim, and nil once
+// the script runs out. It records what each claim saw, in claim order.
+type claimScriptedProcessor struct {
+	results     []error
+	activityIDs []string
+	attempts    []int
+	errorTexts  []string
+}
+
+func (p *claimScriptedProcessor) Process(_ context.Context, event *store.InboxEvent) error {
+	claim := len(p.activityIDs)
+	p.activityIDs = append(p.activityIDs, event.ActivityID)
+	p.attempts = append(p.attempts, event.Attempts)
+	p.errorTexts = append(p.errorTexts, event.Error)
+	if claim < len(p.results) {
+		return p.results[claim]
+	}
+	return nil
+}
+
+// newParkingQueue builds a queue with the default attempt cap and a retry
+// backoff short enough that retries come due at once.
+func (qh *queueHarness) newParkingQueue(t *testing.T, processor Processor, parkDelay time.Duration) *Queue {
+	t.Helper()
+	q, err := NewQueue(QueueOptions{
+		Events:         qh.events,
+		Processor:      processor,
+		RetryBaseDelay: time.Millisecond,
+		ParkDelay:      parkDelay,
+		Lease:          time.Minute,
+	})
+	require.NoError(t, err)
+	return q
+}
+
+// finished reports whether the event has reached either terminal state.
+func (qh *queueHarness) finished(activityID string) func() bool {
+	return func() bool {
+		stored, err := qh.events.GetEvent(context.Background(), activityID)
+		return err == nil && (stored.ProcessedAt != nil || stored.FailedAt != nil)
+	}
+}
+
+// driveQueueUntil runs one processNext per poll until done reports true.
+func driveQueueUntil(t *testing.T, q *Queue, done func() bool) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		q.processNext(context.Background())
+		return done()
+	}, 5*time.Second, time.Millisecond)
+}
+
+// TestQueueThrottledEventNeverPoisons: a throttled event is held rather than
+// failed, so it waits out any number of refusals and still lands.
+func TestQueueThrottledEventNeverPoisons(t *testing.T) {
+	tests := []struct {
+		name        string
+		refusal     error
+		wantRefusal string
+	}{
+		{
+			name:        "mint rate gate",
+			refusal:     fmt.Errorf("mint actor: %w", ErrMintRateExceeded),
+			wantRefusal: "DID mint rate exceeded",
+		},
+		{
+			name: "PLC rate limit",
+			refusal: fmt.Errorf("mint actor: %w",
+				&identity.PLCRateLimitedError{Headers: map[string]string{"Retry-After": "120"}}),
+			wantRefusal: `rate limited, Retry-After "120"`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			qh := newQueueHarness(t)
+			processor := &claimScriptedProcessor{results: slices.Repeat([]error{test.refusal}, 10)}
+			q := qh.newParkingQueue(t, processor, time.Millisecond)
+
+			qh.enqueue(t, "throttled-1", "community-a")
+			driveQueueUntil(t, q, qh.finished("throttled-1"))
+
+			assert.Equal(t, slices.Repeat([]int{1}, 11), processor.attempts,
+				"ten refusals and the landing claim each see one attempt: a park costs nothing")
+			for claim, errorText := range processor.errorTexts {
+				if claim == 0 {
+					assert.Empty(t, errorText, "the first claim has no earlier refusal to see")
+					continue
+				}
+				assert.Contains(t, errorText, test.wantRefusal,
+					"claim %d must see the refusal the park recorded", claim+1)
+			}
+
+			stored, err := qh.events.GetEvent(context.Background(), "throttled-1")
+			require.NoError(t, err)
+			assert.NotNil(t, stored.ProcessedAt, "the event lands once the throttle lifts")
+			assert.Nil(t, stored.FailedAt, "a throttled event is never poisoned")
+		})
+	}
+}
+
+// TestQueueParkedHeadHoldsItsKey: a parked head keeps its younger sibling
+// waiting behind it without holding up other keys. The retry backoff is 1ms, so
+// only the hour-long park can be what holds a-1 back.
+func TestQueueParkedHeadHoldsItsKey(t *testing.T) {
+	qh := newQueueHarness(t)
+	ctx := context.Background()
+	refusal := fmt.Errorf("mint actor: %w", ErrMintRateExceeded)
+	processor := &claimScriptedProcessor{results: []error{refusal}}
+	q := qh.newParkingQueue(t, processor, time.Hour)
+
+	qh.enqueue(t, "a-1", "community-a")
+	qh.enqueue(t, "a-2", "community-a")
+	qh.enqueue(t, "b-1", "community-b")
+
+	require.True(t, q.processNext(ctx), "a-1 is claimed and refused")
+	parked, err := qh.events.GetEvent(ctx, "a-1")
+	require.NoError(t, err)
+	require.Truef(t, parked.NextAttemptAt.After(time.Now().Add(59*time.Minute)),
+		"a-1 must be parked for the hour, next_attempt_at is %s", parked.NextAttemptAt)
+
+	require.True(t, q.processNext(ctx), "another key's event still lands")
+	assert.False(t, q.processNext(ctx), "a-1 is parked and a-2 waits behind it")
+	assert.Equal(t, []string{"a-1", "b-1"}, processor.activityIDs)
+
+	_, err = qh.database.ExecContext(ctx,
+		`UPDATE inbox_events SET next_attempt_at = CURRENT_TIMESTAMP - interval '1 second' WHERE activity_id = $1`,
+		"a-1")
+	require.NoError(t, err)
+
+	require.True(t, q.processNext(ctx))
+	require.True(t, q.processNext(ctx))
+	assert.Equal(t, []string{"a-1", "b-1", "a-1", "a-2"}, processor.activityIDs)
+	for _, activityID := range []string{"a-1", "a-2", "b-1"} {
+		stored, err := qh.events.GetEvent(ctx, activityID)
+		require.NoError(t, err)
+		assert.NotNil(t, stored.ProcessedAt, "%s must land", activityID)
+	}
+}
+
+// TestQueueOrdinaryFailuresStillPoisonAtTheCap: only throttling parks. A
+// wrapped ErrPLCTransient is the row that matters: PLCRateLimitedError unwraps
+// to it, so classifying on the wider sentinel would park every transient
+// failure forever.
+func TestQueueOrdinaryFailuresStillPoisonAtTheCap(t *testing.T) {
+	tests := []struct {
+		name    string
+		failure error
+	}{
+		{name: "plain error", failure: stderrors.New("remote 503")},
+		{name: "wrapped PLC transient", failure: fmt.Errorf("mint actor: %w", identity.ErrPLCTransient)},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			qh := newQueueHarness(t)
+			processor := &claimScriptedProcessor{results: slices.Repeat([]error{test.failure}, 20)}
+			q := qh.newParkingQueue(t, processor, time.Millisecond)
+
+			qh.enqueue(t, "doomed-1", "community-a")
+			driveQueueUntil(t, q, qh.finished("doomed-1"))
+
+			assert.Equal(t, []int{1, 2, 3, 4, 5}, processor.attempts)
+			stored, err := qh.events.GetEvent(context.Background(), "doomed-1")
+			require.NoError(t, err)
+			assert.NotNil(t, stored.FailedAt, "the event is poisoned at the cap")
+			assert.Nil(t, stored.ProcessedAt)
+			assert.Equal(t, 5, stored.Attempts)
+		})
+	}
+}
+
+// parkRecordingEvents is a queue store that hands out one claimed event per
+// ClaimNext and records each park's next attempt. Every other method is the
+// embedded nil interface, so a retry or poison write panics.
+type parkRecordingEvents struct {
+	store.InboxEvents
+	attempts     int
+	nextAttempts []time.Time
+}
+
+func (e *parkRecordingEvents) ClaimNext(context.Context, time.Duration) (*store.InboxEvent, error) {
+	token := time.Date(2026, 11, 1, 12, 2, 0, 0, time.UTC)
+	return &store.InboxEvent{
+		ActivityID:   "park-1",
+		Type:         "Announce",
+		Attempts:     e.attempts,
+		ClaimedUntil: &token,
+	}, nil
+}
+
+func (e *parkRecordingEvents) ReleaseParked(_ context.Context, _, _ string, nextAttempt, _ time.Time) (bool, error) {
+	e.nextAttempts = append(e.nextAttempts, nextAttempt)
+	return true, nil
+}
+
+// TestQueueParkDelayIsFixedWithJitter: the park is two minutes plus up to 30
+// seconds of jitter whatever the attempt count, so it is not a backoff.
+func TestQueueParkDelayIsFixedWithJitter(t *testing.T) {
+	const draws = 200
+
+	tests := []struct {
+		name     string
+		attempts int
+	}{
+		{name: "first attempt", attempts: 1},
+		{name: "at the attempt cap", attempts: 5},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+			events := &parkRecordingEvents{attempts: test.attempts}
+			refusal := fmt.Errorf("mint actor: %w", ErrMintRateExceeded)
+			q, err := NewQueue(QueueOptions{
+				Events:    events,
+				Processor: &claimScriptedProcessor{results: slices.Repeat([]error{refusal}, draws)},
+				Logger:    slog.New(slog.DiscardHandler),
+			})
+			require.NoError(t, err)
+			q.now = func() time.Time { return now }
+
+			for range draws {
+				require.NotPanics(t, func() { q.processNext(context.Background()) },
+					"a throttled event must be parked, not retried or poisoned")
+			}
+
+			require.Len(t, events.nextAttempts, draws)
+			distinct := make(map[time.Duration]struct{})
+			for _, nextAttempt := range events.nextAttempts {
+				delay := nextAttempt.Sub(now)
+				assert.GreaterOrEqual(t, delay, 2*time.Minute)
+				assert.LessOrEqual(t, delay, 2*time.Minute+30*time.Second)
+				distinct[delay] = struct{}{}
+			}
+			assert.Greater(t, len(distinct), 1, "the delay must be jittered")
+		})
+	}
+}
+
+// TestQueueThrottleAtTheCapParksInsteadOfPoisoning: four real failures followed
+// by a refusal on the fifth claim, the one that would hit the attempt cap. The
+// refusal parks, so the throttled case must sit before the cap.
+func TestQueueThrottleAtTheCapParksInsteadOfPoisoning(t *testing.T) {
+	qh := newQueueHarness(t)
+	ctx := context.Background()
+	failure := stderrors.New("remote 503")
+	refusal := fmt.Errorf("mint actor: %w", ErrMintRateExceeded)
+	processor := &claimScriptedProcessor{results: []error{failure, failure, failure, failure, refusal}}
+	q := qh.newParkingQueue(t, processor, time.Millisecond)
+
+	qh.enqueue(t, "capped-1", "community-a")
+	driveQueueUntil(t, q, func() bool { return len(processor.attempts) == 5 })
+	require.Equal(t, []int{1, 2, 3, 4, 5}, processor.attempts, "the refusal lands on the fifth claim")
+
+	stored, err := qh.events.GetEvent(ctx, "capped-1")
+	require.NoError(t, err)
+	assert.Equal(t, 4, stored.Attempts, "the park hands back the fifth claim")
+	assert.Nil(t, stored.FailedAt, "a refusal at the cap must not poison")
+
+	driveQueueUntil(t, q, qh.finished("capped-1"))
+	stored, err = qh.events.GetEvent(ctx, "capped-1")
+	require.NoError(t, err)
+	assert.NotNil(t, stored.ProcessedAt, "the event lands on the claim after the park")
+	assert.Nil(t, stored.FailedAt)
 }

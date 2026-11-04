@@ -84,7 +84,7 @@ func TestUpdateHandle_PLCOperation(t *testing.T) {
 	minter, err := NewMinter(MinterOptions{
 		PLCDirectoryURL: server.URL, BridgeHostname: "tidepool.test", HandleZoneRoot: "ap.tidepool.test",
 		RotationKey: rotationKey, Custodian: testCustodian(t), Actors: struct{ store.BridgedActors }{},
-		HTTPClient: ap.NewGuardedHTTPClient(true, 10*time.Second),
+		HTTPClient: ap.NewGuardedHTTPClient(true, 10*time.Second), Budget: testBudget(t),
 	})
 	require.NoError(t, err)
 	_, err = minter.UpdateHandle(context.Background(), did, "bob.example.com.ap.tidepool.test", nil)
@@ -210,7 +210,7 @@ func TestUpdateHandle_RejectsInvalidLastOperation(t *testing.T) {
 			minter, err := NewMinter(MinterOptions{
 				PLCDirectoryURL: server.URL, BridgeHostname: "tidepool.test", HandleZoneRoot: "ap.tidepool.test",
 				RotationKey: rotationKey, Custodian: testCustodian(t), Actors: struct{ store.BridgedActors }{},
-				HTTPClient: ap.NewGuardedHTTPClient(true, 10*time.Second),
+				HTTPClient: ap.NewGuardedHTTPClient(true, 10*time.Second), Budget: testBudget(t),
 			})
 			require.NoError(t, err)
 			_, err = minter.UpdateHandle(context.Background(), did, "bob.example.com.ap.tidepool.test", nil)
@@ -243,7 +243,7 @@ func TestUpdateHandle_RejectsOversizedLastOperation(t *testing.T) {
 	minter, err := NewMinter(MinterOptions{
 		PLCDirectoryURL: server.URL, BridgeHostname: "tidepool.test", HandleZoneRoot: "ap.tidepool.test",
 		RotationKey: rotationKey, Custodian: testCustodian(t), Actors: struct{ store.BridgedActors }{},
-		HTTPClient: ap.NewGuardedHTTPClient(true, 10*time.Second),
+		HTTPClient: ap.NewGuardedHTTPClient(true, 10*time.Second), Budget: testBudget(t),
 	})
 	require.NoError(t, err)
 	_, err = minter.UpdateHandle(context.Background(), did, "bob.example.com.ap.tidepool.test", nil)
@@ -279,6 +279,8 @@ func TestUpdateHandle_DefaultRetryWaitBacksOff(t *testing.T) {
 			attempt := posts
 			mutex.Unlock()
 			if attempt == 1 {
+				// Retry-After 0 pauses nothing, so only the default wait delays the retry.
+				w.Header().Set("Retry-After", "0")
 				w.WriteHeader(http.StatusTooManyRequests)
 			}
 			return
@@ -289,7 +291,7 @@ func TestUpdateHandle_DefaultRetryWaitBacksOff(t *testing.T) {
 	minter, err := NewMinter(MinterOptions{
 		PLCDirectoryURL: server.URL, BridgeHostname: "tidepool.test", HandleZoneRoot: "ap.tidepool.test",
 		RotationKey: rotationKey, Custodian: testCustodian(t), Actors: struct{ store.BridgedActors }{},
-		HTTPClient: ap.NewGuardedHTTPClient(true, 10*time.Second),
+		HTTPClient: ap.NewGuardedHTTPClient(true, 10*time.Second), Budget: testBudget(t),
 	})
 	require.NoError(t, err)
 	started := time.Now()
@@ -443,14 +445,16 @@ func TestUpdateHandle_ClassifiesPLCRateLimits(t *testing.T) {
 			minter, err := NewMinter(MinterOptions{
 				PLCDirectoryURL: server.URL, BridgeHostname: "tidepool.test", HandleZoneRoot: "ap.tidepool.test",
 				RotationKey: rotationKey, Custodian: testCustodian(t), Actors: struct{ store.BridgedActors }{},
-				HTTPClient: ap.NewGuardedHTTPClient(true, 10*time.Second),
-				Logger:     slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+				HTTPClient: ap.NewGuardedHTTPClient(true, 10*time.Second), Budget: testBudget(t),
+				Logger: slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 				PLCRetryWait: func(context.Context, time.Duration) error {
 					return nil
 				},
 			})
 			require.NoError(t, err)
-			result, err := minter.UpdateHandle(context.Background(), did, "bob.example.com.ap.tidepool.test", nil)
+			// A no-op hook skips the pause: this test classifies 429s, it does not pace them.
+			noPacing := func(context.Context) error { return nil }
+			result, err := minter.UpdateHandle(context.Background(), did, "bob.example.com.ap.tidepool.test", noPacing)
 			if tc.wantApplied {
 				require.NoError(t, err)
 				require.Equal(t, HandleUpdateApplied, result.Outcome)
@@ -491,6 +495,153 @@ func TestUpdateHandle_ClassifiesPLCRateLimits(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestUpdateHandle_RateLimitHoldsNextPOSTUntilPauseEnd(t *testing.T) {
+	rateLimitedOnce := func(attempt int) plcResponse {
+		if attempt == 1 {
+			return plcRateLimited120
+		}
+		return plcResponse{}
+	}
+	for _, tc := range []struct {
+		name             string
+		get              func(attempt int) plcResponse
+		post             func(path string, attempt int) plcResponse
+		postsBeforePause int
+		wantPostTimes    []time.Time
+	}{
+		{
+			name:             "POST answered 429 once",
+			post:             func(_ string, attempt int) plcResponse { return rateLimitedOnce(attempt) },
+			postsBeforePause: 1,
+			wantPostTimes:    []time.Time{clockStart, clockStart.Add(120 * time.Second)},
+		},
+		{
+			name:          "GET answered 429 once",
+			get:           rateLimitedOnce,
+			wantPostTimes: []time.Time{clockStart.Add(120 * time.Second)},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var allowedAtRetry []bool
+			fixture := newBudgetFixture(t, budgetFixtureOptions{
+				get: tc.get, post: tc.post,
+				retried: func(budget *PLCWriteBudget) { allowedAtRetry = append(allowedAtRetry, budget.Allow()) },
+			})
+			ctx, _ := cancellableContext(t)
+
+			update, result := fixture.startUpdate(ctx)
+			fixture.plc.awaitPosts(t, tc.postsBeforePause)
+			fixture.clock.AwaitWaiters(1, update)
+			require.Equal(t, tc.postsBeforePause, fixture.plc.postCount())
+			fixture.clock.Advance(119999 * time.Millisecond)
+			fixture.clock.AwaitWaiters(1, update)
+			require.Equal(t, tc.postsBeforePause, fixture.plc.postCount(), "no POST before the pause's end")
+			fixture.clock.Advance(time.Millisecond)
+
+			require.NoError(t, update.result(t))
+			require.Equal(t, HandleUpdateApplied, result.Outcome)
+			require.Equal(t, tc.wantPostTimes, fixture.plc.postTimes())
+			require.Equal(t, []bool{false}, allowedAtRetry, "the budget is paused by the time the 429 is retried")
+		})
+	}
+}
+
+func TestUpdateHandle_NilHookChargesOneSlot(t *testing.T) {
+	fixture := newBudgetFixture(t, budgetFixtureOptions{})
+
+	result, err := fixture.minter.UpdateHandle(t.Context(), budgetTestDID, budgetTestHandle, nil)
+
+	require.NoError(t, err)
+	require.Equal(t, HandleUpdateApplied, result.Outcome)
+	require.Equal(t, []time.Time{clockStart}, fixture.plc.postTimes(), "a fresh budget needs no clock advance")
+	fixture.clock.Advance(11999 * time.Millisecond)
+	require.False(t, fixture.budget.Allow(), "the update spent the slot")
+	fixture.clock.Advance(time.Millisecond)
+	require.True(t, fixture.budget.Allow(), "the next slot is at +12s")
+}
+
+func TestUpdateHandle_NilHookHoldsEachPOSTForTheBudget(t *testing.T) {
+	failedOnce := func(response plcResponse) func(string, int) plcResponse {
+		return func(_ string, attempt int) plcResponse {
+			if attempt == 1 {
+				return response
+			}
+			return plcResponse{}
+		}
+	}
+	for _, tc := range []struct {
+		name          string
+		spendSlot     bool
+		post          func(path string, attempt int) plcResponse
+		postsHeld     int
+		hold          time.Duration
+		wantPostTimes []time.Time
+	}{
+		{
+			name:          "first POST waits for its slot",
+			spendSlot:     true,
+			hold:          12 * time.Second,
+			wantPostTimes: []time.Time{clockStart.Add(12 * time.Second)},
+		},
+		{
+			name:          "retry after a 429 waits for the pause end",
+			post:          failedOnce(plcRateLimited120),
+			postsHeld:     1,
+			hold:          120 * time.Second,
+			wantPostTimes: []time.Time{clockStart, clockStart.Add(120 * time.Second)},
+		},
+		{
+			name:          "retry after a 5xx waits for its slot",
+			post:          failedOnce(plcResponse{status: http.StatusInternalServerError}),
+			postsHeld:     1,
+			hold:          12 * time.Second,
+			wantPostTimes: []time.Time{clockStart, clockStart.Add(12 * time.Second)},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newBudgetFixture(t, budgetFixtureOptions{post: tc.post})
+			if tc.spendSlot {
+				require.True(t, fixture.budget.Allow())
+			}
+			ctx, _ := cancellableContext(t)
+
+			var result HandleUpdateResult
+			update := startCall("UpdateHandle", func() error {
+				var err error
+				result, err = fixture.minter.UpdateHandle(ctx, budgetTestDID, budgetTestHandle, nil)
+				return err
+			})
+			fixture.plc.awaitPosts(t, tc.postsHeld)
+			fixture.clock.AwaitWaiters(1, update)
+			fixture.clock.Advance(tc.hold - time.Millisecond)
+			fixture.clock.AwaitWaiters(1, update)
+			require.Equal(t, tc.postsHeld, fixture.plc.postCount(), "no POST before the budget releases it")
+			fixture.clock.Advance(time.Millisecond)
+
+			require.NoError(t, update.result(t))
+			require.Equal(t, HandleUpdateApplied, result.Outcome)
+			require.Equal(t, tc.wantPostTimes, fixture.plc.postTimes())
+		})
+	}
+}
+
+func TestUpdateHandle_EveryHeadReadRateLimitedPausesWithoutPOST(t *testing.T) {
+	fixture := newBudgetFixture(t, budgetFixtureOptions{
+		get: func(int) plcResponse { return plcRateLimited120 },
+	})
+	ctx, _ := cancellableContext(t)
+
+	update, _ := fixture.startUpdate(ctx)
+
+	var rateLimited *PLCRateLimitedError
+	require.True(t, errors.As(update.result(t), &rateLimited), "a final 429 must be a rate limit")
+	require.Zero(t, fixture.plc.postCount())
+	fixture.clock.Advance(12 * time.Second)
+	require.False(t, fixture.budget.Allow(), "the ordinary slot has recovered but the pause holds")
+	fixture.clock.Advance(108 * time.Second)
+	require.True(t, fixture.budget.Allow(), "the pause ended at +120s")
 }
 
 // logStringValues collects every string leaf of a decoded JSON log record.

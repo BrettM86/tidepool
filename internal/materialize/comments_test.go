@@ -3,6 +3,7 @@ package materialize
 import (
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"testing"
 
@@ -26,10 +27,23 @@ import (
 // the page must be pulled in by the missing-parent protocol.
 func serveThread(t *testing.T, h *harness) *ap.Object {
 	t.Helper()
+	return serveThreadOptingOut(t, h, "")
+}
+
+// serveThreadOptingOut is serveThread with the named author's document
+// carrying #nobridge.
+func serveThreadOptingOut(t *testing.T, h *harness, optedOut string) *ap.Object {
+	t.Helper()
+	extra := func(username string) map[string]any {
+		if username != optedOut {
+			return nil
+		}
+		return map[string]any{"summary": "<p>#nobridge</p>"}
+	}
 	h.serveLemmyWorldFixtures()
-	h.serveObject("/u/alice", person("https://lemmy.world/u/alice", "alice", nil))
-	h.serveObject("/u/bob", person("https://sh.itjust.works/u/bob", "bob", nil))
-	h.serveObject("/u/carol", person("https://lemmy.zip/u/carol", "carol", nil))
+	h.serveObject("/u/alice", person("https://lemmy.world/u/alice", "alice", extra("alice")))
+	h.serveObject("/u/bob", person("https://sh.itjust.works/u/bob", "bob", extra("bob")))
+	h.serveObject("/u/carol", person("https://lemmy.zip/u/carol", "carol", extra("carol")))
 
 	c1 := note("https://lemmy.world/comment/1001", "https://lemmy.world/u/alice",
 		pageID, "first!", "2026-07-07T04:00:00.000000Z")
@@ -122,6 +136,71 @@ func TestMissingParentChainThreeDeep(t *testing.T) {
 	assert.Less(t, pageIdx, c1Idx, "page before first comment")
 	assert.Less(t, c1Idx, c2Idx, "ancestors before descendants")
 	assert.Less(t, c2Idx, c3Idx, "ancestors before descendants")
+}
+
+// TestMaterializeComment_ReportsCommittedAncestors: an error return must not
+// lose them. Each is committed whatever became of the comment, and only the
+// caller can recheck what happened to it during a wait.
+func TestMaterializeComment_ReportsCommittedAncestors(t *testing.T) {
+	const (
+		c1 = "https://lemmy.world/comment/1001"
+		c2 = "https://sh.itjust.works/comment/2002"
+	)
+	acceptanceFailure := stderrors.New("acceptance refused")
+
+	for _, tc := range []struct {
+		name string
+		// optedOut is the author whose document carries #nobridge.
+		optedOut string
+		// pageMapped commits the root page first, so the chain anchors on it.
+		pageMapped bool
+		// failsAcceptance fails every post's acceptance.
+		failsAcceptance bool
+		skipped         bool
+		ancestors       []string
+	}{
+		{name: "whole chain", ancestors: []string{pageID, c1, c2}},
+		{name: "chain anchored on a mapped page", pageMapped: true, ancestors: []string{c1, c2}},
+		{name: "comment refused for its author", optedOut: "carol", skipped: true, ancestors: []string{pageID, c1, c2}},
+		{name: "ancestor refused for its author", optedOut: "bob", skipped: true, ancestors: []string{pageID, c1}},
+		{name: "first ancestor refused", optedOut: "alice", pageMapped: true, skipped: true},
+		{name: "root page committed but its acceptance failed", failsAcceptance: true, ancestors: []string{pageID}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			leaf := serveThreadOptingOut(t, h, tc.optedOut)
+			if tc.pageMapped {
+				_, err := h.m.MaterializePost(context.Background(), loadFixtureObject(t, "page_lemmy_world.json"), groupID)
+				require.NoError(t, err)
+			}
+			if tc.failsAcceptance {
+				h.m.removalCheck = func(context.Context, string, string) (bool, error) {
+					return false, acceptanceFailure
+				}
+			}
+
+			res, err := h.m.MaterializeComment(context.Background(), leaf, groupID)
+
+			switch {
+			case tc.skipped:
+				require.True(t, IsSkip(err), "got %v", err)
+			case tc.failsAcceptance:
+				require.ErrorIs(t, err, acceptanceFailure)
+			default:
+				require.NoError(t, err)
+			}
+			if tc.ancestors == nil {
+				assert.Nil(t, res, "nothing committed, so nothing to report")
+				return
+			}
+			require.NotNil(t, res)
+			assert.Equal(t, tc.ancestors, res.Ancestors)
+			for _, id := range tc.ancestors {
+				_, err := h.objects.GetByAPID(context.Background(), id)
+				assert.NoError(t, err, "%s is reported as committed", id)
+			}
+		})
+	}
 }
 
 // TestCommentCycleGuard: an inReplyTo cycle is detected during the walk —

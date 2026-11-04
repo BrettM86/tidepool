@@ -411,6 +411,15 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	// One budget gates every PLC POST: the minter, the mint gate and the
+	// rename runner all share this instance.
+	plcWriteBudget, err := identity.NewPLCWriteBudget(identity.PLCWriteBudgetOptions{
+		WritesPerMinute: cfg.PLCWritesPerMinute,
+		Logger:          logger,
+	})
+	if err != nil {
+		return err
+	}
 	minter, err := identity.NewMinter(identity.MinterOptions{
 		PLCDirectoryURL: cfg.PLCDirectoryURL,
 		BridgeHostname:  cfg.BridgeHostname,
@@ -422,13 +431,14 @@ func run(logger *slog.Logger) error {
 		HTTPClient:      ap.NewGuardedHTTPClient(cfg.AllowPrivateAddresses, 30*time.Second),
 		UserAgent:       cfg.UserAgent,
 		Logger:          logger,
+		Budget:          plcWriteBudget,
 	})
 	if err != nil {
 		return err
 	}
 	// Inbound AP activity can trigger DID minting (unseen authors), so the
 	// materializer's minter goes through the rate gate.
-	mintGate, err := ingest.NewMintGate(minter, cfg.MintRatePerMinute, cfg.MintBurst, logger)
+	mintGate, err := ingest.NewMintGate(minter, plcWriteBudget, logger)
 	if err != nil {
 		return err
 	}
@@ -636,7 +646,7 @@ func run(logger *slog.Logger) error {
 	admin.Routes(router)
 	renameRunner, err := handlemigration.NewRunner(handlemigration.Options{
 		Actors: actors, Identity: minter, ActorFetcher: apClient, BridgeHostname: cfg.BridgeHostname,
-		HandleZoneRoot: cfg.HandleZoneRoot, Logger: logger, ActorsPerSecond: cfg.HandleMigrationRate,
+		HandleZoneRoot: cfg.HandleZoneRoot, Logger: logger, Budget: plcWriteBudget,
 	})
 	if err != nil {
 		return err
@@ -653,14 +663,28 @@ func run(logger *slog.Logger) error {
 	}
 	renameAdmin.Routes(router)
 
+	// The one set of outbound switches, armed from the follow list before the
+	// consumer's workers start, so the first delivery sees them. A missing or
+	// malformed file fails startup here (fail fast on a bad deploy, like the
+	// migration gate).
+	outboundSwitches, err := newOutboundSwitches(cfg, logger)
+	if err != nil {
+		return err
+	}
+
 	// Declarative follow list (FOLLOW_LIST_PATH): converge subscriptions to
-	// the repo-committed YAML on startup and every FOLLOW_LIST_INTERVAL. A
-	// missing or malformed file fails startup (fail fast on a bad deploy,
-	// like the migration gate); the reconciler goroutine itself only ever
-	// logs — a file that breaks AFTER startup skips sweeps rather than
-	// unfollowing anything.
+	// the repo-committed YAML on startup and every FOLLOW_LIST_INTERVAL. The
+	// reconciler goroutine only ever logs — a file that breaks AFTER startup
+	// skips sweeps and keeps the last good switches rather than unfollowing
+	// anything.
 	if cfg.FollowListPath != "" {
-		if _, err := ingest.ParseFollowList(cfg.FollowListPath); err != nil {
+		lister, err := ingest.NewLemmyLister(ingest.LemmyListerOptions{
+			Client:    ap.NewGuardedHTTPClient(cfg.AllowPrivateAddresses, 30*time.Second),
+			Scheme:    cfg.BridgeScheme,
+			UserAgent: cfg.UserAgent,
+			Logger:    logger,
+		})
+		if err != nil {
 			return err
 		}
 		reconciler, err := ingest.NewFollowReconciler(ingest.FollowReconcilerOptions{
@@ -668,6 +692,11 @@ func run(logger *slog.Logger) error {
 			Path:     cfg.FollowListPath,
 			Interval: cfg.FollowListInterval,
 			Logger:   logger,
+			Switches: outboundSwitches,
+			Backfill: backfill,
+			Lister:   lister,
+			Posts:    lister,
+			Budget:   plcWriteBudget,
 		})
 		if err != nil {
 			return err
@@ -731,7 +760,7 @@ func run(logger *slog.Logger) error {
 	if cfg.ConsumerEnabled {
 		var acceptEngine *accept.Engine
 		var purger *outbound.Purger
-		consumerDone, acceptEngine, purger, err = startConsumer(ctx, cfg, database, repoManager, personasService, apClient, personasService, logger)
+		consumerDone, acceptEngine, purger, err = startConsumer(ctx, cfg, database, repoManager, personasService, apClient, personasService, outboundSwitches, logger)
 		if err != nil {
 			return err
 		}
@@ -861,6 +890,29 @@ func run(logger *slog.Logger) error {
 	}
 }
 
+// newOutboundSwitches builds the outbound switches from cfg and applies the
+// host and community sets from the follow list. A file that cannot be parsed is
+// an error, which stops boot.
+func newOutboundSwitches(cfg *config.Config, logger *slog.Logger) (*outbound.ConfigSwitches, error) {
+	switches := &outbound.ConfigSwitches{
+		Disabled:       cfg.OutboundDisabled,
+		Dry:            cfg.OutboundDryRun,
+		DisabledActors: cfg.OutboundDisabledActors,
+	}
+	if cfg.FollowListPath == "" {
+		if cfg.OutboundWorkers > 0 {
+			logger.Info("FOLLOW_LIST_PATH is unset: the outbound disabled host and community sets are empty")
+		}
+		return switches, nil
+	}
+	list, err := ingest.ParseFollowList(cfg.FollowListPath)
+	if err != nil {
+		return nil, err
+	}
+	switches.SetDisabledSets(list.OutboundDisabledHosts, list.OutboundDisabledCommunities)
+	return switches, nil
+}
+
 // startConsumer wires the Jetstream consumer (task 14) and starts its read
 // loop. The returned channel closes when the connector's loop has exited, so
 // shutdown can wait for the final cursor flush instead of racing it. The
@@ -892,6 +944,7 @@ func startConsumer(
 	minter consume.ActorMinter,
 	apClient *ap.Client,
 	signers outbound.SignerProvider,
+	switches *outbound.ConfigSwitches,
 	logger *slog.Logger,
 ) (<-chan struct{}, *accept.Engine, *outbound.Purger, error) {
 	// The most SSRF-exposed egress in the bridge: the well-known host comes
@@ -933,20 +986,14 @@ func startConsumer(
 	var worker *outbound.Worker
 	if cfg.OutboundWorkers > 0 {
 		worker, err = outbound.NewWorker(outbound.WorkerOptions{
-			DB:      database,
-			Actors:  store.NewAPActors(database),
-			Prefs:   store.NewFederationPrefs(database),
-			Signers: signers,
-			Inboxes: inboxes,
-			Sender:  apClient,
-			Switches: outbound.ConfigSwitches{
-				Disabled:            cfg.OutboundDisabled,
-				Dry:                 cfg.OutboundDryRun,
-				DisabledHosts:       cfg.OutboundDisabledHosts,
-				DisabledCommunities: cfg.OutboundDisabledCommunities,
-				DisabledActors:      cfg.OutboundDisabledActors,
-			},
-			Logger: logger,
+			DB:       database,
+			Actors:   store.NewAPActors(database),
+			Prefs:    store.NewFederationPrefs(database),
+			Signers:  signers,
+			Inboxes:  inboxes,
+			Sender:   apClient,
+			Switches: switches,
+			Logger:   logger,
 		})
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("consumer: outbound worker: %w", err)

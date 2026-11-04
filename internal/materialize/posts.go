@@ -24,6 +24,9 @@ import (
 // how the two eras coexist: a post first materialized under the deprecated
 // collection keeps being updated there (no migration is planned; Coves
 // indexes both), while everything new is a postv2.
+//
+// A non-nil Result beside an error means the post committed and its acceptance
+// failed. Every other error wrote no post.
 func (m *Materializer) MaterializePost(ctx context.Context, page *ap.Object, communityIRI string) (*Result, error) {
 	if err := requireBoundCommunityIRI(communityIRI); err != nil {
 		return nil, err
@@ -147,10 +150,12 @@ func (m *Materializer) MaterializePost(ctx context.Context, page *ap.Object, com
 		// A failure here fails the whole materialization on purpose. The
 		// alternative — logging and returning the post as materialized — would
 		// leave a post that exists and is invisible, with nothing left to
-		// retry it; this way redelivery heals it.
+		// retry it; this way redelivery heals it. The result stays beside the
+		// error because the post is committed: it is how a caller tells this
+		// failure from a refusal that wrote nothing.
 		acceptingDID, _ := record["community"].(string)
 		if err := m.acceptPost(ctx, acceptingDID, res.ATURI, res.CID, page.Published.Time); err != nil {
-			return nil, err
+			return res, err
 		}
 	}
 	return res, nil

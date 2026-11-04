@@ -402,6 +402,10 @@ type Result struct {
 	// cannot be determined. Empty for profiles and for Results from the
 	// stats-stamp and mapping-reload paths.
 	CommunityDID string
+	// Ancestors lists the AP ids, oldest first, of the ancestors
+	// MaterializeComment committed on the way to the comment. Set beside an
+	// error too: see MaterializeComment.
+	Ancestors []string
 }
 
 // commitRecord is the single write path for every materialized record:

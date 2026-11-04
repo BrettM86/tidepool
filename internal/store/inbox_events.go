@@ -172,19 +172,20 @@ func (r *postgresInboxEvents) MarkProcessed(ctx context.Context, activityID stri
 	return applied, nil
 }
 
-func (r *postgresInboxEvents) Release(ctx context.Context, activityID, message string, nextAttempt time.Time, claimToken time.Time) (bool, error) {
-	if message == "" {
-		return false, errors.NewValidationError("error", "must not be empty")
-	}
-
-	// Fencing + already-processed guard: only the current claim holder may
-	// reschedule (claimed_until == claimToken), and a stale worker's late
-	// release must not reschedule an event a successful retry completed
-	// (processed_at IS NULL). A mismatch writes 0 rows → applied=false.
-	query := `
+// inboxReleaseStatement is the fenced reschedule Release and ReleaseParked both
+// run. Its one slot, filled only from a constant below, is what happens to the
+// attempt count. The statement is shared because the fence is what makes the
+// give-back safe: only the worker whose claim added the increment can subtract
+// one, so a stale park cannot un-count an attempt a newer claim spent.
+//
+// Fencing + already-processed guard: only the current claim holder may
+// reschedule (claimed_until == claimToken), and a stale worker's late release
+// must not reschedule an event a successful retry completed (processed_at IS
+// NULL). A mismatch writes 0 rows → applied=false.
+const inboxReleaseStatement = `
 		WITH updated AS (
 			UPDATE inbox_events
-			SET error = $2, claimed_until = NULL, next_attempt_at = $3
+			SET error = $2, claimed_until = NULL, next_attempt_at = $3%s
 			WHERE activity_id = $1 AND processed_at IS NULL AND claimed_until = $4
 			RETURNING 1
 		)
@@ -192,9 +193,31 @@ func (r *postgresInboxEvents) Release(ctx context.Context, activityID, message s
 			EXISTS (SELECT 1 FROM inbox_events WHERE activity_id = $1),
 			EXISTS (SELECT 1 FROM updated)`
 
+// The two finished statements, expanded once at init: a failure keeps its
+// attempt, a park hands its own back.
+var (
+	inboxReleaseQuery       = fmt.Sprintf(inboxReleaseStatement, "")
+	inboxReleaseParkedQuery = fmt.Sprintf(inboxReleaseStatement, handBackClaimAttempt)
+)
+
+func (r *postgresInboxEvents) Release(ctx context.Context, activityID, message string, nextAttempt time.Time, claimToken time.Time) (bool, error) {
+	return r.release(ctx, "release", inboxReleaseQuery, activityID, message, nextAttempt, claimToken)
+}
+
+func (r *postgresInboxEvents) ReleaseParked(ctx context.Context, activityID, message string, nextAttempt time.Time, claimToken time.Time) (bool, error) {
+	return r.release(ctx, "park", inboxReleaseParkedQuery, activityID, message, nextAttempt, claimToken)
+}
+
+// release runs one of the two finished release statements. operation names it
+// in a wrapped error.
+func (r *postgresInboxEvents) release(ctx context.Context, operation, query, activityID, message string, nextAttempt, claimToken time.Time) (bool, error) {
+	if message == "" {
+		return false, errors.NewValidationError("error", "must not be empty")
+	}
+
 	var exists, applied bool
 	if err := r.db.QueryRowContext(ctx, query, activityID, message, nextAttempt.UTC(), claimToken).Scan(&exists, &applied); err != nil {
-		return false, fmt.Errorf("release inbox event %q: %w", activityID, err)
+		return false, fmt.Errorf("%s inbox event %q: %w", operation, activityID, err)
 	}
 	if !exists {
 		return false, errors.NewNotFoundError("inbox_event", activityID)

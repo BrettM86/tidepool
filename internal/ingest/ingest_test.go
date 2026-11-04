@@ -131,12 +131,27 @@ func (a *remoteActor) signer() *ap.Signer { return ap.NewSigner(a.id+"#main-key"
 type recordingBackfill struct {
 	mu       sync.Mutex
 	triggers []string
+	retried  []string
+	// backlog is what UnfinishedBacklog answers. A test sets it.
+	backlog int
 }
 
 func (r *recordingBackfill) TriggerAsync(c *store.Community, _ bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.triggers = append(r.triggers, c.APGroupID)
+}
+
+func (r *recordingBackfill) RetryUnfinished(c *store.Community) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.retried = append(r.retried, c.APGroupID)
+}
+
+func (r *recordingBackfill) UnfinishedBacklog([]*store.Community) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.backlog
 }
 
 func (r *recordingBackfill) count() int {
@@ -215,12 +230,16 @@ type harness struct {
 	backfills   *recordingBackfill
 	votes       *recordingVotes
 
+	// materializerOptions built mat, for a rig that swaps one dependency.
+	materializerOptions materialize.Options
+
 	mux      *http.ServeMux
 	fixtures *httptest.Server
 	mu       sync.Mutex
 	served   map[string][]byte
 	hits     map[string]int
-	inboxLog [][]byte // POSTs captured at the fake Lemmy shared inbox
+	onFetch  map[string]func() // runs inside a GET of the path, outside mu
+	inboxLog [][]byte          // POSTs captured at the fake Lemmy shared inbox
 }
 
 // serviceRSAKey is generated once: the bridge service actor's key is not
@@ -303,6 +322,7 @@ func newHarness(t *testing.T) *harness {
 		manager:     manager,
 		served:      map[string][]byte{},
 		hits:        map[string]int{},
+		onFetch:     map[string]func(){},
 	}
 	h.mux = http.NewServeMux()
 	h.fixtures = httptest.NewServer(h.mux)
@@ -338,7 +358,7 @@ func newHarness(t *testing.T) *harness {
 	})
 
 	h.minter = &fakeMinter{custodian: custodian}
-	h.mat, err = materialize.New(materialize.Options{
+	h.materializerOptions = materialize.Options{
 		Fetcher:     h.client,
 		Objects:     objects,
 		Actors:      actors,
@@ -364,7 +384,8 @@ func newHarness(t *testing.T) *harness {
 		// outbound request, never the network.
 		NodeInfoClient: &http.Client{Transport: rewriteTransport{target: h.fixtures.Listener.Addr().String()}},
 		UserAgent:      "tidepool-test/1.0",
-	})
+	}
+	h.mat, err = materialize.New(h.materializerOptions)
 	require.NoError(t, err)
 
 	h.backfills = &recordingBackfill{}
@@ -492,7 +513,11 @@ func (h *harness) serveJSON(path string, body []byte) {
 			h.mu.Lock()
 			current := h.served[path]
 			h.hits[path]++
+			onFetch := h.onFetch[path]
 			h.mu.Unlock()
+			if onFetch != nil {
+				onFetch()
+			}
 			w.Header().Set("Content-Type", ap.ContentTypeActivityJSON)
 			_, _ = w.Write(current)
 		})

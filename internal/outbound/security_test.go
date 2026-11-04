@@ -135,9 +135,8 @@ func TestWorker_Unauthorized401IsTransientNotRotationPoison(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestConfigSwitches_HostMatchIsCaseInsensitive(t *testing.T) {
-	sw := ConfigSwitches{
-		DisabledHosts: map[string]struct{}{"Lemmy.World": {}},
-	}
+	sw := &ConfigSwitches{}
+	sw.SetDisabledSets(map[string]struct{}{"Lemmy.World": {}}, nil)
 	assert.False(t, sw.OutboundAllowed(DeliveryScope{InboxHost: "lemmy.world"}),
 		"a disabled-host entry must block regardless of case — hostOf lowercases the scope, so a "+
 			"mixed-case switch value must still block the (lowercased) host")

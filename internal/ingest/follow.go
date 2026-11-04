@@ -643,20 +643,30 @@ func (a *Admin) handleDivergence(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(report)
 }
 
+// followReconcileWriteTimeout bounds how long POST /admin/communities/reconcile
+// may take to write its response. A sweep's 20 listed adds at 12 seconds each
+// are already 4 minutes, past the server's default 30s WriteTimeout.
+const followReconcileWriteTimeout = 10 * time.Minute
+
 // handleReconcile runs one synchronous follow-list sweep on demand, so an
 // operator can converge right after editing the file instead of waiting for
-// the next tick. 501 when no follow list is configured (the handleBackfill
-// nil-dependency pattern).
+// the next tick. The sweep runs under baseCtx, so a client that drops cancels
+// nothing partway and shutdown still does. 501 when no follow list is configured
+// (the handleBackfill nil-dependency pattern).
 func (a *Admin) handleReconcile(w http.ResponseWriter, r *http.Request) {
 	if a.reconciler == nil {
 		http.Error(w, "follow list reconciliation is not configured", http.StatusNotImplemented)
 		return
 	}
-	result, err := a.reconciler.Sweep(r.Context())
+	if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(followReconcileWriteTimeout)); err != nil {
+		a.logger.WarnContext(r.Context(), "extend follow reconcile write deadline", "error", err)
+	}
+	result, err := a.reconciler.Sweep(a.baseCtx)
 	if err != nil {
-		// Parse/list failures abort the pass with no state changes; the
-		// admin API is operator-facing, so the real reason (file path,
-		// entry number) goes straight back.
+		// Parse/list failures abort the pass with no subscription changes;
+		// the outbound sets may already be applied. The admin API is
+		// operator-facing, so the real reason (file path, entry number) goes
+		// straight back.
 		http.Error(w, "reconcile failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}

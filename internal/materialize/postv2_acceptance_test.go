@@ -2,6 +2,7 @@ package materialize
 
 import (
 	"context"
+	stderrors "errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -288,4 +289,23 @@ func TestAcceptanceRefusedWhenRemovalLandsAfterTheGuard(t *testing.T) {
 	require.NoError(t, err,
 		"with no removal standing the same bypassed path must WRITE the acceptance — otherwise "+
 			"the refusal above proves only that the stub broke the write")
+}
+
+// TestMaterializePost_ReturnsTheCommittedPostBesideAnAcceptanceFailure: the
+// result beside the error is the only sign the post committed, and a caller
+// that must undo a commit needs it.
+func TestMaterializePost_ReturnsTheCommittedPostBesideAnAcceptanceFailure(t *testing.T) {
+	h := newHarness(t)
+	h.serveLemmyWorldFixtures()
+	ctx := context.Background()
+	failure := stderrors.New("acceptance refused")
+	h.m.removalCheck = func(context.Context, string, string) (bool, error) { return false, failure }
+
+	res, err := h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"), groupID)
+
+	require.ErrorIs(t, err, failure)
+	mapping, mapErr := h.objects.GetByAPID(ctx, pageID)
+	require.NoError(t, mapErr, "the post committed before the acceptance ran")
+	require.NotNil(t, res)
+	assert.Equal(t, mapping.ATURI, res.ATURI)
 }

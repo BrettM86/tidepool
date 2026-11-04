@@ -93,30 +93,30 @@ func TestRunner_PacesCandidatesWithoutCatchUpBursts(t *testing.T) {
 	)
 	// Gaps are between consecutive PLC POST arrivals on the virtual clock.
 	for _, tc := range []struct {
-		name     string
-		rate     float64
-		explicit bool
+		name            string
+		writesPerMinute int
+		explicit        bool
 		// slowPost advances the clock inside pacetwo's POST, after its arrival.
 		slowPost time.Duration
 		// slowHead advances the clock inside pacetwo's first PLC head read.
 		slowHead time.Duration
 		wantGaps []time.Duration
 	}{
-		{name: "nil dids", rate: 2, wantGaps: []time.Duration{half, half, half, half}},
-		{name: "explicit dids", rate: 2, explicit: true, wantGaps: []time.Duration{half, half, half, half}},
-		{name: "four per second", rate: 4, explicit: true, wantGaps: []time.Duration{quarter, quarter, quarter, quarter}},
-		{name: "slow second actor", rate: 2, explicit: true, slowPost: 2 * time.Second,
+		{name: "nil dids", writesPerMinute: 120, wantGaps: []time.Duration{half, half, half, half}},
+		{name: "explicit dids", writesPerMinute: 120, explicit: true, wantGaps: []time.Duration{half, half, half, half}},
+		{name: "four per second", writesPerMinute: 240, explicit: true, wantGaps: []time.Duration{quarter, quarter, quarter, quarter}},
+		{name: "slow second actor", writesPerMinute: 120, explicit: true, slowPost: 2 * time.Second,
 			wantGaps: []time.Duration{half, 2 * time.Second, half, half}},
-		{name: "slow head read", rate: 2, explicit: true, slowHead: 2 * time.Second,
+		{name: "slow head read", writesPerMinute: 120, explicit: true, slowHead: 2 * time.Second,
 			wantGaps: []time.Duration{2 * time.Second, half, half, half}},
-		{name: "head read shorter than interval", rate: 2, explicit: true, slowHead: 200 * time.Millisecond,
+		{name: "head read shorter than interval", writesPerMinute: 120, explicit: true, slowHead: 200 * time.Millisecond,
 			wantGaps: []time.Duration{half, half, half, half}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newRenameHarness(t)
 			runner, err := NewRunner(Options{Actors: h.actors, Identity: h.minter, ActorFetcher: h.actorClient,
 				BridgeHostname: "tidepool.test", HandleZoneRoot: "ap.tidepool.test", Logger: h.logger,
-				ActorsPerSecond: tc.rate, Now: h.clock.Now, Wait: h.clock.Wait})
+				Budget: clockBudget(t, h.clock, tc.writesPerMinute)})
 			require.NoError(t, err)
 			actors := []struct{ did, name, old, handle string }{
 				{"did:plc:paceone", "one", "one.example-com.tidepool.test", "one.example.com.ap.tidepool.test"},
@@ -216,9 +216,8 @@ func (transport *postTimesTransport) RoundTrip(request *http.Request) (*http.Res
 }
 
 func TestRunner_DefaultClockPacesPLCSubmissions(t *testing.T) {
-	const rate = 10
-	interval := time.Second / rate
-	// The runner stamps a submission inside its gate and the transport sees
+	const interval = 100 * time.Millisecond
+	// The budget stamps a submission inside its gate and the transport sees
 	// that POST a few microseconds later, so the earlier POST of a pair can be
 	// recorded slightly late. The tolerance covers only that in-process gap.
 	const tolerance = 5 * time.Millisecond
@@ -233,10 +232,12 @@ func TestRunner_DefaultClockPacesPLCSubmissions(t *testing.T) {
 		h.insertOldActor(t, did, "https://example.com/u/"+name, name+".example-com.tidepool.test", name)
 		dids = append(dids, did)
 	}
-	// Now and Wait are left nil so the runner uses the real clock and timer.
+	// Now and Wait are left nil so the budget uses the real clock and timer.
+	budget, err := identity.NewPLCWriteBudget(identity.PLCWriteBudgetOptions{WritesPerMinute: 600})
+	require.NoError(t, err)
 	runner, err := NewRunner(Options{Actors: h.actors, Identity: h.minter, ActorFetcher: h.actorClient,
 		BridgeHostname: "tidepool.test", HandleZoneRoot: "ap.tidepool.test", Logger: h.logger,
-		ActorsPerSecond: rate})
+		Budget: budget})
 	require.NoError(t, err)
 	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 	defer cancel()
@@ -259,15 +260,11 @@ func TestRunner_CancelledPacingSendsNoPLCUpdate(t *testing.T) {
 	h.insertOldActor(t, "did:plc:pacetwo", "https://example.com/u/two", "two.example-com.tidepool.test", "two")
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
+	h.clock.onWait = func(time.Duration) { cancel() }
 	var logs bytes.Buffer
 	runner, err := NewRunner(Options{Actors: h.actors, Identity: h.minter, ActorFetcher: h.actorClient,
 		BridgeHostname: "tidepool.test", HandleZoneRoot: "ap.tidepool.test",
-		Logger:          slog.New(slog.NewTextHandler(&logs, nil)),
-		ActorsPerSecond: 2, Now: h.clock.Now,
-		Wait: func(ctx context.Context, _ time.Duration) error {
-			cancel()
-			return ctx.Err()
-		}})
+		Logger: slog.New(slog.NewTextHandler(&logs, nil)), Budget: h.budget})
 	require.NoError(t, err)
 	err = runner.Run(ctx, []string{"did:plc:paceone", "did:plc:pacetwo"})
 	require.ErrorIs(t, err, context.Canceled)
@@ -583,7 +580,7 @@ func TestRunner_FinalizesAfterCancellationOncePLCAccepted(t *testing.T) {
 	defer cancel()
 	runner, err := NewRunner(Options{Actors: h.actors, Identity: cancelAfterPLCAccepted{Identity: h.minter, cancel: cancel}, ActorFetcher: h.actorClient,
 		BridgeHostname: "tidepool.test", HandleZoneRoot: "ap.tidepool.test",
-		ActorsPerSecond: 2, Now: h.clock.Now, Wait: h.clock.Wait})
+		Budget: h.budget})
 	require.NoError(t, err)
 	_ = runner.Run(ctx, []string{did}) // cancellation may be returned or consumed
 	requests, _ := h.plc.snapshot()

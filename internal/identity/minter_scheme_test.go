@@ -58,6 +58,7 @@ func newSchemeMinter(t *testing.T, taken map[string]bool, realActors ...store.Br
 		Custodian:       testCustodian(t),
 		Actors:          actors,
 		HTTPClient:      ap.NewGuardedHTTPClient(true, 10*time.Second),
+		Budget:          testBudget(t),
 	})
 	require.NoError(t, err)
 	return minter, requests

@@ -1,6 +1,9 @@
 package config
 
 import (
+	"bytes"
+	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/netip"
@@ -25,7 +28,7 @@ func clearConfigEnv(t *testing.T) {
 		"PLC_DIRECTORY_URL", "BRIDGE_SERVICE_DID", "USER_AGENT", "BRIDGE_KEK",
 		"BRIDGE_KEK_PREVIOUS",
 		"ADMIN_TOKEN", "BACKFILL_MAX_POSTS", "MINT_RATE_PER_MINUTE",
-		"MINT_BURST", "INGEST_WORKERS", "BRIDGE_SCHEME",
+		"MINT_BURST", "PLC_WRITES_PER_MINUTE", "INGEST_WORKERS", "BRIDGE_SCHEME",
 		"ALLOW_PRIVATE_FETCH", "ALLOW_DEV_REQUEST_CRAWL", "RELAY_HOSTS",
 		"AP_USER_ORIGIN", "AP_HOST_FALLTHROUGH_DEV",
 		"CONSUMER_ENABLED", "JETSTREAM_URL",
@@ -145,39 +148,47 @@ func TestLoad_DNSUDPResponseRate(t *testing.T) {
 	}
 }
 
-func TestLoad_HandleMigrationRate(t *testing.T) {
+func TestLoad_PLCWritesPerMinute(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		value     string
 		unset     bool
-		wantRate  float64
+		wantRate  int
 		wantError bool
 	}{
-		{name: "unset defaults to 0.1", unset: true, wantRate: 0.1},
-		{name: "fractional rate", value: "0.5", wantRate: 0.5},
+		{name: "unset defaults to 5", unset: true, wantRate: 5},
+		{name: "empty defaults to 5", value: "", wantRate: 5},
+		{name: "custom rate", value: "2", wantRate: 2},
 		{name: "zero", value: "0", wantError: true},
-		{name: "negative", value: "-1", wantError: true},
 		{name: "not numeric", value: "abc", wantError: true},
-		{name: "NaN", value: "NaN", wantError: true},
-		{name: "infinity", value: "+Inf", wantError: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			clearConfigEnv(t)
 			if tc.unset {
-				require.NoError(t, os.Unsetenv("HANDLE_MIGRATION_RATE"))
+				require.NoError(t, os.Unsetenv("PLC_WRITES_PER_MINUTE"))
 			} else {
-				t.Setenv("HANDLE_MIGRATION_RATE", tc.value)
+				t.Setenv("PLC_WRITES_PER_MINUTE", tc.value)
 			}
 			cfg, err := Load(discardLogger())
 			if tc.wantError {
 				require.Error(t, err)
-				require.Contains(t, err.Error(), "HANDLE_MIGRATION_RATE")
+				require.Contains(t, err.Error(), "PLC_WRITES_PER_MINUTE")
 				return
 			}
 			require.NoError(t, err)
-			require.Equal(t, tc.wantRate, cfg.HandleMigrationRate)
+			require.Equal(t, tc.wantRate, cfg.PLCWritesPerMinute)
 		})
 	}
+}
+
+func TestLoad_RemovedRateVariablesAreIgnored(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("MINT_RATE_PER_MINUTE", "junk")
+	t.Setenv("MINT_BURST", "junk")
+	t.Setenv("HANDLE_MIGRATION_RATE", "junk")
+
+	_, err := Load(discardLogger())
+	require.NoError(t, err)
 }
 
 func TestLoad_DNSRejectsInvalidDomainNames(t *testing.T) {
@@ -408,8 +419,6 @@ func TestLoad_ProductionWithAllValues(t *testing.T) {
 	assert.Len(t, cfg.BridgeKEK, 32, "base64 KEK decodes to 32 bytes")
 	assert.Equal(t, "prod-admin-token", cfg.AdminToken)
 	assert.Equal(t, 100, cfg.BackfillMaxPosts, "tuning knobs default in every environment")
-	assert.Equal(t, float64(60), cfg.MintRatePerMinute)
-	assert.Equal(t, 120, cfg.MintBurst)
 	assert.Equal(t, 4, cfg.IngestWorkers)
 }
 
@@ -878,8 +887,6 @@ func TestLoad_OutboundDefaultsOff(t *testing.T) {
 		"OUTBOUND_WORKERS defaults to 0: delivery is OFF until a deployment is wired end to end")
 	assert.False(t, cfg.OutboundDryRun, "OUTBOUND_DRY_RUN defaults to false")
 	assert.False(t, cfg.OutboundDisabled, "OUTBOUND_DISABLED defaults to false")
-	assert.Empty(t, cfg.OutboundDisabledHosts, "no hosts disabled by default")
-	assert.Empty(t, cfg.OutboundDisabledCommunities)
 	assert.Empty(t, cfg.OutboundDisabledActors)
 }
 
@@ -913,8 +920,6 @@ func TestLoad_OutboundDryRunParses(t *testing.T) {
 func TestLoad_OutboundDisableListsParse(t *testing.T) {
 	clearConfigEnv(t)
 	t.Setenv("OUTBOUND_DISABLED", "1")
-	t.Setenv("OUTBOUND_DISABLED_HOSTS", "lemmy.world, sh.itjust.works")
-	t.Setenv("OUTBOUND_DISABLED_COMMUNITIES", "https://lemmy.world/c/tech")
 	t.Setenv("OUTBOUND_DISABLED_ACTORS", "did:plc:aaa,did:plc:bbb , ")
 
 	cfg, err := Load(discardLogger())
@@ -922,14 +927,96 @@ func TestLoad_OutboundDisableListsParse(t *testing.T) {
 
 	assert.True(t, cfg.OutboundDisabled, "the global kill switch parses")
 
-	assert.Contains(t, cfg.OutboundDisabledHosts, "lemmy.world")
-	assert.Contains(t, cfg.OutboundDisabledHosts, "sh.itjust.works",
-		"comma-separated hosts are trimmed and split into a set")
-	assert.Len(t, cfg.OutboundDisabledHosts, 2)
-
-	assert.Contains(t, cfg.OutboundDisabledCommunities, "https://lemmy.world/c/tech")
-
 	assert.Contains(t, cfg.OutboundDisabledActors, "did:plc:aaa")
 	assert.Contains(t, cfg.OutboundDisabledActors, "did:plc:bbb")
 	assert.Len(t, cfg.OutboundDisabledActors, 2, "blank entries are dropped, not stored as empty keys")
+}
+
+// loadCapturingLog runs Load over a JSON log and returns the config, the whole
+// log, and its WARN lines.
+func loadCapturingLog(t *testing.T) (*Config, string, []string) {
+	t.Helper()
+	var buffer bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buffer, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	cfg, err := Load(logger)
+	require.NoError(t, err)
+
+	var warnings []string
+	for _, line := range strings.Split(strings.TrimSpace(buffer.String()), "\n") {
+		var record struct {
+			Level string `json:"level"`
+		}
+		require.NoError(t, json.Unmarshal([]byte(line), &record), line)
+		if record.Level == slog.LevelWarn.String() {
+			warnings = append(warnings, line)
+		}
+	}
+	return cfg, buffer.String(), warnings
+}
+
+func linesNaming(lines []string, name string) []string {
+	var named []string
+	for _, line := range lines {
+		if strings.Contains(line, name) {
+			named = append(named, line)
+		}
+	}
+	return named
+}
+
+func TestLoad_RetiredOutboundSwitchVarsWarnWithoutTheirValues(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("OUTBOUND_DISABLED_HOSTS", "hostprobe-one.example, hostprobe-two.example")
+	t.Setenv("OUTBOUND_DISABLED_COMMUNITIES", "https://communityprobe.example/c/tech")
+
+	cfg, log, warnings := loadCapturingLog(t)
+
+	for _, tc := range []struct{ name, other string }{
+		{"OUTBOUND_DISABLED_HOSTS", "OUTBOUND_DISABLED_COMMUNITIES"},
+		{"OUTBOUND_DISABLED_COMMUNITIES", "OUTBOUND_DISABLED_HOSTS"},
+	} {
+		named := linesNaming(warnings, tc.name)
+		if assert.Len(t, named, 1, "one warning for %s", tc.name) {
+			assert.Contains(t, named[0], "communities.yaml")
+			assert.NotContains(t, named[0], tc.other, "each variable has its own warning")
+		}
+	}
+
+	rendered := fmt.Sprintf("%+v", *cfg)
+	for _, probe := range []string{"hostprobe", "communityprobe"} {
+		assert.NotContains(t, log, probe, "the value stays out of the log")
+		assert.NotContains(t, rendered, probe, "the value sets no config")
+	}
+}
+
+func TestLoad_RetiredOutboundSwitchVarWarnsOnlyWhenSet(t *testing.T) {
+	const (
+		hosts       = "OUTBOUND_DISABLED_HOSTS"
+		communities = "OUTBOUND_DISABLED_COMMUNITIES"
+	)
+	for _, tc := range []struct {
+		name    string
+		present string
+		value   string
+		silent  string
+		unset   bool
+	}{
+		{"hosts set, communities empty", hosts, "lemmy.world", communities, false},
+		{"hosts set, communities unset", hosts, "lemmy.world", communities, true},
+		{"communities set, hosts empty", communities, "https://lemmy.world/c/tech", hosts, false},
+		{"communities set, hosts unset", communities, "https://lemmy.world/c/tech", hosts, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearConfigEnv(t)
+			t.Setenv(tc.present, tc.value)
+			if tc.unset {
+				require.NoError(t, os.Unsetenv(tc.silent))
+			}
+
+			_, log, warnings := loadCapturingLog(t)
+
+			assert.Len(t, linesNaming(warnings, tc.present), 1, "the set variable warns")
+			assert.NotContains(t, log, tc.silent, "the other variable is not mentioned")
+		})
+	}
 }

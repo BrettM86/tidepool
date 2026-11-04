@@ -77,7 +77,10 @@ func tidepoolURL() string { return envOr("TIDEPOOL_E2E_URL", "http://localhost:8
 func lemmyURL() string    { return envOr("LEMMY_E2E_URL", "http://localhost:8541") }
 func relayURL() string    { return envOr("RELAY_E2E_URL", "http://localhost:2480") }
 func plcE2EURL() string   { return "http://127.0.0.1:" + envOr("PLC_E2E_PORT", "3012") }
-func dnsAddress() string  { return "127.0.0.1:" + envOr("TIDEPOOL_E2E_DNS_PORT", "5380") }
+func plcFixtureURL() string {
+	return "http://127.0.0.1:" + envOr("PLC_FIXTURE_E2E_PORT", "3013")
+}
+func dnsAddress() string { return "127.0.0.1:" + envOr("TIDEPOOL_E2E_DNS_PORT", "5380") }
 
 // dnsPublicIPv4 is the A answer the e2e Tidepool serves. It must match
 // DNS_PUBLIC_IPV4 on the tidepool service in docker-compose.e2e.yml.
@@ -463,23 +466,47 @@ type lemmyCommunity struct {
 	APID string
 }
 
+// lemmyCommunityOptions are the optional fields of Lemmy's CreateCommunity
+// request. The zero value leaves them out.
+type lemmyCommunityOptions struct {
+	Description string
+	NSFW        bool
+}
+
 func (c *lemmyClient) createCommunity(t *testing.T, name, title string) lemmyCommunity {
 	t.Helper()
+	return c.createCommunityWith(t, name, title, lemmyCommunityOptions{})
+}
+
+// createCommunityWith creates a community with options. A community Lemmy did
+// not store as NSFW would make an NSFW scenario pass on an ordinary one, so the
+// response is checked.
+func (c *lemmyClient) createCommunityWith(t *testing.T, name, title string, options lemmyCommunityOptions) lemmyCommunity {
+	t.Helper()
+	body := map[string]any{"name": name, "title": title}
+	if options.Description != "" {
+		body["description"] = options.Description
+	}
+	if options.NSFW {
+		body["nsfw"] = true
+	}
 	var out struct {
 		CommunityView struct {
 			Community struct {
 				ID      int    `json:"id"`
 				Name    string `json:"name"`
 				ActorID string `json:"actor_id"`
+				NSFW    bool   `json:"nsfw"`
 			} `json:"community"`
 		} `json:"community_view"`
 	}
-	err := c.do(http.MethodPost, "/api/v3/community",
-		map[string]any{"name": name, "title": title}, &out)
-	if err != nil {
+	if err := c.do(http.MethodPost, "/api/v3/community", body, &out); err != nil {
 		t.Fatalf("create community %s: %v", name, err)
 	}
 	comm := out.CommunityView.Community
+	if comm.NSFW != options.NSFW {
+		t.Fatalf("create community %s: lemmy stored nsfw = %v, want %v", name, comm.NSFW, options.NSFW)
+	}
 	return lemmyCommunity{ID: comm.ID, Name: comm.Name, APID: comm.ActorID}
 }
 
@@ -2340,14 +2367,61 @@ func (h *harness) restartTidepool(t *testing.T) {
 	if err != nil {
 		t.Fatalf("restart tidepool: %v\n%s", err, out)
 	}
+	if err := awaitTidepoolHealthy(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// awaitTidepoolHealthy polls /healthz after the bridge container has been
+// restarted or recreated. It returns an error rather than failing the test so a
+// t.Cleanup can report it too.
+func awaitTidepoolHealthy() error {
 	client := &http.Client{Timeout: 5 * time.Second}
 	deadline := time.Now().Add(2 * time.Minute)
 	for {
 		if err := probeHTTP(client, tidepoolURL()+"/healthz"); err == nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("tidepool did not come back healthy after restart")
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+// lemmyCompose runs one docker compose action on the lemmy service alone.
+func lemmyCompose(t *testing.T, action string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "docker", "compose", "-f", composeFile(t), action, "lemmy")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("%s lemmy: %v\n%s", action, err, out)
+	}
+}
+
+// stopLemmy stops the Lemmy container and keeps it, so startLemmy brings back
+// the same container. Pair it with a t.Cleanup(startLemmy): the rest of the
+// suite needs Lemmy.
+func stopLemmy(t *testing.T) {
+	t.Helper()
+	lemmyCompose(t, "stop")
+}
+
+// startLemmy starts the Lemmy container and waits until its API answers. It is a
+// no-op on a running Lemmy.
+func startLemmy(t *testing.T) {
+	t.Helper()
+	lemmyCompose(t, "start")
+	client := &http.Client{Timeout: 5 * time.Second}
+	deadline := time.Now().Add(stackTimeout)
+	for {
+		err := probeHTTP(client, lemmyURL()+"/api/v3/site")
+		if err == nil {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("tidepool did not come back healthy after restart")
+			t.Fatalf("lemmy did not come back within %s: %v", stackTimeout, err)
 		}
 		time.Sleep(time.Second)
 	}

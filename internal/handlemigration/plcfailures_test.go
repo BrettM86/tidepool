@@ -147,7 +147,7 @@ func TestRunner_PLCNonOperationHeadIsNotControlledAndContinues(t *testing.T) {
 			capture := &capturingIdentity{Identity: h.minter}
 			runner, err := NewRunner(Options{Actors: h.actors, Identity: capture, ActorFetcher: h.actorClient,
 				BridgeHostname: "tidepool.test", HandleZoneRoot: "ap.tidepool.test",
-				ActorsPerSecond: 2, Now: h.clock.Now, Wait: h.clock.Wait})
+				Budget: h.budget})
 			require.NoError(t, err)
 			require.NoError(t, runner.Run(t.Context(), []string{plcFailureDID, plcNextDID}))
 			requests, _ := h.plc.snapshot()
@@ -173,7 +173,7 @@ func TestRunner_PLCLastOperationGoneFailsWithoutRetryAndContinues(t *testing.T) 
 			capture := &capturingIdentity{Identity: h.minter}
 			runner, err := NewRunner(Options{Actors: h.actors, Identity: capture, ActorFetcher: h.actorClient,
 				BridgeHostname: "tidepool.test", HandleZoneRoot: "ap.tidepool.test",
-				ActorsPerSecond: 2, Now: h.clock.Now, Wait: h.clock.Wait})
+				Budget: h.budget})
 			require.NoError(t, err)
 			require.NoError(t, runner.Run(t.Context(), []string{plcFailureDID, plcNextDID}))
 			requests, _ := h.plc.snapshot()
@@ -214,7 +214,7 @@ func TestRunner_ExhaustedPLCHeadReadRetriesKeepReservationAndContinue(t *testing
 	capture := &capturingIdentity{Identity: h.minter}
 	runner, err := NewRunner(Options{Actors: h.actors, Identity: capture, ActorFetcher: h.actorClient,
 		BridgeHostname: "tidepool.test", HandleZoneRoot: "ap.tidepool.test",
-		ActorsPerSecond: 2, Now: h.clock.Now, Wait: h.clock.Wait})
+		Budget: h.budget})
 	require.NoError(t, err)
 	require.NoError(t, runner.Run(t.Context(), []string{plcFailureDID, plcNextDID}))
 	requests, _ := h.plc.snapshot()
@@ -358,7 +358,7 @@ func TestRunner_ReconcilesUnclearPLCPostOutcome(t *testing.T) {
 			capture := &capturingIdentity{Identity: h.minter}
 			runner, err := NewRunner(Options{Actors: h.actors, Identity: capture, ActorFetcher: h.actorClient,
 				BridgeHostname: "tidepool.test", HandleZoneRoot: "ap.tidepool.test",
-				ActorsPerSecond: 2, Now: h.clock.Now, Wait: h.clock.Wait})
+				Budget: h.budget})
 			require.NoError(t, err)
 			require.NoError(t, runner.Run(t.Context(), []string{plcFailureDID}))
 			requests, _ := h.plc.snapshot()
@@ -509,7 +509,7 @@ func TestRunner_ExhaustedPLCRetriesKeepReservationAndContinue(t *testing.T) {
 	capture := &capturingIdentity{Identity: h.minter}
 	runner, err := NewRunner(Options{Actors: h.actors, Identity: capture, ActorFetcher: h.actorClient,
 		BridgeHostname: "tidepool.test", HandleZoneRoot: "ap.tidepool.test",
-		ActorsPerSecond: 2, Now: h.clock.Now, Wait: h.clock.Wait})
+		Budget: h.budget})
 	require.NoError(t, err)
 	require.NoError(t, runner.Run(t.Context(), []string{plcFailureDID, plcNextDID}))
 	requests, _ := h.plc.snapshot()

@@ -103,7 +103,7 @@ OUTBOUND_WORKERS=0                        ← intent accumulates, nothing is POS
         │
         │  >0: delivery workers drain the queue onto the wire.
         ▼
-OUTBOUND_DISABLED / _HOSTS / _COMMUNITIES / _ACTORS / OUTBOUND_DRY_RUN
+OUTBOUND_DISABLED / _ACTORS / OUTBOUND_DRY_RUN
                                           ← per-scope parking, checked per delivery.
 ```
 
@@ -147,22 +147,31 @@ for stopping everything. The reason is cost, not safety.
 `pending` with `attempts = 0`. A parked delivery is already `pending`, so a
 redrive does not reach it and it does not need one.
 
-Scope matching (`internal/config/config.go`, `parseHostSet` and `parseSet`):
+The scoped switches match as below. `OUTBOUND_DISABLED_ACTORS` is read from
+the environment (`internal/config/config.go`, `parseSet`). The host and
+community sets are read from `communities.yaml` (`ingest.ParseFollowList`) at
+boot and at each sweep. A file that fails to parse after a good boot keeps the
+last good sets.
 
 | Switch | Matching |
 |---|---|
-| `OUTBOUND_DISABLED_HOSTS` | inbox host, lowercased on load and compared case-insensitively, so case mistakes still block |
-| `OUTBOUND_DISABLED_COMMUNITIES` | community ActivityPub id, such as `https://lemmy.world/c/comicstrips`. Exact and case-sensitive, compared against the delivery's ordering key |
+| `outbound_disabled_hosts` in `communities.yaml` | inbox host, lowercased on load and compared case-insensitively, so case mistakes still block |
+| `outbound_disabled_communities` in `communities.yaml` | community ActivityPub id, such as `https://lemmy.world/c/comicstrips`. Exact and case-sensitive, compared against the delivery's ordering key |
 | `OUTBOUND_DISABLED_ACTORS` | actor DID, exact and case-sensitive |
 
 None of these has an allowlist form. See [Staged rollout](#5-staged-rollout)
 for how that shapes a canary.
 
 **Every switch, including `OUTBOUND_DISABLED` and `OUTBOUND_DRY_RUN`, does
-nothing while `OUTBOUND_WORKERS=0`.** `ConfigSwitches` is built only inside
-`if cfg.OutboundWorkers > 0`, so with no worker nothing reads a switch. Setting
-`OUTBOUND_DISABLED=true` with workers at 0 adds no protection. It is also why
-`OUTBOUND_WORKERS=0` costs nothing: no worker exists to claim, park or write.
+nothing while `OUTBOUND_WORKERS=0`.** `run()` builds `ConfigSwitches` through
+`newOutboundSwitches` whenever the bridge starts, before the consumer, but only
+the delivery worker reads a switch, so with no worker no switch does anything.
+Setting `OUTBOUND_DISABLED=true` with workers at 0 adds no protection. It is
+also why `OUTBOUND_WORKERS=0` costs nothing: no worker exists to claim, park or
+write. With `FOLLOW_LIST_PATH` set, `newOutboundSwitches` parses
+`communities.yaml` at boot, and a file that fails to parse stops boot, even
+with workers at 0. The host and community sets come from that file and reload
+at each sweep. A file that breaks after a good boot keeps the last good sets.
 
 ### Confirming a switch engaged
 
@@ -519,21 +528,26 @@ the AP group id. Build the list from it rather than typing ids by hand:
 ```sh
 curl -s -H "$T" localhost:8091/admin/communities | jq -r '.communities[].community'
 
-# every community except the canary, comma-separated:
+# every community except the canary, as YAML list items for
+# outbound_disabled_communities in communities.yaml:
 CANARY=https://lemmy.world/c/comicstrips
 curl -s -H "$T" localhost:8091/admin/communities \
-  | jq -r --arg c "$CANARY" '[.communities[].community | select(. != $c)] | join(",")'
+  | jq -r --arg c "$CANARY" '[.communities[].community | select(. != $c)] | map("  - \"" + . + "\"") | .[]'
 ```
+
+Paste the output under `outbound_disabled_communities:` in `communities.yaml`,
+then set this in `.env`:
 
 ```
 OUTBOUND_WORKERS=1
-OUTBOUND_DISABLED_COMMUNITIES=<the comma-separated list from above>
 ```
 
 ⚠️ **Adding a community to `communities.yaml` later does not add it to this
 denylist.** The reconciler subscribes it and it starts federating on the next
 sweep. Whenever the follow list grows during a canary, extend
-`OUTBOUND_DISABLED_COMMUNITIES` in the same change.
+`outbound_disabled_communities` in the same commit. An `instances` entry added
+during a canary follows every community on that host, and none of them is in
+this list.
 
 **`OUTBOUND_DRY_RUN=true` does not test the translator.** The worker claims a
 delivery, logs it, and parks before signing or POSTing. The payload was already
@@ -545,13 +559,9 @@ afterwards.
 
 ### Announcement throttling
 
-There is no outbound rate limiter. `MINT_RATE_PER_MINUTE` and `MINT_BURST`
-look like the right knob but are not. Production sets them to 10 and 20
-(`docker-compose.prod.yml`) because the public `plc.directory` returns 429 on
-mint bursts during community backfill. They feed `ingest.NewMintGate`, which
-only the inbound materializer uses, when an unseen Lemmy author gets an
-atproto DID. Persona actors minted by the consumer do not pass through it:
-`run()` hands `personasService` straight to `startConsumer`.
+`PLC_WRITES_PER_MINUTE` paces PLC writes for inbound mints and the rename job
+(default 5 a minute). A PLC 429 pauses all of them for Retry-After or an hour.
+It does not limit outbound delivery.
 
 `internal/outbound` has no rate limiter, sleep or throttle. The only levers on
 outbound volume are:
@@ -565,7 +575,7 @@ outbound volume are:
 
 ### Step 3: widen
 
-Remove entries from `OUTBOUND_DISABLED_COMMUNITIES` one at a time, and raise
+Remove entries from `outbound_disabled_communities` one at a time, and raise
 `OUTBOUND_WORKERS` as the queue requires. Before each widening:
 
 ```sh
@@ -626,10 +636,27 @@ What to look for:
 
 ### Rollback
 
-Roll back with kill switches, not by un-deploying. In escalation order, each
-step is one `.env` edit plus `up -d tidepool`:
+Roll back with kill switches, not by un-deploying. The steps are in escalation
+order. Step 1 is a `communities.yaml` edit plus
+`POST /admin/communities/reconcile`, with no restart. Each step from 2 on is
+one `.env` edit plus `up -d tidepool`:
 
-1. **`OUTBOUND_DISABLED_COMMUNITIES=<the bad one>`** parks one community.
+1. **Add `"<the bad one>"` to `outbound_disabled_communities`** in
+   `communities.yaml`, keeping any canary entries already there: the key is
+   replaced whole, so dropping them starts delivery to every community they
+   held back. Use the exact AP id from `GET /admin/communities`
+   (`.communities[].community`); a well-formed id that differs (a trailing
+   slash, other case) is accepted and never matches. This parks one community.
+   The switch applies when the reconcile starts, even if the response takes
+   minutes. A 500 starting `reconcile failed: follow list` means the file did
+   not parse and the switch did not change: fix the file (or restore the last
+   good copy, keeping the canary entries and the new block) before any
+   `up -d tidepool`, because a file
+   that does not parse also stops the next boot. Confirm with
+   `last_error_class = 'switch_parked'` on that community's
+   `outbound_deliveries` rows (`ordering_key` is the community AP id) and a
+   rising `tidepool_outbound_parked` (see
+   [Confirming a switch engaged](#confirming-a-switch-engaged)).
    Everything else keeps flowing. The parked deliveries keep their retry budget
    and resume when you clear the entry, with no redrive needed. Use this first
    because it is the narrowest. Its only cost is the 5-second re-claim and
@@ -657,6 +684,21 @@ be resumed the way a parked one can.
 Redeploy the previous image only if the failure is a code defect. For a
 federation problem the kill switches act faster and raise no schema-version
 question.
+
+### Stopping an instance onboarding
+
+An `instances` entry in `communities.yaml` follows every local community on its
+host, at most 20 new ones a sweep. There are two ways to stop it:
+
+- **Remove the host's `instances` entry** and run
+  `POST /admin/communities/reconcile`, or wait for the next sweep. Every
+  community on that host that `communities` does not name is unfollowed.
+  What is already bridged is kept.
+- **Lower `PLC_WRITES_PER_MINUTE`** in `.env` and run `up -d tidepool`. The host
+  stays followed, and new communities arrive at a slower pace. The minimum is
+  1; 0 fails boot. The budget is shared, so this slows every PLC write, not
+  only this host's onboarding. A restart ends any active PLC 429 pause; during
+  a 429, use the first way instead.
 
 ---
 

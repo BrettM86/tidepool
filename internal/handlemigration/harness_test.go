@@ -1,6 +1,7 @@
 package handlemigration
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/base64"
@@ -213,6 +214,9 @@ type rewriteTransport struct{ target string }
 type virtualClock struct {
 	mutex sync.Mutex
 	now   time.Time
+	// onWait, when set before the run starts, sees each Wait delay before the
+	// clock advances.
+	onWait func(delay time.Duration)
 }
 
 func newVirtualClock() *virtualClock {
@@ -232,11 +236,24 @@ func (c *virtualClock) Advance(delay time.Duration) {
 }
 
 func (c *virtualClock) Wait(ctx context.Context, delay time.Duration) error {
+	if c.onWait != nil {
+		c.onWait(delay)
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	c.Advance(delay)
 	return nil
+}
+
+// clockBudget returns a PLC write budget on clock.
+func clockBudget(t *testing.T, clock *virtualClock, writesPerMinute int) *identity.PLCWriteBudget {
+	t.Helper()
+	budget, err := identity.NewPLCWriteBudget(identity.PLCWriteBudgetOptions{
+		WritesPerMinute: writesPerMinute, Now: clock.Now, Wait: clock.Wait,
+	})
+	require.NoError(t, err)
+	return budget
 }
 
 func (rt rewriteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -254,7 +271,10 @@ type renameHarness struct {
 	actorTarget string
 	actorClient *ap.Client
 	logger      *slog.Logger
+	// minterLogs holds the Minter's JSON log. Read it after the run returns.
+	minterLogs  bytes.Buffer
 	minter      *identity.Minter
+	budget      *identity.PLCWriteBudget
 	runner      *Runner
 	plc         *plcFixture
 	rotationKey *atcrypto.PrivateKeyK256
@@ -329,10 +349,14 @@ func newRenameHarnessWithTransport(t *testing.T, wrap func(store.BridgedActors) 
 		actorDocs: actorDocs, actorTarget: actorServer.Listener.Addr().String()}
 	plc.now = h.clock.Now
 	h.actorClient = h.actorFetcher(true)
+	// The same budget gates the Minter and every harness runner. 120 a minute
+	// is a 500ms interval.
+	h.budget = clockBudget(t, h.clock, 120)
 	minter, err := identity.NewMinter(identity.MinterOptions{
 		PLCDirectoryURL: server.URL, RotationKey: rotationKey, Custodian: custodian,
 		BridgeHostname: "tidepool.test", HandleZoneRoot: "ap.tidepool.test", Actors: minterActors,
-		HTTPClient: client, PLCRetryWait: func(ctx context.Context, delay time.Duration) error {
+		Logger: slog.New(slog.NewJSONHandler(&h.minterLogs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		Budget: h.budget, HTTPClient: client, PLCRetryWait: func(ctx context.Context, delay time.Duration) error {
 			h.retryMutex.Lock()
 			h.retryDelays = append(h.retryDelays, delay)
 			h.retryMutex.Unlock()
@@ -343,7 +367,7 @@ func newRenameHarnessWithTransport(t *testing.T, wrap func(store.BridgedActors) 
 	runner, err := NewRunner(Options{
 		Actors: actors, Identity: minter, ActorFetcher: h.actorClient,
 		BridgeHostname: "tidepool.test", HandleZoneRoot: "ap.tidepool.test",
-		ActorsPerSecond: 2, Now: h.clock.Now, Wait: h.clock.Wait,
+		Budget: h.budget,
 	})
 	require.NoError(t, err)
 	require.NotNil(t, runner)
@@ -355,7 +379,7 @@ func (h *renameHarness) runnerWithActors(t *testing.T, actors store.BridgedActor
 	t.Helper()
 	runner, err := NewRunner(Options{Actors: actors, Identity: h.minter, ActorFetcher: h.actorClient,
 		BridgeHostname: "tidepool.test", HandleZoneRoot: "ap.tidepool.test", Logger: h.logger,
-		ActorsPerSecond: 2, Now: h.clock.Now, Wait: h.clock.Wait})
+		Budget: h.budget})
 	require.NoError(t, err)
 	require.NotNil(t, runner)
 	return runner

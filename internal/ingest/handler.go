@@ -122,8 +122,7 @@ type HandlerOptions struct {
 
 // Handler dispatches verified, deduplicated inbox activities to the
 // materializer, the vote aggregator, and the follow state machine. It is
-// the queue's processor: a nil or IsSkip return marks the event processed,
-// a validation error poisons it, anything else is retried with backoff.
+// the queue's Processor; see that interface for how each return is treated.
 type Handler struct {
 	mat         Materializer
 	fetcher     Fetcher

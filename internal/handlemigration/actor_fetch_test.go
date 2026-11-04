@@ -178,13 +178,21 @@ func TestRunner_CancelDuringActorFetchStopsWithoutRecordingFailure(t *testing.T)
 
 type unusedActors struct{ store.BridgedActors }
 type unusedIdentity struct{ Identity }
+type unusedActorFetcher struct{ ActorFetcher }
 
 func TestNewRunner_RequiresActorFetcher(t *testing.T) {
-	clock := newVirtualClock()
 	_, err := NewRunner(Options{
 		Actors: unusedActors{}, Identity: unusedIdentity{},
 		BridgeHostname: "tidepool.test", HandleZoneRoot: "ap.tidepool.test",
-		ActorsPerSecond: 2, Now: clock.Now, Wait: clock.Wait,
+		Budget: clockBudget(t, newVirtualClock(), 120),
+	})
+	require.Error(t, err)
+}
+
+func TestNewRunner_RequiresBudget(t *testing.T) {
+	_, err := NewRunner(Options{
+		Actors: unusedActors{}, Identity: unusedIdentity{}, ActorFetcher: unusedActorFetcher{},
+		BridgeHostname: "tidepool.test", HandleZoneRoot: "ap.tidepool.test",
 	})
 	require.Error(t, err)
 }

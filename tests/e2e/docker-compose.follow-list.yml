@@ -1,0 +1,18 @@
+# Layered over docker-compose.e2e.yml by installFollowList
+# (tests/e2e/follow_list_test.go), which recreates `tidepool` alone with both
+# files and restores the base service in cleanup.
+#
+# Why this is not in the base compose file: the follow list is authoritative, so
+# with FOLLOW_LIST_PATH set, restartTidepool's startup sweep would unfollow every
+# community other scenarios subscribed through /admin.
+#
+# Why a directory mount and not a file mount: the test replaces the file by
+# atomic rename, which gives it a new inode. A single-file bind mount stays
+# attached to the old inode and the container would never see the change.
+services:
+  tidepool:
+    environment:
+      FOLLOW_LIST_PATH: /follow-list/communities.yaml
+      FOLLOW_LIST_INTERVAL: ${TIDEPOOL_E2E_FOLLOW_LIST_INTERVAL:-5s}
+    volumes:
+      - "${TIDEPOOL_E2E_FOLLOW_LIST_DIR:?set by installFollowList in tests/e2e/follow_list_test.go}:/follow-list:ro"

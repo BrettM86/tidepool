@@ -163,6 +163,7 @@ func testMinter(t *testing.T, actors store.BridgedActors) (*Minter, *Custodian, 
 		// The PLC client shares the AP client's SSRF guard; localhost needs
 		// the dev/test override, exactly like the httptest-based AP tests.
 		HTTPClient: ap.NewGuardedHTTPClient(true, 10*time.Second),
+		Budget:     testBudget(t),
 	})
 	require.NoError(t, err)
 	return minter, custodian, rotationKey, bridgeHostname
@@ -331,6 +332,7 @@ func TestNewMinter_PDSEndpointScheme(t *testing.T) {
 		Custodian:       testCustodian(t),
 		Actors:          struct{ store.BridgedActors }{},
 		HTTPClient:      http.DefaultClient,
+		Budget:          testBudget(t),
 	}
 
 	cases := []struct {

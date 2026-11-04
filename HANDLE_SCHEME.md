@@ -159,20 +159,22 @@ Details:
   404 (Mastodon) can still be renamed through this fallback. A 410 cannot.
   A 410, a refused redirect, a document that fails validation, or a name
   that fails the check records `username_unavailable`.
-- Bulk runs: a body without `dids` selects every candidate. PLC POSTs are
-  spaced at `HANDLE_MIGRATION_RATE` per second (default 0.1). The run is
-  stored in `handle_migration_runs`, one active row at a time. A run
+- Bulk runs: a body without `dids` selects every candidate. PLC POSTs share
+  one `PLC_WRITES_PER_MINUTE` budget (default 5, burst 1) with DID mints. The
+  run is stored in `handle_migration_runs`, one active row at a time. A run
   interrupted by shutdown resumes in the same mode at boot.
 - PLC rate limits: each 429 from plc.directory (POST or `/log/last`) logs a
   Warn with the DID and these headers: `Retry-After` (first value only),
   `RateLimit`, `RateLimit-*`, `X-RateLimit` and `X-RateLimit-*` (repeated
   values joined with `, `). Values are cut to 128 bytes, and at most 16
   headers besides `Retry-After` are logged. No other headers are logged.
-  When an actor's request is still 429 after its 5 attempts, the whole run
-  (forward or rollback) pauses for `Retry-After` (seconds or HTTP-date), or
-  for 1 hour if there is none, then retries the same actor. It never moves
-  on to the next DID while rate limited. Cancelling during the pause stops
-  the run with the actor still pending.
+  Any PLC 429 pauses every PLC write, mints included, for `Retry-After`
+  (seconds or HTTP-date), or for 1 hour if it is missing or invalid. The
+  pause is not persisted across restarts. When an actor's request is still
+  429 after its 5 attempts, the run (forward or rollback) waits out the
+  pause, then retries the same actor. It never moves on to the next DID
+  while rate limited. Cancelling during the pause stops the run with the
+  actor still pending.
 - Rollback: `{"rollback": true}` targets `previous_handle` for renamed
   actors. For an actor caught mid-forward, the job moves its PLC head back
   to the old handle if the head already lists the new one, releases its

@@ -222,9 +222,9 @@ func (r *postgresOutboundDeliveries) MarkDelivered(ctx context.Context, activity
 //
 // The slot is filled from a CONSTANT below and never from input, and both
 // expansions happen ONCE at package init (releaseQuery / releaseParkedQuery
-// under it) rather than per call — so there are exactly two finished statements
-// in this package, neither of which can be handed a runtime string, and no
-// future `%` written into this SQL can be mangled by a formatting pass.
+// under it) rather than per call — so this template has exactly two finished
+// statements, neither of which can be handed a runtime string, and no future
+// `%` written into this SQL can be mangled by a formatting pass.
 const releaseStatement = `
 		WITH updated AS (
 			UPDATE outbound_deliveries

@@ -353,7 +353,7 @@ func TestRunner_RollbackMidForwardRevertLandedBeforeAbandonCommitted(t *testing.
 		defer cancel()
 		runner, err := NewRunner(Options{Actors: h.actors, Identity: cancelAfterPLCAccepted{Identity: h.minter, cancel: cancel},
 			ActorFetcher: h.actorClient, BridgeHostname: "tidepool.test", HandleZoneRoot: "ap.tidepool.test",
-			ActorsPerSecond: 2, Now: h.clock.Now, Wait: h.clock.Wait})
+			Budget: h.budget})
 		require.NoError(t, err)
 		_ = runner.Rollback(ctx, []string{rollbackDID}) // cancellation may be returned or consumed
 		require.Error(t, ctx.Err())

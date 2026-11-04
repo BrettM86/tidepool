@@ -87,9 +87,10 @@ var ErrPLCTransient = errors.New("identity: PLC transient failure")
 var errPLCHeadNotOperation = errors.New("identity: PLC head is not a plc_operation")
 
 // UpdateHandle submits a signed PLC update operation setting newHandle.
-// beforeSubmit, when not nil, runs right before each POST attempt; an error
-// from it aborts the update without sending that POST. A request whose final
-// attempt is answered 429 returns an error wrapping *PLCRateLimitedError.
+// beforeSubmit runs right before each POST attempt and takes the budget token
+// for that POST; nil means Budget.Wait. An error from it aborts the update
+// without sending that POST. A request whose final attempt is answered 429
+// returns an error wrapping *PLCRateLimitedError.
 func (m *Minter) UpdateHandle(ctx context.Context, did, newHandle string, beforeSubmit func(context.Context) error) (HandleUpdateResult, error) {
 	first, err := m.readLastOperation(ctx, did)
 	if errors.Is(err, errPLCHeadNotOperation) {
@@ -202,13 +203,11 @@ func (m *Minter) readLastOperation(ctx context.Context, did string) (map[string]
 			_ = response.Body.Close()
 			return last, err
 		}
-		_ = response.Body.Close()
 		transient := ErrPLCTransient
 		if status == http.StatusTooManyRequests {
-			headers := rateLimitHeaders(response.Header)
-			m.logPLCRateLimit(did, "get", headers)
-			transient = &PLCRateLimitedError{Headers: headers}
+			transient = m.observePLCRateLimit(did, "get", response.Header)
 		}
+		_ = response.Body.Close()
 		if attempt == maxPLCUpdateAttempts {
 			return nil, fmt.Errorf("identity: GET PLC last operation for %s: %w: status %d after %d attempts",
 				did, transient, status, attempt)
@@ -276,6 +275,9 @@ func (m *Minter) buildHandleUpdate(last map[string]any, newHandle string) (map[s
 }
 
 func (m *Minter) postHandleUpdate(ctx context.Context, did, newHandle, rotationDIDKey string, signed map[string]any, beforeSubmit func(context.Context) error) (HandleUpdateResult, error) {
+	if beforeSubmit == nil {
+		beforeSubmit = m.budget.Wait
+	}
 	body, err := json.Marshal(signed)
 	if err != nil {
 		return HandleUpdateResult{}, fmt.Errorf("identity: marshal PLC handle update for %s: %w", did, err)
@@ -288,10 +290,8 @@ func (m *Minter) postHandleUpdate(ctx context.Context, did, newHandle, rotationD
 		}
 		request.Header.Set("Content-Type", "application/json")
 		request.Header.Set("User-Agent", m.userAgent)
-		if beforeSubmit != nil {
-			if err := beforeSubmit(ctx); err != nil {
-				return HandleUpdateResult{}, fmt.Errorf("identity: before PLC handle update for %s: %w", did, err)
-			}
+		if err := beforeSubmit(ctx); err != nil {
+			return HandleUpdateResult{}, fmt.Errorf("identity: before PLC handle update for %s: %w", did, err)
 		}
 		response, err := m.httpClient.Do(request)
 		if err != nil {
@@ -300,21 +300,19 @@ func (m *Minter) postHandleUpdate(ctx context.Context, did, newHandle, rotationD
 			}
 			return m.reconcileHandleUpdate(ctx, did, newHandle, rotationDIDKey, signed, 0, err.Error())
 		}
+		status := response.StatusCode
+		transient := ErrPLCTransient
+		if status == http.StatusTooManyRequests {
+			transient = m.observePLCRateLimit(did, "post", response.Header)
+		}
 		message, _ := io.ReadAll(io.LimitReader(response.Body, maxPLCErrorBody))
 		_ = response.Body.Close()
-		status := response.StatusCode
 		switch {
 		case status >= 200 && status < 300:
 			return HandleUpdateResult{Outcome: HandleUpdateApplied}, nil
 		case status == http.StatusBadRequest:
 			return m.reconcileHandleUpdate(ctx, did, newHandle, rotationDIDKey, signed, status, strings.TrimSpace(string(message)))
 		case status == http.StatusTooManyRequests || status >= 500:
-			transient := ErrPLCTransient
-			if status == http.StatusTooManyRequests {
-				headers := rateLimitHeaders(response.Header)
-				m.logPLCRateLimit(did, "post", headers)
-				transient = &PLCRateLimitedError{Headers: headers}
-			}
 			if attempt == maxPLCUpdateAttempts {
 				return HandleUpdateResult{}, fmt.Errorf("identity: POST PLC handle update for %s: %w: status %d after %d attempts", did, transient, status, attempt)
 			}
@@ -336,14 +334,7 @@ func (m *Minter) waitForPLCRetry(ctx context.Context, delay time.Duration) error
 		}
 		return ctx.Err()
 	}
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
+	return waitForDelay(ctx, delay)
 }
 
 func (m *Minter) reconcileHandleUpdate(ctx context.Context, did, newHandle, rotationDIDKey string, signed map[string]any, status int, message string) (HandleUpdateResult, error) {

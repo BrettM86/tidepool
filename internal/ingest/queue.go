@@ -2,11 +2,14 @@ package ingest
 
 import (
 	"context"
+	stderrors "errors"
 	"log/slog"
+	"math/rand/v2"
 	"sync"
 	"time"
 
 	"tidepool/internal/errors"
+	"tidepool/internal/identity"
 	"tidepool/internal/materialize"
 	"tidepool/internal/store"
 )
@@ -18,6 +21,7 @@ const (
 	defaultRetryBaseDelay = 30 * time.Second
 	defaultMaxRetryDelay  = time.Hour
 	defaultLease          = 2 * time.Minute
+	defaultParkDelay      = 2 * time.Minute
 	defaultPollInterval   = time.Second
 	// bookkeepingTimeout bounds the outcome-recording writes, which run on a
 	// context detached from the worker's (see processNext) so a completed
@@ -27,8 +31,9 @@ const (
 
 // Processor consumes one claimed inbox event. *Handler implements it.
 // Return contract: nil or IsSkip → processed; IsValidation → poisoned;
-// anything else → retried with backoff until the attempt cap, then
-// poisoned.
+// ErrMintRateExceeded or *identity.PLCRateLimitedError → parked for a fixed
+// delay and retried at no attempt cost, for as long as the throttling lasts;
+// anything else → retried with backoff until the attempt cap, then poisoned.
 type Processor interface {
 	Process(ctx context.Context, event *store.InboxEvent) error
 }
@@ -51,6 +56,9 @@ type QueueOptions struct {
 	// becomes claimable again; it also bounds one event's processing time
 	// (default 2m).
 	Lease time.Duration
+	// ParkDelay is how long a throttled event waits before its next claim
+	// (default 2m). Jitter of up to a quarter of it goes on top.
+	ParkDelay time.Duration
 	// PollInterval is the idle re-check period (default 1s). The inbox also
 	// nudges the pool on every enqueue, so this is only the fallback for
 	// retries and missed nudges.
@@ -68,11 +76,12 @@ type Queue struct {
 	maxAttempts    int
 	retryBaseDelay time.Duration
 	lease          time.Duration
+	parkDelay      time.Duration
 	pollInterval   time.Duration
 	logger         *slog.Logger
 
 	nudge chan struct{}
-	// now is a test seam for backoff scheduling.
+	// now is a test seam for retry and park scheduling.
 	now func() time.Time
 }
 
@@ -95,6 +104,7 @@ func NewQueue(opts QueueOptions) (*Queue, error) {
 		maxAttempts:    opts.MaxAttempts,
 		retryBaseDelay: opts.RetryBaseDelay,
 		lease:          opts.Lease,
+		parkDelay:      opts.ParkDelay,
 		pollInterval:   opts.PollInterval,
 		logger:         logger,
 		nudge:          make(chan struct{}, 1),
@@ -111,6 +121,9 @@ func NewQueue(opts QueueOptions) (*Queue, error) {
 	}
 	if q.lease <= 0 {
 		q.lease = defaultLease
+	}
+	if q.parkDelay <= 0 {
+		q.parkDelay = defaultParkDelay
 	}
 	if q.pollInterval <= 0 {
 		q.pollInterval = defaultPollInterval
@@ -225,6 +238,21 @@ func (q *Queue) processNext(ctx context.Context) bool {
 		q.logger.Warn("inbox event poisoned (invalid payload)",
 			"activity_id", event.ActivityID, "type", event.Type, "error", err)
 		q.poison(bookCtx, event, token, err.Error())
+	case isThrottled(err):
+		// Throttling says nothing about the event, so it waits without
+		// spending an attempt. This case sits above the attempt cap so a
+		// throttled event that used its attempts on real failures is not
+		// poisoned for being throttled.
+		delay := q.parkWait()
+		q.logger.Info("inbox event throttled; parking",
+			"activity_id", event.ActivityID, "type", event.Type,
+			"attempt", event.Attempts, "retry_in", delay, "error", err)
+		applied, rerr := q.events.ReleaseParked(bookCtx, event.ActivityID, err.Error(), q.now().Add(delay), token)
+		if rerr != nil {
+			q.logger.Error("park inbox event", "activity_id", event.ActivityID, "error", rerr)
+		} else if !applied {
+			q.logger.Warn("stale claim; park discarded", "activity_id", event.ActivityID)
+		}
 	case event.Attempts >= q.maxAttempts:
 		q.logger.Error("inbox event poisoned (attempt cap reached)",
 			"activity_id", event.ActivityID, "type", event.Type,
@@ -276,6 +304,26 @@ func claimToken(event *store.InboxEvent) time.Time {
 		return time.Time{}
 	}
 	return *event.ClaimedUntil
+}
+
+// isThrottled reports whether err is a refusal by the PLC write budget or a
+// PLC 429. It matches *identity.PLCRateLimitedError and not the wider
+// identity.ErrPLCTransient that type unwraps to: other transient PLC failures
+// still spend attempts.
+func isThrottled(err error) bool {
+	var rateLimited *identity.PLCRateLimitedError
+	return stderrors.Is(err, ErrMintRateExceeded) || stderrors.As(err, &rateLimited)
+}
+
+// parkWait is the park delay plus jitter uniform in [0, delay/4), so events
+// throttled together do not all come due together. Unlike backoff it does not
+// grow with attempts. A delay too short to have a quarter gets no jitter.
+func (q *Queue) parkWait() time.Duration {
+	jitterBound := int64(q.parkDelay / 4)
+	if jitterBound <= 0 {
+		return q.parkDelay
+	}
+	return q.parkDelay + time.Duration(rand.Int64N(jitterBound))
 }
 
 // backoff doubles the base delay per completed attempt, capped at an hour.

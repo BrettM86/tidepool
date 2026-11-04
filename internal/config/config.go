@@ -9,7 +9,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
-	"math"
 	"net/netip"
 	"net/url"
 	"os"
@@ -41,13 +40,12 @@ type Config struct {
 	// e.g. "tidepool.example". Used for WebFinger, actor IDs, and handles.
 	BridgeHostname string
 	// HandleZoneRoot is the DNS zone for new bridged handles, under BridgeHostname.
-	HandleZoneRoot      string
-	DNSListen           string
-	DNSUDPResponseRate  int
-	HandleMigrationRate float64
-	DNSPublicIPv4       netip.Addr
-	DNSPublicIPv6       netip.Addr
-	DNSNameservers      []string
+	HandleZoneRoot     string
+	DNSListen          string
+	DNSUDPResponseRate int
+	DNSPublicIPv4      netip.Addr
+	DNSPublicIPv6      netip.Addr
+	DNSNameservers     []string
 	// CloudflareAPIToken enables delegation passes (at startup and every 15 minutes) when set.
 	CloudflareAPIToken string
 	// DelegationMaxNSRecords caps configured-nameserver NS records in the zone.
@@ -176,13 +174,11 @@ type Config struct {
 	// (stays pending, resumes when cleared), nothing federates
 	// (OUTBOUND_DISABLED, default false).
 	OutboundDisabled bool
-	// OutboundDisabledHosts / Communities / Actors are the scoped kill
-	// switches: any delivery whose inbox host, community AP id, or actor DID is
-	// in the set is parked (comma-separated OUTBOUND_DISABLED_HOSTS /
-	// OUTBOUND_DISABLED_COMMUNITIES / OUTBOUND_DISABLED_ACTORS). Empty = allow.
-	OutboundDisabledHosts       map[string]struct{}
-	OutboundDisabledCommunities map[string]struct{}
-	OutboundDisabledActors      map[string]struct{}
+	// OutboundDisabledActors is the scoped actor kill switch: any delivery whose
+	// actor DID is in the set is parked (comma-separated
+	// OUTBOUND_DISABLED_ACTORS). Empty = allow. The host and community switches
+	// live in the follow list.
+	OutboundDisabledActors map[string]struct{}
 	// AdminToken is the bearer token protecting the /admin API (community
 	// subscribe/unsubscribe/backfill). ADMIN_TOKEN; required in production,
 	// dev default is a fixed, publicly known value.
@@ -190,14 +186,11 @@ type Config struct {
 	// BackfillMaxPosts caps how many posts one community backfill run
 	// materializes (BACKFILL_MAX_POSTS, default 100).
 	BackfillMaxPosts int
-	// MintRatePerMinute is the sustained rate cap on inbound DID minting
-	// (MINT_RATE_PER_MINUTE, default 60). Inbound AP activity can trigger
-	// minting (post/comment authors), so it must be bounded — PLC
-	// registrations are forever.
-	MintRatePerMinute float64
-	// MintBurst is the mint token bucket's burst size (MINT_BURST, default
-	// 120) — sized to absorb a community backfill's author spike.
-	MintBurst int
+	// PLCWritesPerMinute is the pace of every PLC POST, mints and handle
+	// updates together (PLC_WRITES_PER_MINUTE, default 5, burst 1). Inbound
+	// AP activity can trigger minting (post/comment authors), so it must be
+	// bounded — PLC registrations are forever.
+	PLCWritesPerMinute int
 	// IngestWorkers is the inbox queue worker-pool size (INGEST_WORKERS,
 	// default 4).
 	IngestWorkers int
@@ -339,15 +332,6 @@ func Load(logger *slog.Logger) (*Config, error) {
 	cfg.DNSUDPResponseRate, err = intVar(logger, "DNS_UDP_RESPONSE_RATE", 200)
 	if err != nil {
 		return nil, err
-	}
-	if raw := os.Getenv("HANDLE_MIGRATION_RATE"); raw == "" {
-		cfg.HandleMigrationRate = 0.1
-		logger.Info("HANDLE_MIGRATION_RATE not set, using default", "value", cfg.HandleMigrationRate)
-	} else {
-		cfg.HandleMigrationRate, err = strconv.ParseFloat(raw, 64)
-		if err != nil || cfg.HandleMigrationRate <= 0 || math.IsNaN(cfg.HandleMigrationRate) || math.IsInf(cfg.HandleMigrationRate, 0) {
-			return nil, fmt.Errorf("config: HANDLE_MIGRATION_RATE must be a positive finite number, got %q", raw)
-		}
 	}
 	if cfg.DNSListen != "" {
 		// The zone root and default nameservers derive from BRIDGE_HOSTNAME,
@@ -582,12 +566,7 @@ func Load(logger *slog.Logger) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	mintRate, err := intVar(logger, "MINT_RATE_PER_MINUTE", 60)
-	if err != nil {
-		return nil, err
-	}
-	cfg.MintRatePerMinute = float64(mintRate)
-	cfg.MintBurst, err = intVar(logger, "MINT_BURST", 120)
+	cfg.PLCWritesPerMinute, err = intVar(logger, "PLC_WRITES_PER_MINUTE", 5)
 	if err != nil {
 		return nil, err
 	}
@@ -651,13 +630,15 @@ func Load(logger *slog.Logger) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Hosts are lowercased (the worker's scope host comes from hostOf, which
-	// lowercases): a kill switch must fail CLOSED, so a mixed-case entry has to
-	// still block the normalized host. Communities and actors are exact ids and
-	// keep their case.
-	cfg.OutboundDisabledHosts = parseHostSet(os.Getenv("OUTBOUND_DISABLED_HOSTS"))
-	cfg.OutboundDisabledCommunities = parseSet(os.Getenv("OUTBOUND_DISABLED_COMMUNITIES"))
 	cfg.OutboundDisabledActors = parseSet(os.Getenv("OUTBOUND_DISABLED_ACTORS"))
+	// These two moved to the follow list and set nothing here. An operator who
+	// still sets one may think a kill switch is engaged, so say so. The value
+	// stays out of the log.
+	for _, name := range []string{"OUTBOUND_DISABLED_HOSTS", "OUTBOUND_DISABLED_COMMUNITIES"} {
+		if os.Getenv(name) != "" {
+			logger.Warn("environment variable is ignored: this switch is set in communities.yaml", "variable", name)
+		}
+	}
 
 	// Retention knobs for the task-11 pruners: same semantics as
 	// FIREHOSE_RETENTION (real defaults everywhere, must be positive).
@@ -852,18 +833,6 @@ func parseSet(raw string) map[string]struct{} {
 	set := make(map[string]struct{})
 	for _, item := range strings.Split(raw, ",") {
 		if item = strings.TrimSpace(item); item != "" {
-			set[item] = struct{}{}
-		}
-	}
-	return set
-}
-
-// parseHostSet is parseSet with each entry lowercased — for the host kill
-// switch, whose scope host arrives already lowercased.
-func parseHostSet(raw string) map[string]struct{} {
-	set := make(map[string]struct{})
-	for _, item := range strings.Split(raw, ",") {
-		if item = strings.ToLower(strings.TrimSpace(item)); item != "" {
 			set[item] = struct{}{}
 		}
 	}

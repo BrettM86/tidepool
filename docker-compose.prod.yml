@@ -121,15 +121,10 @@ services:
       # "Runbook: rotating BRIDGE_KEK".
       BRIDGE_KEK_PREVIOUS: ${BRIDGE_KEK_PREVIOUS:-}
       ADMIN_TOKEN: ${ADMIN_TOKEN}
-      # Gentler than the built-in 60/120: the public plc.directory 429s
-      # mint bursts during community backfill (observed at launch), and a
-      # rejected submission wastes a generated DID. Mints retry durably,
-      # so a smoother rate only defers identity creation, never loses it.
-      MINT_RATE_PER_MINUTE: ${MINT_RATE_PER_MINUTE:-10}
-      MINT_BURST: ${MINT_BURST:-20}
-      # PLC handle updates per second for the rename job; empty means the
-      # config default (0.1). Mints share the same plc.directory limit.
-      HANDLE_MIGRATION_RATE: ${HANDLE_MIGRATION_RATE:-}
+      # PLC writes a minute, shared by mints and the rename job. Empty means
+      # the built-in default of 5. Lower it to slow down during an incident.
+      # The minimum is 1; 0 fails boot.
+      PLC_WRITES_PER_MINUTE: ${PLC_WRITES_PER_MINUTE:-}
       # Announced for WIDER-NETWORK visibility only (and quota-limited
       # there — see the relay service below). The app path into Coves is
       # the self-hosted relay + jetstream services in this file. The
@@ -185,15 +180,22 @@ services:
       # :236-242) — never poisoned, never cancelled, so engaging one loses
       # nothing. DRY_RUN parks too, after translating and logging.
       #
-      # ALL OF THESE ARE READ ONCE AT BOOT (config.Load); there is
-      # no reload signal. Changing one means editing /opt/tidepool/.env and
-      # recreating the service.
+      # OUTBOUND_DRY_RUN, OUTBOUND_DISABLED and OUTBOUND_DISABLED_ACTORS are
+      # read once at boot (config.Load); there is no reload signal. Changing
+      # one means editing /opt/tidepool/.env and recreating the service.
+      # ACTORS are DIDs, matched exactly and case-sensitively (parseSet).
       #
-      # HOSTS is lowercased on load; COMMUNITIES and ACTORS are matched EXACTLY
-      # and case-sensitively (parseHostSet and parseSet). Communities are AP ids
-      # ("https://lemmy.world/c/comicstrips"), matched against the delivery's
-      # ordering key; actors are DIDs. There is no allowlist form — a canary is
-      # expressed by disabling every community except the one under test.
+      # The host and community sets come from outbound_disabled_hosts and
+      # outbound_disabled_communities in communities.yaml. They reload at each
+      # follow-list sweep, or at once with POST /admin/communities/reconcile.
+      # Hosts are lowercased on load; communities are AP ids
+      # ("https://lemmy.world/c/comicstrips"), matched exactly against the
+      # delivery's ordering key. A file that breaks after a good boot keeps the
+      # last good sets. The two pass-through lines below are kept only so the
+      # boot warning fires if .env still sets them; their values are ignored.
+      #
+      # There is no allowlist form. A canary lists every community except the
+      # one under test under outbound_disabled_communities.
       OUTBOUND_DRY_RUN: ${OUTBOUND_DRY_RUN:-false}
       OUTBOUND_DISABLED: ${OUTBOUND_DISABLED:-false}
       OUTBOUND_DISABLED_HOSTS: ${OUTBOUND_DISABLED_HOSTS:-}

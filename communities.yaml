@@ -1,5 +1,6 @@
 # Declarative follow list: every Lemmy community this Tidepool instance
-# bridges. Deploys point FOLLOW_LIST_PATH at this file; the reconciler
+# bridges, named one by one under `communities` or a whole host at a time
+# under `instances`. Deploys point FOLLOW_LIST_PATH at this file; the reconciler
 # converges subscriptions to it on startup and every FOLLOW_LIST_INTERVAL
 # (default 15m), and POST /admin/communities/reconcile forces a pass.
 #
@@ -15,13 +16,33 @@
 # Inclusion criteria (evaluate requests against these, not vibes):
 #   - active: posts within the last 30 days
 #   - established moderation (named mod team, posted rules)
-#   - not NSFW-primary
+#   - not NSFW-primary (individually listed communities only; an instances
+#     entry follows every local community)
 # Request additions or removals via GitHub issue; each entry should carry a
 # comment linking its rationale.
 #
 # Entry format: "!name@host" or the community's AP URL ("https://host/c/name").
 # NOTE: entries MUST be quoted — a bare !name@host is a YAML tag and will
 # fail to parse.
+#
+# Optional `instances` key: each entry ({host: "lemmy.world"}) follows every
+# local community on that host, including NSFW ones and ones created later.
+# `exclude` (entries on that host, same two forms) is the only filter. Each
+# sweep lists the host's communities and reads its recent local posts; a
+# community is found by either. Both reads are anonymous, so they never return
+# hidden communities. The listing reaches about 10,000 communities a host, and
+# the post walk finds a community past that once a local post in it is read.
+# Put a wanted community neither finds under `communities`. Removing an instances entry unfollows that host's
+# communities that `communities` does not name; already-bridged records are
+# kept. See docs/ADMIN_API.md, "Instance entries" and "Listing limit".
+#
+# Optional outbound kill switches, applied at each sweep with no restart:
+#   - outbound_disabled_hosts: inbox hostnames, matched case-insensitively
+#   - outbound_disabled_communities: community AP ids
+#     ("https://lemmy.world/c/comicstrips"), matched exactly
+# A matching delivery is parked, not dropped, and resumes when the entry is
+# removed. A file that breaks after a good boot keeps the last good sets.
+# See DEPLOY.md.
 communities:
   - "!comicstrips@lemmy.world"   # seed set, 2026-07: small, active, cross-checks lemmy.world
   - "!selfhosted@lemmy.world"    # seed set, 2026-07

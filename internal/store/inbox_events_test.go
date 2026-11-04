@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"testing"
 	"time"
@@ -201,4 +202,142 @@ func TestInboxEvents_DeepBacklogDoesNotBlockOtherKeys(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, head.ActivityID, again.ActivityID,
 		"the key's head must be re-claimed before any younger sibling")
+}
+
+// TestInboxEvents_ReleaseParkedHandsBackTheClaimAttempt: a park reschedules the
+// event like Release and gives back the attempt its own claim took, so the
+// earlier failure stays counted and the park costs nothing.
+func TestInboxEvents_ReleaseParkedHandsBackTheClaimAttempt(t *testing.T) {
+	repo := NewInboxEvents(testDB(t))
+	ctx := context.Background()
+
+	_, err := repo.RecordEvent(ctx, testActivityID, "Create")
+	require.NoError(t, err)
+
+	first, err := repo.ClaimNext(ctx, time.Minute)
+	require.NoError(t, err)
+	require.NotNil(t, first.ClaimedUntil)
+	applied, err := repo.Release(ctx, testActivityID, "remote 503",
+		time.Now().Add(-time.Second), *first.ClaimedUntil)
+	require.NoError(t, err)
+	require.True(t, applied)
+
+	second, err := repo.ClaimNext(ctx, time.Minute)
+	require.NoError(t, err)
+	require.Equal(t, 2, second.Attempts)
+	require.NotNil(t, second.ClaimedUntil)
+
+	nextAttempt := time.Now().Add(time.Hour).UTC()
+	applied, err = repo.ReleaseParked(ctx, testActivityID, "mint rate exceeded", nextAttempt, *second.ClaimedUntil)
+	require.NoError(t, err)
+	assert.True(t, applied, "the claim holder parks its own event")
+
+	event, err := repo.GetEvent(ctx, testActivityID)
+	require.NoError(t, err)
+	assert.Equal(t, 1, event.Attempts, "only the park's own claim is handed back")
+	assert.Nil(t, event.ClaimedUntil, "the lease is cleared")
+	assert.WithinDuration(t, nextAttempt, event.NextAttemptAt, time.Second)
+	assert.Equal(t, "mint rate exceeded", event.Error)
+	assert.Nil(t, event.ProcessedAt)
+	assert.Nil(t, event.FailedAt)
+}
+
+// TestInboxEvents_ReleaseParkedRefusals: every refused park leaves the row
+// exactly as it was.
+func TestInboxEvents_ReleaseParkedRefusals(t *testing.T) {
+	const missingActivityID = "https://lemmy.world/activities/missing"
+
+	claim := func(t *testing.T, repo InboxEvents) *InboxEvent {
+		t.Helper()
+		claimed, err := repo.ClaimNext(context.Background(), time.Minute)
+		require.NoError(t, err)
+		require.NotNil(t, claimed.ClaimedUntil)
+		return claimed
+	}
+
+	tests := []struct {
+		name       string
+		activityID string
+		message    string
+		// arrange leaves the event in the state under test and returns the
+		// token the park presents.
+		arrange func(t *testing.T, database *sql.DB, repo InboxEvents) time.Time
+		// wantErr is nil when the park is a discarded no-op rather than an error.
+		wantErr func(error) bool
+	}{
+		{
+			name:       "stale token after a re-claim",
+			activityID: testActivityID,
+			message:    "mint rate exceeded",
+			arrange: func(t *testing.T, database *sql.DB, repo InboxEvents) time.Time {
+				staleToken := *claim(t, repo).ClaimedUntil
+				_, err := database.ExecContext(context.Background(),
+					`UPDATE inbox_events SET claimed_until = CURRENT_TIMESTAMP - interval '1 minute' WHERE activity_id = $1`,
+					testActivityID)
+				require.NoError(t, err)
+				require.Equal(t, 2, claim(t, repo).Attempts)
+				return staleToken
+			},
+		},
+		{
+			// MarkProcessed clears claimed_until, so only raw SQL can put a
+			// current token on a processed row and leave the processed_at guard
+			// as the sole refusal.
+			name:       "processed event with its token still on the row",
+			activityID: testActivityID,
+			message:    "mint rate exceeded",
+			arrange: func(t *testing.T, database *sql.DB, repo InboxEvents) time.Time {
+				token := *claim(t, repo).ClaimedUntil
+				_, err := database.ExecContext(context.Background(),
+					`UPDATE inbox_events SET processed_at = CURRENT_TIMESTAMP WHERE activity_id = $1`,
+					testActivityID)
+				require.NoError(t, err)
+				return token
+			},
+		},
+		{
+			name:       "missing id",
+			activityID: missingActivityID,
+			message:    "mint rate exceeded",
+			arrange: func(t *testing.T, _ *sql.DB, repo InboxEvents) time.Time {
+				return *claim(t, repo).ClaimedUntil
+			},
+			wantErr: errors.IsNotFound,
+		},
+		{
+			name:       "empty message",
+			activityID: testActivityID,
+			message:    "",
+			arrange: func(t *testing.T, _ *sql.DB, repo InboxEvents) time.Time {
+				return *claim(t, repo).ClaimedUntil
+			},
+			wantErr: errors.IsValidation,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			database := testDB(t)
+			repo := NewInboxEvents(database)
+			ctx := context.Background()
+
+			_, err := repo.RecordEvent(ctx, testActivityID, "Create")
+			require.NoError(t, err)
+			token := test.arrange(t, database, repo)
+			before, err := repo.GetEvent(ctx, testActivityID)
+			require.NoError(t, err)
+
+			applied, err := repo.ReleaseParked(ctx, test.activityID, test.message, time.Now().Add(time.Hour), token)
+			if test.wantErr == nil {
+				require.NoError(t, err)
+			} else {
+				assert.True(t, test.wantErr(err), "unexpected error: %v", err)
+			}
+			assert.False(t, applied, "a refused park is not applied")
+
+			after, err := repo.GetEvent(ctx, testActivityID)
+			require.NoError(t, err)
+			assert.Equal(t, before, after, "a refused park writes nothing")
+		})
+	}
 }

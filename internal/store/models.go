@@ -416,14 +416,21 @@ type InboxEvent struct {
 	// OrderingKey serializes processing: events sharing a key (normally the
 	// community IRI) are handled strictly in arrival order.
 	OrderingKey string
-	// Attempts counts how many times a worker claimed this event.
+	// Attempts is a refunded counter, not a claim count: ClaimNext adds one on
+	// every claim, and a park the fence applied hands its own back
+	// (ReleaseParked). What stays counted is claims that succeeded or failed
+	// for a real reason, plus abandoned claims whose worker died or lost its
+	// lease before settling. The attempt cap and the backoff read this, so a
+	// throttled event's wait spends none of its retry budget.
 	Attempts int
-	// NextAttemptAt is the retry-backoff schedule; claimable when <= now.
+	// NextAttemptAt is the retry backoff or the park delay; claimable when
+	// <= now.
 	NextAttemptAt time.Time
 	// ClaimedUntil is the current worker lease; nil/past means unclaimed. It
 	// also serves as the fencing/claim token: ClaimNext stamps a fresh value
-	// on every claim, and MarkProcessed/Release/MarkPoisoned require it so a
-	// worker whose lease expired cannot overwrite a re-claim's outcome.
+	// on every claim, and MarkProcessed/Release/ReleaseParked/MarkPoisoned
+	// require it so a worker whose lease expired cannot overwrite a re-claim's
+	// outcome.
 	ClaimedUntil *time.Time
 	// FailedAt marks a poisoned event: permanently failed, skipped by the
 	// queue, no longer blocking its ordering key.

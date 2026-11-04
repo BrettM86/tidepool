@@ -65,7 +65,6 @@ runbook is [DEPLOY.md](../DEPLOY.md) §6.
 | Variable | Default | What it does |
 |---|---|---|
 | `HANDLE_ZONE_ROOT` | `ap.<BRIDGE_HOSTNAME>` | DNS zone for new-format bridged handles. Must be a valid hostname strictly under `BRIDGE_HOSTNAME`. |
-| `HANDLE_MIGRATION_RATE` | `0.1` | PLC handle updates per second sent by the admin handle migration job. Any positive number. See the note below. |
 | `DNS_LISTEN` | empty (DNS off) | UDP and TCP listen address for the built-in DNS server, for example `:53`. Serves the handle zone and per-instance subzones (TXT, SOA, NS, A, AAAA). Zone transfers are refused. When set, `BRIDGE_HOSTNAME` must be a domain name with no port. |
 | `DNS_UDP_RESPONSE_RATE` | `200` | UDP responses per second per client IPv4 /24 or IPv6 /56. Over the limit, every second suppressed response is an empty truncated reply and the rest are dropped. TCP is not limited. |
 | `DNS_PUBLIC_IPV4` | unset | IPv4 address returned in A answers. Required when `DNS_LISTEN` is set. |
@@ -79,10 +78,6 @@ runbook is [DEPLOY.md](../DEPLOY.md) §6.
 `DNS_LISTEN` is set. `DELEGATION_MAX_NS_RECORDS` is read only when
 `CLOUDFLARE_API_TOKEN` is set.
 
-Handle migration: each PLC request, retries included, is sent at least
-1/rate seconds after the previous one. A PLC 429 pauses the whole run. See
-[HANDLE_SCHEME.md](../HANDLE_SCHEME.md).
-
 Delegation runs one pass at startup and one every 15 minutes. Each pass creates
 `<label>.<BRIDGE_HOSTNAME> NS <first DNS_NAMESERVERS entry>` records, oldest
 qualified label first. Creation is capped at 20 records per rolling hour across
@@ -95,7 +90,7 @@ the whole zone, counted from Cloudflare's `created_on`. A pass also stops at
 |---|---|---|
 | `INGEST_WORKERS` | `4` | Inbox queue worker count. |
 | `BACKFILL_MAX_POSTS` | `100` | Posts materialized per community backfill run. |
-| `MINT_RATE_PER_MINUTE` / `MINT_BURST` | `60` / `120` | Rate limit on minting DIDs for inbound authors. Unseen authors in delivered content trigger mints, and PLC registrations are permanent. |
+| `PLC_WRITES_PER_MINUTE` | `5` | PLC POSTs per minute, with a burst of 1, shared by DID mints and handle updates. Unseen authors in delivered content trigger mints, and PLC registrations are permanent. Any positive integer. See the note below. |
 | `SEED_COUNTS_FROM_API` | on | Seeds backfilled posts' vote counts from the community's host through Lemmy's public API. Uses `/api/v3/post` for posts on that host and anonymous `/api/v3/resolve_object` for posts from other instances. Never queries the post's own host. Set `0` to turn off. |
 | `MAX_BLOB_BYTES` | `5242880` (5 MiB) | Largest remote media file (avatar, banner, post image) the materializer downloads. Larger files are dropped, never truncated. Lexicon slots set tighter limits of their own, for example 1 MB for avatars. |
 | `PROFILE_REFRESH_TTL` | `24h` | How old a bridged actor's profile may get before it is fetched again. `Update{Person}` and `Update{Group}` refresh it immediately. The TTL catches what Lemmy does not federate, such as bio edits and the `#nobridge` marker. |
@@ -106,8 +101,16 @@ the whole zone, counted from Cloudflare's `created_on`. A pass also stops at
 | `SYNC_MAX_SUBSCRIBERS` | `100` | Maximum concurrent `subscribeRepos` connections. |
 | `RELAY_HOSTS` | unset | Comma-separated relays sent `com.atproto.sync.requestCrawl` at startup, each retried for a bounded time. In development the request is logged and not sent unless `ALLOW_DEV_REQUEST_CRAWL` is on. |
 | `ALLOW_DEV_REQUEST_CRAWL` | off | Dev only. Sends `requestCrawl` to `RELAY_HOSTS` in development, for the e2e stack's local relay. Refused in production, which always sends. |
-| `FOLLOW_LIST_PATH` | unset | Path to the declarative follow list. See [ADMIN_API.md](ADMIN_API.md#declarative-follow-list-follow_list_path). When unset, the `/admin` API is the only way to manage subscriptions. |
+| `FOLLOW_LIST_PATH` | unset | Path to the declarative follow list. See [ADMIN_API.md](ADMIN_API.md#declarative-follow-list-follow_list_path). Its `instances` key names a whole Lemmy instance; see [Instance entries](ADMIN_API.md#instance-entries). When unset, the `/admin` API is the only way to manage subscriptions, and the outbound host and community switches are empty. |
 | `FOLLOW_LIST_INTERVAL` | `15m` | How often the follow-list reconciler runs. |
+
+`PLC_WRITES_PER_MINUTE` replaces `MINT_RATE_PER_MINUTE`, `MINT_BURST` and
+`HANDLE_MIGRATION_RATE`, which are no longer read. Every PLC POST, retries
+included, shares one budget. Any PLC 429 pauses all writes for `Retry-After`,
+or for 1 hour if it is missing or invalid. The pause is not persisted across
+restarts. An inbox event refused a mint, or stopped by a PLC 429, waits about 2
+minutes and retries without using a retry attempt. Other failures still poison
+the event after 5 attempts. See [HANDLE_SCHEME.md](../HANDLE_SCHEME.md).
 
 ## Outbound federation
 
@@ -122,14 +125,21 @@ comments and votes to ActivityPub peers. Delivery runs only when
 | `JETSTREAM_URL` | unset | Self-hosted Jetstream to subscribe to (`ws://` or `wss://`). Validated whenever set, so it can be staged before `CONSUMER_ENABLED` and a typo fails at boot. |
 | `OUTBOUND_WORKERS` | `0` | Number of delivery workers. With the consumer on and this at `0`, deliveries queue up and nothing is sent. Raising it sends the whole backlog right away. |
 | `OUTBOUND_DISABLED` | off | Global delivery kill switch. Blocked deliveries are parked: they stay `pending` and resume when the switch is cleared. |
-| `OUTBOUND_DISABLED_HOSTS` | empty | Comma-separated inbox hosts to park. Case-insensitive. |
-| `OUTBOUND_DISABLED_COMMUNITIES` | empty | Comma-separated community ActivityPub ids to park, for example `https://lemmy.world/c/comicstrips`. Exact, case-sensitive match. |
 | `OUTBOUND_DISABLED_ACTORS` | empty | Comma-separated actor DIDs to park. Exact match. |
 | `OUTBOUND_DRY_RUN` | off | Logs each claimed delivery and sends nothing. The worker parks before signing, so deliveries resume when the flag is cleared. |
 | `ADMISSION_MAX_PER_AUTHOR_PER_COMMUNITY` | `50` | Most posts one native author may have accepted into one bridged community. Tidepool signs the community's acceptance, so this caps what it vouches for. `0` means no limit. |
 
 Notes on the kill switches and dry run:
 
+- The host and community switches are in the follow-list file, as
+  `outbound_disabled_hosts` and `outbound_disabled_communities`. See
+  [ADMIN_API.md](ADMIN_API.md#declarative-follow-list-follow_list_path). A
+  change applies at the next sweep, or at once with
+  `POST /admin/communities/reconcile`, with no restart. A change to any
+  variable in the table above needs a restart.
+- `OUTBOUND_DISABLED_HOSTS` and `OUTBOUND_DISABLED_COMMUNITIES` no longer set
+  any switch. When either is non-empty, boot logs a warning that names the
+  variable and continues. Move its entries to the file.
 - A park does not use up a retry attempt and never poisons or cancels a
   delivery. No `redrive` is needed afterward.
 - While a switch is engaged and workers are running, each ordering key's head

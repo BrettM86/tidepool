@@ -233,28 +233,13 @@ func TestNativeFacets_LemmyStoresRenderedMarkdown(t *testing.T) {
 func (h *harness) awaitLemmyPostBody(t *testing.T, communityID int, title, communityDID, postURI string) string {
 	t.Helper()
 	deadline := time.Now().Add(eventTimeout)
-	query := url.Values{
-		"community_id": {fmt.Sprint(communityID)},
-		"sort":         {"New"},
-		"limit":        {"50"},
-	}
 	var lastErr error
 	for {
-		var out struct {
-			Posts []struct {
-				Post struct {
-					Name string `json:"name"`
-					Body string `json:"body"`
-				} `json:"post"`
-			} `json:"posts"`
-		}
-		lastErr = h.admin.do(http.MethodGet, "/api/v3/post/list?"+query.Encode(), nil, &out)
-		if lastErr == nil {
-			for _, p := range out.Posts {
-				if p.Post.Name == title {
-					return p.Post.Body
-				}
-			}
+		var body string
+		var found bool
+		body, found, lastErr = h.lemmyPostBody(communityID, title)
+		if found {
+			return body
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("post %q (%s) never reached Lemmy community %d within %s (last list error: %v); bridge admission: %s",
@@ -262,6 +247,34 @@ func (h *harness) awaitLemmyPostBody(t *testing.T, communityID int, title, commu
 		}
 		time.Sleep(time.Second)
 	}
+}
+
+// lemmyPostBody reads the community's newest posts from Lemmy once and returns
+// the stored markdown body of the post titled title. found is false with a nil
+// err only when Lemmy answered and the post is not there.
+func (h *harness) lemmyPostBody(communityID int, title string) (body string, found bool, err error) {
+	query := url.Values{
+		"community_id": {fmt.Sprint(communityID)},
+		"sort":         {"New"},
+		"limit":        {"50"},
+	}
+	var out struct {
+		Posts []struct {
+			Post struct {
+				Name string `json:"name"`
+				Body string `json:"body"`
+			} `json:"post"`
+		} `json:"posts"`
+	}
+	if err := h.admin.do(http.MethodGet, "/api/v3/post/list?"+query.Encode(), nil, &out); err != nil {
+		return "", false, err
+	}
+	for _, p := range out.Posts {
+		if p.Post.Name == title {
+			return p.Post.Body, true, nil
+		}
+	}
+	return "", false, nil
 }
 
 // admissionFor describes the bridge's admission ledger row for a post.

@@ -78,7 +78,11 @@ func truncateRateLimitValue(value string) string {
 	return value
 }
 
-// logPLCRateLimit records one 429 response; request is "get" or "post".
-func (m *Minter) logPLCRateLimit(did, request string, headers map[string]string) {
+// observePLCRateLimit records one 429 response, pausing the budget at once so
+// no write goes out while the caller handles it. request is "get" or "post".
+func (m *Minter) observePLCRateLimit(did, request string, header http.Header) *PLCRateLimitedError {
+	headers := rateLimitHeaders(header)
 	m.logger.Warn("PLC rate limited", "did", did, "request", request, "headers", headers)
+	m.budget.RateLimited(headers["Retry-After"])
+	return &PLCRateLimitedError{Headers: headers}
 }

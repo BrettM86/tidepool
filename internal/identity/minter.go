@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -47,6 +48,18 @@ type MintRequest struct {
 	// Instance is the actor's home DNS hostname without a port (e.g.
 	// "lemmy.world"); a port or an IP address is a validation error.
 	Instance string
+	// BeforeSubmit runs after the handle and key are prepared, immediately
+	// before the PLC POST, and takes the budget token for that POST. waited
+	// reports that state read before the mint may be stale: BeforeSubmit
+	// blocked, or this attempt follows a pause. An error aborts the mint with
+	// nothing sent. Nil means Budget.Wait and reports waited true, since it may
+	// have blocked.
+	BeforeSubmit func(context.Context) (waited bool, err error)
+	// Recheck is optional and runs after BeforeSubmit succeeds, immediately
+	// before the PLC POST, so a caller can look again at state that may have
+	// changed. waited is what BeforeSubmit reported. An error aborts the mint
+	// with nothing sent; the token BeforeSubmit took stays spent.
+	Recheck func(ctx context.Context, waited bool) error
 }
 
 // Identity is a freshly minted did:plc plus its escrowed key material. The
@@ -86,6 +99,7 @@ type Minter struct {
 	userAgent    string
 	logger       *slog.Logger
 	plcRetryWait func(context.Context, time.Duration) error
+	budget       *PLCWriteBudget
 }
 
 // MinterOptions configures NewMinter. All fields except HTTPClient are
@@ -125,6 +139,9 @@ type MinterOptions struct {
 	// client's fallback when empty.
 	UserAgent string
 	Logger    *slog.Logger
+	// Budget gates every PLC POST and is paused by every PLC 429 this Minter
+	// observes. Share one instance with everything else that writes to PLC.
+	Budget *PLCWriteBudget
 }
 
 // NewMinter validates the options and builds a Minter.
@@ -158,6 +175,9 @@ func NewMinter(opts MinterOptions) (*Minter, error) {
 	if opts.Actors == nil {
 		return nil, errors.NewValidationError("actors", "must not be nil")
 	}
+	if opts.Budget == nil {
+		return nil, errors.NewValidationError("budget", "must not be nil")
+	}
 	if opts.HTTPClient == nil {
 		return nil, errors.NewValidationError("http_client",
 			"must be provided (use ap.NewGuardedHTTPClient so PLC egress is SSRF-guarded)")
@@ -182,6 +202,7 @@ func NewMinter(opts MinterOptions) (*Minter, error) {
 		userAgent:      userAgent,
 		logger:         logger,
 		plcRetryWait:   opts.PLCRetryWait,
+		budget:         opts.Budget,
 	}, nil
 }
 
@@ -200,7 +221,9 @@ func NewMinter(opts MinterOptions) (*Minter, error) {
 // e.g. a timeout may fire after the directory processed the op) with no
 // bridged_actors row. Such orphans are logged at error level with did and
 // handle so they can be found; making a retry after the resulting handle
-// collision reuse the registered DID is deferred to tasks 05/06.
+// collision reuse the registered DID is deferred to tasks 05/06. A 429, a
+// BeforeSubmit error or a Recheck error registers nothing, so none logs an
+// orphan: the 429 returns an error wrapping *PLCRateLimitedError.
 func (m *Minter) MintActor(ctx context.Context, req MintRequest) (*Identity, error) {
 	handle, err := m.availableHandle(ctx, req.ActorType, req.PreferredUsername, req.Instance)
 	if err != nil {
@@ -237,12 +260,32 @@ func (m *Minter) MintActor(ctx context.Context, req MintRequest) (*Identity, err
 		return nil, err
 	}
 
+	beforeSubmit := req.BeforeSubmit
+	if beforeSubmit == nil {
+		beforeSubmit = func(ctx context.Context) (bool, error) {
+			return true, m.budget.Wait(ctx)
+		}
+	}
+	waited, err := beforeSubmit(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("identity: before PLC mint of %s (handle %q): %w", did, handle, err)
+	}
+	if req.Recheck != nil {
+		if err := req.Recheck(ctx, waited); err != nil {
+			return nil, fmt.Errorf("identity: recheck before PLC mint of %s (handle %q): %w", did, handle, err)
+		}
+	}
+
 	if err := m.submitOperation(ctx, did, op); err != nil {
 		// The directory may have processed the op even though the call
 		// failed (e.g. timeout after registration): treat this as a
-		// potential orphaned DID and make it findable in the logs.
-		m.logger.Error("PLC mint failed at submission; DID may be orphaned on the directory",
-			"did", did, "handle", handle, "error", err)
+		// potential orphaned DID and make it findable in the logs. A 429
+		// means it did not.
+		var rateLimited *PLCRateLimitedError
+		if !stderrors.As(err, &rateLimited) {
+			m.logger.Error("PLC mint failed at submission; DID may be orphaned on the directory",
+				"did", did, "handle", handle, "error", err)
+		}
 		return nil, fmt.Errorf("identity: mint %s (handle %q): %w", did, handle, err)
 	}
 
@@ -544,7 +587,8 @@ func didForOperation(signedOp map[string]any) (string, error) {
 	return "did:plc:" + hash[:24], nil
 }
 
-// submitOperation POSTs the signed operation to the PLC directory.
+// submitOperation POSTs the signed operation to the PLC directory, once. A
+// 429 pauses the budget and returns an error wrapping *PLCRateLimitedError.
 func (m *Minter) submitOperation(ctx context.Context, did string, signedOp map[string]any) error {
 	body, err := json.Marshal(signedOp)
 	if err != nil {
@@ -563,6 +607,9 @@ func (m *Minter) submitOperation(ctx context.Context, did string, signedOp map[s
 		return fmt.Errorf("identity: POST PLC op for %s: %w", did, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return fmt.Errorf("identity: POST PLC op for %s: %w", did, m.observePLCRateLimit(did, "post", resp.Header))
+	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, maxPLCErrorBody))
 		return fmt.Errorf("identity: PLC directory rejected op for %s: status %d: %s",

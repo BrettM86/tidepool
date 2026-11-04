@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -17,7 +18,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"tidepool/internal/config"
 	"tidepool/internal/identity"
+	"tidepool/internal/outbound"
 	"tidepool/internal/store"
 	"tidepool/internal/testutil"
 )
@@ -167,6 +170,50 @@ func TestRunDNSBindFailurePrecedesHTTP(t *testing.T) {
 				t.Fatal("run did not return its bind failure within 60 seconds")
 			}
 		})
+	}
+}
+
+// TestRunInvalidFollowListStopsBoot holds the HTTP port occupied, so a run that
+// carried on past a bad follow list returns a bind error naming that address
+// instead of the file.
+func TestRunInvalidFollowListStopsBoot(t *testing.T) {
+	database := testutil.DB(t)
+	testutil.Truncate(t, database, "service_keys", "bridged_actors", "ap_actors", "inbox_events", "communities")
+
+	httpListener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = httpListener.Close() }()
+	httpAddress := httpListener.Addr().String()
+
+	followListPath := filepath.Join(t.TempDir(), "communities.yaml")
+	require.NoError(t, os.WriteFile(followListPath, []byte("communities:\n"), 0o644))
+
+	t.Setenv("ENVIRONMENT", "development")
+	t.Setenv("DATABASE_URL", os.Getenv("TIDEPOOL_TEST_DATABASE_URL"))
+	t.Setenv("LISTEN_ADDR", httpAddress)
+	t.Setenv("DNS_LISTEN", "")
+	t.Setenv("DNS_PUBLIC_IPV4", "127.0.0.1")
+	t.Setenv("DNS_PUBLIC_IPV6", "")
+	t.Setenv("DNS_NAMESERVERS", "")
+	t.Setenv("CLOUDFLARE_API_TOKEN", "")
+	t.Setenv("CLOUDFLARE_ZONE_ID", "")
+	t.Setenv("BRIDGE_HOSTNAME", "tdpl.example")
+	t.Setenv("BRIDGE_KEK", rotateTestKEK)
+	t.Setenv("BRIDGE_KEK_PREVIOUS", "")
+	t.Setenv("RELAY_HOSTS", "")
+	t.Setenv("CONSUMER_ENABLED", "")
+	t.Setenv("FOLLOW_LIST_PATH", followListPath)
+	t.Setenv("AP_USER_ORIGIN", "http://127.0.0.1:8091")
+
+	result := make(chan error, 1)
+	go func() { result <- run(testLogger()) }()
+	select {
+	case err := <-result:
+		require.Error(t, err)
+		require.Contains(t, err.Error(), followListPath, "a bad follow list must stop boot")
+		require.NotContains(t, err.Error(), httpAddress)
+	case <-time.After(60 * time.Second):
+		t.Fatal("run did not return within 60 seconds")
 	}
 }
 
@@ -584,4 +631,100 @@ func TestRunRotateKEKDoesNotDisownACompleteInventory(t *testing.T) {
 		"the unmovable row must get its own ERROR line naming it")
 	assert.False(t, disowned,
 		"a walk that finished every table must NOT have its inventory called partial: those counts are exactly how the operator sizes the damage, and a warning that fires on the complete case as well as the aborted one distinguishes nothing")
+}
+
+// followListPathRecords returns the records whose message names FOLLOW_LIST_PATH.
+func followListPathRecords(records []slog.Record) []slog.Record {
+	var named []slog.Record
+	for _, record := range records {
+		if strings.Contains(record.Message, "FOLLOW_LIST_PATH") {
+			named = append(named, record)
+		}
+	}
+	return named
+}
+
+func TestNewOutboundSwitches(t *testing.T) {
+	open := outbound.DeliveryScope{
+		ActorDID:      "did:plc:open",
+		CommunityAPID: "https://open.example/c/open",
+		InboxHost:     "open.example",
+	}
+	writeList := func(t *testing.T, content string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "communities.yaml")
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+		return path
+	}
+
+	t.Run("no follow list with workers on says so and blocks nothing", func(t *testing.T) {
+		logger, records := capturingLogger()
+		switches, err := newOutboundSwitches(&config.Config{OutboundWorkers: 1}, logger)
+		require.NoError(t, err)
+		assert.True(t, switches.OutboundAllowed(open))
+		assert.NotEmpty(t, followListPathRecords(*records))
+	})
+
+	t.Run("no follow list with workers off stays quiet", func(t *testing.T) {
+		logger, records := capturingLogger()
+		_, err := newOutboundSwitches(&config.Config{OutboundWorkers: 0}, logger)
+		require.NoError(t, err)
+		assert.Empty(t, followListPathRecords(*records))
+	})
+
+	t.Run("a valid file arms the sets at boot", func(t *testing.T) {
+		path := writeList(t, `
+communities: []
+outbound_disabled_hosts:
+  - "blocked-host.example"
+outbound_disabled_communities:
+  - "https://open.example/c/blocked"
+`)
+		logger, records := capturingLogger()
+		switches, err := newOutboundSwitches(&config.Config{FollowListPath: path, OutboundWorkers: 1}, logger)
+		require.NoError(t, err)
+
+		assert.False(t, switches.OutboundAllowed(outbound.DeliveryScope{
+			ActorDID:      "did:plc:open",
+			CommunityAPID: "https://open.example/c/open",
+			InboxHost:     "blocked-host.example",
+		}), "the file's host is refused")
+		assert.False(t, switches.OutboundAllowed(outbound.DeliveryScope{
+			ActorDID:      "did:plc:open",
+			CommunityAPID: "https://open.example/c/blocked",
+			InboxHost:     "open.example",
+		}), "the file's community is refused")
+		assert.True(t, switches.OutboundAllowed(open), "a scope the file does not name delivers")
+		assert.Empty(t, followListPathRecords(*records), "a configured path needs no notice")
+	})
+
+	t.Run("an invalid file is an error", func(t *testing.T) {
+		path := writeList(t, "communities:\n")
+		logger, _ := capturingLogger()
+		_, err := newOutboundSwitches(&config.Config{FollowListPath: path, OutboundWorkers: 1}, logger)
+		require.Error(t, err)
+	})
+
+	t.Run("the global switch comes from config", func(t *testing.T) {
+		logger, _ := capturingLogger()
+		switches, err := newOutboundSwitches(&config.Config{OutboundDisabled: true}, logger)
+		require.NoError(t, err)
+		assert.False(t, switches.OutboundAllowed(open))
+	})
+
+	t.Run("dry run and actor blocks come from config", func(t *testing.T) {
+		logger, _ := capturingLogger()
+		switches, err := newOutboundSwitches(&config.Config{
+			OutboundDryRun:         true,
+			OutboundDisabledActors: map[string]struct{}{"did:plc:blocked": {}},
+		}, logger)
+		require.NoError(t, err)
+		assert.True(t, switches.DryRun())
+		assert.False(t, switches.OutboundAllowed(outbound.DeliveryScope{
+			ActorDID:      "did:plc:blocked",
+			CommunityAPID: "https://open.example/c/open",
+			InboxHost:     "open.example",
+		}))
+		assert.True(t, switches.OutboundAllowed(open))
+	})
 }

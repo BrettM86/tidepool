@@ -3,6 +3,7 @@ package materialize
 import (
 	"context"
 	"database/sql"
+	stderrors "errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -54,7 +55,7 @@ func (m *Materializer) ensureActor(ctx context.Context, actorRef *ap.Object, for
 	case err == nil:
 		return m.ensureKnownActor(ctx, stored, actorRef, force)
 	case errors.IsNotFound(err):
-		return m.bridgeNewActor(ctx, actorRef, store.ActorTypePerson, force)
+		return m.bridgeNewActor(ctx, actorRef, store.ActorTypePerson, force, force)
 	default:
 		return nil, fmt.Errorf("materialize: look up actor %s: %w", apID, err)
 	}
@@ -145,8 +146,12 @@ func (m *Materializer) ensureKnownActor(ctx context.Context, stored *store.Bridg
 
 // bridgeNewActor mints an identity for an unseen actor and materializes its
 // profile. actorType selects person vs group handling (groups come through
-// EnsureCommunity, which also maintains the communities row).
-func (m *Materializer) bridgeNewActor(ctx context.Context, actorRef *ap.Object, actorType store.ActorType, allowEmbedded bool) (*store.BridgedActor, error) {
+// EnsureCommunity, which also maintains the communities row). allowEmbedded
+// says actorRef may stand in for the document on this path; force is the
+// caller's own refresh flag, the one that goes to ensureKnownActor when the
+// actor turns out to have a row. They differ for a group, whose caller passes a
+// document it fetched itself: usable to mint from, but read before any wait.
+func (m *Materializer) bridgeNewActor(ctx context.Context, actorRef *ap.Object, actorType store.ActorType, allowEmbedded, force bool) (*store.BridgedActor, error) {
 	doc, err := m.actorDoc(ctx, actorRef, allowEmbedded)
 	if err != nil {
 		return nil, err
@@ -229,8 +234,14 @@ func (m *Materializer) bridgeNewActor(ctx context.Context, actorRef *ap.Object, 
 		return nil, skip(actorRef.ID, fmt.Sprintf(
 			"actor document names already-bridged actor %s; refusing to bridge an alias over it", doc.ID))
 	}
+	if !inserted {
+		// Another worker bridged this actor. doc predates that row and may
+		// predate a budget wait, so the row gets the known-actor policy: its
+		// consent state and freshness decide, not doc.
+		return m.ensureKnownActor(ctx, stored, actorRef, force)
+	}
 	profiled, err := m.rematerializeProfile(ctx, stored, doc)
-	if inserted && errors.IsCollectionImmutable(err) {
+	if errors.IsCollectionImmutable(err) {
 		// The mapping check above lost a race: another worker mapped doc.ID
 		// as content after it, and the profile commit refused. The row this
 		// call inserted would leave a content id reading as a bridged actor
@@ -246,23 +257,61 @@ func (m *Materializer) bridgeNewActor(ctx context.Context, actorRef *ap.Object, 
 	return profiled, err
 }
 
+// errActorBridgedDuringMint aborts a mint whose actor gained a row after the
+// initial check, before anything reached the PLC directory. mintAndUpsert
+// returns that row, and bridgeNewActor puts it through ensureKnownActor.
+var errActorBridgedDuringMint = stderrors.New("materialize: actor was bridged while the mint waited")
+
 // mintAndUpsert mints a DID and registers the bridged_actors row, handling
-// the two races minting can lose:
-//   - another process bridged the same AP actor concurrently → reuse the
+// the races minting can lose:
+//   - another worker bridged the same AP actor while this mint waited for its
+//     budget token → the look right before the PLC POST finds the row and
+//     returns it, with nothing sent and no DID orphaned;
+//   - the actor opted out or went away while this mint waited, leaving no row
+//     → the look reads the document again, only if the mint waited, and a
+//     marker, 404 or 410 is a skip with nothing sent. A failed read aborts the
+//     mint too, so the caller retries rather than mint unchecked;
+//   - another process bridged the same AP actor concurrently → return the
 //     winner's row (our freshly minted DID is orphaned; logged loudly);
 //   - another actor claimed the same handle between the availability check
 //     and the insert → retry the mint once (the suffixer now sees the
 //     claim). Never re-mints in a loop beyond that.
 //
 // The bool is true only when the returned row carries the DID this call
-// minted, i.e. this call inserted it; a reused winner is false.
+// minted, i.e. this call inserted it; a returned winner is false.
 func (m *Materializer) mintAndUpsert(ctx context.Context, doc *ap.Object, actorType store.ActorType, instance string) (*store.BridgedActor, bool, error) {
 	for attempt := 0; ; attempt++ {
+		var bridged *store.BridgedActor
 		minted, err := m.minter.MintActor(ctx, identity.MintRequest{
 			ActorType:         actorType,
 			PreferredUsername: doc.PreferredUsername,
 			Instance:          instance,
+			Recheck: func(ctx context.Context, waited bool) error {
+				row, err := m.actors.GetByAPActorID(ctx, doc.ID)
+				switch {
+				case err == nil:
+					bridged = row
+					return errActorBridgedDuringMint
+				case !errors.IsNotFound(err):
+					return fmt.Errorf("materialize: look up actor %s: %w", doc.ID, err)
+				case !waited:
+					return nil
+				}
+				// Opting out with no row leaves no trace here, so only the
+				// document can say. PLC DIDs are permanent.
+				fresh, err := m.actorDoc(ctx, &ap.Object{ID: doc.ID}, false)
+				if err != nil {
+					return err
+				}
+				if hasNobridgeMarker(fresh) {
+					return skip(doc.ID, "actor opted out (#nobridge/#nobot)")
+				}
+				return nil
+			},
 		})
+		if stderrors.Is(err, errActorBridgedDuringMint) {
+			return bridged, false, nil
+		}
 		if err != nil {
 			return nil, false, fmt.Errorf("materialize: mint identity for %s: %w", doc.ID, err)
 		}
@@ -495,7 +544,7 @@ func (m *Materializer) ensureCommunity(ctx context.Context, groupRef *ap.Object,
 			return nil, skip(apID, fmt.Sprintf(
 				"group document names a different id %s; refusing to bridge an alias", doc.ID))
 		}
-		if actor, err = m.bridgeNewActor(ctx, doc, store.ActorTypeGroup, true); err != nil {
+		if actor, err = m.bridgeNewActor(ctx, doc, store.ActorTypeGroup, true, force); err != nil {
 			return nil, err
 		}
 	default:

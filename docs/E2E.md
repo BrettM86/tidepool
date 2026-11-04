@@ -5,6 +5,10 @@ The e2e suite runs the bridge against real services in one compose network
 
 - Lemmy (a debug build) and pictrs federate with the bridge over plain HTTP.
 - A did:plc directory (`plc`) backs DID minting and resolution.
+- Tidepool reaches `plc` through `plc-fixture` (`e2e/plc-fixture`), a reverse
+  proxy that forwards everything. The local PLC has no rate limit, so
+  `plc_budget_test.go` uses the proxy's control port to answer POSTs 429 and
+  list every POST. The relay and the PDS use `plc` directly.
 - An atproto relay (indigo BigSky) crawls the bridge.
 - A reference PDS (`ghcr.io/bluesky-social/pds`, pinned by digest) hosts one
   native account.
@@ -65,6 +69,7 @@ Host ports bind to loopback only:
 | 127.0.0.1:2480 | Relay XRPC and admin API |
 | 127.0.0.1:3081 | Reference PDS (published on the `relay` service) |
 | 127.0.0.1:6028 | Jetstream WebSocket |
+| 127.0.0.1:3013 | PLC fixture control API (`PLC_FIXTURE_E2E_PORT` overrides) |
 
 The stack carries admin tokens and runs with `ALLOW_PRIVATE_FETCH=1`, so it
 must not be reachable from the local network. The harness never contacts
@@ -205,6 +210,31 @@ The suite is `tests/e2e/`, build tag `e2e`. Shared helpers are in
   acceptance and writes a removal record, while the author's `postv2` stays.
 - `votes_hammer_test.go`: ten real voters vote, flip and clear in parallel
   bursts, and the final aggregates are exact.
+
+### Follow list (`follow_list_test.go`)
+
+`docker-compose.e2e.yml` does not set `FOLLOW_LIST_PATH`. The file is
+authoritative, so `restartTidepool`'s startup sweep would unfollow every
+community other scenarios subscribed through `/admin`.
+
+A scenario that needs the follow list calls `installFollowList`. It writes a
+file naming every tracked community into a temporary directory, then recreates
+only the `tidepool` service with `tests/e2e/docker-compose.follow-list.yml`
+layered on top. That override mounts the directory, sets `FOLLOW_LIST_PATH`, and
+takes `FOLLOW_LIST_INTERVAL` from the scenario. Cleanup recreates the base
+service. The mount is a directory, not a file, because the helper replaces the
+file by atomic rename and a single-file mount would keep the old inode.
+
+- `TestFollowList_HostSwitchParksDeliveriesWithoutRestart` adds the Lemmy host
+  to `outbound_disabled_hosts` and calls `POST /admin/communities/reconcile`. A
+  native post's delivery stays `pending` and parked. Removing the host and
+  calling reconcile again sends the post to Lemmy, on the same container. The
+  interval is an hour, so only the reconcile calls can have applied the changes.
+- `TestFollowList_InstanceEntryFollowsEveryLocalCommunity` first checks the pinned
+  Lemmy's `page` and `limit` limits, which the listing unit tests' fixture copies.
+  An `instances` entry for the Lemmy host then follows a plain, an NSFW and a later
+  community, skips an excluded one and refuses a `#nobridge` one. With Lemmy
+  stopped a sweep unfollows nothing, and following resumes when it returns.
 
 ### Identity and DNS
 

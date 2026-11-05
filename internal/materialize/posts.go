@@ -2,14 +2,22 @@ package materialize
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"strings"
+	"time"
+
+	"github.com/bluesky-social/indigo/atproto/atdata"
 
 	"tidepool/internal/ap"
 	"tidepool/internal/apobject"
 	"tidepool/internal/errors"
 	"tidepool/internal/store"
 )
+
+// linkPreviewTimeout bounds one link unfurl: resolving the thumbnail URL and
+// downloading the thumbnail together.
+const linkPreviewTimeout = 10 * time.Second
 
 // MaterializePost translates a Lemmy Page (or Article) into a
 // social.coves.community.postv2 record, written into the AUTHOR's repo
@@ -324,9 +332,9 @@ func (m *Materializer) fillPostContent(ctx context.Context, record map[string]an
 // buildPostEmbed maps the Page's attachments onto the post embed union:
 // image attachments → social.coves.embed.images (blobs in repoDID, the repo
 // that will hold the record); a link attachment (or `url`) →
-// social.coves.embed.external with the Lemmy-provided thumbnail as thumb (no
-// og-image fetching in v1 — the AP object already carries the thumbnail when
-// there is one).
+// social.coves.embed.external with the Lemmy-provided thumbnail as thumb,
+// falling back to the link's unfurled thumbnail (YouTube oEmbed or og:image)
+// when the Page has none or it fails to fetch.
 func (m *Materializer) buildPostEmbed(ctx context.Context, page *ap.Object, repoDID string) map[string]any {
 	var images []any
 	var externalLink *ap.Link
@@ -397,10 +405,46 @@ func (m *Materializer) buildPostEmbed(ctx context.Context, page *ap.Object, repo
 			external["thumb"] = *blob
 		}
 	}
+	if _, ok := external["thumb"]; !ok && m.linkPreviews != nil {
+		if blob := m.unfurlThumb(ctx, repoDID, uri); blob != nil {
+			external["thumb"] = *blob
+		}
+	}
 	return map[string]any{
 		"$type":    "social.coves.embed.external",
 		"external": external,
 	}
+}
+
+// unfurlThumb resolves uri's thumbnail through the link previewer and
+// fetches it as an external thumb. Every failure is logged (fetchBlob logs
+// its own) and leaves the embed without a thumb.
+func (m *Materializer) unfurlThumb(ctx context.Context, repoDID, uri string) *atdata.Blob {
+	if err := ctx.Err(); err != nil {
+		m.logger.Warn("link thumbnail unfurl skipped",
+			"uri", uri, "did", repoDID, "reason", "context ended", "error", err)
+		return nil
+	}
+	// One deadline covers the resolve and the thumbnail download, so a slow
+	// resolver cannot buy the download a fresh budget.
+	unfurlCtx, cancel := context.WithTimeout(ctx, linkPreviewTimeout)
+	defer cancel()
+	thumbURL, err := m.linkPreviews.ThumbnailURL(unfurlCtx, uri)
+	if err != nil {
+		// The ingest context ending says nothing about the link; the unfurl's
+		// own deadline expiring with the parent still live is a failure.
+		if ctx.Err() != nil && (stderrors.Is(err, context.Canceled) || stderrors.Is(err, context.DeadlineExceeded)) {
+			m.logger.Warn("link thumbnail unfurl skipped",
+				"uri", uri, "did", repoDID, "reason", "context ended", "error", err)
+			return nil
+		}
+		m.logger.Warn("link thumbnail unfurl failed", "uri", uri, "did", repoDID, "error", err)
+		return nil
+	}
+	if thumbURL == "" {
+		return nil
+	}
+	return m.fetchBlob(unfurlCtx, repoDID, thumbURL, slotExternalThumb)
 }
 
 // isSafeLinkScheme restricts bridge-authored clickable URIs (external

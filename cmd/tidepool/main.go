@@ -35,6 +35,7 @@ import (
 	"tidepool/internal/handlemigration"
 	"tidepool/internal/identity"
 	"tidepool/internal/ingest"
+	"tidepool/internal/linkpreview"
 	"tidepool/internal/materialize"
 	"tidepool/internal/media"
 	"tidepool/internal/optout"
@@ -498,6 +499,8 @@ func run(logger *slog.Logger) error {
 		Instances:      store.NewInstances(database),
 		NodeInfoClient: ap.NewGuardedHTTPClient(cfg.AllowPrivateAddresses, 30*time.Second),
 		UserAgent:      cfg.UserAgent,
+		// Link-post thumbnail unfurling (YouTube oEmbed, og:image) is guarded too.
+		LinkPreviews: linkpreview.NewResolver(ap.NewGuardedHTTPClient(cfg.AllowPrivateAddresses, 10*time.Second), cfg.UserAgent),
 	})
 	if err != nil {
 		return err

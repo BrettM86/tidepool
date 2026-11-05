@@ -185,6 +185,12 @@ type VoteScrubber interface {
 	ScrubVoter(ctx context.Context, voterAPID string) error
 }
 
+// LinkPreviewer resolves a link to an absolute thumbnail image URL, or ""
+// when the link has none.
+type LinkPreviewer interface {
+	ThumbnailURL(ctx context.Context, link string) (string, error)
+}
+
 // ModerationLedger records a community moderation decision against a NATIVE
 // post in the admissions ledger — the operator surface that answers "why is
 // this post not in the community?".
@@ -268,6 +274,9 @@ type Options struct {
 	// NodeInfoDiscoveryDeadline bounds one host's discovery cycle
 	// (0 = nodeinfo.DefaultDiscoveryDeadline).
 	NodeInfoDiscoveryDeadline time.Duration
+	// LinkPreviews unfurls a link post's thumbnail when the Page carries no
+	// usable image (optional; nil disables unfurling).
+	LinkPreviews LinkPreviewer
 }
 
 // Materializer translates AP objects into social.coves.* records.
@@ -290,7 +299,9 @@ type Materializer struct {
 	// software serves each origin host's nodeinfo software name for
 	// profiles' originSoftware.
 	software *nodeinfo.Cache
-	now      func() time.Time // test seam for profile TTL
+	// linkPreviews unfurls link thumbnails; nil disables unfurling.
+	linkPreviews LinkPreviewer
+	now          func() time.Time // test seam for profile TTL
 	// deleteBlob deletes one blob by (did, cid); defaults to repos.DeleteBlob.
 	// A test seam so the scrub's retryable-error path can be exercised
 	// without a real storage failure.
@@ -355,23 +366,24 @@ func New(opts Options) (*Materializer, error) {
 		return nil, err
 	}
 	m := &Materializer{
-		fetcher:     opts.Fetcher,
-		objects:     opts.Objects,
-		outbound:    opts.OutboundObjects,
-		ledger:      opts.Ledger,
-		actors:      opts.Actors,
-		communities: opts.Communities,
-		repos:       opts.Repos,
-		minter:      opts.Minter,
-		votes:       opts.Votes,
-		serviceDID:  opts.ServiceDID,
-		profileTTL:  opts.ProfileRefreshTTL,
-		maxBlob:     opts.MaxBlobBytes,
-		strict:      opts.StrictValidation,
-		catalog:     catalog,
-		logger:      logger,
-		software:    software,
-		now:         time.Now,
+		fetcher:      opts.Fetcher,
+		objects:      opts.Objects,
+		outbound:     opts.OutboundObjects,
+		ledger:       opts.Ledger,
+		actors:       opts.Actors,
+		communities:  opts.Communities,
+		repos:        opts.Repos,
+		minter:       opts.Minter,
+		votes:        opts.Votes,
+		serviceDID:   opts.ServiceDID,
+		profileTTL:   opts.ProfileRefreshTTL,
+		maxBlob:      opts.MaxBlobBytes,
+		strict:       opts.StrictValidation,
+		catalog:      catalog,
+		logger:       logger,
+		software:     software,
+		linkPreviews: opts.LinkPreviews,
+		now:          time.Now,
 	}
 	m.deleteBlob = m.repos.DeleteBlob
 	m.removalCheck = m.removalStands

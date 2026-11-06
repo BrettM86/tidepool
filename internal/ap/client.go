@@ -98,10 +98,28 @@ type HTTPError struct {
 	// already-received activity — as DELIVERED, not poisoned). Empty when the
 	// body was not captured.
 	Body string
+	// Method is the request method; empty means GET.
+	Method string
 }
 
+// httpErrorBodyLimit bounds how much of the body Error() shows, so a peer's
+// HTML error page does not flood the logs.
+const httpErrorBodyLimit = 512
+
 func (e HTTPError) Error() string {
-	return fmt.Sprintf("ap: GET %s: unexpected status %d", e.URL, e.StatusCode)
+	method := e.Method
+	if method == "" {
+		method = http.MethodGet
+	}
+	msg := fmt.Sprintf("ap: %s %s: unexpected status %d", method, e.URL, e.StatusCode)
+	body := strings.ToValidUTF8(strings.TrimSpace(e.Body), "")
+	if body == "" {
+		return msg
+	}
+	if len(body) > httpErrorBodyLimit {
+		body = strings.ToValidUTF8(body[:httpErrorBodyLimit], "") + "…"
+	}
+	return msg + ": " + body
 }
 
 // ClientOptions configures a Client. The zero value of every field means
@@ -656,7 +674,7 @@ func (c *Client) SendActivityAs(ctx context.Context, signer *Signer, inboxURL st
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		return nil
 	}
-	return HTTPError{URL: inboxURL, StatusCode: resp.StatusCode, Body: string(body)}
+	return HTTPError{URL: inboxURL, StatusCode: resp.StatusCode, Body: string(body), Method: http.MethodPost}
 }
 
 // sendActivityWith is the RETRYING POST loop: it marshals the activity once,
@@ -696,17 +714,17 @@ func (c *Client) sendActivityWith(ctx context.Context, signer *Signer, inboxURL 
 			lastErr = fmt.Errorf("ap: POST %s: %w", inboxURL, err)
 			continue
 		}
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		_ = resp.Body.Close()
 
 		switch {
 		case resp.StatusCode >= 200 && resp.StatusCode < 300:
 			return nil
 		case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
-			lastErr = HTTPError{URL: inboxURL, StatusCode: resp.StatusCode}
+			lastErr = HTTPError{URL: inboxURL, StatusCode: resp.StatusCode, Body: string(body), Method: http.MethodPost}
 			continue
 		default:
-			return HTTPError{URL: inboxURL, StatusCode: resp.StatusCode}
+			return HTTPError{URL: inboxURL, StatusCode: resp.StatusCode, Body: string(body), Method: http.MethodPost}
 		}
 	}
 	return lastErr

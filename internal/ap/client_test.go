@@ -703,6 +703,38 @@ func TestSendActivity_RetriesAndFails(t *testing.T) {
 	assert.Equal(t, http.StatusServiceUnavailable, httpErr.StatusCode)
 }
 
+// A peer's rejection reason is in the response body (Lemmy answers a refused
+// Follow with a 400 and a JSON message), so the error must carry it and show
+// it in its message, where the callers' logs pick it up.
+func TestSendActivity_RejectionCarriesBody(t *testing.T) {
+	const rejection = `{"error":"unknown","message":"Incoming activity has invalid digest for body"}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, rejection)
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, ClientOptions{MaxAttempts: 2})
+	err := client.SendActivity(context.Background(), server.URL+"/inbox", map[string]any{"type": "Follow"})
+	require.Error(t, err)
+
+	var httpErr HTTPError
+	require.ErrorAs(t, err, &httpErr)
+	assert.Equal(t, http.StatusBadRequest, httpErr.StatusCode)
+	assert.Equal(t, rejection, httpErr.Body)
+	assert.Equal(t, "ap: POST "+server.URL+"/inbox: unexpected status 400: "+rejection, err.Error())
+}
+
+// A long body is cut at httpErrorBodyLimit without splitting a rune.
+func TestHTTPError_TruncatesLongBody(t *testing.T) {
+	body := strings.Repeat("a", httpErrorBodyLimit-1) + "é" + strings.Repeat("b", 100)
+	err := HTTPError{URL: "https://peer.example/inbox", StatusCode: 400, Body: body, Method: http.MethodPost}
+	assert.Equal(t, "ap: POST https://peer.example/inbox: unexpected status 400: "+
+		strings.Repeat("a", httpErrorBodyLimit-1)+"…", err.Error())
+	assert.Equal(t, "ap: GET https://peer.example/x: unexpected status 404",
+		HTTPError{URL: "https://peer.example/x", StatusCode: 404, Body: "  "}.Error())
+}
+
 func TestSendActivity_RequiresSigner(t *testing.T) {
 	client := NewClient(ClientOptions{})
 	err := client.SendActivity(context.Background(), "https://lemmy.world/inbox", map[string]any{})

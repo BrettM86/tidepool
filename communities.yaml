@@ -80,3 +80,7 @@ instances:
   # 2.3k monthly active users. Its 10 NSFW-flagged communities were reviewed
   # and none are explicit, so nothing is excluded.
   - host: "lemmy.zip"
+  # added 2026-11-05 on request: second whole instance, programming and tech
+  # discussion. 459 local communities (444 publicly listed), about 800 monthly
+  # active users. None are NSFW-flagged, so nothing is excluded.
+  - host: "programming.dev"

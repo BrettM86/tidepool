@@ -41,6 +41,7 @@
             "description": "Embedded media, external links, or quoted posts",
             "refs": [
               "social.coves.embed.images",
+              "social.coves.embed.imagesWithAttachment",
               "social.coves.embed.video",
               "social.coves.embed.external",
               "social.coves.embed.post"

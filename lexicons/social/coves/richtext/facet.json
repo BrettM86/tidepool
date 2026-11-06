@@ -27,7 +27,8 @@
               "#blockquote",
               "#heading",
               "#code",
-              "#codeBlock"
+              "#codeBlock",
+              "#image"
             ]
           }
         }
@@ -135,6 +136,18 @@
           "type": "string",
           "maxLength": 40,
           "description": "Optional language hint for syntax highlighting (e.g. 'go', 'python')"
+        }
+      }
+    },
+    "image": {
+      "type": "object",
+      "description": "Places embed.images.images[index] at this position in the body. The covered text is the fallback that readers without image support render.",
+      "required": ["index"],
+      "properties": {
+        "index": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 7
         }
       }
     }

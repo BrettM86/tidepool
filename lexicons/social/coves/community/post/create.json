@@ -44,6 +44,7 @@
               "description": "Embedded media, external links, or quoted posts",
               "refs": [
                 "social.coves.embed.images",
+                "social.coves.embed.imagesWithAttachment",
                 "social.coves.embed.video",
                 "social.coves.embed.external",
                 "social.coves.embed.post"
@@ -123,6 +124,18 @@
         {
           "name": "ContentRuleViolation",
           "description": "Post violates community content rules (e.g., embeds not allowed, text too short)"
+        },
+        {
+          "name": "InvalidEmbed",
+          "description": "The embed does not satisfy its lexicon (social.coves.embed.*) or the embed write rules; the message describes the failure"
+        },
+        {
+          "name": "TooManyImages",
+          "description": "The embed carries more than 8 images"
+        },
+        {
+          "name": "InvalidImageFacet",
+          "description": "An #image facet breaks a placement rule: its index does not name an image of an images embed, it shares its facet with another feature, it places an index already placed, its range is empty, or its range lies inside a #code or #codeBlock range"
         }
       ]
     }

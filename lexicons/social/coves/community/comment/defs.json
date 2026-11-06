@@ -35,7 +35,7 @@
         },
         "record": {
           "type": "unknown",
-          "description": "The social.coves.community.comment record verbatim for an active comment; absent or null exactly when isDeleted is true"
+          "description": "The social.coves.community.comment record as stored for an active comment, except that #image placements breaking the placement rules are removed. Covered text and the stored embed are unchanged; absent or null exactly when isDeleted is true"
         },
         "post": {
           "type": "ref",
@@ -53,6 +53,8 @@
           "refs": [
             "social.coves.embed.images",
             "social.coves.embed.images#view",
+            "social.coves.embed.imagesWithAttachment",
+            "social.coves.embed.imagesWithAttachment#view",
             "social.coves.embed.post",
             "social.coves.embed.post#view"
           ]

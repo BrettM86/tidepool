@@ -54,7 +54,7 @@
     },
     "view": {
       "type": "object",
-      "description": "View of an image set embed as served by the AppView; blob references are replaced with fetchable image URLs",
+      "description": "View of an image set embed as served by the AppView; blob references are replaced with fetchable image URLs. Every #image placement in the served record resolves to an image in this view. Images without a placement render as a gallery after the body.",
       "required": [
         "images"
       ],

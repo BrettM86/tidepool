@@ -28,7 +28,7 @@
         },
         "record": {
           "type": "unknown",
-          "description": "The actual post record (text, image, video, etc.)"
+          "description": "The post record as stored, except that #image placements breaking the placement rules are removed. Covered text and the stored embed are unchanged."
         },
         "community": {
           "type": "ref",
@@ -40,6 +40,8 @@
           "refs": [
             "social.coves.embed.images",
             "social.coves.embed.images#view",
+            "social.coves.embed.imagesWithAttachment",
+            "social.coves.embed.imagesWithAttachment#view",
             "social.coves.embed.video",
             "social.coves.embed.video#view",
             "social.coves.embed.external",
@@ -166,6 +168,11 @@
           "type": "string",
           "maxLength": 253,
           "description": "Instance this community actually lives on (hostname only, e.g. lemmy.world). Validated by the AppView at index time."
+        },
+        "originSoftware": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "Bridge-written home instance software; display only. maxLength counts UTF-8 bytes."
         },
         "avatar": {
           "type": "string",

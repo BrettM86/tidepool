@@ -1,0 +1,132 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.media.uploadImage",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Upload an image to the authenticated user's repository. The AppView strips metadata (including EXIF location), applies EXIF orientation, and stores the sanitized bytes as a blob on the user's PDS. Requires an OAuth session granted the blob:*/* scope, or an aggregator API key or service JWT whose aggregator has a stored OAuth session granted that scope.",
+      "input": {
+        "encoding": "image/*"
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "blob",
+            "mimeType",
+            "size",
+            "aspectRatio"
+          ],
+          "properties": {
+            "blob": {
+              "type": "blob",
+              "accept": [
+                "image/jpeg",
+                "image/png",
+                "image/webp",
+                "image/gif"
+              ],
+              "maxSize": 10000000,
+              "description": "The stored, sanitized image"
+            },
+            "mimeType": {
+              "type": "string",
+              "maxLength": 128,
+              "description": "MIME type of the stored bytes, detected from the image rather than the request's Content-Type. An oriented WebP is stored as JPEG or PNG."
+            },
+            "size": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10000000,
+              "description": "Size of the stored bytes"
+            },
+            "aspectRatio": {
+              "type": "ref",
+              "ref": "social.coves.embed.images#aspectRatio",
+              "description": "Width and height of the stored image after orientation"
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "AuthenticationRequired",
+          "description": "The request carries no credentials, a malformed Authorization header, or a token or session this AppView does not recognise or no longer holds; sign in"
+        },
+        {
+          "name": "AuthRequired",
+          "description": "The request's session was accepted by this AppView, but the user's PDS rejected it as expired or revoked; sign in again"
+        },
+        {
+          "name": "InvalidRequest",
+          "description": "The request body could not be read"
+        },
+        {
+          "name": "RequestTimeout",
+          "description": "The request body was not received in time; try again"
+        },
+        {
+          "name": "MissingBlobScope",
+          "description": "The session was not granted the blob:*/* scope; sign in again to grant it"
+        },
+        {
+          "name": "ImageTooLarge",
+          "description": "The request body, or the sanitized image, exceeds 10,000,000 bytes"
+        },
+        {
+          "name": "UnsupportedImageFormat",
+          "description": "The image is not JPEG, PNG, WebP, or GIF"
+        },
+        {
+          "name": "ImageDimensionsTooLarge",
+          "description": "The image has more than 50,000,000 pixels"
+        },
+        {
+          "name": "InvalidImage",
+          "description": "The image could not be decoded"
+        },
+        {
+          "name": "UploadRateLimited",
+          "description": "The user has stored as many uploads as this AppView allows in a rolling ten-minute window; try again later"
+        },
+        {
+          "name": "PDSUploadFailed",
+          "description": "The user's PDS could not be reached, failed, or did not store the blob"
+        },
+        {
+          "name": "PayloadTooLarge",
+          "description": "The user's PDS refused the sanitized image as larger than its own blob limit"
+        },
+        {
+          "name": "PermissionDenied",
+          "description": "The user's PDS refused the upload for this session's permissions; sign in again to grant them"
+        },
+        {
+          "name": "RateLimitExceeded",
+          "description": "The user's PDS rate-limited the upload; try again later"
+        },
+        {
+          "name": "SessionBusy",
+          "description": "Another request is refreshing this session; retry"
+        },
+        {
+          "name": "ServiceUnavailable",
+          "description": "Image processing is busy, or an aggregator's stored session could not be loaded or resumed; try again"
+        },
+        {
+          "name": "NoAuthorCredentials",
+          "description": "The aggregator authenticated by API key or service JWT has no usable stored OAuth session; it must complete the OAuth flow again"
+        },
+        {
+          "name": "Timeout",
+          "description": "The upload did not complete in time"
+        },
+        {
+          "name": "RequestCanceled",
+          "description": "The request was canceled before the upload completed"
+        }
+      ]
+    }
+  }
+}

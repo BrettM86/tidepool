@@ -42,7 +42,10 @@
             "community": {
               "type": "ref",
               "ref": "social.coves.community.post.defs#communityRef"
-            }
+            },
+            "author": {"type": "ref", "ref": "social.coves.community.post.defs#authorView", "description": "The root post's author; present only when the root post has no status."},
+            "createdAt": {"type": "string", "format": "datetime", "description": "When the root post was created; present only when the root post has no status."},
+            "stats": {"type": "ref", "ref": "social.coves.community.post.defs#postStats", "description": "The root post's stats (votes, score and comment count); present only when the root post has no status."}
           }
         },
         "subject": {
@@ -52,7 +55,7 @@
             "uri": {"type": "string", "format": "at-uri"},
             "cid": {"type": "string", "format": "cid"},
             "status": {"type": "string", "description": "Read-time status when the subject is unavailable: deleted by its author, removed by its community's moderators, or removed by the server admin.", "knownValues": ["deleted", "removedByModerator", "removedByServerAdmin"]},
-            "preview": {"type": "string", "description": "The post's title, or the first 140 graphemes of the post body or comment text when there is no title; absent when the reference has a status."},
+            "preview": {"type": "string", "description": "The post's title, or the first 1,000 graphemes of the post body or comment text when there is no title; absent when the reference has a status."},
             "labels": {"type": "ref", "ref": "com.atproto.label.defs#selfLabels", "description": "Self-labels the referenced record's author applied; absent when none or when the reference has a status."},
             "thumbnail": {"type": "string", "format": "uri", "description": "Preview image URL for a post (link-card thumbnail or first image), served through the AppView's image proxy; never set for comments or references with a status."},
             "thumbnailAlt": {"type": "string", "maxLength": 10000, "maxGraphemes": 1000, "description": "Alt text of the image in thumbnail, from the post author's first image; set only alongside an image post's thumbnail, never for link-card thumbnails."}
@@ -65,7 +68,7 @@
             "uri": {"type": "string", "format": "at-uri"},
             "cid": {"type": "string", "format": "cid"},
             "status": {"type": "string", "description": "Read-time status when the record is unavailable: deleted by its author, removed by its community's moderators, or removed by the server admin.", "knownValues": ["deleted", "removedByModerator", "removedByServerAdmin"]},
-            "excerpt": {"type": "string", "maxGraphemes": 140, "description": "The first 140 graphemes of the triggering record's text; absent when the record has a status."},
+            "excerpt": {"type": "string", "maxGraphemes": 1000, "description": "The first 1,000 graphemes of the triggering record's text; absent when the record has a status."},
             "createdAt": {"type": "string", "format": "datetime"},
             "labels": {"type": "ref", "ref": "com.atproto.label.defs#selfLabels", "description": "Self-labels the referenced record's author applied; absent when none or when the reference has a status."},
             "thumbnail": {"type": "string", "format": "uri", "description": "Preview image URL for a post (link-card thumbnail or first image), served through the AppView's image proxy; never set for comments or references with a status."},

@@ -35,6 +35,7 @@
             "description": "Embedded media or quoted posts",
             "refs": [
               "social.coves.embed.images",
+              "social.coves.embed.imagesWithAttachment",
               "social.coves.embed.post"
             ]
           },

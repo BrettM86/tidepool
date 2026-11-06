@@ -1,0 +1,48 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.embed.imagesWithAttachment",
+  "defs": {
+    "main": {
+      "type": "object",
+      "description": "Images with an external link or a quoted post. At most eight images total across both galleries. Comments allow only a quoted-post attachment.",
+      "required": [
+        "images",
+        "attachment"
+      ],
+      "properties": {
+        "images": {
+          "type": "ref",
+          "ref": "social.coves.embed.images"
+        },
+        "attachment": {
+          "type": "union",
+          "refs": [
+            "social.coves.embed.external",
+            "social.coves.embed.post"
+          ]
+        }
+      }
+    },
+    "view": {
+      "type": "object",
+      "description": "Images and attachment as served by the AppView. Image URLs are projected from blob references; Coves quotes retain only their strong reference. Every #image placement in the served record resolves to an image in the main images gallery, never the attachment. Images without a placement render as a gallery after the body.",
+      "required": [
+        "images",
+        "attachment"
+      ],
+      "properties": {
+        "images": {
+          "type": "ref",
+          "ref": "social.coves.embed.images#view"
+        },
+        "attachment": {
+          "type": "union",
+          "refs": [
+            "social.coves.embed.external#viewExternal",
+            "social.coves.embed.post#view"
+          ]
+        }
+      }
+    }
+  }
+}

@@ -536,12 +536,26 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	// A vote becomes a record only once its activity is fetched from the
+	// voter's own instance (the Announce signs only the community), through
+	// the signed, SSRF-guarded client.
+	originVerifier, err := votes.NewOriginVerifier(apClient, votes.OriginVerifierOptions{
+		HostRPS:   cfg.BridgedVoteVerifyHostRPS,
+		GlobalRPS: cfg.BridgedVoteVerifyGlobalRPS,
+		Timeout:   10 * time.Second,
+	}, logger)
+	if err != nil {
+		return err
+	}
 	recordWriter, err := votes.NewRecordWriter(database, repoManager, objects, statsRefresher,
 		votes.RecordWriterOptions{
-			Mode:     recordMode,
-			DryRun:   cfg.BridgedVoteRecordsDryRun,
-			Interval: cfg.BridgedVoteRecordsInterval,
-			Batch:    cfg.BridgedVoteRecordsBatch,
+			Mode:        recordMode,
+			DryRun:      cfg.BridgedVoteRecordsDryRun,
+			Interval:    cfg.BridgedVoteRecordsInterval,
+			Batch:       cfg.BridgedVoteRecordsBatch,
+			Verifier:    originVerifier,
+			Window:      cfg.BridgedVoteVerifyWindow,
+			VerifyBatch: cfg.BridgedVoteVerifyBatch,
 		}, logger)
 	if err != nil {
 		return err
@@ -550,7 +564,9 @@ func run(logger *slog.Logger) error {
 	go recordWriter.Run(ctx)
 	logger.Info("bridged vote records configured",
 		"mode", recordMode.String(), "dry_run", cfg.BridgedVoteRecordsDryRun,
-		"interval", cfg.BridgedVoteRecordsInterval.String(), "batch", cfg.BridgedVoteRecordsBatch)
+		"interval", cfg.BridgedVoteRecordsInterval.String(), "batch", cfg.BridgedVoteRecordsBatch,
+		"verify_host_rps", cfg.BridgedVoteVerifyHostRPS, "verify_global_rps", cfg.BridgedVoteVerifyGlobalRPS,
+		"verify_window", cfg.BridgedVoteVerifyWindow.String(), "verify_batch", cfg.BridgedVoteVerifyBatch)
 	// Seeding imports historical scores for backfilled posts from the
 	// community host's public API (AP alone cannot provide them).
 	var seeder ingest.CountSeeder

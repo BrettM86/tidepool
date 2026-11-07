@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/netip"
 	"net/url"
 	"os"
@@ -275,8 +276,13 @@ type Config struct {
 	// scrub, convert) handles (BRIDGED_VOTE_RECORDS_BATCH, default 20, must be
 	// positive).
 	BridgedVoteRecordsBatch int
-	// Origin verification of bridged votes before they become records
-	// (BRIDGED_VOTE_VERIFY_HOST_RPS, _GLOBAL_RPS, _WINDOW, _BATCH).
+	// Origin verification of bridged votes before they become records:
+	// fetch start rates per voter host and in all
+	// (BRIDGED_VOTE_VERIFY_HOST_RPS default 1, BRIDGED_VOTE_VERIFY_GLOBAL_RPS
+	// default 5, both positive), the age past which a vote is no longer
+	// checked (BRIDGED_VOTE_VERIFY_WINDOW, default 144h, positive and under
+	// 168h: Lemmy prunes sent activities at 7 days), and the candidates one
+	// sweep reads (BRIDGED_VOTE_VERIFY_BATCH, default 300, positive).
 	BridgedVoteVerifyHostRPS   float64
 	BridgedVoteVerifyGlobalRPS float64
 	BridgedVoteVerifyWindow    time.Duration
@@ -763,6 +769,26 @@ func Load(logger *slog.Logger) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	cfg.BridgedVoteVerifyHostRPS, err = positiveFloatVar(logger, "BRIDGED_VOTE_VERIFY_HOST_RPS", 1)
+	if err != nil {
+		return nil, err
+	}
+	cfg.BridgedVoteVerifyGlobalRPS, err = positiveFloatVar(logger, "BRIDGED_VOTE_VERIFY_GLOBAL_RPS", 5)
+	if err != nil {
+		return nil, err
+	}
+	cfg.BridgedVoteVerifyWindow, err = durationVar(logger, "BRIDGED_VOTE_VERIFY_WINDOW", 144*time.Hour)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.BridgedVoteVerifyWindow >= 168*time.Hour {
+		return nil, fmt.Errorf("config: BRIDGED_VOTE_VERIFY_WINDOW must be under 168h (Lemmy prunes sent activities at 7 days), got %s",
+			cfg.BridgedVoteVerifyWindow)
+	}
+	cfg.BridgedVoteVerifyBatch, err = intVar(logger, "BRIDGED_VOTE_VERIFY_BATCH", 300)
+	if err != nil {
+		return nil, err
+	}
 
 	// Declarative follow list: optional in every environment (unset = the
 	// /admin API is the only subscription control). The path's existence and
@@ -843,6 +869,21 @@ func durationVar(logger *slog.Logger, name string, fallback time.Duration) (time
 	}
 	if parsed <= 0 {
 		return 0, fmt.Errorf("config: %s must be positive, got %s", name, parsed)
+	}
+	return parsed, nil
+}
+
+// positiveFloatVar returns a positive, finite float environment variable,
+// falling back to a logged default.
+func positiveFloatVar(logger *slog.Logger, name string, fallback float64) (float64, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		logger.Info(name+" not set, using default", "value", fallback)
+		return fallback, nil
+	}
+	parsed, err := strconv.ParseFloat(raw, 64)
+	if err != nil || !(parsed > 0) || math.IsInf(parsed, 0) {
+		return 0, fmt.Errorf("config: %s must be a positive number, got %q", name, raw)
 	}
 	return parsed, nil
 }

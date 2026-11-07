@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	stderrors "errors"
+	"expvar"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/bluesky-social/indigo/atproto/syntax"
 
+	"tidepool/internal/ap"
 	"tidepool/internal/errors"
 	"tidepool/internal/repo"
 	"tidepool/internal/store"
@@ -90,9 +92,9 @@ type RecordWriterOptions struct {
 	Interval time.Duration
 	Batch    int
 	// Verifier checks each vote at the voter's origin before it may become a
-	// record; Window bounds which votes are still checkable; VerifyBatch
-	// bounds a sweep's verification candidates; Sleep waits between
-	// verification rounds.
+	// record (required unless Mode is off); Window bounds which votes are
+	// still checkable; VerifyBatch bounds a sweep's verification candidates;
+	// Sleep waits between verification rounds (the sweep's only clock).
 	Verifier    OriginVerifier
 	Window      time.Duration
 	VerifyBatch int
@@ -129,6 +131,34 @@ const (
 	// carry a non-positive value.
 	DefaultRecordInterval = time.Minute
 	DefaultRecordBatch    = 20
+
+	// DefaultVerifyWindow and DefaultVerifyBatch apply when the options carry
+	// a non-positive value. Lemmy prunes sent activities at 7 days.
+	DefaultVerifyWindow = 144 * time.Hour
+	DefaultVerifyBatch  = 300
+
+	// A sweep spends at most verifyBudgetPercent of its interval verifying,
+	// in rounds verifyRoundPause apart, taking at most verifyPerHost
+	// candidates from one voter host.
+	verifyBudgetPercent = 80
+	verifyRoundPause    = 100 * time.Millisecond
+	verifyPerHost       = 60
+	// verifyRetryAfter keeps an 'unavailable' vote out of the queue for a
+	// while after its check (the verifier also backs the host off).
+	verifyRetryAfter = originFirstBackoff
+	// maxExpirePerSweep bounds the unavailable → expired UPDATE.
+	maxExpirePerSweep = 1000
+	// verifyWarnMargin: warn when the oldest pending vote is this close to
+	// leaving the window unchecked.
+	verifyWarnMargin = 24 * time.Hour
+)
+
+// Origin verification metrics, recomputed each sweep (the verdict map counts
+// every verdict stored, plus votes deferred for lack of a fetch slot).
+var (
+	voteVerifyBacklog       = expvar.NewInt("tidepool_vote_verify_backlog")
+	voteVerifyOldestPending = expvar.NewInt("tidepool_vote_verify_oldest_pending_seconds")
+	voteVerifyVerdicts      = expvar.NewMap("tidepool_vote_verify_verdicts")
 )
 
 // errStaleRecordWork is returned from the commit side effect when a row's
@@ -169,6 +199,10 @@ type RecordWriter struct {
 	dryRun    bool
 	interval  time.Duration
 	batch     int
+	verifier  OriginVerifier
+	window    time.Duration
+	verifyMax int
+	sleep     func(ctx context.Context, d time.Duration) error
 	logger    *slog.Logger
 	// Each sweep pass resumes after the last voter it handled, wrapping, so
 	// voters whose work keeps failing cannot starve the rest. Sweep runs on
@@ -201,11 +235,38 @@ func NewRecordWriter(db *sql.DB, committer RecordCommitter, objects store.APObje
 	if opts.Batch <= 0 {
 		opts.Batch = DefaultRecordBatch
 	}
+	// There is no unverified record path.
+	if opts.Verifier == nil && opts.Mode != RecordsOff {
+		return nil, errors.NewValidationError("verifier", "must not be nil unless the record mode is off")
+	}
+	if opts.Window <= 0 {
+		opts.Window = DefaultVerifyWindow
+	}
+	if opts.VerifyBatch <= 0 {
+		opts.VerifyBatch = DefaultVerifyBatch
+	}
+	if opts.Sleep == nil {
+		opts.Sleep = sleepContext
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &RecordWriter{db: db, committer: committer, objects: objects, stats: stats,
-		mode: opts.Mode, dryRun: opts.DryRun, interval: opts.Interval, batch: opts.Batch, logger: logger}, nil
+		mode: opts.Mode, dryRun: opts.DryRun, interval: opts.Interval, batch: opts.Batch,
+		verifier: opts.Verifier, window: opts.Window, verifyMax: opts.VerifyBatch, sleep: opts.Sleep,
+		logger: logger}, nil
+}
+
+// sleepContext waits d or until ctx is done.
+func sleepContext(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // rowQuerier is what *sql.DB and *sql.Tx share for single-row reads.
@@ -240,20 +301,66 @@ func recordATURI(did, activityID string, createdAt time.Time) (string, error) {
 	return "at://" + did + "/" + voteRecordCollection + "/" + rkey.String(), nil
 }
 
-// markIfEligible is phase 1's record decision for a just-inserted vote row,
-// inside the vote transaction: when the voter is eligible and the mode allows
-// the direction, the row becomes pending.
-func (w *RecordWriter) markIfEligible(ctx context.Context, tx *sql.Tx, eventID int64, voter, direction, activityID string, createdAt time.Time) (bool, error) {
+// verifyLive checks a new vote at its origin before the vote transaction, when
+// it could become a record: the mode allows the direction, not dry-run, the
+// voter is eligible and the activity id is new. It never fetches under a lock
+// and never waits for a slot: "" means unchecked (the sweep picks it up).
+func (w *RecordWriter) verifyLive(ctx context.Context, activityID, voter, subject, direction string) (OriginVerdict, error) {
 	if !w.mode.allows(direction) {
+		return "", nil
+	}
+	var seen bool
+	if err := w.db.QueryRowContext(ctx, `
+		SELECT EXISTS (SELECT 1 FROM vote_events WHERE activity_id = $1)`, activityID).Scan(&seen); err != nil {
+		return "", fmt.Errorf("votes: dedupe vote %q before its origin check: %w", activityID, err)
+	}
+	if seen {
+		return "", nil
+	}
+	_, eligible, err := eligibleDID(ctx, w.db, voter)
+	if err != nil || !eligible {
+		return "", err
+	}
+	if w.dryRun {
+		w.logger.Debug("vote records dry run: vote would be checked at its origin", "voter", voter, "activity", activityID)
+		return "", nil
+	}
+	verdict, deferred := w.verifier.Verify(ctx, voteClaim(activityID, voter, subject, direction))
+	if deferred {
+		voteVerifyVerdicts.Add("deferred", 1)
+		return "", nil
+	}
+	voteVerifyVerdicts.Add(string(verdict), 1)
+	return verdict, nil
+}
+
+// voteClaim is the claim a stored vote makes.
+func voteClaim(activityID, voter, subject, direction string) VoteClaim {
+	voteType := ap.TypeLike
+	if direction == directionDown {
+		voteType = ap.TypeDislike
+	}
+	return VoteClaim{ActivityID: activityID, Actor: voter, Object: subject, Type: voteType}
+}
+
+// markIfEligible is phase 1's record decision for a just-inserted vote row,
+// inside the vote transaction: it stores the origin verdict (verifyLive's,
+// "" = none), and when the vote was verified, the voter is still eligible and
+// the mode allows the direction, the row becomes pending.
+func (w *RecordWriter) markIfEligible(ctx context.Context, tx *sql.Tx, eventID int64, voter, direction, activityID string, createdAt time.Time, verdict OriginVerdict) (bool, error) {
+	if verdict != "" {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE vote_events SET origin_check = $2, origin_checked_at = now() WHERE id = $1`,
+			eventID, string(verdict)); err != nil {
+			return false, fmt.Errorf("store origin check of vote %q: %w", activityID, err)
+		}
+	}
+	if verdict != OriginVerified || w.dryRun || !w.mode.allows(direction) {
 		return false, nil
 	}
 	did, eligible, err := eligibleDID(ctx, tx, voter)
 	if err != nil || !eligible {
 		return false, err
-	}
-	if w.dryRun {
-		w.logger.Debug("vote records dry run: vote would become a record", "voter", voter, "activity", activityID)
-		return false, nil
 	}
 	atURI, err := recordATURI(did, activityID, createdAt)
 	if err != nil {
@@ -698,11 +805,13 @@ func (w *RecordWriter) runSweep(ctx context.Context) {
 	}
 }
 
-// Sweep runs three passes, each over up to Batch voters: repair (eligible
-// voters with outstanding work), scrub (voters holding record rows who are no
-// longer eligible), and — unless the mode is off — conversion (eligible voters
-// with live unrecorded votes in an allowed direction on a live subject, at any
-// age). In dry-run it logs what it would do and touches nothing.
+// Sweep runs repair (eligible voters with outstanding work) and scrub (voters
+// holding record rows who are no longer eligible), each over up to Batch
+// voters, then — unless the mode is off — origin verification (votes inside
+// the window, oldest first, within a time budget) and conversion of up to
+// Batch voters' verified live unrecorded votes in an allowed direction on a
+// live subject (a verified vote at any age: verified is final). In dry-run it
+// logs what it would do and touches nothing.
 func (w *RecordWriter) Sweep(ctx context.Context) error {
 	upOnly := w.mode == RecordsUp
 	// $1 limit, $2/$3 the voter window (sweepVoters), $4 upOnly.
@@ -715,7 +824,8 @@ func (w *RecordWriter) Sweep(ctx context.Context) error {
 		WHERE e.record_state IN ('pending', 'written') AND NOT ` + eligibleVoterSQL + voterWindowSQL
 	convertQuery := `
 		SELECT DISTINCT e.voter_ap_id FROM vote_events e
-		WHERE NOT e.undone AND e.record_at_uri IS NULL AND (NOT $4 OR e.direction = 'up')
+		WHERE NOT e.undone AND e.record_at_uri IS NULL AND e.origin_check = 'verified'
+		  AND (NOT $4 OR e.direction = 'up')
 		  AND ` + liveSubjectSQL + `
 		  AND ` + eligibleVoterSQL + voterWindowSQL
 
@@ -765,6 +875,12 @@ func (w *RecordWriter) Sweep(ctx context.Context) error {
 		}
 	}
 	if w.mode != RecordsOff {
+		if err := w.verifyOrigins(ctx, upOnly); err != nil {
+			if ctx.Err() != nil {
+				return stderrors.Join(append(errs, err)...)
+			}
+			errs = append(errs, err)
+		}
 		convert, err := w.sweepVoters(ctx, convertQuery, &w.convertCursor, upOnly)
 		if err != nil {
 			return stderrors.Join(append(errs, err)...)
@@ -833,8 +949,8 @@ func (w *RecordWriter) queryVoters(ctx context.Context, query string, limit int,
 	return voters, nil
 }
 
-// convertVoter marks up to maxRecordOpsPerCommit of an eligible voter's live
-// unrecorded votes pending, under their aggregates' locks taken in subject
+// convertVoter marks up to maxRecordOpsPerCommit of an eligible voter's
+// verified live unrecorded votes pending, under their aggregates' locks taken in subject
 // order (the scrub's discipline), and recomputes those aggregates.
 func (w *RecordWriter) convertVoter(ctx context.Context, voter string, upOnly bool) error {
 	did, eligible, err := eligibleDID(ctx, w.db, voter)
@@ -868,10 +984,11 @@ func (w *RecordWriter) convertVoter(ctx context.Context, voter string, upOnly bo
 			if err != nil {
 				return err
 			}
-			// Guarded: a vote superseded since the read above stays as it is.
+			// Guarded: a vote superseded since the read above stays as it is,
+			// and only a vote verified at its origin becomes a record.
 			result, err := tx.ExecContext(ctx, `
 				UPDATE vote_events SET record_at_uri = $2, record_state = 'pending'
-				WHERE id = $1 AND NOT undone AND record_at_uri IS NULL`, c.id, atURI)
+				WHERE id = $1 AND NOT undone AND record_at_uri IS NULL AND origin_check = 'verified'`, c.id, atURI)
 			if err != nil {
 				return fmt.Errorf("mark vote %d pending: %w", c.id, err)
 			}
@@ -902,12 +1019,13 @@ type convertCandidate struct {
 	createdAt  time.Time
 }
 
-// convertibleVotes reads up to maxRecordOpsPerCommit of the voter's live
-// unrecorded votes on live subjects, in subject order.
+// convertibleVotes reads up to maxRecordOpsPerCommit of the voter's verified
+// live unrecorded votes on live subjects, in subject order.
 func (w *RecordWriter) convertibleVotes(ctx context.Context, voter string, upOnly bool) ([]convertCandidate, error) {
 	rows, err := w.db.QueryContext(ctx, `
 		SELECT e.id, e.subject_ap_id, e.activity_id, e.created_at FROM vote_events e
-		WHERE e.voter_ap_id = $1 AND NOT e.undone AND e.record_at_uri IS NULL AND (NOT $2 OR e.direction = 'up')
+		WHERE e.voter_ap_id = $1 AND NOT e.undone AND e.record_at_uri IS NULL AND e.origin_check = 'verified'
+		  AND (NOT $2 OR e.direction = 'up')
 		  AND `+liveSubjectSQL+`
 		ORDER BY e.subject_ap_id, e.id
 		LIMIT $3`, voter, upOnly, maxRecordOpsPerCommit)
@@ -927,4 +1045,184 @@ func (w *RecordWriter) convertibleVotes(ctx context.Context, voter string, upOnl
 		return nil, fmt.Errorf("votes: iterate convertible votes of %q: %w", voter, err)
 	}
 	return candidates, nil
+}
+
+// verifyCandidateSQL selects the verification queue: live unrecorded votes
+// inside the window ($1 seconds) never checked, or 'unavailable' and checked
+// more than $2 seconds ago, in an allowed direction ($3 upOnly), on a live
+// subject, by an eligible voter; oldest first, at most $4 per voter host, at
+// most $5 in all.
+const verifyCandidateSQL = `
+	SELECT id, activity_id, voter_ap_id, subject_ap_id, direction, host FROM (
+		SELECT e.id, e.activity_id, e.voter_ap_id, e.subject_ap_id, e.direction, e.created_at,
+			split_part(e.voter_ap_id, '/', 3) AS host,
+			row_number() OVER (PARTITION BY split_part(e.voter_ap_id, '/', 3) ORDER BY e.created_at, e.id) AS n
+		FROM vote_events e
+		WHERE NOT e.undone AND e.record_at_uri IS NULL
+		  AND (e.origin_check IS NULL
+		       OR (e.origin_check = 'unavailable' AND e.origin_checked_at < now() - make_interval(secs => $2)))
+		  AND e.created_at > now() - make_interval(secs => $1)
+		  AND (NOT $3 OR e.direction = 'up')
+		  AND ` + liveSubjectSQL + `
+		  AND ` + eligibleVoterSQL + `
+	) c
+	WHERE n <= $4
+	ORDER BY created_at, id
+	LIMIT $5`
+
+// verifyCandidate is one vote waiting for its origin check.
+type verifyCandidate struct {
+	id    int64
+	claim VoteClaim
+}
+
+// verifyOrigins is the sweep's verification pass. It expires 'unavailable'
+// votes that left the window, then checks the queue in rounds: each round
+// tries the oldest vote of each voter host (hosts in order of their oldest
+// vote), so a host in backoff holds only its own queue; a deferred vote waits
+// for the next round. Rounds are verifyRoundPause apart, through the sleep
+// seam, until the budget (verifyBudgetPercent of the interval) is spent or
+// the queue is empty. Last it publishes the backlog.
+func (w *RecordWriter) verifyOrigins(ctx context.Context, upOnly bool) error {
+	var errs []error
+	if err := w.expireUnavailable(ctx); err != nil {
+		errs = append(errs, err)
+	}
+
+	queues, err := w.verifyQueues(ctx, upOnly)
+	if err != nil {
+		return stderrors.Join(append(errs, err)...)
+	}
+	budget := w.interval * verifyBudgetPercent / 100
+	var slept time.Duration
+	for {
+		remaining := 0
+		for i, queue := range queues {
+			if len(queue) == 0 {
+				continue
+			}
+			c := queue[0]
+			verdict, deferred := w.verifier.Verify(ctx, c.claim)
+			if deferred {
+				remaining += len(queue)
+				continue
+			}
+			queues[i] = queue[1:]
+			remaining += len(queue) - 1
+			if err := w.storeVerdict(ctx, c, verdict); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		if remaining == 0 || slept+verifyRoundPause > budget || ctx.Err() != nil {
+			voteVerifyVerdicts.Add("deferred", int64(remaining))
+			break
+		}
+		if err := w.sleep(ctx, verifyRoundPause); err != nil {
+			return stderrors.Join(append(errs, err)...)
+		}
+		slept += verifyRoundPause
+	}
+
+	if err := w.reportVerifyBacklog(ctx, upOnly); err != nil {
+		errs = append(errs, err)
+	}
+	return stderrors.Join(errs...)
+}
+
+// verifyQueues reads the verification queue grouped by voter host, hosts in
+// order of their oldest vote.
+func (w *RecordWriter) verifyQueues(ctx context.Context, upOnly bool) ([][]verifyCandidate, error) {
+	rows, err := w.db.QueryContext(ctx, verifyCandidateSQL,
+		w.window.Seconds(), verifyRetryAfter.Seconds(), upOnly, verifyPerHost, w.verifyMax)
+	if err != nil {
+		return nil, fmt.Errorf("votes: select origin check candidates: %w", err)
+	}
+	defer rows.Close()
+	var queues [][]verifyCandidate
+	byHost := map[string]int{}
+	for rows.Next() {
+		var c verifyCandidate
+		var voter, subject, direction, host string
+		if err := rows.Scan(&c.id, &c.claim.ActivityID, &voter, &subject, &direction, &host); err != nil {
+			return nil, fmt.Errorf("votes: scan origin check candidate: %w", err)
+		}
+		c.claim = voteClaim(c.claim.ActivityID, voter, subject, direction)
+		i, ok := byHost[host]
+		if !ok {
+			i = len(queues)
+			byHost[host] = i
+			queues = append(queues, nil)
+		}
+		queues[i] = append(queues[i], c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("votes: iterate origin check candidates: %w", err)
+	}
+	return queues, nil
+}
+
+// storeVerdict records a vote's origin verdict unless the vote changed since
+// it was selected (undone, recorded, or checked meanwhile).
+func (w *RecordWriter) storeVerdict(ctx context.Context, c verifyCandidate, verdict OriginVerdict) error {
+	voteVerifyVerdicts.Add(string(verdict), 1)
+	if _, err := w.db.ExecContext(ctx, `
+		UPDATE vote_events SET origin_check = $2, origin_checked_at = now()
+		WHERE id = $1 AND NOT undone AND record_at_uri IS NULL
+		  AND (origin_check IS NULL OR origin_check = 'unavailable')`, c.id, string(verdict)); err != nil {
+		return fmt.Errorf("votes: store origin check of vote %d: %w", c.id, err)
+	}
+	if verdict != OriginVerified {
+		w.logger.Debug("vote not verified at its origin; it stays aggregate",
+			"activity", c.claim.ActivityID, "verdict", string(verdict))
+	}
+	return nil
+}
+
+// expireUnavailable ends 'unavailable' votes that left the window at
+// 'expired'. Never-checked votes outside the window are left alone: they are
+// simply never candidates.
+func (w *RecordWriter) expireUnavailable(ctx context.Context) error {
+	result, err := w.db.ExecContext(ctx, `
+		UPDATE vote_events SET origin_check = 'expired', origin_checked_at = now()
+		WHERE id IN (
+			SELECT id FROM vote_events
+			WHERE NOT undone AND record_at_uri IS NULL AND origin_check = 'unavailable'
+			  AND created_at <= now() - make_interval(secs => $1)
+			LIMIT $2)`, w.window.Seconds(), maxExpirePerSweep)
+	if err != nil {
+		return fmt.Errorf("votes: expire unavailable origin checks: %w", err)
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("votes: expire unavailable origin checks: rows affected: %w", err)
+	}
+	voteVerifyVerdicts.Add(string(OriginExpired), n)
+	return nil
+}
+
+// reportVerifyBacklog publishes how many candidates in the window are still
+// unchecked or retryable and the age of the oldest, and warns once when that
+// vote is within verifyWarnMargin of leaving the window unchecked.
+func (w *RecordWriter) reportVerifyBacklog(ctx context.Context, upOnly bool) error {
+	var backlog int64
+	var oldest float64
+	if err := w.db.QueryRowContext(ctx, `
+		SELECT COUNT(*), COALESCE(EXTRACT(EPOCH FROM now() - MIN(e.created_at)), 0)::float8
+		FROM vote_events e
+		WHERE NOT e.undone AND e.record_at_uri IS NULL
+		  AND (e.origin_check IS NULL OR e.origin_check = 'unavailable')
+		  AND e.created_at > now() - make_interval(secs => $1)
+		  AND (NOT $2 OR e.direction = 'up')
+		  AND `+liveSubjectSQL+`
+		  AND `+eligibleVoterSQL, w.window.Seconds(), upOnly).Scan(&backlog, &oldest); err != nil {
+		return fmt.Errorf("votes: count origin check backlog: %w", err)
+	}
+	voteVerifyBacklog.Set(backlog)
+	voteVerifyOldestPending.Set(int64(oldest))
+	oldestAge := time.Duration(oldest * float64(time.Second))
+	if backlog > 0 && oldestAge > w.window-verifyWarnMargin {
+		w.logger.Warn("origin verification is falling behind: the oldest unchecked vote will leave the window and stay aggregate",
+			"backlog", backlog, "oldest_pending", oldestAge.Round(time.Second).String(), "window", w.window.String())
+	}
+	return nil
 }

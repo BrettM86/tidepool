@@ -237,6 +237,15 @@ func (a *Aggregator) ApplyVote(ctx context.Context, vote *ap.Object, communityIR
 		}
 	}
 
+	// A vote that may become a record is checked at the voter's origin first,
+	// outside the transaction: the check may fetch, and no lock is held then.
+	var originVerdict OriginVerdict
+	if a.writer != nil {
+		if originVerdict, err = a.writer.verifyLive(ctx, vote.ID, voter, subject, direction); err != nil {
+			return err
+		}
+	}
+
 	// recordWork: this vote left the voter with record work (a new pending
 	// record, or a superseded row whose record must go), which phase 2 below
 	// commits after this transaction releases the aggregate lock.
@@ -296,7 +305,7 @@ func (a *Aggregator) ApplyVote(ctx context.Context, vote *ap.Object, communityIR
 		}
 		var marked bool
 		if a.writer != nil {
-			if marked, err = a.writer.markIfEligible(ctx, tx, eventID, voter, direction, vote.ID, createdAt); err != nil {
+			if marked, err = a.writer.markIfEligible(ctx, tx, eventID, voter, direction, vote.ID, createdAt, originVerdict); err != nil {
 				return err
 			}
 		}

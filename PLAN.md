@@ -487,8 +487,9 @@ is left with the Group-actor AP surface and the admission-policy wiring.
     `social.coves.feed.vote` records in that repo. This supersedes decision 7's
     inbound half.
     - Who gets records: a Like or Dislike whose voter is a bridged person with
-      consent `ok` and an existing repo. The vote path never mints; a voter
-      gets a repo only by authoring.
+      consent `ok` and an existing repo, once the vote is verified at the
+      voter's origin (below). The vote path never mints; a voter gets a repo
+      only by authoring.
     - Who stays aggregate: voters with no repo, `#nobridge`/`#nobot` actors,
       PieFed's legacy alt actors (they never author, so never get a repo), and
       the API-seeded baseline, forever. Votes by our own personas are neither:
@@ -499,7 +500,8 @@ is left with the Group-actor AP surface and the admission-policy wiring.
       outbound − recorded, so no vote is counted both bridge-side and in
       Coves' native column.
     - Two phases. Phase 1, in the aggregator transaction under the subject's
-      aggregate lock: store the vote, mark it pending, recompute without it.
+      aggregate lock: store the vote, mark it pending if verified, recompute
+      without it.
       Phase 2 (`votes.RecordWriter.SyncVoter`): repin `bridgedStats` for each
       due subject first, then write the voter's creates and deletes in one
       repo commit whose side effect moves each row's state under a guard; any
@@ -514,11 +516,48 @@ is left with the Group-actor AP surface and the admission-policy wiring.
       the timestamp half is the time the bridge first recorded the vote and
       the clock bits hash the activity id. A flip is delete(old) plus
       create(new) in one commit.
+    - Origin verification. The Announce is signed only by the community's
+      instance; nothing proves the inner vote's actor cast it, so a followed
+      instance could forge votes into a bridged voter's repo. Rule: a vote
+      becomes a record only after `GET <activity id>` at the voter's own
+      instance (signed, SSRF-guarded, redirects pinned to that host) returns
+      the same type, actor, object and id. The verdict is stored on
+      `vote_events.origin_check`: `verified` (converted), `mismatch` (id host
+      ≠ actor host, off-host redirect, or a different activity), `not_found`
+      (400/401/403/404/410 or Tombstone; Lemmy answers a missing activity
+      with 400), `unavailable` (timeout, network, 429, 5xx, bad body;
+      retried after a host backoff, 30s doubling to 15m) and `expired`
+      (still unavailable when the vote left the window). Only `unavailable`
+      is retried; everything not verified stays aggregate. The window is 6
+      days (`BRIDGED_VOTE_VERIFY_WINDOW`, under 168h) because Lemmy prunes
+      `sent_activity` at 7 days and PieFed's `ActivityPubLog` at 3; older
+      votes are never fetched. PieFed is covered by the same fetch (older
+      PieFed votes come back `not_found`); Mbin serves no activities and
+      stays aggregate. Undo is not verified: Lemmy rebuilds the inner vote
+      with a fresh, unfetchable id, and a forged Undo can only delete a real
+      record on the forger's own community's content, the reach it already
+      has over the aggregate.
+    - Pacing. Fetches start at most `BRIDGED_VOTE_VERIFY_HOST_RPS` (1) per
+      voter host and `BRIDGED_VOTE_VERIFY_GLOBAL_RPS` (5) in all, admitted
+      only when both buckets have a token; no token means deferred, never a
+      wait. The live path checks outside the vote transaction; a deferred
+      vote stays aggregate with nothing stored. Each sweep verifies the
+      queue oldest first (Lemmy prunes oldest first), at most
+      `BRIDGED_VOTE_VERIFY_BATCH` (300) votes and 60 per host, in rounds of
+      one vote per host for 80% of the interval, so a host in backoff cannot
+      starve healthy ones. Capacity is 432k/day globally and 86.4k/day per
+      host, against about 3.6k/day (busiest day ~5.1k) of lemmy.world votes
+      by repo voters. `tidepool_vote_verify_backlog`,
+      `tidepool_vote_verify_oldest_pending_seconds` and the
+      `tidepool_vote_verify_verdicts` map report it; a sweep warns once when
+      the oldest unchecked vote is within a day of the window edge.
     - A paced sweeper repairs outstanding work (pending creates, owed
-      deletes) and converts eligible voters' existing aggregate votes, at any
-      age. That covers turning the switch on and voters who get a repo at any
-      later date, with no hook on minting. It also scrubs record rows of
-      voters who are no longer eligible.
+      deletes), verifies, and converts eligible voters' verified aggregate
+      votes (a verified vote at any age: a restored subject or a failed
+      conversion converts without a refetch). That covers turning the switch
+      on and voters who get a repo later, with no hook on minting, for votes
+      still inside the window. It also scrubs record rows of voters who are
+      no longer eligible.
     - Switches, read at boot: `BRIDGED_VOTE_RECORDS=off|up|both` (default
       off), `BRIDGED_VOTE_RECORDS_DRY_RUN` (log only, mark and write nothing),
       `BRIDGED_VOTE_RECORDS_INTERVAL` (1m), `BRIDGED_VOTE_RECORDS_BATCH`

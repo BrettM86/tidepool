@@ -178,12 +178,15 @@ func withNodeInfoDiscoveryDeadline(d time.Duration) func(*Options) {
 
 // recordingScrubber records ScrubVoter calls (the task-11 vote-scrub hook)
 // and the voter's bridged_actors consent_state at each call ("" when the
-// voter has no row).
+// voter has no row). When failOnCall is N > 0, the Nth call is still
+// recorded but returns failErr (0 never fails).
 type recordingScrubber struct {
-	actors   store.BridgedActors
-	mu       sync.Mutex
-	ids      []string
-	consents []store.ConsentState
+	actors     store.BridgedActors
+	mu         sync.Mutex
+	ids        []string
+	consents   []store.ConsentState
+	failOnCall int
+	failErr    error
 }
 
 func (r *recordingScrubber) ScrubVoter(ctx context.Context, voterAPID string) error {
@@ -199,7 +202,17 @@ func (r *recordingScrubber) ScrubVoter(ctx context.Context, voterAPID string) er
 	defer r.mu.Unlock()
 	r.ids = append(r.ids, voterAPID)
 	r.consents = append(r.consents, consent)
+	if r.failOnCall > 0 && len(r.ids) == r.failOnCall {
+		return r.failErr
+	}
 	return nil
+}
+
+// failCall makes the nth ScrubVoter call (1-based) return err.
+func (r *recordingScrubber) failCall(n int, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.failOnCall, r.failErr = n, err
 }
 
 // consentsAtCall returns the voter's consent_state at each ScrubVoter call.

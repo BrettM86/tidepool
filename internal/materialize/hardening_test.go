@@ -16,6 +16,7 @@ import (
 	"tidepool/internal/ap"
 	"tidepool/internal/errors"
 	"tidepool/internal/repo"
+	"tidepool/internal/store"
 )
 
 // Task 11 hardening tests: the #account frame + vote scrub + blob scrub on
@@ -102,6 +103,59 @@ func TestDeleteActor_AccountEventVoteAndBlobScrub(t *testing.T) {
 	}
 	assert.Equal(t, 1, accountEvents, "exactly one account event for one Delete(Actor)")
 	assert.Equal(t, 3, deleteOps, "scrub deletes: the acceptance, the post and the actor profile")
+}
+
+// TestDeleteActor_VoteScrubFailure: a vote-scrub failure BEFORE the
+// consent flip aborts DeleteActor (a retry redoes everything). A failure
+// AFTER the flip must not: a retry would stop at the already-deleted guard
+// and the #account frame would never be sent, so DeleteActor completes and
+// leaves leftover vote records to the vote sweeper.
+func TestDeleteActor_VoteScrubFailure(t *testing.T) {
+	cases := []struct {
+		name          string
+		failCall      int
+		wantErr       bool
+		wantConsent   store.ConsentState
+		accountEvents int
+	}{
+		{name: "pre-flip scrub fails", failCall: 1, wantErr: true, wantConsent: store.ConsentStateOK, accountEvents: 0},
+		{name: "post-flip scrub fails", failCall: 2, wantErr: false, wantConsent: store.ConsentStateDeleted, accountEvents: 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.serveLemmyWorldFixtures()
+			ctx := context.Background()
+
+			_, err := h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"), groupID)
+			require.NoError(t, err)
+			authorDID := testDIDFor("LeftLeaningFreedomFighters", "lemmy.world")
+
+			h.scrubbed.failCall(tc.failCall, fmt.Errorf("vote store unavailable"))
+			err = h.m.DeleteActor(ctx, personID)
+			if tc.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err, "a post-flip vote-scrub failure must not fail DeleteActor")
+			}
+
+			actor, err := h.actors.GetByAPActorID(ctx, personID)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantConsent, actor.ConsentState)
+
+			var accountEvents int
+			for _, ev := range h.firehoseEvents() {
+				if ev.Kind != repo.EventKindAccount {
+					continue
+				}
+				accountEvents++
+				assert.Equal(t, authorDID, ev.DID)
+				assert.False(t, ev.AccountActive)
+				assert.Equal(t, repo.AccountStatusDeleted, ev.AccountStatus)
+			}
+			assert.Equal(t, tc.accountEvents, accountEvents, "#account deleted events on the firehose")
+		})
+	}
 }
 
 // TestSuppressActor_ScrubsVotesToo: the reversible nobridge scrub erases

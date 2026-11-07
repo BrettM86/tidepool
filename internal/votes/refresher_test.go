@@ -418,3 +418,50 @@ func TestRefresherBatchBounded(t *testing.T) {
 	r.Sweep(ctx)
 	assert.Len(t, emitter.snapshot(), 5, "and the remainder")
 }
+
+// B15: RefreshSubject emits one subject exactly like a sweep would — only when
+// due, with the current counts, advancing the watermark.
+func TestRefreshSubjectEmitsOnlyADueSubject(t *testing.T) {
+	tests := []struct {
+		name string
+		// alreadyEmitted sweeps once before RefreshSubject, so the row is not due.
+		alreadyEmitted bool
+	}{
+		{name: "due"},
+		{name: "not due", alreadyEmitted: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			database := testDB(t)
+			agg, objects := testAggregator(t, database)
+			bridgeSubject(t, objects, subjectPost, "3jzfcijpj2z2a")
+			ctx := context.Background()
+			require.NoError(t, agg.ApplyVote(ctx, like(activityID(t, 1), voterAlice, subjectPost), ""))
+			require.NoError(t, agg.ApplyVote(ctx, dislike(activityID(t, 2), voterBob, subjectPost), ""))
+			emitter := &fakeEmitter{}
+			r := testRefresher(t, database, emitter)
+			if tc.alreadyEmitted {
+				r.Sweep(ctx)
+				require.Len(t, emitter.snapshot(), 1)
+			}
+
+			require.NoError(t, r.RefreshSubject(ctx, subjectPost))
+
+			calls := emitter.snapshot()
+			if tc.alreadyEmitted {
+				assert.Len(t, calls, 1, "a subject that is not due is not emitted")
+				return
+			}
+			require.Len(t, calls, 1, "the due subject is emitted")
+			updated, emitted, found := aggregateTimes(t, database, subjectPost)
+			require.True(t, found)
+			assert.Equal(t, emitCall{subject: subjectPost, up: 1, down: 1, asOf: calls[0].asOf}, calls[0])
+			assert.True(t, calls[0].asOf.Equal(updated), "asOf is the counts' updated_at")
+			require.True(t, emitted.Valid, "the watermark was stamped")
+			assert.True(t, emitted.Time.Equal(updated), "watermark is the row's updated_at")
+
+			r.Sweep(ctx)
+			assert.Len(t, emitter.snapshot(), 1, "a refreshed subject is not re-emitted by the next sweep")
+		})
+	}
+}

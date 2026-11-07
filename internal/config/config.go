@@ -253,6 +253,11 @@ type Config struct {
 	// (STATS_REFRESH_BATCH, default 200, must be positive). Commits are
 	// globally serialized, so the batch keeps one sweep from flooding the lock.
 	StatsRefreshBatch int
+	// RED compile stubs: bridged vote records switches.
+	BridgedVoteRecords         string
+	BridgedVoteRecordsDryRun   bool
+	BridgedVoteRecordsInterval time.Duration
+	BridgedVoteRecordsBatch    int
 	// FollowListPath optionally points at the declarative follow list — a
 	// repo-committed YAML file naming every community the bridge should
 	// follow (FOLLOW_LIST_PATH). When set, a reconciler converges the

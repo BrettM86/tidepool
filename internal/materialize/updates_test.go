@@ -219,6 +219,24 @@ func TestNobridgeAddedOnRefresh(t *testing.T) {
 	assert.Equal(t, store.ConsentStateNoBridge, actor.ConsentState)
 }
 
+// B17: the nobridge transition on refresh scrubs the actor's votes (and so
+// their vote records), as SuppressActor does.
+func TestNobridgeAddedOnRefreshScrubsVotes(t *testing.T) {
+	h := newHarness(t)
+	h.serveObject("/u/flipflop", person("https://lemmy.world/u/flipflop", "flipflop", nil))
+	ctx := context.Background()
+	_, err := h.m.EnsureActor(ctx, &ap.Object{ID: "https://lemmy.world/u/flipflop"})
+	require.NoError(t, err)
+
+	updated := person("https://lemmy.world/u/flipflop", "flipflop", map[string]any{
+		"summary": "<p>done with this #nobridge</p>",
+	})
+	_, err = h.m.RefreshActor(ctx, objectFromMap(t, updated))
+
+	require.True(t, IsSkip(err), "the opted-out actor is skipped, got %v", err)
+	assert.Equal(t, []string{"https://lemmy.world/u/flipflop"}, h.scrubbed.calls())
+}
+
 // TestListByActorDIDSpine sanity-checks the store addition this task made:
 // author_did finds an actor's content. Post-flip a postv2 is an own-repo
 // record, so author_did and did agree for it — but the column is still the

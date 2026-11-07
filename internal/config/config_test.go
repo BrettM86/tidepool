@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -35,6 +36,8 @@ func clearConfigEnv(t *testing.T) {
 		"OUTBOUND_WORKERS", "OUTBOUND_DRY_RUN", "OUTBOUND_DISABLED",
 		"OUTBOUND_DISABLED_HOSTS", "OUTBOUND_DISABLED_COMMUNITIES",
 		"OUTBOUND_DISABLED_ACTORS",
+		"BRIDGED_VOTE_RECORDS", "BRIDGED_VOTE_RECORDS_DRY_RUN", "BRIDGED_VOTE_RECORDS_INTERVAL",
+		"BRIDGED_VOTE_RECORDS_BATCH",
 	} {
 		t.Setenv(name, "")
 	}
@@ -1017,6 +1020,68 @@ func TestLoad_RetiredOutboundSwitchVarWarnsOnlyWhenSet(t *testing.T) {
 
 			assert.Len(t, linesNaming(warnings, tc.present), 1, "the set variable warns")
 			assert.NotContains(t, log, tc.silent, "the other variable is not mentioned")
+		})
+	}
+}
+
+// B18.
+func TestLoad_BridgedVoteRecords(t *testing.T) {
+	type switches struct {
+		mode     string
+		dryRun   bool
+		interval time.Duration
+		batch    int
+	}
+	tests := []struct {
+		name string
+		env  map[string]string
+		want switches
+		// wantErr names the variable a Load error must mention ("" = no error).
+		wantErr string
+	}{
+		{name: "unset", want: switches{mode: "off", interval: time.Minute, batch: 20}},
+		{name: "up", env: map[string]string{"BRIDGED_VOTE_RECORDS": "up"},
+			want: switches{mode: "up", interval: time.Minute, batch: 20}},
+		{name: "both", env: map[string]string{"BRIDGED_VOTE_RECORDS": "both"},
+			want: switches{mode: "both", interval: time.Minute, batch: 20}},
+		{name: "explicit off", env: map[string]string{"BRIDGED_VOTE_RECORDS": "off"},
+			want: switches{mode: "off", interval: time.Minute, batch: 20}},
+		{name: "dry run, interval and batch set", env: map[string]string{
+			"BRIDGED_VOTE_RECORDS": "both", "BRIDGED_VOTE_RECORDS_DRY_RUN": "true",
+			"BRIDGED_VOTE_RECORDS_INTERVAL": "5m", "BRIDGED_VOTE_RECORDS_BATCH": "7",
+		}, want: switches{mode: "both", dryRun: true, interval: 5 * time.Minute, batch: 7}},
+		{name: "invalid mode", env: map[string]string{"BRIDGED_VOTE_RECORDS": "sideways"},
+			wantErr: "BRIDGED_VOTE_RECORDS"},
+		{name: "zero interval", env: map[string]string{"BRIDGED_VOTE_RECORDS_INTERVAL": "0s"},
+			wantErr: "BRIDGED_VOTE_RECORDS_INTERVAL"},
+		{name: "negative interval", env: map[string]string{"BRIDGED_VOTE_RECORDS_INTERVAL": "-1m"},
+			wantErr: "BRIDGED_VOTE_RECORDS_INTERVAL"},
+		{name: "zero batch", env: map[string]string{"BRIDGED_VOTE_RECORDS_BATCH": "0"},
+			wantErr: "BRIDGED_VOTE_RECORDS_BATCH"},
+		{name: "negative batch", env: map[string]string{"BRIDGED_VOTE_RECORDS_BATCH": "-3"},
+			wantErr: "BRIDGED_VOTE_RECORDS_BATCH"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			clearConfigEnv(t)
+			for name, value := range tc.env {
+				t.Setenv(name, value)
+			}
+
+			cfg, err := Load(discardLogger())
+
+			if tc.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, switches{
+				mode:     cfg.BridgedVoteRecords,
+				dryRun:   cfg.BridgedVoteRecordsDryRun,
+				interval: cfg.BridgedVoteRecordsInterval,
+				batch:    cfg.BridgedVoteRecordsBatch,
+			})
 		})
 	}
 }

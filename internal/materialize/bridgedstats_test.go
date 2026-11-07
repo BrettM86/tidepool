@@ -328,3 +328,52 @@ func TestCommentEditCarriesReplyRefsForward(t *testing.T) {
 		"reply.root must be carried forward verbatim, NOT re-resolved to the churned post CID")
 	assert.Equal(t, origParent, gotParent, "reply.parent must be carried forward verbatim")
 }
+
+// B16: asOf is monotonic — a stale emit (older asOf than the record carries)
+// leaves the record untouched and succeeds; a newer one replaces the stats.
+func TestEmitBridgedStatsRefusesAnOlderAsOf(t *testing.T) {
+	earlier := statsAsOf.Add(-time.Hour)
+	later := statsAsOf.Add(time.Hour)
+	tests := []struct {
+		name          string
+		asOf          time.Time
+		wantCommitted bool
+		wantUp        int64
+		wantAsOf      string
+		wantNewCID    bool
+	}{
+		{name: "older asOf is refused", asOf: earlier, wantCommitted: false, wantUp: 10,
+			wantAsOf: recordDatetimeMicros(statsAsOf), wantNewCID: false},
+		{name: "newer asOf replaces", asOf: later, wantCommitted: true, wantUp: 11,
+			wantAsOf: recordDatetimeMicros(later), wantNewCID: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.serveLemmyWorldFixtures()
+			ctx := context.Background()
+			_, err := h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"), groupID)
+			require.NoError(t, err)
+			mapping, err := h.objects.GetByAPID(ctx, pageID)
+			require.NoError(t, err)
+			_, err = h.m.SetBridgedStats(ctx, mapping, 10, 1, statsAsOf)
+			require.NoError(t, err)
+			mapping, err = h.objects.GetByAPID(ctx, pageID)
+			require.NoError(t, err)
+			_, stampedCID, err := h.manager.GetRecord(ctx, mapping.DID, mapping.Collection, mapping.RKey)
+			require.NoError(t, err)
+
+			committed, err := h.m.EmitBridgedStats(ctx, mapping, 11, 1, tc.asOf)
+
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantCommitted, committed)
+			record, cid, err := h.manager.GetRecord(ctx, mapping.DID, mapping.Collection, mapping.RKey)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantNewCID, cid != stampedCID, "record CID changed")
+			stats := record["bridgedStats"].(map[string]any)
+			assert.EqualValues(t, tc.wantUp, stats["upvotes"])
+			assert.EqualValues(t, 1, stats["downvotes"])
+			assert.Equal(t, tc.wantAsOf, stats["asOf"])
+		})
+	}
+}

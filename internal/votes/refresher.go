@@ -273,3 +273,6 @@ func (r *Refresher) advance(ctx context.Context, subject string, watermark time.
 		r.logger.Error("stats refresh: advance watermark failed", "subject", subject, "error", err)
 	}
 }
+
+// RefreshSubject is a RED compile stub.
+func (r *Refresher) RefreshSubject(ctx context.Context, subjectAPID string) error { return nil }

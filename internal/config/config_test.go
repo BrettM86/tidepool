@@ -38,6 +38,8 @@ func clearConfigEnv(t *testing.T) {
 		"OUTBOUND_DISABLED_ACTORS",
 		"BRIDGED_VOTE_RECORDS", "BRIDGED_VOTE_RECORDS_DRY_RUN", "BRIDGED_VOTE_RECORDS_INTERVAL",
 		"BRIDGED_VOTE_RECORDS_BATCH",
+		"BRIDGED_VOTE_VERIFY_HOST_RPS", "BRIDGED_VOTE_VERIFY_GLOBAL_RPS", "BRIDGED_VOTE_VERIFY_WINDOW",
+		"BRIDGED_VOTE_VERIFY_BATCH",
 	} {
 		t.Setenv(name, "")
 	}
@@ -1081,6 +1083,76 @@ func TestLoad_BridgedVoteRecords(t *testing.T) {
 				dryRun:   cfg.BridgedVoteRecordsDryRun,
 				interval: cfg.BridgedVoteRecordsInterval,
 				batch:    cfg.BridgedVoteRecordsBatch,
+			})
+		})
+	}
+}
+
+// O9: origin verification pacing and window.
+func TestLoad_BridgedVoteVerify(t *testing.T) {
+	type verify struct {
+		hostRPS, globalRPS float64
+		window             time.Duration
+		batch              int
+	}
+	defaults := verify{hostRPS: 1, globalRPS: 5, window: 144 * time.Hour, batch: 300}
+	tests := []struct {
+		name string
+		env  map[string]string
+		want verify
+		// wantErr names the variable a Load error must mention ("" = no error).
+		wantErr string
+	}{
+		{name: "unset", want: defaults},
+		{name: "all set", env: map[string]string{
+			"BRIDGED_VOTE_VERIFY_HOST_RPS": "0.5", "BRIDGED_VOTE_VERIFY_GLOBAL_RPS": "12",
+			"BRIDGED_VOTE_VERIFY_WINDOW": "120h", "BRIDGED_VOTE_VERIFY_BATCH": "40",
+		}, want: verify{hostRPS: 0.5, globalRPS: 12, window: 120 * time.Hour, batch: 40}},
+		{name: "window just under seven days", env: map[string]string{"BRIDGED_VOTE_VERIFY_WINDOW": "167h59m"},
+			want: verify{hostRPS: 1, globalRPS: 5, window: 167*time.Hour + 59*time.Minute, batch: 300}},
+		{name: "zero host rps", env: map[string]string{"BRIDGED_VOTE_VERIFY_HOST_RPS": "0"},
+			wantErr: "BRIDGED_VOTE_VERIFY_HOST_RPS"},
+		{name: "negative host rps", env: map[string]string{"BRIDGED_VOTE_VERIFY_HOST_RPS": "-1"},
+			wantErr: "BRIDGED_VOTE_VERIFY_HOST_RPS"},
+		{name: "unparseable host rps", env: map[string]string{"BRIDGED_VOTE_VERIFY_HOST_RPS": "fast"},
+			wantErr: "BRIDGED_VOTE_VERIFY_HOST_RPS"},
+		{name: "zero global rps", env: map[string]string{"BRIDGED_VOTE_VERIFY_GLOBAL_RPS": "0"},
+			wantErr: "BRIDGED_VOTE_VERIFY_GLOBAL_RPS"},
+		{name: "negative global rps", env: map[string]string{"BRIDGED_VOTE_VERIFY_GLOBAL_RPS": "-5"},
+			wantErr: "BRIDGED_VOTE_VERIFY_GLOBAL_RPS"},
+		{name: "window seven days", env: map[string]string{"BRIDGED_VOTE_VERIFY_WINDOW": "168h"},
+			wantErr: "BRIDGED_VOTE_VERIFY_WINDOW"},
+		{name: "window over seven days", env: map[string]string{"BRIDGED_VOTE_VERIFY_WINDOW": "200h"},
+			wantErr: "BRIDGED_VOTE_VERIFY_WINDOW"},
+		{name: "zero window", env: map[string]string{"BRIDGED_VOTE_VERIFY_WINDOW": "0s"},
+			wantErr: "BRIDGED_VOTE_VERIFY_WINDOW"},
+		{name: "negative window", env: map[string]string{"BRIDGED_VOTE_VERIFY_WINDOW": "-1h"},
+			wantErr: "BRIDGED_VOTE_VERIFY_WINDOW"},
+		{name: "zero batch", env: map[string]string{"BRIDGED_VOTE_VERIFY_BATCH": "0"},
+			wantErr: "BRIDGED_VOTE_VERIFY_BATCH"},
+		{name: "negative batch", env: map[string]string{"BRIDGED_VOTE_VERIFY_BATCH": "-2"},
+			wantErr: "BRIDGED_VOTE_VERIFY_BATCH"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			clearConfigEnv(t)
+			for name, value := range tc.env {
+				t.Setenv(name, value)
+			}
+
+			cfg, err := Load(discardLogger())
+
+			if tc.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, verify{
+				hostRPS:   cfg.BridgedVoteVerifyHostRPS,
+				globalRPS: cfg.BridgedVoteVerifyGlobalRPS,
+				window:    cfg.BridgedVoteVerifyWindow,
+				batch:     cfg.BridgedVoteVerifyBatch,
 			})
 		})
 	}

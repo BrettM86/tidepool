@@ -275,6 +275,12 @@ type Config struct {
 	// scrub, convert) handles (BRIDGED_VOTE_RECORDS_BATCH, default 20, must be
 	// positive).
 	BridgedVoteRecordsBatch int
+	// Origin verification of bridged votes before they become records
+	// (BRIDGED_VOTE_VERIFY_HOST_RPS, _GLOBAL_RPS, _WINDOW, _BATCH).
+	BridgedVoteVerifyHostRPS   float64
+	BridgedVoteVerifyGlobalRPS float64
+	BridgedVoteVerifyWindow    time.Duration
+	BridgedVoteVerifyBatch     int
 	// FollowListPath optionally points at the declarative follow list — a
 	// repo-committed YAML file naming every community the bridge should
 	// follow (FOLLOW_LIST_PATH). When set, a reconciler converges the

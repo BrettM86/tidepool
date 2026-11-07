@@ -89,6 +89,14 @@ type RecordWriterOptions struct {
 	DryRun   bool
 	Interval time.Duration
 	Batch    int
+	// Verifier checks each vote at the voter's origin before it may become a
+	// record; Window bounds which votes are still checkable; VerifyBatch
+	// bounds a sweep's verification candidates; Sleep waits between
+	// verification rounds.
+	Verifier    OriginVerifier
+	Window      time.Duration
+	VerifyBatch int
+	Sleep       func(ctx context.Context, d time.Duration) error
 }
 
 // RecordCommitter is the slice of *repo.Manager the writer commits through.

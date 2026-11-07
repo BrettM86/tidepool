@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -56,13 +57,53 @@ type recordsWorld struct {
 	objects store.APObjects
 	manager *repo.Manager
 	writer  *RecordWriter
+	// trusting is the default origin verifier: it verifies every claim and
+	// remembers it. verifier and sleep are what the writer was built with.
+	trusting *trustingVerifier
+	verifier OriginVerifier
+	sleep    func(ctx context.Context, d time.Duration) error
+	logger   *slog.Logger
 }
+
+// trustingVerifier is the default origin for tests that are not about origin
+// verification: every vote the tests send is verified, in process, with no
+// fetch and no pacing. It records each claim it was asked about.
+type trustingVerifier struct {
+	mu     sync.Mutex
+	claims []VoteClaim
+}
+
+func (v *trustingVerifier) Verify(_ context.Context, claim VoteClaim) (OriginVerdict, bool) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.claims = append(v.claims, claim)
+	return OriginVerified, false
+}
+
+// asked counts the claims for one activity id.
+func (v *trustingVerifier) asked(activityID string) int {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	n := 0
+	for _, claim := range v.claims {
+		if claim.ActivityID == activityID {
+			n++
+		}
+	}
+	return n
+}
+
+// noSleep is the default writer sleep: tests never wait in real time.
+func noSleep(ctx context.Context, _ time.Duration) error { return ctx.Err() }
 
 // writerSeams are the RecordWriter's injectable dependencies; a
 // recordsWorldOption replaces one before the writer is built.
 type writerSeams struct {
 	committer RecordCommitter
 	refresher SubjectRefresher
+	verifier  OriginVerifier
+	sleep     func(ctx context.Context, d time.Duration) error
+	logger    *slog.Logger
 }
 
 type recordsWorldOption func(w *recordsWorld, seams *writerSeams)
@@ -77,6 +118,20 @@ func withRefresher(build func(w *recordsWorld) SubjectRefresher) recordsWorldOpt
 	return func(w *recordsWorld, seams *writerSeams) { seams.refresher = build(w) }
 }
 
+// withOrigin replaces the trusting verifier with verifier, and the writer's
+// sleep with the clock's (the clock the verifier reads).
+func withOrigin(verifier OriginVerifier, clock *fakeClock) recordsWorldOption {
+	return func(_ *recordsWorld, seams *writerSeams) {
+		seams.verifier = verifier
+		seams.sleep = clock.Sleep
+	}
+}
+
+// withLogger gives the writer a logger over handler.
+func withLogger(handler slog.Handler) recordsWorldOption {
+	return func(_ *recordsWorld, seams *writerSeams) { seams.logger = slog.New(handler) }
+}
+
 // recordsBoth is the default writer configuration.
 var recordsBoth = RecordWriterOptions{Mode: RecordsBoth, Interval: time.Minute, Batch: 20}
 
@@ -88,12 +143,14 @@ func newRecordsWorld(t *testing.T, opts RecordWriterOptions, options ...recordsW
 	require.NoError(t, err)
 	manager, err := repo.NewManager(database, &staticSigningKeys{key: key}, nil)
 	require.NoError(t, err)
-	w := &recordsWorld{db: database, agg: agg, objects: objects, manager: manager}
-	seams := writerSeams{committer: manager, refresher: nopSubjectRefresher{}}
+	w := &recordsWorld{db: database, agg: agg, objects: objects, manager: manager, trusting: &trustingVerifier{}}
+	seams := writerSeams{committer: manager, refresher: nopSubjectRefresher{},
+		verifier: w.trusting, sleep: noSleep, logger: slog.Default()}
 	for _, option := range options {
 		option(w, &seams)
 	}
-	writer, err := NewRecordWriter(database, seams.committer, objects, seams.refresher, opts, slog.Default())
+	w.verifier, w.sleep, w.logger = seams.verifier, seams.sleep, seams.logger
+	writer, err := NewRecordWriter(database, seams.committer, objects, seams.refresher, w.withSeams(opts), seams.logger)
 	require.NoError(t, err)
 	agg.SetRecordWriter(writer)
 	w.writer = writer
@@ -101,13 +158,25 @@ func newRecordsWorld(t *testing.T, opts RecordWriterOptions, options ...recordsW
 	return w
 }
 
+// withSeams fills the options' verifier and sleep with the world's unless the
+// test set them.
+func (w *recordsWorld) withSeams(opts RecordWriterOptions) RecordWriterOptions {
+	if opts.Verifier == nil {
+		opts.Verifier = w.verifier
+	}
+	if opts.Sleep == nil {
+		opts.Sleep = w.sleep
+	}
+	return opts
+}
+
 // restartWriter replaces the aggregator and writer with fresh ones over the
 // same database and repo (a process restart with new switches), using the
-// real committer and the no-op refresher.
+// real committer and the no-op refresher (and the world's origin verifier).
 func (w *recordsWorld) restartWriter(t *testing.T, opts RecordWriterOptions) {
 	t.Helper()
 	agg, objects := testAggregator(t, w.db)
-	writer, err := NewRecordWriter(w.db, w.manager, objects, nopSubjectRefresher{}, opts, slog.Default())
+	writer, err := NewRecordWriter(w.db, w.manager, objects, nopSubjectRefresher{}, w.withSeams(opts), w.logger)
 	require.NoError(t, err)
 	agg.SetRecordWriter(writer)
 	w.agg, w.objects, w.writer = agg, objects, writer

@@ -28,6 +28,10 @@ const (
 	subjectRKeyB = "3jzfcijpj2z2b"
 
 	carolDID = "did:plc:recordscarol000000000000"
+
+	// A third bridged subject, at://testDID/testCollection/subjectRKeyC.
+	subjectPostC = "https://lemmy.world/post/102"
+	subjectRKeyC = "3jzfcijpj2z2c"
 )
 
 // secondSubject bridges subjectPostB.
@@ -43,6 +47,18 @@ func ageVotes(t *testing.T, database *sql.DB, voterAPID string, days int) {
 		UPDATE vote_events SET created_at = created_at - make_interval(days => $2)
 		WHERE voter_ap_id = $1`, voterAPID, days)
 	require.NoError(t, err)
+}
+
+// ageVote moves one vote_events row by into the past.
+func ageVote(t *testing.T, database *sql.DB, activity string, by time.Duration) {
+	t.Helper()
+	result, err := database.Exec(`
+		UPDATE vote_events SET created_at = created_at - make_interval(secs => $2)
+		WHERE activity_id = $1`, activity, by.Seconds())
+	require.NoError(t, err)
+	n, err := result.RowsAffected()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), n, "no vote %s to age", activity)
 }
 
 // recordPath is the {collection}/{rkey} repo path of an at-uri.
@@ -177,19 +193,31 @@ func TestSweepConvertsVotesOfAVoterWhoGotARepoLater(t *testing.T) {
 			w.secondSubject(t)
 			tc.beforeVotes(t, w)
 
-			likeA, likeB := activityID(t, 1), activityID(t, 2)
+			bridgeSubject(t, w.objects, subjectPostC, subjectRKeyC)
+
+			likeA, likeB, likeC := activityID(t, 1), activityID(t, 2), activityID(t, 3)
 			require.NoError(t, w.agg.ApplyVote(ctx, like(likeA, voterAlice, subjectPost), ""))
 			require.NoError(t, w.agg.ApplyVote(ctx, like(likeB, voterAlice, subjectPostB), ""))
-			ageVotes(t, w.db, voterAlice, 60)
+			require.NoError(t, w.agg.ApplyVote(ctx, like(likeC, voterAlice, subjectPostC), ""))
+			// A and B are 3 days old (inside the 6-day verification window), C
+			// is 8 days old: its origin has pruned the activity.
+			ageVotes(t, w.db, voterAlice, 3)
+			ageVote(t, w.db, likeC, 5*24*time.Hour)
 			assertServed(t, w.db, subjectPost, 1, 0)
 			assertServed(t, w.db, subjectPostB, 1, 0)
+			assertServed(t, w.db, subjectPostC, 1, 0)
 			tc.afterVotes(t, w)
 
 			require.NoError(t, w.writer.Sweep(ctx))
 
-			require.Len(t, w.voteRecords(t, aliceDID), 2, "both aged Likes must become records")
+			require.Len(t, w.voteRecords(t, aliceDID), 2, "both Likes inside the window must become records, the 8-day Like not")
 			assertServed(t, w.db, subjectPost, 0, 0)
 			assertServed(t, w.db, subjectPostB, 0, 0)
+			assertServed(t, w.db, subjectPostC, 1, 0)
+			rowC := readVoteRow(t, w.db, likeC)
+			assert.Equal(t, sql.NullString{}, rowC.recordState, "the Like outside the window stays aggregate")
+			assert.Equal(t, sql.NullString{}, rowC.recordATURI)
+			assert.Equal(t, 0, w.trusting.asked(likeC), "a vote outside the window is never checked at its origin")
 			for _, id := range []string{likeA, likeB} {
 				row := readVoteRow(t, w.db, id)
 				assert.Equal(t, written(), row.recordState, id)
@@ -733,7 +761,7 @@ func TestSoftDeletedSubjectReturnsTheVoteToTheAggregate(t *testing.T) {
 			} else {
 				w.bridgedVoter(t, voterAlice, aliceDID, store.ConsentStateOK, false)
 				require.NoError(t, w.agg.ApplyVote(ctx, like(likeID, voterAlice, subjectPost), ""))
-				ageVotes(t, w.db, voterAlice, 60)
+				ageVotes(t, w.db, voterAlice, 3)
 				require.NoError(t, w.objects.SoftDelete(ctx, subjectPost))
 				w.giveRepo(t, aliceDID)
 				seq = latestSeq(t, w.db)

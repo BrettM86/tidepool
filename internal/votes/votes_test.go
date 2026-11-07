@@ -59,6 +59,9 @@ var voteTablesToTruncate = []string{
 	// Consumer state, for the tests that drive the real write path.
 	"federation_prefs", "jetstream_record_revs", "jetstream_dead_letters",
 	"consumer_cursors", "repo_state",
+	// The real repo the bridged-vote-records tests commit voters' feed.vote
+	// records into: a leftover commit would shift every firehose count.
+	"blocks", "firehose_events",
 	// The acceptance ledger. 17e's divergence sweep runs here (the re-cast
 	// tests drive the real reconciler), and it READS this table — so a row left
 	// by another package's run would surface as an undelivered-acceptance

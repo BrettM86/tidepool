@@ -465,3 +465,53 @@ func TestRefreshSubjectEmitsOnlyADueSubject(t *testing.T) {
 		})
 	}
 }
+
+// A sweep re-reads each row's counts right before its emit: a vote that lands
+// on subject B while the sweep is emitting subject A is in B's emit, not the
+// counts the sweep read at its start.
+func TestRefresherSweepEmitsCountsCurrentAtEachEmit(t *testing.T) {
+	database := testDB(t)
+	agg, objects := testAggregator(t, database)
+	bridgeSubject(t, objects, subjectPost, subjectRKey)
+	bridgeSubject(t, objects, subjectPostB, subjectRKeyB)
+	ctx := context.Background()
+	require.NoError(t, agg.ApplyVote(ctx, like(activityID(t, 1), voterAlice, subjectPost), ""))
+	require.NoError(t, agg.ApplyVote(ctx, like(activityID(t, 2), voterAlice, subjectPostB), ""))
+
+	injected := false
+	emitter := &fakeEmitter{fn: func(mapping *store.APObjectMapping, _, _ int) (bool, error) {
+		if mapping.APID == subjectPost && !injected {
+			injected = true
+			require.NoError(t, agg.ApplyVote(ctx, like(activityID(t, 3), voterBob, subjectPostB), ""))
+		}
+		return true, nil
+	}}
+	r := testRefresher(t, database, emitter)
+	r.Sweep(ctx)
+
+	calls := emitter.snapshot()
+	require.Len(t, calls, 2)
+	assert.Equal(t, subjectPost, calls[0].subject)
+	assert.Equal(t, 1, calls[0].up)
+	assert.Equal(t, subjectPostB, calls[1].subject)
+	assert.Equal(t, 2, calls[1].up, "B's emit carries the vote that landed during A's emit")
+}
+
+// RefreshSubject reports a lexicon validation failure: the record writer must
+// not commit a vote record behind stats that did not change.
+func TestRefreshSubjectReportsAValidationFailure(t *testing.T) {
+	database := testDB(t)
+	agg, objects := testAggregator(t, database)
+	bridgeSubject(t, objects, subjectPost, subjectRKey)
+	ctx := context.Background()
+	require.NoError(t, agg.ApplyVote(ctx, like(activityID(t, 1), voterAlice, subjectPost), ""))
+	emitter := &fakeEmitter{fn: func(*store.APObjectMapping, int, int) (bool, error) {
+		return false, errors.NewValidationError("record", "fails lexicon validation")
+	}}
+	r := testRefresher(t, database, emitter)
+
+	err := r.RefreshSubject(ctx, subjectPost)
+
+	require.Error(t, err)
+	assert.True(t, errors.IsValidation(err), "got %v", err)
+}

@@ -3,6 +3,7 @@ package votes
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"testing"
 	"time"
 
@@ -112,4 +113,58 @@ func TestPruneUndoneEventsKeepsRowsOwedARecordDelete(t *testing.T) {
 	assert.Equal(t, int64(1), n, "only bob's aggregate undone row is pruned")
 	assert.Equal(t, written(), readVoteRow(t, w.db, aliceLike).recordState)
 	assert.Equal(t, 0, voterRows(t, w.db, voterBob))
+}
+
+// Without a RecordWriter the scrub deletes only rows owed no record: a
+// 'written' row must survive until a writer can delete its record.
+func TestScrubWithoutARecordWriterKeepsWrittenRows(t *testing.T) {
+	w := newRecordsWorld(t, recordsBoth)
+	ctx := context.Background()
+	w.secondSubject(t)
+	// Alice's Dislike on B arrives before she has a repo (unrecorded); her
+	// Like on A arrives after (written).
+	w.bridgedVoter(t, voterAlice, aliceDID, store.ConsentStateOK, false)
+	unrecorded, recorded := activityID(t, 1), activityID(t, 2)
+	require.NoError(t, w.agg.ApplyVote(ctx, dislike(unrecorded, voterAlice, subjectPostB), ""))
+	w.giveRepo(t, aliceDID)
+	require.NoError(t, w.agg.ApplyVote(ctx, like(recorded, voterAlice, subjectPost), ""))
+	require.Equal(t, written(), readVoteRow(t, w.db, recorded).recordState)
+	plain, _ := testAggregator(t, w.db)
+
+	require.NoError(t, plain.ScrubVoter(ctx, voterAlice))
+
+	assert.Equal(t, 1, voterRows(t, w.db, voterAlice), "only the written row is left")
+	assert.Equal(t, written(), readVoteRow(t, w.db, recorded).recordState)
+	assert.Len(t, w.voteRecords(t, aliceDID), 1)
+	assertServed(t, w.db, subjectPostB, 0, 0)
+}
+
+// Scrubbing a voter with more records than one commit holds deletes them all
+// in commits of at most 100 ops.
+func TestScrubDeletesMoreRecordsThanOneCommitHolds(t *testing.T) {
+	w := newRecordsWorld(t, recordsBoth)
+	ctx := context.Background()
+	w.bridgedVoter(t, voterAlice, aliceDID, store.ConsentStateOK, false)
+	for i := range 101 {
+		subject := fmt.Sprintf("https://lemmy.world/post/%d", 3000+i)
+		bridgeSubject(t, w.objects, subject, fmt.Sprintf("scrub%03d", i))
+		require.NoError(t, w.agg.ApplyVote(ctx, like(activityID(t, i), voterAlice, subject), ""))
+	}
+	w.giveRepo(t, aliceDID)
+	for range 3 {
+		require.NoError(t, w.writer.Sweep(ctx))
+	}
+	require.Len(t, w.voteRecords(t, aliceDID), 101)
+	seq := latestSeq(t, w.db)
+
+	require.NoError(t, w.agg.ScrubVoter(ctx, voterAlice))
+
+	deletes := 0
+	for _, ops := range firehoseOpsSince(t, w.db, aliceDID, seq) {
+		assert.LessOrEqual(t, len(ops), 100, "ops in one commit")
+		deletes += len(ops)
+	}
+	assert.Equal(t, 101, deletes)
+	assert.Empty(t, w.voteRecords(t, aliceDID))
+	assert.Equal(t, 0, voterRows(t, w.db, voterAlice))
 }

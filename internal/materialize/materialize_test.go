@@ -176,17 +176,37 @@ func withNodeInfoDiscoveryDeadline(d time.Duration) func(*Options) {
 	return func(o *Options) { o.NodeInfoDiscoveryDeadline = d }
 }
 
-// recordingScrubber records ScrubVoter calls (the task-11 vote-scrub hook).
+// recordingScrubber records ScrubVoter calls (the task-11 vote-scrub hook)
+// and the voter's bridged_actors consent_state at each call ("" when the
+// voter has no row).
 type recordingScrubber struct {
-	mu  sync.Mutex
-	ids []string
+	actors   store.BridgedActors
+	mu       sync.Mutex
+	ids      []string
+	consents []store.ConsentState
 }
 
-func (r *recordingScrubber) ScrubVoter(_ context.Context, voterAPID string) error {
+func (r *recordingScrubber) ScrubVoter(ctx context.Context, voterAPID string) error {
+	var consent store.ConsentState
+	actor, err := r.actors.GetByAPActorID(ctx, voterAPID)
+	switch {
+	case err == nil:
+		consent = actor.ConsentState
+	case !errors.IsNotFound(err):
+		return err
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.ids = append(r.ids, voterAPID)
+	r.consents = append(r.consents, consent)
 	return nil
+}
+
+// consentsAtCall returns the voter's consent_state at each ScrubVoter call.
+func (r *recordingScrubber) consentsAtCall() []store.ConsentState {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]store.ConsentState(nil), r.consents...)
 }
 
 func (r *recordingScrubber) calls() []string {
@@ -243,7 +263,7 @@ func newHarness(t *testing.T, configure ...func(*Options)) *harness {
 		MaxAttempts:           1, // fixture errors are deterministic; retries just slow tests
 	})
 
-	scrubbed := &recordingScrubber{}
+	scrubbed := &recordingScrubber{actors: actors}
 	minter := &fakeMinter{custodian: custodian}
 	options := Options{
 		Fetcher:          client,

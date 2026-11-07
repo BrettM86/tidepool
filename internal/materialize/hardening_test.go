@@ -61,8 +61,8 @@ func TestDeleteActor_AccountEventVoteAndBlobScrub(t *testing.T) {
 
 	require.NoError(t, h.m.DeleteActor(ctx, personID))
 
-	// Vote scrub hook called with the actor's AP id.
-	assert.Equal(t, []string{personID}, h.scrubbed.calls())
+	// Vote scrub hook called with the actor's AP id, before and after the consent flip.
+	assert.Equal(t, []string{personID, personID}, h.scrubbed.calls(), "scrubbed before and again after the consent flip")
 
 	// The post's thumbnail is gone.
 	_, _, err = h.manager.GetBlob(ctx, authorDID, thumbCID)
@@ -116,7 +116,7 @@ func TestSuppressActor_ScrubsVotesToo(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NoError(t, h.m.SuppressActor(ctx, personID))
-	assert.Equal(t, []string{personID}, h.scrubbed.calls())
+	assert.Equal(t, []string{personID, personID}, h.scrubbed.calls(), "scrubbed before and again after the consent flip")
 	for _, ev := range h.firehoseEvents() {
 		assert.NotEqual(t, repo.EventKindAccount, ev.Kind,
 			"nobridge is reversible: no #account frame may be emitted")

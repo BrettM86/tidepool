@@ -199,6 +199,10 @@ func TestSweepConvertsVotesOfAVoterWhoGotARepoLater(t *testing.T) {
 				require.NoError(t, err)
 				assert.True(t, tid.Time().Equal(row.createdAt.Truncate(time.Microsecond)),
 					"rkey time %s must be the aged created_at %s", tid.Time().UTC(), row.createdAt.UTC())
+				record, _, err := w.manager.GetRecord(ctx, aliceDID, voteCollection, rkey)
+				require.NoError(t, err)
+				assert.Equal(t, row.createdAt.UTC().Truncate(time.Millisecond).Format("2006-01-02T15:04:05.000Z"),
+					record["createdAt"], "record createdAt is the aged created_at, to the millisecond")
 			}
 
 			commits := firehoseEvents(t, w.db, aliceDID)
@@ -681,5 +685,220 @@ func TestOptOutBeforeTheRecordCommitStopsTheCreate(t *testing.T) {
 	var rows int
 	require.NoError(t, w.db.QueryRow(`SELECT COUNT(*) FROM vote_events WHERE voter_ap_id = $1`, voterAlice).Scan(&rows))
 	assert.Equal(t, 0, rows, "the scrub removes the opted-out voter's vote rows")
+	assertServed(t, w.db, subjectPost, 0, 0)
+}
+
+// refresherFunc is a SubjectRefresher hook.
+type refresherFunc func(ctx context.Context, subject string) error
+
+func (f refresherFunc) RefreshSubject(ctx context.Context, subject string) error {
+	return f(ctx, subject)
+}
+
+// A subject soft-deleted before the record commit is reversible: the vote goes
+// back to the aggregate instead of being abandoned, nothing churns while the
+// subject stays deleted, and a restore lets the next sweep record it.
+func TestSoftDeletedSubjectReturnsTheVoteToTheAggregate(t *testing.T) {
+	tests := []struct {
+		name string
+		// softDeleteInRefresh soft-deletes the subject from the writer's
+		// pre-commit refresh (between the vote's phase 1 and phase 2);
+		// otherwise the vote is aged and unrecorded and the subject is
+		// soft-deleted before the converting sweep.
+		softDeleteInRefresh bool
+	}{
+		{name: "vote path, soft-deleted before the record commit", softDeleteInRefresh: true},
+		{name: "sweep conversion of an aged unrecorded Like"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			deleted := false
+			w := newRecordsWorld(t, recordsBoth, withRefresher(func(w *recordsWorld) SubjectRefresher {
+				return refresherFunc(func(ctx context.Context, subject string) error {
+					if tc.softDeleteInRefresh && !deleted && subject == subjectPost {
+						deleted = true
+						return w.objects.SoftDelete(ctx, subject)
+					}
+					return nil
+				})
+			}))
+			ctx := context.Background()
+			likeID := activityID(t, 1)
+			var seq int64
+			if tc.softDeleteInRefresh {
+				w.eligibleVoter(t, voterAlice, aliceDID)
+				seq = latestSeq(t, w.db)
+				require.NoError(t, w.agg.ApplyVote(ctx, like(likeID, voterAlice, subjectPost), ""))
+				require.True(t, deleted, "the refresh hook must have soft-deleted the subject")
+			} else {
+				w.bridgedVoter(t, voterAlice, aliceDID, store.ConsentStateOK, false)
+				require.NoError(t, w.agg.ApplyVote(ctx, like(likeID, voterAlice, subjectPost), ""))
+				ageVotes(t, w.db, voterAlice, 60)
+				require.NoError(t, w.objects.SoftDelete(ctx, subjectPost))
+				w.giveRepo(t, aliceDID)
+				seq = latestSeq(t, w.db)
+				require.NoError(t, w.writer.Sweep(ctx))
+			}
+
+			assert.Empty(t, w.voteRecords(t, aliceDID), "no record for a soft-deleted subject")
+			assert.Equal(t, 0, eventsSince(t, w.db, seq), "no commit for a soft-deleted subject")
+			row := readVoteRow(t, w.db, likeID)
+			assert.Equal(t, sql.NullString{}, row.recordState, "the live vote is back in the aggregate")
+			assert.Equal(t, sql.NullString{}, row.recordATURI, "the live vote is back in the aggregate")
+
+			seq = latestSeq(t, w.db)
+			require.NoError(t, w.writer.Sweep(ctx))
+			assert.Equal(t, 0, eventsSince(t, w.db, seq), "a sweep while the subject stays deleted commits nothing")
+			assert.Equal(t, sql.NullString{}, readVoteRow(t, w.db, likeID).recordState)
+
+			require.NoError(t, w.objects.Restore(ctx, subjectPost))
+			assertServed(t, w.db, subjectPost, 1, 0)
+
+			require.NoError(t, w.writer.Sweep(ctx))
+			assert.Len(t, w.voteRecords(t, aliceDID), 1, "the restored subject's Like becomes a record")
+			assert.Equal(t, written(), readVoteRow(t, w.db, likeID).recordState)
+			assertServed(t, w.db, subjectPost, 0, 0)
+		})
+	}
+}
+
+// failDIDCommitter fails every ApplyOpsTx for which fail(did) is true.
+type failDIDCommitter struct {
+	next RecordCommitter
+	fail func(did string) bool
+}
+
+func (c *failDIDCommitter) ApplyOpsTx(ctx context.Context, did string, ops []repo.RecordOp, sideEffect repo.TxSideEffect) (*repo.CommitResult, error) {
+	if c.fail(did) {
+		return nil, fmt.Errorf("injected commit failure for %s", did)
+	}
+	return c.next.ApplyOpsTx(ctx, did, ops, sideEffect)
+}
+
+// A voter whose repair fails every sweep (alice, who sorts first) cannot
+// starve the other voters' repair, the privacy scrub or conversion.
+func TestSweepFailingVoterDoesNotStarveOthers(t *testing.T) {
+	tests := []struct {
+		name string
+		// setup runs after alice's Like is left pending; check asserts the
+		// other voter's outcome after the sweeps.
+		setup func(t *testing.T, w *recordsWorld)
+		check func(t *testing.T, w *recordsWorld)
+	}{
+		{
+			name: "repair of a later voter",
+			setup: func(t *testing.T, w *recordsWorld) {
+				w.eligibleVoter(t, voterBob, bobDID) // bob's first commit fails: pending
+				require.NoError(t, w.agg.ApplyVote(context.Background(), like(activityID(t, 2), voterBob, subjectPost), ""))
+				require.Equal(t, sql.NullString{String: "pending", Valid: true}, readVoteRow(t, w.db, activityID(t, 2)).recordState)
+			},
+			check: func(t *testing.T, w *recordsWorld) {
+				assert.Len(t, w.voteRecords(t, bobDID), 1, "bob's pending Like is repaired")
+				assert.Equal(t, written(), readVoteRow(t, w.db, activityID(t, 2)).recordState)
+			},
+		},
+		{
+			name: "scrub of a voter no longer eligible",
+			setup: func(t *testing.T, w *recordsWorld) {
+				w.eligibleVoter(t, voterCarol, carolDID)
+				require.NoError(t, w.agg.ApplyVote(context.Background(), like(activityID(t, 2), voterCarol, subjectPost), ""))
+				require.Len(t, w.voteRecords(t, carolDID), 1)
+				_, err := w.db.Exec(`UPDATE bridged_actors SET consent_state = 'nobridge' WHERE ap_actor_id = $1`, voterCarol)
+				require.NoError(t, err)
+			},
+			check: func(t *testing.T, w *recordsWorld) {
+				assert.Empty(t, w.voteRecords(t, carolDID), "carol's record is scrubbed")
+				assert.Equal(t, 0, voterRows(t, w.db, voterCarol), "carol's rows are scrubbed")
+			},
+		},
+		{
+			name: "conversion of an eligible voter",
+			setup: func(t *testing.T, w *recordsWorld) {
+				w.bridgedVoter(t, voterCarol, carolDID, store.ConsentStateOK, false)
+				require.NoError(t, w.agg.ApplyVote(context.Background(), like(activityID(t, 2), voterCarol, subjectPost), ""))
+				w.giveRepo(t, carolDID)
+			},
+			check: func(t *testing.T, w *recordsWorld) {
+				assert.Len(t, w.voteRecords(t, carolDID), 1, "carol's Like is converted")
+				assert.Equal(t, written(), readVoteRow(t, w.db, activityID(t, 2)).recordState)
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			bobFailed := false
+			w := newRecordsWorld(t, RecordWriterOptions{Mode: RecordsBoth, Interval: time.Minute, Batch: 1},
+				withCommitter(func(_ *recordsWorld, next RecordCommitter) RecordCommitter {
+					return &failDIDCommitter{next: next, fail: func(did string) bool {
+						if did == bobDID && !bobFailed {
+							bobFailed = true
+							return true
+						}
+						return did == aliceDID
+					}}
+				}))
+			ctx := context.Background()
+			w.eligibleVoter(t, voterAlice, aliceDID)
+			require.NoError(t, w.agg.ApplyVote(ctx, like(activityID(t, 1), voterAlice, subjectPost), ""))
+			require.Equal(t, sql.NullString{String: "pending", Valid: true}, readVoteRow(t, w.db, activityID(t, 1)).recordState)
+			tc.setup(t, w)
+
+			for range 2 {
+				assert.Error(t, w.writer.Sweep(ctx), "alice's repair keeps failing")
+			}
+
+			tc.check(t, w)
+			assert.Equal(t, sql.NullString{String: "pending", Valid: true}, readVoteRow(t, w.db, activityID(t, 1)).recordState)
+		})
+	}
+}
+
+// A flip's delete and create land in one commit even when the voter's other
+// pending work would put them either side of the 100-op boundary.
+func TestFlipIsNeverSplitAcrossCommits(t *testing.T) {
+	failOthers := true
+	w := newRecordsWorld(t, recordsBoth, withRefresher(func(*recordsWorld) SubjectRefresher {
+		return refresherFunc(func(_ context.Context, subject string) error {
+			if failOthers && subject != subjectPost {
+				return fmt.Errorf("injected refresh failure for %s", subject)
+			}
+			return nil
+		})
+	}))
+	ctx := context.Background()
+	w.eligibleVoter(t, voterAlice, aliceDID)
+	// 99 Likes on distinct subjects stay pending (their refresh fails).
+	for i := range 99 {
+		subject := fmt.Sprintf("https://lemmy.world/post/%d", 2000+i)
+		bridgeSubject(t, w.objects, subject, fmt.Sprintf("split%03d", i))
+		require.NoError(t, w.agg.ApplyVote(ctx, like(activityID(t, i), voterAlice, subject), ""))
+	}
+	likeZ, dislikeZ := activityID(t, 200), activityID(t, 201)
+	require.NoError(t, w.agg.ApplyVote(ctx, like(likeZ, voterAlice, subjectPost), ""))
+	require.Len(t, w.voteRecords(t, aliceDID), 1, "only the Like on Z is recorded")
+	require.Equal(t, map[string]int{"pending": 99, "written": 1}, recordStates(t, w.db))
+	failOthers = false
+	seq := latestSeq(t, w.db)
+
+	// Work in id order: 99 creates, Z's delete (op 100), Z's create (op 101).
+	require.NoError(t, w.agg.ApplyVote(ctx, dislike(dislikeZ, voterAlice, subjectPost), ""))
+
+	deletePath := recordPath(t, readVoteRow(t, w.db, likeZ).recordATURI.String)
+	createPath := recordPath(t, readVoteRow(t, w.db, dislikeZ).recordATURI.String)
+	var flipCommits int
+	for _, ops := range firehoseOpsSince(t, w.db, aliceDID, seq) {
+		assert.LessOrEqual(t, len(ops), 100, "ops in one commit")
+		actions := map[string]repo.OpAction{}
+		for _, op := range ops {
+			actions[op.Path] = op.Action
+		}
+		if actions[createPath] == repo.OpActionCreate {
+			flipCommits++
+			assert.Equal(t, repo.OpActionDelete, actions[deletePath], "the commit creating Z's Dislike also deletes Z's Like")
+		}
+	}
+	assert.Equal(t, 1, flipCommits)
+	assert.Len(t, w.voteRecords(t, aliceDID), 100)
+	assert.Equal(t, map[string]int{"written": 100, "removed": 1}, recordStates(t, w.db))
 	assertServed(t, w.db, subjectPost, 0, 0)
 }

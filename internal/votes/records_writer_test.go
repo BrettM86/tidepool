@@ -843,9 +843,11 @@ func TestSweepFailingVoterDoesNotStarveOthers(t *testing.T) {
 			require.Equal(t, sql.NullString{String: "pending", Valid: true}, readVoteRow(t, w.db, activityID(t, 1)).recordState)
 			tc.setup(t, w)
 
-			for range 2 {
-				assert.Error(t, w.writer.Sweep(ctx), "alice's repair keeps failing")
-			}
+			// The first sweep handles alice (Batch 1) and fails. The second
+			// resumes after her, so it may succeed when the other voter's work
+			// does; alice still being pending is asserted below.
+			assert.Error(t, w.writer.Sweep(ctx), "alice's repair fails")
+			_ = w.writer.Sweep(ctx)
 
 			tc.check(t, w)
 			assert.Equal(t, sql.NullString{String: "pending", Valid: true}, readVoteRow(t, w.db, activityID(t, 1)).recordState)

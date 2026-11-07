@@ -6,6 +6,7 @@ import (
 	stderrors "errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"tidepool/internal/errors"
@@ -38,6 +39,9 @@ type Refresher struct {
 	interval time.Duration
 	batch    int
 	logger   *slog.Logger
+	// emitMu serializes read→emit→advance across Sweep and RefreshSubject, so
+	// an older sample can never be emitted after a newer one.
+	emitMu sync.Mutex
 }
 
 // StatsEmitter writes an aggregate's counts onto its materialized record and
@@ -116,10 +120,11 @@ type dueRow struct {
 // Sweep emits one bounded batch of due aggregates. Exported for the tests to
 // drive one deterministic pass without the ticker.
 func (r *Refresher) Sweep(ctx context.Context) {
-	// Read the whole batch into memory FIRST, then emit. Each emit runs its own
-	// commit transaction taking the global advisory lock; holding this SELECT's
-	// cursor (and its connection) open across those commits would pin a
-	// connection for the whole sweep.
+	// Read the batch's subjects into memory FIRST, then emit. Each emit runs
+	// its own commit transaction taking the global advisory lock; holding this
+	// SELECT's cursor (and its connection) open across those commits would pin
+	// a connection for the whole sweep. Each row's counts are re-read under
+	// emitMu right before its emit (readDue), never taken from this list.
 	//
 	// Ordering caveat (oldest-dirty first, ORDER BY updated_at ASC): a
 	// TRANSIENT-failing row keeps its old updated_at, so it sorts to the HEAD of
@@ -132,7 +137,7 @@ func (r *Refresher) Sweep(ctx context.Context) {
 	// What remains at the head is a truly transient fault (a DB blip), which is
 	// the right thing to retry first.
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT subject_ap_id, upvotes, downvotes, updated_at
+		SELECT subject_ap_id
 		FROM vote_aggregates
 		WHERE stats_emitted_at IS NULL OR updated_at > stats_emitted_at
 		ORDER BY updated_at ASC
@@ -143,35 +148,26 @@ func (r *Refresher) Sweep(ctx context.Context) {
 		}
 		return
 	}
-	var due []dueRow
-	for rows.Next() {
-		var d dueRow
-		if err := rows.Scan(&d.subject, &d.upvotes, &d.downvotes, &d.updatedAt); err != nil {
-			_ = rows.Close()
-			r.logger.Error("stats refresh: scan due aggregate failed", "error", err)
-			return
-		}
-		due = append(due, d)
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
+	subjects, err := scanSubjects(rows)
+	if err != nil {
 		if ctx.Err() == nil {
-			r.logger.Error("stats refresh: iterate due aggregates failed", "error", err)
+			r.logger.Error("stats refresh: read due aggregates failed", "error", err)
 		}
 		return
 	}
-	_ = rows.Close()
 
 	var emitted, failed int
-	for _, d := range due {
+	for _, subject := range subjects {
 		if ctx.Err() != nil {
 			return
 		}
-		committed, err := r.refreshOne(ctx, d)
+		committed, err := r.refreshIfDue(ctx, subject)
 		if committed {
 			emitted++
 		}
-		if err != nil {
+		// A validation failure already advanced the watermark; it is not a
+		// row left dirty.
+		if err != nil && !errors.IsValidation(err) {
 			failed++
 		}
 	}
@@ -179,14 +175,52 @@ func (r *Refresher) Sweep(ctx context.Context) {
 	// failed count is how a wedged sweep (a batch head jammed by failing rows)
 	// becomes visible instead of silently emitting nothing every interval.
 	if emitted > 0 || failed > 0 {
-		r.logger.Info("bridged vote stats sweep", "emitted", emitted, "failed", failed, "due", len(due))
+		r.logger.Info("bridged vote stats sweep", "emitted", emitted, "failed", failed, "due", len(subjects))
 	}
 }
 
+// scanSubjects reads one subject_ap_id column and closes rows.
+func scanSubjects(rows *sql.Rows) ([]string, error) {
+	defer rows.Close()
+	var subjects []string
+	for rows.Next() {
+		var subject string
+		if err := rows.Scan(&subject); err != nil {
+			return nil, err
+		}
+		subjects = append(subjects, subject)
+	}
+	return subjects, rows.Err()
+}
+
+// refreshIfDue re-reads the subject's aggregate under emitMu and, if it is
+// still due, emits those counts (refreshOne).
+func (r *Refresher) refreshIfDue(ctx context.Context, subject string) (committed bool, err error) {
+	r.emitMu.Lock()
+	defer r.emitMu.Unlock()
+	var d dueRow
+	err = r.db.QueryRowContext(ctx, `
+		SELECT subject_ap_id, upvotes, downvotes, updated_at
+		FROM vote_aggregates
+		WHERE subject_ap_id = $1 AND (stats_emitted_at IS NULL OR updated_at > stats_emitted_at)`,
+		subject).Scan(&d.subject, &d.upvotes, &d.downvotes, &d.updatedAt)
+	if stderrors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		if ctx.Err() == nil {
+			r.logger.Error("stats refresh: read aggregate failed", "subject", subject, "error", err)
+		}
+		return false, fmt.Errorf("stats refresh: read aggregate %s: %w", subject, err)
+	}
+	return r.refreshOne(ctx, d)
+}
+
 // refreshOne emits one due row. It returns committed (a record commit actually
-// happened, for the emitted count) and a non-nil error only for a transient
-// failure that left the row dirty (the sweep's failed count and wedge
-// visibility; RefreshSubject's caller retries on it).
+// happened, for the emitted count) and a non-nil error for a transient failure
+// that left the row dirty (the sweep's failed count and wedge visibility) or
+// for a validation failure, which advances anyway. On either, the
+// RecordWriter leaves that subject's creates pending and its sweep retries.
 //
 // Watermark discipline: advance on success AND on every PERMANENT skip
 // (missing/soft-deleted mapping, record gone, consent-frozen repo,
@@ -248,7 +282,7 @@ func (r *Refresher) refreshOne(ctx context.Context, d dueRow) (committed bool, e
 		r.logger.Warn("stats refresh: record fails lexicon validation; advancing watermark to avoid wedging the sweep (investigate)",
 			"subject", d.subject, "at_uri", mapping.ATURI, "error", err)
 		r.advance(ctx, d.subject, d.updatedAt)
-		return false, nil
+		return false, fmt.Errorf("stats refresh: emit %s: %w", d.subject, err)
 	default:
 		// Transient (a DB blip, a lock timeout, persistent CAS churn): keep the
 		// row dirty so the next sweep retries it.
@@ -282,20 +316,9 @@ func (r *Refresher) advance(ctx context.Context, subject string, watermark time.
 // The RecordWriter calls it before committing a vote record, so the subject's
 // bridgedStats already show the dropped count when Coves sees the record
 // (otherwise Coves would briefly count the vote twice: natively and in the
-// stale stats). It returns an error only when the row is left dirty.
+// stale stats). It returns an error when the row is left dirty or the emit
+// failed validation.
 func (r *Refresher) RefreshSubject(ctx context.Context, subjectAPID string) error {
-	var d dueRow
-	err := r.db.QueryRowContext(ctx, `
-		SELECT subject_ap_id, upvotes, downvotes, updated_at
-		FROM vote_aggregates
-		WHERE subject_ap_id = $1 AND (stats_emitted_at IS NULL OR updated_at > stats_emitted_at)`,
-		subjectAPID).Scan(&d.subject, &d.upvotes, &d.downvotes, &d.updatedAt)
-	if stderrors.Is(err, sql.ErrNoRows) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("stats refresh: read aggregate %s: %w", subjectAPID, err)
-	}
-	_, err = r.refreshOne(ctx, d)
+	_, err := r.refreshIfDue(ctx, subjectAPID)
 	return err
 }

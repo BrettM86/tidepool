@@ -137,6 +137,10 @@ func (m *Materializer) ensureKnownActor(ctx context.Context, stored *store.Bridg
 			if err := m.actors.SetConsentState(ctx, stored.APActorID, store.ConsentStateNoBridge); err != nil {
 				return nil, fmt.Errorf("materialize: record nobridge for %s: %w", stored.APActorID, err)
 			}
+			// Again after the flip: a vote may have become a record meanwhile.
+			if err := m.scrubActorVotes(ctx, stored.APActorID); err != nil {
+				return nil, err
+			}
 			m.logger.Info("actor added nobridge marker; existing content scrubbed and new materialization stopped",
 				"ap_actor_id", stored.APActorID)
 			return nil, skip(stored.APActorID, "actor opted out (#nobridge/#nobot)")

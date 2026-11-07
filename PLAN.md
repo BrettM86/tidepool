@@ -109,12 +109,12 @@ Outbound:
    set `hostedBy` to the bridge's service DID.
 7. Inbound half superseded by decision 21: votes by bridged voters who already
    have a repo become `feed.vote` records in it. The rest still holds for
-   every other inbound vote. Votes never become records. Inbound Like and
-   Dislike activities update bridge-side tallies (`internal/votes`). Tidepool
-   exposes them two ways: it folds the counts onto the bridged post or comment
-   record as the optional `bridgedStats` field (`{upvotes, downvotes, asOf}`),
-   and it serves them over the `social.coves.bridge.getVoteAggregates` XRPC
-   for the AppView to poll.
+   every other inbound vote. Inbound Like and Dislike activities update
+   bridge-side tallies (`internal/votes`). Tidepool exposes them two ways: it
+   folds the counts onto the bridged post or comment record as the optional
+   `bridgedStats` field (`{upvotes, downvotes, asOf}`), and it serves them
+   over the `social.coves.bridge.getVoteAggregates` XRPC for the AppView to
+   poll.
 8. Coves conventions apply: goose migrations, raw `database/sql` with `lib/pq`,
    chi router, `log/slog`, typed sentinel errors wrapped with `%w`, env-var
    config with logged dev defaults, `context.Context` everywhere, interfaces
@@ -363,9 +363,8 @@ is left with the Group-actor AP surface and the admission-policy wiring.
 16. Native votes are `social.coves.feed.vote` records in users' repos, read
     from Jetstream and sent out per actor. Inbound fediverse votes become
     records only for bridged voters who already have a repo (decision 21). The
-    outbound vote row from decision 14, keyed
-    `(actor_did, subject_at_uri)`, holds the current intended vote and its
-    delivery state. The direction changes when the new vote is queued, not
+    outbound vote row from decision 14, keyed `(actor_did, subject_at_uri)`,
+    holds the current intended vote and its delivery state. The direction changes when the new vote is queued, not
     when it is delivered; FOLLOWUPS.md lists the recast and reseed gaps this
     leaves.
     - The aggregator drops echoes of our own outbound Like and Dislike ids.
@@ -491,9 +490,9 @@ is left with the Group-actor AP surface and the admission-policy wiring.
       consent `ok` and an existing repo. The vote path never mints; a voter
       gets a repo only by authoring.
     - Who stays aggregate: voters with no repo, `#nobridge`/`#nobot` actors,
-      PieFed's legacy alt actors (they never author, so never get a repo), our
-      own personas (the echo guard drops them first), and the API-seeded
-      baseline, forever.
+      PieFed's legacy alt actors (they never author, so never get a repo), and
+      the API-seeded baseline, forever. Votes by our own personas are neither:
+      the echo guard drops them before either path.
     - Netting. The aggregate recompute counts only live unrecorded rows. The
       seeder still subtracts every live row, recorded ones included, because
       the Lemmy API total contains them. Served = API total − delivered
@@ -504,7 +503,9 @@ is left with the Group-actor AP surface and the admission-policy wiring.
       Phase 2 (`votes.RecordWriter.SyncVoter`): repin `bridgedStats` for each
       due subject first, then write the voter's creates and deletes in one
       repo commit whose side effect moves each row's state under a guard; any
-      guard miss rolls the whole commit back. The aggregate drop is visible
+      guard miss rolls the whole commit back. Work commits in chunks of up to
+      100 ops, one repo commit each, and a subject's ops are never split
+      across chunks. The aggregate drop is visible
       before the record exists, so the visible error is a brief one-low, never
       a double count. `bridgedStats.asOf` is monotonic: a stamp older than the
       one the record carries is refused, so a stale sweep cannot re-add a
@@ -521,8 +522,12 @@ is left with the Group-actor AP surface and the admission-policy wiring.
     - Switches, read at boot: `BRIDGED_VOTE_RECORDS=off|up|both` (default
       off), `BRIDGED_VOTE_RECORDS_DRY_RUN` (log only, mark and write nothing),
       `BRIDGED_VOTE_RECORDS_INTERVAL` (1m), `BRIDGED_VOTE_RECORDS_BATCH`
-      (voters per sweep, 20). Off stops new records only; pending creates and
-      owed deletes still drain. A scrub always deletes, whatever the mode.
+      (voters per pass, 20; each of the repair, scrub and convert passes
+      resumes after the last voter it handled). Off stops new records only;
+      pending creates and owed deletes still drain. Dry-run also pauses the
+      sweeper's repair and scrub, so owed deletes wait too; only the lifecycle
+      scrubs (`Delete(Actor)`, `SuppressActor`, `#nobridge`) always delete,
+      whatever the mode.
     - Lifecycle. `Delete(Actor)`, `SuppressActor`, the refresh-time
       `#nobridge` transition and the sweeper's ineligible-voter scrub delete
       the voter's records first, then their rows. Undone rows still owed a

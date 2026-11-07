@@ -3,9 +3,9 @@
 // aggregate counts served over one sanctioned side-channel XRPC,
 // social.coves.bridge.getVoteAggregates — except an eligible bridged voter's
 // vote (a bridged person with consent ok and a repo, in a direction
-// BRIDGED_VOTE_RECORDS allows), which RecordWriter turns into a
-// social.coves.feed.vote record in the voter's repo and which then leaves the
-// served aggregate.
+// BRIDGED_VOTE_RECORDS allows), which leaves the served aggregate at once and
+// which RecordWriter then commits as a social.coves.feed.vote record in the
+// voter's repo.
 //
 // The counting model: AP vote delivery is a stream of per-voter state
 // changes, not increments. Voters flip votes (Like → Undo{Like} → Dislike),
@@ -138,7 +138,8 @@ type Aggregator struct {
 }
 
 // SetRecordWriter enables per-voter vote records. Call it before the
-// aggregator takes traffic; nil (the default) keeps every vote aggregate.
+// aggregator serves anything: it is not safe to call concurrently with votes.
+// nil (the default) keeps every vote aggregate.
 func (a *Aggregator) SetRecordWriter(writer *RecordWriter) { a.writer = writer }
 
 // NewAggregator validates dependencies and builds an Aggregator.
@@ -283,8 +284,8 @@ func (a *Aggregator) ApplyVote(ctx context.Context, vote *ap.Object, communityIR
 		// Supersede: a voter has one current vote per subject. The previous
 		// live vote (same or opposite direction — re-like and flip both land
 		// here) is marked undone; only the new event stays live. A superseded
-		// row keeps its record_state: a pending or written record is now owed
-		// a delete.
+		// row keeps its record_state: a written record is now owed a delete; a
+		// pending one was never written and phase 2 just ends it removed.
 		_, owed, err := markUndone(ctx, tx, `
 			UPDATE vote_events
 			SET undone = TRUE
@@ -293,9 +294,11 @@ func (a *Aggregator) ApplyVote(ctx context.Context, vote *ap.Object, communityIR
 		if err != nil {
 			return fmt.Errorf("supersede votes by %q on %q: %w", voter, subject, err)
 		}
-		marked, err := a.writer.markIfEligible(ctx, tx, eventID, voter, direction, vote.ID, createdAt)
-		if err != nil {
-			return err
+		var marked bool
+		if a.writer != nil {
+			if marked, err = a.writer.markIfEligible(ctx, tx, eventID, voter, direction, vote.ID, createdAt); err != nil {
+				return err
+			}
 		}
 		recordWork = owed || marked
 
@@ -319,14 +322,21 @@ func (a *Aggregator) syncVoter(ctx context.Context, voter string) {
 		// Rows owed a delete from an earlier writer wait for the next one.
 		return
 	}
-	if err := a.writer.SyncVoter(ctx, voter); err != nil {
+	err := a.writer.SyncVoter(ctx, voter)
+	if err != nil && onlyStaleRecordWork(err) {
+		// Work changed under both attempts (a concurrent sync or scrub); the
+		// sweep settles whatever is left.
+		a.logger.Debug("vote record commit raced other record work; the record sweep will settle it", "voter", voter, "error", err)
+		return
+	}
+	if err != nil {
 		a.logger.Warn("vote record commit failed; the record sweep will repair it", "voter", voter, "error", err)
 	}
 }
 
 // markUndone runs an UPDATE ... SET undone = TRUE ... RETURNING record_state
-// and reports how many rows it undid and whether any of them was owed a
-// record delete (record_state pending or written).
+// and reports how many rows it undid and whether any of them has record work
+// for phase 2: a written record owed a delete, or a pending row to end removed.
 func markUndone(ctx context.Context, tx *sql.Tx, query string, args ...any) (undone int64, owed bool, err error) {
 	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -527,22 +537,21 @@ func (a *Aggregator) RetractVote(ctx context.Context, vote *ap.Object, community
 // serves is the FEDIVERSE-ONLY tally:
 //
 //	served(subject) = api_total(subject) − { our personas' votes Lemmy currently holds }
+//	                                     − { recorded live votes }
 //
-// The community host's counts are a TOTAL, and two populations inside it are already
-// accounted for elsewhere:
+// The community host's counts are a TOTAL, and three populations inside it are
+// already accounted for elsewhere:
 //
 //   - votes that ALSO federated live and sit in vote_events as live rows (any
 //     vote cast after the community was subscribed). Keeping them counts those
 //     voters twice — once in the baseline, once in the recompute's live term;
 //   - votes TIDEPOOL ITSELF wrote back for native users, which Lemmy is holding
 //     and reporting. Coves counts those in its NATIVE column, so keeping them
-//     counts one person's single vote twice across the two columns in the UI.
-//
-// A third population is netted the same way: live votes that are feed.vote
-// records (record_at_uri set), which Coves counts natively from the voter's
-// repo. The live subtrahend below counts them while recomputeAggregate does
-// not add them back — exclude them from both and they would stay inside the
-// baseline, counted twice.
+//     counts one person's single vote twice across the two columns in the UI;
+//   - live votes that are feed.vote records (record_at_uri set), which Coves
+//     counts natively from the voter's repo. The live subtrahend below counts
+//     them while recomputeAggregate does not add them back — exclude them
+//     from both and they would stay inside the baseline, counted twice.
 //
 // So the baseline is stored NET of all three, per direction, clamped at zero. See
 // reportSeed for what the seed publishes about that: the volume it subtracted,

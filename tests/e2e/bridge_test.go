@@ -403,8 +403,8 @@ func TestVotes_SideChannelOnly(t *testing.T) {
 	}
 }
 
-// isVoteRecordOn reports whether ev is a feed.vote commit (any operation)
-// whose subject is subjectURI. Deletes carry no record, so they never match.
+// isVoteRecordOn reports whether ev is a feed.vote create or update whose
+// subject is subjectURI (deletes carry no record).
 func isVoteRecordOn(ev *jsEvent, subjectURI string) bool {
 	if ev.Kind != kindCommit || ev.Commit == nil || ev.Commit.Collection != colVote {
 		return false

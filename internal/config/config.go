@@ -262,15 +262,18 @@ type Config struct {
 	BridgedVoteRecords string
 	// BridgedVoteRecordsDryRun logs what the vote path and the sweeper would
 	// record or convert and writes nothing (BRIDGED_VOTE_RECORDS_DRY_RUN,
-	// default false). Scrubs still delete records.
+	// default false). It also pauses the sweeper's repair and scrub, so owed
+	// deletes wait; only the lifecycle scrubs (Delete(Actor), SuppressActor,
+	// #nobridge) always delete records.
 	BridgedVoteRecordsDryRun bool
 	// BridgedVoteRecordsInterval is how often the vote-record sweeper repairs
 	// outstanding record work and converts eligible voters' aggregate votes
 	// (BRIDGED_VOTE_RECORDS_INTERVAL, a Go duration, default 1m, must be
 	// positive).
 	BridgedVoteRecordsInterval time.Duration
-	// BridgedVoteRecordsBatch bounds how many voters one sweep repairs or
-	// converts (BRIDGED_VOTE_RECORDS_BATCH, default 20, must be positive).
+	// BridgedVoteRecordsBatch bounds how many voters each sweep pass (repair,
+	// scrub, convert) handles (BRIDGED_VOTE_RECORDS_BATCH, default 20, must be
+	// positive).
 	BridgedVoteRecordsBatch int
 	// FollowListPath optionally points at the declarative follow list — a
 	// repo-committed YAML file naming every community the bridge should

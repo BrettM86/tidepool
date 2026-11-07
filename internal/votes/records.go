@@ -35,8 +35,11 @@ import (
 type RecordMode int
 
 const (
+	// RecordsOff makes no new records.
 	RecordsOff RecordMode = iota
+	// RecordsUp records Likes only; a Dislike stays aggregate.
 	RecordsUp
+	// RecordsBoth records Likes and Dislikes.
 	RecordsBoth
 )
 
@@ -54,6 +57,7 @@ func ParseRecordMode(value string) (RecordMode, error) {
 		fmt.Sprintf("must be off, up or both, got %q", value))
 }
 
+// String returns the switch value ParseRecordMode accepts.
 func (m RecordMode) String() string {
 	switch m {
 	case RecordsOff:
@@ -79,7 +83,7 @@ func (m RecordMode) allows(direction string) bool {
 
 // RecordWriterOptions are the switches. DryRun logs what would be recorded and
 // writes and marks nothing (ScrubVoter excepted: it always deletes). Interval
-// paces Run; Batch bounds the voters one Sweep handles.
+// paces Run; Batch bounds the voters each of a Sweep's passes handles.
 type RecordWriterOptions struct {
 	Mode     RecordMode
 	DryRun   bool
@@ -125,6 +129,21 @@ const (
 // retries once.
 var errStaleRecordWork = stderrors.New("votes: vote record work changed before its commit")
 
+// onlyStaleRecordWork reports whether err is stale work and nothing else
+// (every branch of a joined error is errStaleRecordWork).
+func onlyStaleRecordWork(err error) bool {
+	var joined interface{ Unwrap() []error }
+	if stderrors.As(err, &joined) {
+		for _, branch := range joined.Unwrap() {
+			if !onlyStaleRecordWork(branch) {
+				return false
+			}
+		}
+		return true
+	}
+	return stderrors.Is(err, errStaleRecordWork)
+}
+
 // eligibleVoterSQL is the eligibility predicate for vote_events alias e: a
 // bridged person, consent ok, whose repo exists. The vote path never mints.
 const eligibleVoterSQL = `EXISTS (
@@ -143,6 +162,10 @@ type RecordWriter struct {
 	interval  time.Duration
 	batch     int
 	logger    *slog.Logger
+	// Each sweep pass resumes after the last voter it handled, wrapping, so
+	// voters whose work keeps failing cannot starve the rest. Sweep runs on
+	// one goroutine (Run).
+	repairCursor, scrubCursor, convertCursor string
 }
 
 // NewRecordWriter validates dependencies and builds a RecordWriter.
@@ -211,9 +234,9 @@ func recordATURI(did, activityID string, createdAt time.Time) (string, error) {
 
 // markIfEligible is phase 1's record decision for a just-inserted vote row,
 // inside the vote transaction: when the voter is eligible and the mode allows
-// the direction, the row becomes pending. A nil writer marks nothing.
+// the direction, the row becomes pending.
 func (w *RecordWriter) markIfEligible(ctx context.Context, tx *sql.Tx, eventID int64, voter, direction, activityID string, createdAt time.Time) (bool, error) {
-	if w == nil || !w.mode.allows(direction) {
+	if !w.mode.allows(direction) {
 		return false, nil
 	}
 	did, eligible, err := eligibleDID(ctx, tx, voter)
@@ -221,7 +244,7 @@ func (w *RecordWriter) markIfEligible(ctx context.Context, tx *sql.Tx, eventID i
 		return false, err
 	}
 	if w.dryRun {
-		w.logger.Info("vote records dry run: vote would become a record", "voter", voter, "activity", activityID)
+		w.logger.Debug("vote records dry run: vote would become a record", "voter", voter, "activity", activityID)
 		return false, nil
 	}
 	atURI, err := recordATURI(did, activityID, createdAt)
@@ -316,16 +339,48 @@ func (w *RecordWriter) syncOnce(ctx context.Context, voter string) error {
 		return err
 	}
 	var errs []error
-	for start := 0; start < len(opRows); start += maxRecordOpsPerCommit {
-		chunk := opRows[start:min(start+maxRecordOpsPerCommit, len(opRows))]
+	for _, chunk := range chunkBySubject(opRows) {
 		if err := w.commitChunk(ctx, voter, eligible, chunk); err != nil {
 			if stderrors.Is(err, errStaleRecordWork) {
-				return err
+				return stderrors.Join(append(errs, err)...)
 			}
 			errs = append(errs, err)
 		}
 	}
 	return stderrors.Join(errs...)
+}
+
+// chunkBySubject splits work rows into chunks of at most
+// maxRecordOpsPerCommit, never splitting one subject's rows (a flip's delete
+// and create commit together) unless that subject alone exceeds the cap.
+// Subjects keep the order of their first row.
+func chunkBySubject(rows []workRow) [][]workRow {
+	var subjects []string
+	bySubject := map[string][]workRow{}
+	for _, r := range rows {
+		if _, ok := bySubject[r.subject]; !ok {
+			subjects = append(subjects, r.subject)
+		}
+		bySubject[r.subject] = append(bySubject[r.subject], r)
+	}
+	var chunks [][]workRow
+	var current []workRow
+	for _, subject := range subjects {
+		group := bySubject[subject]
+		if len(current) > 0 && len(current)+len(group) > maxRecordOpsPerCommit {
+			chunks = append(chunks, current)
+			current = nil
+		}
+		for len(group) > maxRecordOpsPerCommit {
+			chunks = append(chunks, group[:maxRecordOpsPerCommit])
+			group = group[maxRecordOpsPerCommit:]
+		}
+		current = append(current, group...)
+	}
+	if len(current) > 0 {
+		chunks = append(chunks, current)
+	}
+	return chunks
 }
 
 // stateGuard is one row's state transition, checked inside the commit.
@@ -346,8 +401,9 @@ type pendingCommit struct {
 
 // commitChunk refreshes the chunk's create subjects first (bridgedStats must
 // show the dropped count before Coves sees the record, or Coves counts the
-// vote twice for a while), then builds the
-// ops from the current subject mappings and commits them.
+// vote twice for a while), then builds the ops from the current subject
+// mappings and commits them. A live vote whose subject mapping is missing or
+// soft-deleted goes back to the aggregate instead.
 func (w *RecordWriter) commitChunk(ctx context.Context, voter string, eligible bool, chunk []workRow) error {
 	var errs []error
 	refreshFailed := map[string]bool{}
@@ -382,7 +438,7 @@ func (w *RecordWriter) commitChunk(ctx context.Context, voter string, eligible b
 		c.guards = append(c.guards, guard)
 		c.creates = c.creates || create
 	}
-	var abandoned []workRow
+	var unmapped []workRow
 	for _, r := range chunk {
 		uri, err := syntax.ParseATURI(r.atURI)
 		if err != nil {
@@ -400,8 +456,9 @@ func (w *RecordWriter) commitChunk(ctx context.Context, voter string, eligible b
 		}
 		mapping, err := w.objects.GetByAPID(ctx, r.subject)
 		if errors.IsNotFound(err) || (err == nil && mapping.IsDeleted()) {
-			// The subject is gone: no record to write, and none is owed.
-			abandoned = append(abandoned, r)
+			// No subject to point at; a soft delete can be restored, so the
+			// vote is counted in the aggregate until then.
+			unmapped = append(unmapped, r)
 			continue
 		}
 		if err != nil {
@@ -417,13 +474,13 @@ func (w *RecordWriter) commitChunk(ctx context.Context, voter string, eligible b
 			}},
 			stateGuard{id: r.id, from: recordPending, to: recordWritten, undone: sql.NullBool{Bool: false, Valid: true}}, true)
 	}
-	if err := w.removePending(ctx, abandoned); err != nil {
-		return err
+	if err := w.returnToAggregate(ctx, voter, unmapped); err != nil {
+		errs = append(errs, err)
 	}
 	for _, did := range dids {
 		if err := w.commit(ctx, voter, did, commits[did]); err != nil {
 			if stderrors.Is(err, errStaleRecordWork) {
-				return err
+				return stderrors.Join(append(errs, err)...)
 			}
 			errs = append(errs, err)
 		}
@@ -433,8 +490,8 @@ func (w *RecordWriter) commitChunk(ctx context.Context, voter string, eligible b
 
 // commit applies one DID's ops in one repo commit. The side effect moves every
 // row's state under the commit lock; a guard miss rolls back the whole commit
-// (records, firehose event and the other rows' transitions). Never called with
-// zero ops.
+// (records, firehose event and the other rows' transitions). With zero ops it
+// does nothing: ApplyOpsTx is never called empty.
 func (w *RecordWriter) commit(ctx context.Context, voter, did string, c *pendingCommit) error {
 	if len(c.ops) == 0 {
 		return nil
@@ -483,6 +540,50 @@ func applyGuards(ctx context.Context, tx *sql.Tx, guards []stateGuard) error {
 		}
 	}
 	return nil
+}
+
+// returnToAggregate clears the record columns of live pending votes and
+// recomputes, each subject in its own transaction under its aggregate lock
+// (the vote path's lock; no commit lock is held). A row no longer pending and
+// live is left alone. Conversion skips subjects without a live mapping, so the
+// vote stays aggregate until its subject is restored.
+func (w *RecordWriter) returnToAggregate(ctx context.Context, voter string, rows []workRow) error {
+	var errs []error
+	for _, r := range rows {
+		returned := false
+		err := inTx(ctx, w.db, func(tx *sql.Tx) error {
+			var one int
+			err := tx.QueryRowContext(ctx, `
+				SELECT 1 FROM vote_aggregates WHERE subject_ap_id = $1 FOR UPDATE`, r.subject).Scan(&one)
+			if err != nil && !stderrors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("lock vote aggregate for %q: %w", r.subject, err)
+			}
+			result, err := tx.ExecContext(ctx, `
+				UPDATE vote_events SET record_at_uri = NULL, record_state = NULL
+				WHERE id = $1 AND record_state = 'pending' AND NOT undone`, r.id)
+			if err != nil {
+				return fmt.Errorf("return vote %d to the aggregate: %w", r.id, err)
+			}
+			n, err := result.RowsAffected()
+			if err != nil {
+				return fmt.Errorf("return vote %d to the aggregate: rows affected: %w", r.id, err)
+			}
+			if n == 0 {
+				return nil
+			}
+			returned = true
+			return recomputeAggregate(ctx, tx, r.subject)
+		})
+		if err != nil {
+			errs = append(errs, fmt.Errorf("votes: %w", err))
+			continue
+		}
+		if returned {
+			w.logger.Info("vote returned to the aggregate: subject mapping missing or soft-deleted",
+				"voter", voter, "subject", r.subject, "vote_id", r.id)
+		}
+	}
+	return stderrors.Join(errs...)
 }
 
 // removePending ends never-written rows at 'removed' in a plain transaction:
@@ -589,41 +690,43 @@ func (w *RecordWriter) runSweep(ctx context.Context) {
 	}
 }
 
-// Sweep handles up to Batch voters, in three passes sharing that budget:
-// repair (eligible voters with outstanding work), scrub (voters holding
-// record rows who are no longer eligible), and — unless the mode is off —
-// conversion (eligible voters with live unrecorded votes in an allowed
-// direction, at any age). In dry-run it logs what it would do and touches
-// nothing.
+// Sweep runs three passes, each over up to Batch voters: repair (eligible
+// voters with outstanding work), scrub (voters holding record rows who are no
+// longer eligible), and — unless the mode is off — conversion (eligible voters
+// with live unrecorded votes in an allowed direction on a live subject, at any
+// age). In dry-run it logs what it would do and touches nothing.
 func (w *RecordWriter) Sweep(ctx context.Context) error {
 	upOnly := w.mode == RecordsUp
+	// $1 limit, $2/$3 the voter window (sweepVoters), $4 upOnly.
 	repairQuery := `
 		SELECT DISTINCT e.voter_ap_id FROM vote_events e
 		WHERE e.record_state IN ('pending', 'written') AND (e.record_state = 'pending' OR e.undone)
-		  AND ` + eligibleVoterSQL + `
-		ORDER BY 1 LIMIT $1`
+		  AND ` + eligibleVoterSQL + voterWindowSQL
 	scrubQuery := `
 		SELECT DISTINCT e.voter_ap_id FROM vote_events e
-		WHERE e.record_state IN ('pending', 'written') AND NOT ` + eligibleVoterSQL + `
-		ORDER BY 1 LIMIT $1`
+		WHERE e.record_state IN ('pending', 'written') AND NOT ` + eligibleVoterSQL + voterWindowSQL
 	convertQuery := `
 		SELECT DISTINCT e.voter_ap_id FROM vote_events e
-		WHERE NOT e.undone AND e.record_at_uri IS NULL AND (NOT $2 OR e.direction = 'up')
-		  AND ` + eligibleVoterSQL + `
-		ORDER BY 1 LIMIT $1`
+		WHERE NOT e.undone AND e.record_at_uri IS NULL AND (NOT $4 OR e.direction = 'up')
+		  AND ` + liveSubjectSQL + `
+		  AND ` + eligibleVoterSQL + voterWindowSQL
 
 	if w.dryRun {
-		repair, err := w.sweepVoters(ctx, repairQuery, w.batch)
+		// Counted from a throwaway cursor: a dry run moves no pass forward.
+		var cursor string
+		repair, err := w.sweepVoters(ctx, repairQuery, &cursor)
 		if err != nil {
 			return err
 		}
-		scrub, err := w.sweepVoters(ctx, scrubQuery, w.batch)
+		cursor = ""
+		scrub, err := w.sweepVoters(ctx, scrubQuery, &cursor)
 		if err != nil {
 			return err
 		}
 		var convert []string
 		if w.mode != RecordsOff {
-			if convert, err = w.sweepVoters(ctx, convertQuery, w.batch, upOnly); err != nil {
+			cursor = ""
+			if convert, err = w.sweepVoters(ctx, convertQuery, &cursor, upOnly); err != nil {
 				return err
 			}
 		}
@@ -634,30 +737,27 @@ func (w *RecordWriter) Sweep(ctx context.Context) error {
 		return nil
 	}
 
-	budget := w.batch
 	var errs []error
-	repair, err := w.sweepVoters(ctx, repairQuery, budget)
+	repair, err := w.sweepVoters(ctx, repairQuery, &w.repairCursor)
 	if err != nil {
 		return err
 	}
-	budget -= len(repair)
 	for _, voter := range repair {
 		if err := w.SyncVoter(ctx, voter); err != nil {
 			errs = append(errs, fmt.Errorf("repair %q: %w", voter, err))
 		}
 	}
-	scrub, err := w.sweepVoters(ctx, scrubQuery, budget)
+	scrub, err := w.sweepVoters(ctx, scrubQuery, &w.scrubCursor)
 	if err != nil {
 		return stderrors.Join(append(errs, err)...)
 	}
-	budget -= len(scrub)
 	for _, voter := range scrub {
 		if err := w.ScrubVoter(ctx, voter); err != nil {
 			errs = append(errs, fmt.Errorf("scrub ineligible %q: %w", voter, err))
 		}
 	}
 	if w.mode != RecordsOff {
-		convert, err := w.sweepVoters(ctx, convertQuery, budget, upOnly)
+		convert, err := w.sweepVoters(ctx, convertQuery, &w.convertCursor, upOnly)
 		if err != nil {
 			return stderrors.Join(append(errs, err)...)
 		}
@@ -674,12 +774,39 @@ func (w *RecordWriter) Sweep(ctx context.Context) error {
 	return stderrors.Join(errs...)
 }
 
-// sweepVoters runs one of Sweep's voter queries ($1 = limit).
-func (w *RecordWriter) sweepVoters(ctx context.Context, query string, limit int, args ...any) ([]string, error) {
-	if limit <= 0 {
-		return nil, nil
+// voterWindowSQL ends a sweep voter query: voters after $2, and at or before
+// $3 when $3 is not NULL, in order, at most $1.
+const voterWindowSQL = `
+		  AND e.voter_ap_id > $2 AND ($3::text IS NULL OR e.voter_ap_id <= $3)
+		ORDER BY 1 LIMIT $1`
+
+// liveSubjectSQL holds for a vote_events row (alias e) whose subject mapping
+// exists and is not soft-deleted.
+const liveSubjectSQL = `EXISTS (
+	SELECT 1 FROM ap_objects o WHERE o.ap_id = e.subject_ap_id AND o.deleted_at IS NULL)`
+
+// sweepVoters returns up to Batch voters of one sweep query, starting after
+// *cursor and wrapping to the start, and moves *cursor to the last one.
+func (w *RecordWriter) sweepVoters(ctx context.Context, query string, cursor *string, args ...any) ([]string, error) {
+	voters, err := w.queryVoters(ctx, query, w.batch, *cursor, sql.NullString{}, args)
+	if err != nil {
+		return nil, err
 	}
-	rows, err := w.db.QueryContext(ctx, query, append([]any{limit}, args...)...)
+	if len(voters) < w.batch && *cursor != "" {
+		wrapped, err := w.queryVoters(ctx, query, w.batch-len(voters), "", sql.NullString{String: *cursor, Valid: true}, args)
+		if err != nil {
+			return nil, err
+		}
+		voters = append(voters, wrapped...)
+	}
+	if len(voters) > 0 {
+		*cursor = voters[len(voters)-1]
+	}
+	return voters, nil
+}
+
+func (w *RecordWriter) queryVoters(ctx context.Context, query string, limit int, after string, through sql.NullString, args []any) ([]string, error) {
+	rows, err := w.db.QueryContext(ctx, query, append([]any{limit, after, through}, args...)...)
 	if err != nil {
 		return nil, fmt.Errorf("votes: select record sweep voters: %w", err)
 	}
@@ -706,36 +833,9 @@ func (w *RecordWriter) convertVoter(ctx context.Context, voter string, upOnly bo
 	if err != nil || !eligible {
 		return err
 	}
-	type candidate struct {
-		id         int64
-		subject    string
-		activityID string
-		createdAt  time.Time
-	}
-	var candidates []candidate
-	rows, err := w.db.QueryContext(ctx, `
-		SELECT id, subject_ap_id, activity_id, created_at FROM vote_events
-		WHERE voter_ap_id = $1 AND NOT undone AND record_at_uri IS NULL AND (NOT $2 OR direction = 'up')
-		ORDER BY subject_ap_id, id
-		LIMIT $3`, voter, upOnly, maxRecordOpsPerCommit)
-	if err != nil {
-		return fmt.Errorf("votes: select convertible votes of %q: %w", voter, err)
-	}
-	for rows.Next() {
-		var c candidate
-		if err := rows.Scan(&c.id, &c.subject, &c.activityID, &c.createdAt); err != nil {
-			_ = rows.Close()
-			return fmt.Errorf("votes: scan convertible vote of %q: %w", voter, err)
-		}
-		candidates = append(candidates, c)
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		return fmt.Errorf("votes: iterate convertible votes of %q: %w", voter, err)
-	}
-	_ = rows.Close()
-	if len(candidates) == 0 {
-		return nil
+	candidates, err := w.convertibleVotes(ctx, voter, upOnly)
+	if err != nil || len(candidates) == 0 {
+		return err
 	}
 
 	var subjects []string
@@ -784,4 +884,39 @@ func (w *RecordWriter) convertVoter(ctx context.Context, voter string, upOnly bo
 	}
 	w.logger.Info("bridged votes marked for records", "voter", voter, "votes", marked)
 	return nil
+}
+
+// convertCandidate is one live unrecorded vote convertVoter may mark.
+type convertCandidate struct {
+	id         int64
+	subject    string
+	activityID string
+	createdAt  time.Time
+}
+
+// convertibleVotes reads up to maxRecordOpsPerCommit of the voter's live
+// unrecorded votes on live subjects, in subject order.
+func (w *RecordWriter) convertibleVotes(ctx context.Context, voter string, upOnly bool) ([]convertCandidate, error) {
+	rows, err := w.db.QueryContext(ctx, `
+		SELECT e.id, e.subject_ap_id, e.activity_id, e.created_at FROM vote_events e
+		WHERE e.voter_ap_id = $1 AND NOT e.undone AND e.record_at_uri IS NULL AND (NOT $2 OR e.direction = 'up')
+		  AND `+liveSubjectSQL+`
+		ORDER BY e.subject_ap_id, e.id
+		LIMIT $3`, voter, upOnly, maxRecordOpsPerCommit)
+	if err != nil {
+		return nil, fmt.Errorf("votes: select convertible votes of %q: %w", voter, err)
+	}
+	defer rows.Close()
+	var candidates []convertCandidate
+	for rows.Next() {
+		var c convertCandidate
+		if err := rows.Scan(&c.id, &c.subject, &c.activityID, &c.createdAt); err != nil {
+			return nil, fmt.Errorf("votes: scan convertible vote of %q: %w", voter, err)
+		}
+		candidates = append(candidates, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("votes: iterate convertible votes of %q: %w", voter, err)
+	}
+	return candidates, nil
 }

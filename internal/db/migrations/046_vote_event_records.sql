@@ -5,16 +5,13 @@
 --
 -- record_at_uri names the record (at://<voter did>/social.coves.feed.vote/<rkey>)
 -- and record_state tracks it: pending = owed but not committed yet, written =
--- in the repo, removed = none exists and none is owed. The two are set and
--- cleared together. A non-NULL record_at_uri takes the row OUT of the served
--- aggregate whatever its state: Coves counts the record in its native column.
+-- in the repo, removed = none exists and none is owed. The two are both NULL
+-- or both set; 'removed' keeps the URI. A non-NULL record_at_uri takes the row
+-- OUT of the served aggregate whatever its state: Coves counts the record in
+-- its native column.
 --
--- recomputeAggregate excludes those rows, but the seeder's live subquery still
--- counts ALL live rows. The community host's API total contains recorded votes
--- too, so they must be subtracted from the baseline and not added back:
--- served = api_total − ours − recorded. Excluding them in both places would
--- leave them inside the baseline and double count them against Coves' native
--- column.
+-- The seeder still subtracts recorded votes from the API total, which
+-- contains them: served = api_total − ours − recorded.
 ALTER TABLE vote_events
     ADD COLUMN record_at_uri TEXT,
     ADD COLUMN record_state TEXT,

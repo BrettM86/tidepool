@@ -467,9 +467,9 @@ func run(logger *slog.Logger) error {
 	// The vote aggregation side channel (task 07): Like/Dislike activities
 	// maintain bridge-side counts, served over
 	// social.coves.bridge.getVoteAggregates; votes by bridged voters with a
-	// repo can become records instead (the record writer below). Built before the materializer
-	// because the materializer's actor scrub erases a deleted voter's
-	// vote_events rows through it.
+	// repo can become records instead (the record writer below). Built before
+	// the materializer because the materializer's actor scrub erases a deleted
+	// voter's vote_events rows through it.
 	voteAggregator, err := votes.NewAggregator(database, objects, communities, repoManager,
 		echoClassifier, logger)
 	if err != nil {

@@ -55,12 +55,32 @@ type recordsWorld struct {
 	agg     *Aggregator
 	objects store.APObjects
 	manager *repo.Manager
+	writer  *RecordWriter
+}
+
+// writerSeams are the RecordWriter's injectable dependencies; a
+// recordsWorldOption replaces one before the writer is built.
+type writerSeams struct {
+	committer RecordCommitter
+	refresher SubjectRefresher
+}
+
+type recordsWorldOption func(w *recordsWorld, seams *writerSeams)
+
+// withCommitter wraps the real repo.Manager committer.
+func withCommitter(wrap func(w *recordsWorld, next RecordCommitter) RecordCommitter) recordsWorldOption {
+	return func(w *recordsWorld, seams *writerSeams) { seams.committer = wrap(w, seams.committer) }
+}
+
+// withRefresher replaces the no-op SubjectRefresher.
+func withRefresher(build func(w *recordsWorld) SubjectRefresher) recordsWorldOption {
+	return func(w *recordsWorld, seams *writerSeams) { seams.refresher = build(w) }
 }
 
 // recordsBoth is the default writer configuration.
 var recordsBoth = RecordWriterOptions{Mode: RecordsBoth, Interval: time.Minute, Batch: 20}
 
-func newRecordsWorld(t *testing.T, opts RecordWriterOptions) *recordsWorld {
+func newRecordsWorld(t *testing.T, opts RecordWriterOptions, options ...recordsWorldOption) *recordsWorld {
 	t.Helper()
 	database := testDB(t)
 	agg, objects := testAggregator(t, database)
@@ -68,11 +88,29 @@ func newRecordsWorld(t *testing.T, opts RecordWriterOptions) *recordsWorld {
 	require.NoError(t, err)
 	manager, err := repo.NewManager(database, &staticSigningKeys{key: key}, nil)
 	require.NoError(t, err)
-	writer, err := NewRecordWriter(database, manager, objects, nopSubjectRefresher{}, opts, slog.Default())
+	w := &recordsWorld{db: database, agg: agg, objects: objects, manager: manager}
+	seams := writerSeams{committer: manager, refresher: nopSubjectRefresher{}}
+	for _, option := range options {
+		option(w, &seams)
+	}
+	writer, err := NewRecordWriter(database, seams.committer, objects, seams.refresher, opts, slog.Default())
 	require.NoError(t, err)
 	agg.SetRecordWriter(writer)
+	w.writer = writer
 	require.Equal(t, subjectATURI, bridgeSubject(t, objects, subjectPost, subjectRKey))
-	return &recordsWorld{db: database, agg: agg, objects: objects, manager: manager}
+	return w
+}
+
+// restartWriter replaces the aggregator and writer with fresh ones over the
+// same database and repo (a process restart with new switches), using the
+// real committer and the no-op refresher.
+func (w *recordsWorld) restartWriter(t *testing.T, opts RecordWriterOptions) {
+	t.Helper()
+	agg, objects := testAggregator(t, w.db)
+	writer, err := NewRecordWriter(w.db, w.manager, objects, nopSubjectRefresher{}, opts, slog.Default())
+	require.NoError(t, err)
+	agg.SetRecordWriter(writer)
+	w.agg, w.objects, w.writer = agg, objects, writer
 }
 
 // bridgedVoter registers a bridged person with the given consent and, when
@@ -88,12 +126,18 @@ func (w *recordsWorld) bridgedVoter(t *testing.T, apID, did string, consent stor
 	})
 	require.NoError(t, err)
 	if withRepo {
-		_, err = w.manager.PutRecord(ctx, did, "social.coves.actor.profile", "self", map[string]any{
-			"$type":       "social.coves.actor.profile",
-			"displayName": "voter",
-		})
-		require.NoError(t, err)
+		w.giveRepo(t, did)
 	}
+}
+
+// giveRepo creates did's repo through a genesis actor.profile commit.
+func (w *recordsWorld) giveRepo(t *testing.T, did string) {
+	t.Helper()
+	_, err := w.manager.PutRecord(context.Background(), did, "social.coves.actor.profile", "self", map[string]any{
+		"$type":       "social.coves.actor.profile",
+		"displayName": "voter",
+	})
+	require.NoError(t, err)
 }
 
 // eligibleVoter is a bridged person, consent ok, with a repo.

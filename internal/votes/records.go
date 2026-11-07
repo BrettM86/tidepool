@@ -42,3 +42,5 @@ func NewRecordWriter(db *sql.DB, committer RecordCommitter, objects store.APObje
 }
 
 func (a *Aggregator) SetRecordWriter(writer *RecordWriter) {}
+
+func (w *RecordWriter) Sweep(ctx context.Context) error { return nil }

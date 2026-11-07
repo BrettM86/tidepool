@@ -253,11 +253,25 @@ type Config struct {
 	// (STATS_REFRESH_BATCH, default 200, must be positive). Commits are
 	// globally serialized, so the batch keeps one sweep from flooding the lock.
 	StatsRefreshBatch int
-	// RED compile stubs: bridged vote records switches.
-	BridgedVoteRecords         string
-	BridgedVoteRecordsDryRun   bool
+	// BridgedVoteRecords selects which inbound fediverse votes by bridged
+	// voters with a repo become social.coves.feed.vote records
+	// (BRIDGED_VOTE_RECORDS: "off" none, "up" Likes only, "both" Likes and
+	// Dislikes; default off; anything else fails boot). Off stops new records
+	// only: outstanding deletes and pending creates still drain. PLAN.md
+	// decision 21.
+	BridgedVoteRecords string
+	// BridgedVoteRecordsDryRun logs what the vote path and the sweeper would
+	// record or convert and writes nothing (BRIDGED_VOTE_RECORDS_DRY_RUN,
+	// default false). Scrubs still delete records.
+	BridgedVoteRecordsDryRun bool
+	// BridgedVoteRecordsInterval is how often the vote-record sweeper repairs
+	// outstanding record work and converts eligible voters' aggregate votes
+	// (BRIDGED_VOTE_RECORDS_INTERVAL, a Go duration, default 1m, must be
+	// positive).
 	BridgedVoteRecordsInterval time.Duration
-	BridgedVoteRecordsBatch    int
+	// BridgedVoteRecordsBatch bounds how many voters one sweep repairs or
+	// converts (BRIDGED_VOTE_RECORDS_BATCH, default 20, must be positive).
+	BridgedVoteRecordsBatch int
 	// FollowListPath optionally points at the declarative follow list — a
 	// repo-committed YAML file naming every community the bridge should
 	// follow (FOLLOW_LIST_PATH). When set, a reconciler converges the
@@ -712,6 +726,31 @@ func Load(logger *slog.Logger) (*Config, error) {
 		return nil, err
 	}
 	cfg.StatsRefreshBatch, err = intVar(logger, "STATS_REFRESH_BATCH", 200)
+	if err != nil {
+		return nil, err
+	}
+
+	// Bridged vote records (decision 21): default off in every environment.
+	// The mode values mirror votes.ParseRecordMode, which main applies; config
+	// validates them here so a typo fails boot rather than reading as off.
+	cfg.BridgedVoteRecords = strings.ToLower(strings.TrimSpace(os.Getenv("BRIDGED_VOTE_RECORDS")))
+	switch cfg.BridgedVoteRecords {
+	case "":
+		cfg.BridgedVoteRecords = "off"
+		logger.Info("BRIDGED_VOTE_RECORDS not set, using default", "value", cfg.BridgedVoteRecords)
+	case "off", "up", "both":
+	default:
+		return nil, fmt.Errorf("config: BRIDGED_VOTE_RECORDS must be off, up or both, got %q", cfg.BridgedVoteRecords)
+	}
+	cfg.BridgedVoteRecordsDryRun, err = boolVarDefault(logger, "BRIDGED_VOTE_RECORDS_DRY_RUN", false)
+	if err != nil {
+		return nil, err
+	}
+	cfg.BridgedVoteRecordsInterval, err = durationVar(logger, "BRIDGED_VOTE_RECORDS_INTERVAL", time.Minute)
+	if err != nil {
+		return nil, err
+	}
+	cfg.BridgedVoteRecordsBatch, err = intVar(logger, "BRIDGED_VOTE_RECORDS_BATCH", 20)
 	if err != nil {
 		return nil, err
 	}

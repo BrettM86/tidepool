@@ -21,8 +21,9 @@ the numbers stay fixed even when a decision is superseded.
 ## The materialization principle
 
 Materialize as PDS records the things other records may need to reference:
-communities, author profiles, posts and comments. Keep things that are only
-ever counted (votes) as bridge-side state. Nothing ever strongRefs a vote.
+communities, author profiles, posts and comments. Votes by bridged voters who
+already have a repo are records too (decision 21); every other vote is only
+counted, as bridge-side state. Nothing ever strongRefs a vote.
 
 ## Architecture
 
@@ -106,11 +107,14 @@ Outbound:
    `Delete(Actor)` tombstones their bridged repo. Bridged profiles carry a bio
    line naming the origin ("bridged from @alice@lemmy.world by Tidepool") and
    set `hostedBy` to the bridge's service DID.
-7. Votes never become records. Inbound Like and Dislike activities update
-   bridge-side tallies (`internal/votes`). Tidepool exposes them two ways: it
-   folds the counts onto the bridged post or comment record as the optional
-   `bridgedStats` field (`{upvotes, downvotes, asOf}`), and it serves them over
-   the `social.coves.bridge.getVoteAggregates` XRPC for the AppView to poll.
+7. Inbound half superseded by decision 21: votes by bridged voters who already
+   have a repo become `feed.vote` records in it. The rest still holds for
+   every other inbound vote. Votes never become records. Inbound Like and
+   Dislike activities update bridge-side tallies (`internal/votes`). Tidepool
+   exposes them two ways: it folds the counts onto the bridged post or comment
+   record as the optional `bridgedStats` field (`{upvotes, downvotes, asOf}`),
+   and it serves them over the `social.coves.bridge.getVoteAggregates` XRPC
+   for the AppView to poll.
 8. Coves conventions apply: goose migrations, raw `database/sql` with `lib/pq`,
    chi router, `log/slog`, typed sentinel errors wrapped with `%w`, env-var
    config with logged dev defaults, `context.Context` everywhere, interfaces
@@ -357,8 +361,9 @@ is left with the Group-actor AP surface and the admission-policy wiring.
       the inbound service actor follows every bridged community. That Follow is
       also the outbound side's return channel, so it must stay in place.
 16. Native votes are `social.coves.feed.vote` records in users' repos, read
-    from Jetstream and sent out per actor. Inbound fediverse votes still never
-    become records (decision 7). The outbound vote row from decision 14, keyed
+    from Jetstream and sent out per actor. Inbound fediverse votes become
+    records only for bridged voters who already have a repo (decision 21). The
+    outbound vote row from decision 14, keyed
     `(actor_did, subject_at_uri)`, holds the current intended vote and its
     delivery state. The direction changes when the new vote is queued, not
     when it is delivered; FOLLOWUPS.md lists the recast and reseed gaps this
@@ -423,7 +428,9 @@ is left with the Group-actor AP surface and the admission-policy wiring.
     - Support matrix. Lemmy 0.19.20 is the pinned strictness ceiling and the
       e2e target. Mbin is covered by hand-built fixtures for link posts only.
       PieFed is untested: there are no captured fixtures. Its votes arrive from
-      anonymous per-user actors, which is fine for tallies. Pylova is untested.
+      anonymous per-user actors, which is fine for tallies. Votes from these
+      legacy alt actors stay in the tallies: the actors never author, so they
+      never get a repo (decision 21). Pylova is untested.
       Lemmy 1.0-beta is tracked but not targeted (vote `FederationMode`, inbox
       collapsing, NoteWrapper).
     - Rollout safety. Outbound has global, per-host, per-community and
@@ -477,3 +484,51 @@ is left with the Group-actor AP surface and the admission-policy wiring.
       bridged legacy posts exist, which Coves has accepted. A migration would
       need a remap decision from Coves and an old-to-new ledger; it is
       recorded in [FOLLOWUPS.md](FOLLOWUPS.md), and nothing depends on it.
+21. Inbound votes by bridged voters who already have a repo are
+    `social.coves.feed.vote` records in that repo. This supersedes decision 7's
+    inbound half.
+    - Who gets records: a Like or Dislike whose voter is a bridged person with
+      consent `ok` and an existing repo. The vote path never mints; a voter
+      gets a repo only by authoring.
+    - Who stays aggregate: voters with no repo, `#nobridge`/`#nobot` actors,
+      PieFed's legacy alt actors (they never author, so never get a repo), our
+      own personas (the echo guard drops them first), and the API-seeded
+      baseline, forever.
+    - Netting. The aggregate recompute counts only live unrecorded rows. The
+      seeder still subtracts every live row, recorded ones included, because
+      the Lemmy API total contains them. Served = API total − delivered
+      outbound − recorded, so no vote is counted both bridge-side and in
+      Coves' native column.
+    - Two phases. Phase 1, in the aggregator transaction under the subject's
+      aggregate lock: store the vote, mark it pending, recompute without it.
+      Phase 2 (`votes.RecordWriter.SyncVoter`): repin `bridgedStats` for each
+      due subject first, then write the voter's creates and deletes in one
+      repo commit whose side effect moves each row's state under a guard; any
+      guard miss rolls the whole commit back. The aggregate drop is visible
+      before the record exists, so the visible error is a brief one-low, never
+      a double count. `bridgedStats.asOf` is monotonic: a stamp older than the
+      one the record carries is refused, so a stale sweep cannot re-add a
+      recorded vote.
+    - Rkeys follow decision 4, adapted: Lemmy votes carry no `published`, so
+      the timestamp half is the time the bridge first recorded the vote and
+      the clock bits hash the activity id. A flip is delete(old) plus
+      create(new) in one commit.
+    - A paced sweeper repairs outstanding work (pending creates, owed
+      deletes) and converts eligible voters' existing aggregate votes, at any
+      age. That covers turning the switch on and voters who get a repo at any
+      later date, with no hook on minting. It also scrubs record rows of
+      voters who are no longer eligible.
+    - Switches, read at boot: `BRIDGED_VOTE_RECORDS=off|up|both` (default
+      off), `BRIDGED_VOTE_RECORDS_DRY_RUN` (log only, mark and write nothing),
+      `BRIDGED_VOTE_RECORDS_INTERVAL` (1m), `BRIDGED_VOTE_RECORDS_BATCH`
+      (voters per sweep, 20). Off stops new records only; pending creates and
+      owed deletes still drain. A scrub always deletes, whatever the mode.
+    - Lifecycle. `Delete(Actor)`, `SuppressActor`, the refresh-time
+      `#nobridge` transition and the sweeper's ineligible-voter scrub delete
+      the voter's records first, then their rows. Undone rows still owed a
+      delete are not pruned.
+    - Coves needs no change: its vote consumer indexes `feed.vote` from any
+      `did:` repo on both Jetstream feeds. For native-authored subjects Coves
+      reads bridged counts by polling `getVoteAggregates`
+      (`BRIDGED_VOTE_POLL_INTERVAL`, default 5m, 2,000 subjects per sweep), so
+      there the one-low error can last up to one poll rotation.

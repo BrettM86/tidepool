@@ -169,6 +169,13 @@ services:
       # counts and never asserts "no further commits").
       STATS_REFRESH_INTERVAL: 2s
       STATS_REFRESH_BATCH: "50"
+      # Per-voter feed.vote records (PLAN.md decision 21) on for both
+      # directions, with a short sweep interval so catch-up and repair run
+      # within the suite's waits.
+      BRIDGED_VOTE_RECORDS: both
+      BRIDGED_VOTE_RECORDS_DRY_RUN: "0"
+      BRIDGED_VOTE_RECORDS_INTERVAL: 2s
+      BRIDGED_VOTE_RECORDS_BATCH: "20"
       # Announce ourselves to the local relay on startup via the REAL
       # RequestCrawlAll path. ALLOW_DEV_REQUEST_CRAWL exists precisely for
       # this stack (dev is otherwise log-only, and production refuses the

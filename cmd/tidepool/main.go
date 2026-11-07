@@ -465,8 +465,9 @@ func run(logger *slog.Logger) error {
 	}
 
 	// The vote aggregation side channel (task 07): Like/Dislike activities
-	// maintain bridge-side counts (never records), served over
-	// social.coves.bridge.getVoteAggregates. Built before the materializer
+	// maintain bridge-side counts, served over
+	// social.coves.bridge.getVoteAggregates; votes by bridged voters with a
+	// repo can become records instead (the record writer below). Built before the materializer
 	// because the materializer's actor scrub erases a deleted voter's
 	// vote_events rows through it.
 	voteAggregator, err := votes.NewAggregator(database, objects, communities, repoManager,
@@ -524,6 +525,32 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 	go statsRefresher.Run(ctx)
+
+	// Per-voter feed.vote records (PLAN.md decision 21): a bridged voter with
+	// a repo gets their votes as records in that repo; everyone else stays in
+	// the aggregate. The writer repins bridgedStats through the refresher
+	// before each record commit, so it is built after it and attached before
+	// any ingestion. It runs in every mode: off stops new records, but its
+	// sweeper still drains pending creates and owed deletes.
+	recordMode, err := votes.ParseRecordMode(cfg.BridgedVoteRecords)
+	if err != nil {
+		return err
+	}
+	recordWriter, err := votes.NewRecordWriter(database, repoManager, objects, statsRefresher,
+		votes.RecordWriterOptions{
+			Mode:     recordMode,
+			DryRun:   cfg.BridgedVoteRecordsDryRun,
+			Interval: cfg.BridgedVoteRecordsInterval,
+			Batch:    cfg.BridgedVoteRecordsBatch,
+		}, logger)
+	if err != nil {
+		return err
+	}
+	voteAggregator.SetRecordWriter(recordWriter)
+	go recordWriter.Run(ctx)
+	logger.Info("bridged vote records configured",
+		"mode", recordMode.String(), "dry_run", cfg.BridgedVoteRecordsDryRun,
+		"interval", cfg.BridgedVoteRecordsInterval.String(), "batch", cfg.BridgedVoteRecordsBatch)
 	// Seeding imports historical scores for backfilled posts from the
 	// community host's public API (AP alone cannot provide them).
 	var seeder ingest.CountSeeder

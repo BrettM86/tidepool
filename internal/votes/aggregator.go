@@ -1,7 +1,11 @@
-// Package votes is the bridge-side vote aggregation store (task 07, PLAN.md
-// locked decision 7): Lemmy Like/Dislike activities never become records —
-// they maintain per-subject aggregate counts served over one sanctioned
-// side-channel XRPC, social.coves.bridge.getVoteAggregates.
+// Package votes is the bridge-side vote store (task 07, PLAN.md locked
+// decisions 7 and 21). Lemmy Like/Dislike activities maintain per-subject
+// aggregate counts served over one sanctioned side-channel XRPC,
+// social.coves.bridge.getVoteAggregates — except an eligible bridged voter's
+// vote (a bridged person with consent ok and a repo, in a direction
+// BRIDGED_VOTE_RECORDS allows), which RecordWriter turns into a
+// social.coves.feed.vote record in the voter's repo and which then leaves the
+// served aggregate.
 //
 // The counting model: AP vote delivery is a stream of per-voter state
 // changes, not increments. Voters flip votes (Like → Undo{Like} → Dislike),
@@ -129,7 +133,13 @@ type Aggregator struct {
 	echoLog     *ratelimit.Sampler
 	clampLog    *ratelimit.Sampler
 	logger      *slog.Logger
+	// writer turns eligible votes into records; nil keeps every vote aggregate.
+	writer *RecordWriter
 }
+
+// SetRecordWriter enables per-voter vote records. Call it before the
+// aggregator takes traffic; nil (the default) keeps every vote aggregate.
+func (a *Aggregator) SetRecordWriter(writer *RecordWriter) { a.writer = writer }
 
 // NewAggregator validates dependencies and builds an Aggregator.
 func NewAggregator(db *sql.DB, objects store.APObjects, communities store.Communities, records RecordReader, voters VoterProbe, logger *slog.Logger) (*Aggregator, error) {
@@ -226,7 +236,11 @@ func (a *Aggregator) ApplyVote(ctx context.Context, vote *ap.Object, communityIR
 		}
 	}
 
-	return a.inTx(ctx, func(tx *sql.Tx) error {
+	// recordWork: this vote left the voter with record work (a new pending
+	// record, or a superseded row whose record must go), which phase 2 below
+	// commits after this transaction releases the aggregate lock.
+	var recordWork bool
+	if err := a.inTx(ctx, func(tx *sql.Tx) error {
 		// Dedupe BEFORE creating the aggregate row: a duplicate activity id
 		// aimed at a DIFFERENT subject must not mint a spurious 0/0 aggregate
 		// for a never-voted subject (the XRPC contract omits never-voted
@@ -250,36 +264,86 @@ func (a *Aggregator) ApplyVote(ctx context.Context, vote *ap.Object, communityIR
 
 		// Dedupe backstop: the activity id is unique forever. A concurrent
 		// first delivery that slipped past the probe above changes nothing.
-		result, err := tx.ExecContext(ctx, `
+		var eventID int64
+		var createdAt time.Time
+		err := tx.QueryRowContext(ctx, `
 			INSERT INTO vote_events (activity_id, voter_ap_id, subject_ap_id, direction)
 			VALUES ($1, $2, $3, $4)
-			ON CONFLICT (activity_id) DO NOTHING`,
-			vote.ID, voter, subject, direction)
-		if err != nil {
-			return fmt.Errorf("insert vote event %q: %w", vote.ID, err)
-		}
-		inserted, err := result.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("insert vote event %q: rows affected: %w", vote.ID, err)
-		}
-		if inserted == 0 {
+			ON CONFLICT (activity_id) DO NOTHING
+			RETURNING id, created_at`,
+			vote.ID, voter, subject, direction).Scan(&eventID, &createdAt)
+		if stderrors.Is(err, sql.ErrNoRows) {
 			a.logger.Debug("vote dropped: duplicate activity id", "activity", vote.ID)
 			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("insert vote event %q: %w", vote.ID, err)
 		}
 
 		// Supersede: a voter has one current vote per subject. The previous
 		// live vote (same or opposite direction — re-like and flip both land
-		// here) is marked undone; only the new event stays live.
-		if _, err := tx.ExecContext(ctx, `
+		// here) is marked undone; only the new event stays live. A superseded
+		// row keeps its record_state: a pending or written record is now owed
+		// a delete.
+		_, owed, err := markUndone(ctx, tx, `
 			UPDATE vote_events
 			SET undone = TRUE
-			WHERE subject_ap_id = $1 AND voter_ap_id = $2 AND NOT undone AND activity_id <> $3`,
-			subject, voter, vote.ID); err != nil {
+			WHERE subject_ap_id = $1 AND voter_ap_id = $2 AND NOT undone AND activity_id <> $3
+			RETURNING record_state`, subject, voter, vote.ID)
+		if err != nil {
 			return fmt.Errorf("supersede votes by %q on %q: %w", voter, subject, err)
 		}
+		marked, err := a.writer.markIfEligible(ctx, tx, eventID, voter, direction, vote.ID, createdAt)
+		if err != nil {
+			return err
+		}
+		recordWork = owed || marked
 
 		return recomputeAggregate(ctx, tx, subject)
-	})
+	}); err != nil {
+		return err
+	}
+	if recordWork {
+		a.syncVoter(ctx, voter)
+	}
+	return nil
+}
+
+// syncVoter is phase 2 of a vote: commit the voter's record work. A failure is
+// logged, not returned — phase 1 already committed (the served aggregate
+// already excludes the vote), and the RecordWriter's sweep repairs whatever
+// is left pending; returning it would make ingest retry a vote that is
+// already applied.
+func (a *Aggregator) syncVoter(ctx context.Context, voter string) {
+	if a.writer == nil {
+		// Rows owed a delete from an earlier writer wait for the next one.
+		return
+	}
+	if err := a.writer.SyncVoter(ctx, voter); err != nil {
+		a.logger.Warn("vote record commit failed; the record sweep will repair it", "voter", voter, "error", err)
+	}
+}
+
+// markUndone runs an UPDATE ... SET undone = TRUE ... RETURNING record_state
+// and reports how many rows it undid and whether any of them was owed a
+// record delete (record_state pending or written).
+func markUndone(ctx context.Context, tx *sql.Tx, query string, args ...any) (undone int64, owed bool, err error) {
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return 0, false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var state sql.NullString
+		if err := rows.Scan(&state); err != nil {
+			return 0, false, err
+		}
+		undone++
+		if state.String == recordPending || state.String == recordWritten {
+			owed = true
+		}
+	}
+	return undone, owed, rows.Err()
 }
 
 // RetractVote undoes a previously applied vote (Undo{Like|Dislike}): the
@@ -365,7 +429,8 @@ func (a *Aggregator) RetractVote(ctx context.Context, vote *ap.Object, community
 		}
 	}
 
-	return a.inTx(ctx, func(tx *sql.Tx) error {
+	var recordWork bool
+	if err := a.inTx(ctx, func(tx *sql.Tx) error {
 		// The aggregate row is the per-subject lock; no row means no vote was
 		// ever counted for this subject, so there is nothing to retract.
 		var locked int
@@ -388,16 +453,15 @@ func (a *Aggregator) RetractVote(ctx context.Context, vote *ap.Object, community
 		// the authoritative target and the inner type is unreliable.
 		var retracted int64
 		if vote.ID != "" {
-			result, err := tx.ExecContext(ctx, `
+			var err error
+			retracted, recordWork, err = markUndone(ctx, tx, `
 				UPDATE vote_events
 				SET undone = TRUE
-				WHERE subject_ap_id = $1 AND voter_ap_id = $2 AND NOT undone AND activity_id = $3`,
+				WHERE subject_ap_id = $1 AND voter_ap_id = $2 AND NOT undone AND activity_id = $3
+				RETURNING record_state`,
 				subject, voter, vote.ID)
 			if err != nil {
 				return fmt.Errorf("retract vote %q by %q on %q: %w", vote.ID, voter, subject, err)
-			}
-			if retracted, err = result.RowsAffected(); err != nil {
-				return fmt.Errorf("retract vote %q by %q on %q: rows affected: %w", vote.ID, voter, subject, err)
 			}
 			if retracted == 0 {
 				// Zero rows means either a REPLAY (the id is known but its
@@ -424,16 +488,15 @@ func (a *Aggregator) RetractVote(ctx context.Context, vote *ap.Object, community
 		// (the reconstructed inner vote is typed Like even when the live
 		// vote is a Dislike).
 		if retracted == 0 {
-			result, err := tx.ExecContext(ctx, `
+			var err error
+			retracted, recordWork, err = markUndone(ctx, tx, `
 				UPDATE vote_events
 				SET undone = TRUE
-				WHERE subject_ap_id = $1 AND voter_ap_id = $2 AND NOT undone`,
+				WHERE subject_ap_id = $1 AND voter_ap_id = $2 AND NOT undone
+				RETURNING record_state`,
 				subject, voter)
 			if err != nil {
 				return fmt.Errorf("retract vote by %q on %q: %w", voter, subject, err)
-			}
-			if retracted, err = result.RowsAffected(); err != nil {
-				return fmt.Errorf("retract vote by %q on %q: rows affected: %w", voter, subject, err)
 			}
 		}
 		if retracted == 0 {
@@ -442,7 +505,15 @@ func (a *Aggregator) RetractVote(ctx context.Context, vote *ap.Object, community
 			return nil
 		}
 		return recomputeAggregate(ctx, tx, subject)
-	})
+	}); err != nil {
+		return err
+	}
+	// A retracted row that was pending or written is owed a delete (or, never
+	// written, just its terminal state): phase 2, after the aggregate lock.
+	if recordWork {
+		a.syncVoter(ctx, voter)
+	}
+	return nil
 }
 
 // SeedAggregates imports a baseline (upvotes, downvotes) for a bridged
@@ -467,7 +538,13 @@ func (a *Aggregator) RetractVote(ctx context.Context, vote *ap.Object, community
 //     and reporting. Coves counts those in its NATIVE column, so keeping them
 //     counts one person's single vote twice across the two columns in the UI.
 //
-// So the baseline is stored NET of both, per direction, clamped at zero. See
+// A third population is netted the same way: live votes that are feed.vote
+// records (record_at_uri set), which Coves counts natively from the voter's
+// repo. The live subtrahend below counts them while recomputeAggregate does
+// not add them back — exclude them from both and they would stay inside the
+// baseline, counted twice.
+//
+// So the baseline is stored NET of all three, per direction, clamped at zero. See
 // reportSeed for what the seed publishes about that: the volume it subtracted,
 // and — on the rare subject whose whole tally is smaller than the deficit — the
 // clamp that would otherwise absorb the difference in silence.
@@ -712,17 +789,37 @@ func min64(a, b int64) int64 {
 // ScrubVoter erases every vote_events row a voter ever produced — the vote
 // counterpart of the record scrub on Delete(Actor)/consent revocation
 // (task 11; the rows tie an identifiable AP actor id to their voting
-// history, which must not outlive their account). Live votes are removed
-// from served counts too: every affected aggregate is locked (in
-// deterministic subject order, so concurrent per-subject writers cannot
-// deadlock against the scrub) and recomputed in the same transaction.
-// Seeded baselines are untouched — they were never per-voter data. A voter
-// with no rows is a no-op success.
+// history, which must not outlive their account). With a RecordWriter set,
+// the voter's feed.vote records are deleted first, whatever the switches say
+// (RecordWriter.ScrubVoter). Without one, rows still owed a record delete are
+// kept so the record is never orphaned, and a Warn says so. A voter with no
+// rows is a no-op success.
 func (a *Aggregator) ScrubVoter(ctx context.Context, voterAPID string) error {
 	if voterAPID == "" {
 		return errors.NewValidationError("voter_ap_id", "must not be empty")
 	}
-	return a.inTx(ctx, func(tx *sql.Tx) error {
+	if a.writer != nil {
+		return a.writer.ScrubVoter(ctx, voterAPID)
+	}
+	owed, err := scrubVoterRows(ctx, a.db, a.logger, voterAPID)
+	if err != nil {
+		return err
+	}
+	if owed > 0 {
+		a.logger.Warn("vote scrub kept rows owed a record delete: no record writer is configured",
+			"voter", voterAPID, "rows", owed)
+	}
+	return nil
+}
+
+// scrubVoterRows deletes a voter's vote_events rows that are owed no record
+// (record_state NULL or removed) and reports how many owed rows remain. Live
+// votes are removed from served counts too: every affected aggregate is
+// locked (in deterministic subject order, so concurrent per-subject writers
+// cannot deadlock against the scrub) and recomputed in the same transaction.
+// Seeded baselines are untouched — they were never per-voter data.
+func scrubVoterRows(ctx context.Context, db *sql.DB, logger *slog.Logger, voterAPID string) (owed int, err error) {
+	err = inTx(ctx, db, func(tx *sql.Tx) error {
 		// Lock the aggregates the voter is KNOWN to have voted on first,
 		// ordered, exactly like the single-subject paths do (lock → mutate →
 		// recompute).
@@ -761,8 +858,10 @@ func (a *Aggregator) ScrubVoter(ctx context.Context, voterAPID string) error {
 		// lost-update bug.
 		var deleted int64
 		affected := map[string]bool{}
-		delRows, err := tx.QueryContext(ctx,
-			`DELETE FROM vote_events WHERE voter_ap_id = $1 RETURNING subject_ap_id`, voterAPID)
+		delRows, err := tx.QueryContext(ctx, `
+			DELETE FROM vote_events
+			WHERE voter_ap_id = $1 AND (record_state IS NULL OR record_state = 'removed')
+			RETURNING subject_ap_id`, voterAPID)
 		if err != nil {
 			return fmt.Errorf("scrub vote events for %q: %w", voterAPID, err)
 		}
@@ -821,12 +920,18 @@ func (a *Aggregator) ScrubVoter(ctx context.Context, voterAPID string) error {
 				return err
 			}
 		}
+		if err := tx.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM vote_events
+			WHERE voter_ap_id = $1 AND record_state IN ('pending', 'written')`, voterAPID).Scan(&owed); err != nil {
+			return fmt.Errorf("count owed vote records for %q: %w", voterAPID, err)
+		}
 		if deleted > 0 {
-			a.logger.Info("vote events scrubbed for deleted voter",
+			logger.Info("vote events scrubbed for deleted voter",
 				"voter", voterAPID, "events", deleted, "subjects", len(recomputeSet))
 		}
 		return nil
 	})
+	return owed, err
 }
 
 // pruneVoteEventsBatchSize bounds one DELETE inside PruneUndoneEvents.
@@ -839,7 +944,9 @@ const pruneVoteEventsBatchSize = 1000
 // dedupe record for its activity id, so pruning re-opens replay for
 // activities older than the retention window — but real federation queues
 // redeliver over hours-to-days, not months, and VOTE_EVENT_RETENTION's
-// default (90 days) dwarfs that horizon.
+// default (90 days) dwarfs that horizon. Rows still owed a record delete
+// (record_state pending or written) are kept: the row is the only pointer to
+// the record.
 func (a *Aggregator) PruneUndoneEvents(ctx context.Context, cutoff time.Time) (int64, error) {
 	var total int64
 	for {
@@ -847,6 +954,7 @@ func (a *Aggregator) PruneUndoneEvents(ctx context.Context, cutoff time.Time) (i
 			DELETE FROM vote_events WHERE id IN (
 				SELECT id FROM vote_events
 				WHERE undone AND created_at < $1
+				  AND (record_state IS NULL OR record_state = 'removed')
 				LIMIT $2
 			)`, cutoff, pruneVoteEventsBatchSize)
 		if err != nil {
@@ -950,7 +1058,11 @@ func (a *Aggregator) subjectBelongsToCommunity(ctx context.Context, mapping *sto
 // inTx runs fn inside a transaction, committing on nil and rolling back on
 // error.
 func (a *Aggregator) inTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
-	tx, err := a.db.BeginTx(ctx, nil)
+	return inTx(ctx, a.db, fn)
+}
+
+func inTx(ctx context.Context, db *sql.DB, fn func(tx *sql.Tx) error) error {
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("votes: begin tx: %w", err)
 	}
@@ -980,7 +1092,8 @@ func lockAggregate(ctx context.Context, tx *sql.Tx, subject, atURI string) error
 }
 
 // recomputeAggregate rewrites the subject's served totals from the seeded
-// baseline plus the live (non-undone) events. Recompute-per-subject over
+// baseline plus the live (non-undone) events that are not feed.vote records
+// (record_at_uri IS NULL; Coves counts those natively). Recompute-per-subject over
 // incremental arithmetic: a Lemmy post sees at most a few thousand votes,
 // and recomputing inside the locking transaction cannot drift.
 //
@@ -1005,7 +1118,7 @@ func recomputeAggregate(ctx context.Context, tx *sql.Tx, subject string) error {
 				COUNT(*) FILTER (WHERE direction = 'up') AS up,
 				COUNT(*) FILTER (WHERE direction = 'down') AS down
 			FROM vote_events
-			WHERE subject_ap_id = $1 AND NOT undone
+			WHERE subject_ap_id = $1 AND NOT undone AND record_at_uri IS NULL
 		) live
 		WHERE a.subject_ap_id = $1`,
 		subject); err != nil {

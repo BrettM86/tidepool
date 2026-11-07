@@ -317,9 +317,9 @@ func TestUpdateAndDelete(t *testing.T) {
 	}
 }
 
-// Scenario 5: votes — on posts AND comments — update the getVoteAggregates
-// side channel and NEVER appear as records on the firehose (PLAN.md locked
-// decision 7). Covers the full lifecycle: upvote, flip to downvote (an
+// Scenario 5: votes — on posts AND comments — by a voter with no repo update
+// the getVoteAggregates side channel and NEVER appear as records on the
+// firehose (PLAN.md decisions 7 and 21). Covers the full lifecycle: upvote, flip to downvote (an
 // announced Dislike, Announce{Dislike}, with no Undo), retract (an Undo carrying a reconstructed inner vote), and a
 // comment vote (task 07's reply.root community-binding path).
 func TestVotes_SideChannelOnly(t *testing.T) {
@@ -388,7 +388,8 @@ func TestVotes_SideChannelOnly(t *testing.T) {
 		return ok && up == 1 && bridgedStatsAsOfParses(e.Commit.Record)
 	})
 
-	// The whole time, nothing vote-shaped may have hit the firehose. The
+	// The whole time, no vote record on these subjects may have hit the
+	// firehose: the voter never authored, so has no repo (decision 21). The
 	// listener's centralized vetting already fails fast on any unexpected
 	// collection; this explicit unfiltered sweep is the belt to that
 	// suspenders.
@@ -396,7 +397,20 @@ func TestVotes_SideChannelOnly(t *testing.T) {
 		if ev.Kind == kindCommit && ev.Commit != nil && !expectedCollections[ev.Commit.Collection] {
 			t.Errorf("unexpected collection on firehose during voting: %s", ev)
 		}
+		if isVoteRecordOn(ev, postURI) || isVoteRecordOn(ev, commentEv.atURI()) {
+			t.Errorf("vote record for a voter with no repo: %s", ev)
+		}
 	}
+}
+
+// isVoteRecordOn reports whether ev is a feed.vote commit (any operation)
+// whose subject is subjectURI. Deletes carry no record, so they never match.
+func isVoteRecordOn(ev *jsEvent, subjectURI string) bool {
+	if ev.Kind != kindCommit || ev.Commit == nil || ev.Commit.Collection != colVote {
+		return false
+	}
+	uri, _ := fieldOf(ev.Commit.Record, "subject", "uri")
+	return uri == subjectURI
 }
 
 // awaitAggregates polls the side-channel XRPC until the subject shows the
@@ -415,6 +429,76 @@ func awaitAggregates(t *testing.T, h *harness, uri string, up, down int64) {
 		time.Sleep(time.Second)
 	}
 	t.Fatalf("aggregates for %s = %d up / %d down, want %d/%d", uri, last.Upvotes, last.Downvotes, up, down)
+}
+
+// Scenario 5b: a Lemmy voter who already has a bridged repo (they commented
+// in a followed community, so the bridge materialized their content) gets
+// their upvote as a social.coves.feed.vote record in that repo, and the
+// aggregate does NOT count it; a fresh voter with no repo upvoting the same
+// post stays aggregate and IS counted (PLAN.md decision 21; the stack runs
+// BRIDGED_VOTE_RECORDS=both).
+func TestVotes_RepoVoterBecomesRecord(t *testing.T) {
+	h := newHarness(t)
+	community, _ := setupSubscribedCommunity(t, h, "vrec")
+
+	author := h.registerUser(t, h.uniqueName(t, "gale"))
+	repoVoter := h.registerUser(t, h.uniqueName(t, "hana"))
+	freshVoter := h.registerUser(t, h.uniqueName(t, "ivo"))
+
+	cursor := cursorNow()
+	l := h.newListener(t, cursor) // unfiltered: watch EVERYTHING while votes flow
+
+	title := "Recorded vote " + h.suffix
+	post := author.createPost(t, community.ID, title, "vote on me")
+	postEv := l.await("post create", func(e *jsEvent) bool {
+		got, _ := fieldOf(e.Commit.Record, "title")
+		return e.Commit.Collection == colPostV2 && e.Commit.Operation == opCreate && got == title
+	})
+	postURI := postEv.atURI()
+
+	// The repo voter authors first: the comment is what mints their repo.
+	// Its firehose event names that repo's DID.
+	commentText := "hana was here " + h.suffix
+	repoVoter.createComment(t, post.ID, 0, commentText)
+	commentEv := l.await("repo voter's comment create", func(e *jsEvent) bool {
+		got, _ := fieldOf(e.Commit.Record, "content")
+		return e.Commit.Collection == colComment && e.Commit.Operation == opCreate && got == commentText
+	})
+	repoVoterDID := commentEv.Did
+	if repoVoterDID == postEv.Did {
+		t.Fatalf("comment landed in the post author's repo %s, want the commenter's own repo", repoVoterDID)
+	}
+
+	repoVoter.likePost(t, post.ID, 1)
+	voteEv := l.await("feed.vote create in the repo voter's repo", func(e *jsEvent) bool {
+		return e.Did == repoVoterDID && e.Commit.Operation == opCreate && isVoteRecordOn(e, postURI)
+	})
+	if got := recordField(t, voteEv.Commit.Record, "direction"); got != "up" {
+		t.Errorf("vote direction = %q, want %q", got, "up")
+	}
+
+	// The vote is a record now, so the aggregate must not count it: Coves
+	// counts the record natively, and counting it here too would double it.
+	awaitAggregates(t, h, postURI, 0, 0)
+
+	// A voter with no repo stays aggregate. Exactly 1: the repo voter's
+	// recorded vote is not in the sum.
+	freshVoter.likePost(t, post.ID, 1)
+	awaitAggregates(t, h, postURI, 1, 0)
+
+	// awaitAggregates returns on the first 1/0 it sees; read once more after
+	// the fresh vote has been counted so a late double count still fails.
+	if got := h.getVoteAggregates(t, postURI)[postURI]; got.Upvotes != 1 || got.Downvotes != 0 {
+		t.Errorf("aggregates for %s = %d up / %d down after both votes, want 1/0", postURI, got.Upvotes, got.Downvotes)
+	}
+
+	// The fresh voter's vote never becomes a record: the only feed.vote on
+	// this post is the repo voter's.
+	for _, ev := range l.drain(negativeWindow) {
+		if isVoteRecordOn(ev, postURI) && ev.Did != repoVoterDID {
+			t.Errorf("vote record from a voter with no repo: %s", ev)
+		}
+	}
 }
 
 // Scenario 6: backfill — posts that existed BEFORE the bridge subscribed

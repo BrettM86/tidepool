@@ -1211,6 +1211,7 @@ func sliceInlineRanges(ranges []inlineRange, start, end int) []inlineRange {
 
 func renderMarkdown(source string, ranges []inlineRange) string {
 	var b strings.Builder
+	breaks := hardLineBreaks(source)
 	atLineStart := true
 	insideCode := false
 	offset := 0
@@ -1222,7 +1223,7 @@ func renderMarkdown(source string, ranges []inlineRange) string {
 				b.WriteString(text)
 				return
 			}
-			atLineStart = appendEscapedPlaintextMarkdown(&b, source, start, offset, atLineStart)
+			atLineStart = appendEscapedPlaintextMarkdown(&b, source, start, offset, atLineStart, breaks)
 		},
 		func(current inlineRange) {
 			writeMarkdownFacet(&b, source, current, false)
@@ -1420,7 +1421,7 @@ func renderFacets(source string, ranges []inlineRange, writeText func(string), o
 // code) are made once per source line against the whole line, so they hold
 // even when facets split the line into several chunks, and a long line costs
 // linear time.
-func appendEscapedPlaintextMarkdown(b *strings.Builder, source string, start, end int, atLineStart bool) bool {
+func appendEscapedPlaintextMarkdown(b *strings.Builder, source string, start, end int, atLineStart bool, breaks map[int]bool) bool {
 	markerStart, setextUnderline, indentedCode := -1, false, false
 	if atLineStart {
 		markerStart, setextUnderline, indentedCode = describeMarkdownLine(source, start)
@@ -1453,7 +1454,9 @@ func appendEscapedPlaintextMarkdown(b *strings.Builder, source string, start, en
 		case '=':
 			escape = setextUnderline
 		}
-		if escape {
+		if char == '\n' && breaks[i] {
+			b.WriteString(hardLineBreakMarkdown)
+		} else if escape {
 			b.WriteByte('\\')
 		}
 		b.WriteByte(char)
@@ -1463,6 +1466,63 @@ func appendEscapedPlaintextMarkdown(b *strings.Builder, source string, start, en
 		}
 	}
 	return atLineStart
+}
+
+// hardLineBreakMarkdown precedes a newline that hardLineBreaks marks. The
+// space keeps a bare URL ending the line from absorbing the backslash:
+// lemmy-ui's markdown-it linkify accepts a backslash inside a URL path, so
+// "https://example.com/a\\" would link to ".../a%5C" and lose the break.
+const hardLineBreakMarkdown = " \\"
+
+// hardLineBreaks returns the offsets of the newlines in source that render as
+// hard line breaks. Coves shows every newline as a line break, but CommonMark
+// joins the lines of a paragraph, so both outputs mark a newline inside a
+// paragraph as a hard break. Paragraphs end at lines markdown-it treats as
+// blank (spaces and tabs only). markdown-it trims each paragraph with
+// JavaScript's trim, which also strips no-break spaces and U+FEFF, so a newline
+// with only such lines before it or after it in its paragraph stays soft: a
+// break there would show as a literal backslash.
+func hardLineBreaks(source string) map[int]bool {
+	breaks := make(map[int]bool)
+	var newlines []int
+	var hasContent []bool
+	endParagraph := func() {
+		first, last := -1, -1
+		for line, content := range hasContent {
+			if content {
+				if first < 0 {
+					first = line
+				}
+				last = line
+			}
+		}
+		// newlines[line] ends paragraph line `line`; the paragraph's last
+		// newline, if any, precedes a blank line and is never a break.
+		for line, newline := range newlines {
+			if first >= 0 && first <= line && line+1 <= last {
+				breaks[newline] = true
+			}
+		}
+		newlines, hasContent = newlines[:0], hasContent[:0]
+	}
+	for lineStart := 0; lineStart <= len(source); {
+		lineEnd := len(source)
+		if next := strings.IndexByte(source[lineStart:], '\n'); next >= 0 {
+			lineEnd = lineStart + next
+		}
+		line := source[lineStart:lineEnd]
+		if isWhitespaceOnlyBlankLine(line) {
+			endParagraph()
+		} else {
+			hasContent = append(hasContent, strings.TrimFunc(line, isSpoilerTitleWhitespace) != "")
+			if lineEnd < len(source) {
+				newlines = append(newlines, lineEnd)
+			}
+		}
+		lineStart = lineEnd + 1
+	}
+	endParagraph()
+	return breaks
 }
 
 func describeMarkdownLine(source string, lineStart int) (markerStart int, setextUnderline, indentedCode bool) {
@@ -1573,12 +1633,33 @@ func writeHTMLParagraph(b *strings.Builder, source string, ranges []inlineRange,
 
 func renderInlineHTML(source string, ranges []inlineRange) string {
 	var b strings.Builder
+	breaks := hardLineBreaks(source)
+	offset := 0
 	renderFacets(source, ranges,
-		func(text string) { b.WriteString(html.EscapeString(strings.ReplaceAll(text, "\r\n", "\n"))) },
+		func(text string) {
+			start := offset
+			offset += len(text)
+			writeHTMLText(&b, source, start, offset, breaks)
+		},
 		func(current inlineRange) { writeHTMLFacet(&b, current, false) },
 		func(current inlineRange) { writeHTMLFacet(&b, current, true) },
 	)
 	return b.String()
+}
+
+// writeHTMLText escapes source[start:end] as HTML text, writing <br> before
+// each newline in breaks so the HTML breaks exactly where the Markdown does.
+func writeHTMLText(b *strings.Builder, source string, start, end int, breaks map[int]bool) {
+	segmentStart := start
+	for i := start; i < end; i++ {
+		if !breaks[i] {
+			continue
+		}
+		b.WriteString(html.EscapeString(strings.ReplaceAll(strings.TrimSuffix(source[segmentStart:i], "\r"), "\r\n", "\n")))
+		b.WriteString("<br>")
+		segmentStart = i
+	}
+	b.WriteString(html.EscapeString(strings.ReplaceAll(source[segmentStart:end], "\r\n", "\n")))
 }
 
 func writeHTMLFacet(b *strings.Builder, current inlineRange, closing bool) {

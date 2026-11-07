@@ -65,11 +65,11 @@ func TestBuildNote_EscapesFacetFreePlaintextForLemmy(t *testing.T) {
 		"``` fence\r\n" +
 		"::: spoiler Warning\r\n\r\n" +
 		"After blank line"
-	const expectedMarkdown = "Inline \\*stars\\* \\[brackets\\] \\<script\\>alert(1)\\</script\\> \\&copy; C:\\\\temp\n" +
-		"\\# heading\n" +
-		"\\> quote\n" +
-		"\\- list\n" +
-		"\\`\\`\\` fence\n" +
+	const expectedMarkdown = "Inline \\*stars\\* \\[brackets\\] \\<script\\>alert(1)\\</script\\> \\&copy; C:\\\\temp \\\n" +
+		"\\# heading \\\n" +
+		"\\> quote \\\n" +
+		"\\- list \\\n" +
+		"\\`\\`\\` fence \\\n" +
 		"\\::: spoiler Warning\n\n" +
 		"After blank line"
 
@@ -93,7 +93,7 @@ func TestBuildNote_EscapesFacetFreePlaintextForLemmy(t *testing.T) {
 				paragraphs = append(paragraphs, node)
 			}
 			switch node.Data {
-			case "html", "head", "body", "p":
+			case "html", "head", "body", "p", "br":
 			default:
 				unexpectedElements = append(unexpectedElements, node.Data)
 			}
@@ -128,7 +128,7 @@ func TestBuildNote_EscapesFacetFreePlaintextForLemmy(t *testing.T) {
 func TestBuildNote_EscapesAdditionalFacetFreeBlockMarkdownMarkers(t *testing.T) {
 	const (
 		plaintext        = "+ list\n\n1. numbered\n\nsetext candidate\n==="
-		expectedMarkdown = "\\+ list\n\n1\\. numbered\n\nsetext candidate\n\\=\\=\\="
+		expectedMarkdown = "\\+ list\n\n1\\. numbered\n\nsetext candidate \\\n\\=\\=\\="
 	)
 	note := BuildNote("actor", "community", "parent", "object", map[string]any{"content": plaintext})
 	source, ok := note["source"].(map[string]any)
@@ -168,7 +168,7 @@ func TestBuildNote_FacetFreeCommonMarkSyntaxStaysLiteral(t *testing.T) {
 		indent := strings.Repeat(" ", offset+1)
 		tests = append(tests,
 			testCase{name: name + "-space indented list", plaintext: indent + "- list", expectedMarkdown: indent + `\- list`},
-			testCase{name: name + "-space indented setext", plaintext: "title\n" + indent + "===", expectedMarkdown: "title\n&#32;" + indent[1:] + `\=\=\=`},
+			testCase{name: name + "-space indented setext", plaintext: "title\n" + indent + "===", expectedMarkdown: "title \\\n&#32;" + indent[1:] + `\=\=\=`},
 			testCase{name: name + "-space indented spoiler", plaintext: indent + "::: spoiler Warning", expectedMarkdown: indent + `\::: spoiler Warning`},
 		)
 	}
@@ -201,14 +201,14 @@ func TestBuildNote_FacetFreeMarkdownEscapingEdgeCases(t *testing.T) {
 		{name: "exclamation mark", plaintext: "wow! ![alt](x)", expectedMarkdown: `wow\! \!\[alt\](x)`, expectedHTML: "<p>wow! ![alt](x)</p>\n"},
 		{name: "ordered marker alone at end of text", plaintext: "2020.", expectedMarkdown: `2020\.`, expectedHTML: "<p>2020.</p>\n"},
 		{name: "parenthesized ordered marker alone at end of text", plaintext: "7)", expectedMarkdown: `7\)`, expectedHTML: "<p>7)</p>\n"},
-		{name: "ordered marker alone at end of line", plaintext: "2020.\nnext", expectedMarkdown: "2020\\.\nnext", expectedHTML: "<p>2020.\nnext</p>\n"},
-		{name: "ordered marker alone before CRLF", plaintext: "2020.\r\nnext", expectedMarkdown: "2020\\.\nnext", expectedHTML: "<p>2020.\nnext</p>\n"},
+		{name: "ordered marker alone at end of line", plaintext: "2020.\nnext", expectedMarkdown: "2020\\. \\\nnext", expectedHTML: "<p>2020.<br>\nnext</p>\n"},
+		{name: "ordered marker alone before CRLF", plaintext: "2020.\r\nnext", expectedMarkdown: "2020\\. \\\nnext", expectedHTML: "<p>2020.<br>\nnext</p>\n"},
 		{name: "leading tab", plaintext: "\tindented prose", expectedMarkdown: "&#9;indented prose", expectedHTML: "<p>indented prose</p>\n"},
 		{name: "spaces then tab", plaintext: "  \tindented prose", expectedMarkdown: "&#32; \tindented prose", expectedHTML: "<p>indented prose</p>\n"},
-		{name: "tab on later line", plaintext: "first\n\tsecond", expectedMarkdown: "first\n&#9;second", expectedHTML: "<p>first\n\tsecond</p>\n"},
-		{name: "three spaces then tab", plaintext: "first\n   \tsecond", expectedMarkdown: "first\n&#32;  \tsecond", expectedHTML: "<p>first\n   \tsecond</p>\n"},
+		{name: "tab on later line", plaintext: "first\n\tsecond", expectedMarkdown: "first \\\n&#9;second", expectedHTML: "<p>first<br>\n\tsecond</p>\n"},
+		{name: "three spaces then tab", plaintext: "first\n   \tsecond", expectedMarkdown: "first \\\n&#32;  \tsecond", expectedHTML: "<p>first<br>\n   \tsecond</p>\n"},
 		{name: "setext escaping with long line cache", plaintext: "title\n  == =\nnot = setext\n===x",
-			expectedMarkdown: "title\n&#32; \\=\\= \\=\nnot = setext\n===x", expectedHTML: "<p>title\n  == =\nnot = setext\n===x</p>\n"},
+			expectedMarkdown: "title \\\n&#32; \\=\\= \\= \\\nnot = setext \\\n===x", expectedHTML: "<p>title<br>\n  == =<br>\nnot = setext<br>\n===x</p>\n"},
 	}
 
 	for _, test := range tests {
@@ -237,15 +237,15 @@ func TestBuildNote_LoneCarriageReturnIsALineBreak(t *testing.T) {
 		expectedHTML     string
 	}{
 		{name: "setext underline", plaintext: "a\r===",
-			expectedMarkdown: "a\n\\=\\=\\=", expectedHTML: "<p>a\n===</p>\n"},
+			expectedMarkdown: "a \\\n\\=\\=\\=", expectedHTML: "<p>a<br>\n===</p>\n"},
 		{name: "ordered list marker", plaintext: "a\r1. item",
-			expectedMarkdown: "a\n1\\. item", expectedHTML: "<p>a\n1. item</p>\n"},
+			expectedMarkdown: "a \\\n1\\. item", expectedHTML: "<p>a<br>\n1. item</p>\n"},
 		{name: "spoiler fence after blank line", plaintext: "a\r\r::: spoiler x",
 			expectedMarkdown: "a\n\n\\::: spoiler x", expectedHTML: "<p>a</p>\n<p>::: spoiler x</p>\n"},
 		{name: "spoiler closing fence inside spoiler", plaintext: "hidden\r:::\rrevealed",
 			facets:           []any{testFacet(0, len("hidden\r:::\rrevealed"), testSpoilerFeature(""))},
-			expectedMarkdown: "::: spoiler Spoiler\nhidden\n\\:::\nrevealed\n:::",
-			expectedHTML:     "<details>\n<summary>Spoiler</summary>\n<p>hidden\n:::\nrevealed</p>\n</details>\n"},
+			expectedMarkdown: "::: spoiler Spoiler\nhidden \\\n\\::: \\\nrevealed\n:::",
+			expectedHTML:     "<details>\n<summary>Spoiler</summary>\n<p>hidden<br>\n:::<br>\nrevealed</p>\n</details>\n"},
 		{name: "code block inside quote", plaintext: "before\nfirst\r```\rsecond\nafter",
 			facets: []any{
 				testFacet(1, len("before\nfirst\r```\rsecond\naft"), testBlockquoteFeature()),
@@ -269,7 +269,7 @@ func TestBuildNote_LoneCarriageReturnIsALineBreak(t *testing.T) {
 func TestBuildNote_LongSetextCandidateLineRendersInLinearTime(t *testing.T) {
 	const equalsCount = 500_000
 	plaintext := "title\n" + strings.Repeat("=", equalsCount)
-	expectedMarkdown := "title\n" + strings.Repeat(`\=`, equalsCount)
+	expectedMarkdown := "title \\\n" + strings.Repeat(`\=`, equalsCount)
 
 	rendered := make(chan string, 1)
 	go func() {

@@ -330,9 +330,9 @@ func TestBuildNote_LiteralSpoilerFenceLineCannotTerminateAnnotatedContent(t *tes
 	const (
 		plaintext        = "before\nhidden\n:::\nstill hidden\nafter"
 		hiddenText       = "hidden\n:::\nstill hidden"
-		expectedMarkdown = "before\n\n::: spoiler Twist\nhidden\n\\:::\nstill hidden\n:::\n\nafter"
+		expectedMarkdown = "before\n\n::: spoiler Twist\nhidden \\\n\\::: \\\nstill hidden\n:::\n\nafter"
 		expectedHTML     = "<p>before</p>\n<details>\n<summary>Twist</summary>\n" +
-			"<p>hidden\n:::\nstill hidden</p>\n</details>\n<p>after</p>\n"
+			"<p>hidden<br>\n:::<br>\nstill hidden</p>\n</details>\n<p>after</p>\n"
 	)
 	start := strings.Index(plaintext, hiddenText)
 	markdown, content := buildTestNote(t, plaintext, []any{
@@ -353,8 +353,8 @@ func TestBuildNote_IndentedLiteralSpoilerFencesStayInsideAnnotatedContent(t *tes
 			indent := strings.Repeat(" ", spaces+1)
 			plaintext := "hidden\n" + indent + ":::\nstill hidden\n" +
 				indent + "::: spoiler Nested\nalso hidden"
-			expectedMarkdown := "::: spoiler Twist\nhidden\n" + indent + "\\:::\nstill hidden\n" +
-				indent + "\\::: spoiler Nested\nalso hidden\n:::"
+			expectedMarkdown := "::: spoiler Twist\nhidden \\\n" + indent + "\\::: \\\nstill hidden \\\n" +
+				indent + "\\::: spoiler Nested \\\nalso hidden\n:::"
 
 			markdown, content := buildTestNote(t, plaintext, []any{
 				testFacet(0, len(plaintext), testSpoilerFeature("Twist")),

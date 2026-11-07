@@ -81,6 +81,13 @@ func testHTMLText(root *html.Node) string {
 		if node.Type == html.TextNode {
 			text.WriteString(node.Data)
 		}
+		// Hard breaks go out as " \\\n", and the space before a <br> is
+		// invisible, so it is dropped from the visible text.
+		if node.Type == html.ElementNode && node.Data == "br" {
+			visible := strings.TrimRight(text.String(), " ")
+			text.Reset()
+			text.WriteString(visible)
+		}
 		for child := node.FirstChild; child != nil; child = child.NextSibling {
 			walk(child)
 		}

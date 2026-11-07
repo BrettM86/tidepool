@@ -135,8 +135,8 @@ func TestBuildNote_UnsafeInlineCodeRangesDegradeToPlaintext(t *testing.T) {
 			plaintext:        "before one*\ntwo after",
 			start:            len("before "),
 			end:              len("before one*\ntwo"),
-			expectedMarkdown: "before one\\*\ntwo after",
-			expectedHTML:     "<p>before one*\ntwo after</p>\n",
+			expectedMarkdown: "before one\\* \\\ntwo after",
+			expectedHTML:     "<p>before one*<br>\ntwo after</p>\n",
 		},
 	}
 

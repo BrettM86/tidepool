@@ -375,7 +375,7 @@ func TestBuildNote_IndentedCodeDetectionUsesWholeSourceLine(t *testing.T) {
 		{name: "four spaces before bold", plaintext: "    bold line", start: 4, end: 8,
 			expectedMarkdown: "&#32;   **bold** line", expectedHTML: "<p><strong>bold</strong> line</p>\n"},
 		{name: "tab before bold on later line", plaintext: "first\n\tbold line", start: 7, end: 11,
-			expectedMarkdown: "first\n&#9;**bold** line", expectedHTML: "<p>first\n\t<strong>bold</strong> line</p>\n"},
+			expectedMarkdown: "first \\\n&#9;**bold** line", expectedHTML: "<p>first<br>\n\t<strong>bold</strong> line</p>\n"},
 	}
 
 	for _, test := range tests {

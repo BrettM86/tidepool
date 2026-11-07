@@ -79,14 +79,14 @@ func TestBuildNote_InvalidHeadingFacetsRemainVisiblePlaintext(t *testing.T) {
 	t.Run("more than one line", func(t *testing.T) {
 		const (
 			multiline        = "first #\nsecond >"
-			expectedMarkdown = "first \\#\nsecond \\>"
+			expectedMarkdown = "first \\# \\\nsecond \\>"
 		)
 		markdown, content := buildTestNote(t, multiline, []any{
 			testFacet(0, len(multiline), testHeadingFeature(2)),
 		})
 
 		assert.Equal(t, expectedMarkdown, markdown)
-		assert.Equal(t, "<p>first #\nsecond &gt;</p>\n", content)
+		assert.Equal(t, "<p>first #<br>\nsecond &gt;</p>\n", content)
 		requireNoBlockElements(t, parseTestHTML(t, content))
 		requireNoBlockElements(t, parseRenderedMarkdown(t, markdown))
 	})
@@ -141,8 +141,8 @@ func TestBuildNote_BlockquoteFacetsRenderDefaultAndExactLevels(t *testing.T) {
 	t.Run("one multiline facet prefixes every line as one quote block", func(t *testing.T) {
 		const (
 			multiline        = "first > marker\nsecond # marker"
-			expectedMarkdown = "> first \\> marker\n> second \\# marker"
-			expectedHTML     = "<blockquote>\n<p>first &gt; marker\nsecond # marker</p>\n</blockquote>\n"
+			expectedMarkdown = "> first \\> marker \\\n> second \\# marker"
+			expectedHTML     = "<blockquote>\n<p>first &gt; marker<br>\nsecond # marker</p>\n</blockquote>\n"
 		)
 		expectedQuotes := []quoteBlockExpectation{{1, "first > marker\nsecond # marker"}}
 		requireQuoteBlocks(t, parseRenderedMarkdown(t, expectedMarkdown), expectedQuotes)
@@ -325,8 +325,8 @@ func TestBuildNote_DistinctAdjacentQuotesPreserveBlocksDepthAndDeterminism(t *te
 func TestBuildNote_IncompatibleBlockquoteRangesAllDegradeDeterministically(t *testing.T) {
 	const (
 		plaintext        = "alpha > marker\nbravo # marker\ncharlie * marker\ndelta _ marker"
-		expectedMarkdown = "alpha \\> marker\nbravo \\# marker\ncharlie \\* marker\ndelta \\_ marker"
-		expectedHTML     = "<p>alpha &gt; marker\nbravo # marker\ncharlie * marker\ndelta _ marker</p>\n"
+		expectedMarkdown = "alpha \\> marker \\\nbravo \\# marker \\\ncharlie \\* marker \\\ndelta \\_ marker"
+		expectedHTML     = "<p>alpha &gt; marker<br>\nbravo # marker<br>\ncharlie * marker<br>\ndelta _ marker</p>\n"
 	)
 	outer := testFacet(strings.Index(plaintext, "alpha")+1, strings.Index(plaintext, "charlie")+4,
 		testBlockquoteFeature(1))

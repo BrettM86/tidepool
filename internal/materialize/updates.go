@@ -271,9 +271,15 @@ func (m *Materializer) DeleteActor(ctx context.Context, apActorID string) error 
 		return fmt.Errorf("materialize: tombstone actor %s: %w", apActorID, err)
 	}
 	// Again after the flip (a vote can become a record between the first
-	// scrub and the flip), and before the #account frame.
+	// scrub and the flip), and before the #account frame. Best-effort: once
+	// the consent flip has committed, a retry stops at the already-deleted
+	// guard above, so returning here would mean the #account frame is never
+	// sent. Continuing is safe because the pre-flip scrub already erased the
+	// actor's vote rows, and the vote record sweeper deletes any vote record
+	// left behind for a voter who is no longer eligible.
 	if err := m.scrubActorVotes(ctx, apActorID); err != nil {
-		return err
+		m.logger.Warn("post-tombstone vote scrub failed; continuing to account event",
+			"ap_actor_id", apActorID, "error", err)
 	}
 	// AFTER the scrub commits and the consent flip, so the frame is the
 	// last thing a per-repo-ordered consumer sees. Emitted even when the

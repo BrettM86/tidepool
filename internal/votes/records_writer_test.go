@@ -636,3 +636,50 @@ func TestSweepCapsOpsPerCommit(t *testing.T) {
 	assert.Equal(t, 101, creates)
 	assert.Equal(t, map[string]int{"written": 101}, recordStates(t, w.db))
 }
+
+// optOutFirstCommitter opts alice out of bridging before delegating its first
+// call: the create it was handed was built while she was still eligible.
+type optOutFirstCommitter struct {
+	database *sql.DB
+	next     RecordCommitter
+	done     bool
+}
+
+func (c *optOutFirstCommitter) ApplyOpsTx(ctx context.Context, did string, ops []repo.RecordOp, sideEffect repo.TxSideEffect) (*repo.CommitResult, error) {
+	if !c.done {
+		c.done = true
+		if _, err := c.database.ExecContext(ctx,
+			`UPDATE bridged_actors SET consent_state = 'nobridge' WHERE ap_actor_id = $1`, voterAlice); err != nil {
+			return nil, err
+		}
+	}
+	return c.next.ApplyOpsTx(ctx, did, ops, sideEffect)
+}
+
+// An opt-out between the writer's read and its commit stops the create; the
+// next sweep scrubs the voter's rows.
+func TestOptOutBeforeTheRecordCommitStopsTheCreate(t *testing.T) {
+	w := newRecordsWorld(t, recordsBoth, withCommitter(func(w *recordsWorld, next RecordCommitter) RecordCommitter {
+		return &optOutFirstCommitter{database: w.db, next: next}
+	}))
+	ctx := context.Background()
+	w.eligibleVoter(t, voterAlice, aliceDID)
+	likeID := activityID(t, 1)
+
+	require.NoError(t, w.agg.ApplyVote(ctx, like(likeID, voterAlice, subjectPost), ""))
+
+	row := readVoteRow(t, w.db, likeID)
+	require.True(t, row.recordATURI.Valid, "the vote was marked for a record while alice was eligible")
+	path := recordPath(t, row.recordATURI.String)
+	assert.Empty(t, w.voteRecords(t, aliceDID), "no record lands for a voter who opted out mid-commit")
+	assert.Empty(t, opSeqs(t, w.db, aliceDID, path, repo.OpActionCreate), "the create never reaches the firehose")
+
+	require.NoError(t, w.writer.Sweep(ctx))
+
+	assert.Empty(t, w.voteRecords(t, aliceDID))
+	assert.Empty(t, opSeqs(t, w.db, aliceDID, path, repo.OpActionCreate))
+	var rows int
+	require.NoError(t, w.db.QueryRow(`SELECT COUNT(*) FROM vote_events WHERE voter_ap_id = $1`, voterAlice).Scan(&rows))
+	assert.Equal(t, 0, rows, "the scrub removes the opted-out voter's vote rows")
+	assertServed(t, w.db, subjectPost, 0, 0)
+}

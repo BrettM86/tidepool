@@ -42,13 +42,15 @@ const (
 	OriginNotFound OriginVerdict = "not_found"
 	// OriginExpired: still unavailable when the vote left the window. Final.
 	OriginExpired OriginVerdict = "expired"
-	// OriginUnavailable: timeout, network error, 429, 5xx or an unparseable
-	// body. Retried inside the window.
+	// OriginUnavailable: timeout, network error, 429, 5xx, an unparseable
+	// body or an egress refusal (the SSRF guard). Retried inside the window.
 	OriginUnavailable OriginVerdict = "unavailable"
 )
 
 // OriginVerifier checks a vote claim at the voter's origin. deferred means no
-// fetch slot was free (rate limit or host backoff); the verdict is then "".
+// fetch slot was free (rate limit or host backoff) or the caller's context
+// ended first (the inline 2s, the sweep's per-fetch deadline, shutdown); the
+// verdict is then "" and nothing is stored.
 type OriginVerifier interface {
 	Verify(ctx context.Context, claim VoteClaim) (verdict OriginVerdict, deferred bool)
 }
@@ -71,15 +73,20 @@ type OriginVerifierOptions struct {
 }
 
 const (
-	DefaultVerifyHostRPS   = 1
+	// DefaultVerifyHostRPS is the default fetch start rate per voter host.
+	DefaultVerifyHostRPS = 1
+	// DefaultVerifyGlobalRPS is the default fetch start rate over all hosts.
 	DefaultVerifyGlobalRPS = 5
-	DefaultVerifyTimeout   = 10 * time.Second
+	// DefaultVerifyTimeout is the default bound on one fetch; a caller's
+	// shorter deadline wins.
+	DefaultVerifyTimeout = 10 * time.Second
 
 	// A host that answered 'unavailable' is not fetched for originFirstBackoff,
-	// doubling per further failure up to originMaxBackoff; any definitive
-	// answer resets it.
-	originFirstBackoff = 30 * time.Second
-	originMaxBackoff   = 15 * time.Minute
+	// doubling per further failure (at most originMaxBackoffShift doublings)
+	// up to originMaxBackoff; any definitive answer resets it.
+	originFirstBackoff    = 30 * time.Second
+	originMaxBackoff      = 15 * time.Minute
+	originMaxBackoffShift = 5
 )
 
 // NewOriginVerifier builds the origin verifier. Non-positive options take the
@@ -87,6 +94,11 @@ const (
 func NewOriginVerifier(fetcher OriginFetcher, opts OriginVerifierOptions, logger *slog.Logger) (OriginVerifier, error) {
 	if fetcher == nil {
 		return nil, errors.NewValidationError("fetcher", "must not be nil")
+	}
+	if !fetcher.RefusesRedirects() {
+		// An open redirect on the voter's host could serve any document as
+		// the activity.
+		return nil, errors.NewValidationError("fetcher", "must refuse redirects")
 	}
 	if opts.HostRPS <= 0 {
 		opts.HostRPS = DefaultVerifyHostRPS
@@ -183,7 +195,7 @@ func (v *originVerifier) settle(host string, verdict OriginVerdict) {
 		h.failures, h.backoffUntil = 0, time.Time{}
 		return
 	}
-	backoff := originFirstBackoff << min(h.failures, 5)
+	backoff := originFirstBackoff << min(h.failures, originMaxBackoffShift)
 	h.failures++
 	h.backoffUntil = v.now().Add(min(backoff, originMaxBackoff))
 }

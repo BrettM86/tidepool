@@ -107,8 +107,8 @@ Outbound:
    `Delete(Actor)` tombstones their bridged repo. Bridged profiles carry a bio
    line naming the origin ("bridged from @alice@lemmy.world by Tidepool") and
    set `hostedBy` to the bridge's service DID.
-7. Inbound half superseded by decision 21: votes by bridged voters who already
-   have a repo become `feed.vote` records in it. The rest still holds for
+7. Partly superseded by decision 21 (its inbound half): verified votes by
+   bridged voters who already have a repo become `feed.vote` records in it. The rest still holds for
    every other inbound vote. Inbound Like and Dislike activities update
    bridge-side tallies (`internal/votes`). Tidepool exposes them two ways: it
    folds the counts onto the bridged post or comment record as the optional
@@ -484,8 +484,8 @@ is left with the Group-actor AP surface and the admission-policy wiring.
       need a remap decision from Coves and an old-to-new ledger; it is
       recorded in [FOLLOWUPS.md](FOLLOWUPS.md), and nothing depends on it.
 21. Inbound votes by bridged voters who already have a repo are
-    `social.coves.feed.vote` records in that repo. This supersedes decision 7's
-    inbound half.
+    `social.coves.feed.vote` records in that repo. This partly supersedes
+    decision 7 (its inbound half).
     - Who gets records: a Like or Dislike whose voter is a bridged person with
       consent `ok` and an existing repo, once the vote is verified at the
       voter's origin (below). The vote path never mints; a voter gets a repo
@@ -505,9 +505,11 @@ is left with the Group-actor AP surface and the admission-policy wiring.
       Phase 2 (`votes.RecordWriter.SyncVoter`): repin `bridgedStats` for each
       due subject first, then write the voter's creates and deletes in one
       repo commit whose side effect moves each row's state under a guard; any
-      guard miss rolls the whole commit back. Work commits in chunks of up to
-      100 ops, one repo commit each, and a subject's ops are never split
-      across chunks. The aggregate drop is visible
+      guard miss rolls the whole commit back. Work commits in chunks of at
+      most 100 ops, one repo commit each; a subject's ops stay in one chunk
+      unless that subject alone exceeds the cap. If a subject's create is held
+      back (its repin or mapping lookup failed), its delete waits too, so a
+      flip never commits half. The aggregate drop is visible
       before the record exists, so the visible error is a brief one-low, never
       a double count. `bridgedStats.asOf` is monotonic: a stamp older than the
       one the record carries is refused, so a stale sweep cannot re-add a
@@ -557,20 +559,28 @@ is left with the Group-actor AP surface and the admission-policy wiring.
       rounds of one vote per host for 80% of the interval, wall clock with
       fetch time included, so neither a slow nor a backed-off host can
       starve healthy ones. At the 1m default that is about 48 votes per host
-      and 240 in all per sweep (~69k/day per host, ~345k/day total), against
-      about 3.6k/day (busiest day ~5.1k) of lemmy.world votes by repo
-      voters. `tidepool_vote_verify_backlog`,
+      and 240 in all per sweep (~69k/day per host, ~345k/day total). As
+      measured on 2026-11-07, lemmy.world sent about 3.6k votes/day by repo
+      voters (busiest day ~5.1k). A sweep fetch is cut off after 3s (or the
+      budget left), so a tarpit host costs at most that per check.
+      `tidepool_vote_verify_backlog`,
       `tidepool_vote_verify_oldest_pending_seconds` and the
       `tidepool_vote_verify_verdicts` map report it; each sweep warns while the oldest unchecked vote is within min(1 day, window/4)
       of the window edge. Dry-run does not verify, so its conversion preview
-      shows 0.
+      counts only votes already verified.
     - A paced sweeper repairs outstanding work (pending creates, owed
       deletes), verifies, and converts eligible voters' verified aggregate
       votes (a verified vote at any age: a restored subject or a failed
       conversion converts without a refetch). That covers turning the switch
       on and voters who get a repo later, with no hook on minting, for votes
       still inside the window. It also scrubs record rows of voters who are
-      no longer eligible.
+      no longer eligible, and every row left of a voter who opted out or was
+      deleted.
+    - Native subjects. On a subject whose record is not in a repo hosted
+      here (native Coves content), there is no `bridgedStats` to repin:
+      Coves keeps serving the bridged count from its last poll. So there the
+      sweep never converts (or verifies) an already-counted vote, which stays
+      aggregate; only inline-verified votes, never counted, become records.
     - Switches, read at boot: `BRIDGED_VOTE_RECORDS=off|up|both` (default
       off), `BRIDGED_VOTE_RECORDS_DRY_RUN` (log only, mark and write nothing),
       `BRIDGED_VOTE_RECORDS_INTERVAL` (1m), `BRIDGED_VOTE_RECORDS_BATCH`

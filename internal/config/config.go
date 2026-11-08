@@ -268,7 +268,8 @@ type Config struct {
 	// #nobridge) always delete records.
 	BridgedVoteRecordsDryRun bool
 	// BridgedVoteRecordsInterval is how often the vote-record sweeper repairs
-	// outstanding record work and converts eligible voters' aggregate votes
+	// outstanding record work, verifies votes at their origin (for at most 80%
+	// of the interval) and converts eligible voters' verified aggregate votes
 	// (BRIDGED_VOTE_RECORDS_INTERVAL, a Go duration, default 1m, must be
 	// positive).
 	BridgedVoteRecordsInterval time.Duration

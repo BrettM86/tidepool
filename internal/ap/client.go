@@ -161,7 +161,7 @@ type ClientOptions struct {
 	// config.AllowPrivateAddresses. Tests that hit httptest servers on
 	// 127.0.0.1 set it true.
 	AllowPrivateAddresses bool
-	// NoRedirects makes every object fetch (FetchObjectSameAuthority
+	// NoRedirects makes every non-media fetch (FetchObjectSameAuthority
 	// included) refuse every redirect, same-authority hops included, without
 	// requesting the target. Media fetches are unaffected.
 	NoRedirects bool
@@ -375,8 +375,9 @@ func (c *Client) FetchObjectSameAuthority(ctx context.Context, iri string) (*Obj
 	return c.fetchObject(ctx, iri, fetchModeObjectPinnedAuthority)
 }
 
-// RefusesRedirects reports whether every object fetch refuses redirects.
-func (c *Client) RefusesRedirects() bool { return false }
+// RefusesRedirects reports whether every non-media fetch refuses redirects
+// (ClientOptions.NoRedirects).
+func (c *Client) RefusesRedirects() bool { return c.noRedirects }
 
 // SameAuthority reports whether two absolute URLs share scheme and host (the
 // authority). Exported so consumers that key storage on a fetched object's

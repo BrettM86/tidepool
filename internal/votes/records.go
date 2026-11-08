@@ -21,9 +21,10 @@ import (
 // Bridged vote records (PLAN.md decision 21). An eligible bridged voter's vote
 // is recorded in two phases, in this order:
 //
-//  1. The aggregator's vote transaction, under the subject's aggregate lock,
-//     marks the row pending (record_at_uri set) and recomputes — the served
-//     aggregate drops the vote at once.
+//  1. Once the vote is verified at the voter's origin (inline, or later by
+//     the sweep), a transaction under the subject's aggregate lock marks the
+//     row pending (record_at_uri set) and recomputes — the served aggregate
+//     drops the vote at once. An unverified vote never leaves the aggregate.
 //  2. RecordWriter.SyncVoter, with no aggregate lock held, repins the
 //     subject's bridgedStats and commits the record in the voter's repo.
 //
@@ -85,7 +86,8 @@ func (m RecordMode) allows(direction string) bool {
 
 // RecordWriterOptions are the switches. DryRun logs what would be recorded and
 // writes and marks nothing (ScrubVoter excepted: it always deletes). Interval
-// paces Run; Batch bounds the voters each of a Sweep's passes handles.
+// paces Run, and a sweep spends at most 80% of it verifying origins; Batch
+// bounds the voters each of a Sweep's passes handles.
 type RecordWriterOptions struct {
 	Mode     RecordMode
 	DryRun   bool
@@ -94,7 +96,7 @@ type RecordWriterOptions struct {
 	// Verifier checks each vote at the voter's origin before it may become a
 	// record (required unless Mode is off); Window bounds which votes are
 	// still checkable; VerifyBatch bounds a sweep's verification candidates;
-	// Sleep waits between verification rounds (the sweep's only clock).
+	// Sleep waits between verification rounds.
 	Verifier    OriginVerifier
 	Window      time.Duration
 	VerifyBatch int
@@ -157,6 +159,10 @@ const (
 	// inlineVerifyTimeout bounds the live path's origin fetch; a vote whose
 	// check runs out stays unchecked for the sweep.
 	inlineVerifyTimeout = 2 * time.Second
+	// sweepVerifyTimeout bounds one sweep fetch (or the budget left, if
+	// less), so a tarpit host costs at most this per check; the check is
+	// left unchecked for a later sweep.
+	sweepVerifyTimeout = 3 * time.Second
 )
 
 // Origin verification metrics. The gauges are recomputed each sweep; the
@@ -367,9 +373,10 @@ func voteClaim(activityID, voter, subject, direction string) VoteClaim {
 }
 
 // markIfEligible is phase 1's record decision for a just-inserted vote row,
-// inside the vote transaction: it stores the origin verdict (verifyLive's,
-// "" = none; the caller counts it once the transaction commits), and when the vote was verified, the voter is still eligible and
-// the mode allows the direction, the row becomes pending.
+// inside the vote transaction. It stores verifyLive's verdict ("" stores
+// nothing; the caller counts the verdict once the transaction commits). The
+// row becomes pending only when the vote was verified, the voter is still
+// eligible and the mode allows the direction.
 func (w *RecordWriter) markIfEligible(ctx context.Context, tx *sql.Tx, eventID int64, voter, direction, activityID string, createdAt time.Time, verdict OriginVerdict) (bool, error) {
 	if verdict != "" {
 		if _, err := tx.ExecContext(ctx, `
@@ -576,37 +583,64 @@ func (w *RecordWriter) commitChunk(ctx context.Context, voter string, eligible b
 		c.guards = append(c.guards, guard)
 		c.creates = c.creates || create
 	}
+	// A subject whose create is held back this round (refresh failure, a
+	// failed mapping lookup) holds back its deletes too: a flip's delete never
+	// commits without its create.
+	held := map[string]bool{}
+	for subject := range refreshFailed {
+		held[subject] = true
+	}
+	type parsedRow struct {
+		row       workRow
+		did, rkey string
+		mapping   *store.APObjectMapping
+	}
+	var parsed []parsedRow
 	var unmapped []workRow
 	for _, r := range chunk {
 		uri, err := syntax.ParseATURI(r.atURI)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("votes: vote %d record uri %q: %w", r.id, r.atURI, err))
+			if !r.undone {
+				held[r.subject] = true
+			}
 			continue
 		}
-		did, rkey := uri.Authority().String(), uri.RecordKey().String()
+		p := parsedRow{row: r, did: uri.Authority().String(), rkey: uri.RecordKey().String()}
+		if !r.undone {
+			if !eligible || held[r.subject] {
+				continue
+			}
+			mapping, err := w.objects.GetByAPID(ctx, r.subject)
+			if errors.IsNotFound(err) || (err == nil && mapping.IsDeleted()) {
+				// No subject to point at; a soft delete can be restored, so
+				// the vote is counted in the aggregate until then.
+				unmapped = append(unmapped, r)
+				continue
+			}
+			if err != nil {
+				errs = append(errs, fmt.Errorf("votes: resolve vote record subject %s: %w", r.subject, err))
+				held[r.subject] = true
+				continue
+			}
+			p.mapping = mapping
+		}
+		parsed = append(parsed, p)
+	}
+	for _, p := range parsed {
+		r := p.row
+		if held[r.subject] {
+			continue
+		}
 		if r.undone {
-			add(did, repo.RecordOp{Action: repo.OpActionDelete, Collection: voteRecordCollection, RKey: rkey},
+			add(p.did, repo.RecordOp{Action: repo.OpActionDelete, Collection: voteRecordCollection, RKey: p.rkey},
 				stateGuard{id: r.id, from: recordWritten, to: recordRemoved, undone: sql.NullBool{Bool: true, Valid: true}}, false)
 			continue
 		}
-		if !eligible || refreshFailed[r.subject] {
-			continue
-		}
-		mapping, err := w.objects.GetByAPID(ctx, r.subject)
-		if errors.IsNotFound(err) || (err == nil && mapping.IsDeleted()) {
-			// No subject to point at; a soft delete can be restored, so the
-			// vote is counted in the aggregate until then.
-			unmapped = append(unmapped, r)
-			continue
-		}
-		if err != nil {
-			errs = append(errs, fmt.Errorf("votes: resolve vote record subject %s: %w", r.subject, err))
-			continue
-		}
-		add(did, repo.RecordOp{Action: repo.OpActionCreate, Collection: voteRecordCollection, RKey: rkey,
+		add(p.did, repo.RecordOp{Action: repo.OpActionCreate, Collection: voteRecordCollection, RKey: p.rkey,
 			Record: map[string]any{
 				"$type":     voteRecordCollection,
-				"subject":   map[string]any{"uri": mapping.ATURI, "cid": mapping.CID},
+				"subject":   map[string]any{"uri": p.mapping.ATURI, "cid": p.mapping.CID},
 				"direction": r.direction,
 				"createdAt": r.createdAt.UTC().Format("2006-01-02T15:04:05.000Z"),
 			}},
@@ -829,12 +863,13 @@ func (w *RecordWriter) runSweep(ctx context.Context) {
 }
 
 // Sweep runs repair (eligible voters with outstanding work) and scrub (voters
-// holding record rows who are no longer eligible), each over up to Batch
-// voters, then — unless the mode is off — origin verification (votes inside
-// the window, oldest first, within a time budget) and conversion of up to
+// holding record rows who are no longer eligible, and opted-out or deleted
+// voters with any rows left), each over up to Batch voters, then — unless the
+// mode is off — origin verification (verifyOrigins) and conversion of up to
 // Batch voters' verified live unrecorded votes in an allowed direction on a
-// live subject (a verified vote at any age: verified is final). In dry-run it
-// logs what it would do and touches nothing.
+// live subject hosted here (a verified vote at any age: verified is final).
+// In dry-run it logs what it would do and touches nothing; it previews only
+// already-verified conversions.
 func (w *RecordWriter) Sweep(ctx context.Context) error {
 	upOnly := w.mode == RecordsUp
 	// $1 limit, $2/$3 the voter window (sweepVoters), $4 upOnly.
@@ -842,14 +877,25 @@ func (w *RecordWriter) Sweep(ctx context.Context) error {
 		SELECT DISTINCT e.voter_ap_id FROM vote_events e
 		WHERE e.record_state IN ('pending', 'written') AND (e.record_state = 'pending' OR e.undone)
 		  AND ` + eligibleVoterSQL + voterWindowSQL
+	// Scrub: voters holding record rows who are no longer eligible, and
+	// voters who opted out or were deleted while any row of theirs is left (a
+	// scrub that failed after its record deletes leaves live 'removed' rows
+	// nothing else revisits). Never a voter merely for having no repo.
 	scrubQuery := `
-		SELECT DISTINCT e.voter_ap_id FROM vote_events e
-		WHERE e.record_state IN ('pending', 'written') AND NOT ` + eligibleVoterSQL + voterWindowSQL
+		SELECT DISTINCT e.voter_ap_id FROM (
+			SELECT e.voter_ap_id FROM vote_events e
+			WHERE e.record_state IN ('pending', 'written') AND NOT ` + eligibleVoterSQL + `
+			UNION
+			SELECT ba.ap_actor_id FROM bridged_actors ba
+			WHERE ba.consent_state IN ('nobridge', 'deleted')
+			  AND EXISTS (SELECT 1 FROM vote_events v WHERE v.voter_ap_id = ba.ap_actor_id)
+		) e
+		WHERE TRUE` + voterWindowSQL
 	convertQuery := `
 		SELECT DISTINCT e.voter_ap_id FROM vote_events e
 		WHERE NOT e.undone AND e.record_at_uri IS NULL AND e.origin_check = 'verified'
 		  AND (NOT $4 OR e.direction = 'up')
-		  AND ` + liveSubjectSQL + `
+		  AND ` + hostedSubjectSQL + `
 		  AND ` + eligibleVoterSQL + voterWindowSQL
 
 	if w.dryRun {
@@ -927,10 +973,16 @@ const voterWindowSQL = `
 		  AND e.voter_ap_id > $2 AND ($3::text IS NULL OR e.voter_ap_id <= $3)
 		ORDER BY 1 LIMIT $1`
 
-// liveSubjectSQL holds for a vote_events row (alias e) whose subject mapping
-// exists and is not soft-deleted.
-const liveSubjectSQL = `EXISTS (
-	SELECT 1 FROM ap_objects o WHERE o.ap_id = e.subject_ap_id AND o.deleted_at IS NULL)`
+// hostedSubjectSQL holds for a vote_events row (alias e) whose subject
+// mapping exists, is not soft-deleted, and whose record is in a repo hosted
+// here. Only such a subject's bridgedStats can be repinned,
+// so only there may the sweep convert an already-counted vote: on a native
+// Coves subject Coves keeps serving the bridged count from its last poll and
+// the record would double-count. Native subjects get records only from
+// inline-verified votes, which were never counted.
+const hostedSubjectSQL = `EXISTS (
+	SELECT 1 FROM ap_objects o JOIN repo_state rs ON rs.did = o.did
+	WHERE o.ap_id = e.subject_ap_id AND o.deleted_at IS NULL)`
 
 // sweepVoters returns up to Batch voters of one sweep query, starting after
 // *cursor and wrapping to the start, and moves *cursor to the last one.
@@ -1049,7 +1101,7 @@ func (w *RecordWriter) convertibleVotes(ctx context.Context, voter string, upOnl
 		SELECT e.id, e.subject_ap_id, e.activity_id, e.created_at FROM vote_events e
 		WHERE e.voter_ap_id = $1 AND NOT e.undone AND e.record_at_uri IS NULL AND e.origin_check = 'verified'
 		  AND (NOT $2 OR e.direction = 'up')
-		  AND `+liveSubjectSQL+`
+		  AND `+hostedSubjectSQL+`
 		ORDER BY e.subject_ap_id, e.id
 		LIMIT $3`, voter, upOnly, maxRecordOpsPerCommit)
 	if err != nil {
@@ -1089,7 +1141,7 @@ const verifyCandidateSQL = `
 		       OR (e.origin_check = 'unavailable' AND e.origin_checked_at < now() - make_interval(secs => $2)))
 		  AND e.created_at > now() - make_interval(secs => $1)
 		  AND (NOT $3 OR e.direction = 'up')
-		  AND ` + liveSubjectSQL + `
+		  AND ` + hostedSubjectSQL + `
 		  AND ` + eligibleVoterSQL + `
 	) c
 	WHERE n <= $4
@@ -1143,7 +1195,7 @@ func (w *RecordWriter) verifyOrigins(ctx context.Context, upOnly bool) (err erro
 				return nil
 			}
 			c := queue[0]
-			fetchCtx, cancel := context.WithTimeout(ctx, left)
+			fetchCtx, cancel := context.WithTimeout(ctx, min(sweepVerifyTimeout, left))
 			verdict, deferred := w.verifier.Verify(fetchCtx, c.claim)
 			cancel()
 			if deferred {
@@ -1167,7 +1219,7 @@ func (w *RecordWriter) verifyOrigins(ctx context.Context, upOnly bool) (err erro
 }
 
 // verifyQueues reads the verification queue grouped by voter host, hosts in
-// order of their oldest vote.
+// order of their first queued vote.
 func (w *RecordWriter) verifyQueues(ctx context.Context, upOnly bool) ([][]verifyCandidate, error) {
 	rows, err := w.db.QueryContext(ctx, verifyCandidateSQL,
 		w.window.Seconds(), verifyRetryAfter.Seconds(), upOnly, verifyPerHost, w.verifyMax)
@@ -1258,7 +1310,7 @@ func (w *RecordWriter) reportVerifyBacklog(ctx context.Context, upOnly bool) err
 		  AND (e.origin_check IS NULL OR e.origin_check = 'unavailable')
 		  AND e.created_at > now() - make_interval(secs => $1)
 		  AND (NOT $2 OR e.direction = 'up')
-		  AND `+liveSubjectSQL+`
+		  AND `+hostedSubjectSQL+`
 		  AND `+eligibleVoterSQL, w.window.Seconds(), upOnly).Scan(&backlog, &oldest); err != nil {
 		return fmt.Errorf("votes: count origin check backlog: %w", err)
 	}

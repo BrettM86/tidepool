@@ -553,7 +553,7 @@ func run(logger *slog.Logger) error {
 	originVerifier, err := votes.NewOriginVerifier(originClient, votes.OriginVerifierOptions{
 		HostRPS:   cfg.BridgedVoteVerifyHostRPS,
 		GlobalRPS: cfg.BridgedVoteVerifyGlobalRPS,
-		Timeout:   10 * time.Second,
+		Timeout:   votes.DefaultVerifyTimeout,
 	}, logger)
 	if err != nil {
 		return err

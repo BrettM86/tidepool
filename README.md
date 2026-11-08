@@ -68,9 +68,9 @@ matches; the `Announce` signs only the community. Votes older than
 `BRIDGED_VOTE_VERIFY_WINDOW` (default 144h, under 168h) are not checked and
 stay in the aggregate. Fetches are paced by `BRIDGED_VOTE_VERIFY_HOST_RPS`
 (default 1) and `BRIDGED_VOTE_VERIFY_GLOBAL_RPS` (default 5), and each sweep
-reads up to `BRIDGED_VOTE_VERIFY_BATCH` (default 300) unchecked votes, about
-240 of which it can check in the 1m default interval. Dry-run does not verify,
-so it previews no conversions.
+reads up to `BRIDGED_VOTE_VERIFY_BATCH` (default 300) unchecked or retryable
+votes, about 48 per voter host and 240 in all per 1m sweep. Dry-run does not
+verify, so it previews only already-verified votes.
 
 **Outbound.** With the consumer on, Tidepool reads native Coves activity from
 Jetstream, translates it to ActivityPub, and queues deliveries to the

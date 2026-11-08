@@ -3,9 +3,10 @@
 // aggregate counts served over one sanctioned side-channel XRPC,
 // social.coves.bridge.getVoteAggregates — except an eligible bridged voter's
 // vote (a bridged person with consent ok and a repo, in a direction
-// BRIDGED_VOTE_RECORDS allows), which leaves the served aggregate at once and
-// which RecordWriter then commits as a social.coves.feed.vote record in the
-// voter's repo.
+// BRIDGED_VOTE_RECORDS allows) once it is verified at the voter's origin: it
+// then leaves the served aggregate and RecordWriter commits it as a
+// social.coves.feed.vote record in the voter's repo. An unverified vote stays
+// in the aggregate.
 //
 // The counting model: AP vote delivery is a stream of per-voter state
 // changes, not increments. Voters flip votes (Like → Undo{Like} → Dislike),
@@ -436,9 +437,14 @@ func (a *Aggregator) RetractVote(ctx context.Context, vote *ap.Object, community
 	}
 
 	if communityIRI != "" {
-		mapping, err := a.subjectMapping(ctx, subject)
+		// A soft-deleted mapping still binds: a recorded vote on deleted
+		// content must still be retracted, or its record stays forever.
+		mapping, err := a.objects.GetByAPID(ctx, subject)
+		if errors.IsNotFound(err) {
+			mapping, err = nil, nil
+		}
 		if err != nil {
-			return err
+			return fmt.Errorf("votes: resolve subject %s: %w", subject, err)
 		}
 		if mapping == nil {
 			a.logger.Debug("vote retraction dropped: subject not bridged",

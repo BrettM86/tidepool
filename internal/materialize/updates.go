@@ -223,10 +223,11 @@ func (m *Materializer) scrubActorVotes(ctx context.Context, apActorID string) er
 // the consent state is marked deleted (terminal), freezing the repo, the
 // votes are scrubbed again — and an #account{active:false, status:"deleted"} event is
 // appended to the firehose so subscribers (relays above all) purge the repo
-// instead of inferring its death from the delete commits. The order means a
-// crash between any two steps re-runs cleanly: deletes and vote scrubs are
-// idempotent, re-tombstoning is a no-op success, and the final account
-// event still lands.
+// instead of inferring its death from the delete commits. A crash before the
+// consent flip re-runs cleanly: deletes and vote scrubs are idempotent and
+// re-tombstoning is a no-op success. After the flip a re-run stops at the
+// already-deleted guard, so a crash there loses the account event; the vote
+// record sweep scrubs any vote rows left.
 func (m *Materializer) DeleteActor(ctx context.Context, apActorID string) error {
 	actor, err := m.actors.GetByAPActorID(ctx, apActorID)
 	if errors.IsNotFound(err) {

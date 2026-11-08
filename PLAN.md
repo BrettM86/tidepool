@@ -575,7 +575,9 @@ is left with the Group-actor AP surface and the admission-policy wiring.
       on and voters who get a repo later, with no hook on minting, for votes
       still inside the window. It also scrubs record rows of voters who are
       no longer eligible, and every row left of a voter who opted out or was
-      deleted.
+      deleted while any of their rows still holds record state (a live row
+      that is or was a record, or a row still owed a delete); a left voter
+      with only plain aggregate rows keeps those votes counted.
     - Native subjects. On a subject whose record is not in a repo hosted
       here (native Coves content), there is no `bridgedStats` to repin:
       Coves keeps serving the bridged count from its last poll. So there the

@@ -864,10 +864,11 @@ func (w *RecordWriter) runSweep(ctx context.Context) {
 
 // Sweep runs repair (eligible voters with outstanding work) and scrub (voters
 // holding record rows who are no longer eligible, and opted-out or deleted
-// voters with any rows left), each over up to Batch voters, then — unless the
-// mode is off — origin verification (verifyOrigins) and conversion of up to
-// Batch voters' verified live unrecorded votes in an allowed direction on a
-// live subject hosted here (a verified vote at any age: verified is final).
+// voters with a row still holding record state), each over up to Batch
+// voters, then — unless the mode is off — origin verification
+// (verifyOrigins) and conversion of up to Batch voters' verified live
+// unrecorded votes in an allowed direction on a live subject hosted here (a
+// verified vote at any age: verified is final).
 // In dry-run it logs what it would do and touches nothing; it previews only
 // already-verified conversions.
 func (w *RecordWriter) Sweep(ctx context.Context) error {
@@ -878,9 +879,12 @@ func (w *RecordWriter) Sweep(ctx context.Context) error {
 		WHERE e.record_state IN ('pending', 'written') AND (e.record_state = 'pending' OR e.undone)
 		  AND ` + eligibleVoterSQL + voterWindowSQL
 	// Scrub: voters holding record rows who are no longer eligible, and
-	// voters who opted out or were deleted while any row of theirs is left (a
-	// scrub that failed after its record deletes leaves live 'removed' rows
-	// nothing else revisits). Never a voter merely for having no repo.
+	// voters who opted out or were deleted while a row of theirs still holds
+	// record state: a live row that is or was a record, or a row still owed a
+	// delete (a scrub that failed after its record deletes leaves live
+	// 'removed' rows nothing else revisits). A left voter whose rows are all
+	// plain aggregate rows keeps them counted. Never a voter merely for
+	// having no repo.
 	scrubQuery := `
 		SELECT DISTINCT e.voter_ap_id FROM (
 			SELECT e.voter_ap_id FROM vote_events e
@@ -888,7 +892,9 @@ func (w *RecordWriter) Sweep(ctx context.Context) error {
 			UNION
 			SELECT ba.ap_actor_id FROM bridged_actors ba
 			WHERE ba.consent_state IN ('nobridge', 'deleted')
-			  AND EXISTS (SELECT 1 FROM vote_events v WHERE v.voter_ap_id = ba.ap_actor_id)
+			  AND EXISTS (SELECT 1 FROM vote_events v WHERE v.voter_ap_id = ba.ap_actor_id
+			    AND v.record_at_uri IS NOT NULL
+			    AND (NOT v.undone OR v.record_state IN ('pending', 'written')))
 		) e
 		WHERE TRUE` + voterWindowSQL
 	convertQuery := `

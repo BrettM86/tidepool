@@ -99,6 +99,9 @@ type RecordWriterOptions struct {
 	Window      time.Duration
 	VerifyBatch int
 	Sleep       func(ctx context.Context, d time.Duration) error
+	// Now is the sweep's clock for its verification budget (default
+	// time.Now); tests pass the verifier's clock.
+	Now func() time.Time
 }
 
 // RecordCommitter is the slice of *repo.Manager the writer commits through.

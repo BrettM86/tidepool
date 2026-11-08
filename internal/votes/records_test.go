@@ -62,6 +62,7 @@ type recordsWorld struct {
 	trusting *trustingVerifier
 	verifier OriginVerifier
 	sleep    func(ctx context.Context, d time.Duration) error
+	now      func() time.Time
 	logger   *slog.Logger
 }
 
@@ -103,6 +104,7 @@ type writerSeams struct {
 	refresher SubjectRefresher
 	verifier  OriginVerifier
 	sleep     func(ctx context.Context, d time.Duration) error
+	now       func() time.Time
 	logger    *slog.Logger
 }
 
@@ -119,11 +121,12 @@ func withRefresher(build func(w *recordsWorld) SubjectRefresher) recordsWorldOpt
 }
 
 // withOrigin replaces the trusting verifier with verifier, and the writer's
-// sleep with the clock's (the clock the verifier reads).
+// sleep and clock with the clock's (the clock the verifier reads).
 func withOrigin(verifier OriginVerifier, clock *fakeClock) recordsWorldOption {
 	return func(_ *recordsWorld, seams *writerSeams) {
 		seams.verifier = verifier
 		seams.sleep = clock.Sleep
+		seams.now = clock.Now
 	}
 }
 
@@ -149,7 +152,7 @@ func newRecordsWorld(t *testing.T, opts RecordWriterOptions, options ...recordsW
 	for _, option := range options {
 		option(w, &seams)
 	}
-	w.verifier, w.sleep, w.logger = seams.verifier, seams.sleep, seams.logger
+	w.verifier, w.sleep, w.now, w.logger = seams.verifier, seams.sleep, seams.now, seams.logger
 	writer, err := NewRecordWriter(database, seams.committer, objects, seams.refresher, w.withSeams(opts), seams.logger)
 	require.NoError(t, err)
 	agg.SetRecordWriter(writer)
@@ -158,14 +161,17 @@ func newRecordsWorld(t *testing.T, opts RecordWriterOptions, options ...recordsW
 	return w
 }
 
-// withSeams fills the options' verifier and sleep with the world's unless the
-// test set them.
+// withSeams fills the options' verifier, sleep and clock with the world's
+// unless the test set them.
 func (w *recordsWorld) withSeams(opts RecordWriterOptions) RecordWriterOptions {
 	if opts.Verifier == nil {
 		opts.Verifier = w.verifier
 	}
 	if opts.Sleep == nil {
 		opts.Sleep = w.sleep
+	}
+	if opts.Now == nil {
+		opts.Now = w.now
 	}
 	return opts
 }
@@ -451,6 +457,8 @@ func TestVotesThatStayAggregate(t *testing.T) {
 			row := readVoteRow(t, w.db, id)
 			assert.False(t, row.recordATURI.Valid, "record_at_uri must be NULL")
 			assert.False(t, row.recordState.Valid, "record_state must be NULL")
+			assert.Equal(t, 0, w.trusting.asked(id), "a vote that cannot become a record is not checked at origin")
+			assert.Equal(t, originCheck{}, readOriginCheck(t, w.db, id), "no origin verdict is stored")
 			up, down, found := counts(t, w.db, subjectPost)
 			require.True(t, found)
 			assert.Equal(t, tc.wantUp, up)
@@ -550,6 +558,7 @@ func TestRedeliveredRecordedLikeCommitsNothing(t *testing.T) {
 
 	assert.Len(t, w.voteRecords(t, aliceDID), 1)
 	assert.Equal(t, commits, firehoseEvents(t, w.db, aliceDID), "re-delivery commits nothing")
+	assert.Equal(t, 1, w.trusting.asked(id), "a re-delivery is not checked at origin again")
 }
 
 // B6.

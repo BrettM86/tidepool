@@ -53,19 +53,26 @@ func (c *fakeClock) Sleep(ctx context.Context, d time.Duration) error {
 }
 
 // originAnswer is what the fake origin returns for one IRI. blockUntilDone
-// waits for the fetch context to end (a hung origin).
+// waits for the fetch context to end (a hung origin). release, when set, holds
+// the fetch until it is closed (whatever the context), after signalling
+// started.
 type originAnswer struct {
 	object         *ap.Object
 	err            error
 	blockUntilDone bool
+	started        chan<- struct{}
+	release        <-chan struct{}
 }
 
 // fakeOrigin is an in-process OriginFetcher: IRIs it was told to serve answer
-// as configured, any other IRI is a 404. It counts fetches per IRI.
+// as configured, any other IRI is a 404. It counts fetches per IRI. onFetch,
+// when set, runs at the start of every fetch (a slow origin advances the
+// test's clock).
 type fakeOrigin struct {
 	mu      sync.Mutex
 	answers map[string]originAnswer
 	hits    map[string]int
+	onFetch func()
 }
 
 func newFakeOrigin() *fakeOrigin {
@@ -116,7 +123,17 @@ func (o *fakeOrigin) FetchObjectSameAuthority(ctx context.Context, iri string) (
 	o.mu.Lock()
 	o.hits[iri]++
 	a, ok := o.answers[iri]
+	onFetch := o.onFetch
 	o.mu.Unlock()
+	if onFetch != nil {
+		onFetch()
+	}
+	if a.release != nil {
+		if a.started != nil {
+			a.started <- struct{}{}
+		}
+		<-a.release
+	}
 	if !ok {
 		return nil, errors.NewNotFoundError("activity", iri)
 	}
@@ -191,7 +208,23 @@ func TestOriginVerifierVerdicts(t *testing.T) {
 				a.ID = ""
 				o.answer(c.ActivityID, originAnswer{object: a})
 			},
-			want: OriginVerified, wantFetches: 1},
+			want: OriginMismatch, wantFetches: 1},
+		{name: "activities path in upper case",
+			claim:  VoteClaim{ActivityID: "https://lemmy.world/Activities/Like/1", Actor: honest.Actor, Object: honest.Object, Type: ap.TypeLike},
+			origin: func(o *fakeOrigin, c VoteClaim) { o.serve(c) },
+			want:   OriginVerified, wantFetches: 1},
+		{name: "activity id with a query",
+			claim:  VoteClaim{ActivityID: honest.ActivityID + "?q=1", Actor: honest.Actor, Object: honest.Object, Type: ap.TypeLike},
+			origin: func(o *fakeOrigin, c VoteClaim) { o.serve(c) },
+			want:   OriginMismatch, wantFetches: 0},
+		{name: "activity id with a fragment",
+			claim:  VoteClaim{ActivityID: honest.ActivityID + "#main", Actor: honest.Actor, Object: honest.Object, Type: ap.TypeLike},
+			origin: func(o *fakeOrigin, c VoteClaim) { o.serve(c) },
+			want:   OriginMismatch, wantFetches: 0},
+		{name: "activity id outside the activities path",
+			claim:  VoteClaim{ActivityID: "https://lemmy.world/files/abc", Actor: honest.Actor, Object: honest.Object, Type: ap.TypeLike},
+			origin: func(o *fakeOrigin, c VoteClaim) { o.serve(c) },
+			want:   OriginMismatch, wantFetches: 0},
 		{name: "activity id host differs from the actor host",
 			claim:  VoteClaim{ActivityID: "https://evil.example/activities/like/1", Actor: honest.Actor, Object: honest.Object, Type: ap.TypeLike},
 			origin: func(o *fakeOrigin, c VoteClaim) { o.serve(c) },
@@ -222,9 +255,14 @@ func TestOriginVerifierVerdicts(t *testing.T) {
 			want: OriginMismatch, wantFetches: 1},
 		{name: "off-host redirect", claim: honest,
 			origin: func(o *fakeOrigin, c VoteClaim) {
-				o.fail(c, errors.NewValidationError("iri", "redirected to another authority"))
+				o.fail(c, errors.NewValidationError("redirect", "redirected to another authority"))
 			},
 			want: OriginMismatch, wantFetches: 1},
+		{name: "egress guard refuses the address", claim: honest,
+			origin: func(o *fakeOrigin, c VoteClaim) {
+				o.fail(c, errors.NewValidationError("address", "resolves to a private address"))
+			},
+			want: OriginUnavailable, wantFetches: 1},
 		{name: "not found", claim: honest,
 			origin: func(o *fakeOrigin, c VoteClaim) { o.fail(c, errors.NewNotFoundError("activity", c.ActivityID)) },
 			want:   OriginNotFound, wantFetches: 1},
@@ -381,5 +419,45 @@ func TestOriginVerifierAdmission(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// O1: the host backoff doubles per further failure and resets after any
+// definitive answer.
+func TestOriginVerifierBackoffDoublesAndResets(t *testing.T) {
+	ctx := context.Background()
+	origin, clock := newFakeOrigin(), newFakeClock()
+	verifier := newTestVerifier(t, origin, clock, 1, 5)
+	down := func(c VoteClaim) { origin.fail(c, ap.HTTPError{URL: c.ActivityID, StatusCode: 503}) }
+	type step struct {
+		advance      time.Duration
+		claim        VoteClaim
+		down         bool
+		wantDeferred bool
+		want         OriginVerdict
+	}
+	steps := []step{
+		{claim: claimOn("lemmy.ml", 1), down: true, want: OriginUnavailable},
+		// The first backoff (30s) has passed: a second failure.
+		{advance: 31 * time.Second, claim: claimOn("lemmy.ml", 2), down: true, want: OriginUnavailable},
+		// The second backoff is 60s.
+		{advance: 31 * time.Second, claim: claimOn("lemmy.ml", 3), wantDeferred: true},
+		{advance: 30 * time.Second, claim: claimOn("lemmy.ml", 3), want: OriginVerified},
+		// The verified answer reset the backoff: the next failure backs off 30s.
+		{advance: time.Second, claim: claimOn("lemmy.ml", 4), down: true, want: OriginUnavailable},
+		{advance: 31 * time.Second, claim: claimOn("lemmy.ml", 5), want: OriginVerified},
+	}
+	for i, s := range steps {
+		if s.down {
+			down(s.claim)
+		} else {
+			origin.serve(s.claim)
+		}
+		clock.Advance(s.advance)
+
+		verdict, deferred := verifier.Verify(ctx, s.claim)
+
+		assert.Equal(t, s.wantDeferred, deferred, "step %d", i)
+		assert.Equal(t, s.want, verdict, "step %d", i)
 	}
 }

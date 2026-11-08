@@ -491,3 +491,290 @@ func TestVerifiedVoteReturnedToTheAggregateConvertsWithoutRefetch(t *testing.T) 
 		})
 	}
 }
+
+// voterOn is the n-th bridged test voter on host: its AP id and DID.
+func voterOn(host string, n int) (apID, did string) {
+	return fmt.Sprintf("https://%s/u/voter%d", host, n), fmt.Sprintf("did:plc:recordshost%02d00000000000", n)
+}
+
+// countOriginChecks counts vote_events rows holding verdict.
+func countOriginChecks(t *testing.T, database *sql.DB, verdict string) int {
+	t.Helper()
+	var n int
+	require.NoError(t, database.QueryRow(`
+		SELECT COUNT(*) FROM vote_events WHERE origin_check = $1`, verdict).Scan(&n))
+	return n
+}
+
+// O5: the sweep's verification budget is wall-clock: time spent fetching
+// counts, not only the pauses between rounds.
+func TestSweepVerificationBudgetCountsFetchTime(t *testing.T) {
+	// A one-minute interval is a 48s budget; every fetch takes 10s.
+	opts := RecordWriterOptions{Mode: RecordsBoth, Interval: time.Minute, Batch: 20}
+	w, origin, clock := originWorld(t, opts, 1, 100)
+	ctx := context.Background()
+	const hosts = 10
+	dids := make([]string, hosts)
+	for i := range hosts {
+		host := fmt.Sprintf("lemmy%d.example", i)
+		voter, did := voterOn(host, i)
+		dids[i] = did
+		w.bridgedVoter(t, voter, did, store.ConsentStateOK, false)
+		id, subject := voteIDOn(t, host, i), w.verifySubject(t, i)
+		origin.serve(likeClaim(id, voter, subject))
+		require.NoError(t, w.agg.ApplyVote(ctx, like(id, voter, subject), ""))
+	}
+	for _, did := range dids {
+		w.giveRepo(t, did)
+	}
+	origin.mu.Lock()
+	origin.onFetch = func() { clock.Advance(10 * time.Second) }
+	origin.mu.Unlock()
+
+	require.NoError(t, w.writer.Sweep(ctx))
+
+	assert.Equal(t, 5, origin.totalFetches(), "fetches starting at 0s, 10s, 20s, 30s and 40s fit a 48s budget")
+	assert.Equal(t, 5, countOriginChecks(t, w.db, "verified"))
+	assert.Equal(t, 5, uncheckedCandidates(t, w.db), "the rest stay unchecked")
+
+	require.NoError(t, w.writer.Sweep(ctx))
+
+	assert.Equal(t, 10, origin.totalFetches())
+	assert.Equal(t, 10, countOriginChecks(t, w.db, "verified"), "the next sweep verifies the rest")
+	for _, did := range dids {
+		assert.Len(t, w.voteRecords(t, did), 1, "%s's records", did)
+	}
+}
+
+// O5: candidates are selected round-robin across voter hosts, so hosts with
+// many old candidates cannot fill the batch.
+func TestSweepSelectsCandidatesAcrossHosts(t *testing.T) {
+	opts := RecordWriterOptions{Mode: RecordsBoth, Interval: time.Minute, Batch: 20, VerifyBatch: 6}
+	w, origin, _ := originWorld(t, opts, 1, 100)
+	ctx := context.Background()
+	var dids []string
+	n := 0
+	for i := range 5 {
+		host := fmt.Sprintf("stalled%d.example", i)
+		voter, did := voterOn(host, i)
+		dids = append(dids, did)
+		w.bridgedVoter(t, voter, did, store.ConsentStateOK, false)
+		for j := range 3 {
+			id, subject := voteIDOn(t, host, n), w.verifySubject(t, n)
+			origin.fail(likeClaim(id, voter, subject), ap.HTTPError{URL: id, StatusCode: 503})
+			require.NoError(t, w.agg.ApplyVote(ctx, like(id, voter, subject), ""))
+			ageVote(t, w.db, id, 5*24*time.Hour-time.Duration(i)*time.Hour-time.Duration(j)*time.Minute)
+			n++
+		}
+	}
+	w.bridgedVoter(t, voterAlice, aliceDID, store.ConsentStateOK, false)
+	healthy, subject := activityID(t, n), w.verifySubject(t, n)
+	origin.serve(likeClaim(healthy, voterAlice, subject))
+	require.NoError(t, w.agg.ApplyVote(ctx, like(healthy, voterAlice, subject), ""))
+	ageVote(t, w.db, healthy, time.Hour)
+	for _, did := range append(dids, aliceDID) {
+		w.giveRepo(t, did)
+	}
+
+	require.NoError(t, w.writer.Sweep(ctx))
+
+	assert.Equal(t, verdict("verified"), readOriginCheck(t, w.db, healthy).verdict, "the healthy host's newer vote is selected")
+	assert.Equal(t, written(), readVoteRow(t, w.db, healthy).recordState)
+	assert.Len(t, w.voteRecords(t, aliceDID), 1)
+	assertServed(t, w.db, subject, 0, 0)
+}
+
+// O5: a host's never-checked votes go before its retryable 'unavailable'
+// ones, so one failing activity does not block the host's fresh votes.
+func TestSweepChecksFreshVotesBeforeRetryingUnavailableOnes(t *testing.T) {
+	// One fetch per 25s on the host: two fit a 48s budget.
+	w, origin, _ := originWorld(t, recordsBoth, 0.04, 100)
+	ctx := context.Background()
+	w.bridgedVoter(t, voterDave, daveDID, store.ConsentStateOK, false)
+	type vote struct {
+		id          string
+		age         time.Duration
+		down        bool
+		wantVerdict string
+		wantRecord  bool
+	}
+	votes := []vote{
+		{id: voteIDOn(t, "lemmy.ml", 1), age: time.Hour, down: true, wantVerdict: "unavailable"},
+		{id: voteIDOn(t, "lemmy.ml", 2), age: 30 * time.Minute, wantVerdict: "verified", wantRecord: true},
+		{id: voteIDOn(t, "lemmy.ml", 3), age: 20 * time.Minute, wantVerdict: "verified", wantRecord: true},
+	}
+	subjects := make([]string, len(votes))
+	for i, v := range votes {
+		subjects[i] = w.verifySubject(t, i)
+		claim := likeClaim(v.id, voterDave, subjects[i])
+		if v.down {
+			origin.fail(claim, ap.HTTPError{URL: v.id, StatusCode: 503})
+		} else {
+			origin.serve(claim)
+		}
+		require.NoError(t, w.agg.ApplyVote(ctx, like(v.id, voterDave, subjects[i]), ""))
+		ageVote(t, w.db, v.id, v.age)
+		if v.down {
+			setOriginCheck(t, w.db, v.id, "unavailable", time.Minute)
+		}
+	}
+	w.giveRepo(t, daveDID)
+
+	require.NoError(t, w.writer.Sweep(ctx))
+
+	assert.Len(t, w.voteRecords(t, daveDID), 2, "both fresh votes are recorded")
+	for i, v := range votes {
+		assert.Equal(t, verdict(v.wantVerdict), readOriginCheck(t, w.db, v.id).verdict, "vote %d", i)
+		if v.wantRecord {
+			assert.Equal(t, written(), readVoteRow(t, w.db, v.id).recordState, "vote %d", i)
+			assertServed(t, w.db, subjects[i], 0, 0)
+		} else {
+			assert.Equal(t, sql.NullString{}, readVoteRow(t, w.db, v.id).recordState, "vote %d", i)
+			assertServed(t, w.db, subjects[i], 1, 0)
+		}
+	}
+	assert.Equal(t, 0, origin.fetches(votes[0].id), "the retryable vote waits behind the fresh ones")
+}
+
+// O2: at most one inline origin fetch is in flight; a live vote arriving
+// meanwhile is not fetched and stays aggregate for the sweep.
+func TestLiveVerificationHoldsOneInlineFetch(t *testing.T) {
+	origin, clock := newFakeOrigin(), newFakeClock()
+	verifier, err := NewOriginVerifier(origin, OriginVerifierOptions{
+		HostRPS: 1, GlobalRPS: 5, Timeout: time.Minute, Now: clock.Now,
+	}, slog.Default())
+	require.NoError(t, err)
+	w := newRecordsWorld(t, recordsBoth, withOrigin(verifier, clock))
+	ctx := context.Background()
+	w.secondSubject(t)
+	w.eligibleVoter(t, voterAlice, aliceDID)
+	w.eligibleVoter(t, voterDave, daveDID)
+
+	held := activityID(t, 1)
+	started, release := make(chan struct{}, 1), make(chan struct{})
+	var releaseOnce sync.Once
+	releaseHeld := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseHeld)
+	origin.answer(held, originAnswer{
+		object: matchingActivity(likeClaim(held, voterAlice, subjectPost)), started: started, release: release,
+	})
+	heldDone := make(chan error, 1)
+	go func() { heldDone <- w.agg.ApplyVote(ctx, like(held, voterAlice, subjectPost), "") }()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first live vote never reached its origin")
+	}
+	// The global bucket has a token again; only the inline slot is taken.
+	clock.Advance(time.Second)
+
+	second := voteIDOn(t, "lemmy.ml", 2)
+	origin.serve(likeClaim(second, voterDave, subjectPostB))
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- w.agg.ApplyVote(ctx, like(second, voterDave, subjectPostB), "") }()
+	select {
+	case err := <-secondDone:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("a live vote waited for another vote's origin fetch")
+	}
+
+	assert.Equal(t, 0, origin.fetches(second), "no inline fetch while one is in flight")
+	assert.Equal(t, originCheck{}, readOriginCheck(t, w.db, second), "nothing stored: the sweep picks it up")
+	assert.Equal(t, sql.NullString{}, readVoteRow(t, w.db, second).recordState)
+	assertServed(t, w.db, subjectPostB, 1, 0)
+
+	releaseHeld()
+	select {
+	case err := <-heldDone:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the held vote never finished")
+	}
+	// The slot is free again: the next live vote is checked inline.
+	clock.Advance(time.Second)
+	third, subject := voteIDOn(t, "lemmy.ml", 3), w.verifySubject(t, 3)
+	origin.serve(likeClaim(third, voterDave, subject))
+	require.NoError(t, w.agg.ApplyVote(ctx, like(third, voterDave, subject), ""))
+	assert.Equal(t, verdict("verified"), readOriginCheck(t, w.db, third).verdict)
+	assert.Equal(t, written(), readVoteRow(t, w.db, third).recordState)
+}
+
+// O4: an 'unavailable' vote inside the window is fetched again once its retry
+// delay has passed, and not before.
+func TestSweepRetriesAnUnavailableVoteAfterItsDelay(t *testing.T) {
+	w, origin, _ := originWorld(t, recordsBoth, 1, 5)
+	ctx := context.Background()
+	w.bridgedVoter(t, voterDave, daveDID, store.ConsentStateOK, false)
+	w.bridgedVoter(t, voterAlice, aliceDID, store.ConsentStateOK, false)
+	retried, retriedSubject := voteIDOn(t, "lemmy.ml", 1), w.verifySubject(t, 1)
+	recent, recentSubject := activityID(t, 2), w.verifySubject(t, 2)
+	origin.serve(likeClaim(retried, voterDave, retriedSubject))
+	origin.serve(likeClaim(recent, voterAlice, recentSubject))
+	require.NoError(t, w.agg.ApplyVote(ctx, like(retried, voterDave, retriedSubject), ""))
+	require.NoError(t, w.agg.ApplyVote(ctx, like(recent, voterAlice, recentSubject), ""))
+	ageVote(t, w.db, retried, time.Hour)
+	ageVote(t, w.db, recent, time.Hour)
+	setOriginCheck(t, w.db, retried, "unavailable", time.Minute)
+	setOriginCheck(t, w.db, recent, "unavailable", 10*time.Second)
+	w.giveRepo(t, daveDID)
+	w.giveRepo(t, aliceDID)
+
+	require.NoError(t, w.writer.Sweep(ctx))
+
+	assert.Equal(t, 1, origin.fetches(retried))
+	assert.Equal(t, verdict("verified"), readOriginCheck(t, w.db, retried).verdict)
+	assert.Equal(t, written(), readVoteRow(t, w.db, retried).recordState)
+	assert.Len(t, w.voteRecords(t, daveDID), 1)
+	assertServed(t, w.db, retriedSubject, 0, 0)
+
+	assert.Equal(t, 0, origin.fetches(recent), "checked 10s ago: not retried yet")
+	assert.Equal(t, verdict("unavailable"), readOriginCheck(t, w.db, recent).verdict)
+	assert.Empty(t, w.voteRecords(t, aliceDID))
+	assertServed(t, w.db, recentSubject, 1, 0)
+}
+
+// O4: the sweep never fetches a vote that could not become a record.
+func TestSweepDoesNotCheckVotesThatStayAggregate(t *testing.T) {
+	tests := []struct {
+		name     string
+		opts     RecordWriterOptions
+		eligible bool
+		voter    string
+		claim    func(t *testing.T, voter, subject string) VoteClaim
+		wantUp   int
+		wantDown int
+	}{
+		{name: "a voter who is not bridged", opts: recordsBoth, voter: voterBob,
+			claim: func(t *testing.T, voter, subject string) VoteClaim {
+				return likeClaim(voteIDOn(t, "lemmy.zip", 1), voter, subject)
+			},
+			wantUp: 1},
+		{name: "a Dislike under mode up", opts: RecordWriterOptions{Mode: RecordsUp, Interval: time.Minute, Batch: 20},
+			eligible: true, voter: voterAlice,
+			claim: func(t *testing.T, voter, subject string) VoteClaim {
+				return VoteClaim{ActivityID: fmt.Sprintf("https://lemmy.world/activities/dislike/%s-1", t.Name()),
+					Actor: voter, Object: subject, Type: ap.TypeDislike}
+			},
+			wantDown: 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			w, origin, _ := originWorld(t, tc.opts, 1, 5)
+			ctx := context.Background()
+			if tc.eligible {
+				w.eligibleVoter(t, tc.voter, aliceDID)
+			}
+			claim := tc.claim(t, tc.voter, subjectPost)
+			origin.serve(claim)
+			require.NoError(t, w.agg.ApplyVote(ctx, vote(claim.Type, claim.ActivityID, tc.voter, subjectPost), ""))
+
+			require.NoError(t, w.writer.Sweep(ctx))
+
+			assert.Equal(t, 0, origin.totalFetches())
+			assert.Equal(t, originCheck{}, readOriginCheck(t, w.db, claim.ActivityID))
+			assert.Equal(t, sql.NullString{}, readVoteRow(t, w.db, claim.ActivityID).recordState)
+			assertServed(t, w.db, subjectPost, tc.wantUp, tc.wantDown)
+		})
+	}
+}

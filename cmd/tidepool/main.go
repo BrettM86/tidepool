@@ -538,8 +538,17 @@ func run(logger *slog.Logger) error {
 	}
 	// A vote becomes a record only once its activity is fetched from the
 	// voter's own instance (the Announce signs only the community), through
-	// the signed, SSRF-guarded client.
-	originVerifier, err := votes.NewOriginVerifier(apClient, votes.OriginVerifierOptions{
+	// a signed, SSRF-guarded client of its own that never retries: the
+	// verifier's timeout bounds each check and the sweep retries later.
+	originClient := ap.NewClient(ap.ClientOptions{
+		UserAgent:             cfg.UserAgent,
+		UserOriginUserAgent:   cfg.UserOriginUserAgent,
+		Signer:                serviceActor.Signer(),
+		HTTPClient:            &http.Client{Timeout: 10 * time.Second},
+		MaxAttempts:           1,
+		AllowPrivateAddresses: cfg.AllowPrivateAddresses,
+	})
+	originVerifier, err := votes.NewOriginVerifier(originClient, votes.OriginVerifierOptions{
 		HostRPS:   cfg.BridgedVoteVerifyHostRPS,
 		GlobalRPS: cfg.BridgedVoteVerifyGlobalRPS,
 		Timeout:   10 * time.Second,

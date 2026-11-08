@@ -521,11 +521,15 @@ is left with the Group-actor AP surface and the admission-policy wiring.
       instance could forge votes into a bridged voter's repo. Rule: a vote
       becomes a record only after `GET <activity id>` at the voter's own
       instance (signed, SSRF-guarded, redirects pinned to that host) returns
-      the same type, actor, object and id. The verdict is stored on
-      `vote_events.origin_check`: `verified` (converted), `mismatch` (id host
-      ≠ actor host, off-host redirect, or a different activity), `not_found`
-      (400/401/403/404/410 or Tombstone; Lemmy answers a missing activity
-      with 400), `unavailable` (timeout, network, 429, 5xx, bad body;
+      the same id, type, actor and object. The verdict is stored on
+      `vote_events.origin_check`: `verified` (converted), `mismatch` (the id
+      is not `/activities/like/…` or `/activities/dislike/…` without query
+      or fragment, id host ≠ actor host, off-host redirect, or a different
+      activity, an empty id included), `not_found` (400/401/403/404/410 or
+      Tombstone; Lemmy answers a missing activity with 400; final, so an
+      instance that refuses our signed fetch with 401/403 is not asked
+      again), `unavailable` (timeout, network, egress refusal, 429, 5xx, bad
+      body;
       retried after a host backoff, 30s doubling to 15m) and `expired`
       (still unavailable when the vote left the window). Only `unavailable`
       is retried; everything not verified stays aggregate. The window is 6
@@ -540,17 +544,24 @@ is left with the Group-actor AP surface and the admission-policy wiring.
     - Pacing. Fetches start at most `BRIDGED_VOTE_VERIFY_HOST_RPS` (1) per
       voter host and `BRIDGED_VOTE_VERIFY_GLOBAL_RPS` (5) in all, admitted
       only when both buckets have a token; no token means deferred, never a
-      wait. The live path checks outside the vote transaction; a deferred
-      vote stays aggregate with nothing stored. Each sweep verifies the
-      queue oldest first (Lemmy prunes oldest first), at most
-      `BRIDGED_VOTE_VERIFY_BATCH` (300) votes and 60 per host, in rounds of
-      one vote per host for 80% of the interval, so a host in backoff cannot
-      starve healthy ones. Capacity is 432k/day globally and 86.4k/day per
-      host, against about 3.6k/day (busiest day ~5.1k) of lemmy.world votes
-      by repo voters. `tidepool_vote_verify_backlog`,
+      wait. The live path checks outside the vote transaction, one inline
+      fetch at a time with a 2s timeout; a vote that finds the slot taken or
+      runs out of time stays aggregate with nothing stored, for the sweep.
+      Verification uses its own AP client with no retries; the verifier's
+      10s timeout bounds each check. Each sweep selects at most
+      `BRIDGED_VOTE_VERIFY_BATCH` (300) votes and 60 per host, round-robin
+      across hosts; within a host never-checked votes go before retries,
+      then oldest first (Lemmy prunes oldest first). It checks them in
+      rounds of one vote per host for 80% of the interval, wall clock with
+      fetch time included, so neither a slow nor a backed-off host can
+      starve healthy ones. At the 1m default that is about 48 votes per host
+      and 240 in all per sweep (~69k/day per host, ~345k/day total), against
+      about 3.6k/day (busiest day ~5.1k) of lemmy.world votes by repo
+      voters. `tidepool_vote_verify_backlog`,
       `tidepool_vote_verify_oldest_pending_seconds` and the
-      `tidepool_vote_verify_verdicts` map report it; a sweep warns once when
-      the oldest unchecked vote is within a day of the window edge.
+      `tidepool_vote_verify_verdicts` map report it; each sweep warns while the oldest unchecked vote is within min(1 day, window/4)
+      of the window edge. Dry-run does not verify, so its conversion preview
+      shows 0.
     - A paced sweeper repairs outstanding work (pending creates, owed
       deletes), verifies, and converts eligible voters' verified aggregate
       votes (a verified vote at any age: a restored subject or a failed

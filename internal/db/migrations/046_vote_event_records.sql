@@ -17,7 +17,8 @@
 -- voter's own instance (the Announce signs only the community). Only a
 -- 'verified' vote becomes a record. 'unavailable' is retried while the vote is
 -- inside the verification window and becomes 'expired' after it; the others
--- are final. NULL = never checked. origin_checked_at is set with it.
+-- are final. NULL = never checked. origin_checked_at is set with it. An
+-- 'unavailable' row on an undone vote is never retried or expired; it is inert.
 ALTER TABLE vote_events
     ADD COLUMN record_at_uri TEXT,
     ADD COLUMN record_state TEXT,

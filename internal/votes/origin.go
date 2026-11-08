@@ -33,10 +33,12 @@ type OriginVerdict string
 const (
 	// OriginVerified: the origin serves the claimed activity. Final.
 	OriginVerified OriginVerdict = "verified"
-	// OriginMismatch: the activity id is not on the voter's host, the fetch
-	// was redirected off it, or the served activity differs. Final.
+	// OriginMismatch: the activity id is not a vote activity URL on the
+	// voter's host, the fetch was redirected off that host, or the served
+	// document is a different activity (an empty id included). Final.
 	OriginMismatch OriginVerdict = "mismatch"
-	// OriginNotFound: 400/401/403/404/410 or a Tombstone. Final.
+	// OriginNotFound: 400/401/403/404/410 or a Tombstone. Final: an origin
+	// that refuses our signed fetch (401/403) is not asked again.
 	OriginNotFound OriginVerdict = "not_found"
 	// OriginExpired: still unavailable when the vote left the window. Final.
 	OriginExpired OriginVerdict = "expired"
@@ -58,8 +60,8 @@ type OriginFetcher interface {
 }
 
 // OriginVerifierOptions pace the verifier. HostRPS and GlobalRPS are fetch
-// START rates (burst 1); the fetcher may retry a 5xx/429 itself, and Timeout
-// bounds the whole fetch.
+// START rates (burst 1); Timeout bounds the caller's wait for one fetch. In
+// production the fetcher is a dedicated client that never retries.
 type OriginVerifierOptions struct {
 	HostRPS   float64
 	GlobalRPS float64
@@ -129,7 +131,7 @@ type originHost struct {
 }
 
 func (v *originVerifier) Verify(ctx context.Context, claim VoteClaim) (OriginVerdict, bool) {
-	if !ap.SameAuthority(claim.ActivityID, claim.Actor) {
+	if !voteActivityURL(claim.ActivityID) || !ap.SameAuthority(claim.ActivityID, claim.Actor) {
 		return OriginMismatch, false
 	}
 	host := hostOf(claim.Actor)
@@ -192,8 +194,7 @@ func classifyOrigin(claim VoteClaim, fetched *ap.Object, err error) OriginVerdic
 		switch {
 		case errors.IsNotFound(err), errors.IsTombstoned(err):
 			return OriginNotFound
-		case errors.IsValidation(err):
-			// The origin redirected off its own host.
+		case isOffHostRedirect(err):
 			return OriginMismatch
 		case stderrors.As(err, &httpErr):
 			switch httpErr.StatusCode {
@@ -210,11 +211,32 @@ func classifyOrigin(claim VoteClaim, fetched *ap.Object, err error) OriginVerdic
 	if fetched.IsTombstone() {
 		return OriginNotFound
 	}
-	if fetched.Type != claim.Type || refID(fetched.Actor) != claim.Actor || refID(fetched.Object) != claim.Object ||
-		(fetched.ID != "" && fetched.ID != claim.ActivityID) {
+	if fetched.ID != claim.ActivityID || fetched.Type != claim.Type ||
+		refID(fetched.Actor) != claim.Actor || refID(fetched.Object) != claim.Object {
 		return OriginMismatch
 	}
 	return OriginVerified
+}
+
+// isOffHostRedirect reports the fetcher's refusal to follow a redirect to
+// another authority. Other validation errors (the egress guard, a bad URL)
+// prove nothing about the vote and are 'unavailable'.
+func isOffHostRedirect(err error) bool {
+	var validation errors.ValidationError
+	return stderrors.As(err, &validation) && validation.Field == "redirect"
+}
+
+// voteActivityURL reports whether id has the shape Lemmy and PieFed give vote
+// activities: no query or fragment, path under /activities/like/ or
+// /activities/dislike/. Anything else could be a user upload on the voter's
+// host that merely looks like the claimed activity.
+func voteActivityURL(id string) bool {
+	u, err := url.Parse(id)
+	if err != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.Contains(id, "#") {
+		return false
+	}
+	path := strings.ToLower(u.EscapedPath())
+	return strings.HasPrefix(path, "/activities/like/") || strings.HasPrefix(path, "/activities/dislike/")
 }
 
 // hostOf is the lower-cased host of an absolute URL ("" when unparseable).

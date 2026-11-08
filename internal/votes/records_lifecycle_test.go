@@ -196,8 +196,12 @@ func TestSweepScrubsLeftoverRowsOfVotersWhoLeft(t *testing.T) {
 				UPDATE vote_events SET record_state = 'removed', record_at_uri = $2 WHERE activity_id = $1`,
 				removedID, "at://"+aliceDID+"/"+voteCollection+"/3mzthokhb5mga")
 			require.NoError(t, err)
-			_, err = w.db.Exec(`UPDATE bridged_actors SET consent_state = $2 WHERE ap_actor_id = $1`,
-				voterAlice, string(tc.consent))
+			// Dave left the same way but holds only a plain aggregate row (no
+			// record_at_uri): his vote stays counted and is not scrubbed.
+			w.bridgedVoter(t, voterDave, daveDID, store.ConsentStateOK, false)
+			require.NoError(t, w.agg.ApplyVote(ctx, like(activityID(t, 5), voterDave, subjectPost), ""))
+			_, err = w.db.Exec(`UPDATE bridged_actors SET consent_state = $3 WHERE ap_actor_id IN ($1, $2)`,
+				voterAlice, voterDave, string(tc.consent))
 			require.NoError(t, err)
 			// Bob was never bridged; carol is bridged with consent ok but no
 			// repo. Neither is scrubbed.
@@ -210,7 +214,8 @@ func TestSweepScrubsLeftoverRowsOfVotersWhoLeft(t *testing.T) {
 			assert.Equal(t, 0, voterRows(t, w.db, voterAlice), "both of alice's rows are scrubbed")
 			assert.Equal(t, 1, voterRows(t, w.db, voterBob), "a never-bridged voter's row is untouched")
 			assert.Equal(t, 1, voterRows(t, w.db, voterCarol), "a voter without a repo is not scrubbed")
-			assertServed(t, w.db, subjectPost, 1, 0)
+			assert.Equal(t, 1, voterRows(t, w.db, voterDave), "a left voter's plain aggregate row is kept")
+			assertServed(t, w.db, subjectPost, 2, 0)
 			assertServed(t, w.db, subjectPostB, 1, 0)
 		})
 	}

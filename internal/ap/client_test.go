@@ -3,6 +3,7 @@ package ap
 import (
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -262,6 +263,51 @@ func TestFetchObject_FollowsRedirectsWithFreshSignatures(t *testing.T) {
 	obj, err := client.FetchObject(context.Background(), server.URL+"/old")
 	require.NoError(t, err)
 	assert.Equal(t, "https://x.example/new", obj.ID)
+}
+
+// TestFetchObjectSameAuthority_NoRedirects: with NoRedirects set, even a
+// same-host redirect is refused before its target is requested; without it
+// the same-host hop is followed.
+func TestFetchObjectSameAuthority_NoRedirects(t *testing.T) {
+	tests := []struct {
+		name            string
+		noRedirects     bool
+		wantRedirectErr bool
+		wantTargetHits  int64
+	}{
+		{name: "redirects refused", noRedirects: true, wantRedirectErr: true, wantTargetHits: 0},
+		{name: "redirects followed", noRedirects: false, wantRedirectErr: false, wantTargetHits: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var targetHits atomic.Int64
+			mux := http.NewServeMux()
+			server := httptest.NewServer(mux)
+			defer server.Close()
+			mux.HandleFunc("/activities/like/1", func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, "/files/payload.json", http.StatusFound)
+			})
+			mux.HandleFunc("/files/payload.json", func(w http.ResponseWriter, r *http.Request) {
+				targetHits.Add(1)
+				_, _ = w.Write([]byte(`{"type":"Like","id":"https://x.example/activities/like/1"}`))
+			})
+
+			client := newTestClient(t, ClientOptions{NoRedirects: tt.noRedirects})
+			obj, err := client.FetchObjectSameAuthority(context.Background(), server.URL+"/activities/like/1")
+			if tt.wantRedirectErr {
+				require.Error(t, err)
+				assert.True(t, errors.IsValidation(err), "want a validation error, got %v", err)
+				var validation errors.ValidationError
+				require.True(t, stderrors.As(err, &validation), "want an errors.ValidationError, got %T", err)
+				assert.Equal(t, "redirect", validation.Field)
+				assert.Nil(t, obj)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, "https://x.example/activities/like/1", obj.ID)
+			}
+			assert.Equal(t, tt.wantTargetHits, targetHits.Load(), "redirect target requests")
+		})
+	}
 }
 
 // scriptedTransport is a RoundTripper answering from a script instead of the

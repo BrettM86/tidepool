@@ -161,6 +161,9 @@ type ClientOptions struct {
 	// config.AllowPrivateAddresses. Tests that hit httptest servers on
 	// 127.0.0.1 set it true.
 	AllowPrivateAddresses bool
+	// NoRedirects makes FetchObjectSameAuthority refuse every redirect,
+	// same-authority hops included.
+	NoRedirects bool
 }
 
 // Client fetches ActivityPub objects with signed GETs, per-host rate

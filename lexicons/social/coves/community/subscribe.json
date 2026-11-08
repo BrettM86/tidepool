@@ -50,6 +50,10 @@
         {
           "name": "Blocked",
           "description": "Cannot subscribe - you are blocked from this community"
+        },
+        {
+          "name": "CommunityRemoved",
+          "description": "The community is removed by the instance and takes no new subscriptions"
         }
       ]
     }

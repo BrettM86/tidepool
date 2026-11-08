@@ -51,6 +51,11 @@
           "minLength": 1,
           "maxLength": 128,
           "description": "Opaque service-local action identifier, not an AT-URI or CID"
+        },
+        "expiresAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "When a temporary account ban ends; present only on a localRemoval that is a temporary account ban"
         }
       }
     },
@@ -79,7 +84,7 @@
     },
     "subjectRef": {
       "type": "object",
-      "description": "Reference to the repository record targeted by moderation",
+      "description": "Reference to the subject targeted by moderation: a repository record, or an account or community (at://<did>)",
       "required": [
         "uri"
       ],
@@ -87,7 +92,7 @@
         "uri": {
           "type": "string",
           "format": "at-uri",
-          "description": "AT-URI of the moderated record"
+          "description": "AT-URI of the moderated record, or at://<did> for a moderated account or community"
         },
         "cid": {
           "type": "string",
@@ -181,7 +186,7 @@
         },
         "reason": {
           "type": "ref",
-          "ref": "#reasonType",
+          "ref": "#actionReasonType",
           "description": "Public reason classification for the action"
         },
         "labelValue": {
@@ -202,6 +207,11 @@
           "type": "ref",
           "ref": "#actionRef",
           "description": "Earlier moderation action reversed by this action"
+        },
+        "expiresAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "When a temporary account ban ends; present only on the remove action of a temporary account ban. The ban stops applying at this time with no further action"
         },
         "issuedAt": {
           "type": "string",
@@ -302,7 +312,7 @@
         },
         "reason": {
           "type": "ref",
-          "ref": "#reasonType",
+          "ref": "#actionReasonType",
           "description": "Public reason classification supplied by this source"
         },
         "label": {
@@ -508,6 +518,20 @@
         "social.coves.moderation.defs#reasonModeratorDiscretion"
       ]
     },
+    "actionReasonType": {
+      "type": "string",
+      "description": "Reason vocabulary of logged moderation actions: reasonType plus the system-only reasonSubjectMoved, which no request accepts",
+      "maxLength": 640,
+      "knownValues": [
+        "social.coves.moderation.defs#reasonSpam",
+        "social.coves.moderation.defs#reasonHarassment",
+        "social.coves.moderation.defs#reasonDoxing",
+        "social.coves.moderation.defs#reasonIllegalContent",
+        "social.coves.moderation.defs#reasonRuleViolation",
+        "social.coves.moderation.defs#reasonModeratorDiscretion",
+        "social.coves.moderation.defs#reasonSubjectMoved"
+      ]
+    },
     "reasonSpam": {
       "type": "token",
       "description": "Unsolicited, repetitive, or deceptive content classified as spam"
@@ -531,6 +555,10 @@
     "reasonModeratorDiscretion": {
       "type": "token",
       "description": "Moderation decision made under documented moderator discretion"
+    },
+    "reasonSubjectMoved": {
+      "type": "token",
+      "description": "The subject was re-created outside the authority's scope, so the authority's decision lost or regained effect automatically; not an act of the authority"
     }
   }
 }

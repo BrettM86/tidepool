@@ -120,6 +120,14 @@
         {
           "name": "TooManyImages",
           "description": "The embed carries more than 8 images"
+        },
+        {
+          "name": "Banned",
+          "description": "The user is banned from the community the thread belongs to, or their account is banned on this instance"
+        },
+        {
+          "name": "CommunityRemoved",
+          "description": "The community the thread belongs to is removed by the instance and takes no new comments"
         }
       ]
     }

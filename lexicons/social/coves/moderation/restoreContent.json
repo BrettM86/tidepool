@@ -30,7 +30,7 @@
         },
         {
           "name": "InvalidRequest",
-          "description": "The request is incomplete, including a missing reviewedSubject when a current record exists; correct it before retrying."
+          "description": "The request is incomplete, including a missing reviewedSubject when a current record exists, or actionId names an account ban or community removal (unbanAccount or restoreCommunity reverses those); correct it before retrying."
         },
         {
           "name": "DecisionNotFound",

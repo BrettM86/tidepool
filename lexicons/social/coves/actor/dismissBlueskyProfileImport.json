@@ -1,0 +1,44 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.actor.dismissBlueskyProfileImport",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Record that the authenticated user no longer wants the automatic Bluesky profile import offer. Idempotent: an existing dismissal is kept. Takes no input and returns an empty body.",
+      "errors": [
+        {
+          "name": "AuthenticationRequired",
+          "description": "The request is not authenticated."
+        },
+        {
+          "name": "ServiceUnavailable",
+          "description": "The session store is temporarily unavailable; retry."
+        },
+        {
+          "name": "AccountNotFound",
+          "description": "The authenticated user has no Coves account record."
+        },
+        {
+          "name": "InvalidDID",
+          "description": "The authenticated user's DID is not valid."
+        },
+        {
+          "name": "Timeout",
+          "description": "The request timed out."
+        },
+        {
+          "name": "RequestCanceled",
+          "description": "The request was canceled."
+        },
+        {
+          "name": "InternalServerError",
+          "description": "The dismissal could not be recorded."
+        },
+        {
+          "name": "MethodNotAllowed",
+          "description": "The request method is not POST."
+        }
+      ]
+    }
+  }
+}

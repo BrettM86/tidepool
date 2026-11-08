@@ -232,6 +232,13 @@
           "type": "ref",
           "ref": "#viewerState",
           "description": "Viewer's relationship to this community"
+        },
+        "status": {
+          "type": "string",
+          "knownValues": [
+            "removed"
+          ],
+          "description": "Absent for a live community. 'removed' while the instance has removed the community: displayName, description, descriptionFacets, avatar and banner are withheld."
         }
       }
     },
@@ -317,6 +324,17 @@
           "type": "string",
           "format": "at-uri",
           "description": "AT-URI of the ban record if viewer is banned"
+        },
+        "banReason": {
+          "type": "string",
+          "maxGraphemes": 2000,
+          "maxLength": 20000,
+          "description": "Reason given in the ban record if the viewer is banned and the record states one"
+        },
+        "banExpiresAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "When the viewer's ban ends. Omitted for a permanent ban."
         }
       }
     }

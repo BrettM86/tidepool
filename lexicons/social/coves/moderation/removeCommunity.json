@@ -1,0 +1,98 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.moderation.removeCommunity",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Remove an indexed community by its DID as one instance decision and publish a !takedown label on the community DID. Removing a community that is already removed is unchanged. Instance authority and actor identity come from the authenticated service context, never request fields.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#input"
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "social.coves.moderation.defs#mutationResult"
+        }
+      },
+      "errors": [
+        {
+          "name": "AuthRequired",
+          "description": "Authentication is required; authenticate with an authorized service account before retrying."
+        },
+        {
+          "name": "Forbidden",
+          "description": "The authenticated actor lacks permission; do not retry unless its moderation authority changes."
+        },
+        {
+          "name": "InvalidRequest",
+          "description": "The request is incomplete or malformed, including a subject that is not a DID; correct it before retrying."
+        },
+        {
+          "name": "InvalidSubject",
+          "description": "The DID is not an indexed community; do not retry."
+        },
+        {
+          "name": "StateConflict",
+          "description": "expectedVersion is stale, or the DID has an account ban in force (lift it with unbanAccount first); refetch getSubjectState before retrying."
+        },
+        {
+          "name": "IdempotencyConflict",
+          "description": "The same key was reused with a different request; do not retry with that key."
+        },
+        {
+          "name": "UnsupportedReason",
+          "description": "The reason is not supported for this action; choose a supported reason before retrying."
+        },
+        {
+          "name": "ModerationUnavailable",
+          "description": "The moderation service is temporarily unavailable; retry later."
+        }
+      ]
+    },
+    "input": {
+      "type": "object",
+      "description": "Request to remove a community",
+      "required": [
+        "subject",
+        "expectedVersion",
+        "idempotencyKey",
+        "reason"
+      ],
+      "properties": {
+        "subject": {
+          "type": "string",
+          "format": "did",
+          "description": "DID of the indexed community to remove; any other DID is refused with InvalidSubject"
+        },
+        "expectedVersion": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Opaque subject-state version of at://<subject> expected by the caller"
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Opaque key that makes equivalent removal requests idempotent"
+        },
+        "reason": {
+          "type": "ref",
+          "ref": "social.coves.moderation.defs#reasonType",
+          "description": "Public reason classification for removing the community"
+        },
+        "privateNote": {
+          "type": "string",
+          "maxGraphemes": 1000,
+          "maxLength": 10000,
+          "description": "Private administrative note retained only on the admin action"
+        }
+      }
+    }
+  }
+}

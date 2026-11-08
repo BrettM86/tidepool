@@ -128,6 +128,37 @@
             "ref": "social.coves.richtext.facet"
           },
           "maxLength": 50
+        },
+        "accountStatus": {
+          "type": "string",
+          "knownValues": [
+            "suspended"
+          ],
+          "description": "Set for viewers other than the account itself while the account is banned on this instance or its PDS has confirmed it is taken down or suspended; the profile then carries only did, handle, createdAt and zero stats."
+        },
+        "banNotice": {
+          "type": "ref",
+          "ref": "#accountBanNotice",
+          "description": "Present only on the account's own profile while it is banned on this instance."
+        }
+      }
+    },
+    "accountBanNotice": {
+      "type": "object",
+      "description": "The instance ban in force on the viewer's own account",
+      "required": [
+        "reason"
+      ],
+      "properties": {
+        "reason": {
+          "type": "ref",
+          "ref": "social.coves.moderation.defs#reasonType",
+          "description": "Public reason classification of the ban"
+        },
+        "expiresAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "When a temporary ban ends; absent for a permanent ban."
         }
       }
     },

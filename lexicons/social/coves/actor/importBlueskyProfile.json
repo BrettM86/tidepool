@@ -1,0 +1,157 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.actor.importBlueskyProfile",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Copy fields of the authenticated user's app.bsky.actor.profile record onto their social.coves.actor.profile record. Values are re-read from the user's PDS; the input names fields only. Avatar and banner are copied as blob refs, never re-uploaded. Also records the import offer as dismissed; that step is best effort, and its failure does not fail the import.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "fields"
+          ],
+          "properties": {
+            "fields": {
+              "type": "array",
+              "minLength": 1,
+              "maxLength": 4,
+              "description": "Fields to import, without duplicates.",
+              "items": {
+                "type": "string",
+                "maxLength": 32,
+                "knownValues": [
+                  "displayName",
+                  "description",
+                  "avatar",
+                  "banner"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "uri",
+            "cid",
+            "imported"
+          ],
+          "properties": {
+            "uri": {
+              "type": "string",
+              "format": "at-uri",
+              "description": "AT-URI of the written profile record"
+            },
+            "cid": {
+              "type": "string",
+              "format": "cid",
+              "description": "CID of the written profile record"
+            },
+            "imported": {
+              "type": "array",
+              "maxLength": 4,
+              "description": "Requested fields that were written. A requested field absent on the Bluesky profile is skipped.",
+              "items": {
+                "type": "string",
+                "maxLength": 32,
+                "knownValues": [
+                  "displayName",
+                  "description",
+                  "avatar",
+                  "banner"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "AuthenticationRequired",
+          "description": "The request is not authenticated."
+        },
+        {
+          "name": "ServiceUnavailable",
+          "description": "The session store is temporarily unavailable; retry."
+        },
+        {
+          "name": "MissingCredentials",
+          "description": "The session has no PDS host; sign in again."
+        },
+        {
+          "name": "InvalidRequest",
+          "description": "fields is empty, repeats a field, or names an unknown field, the body is not valid, or the user's PDS rejected a request as invalid."
+        },
+        {
+          "name": "NothingToImport",
+          "description": "The user has no Bluesky profile record, or none of the requested fields is importable from it. Nothing was written."
+        },
+        {
+          "name": "SessionError",
+          "description": "The user's PDS session could not be restored; sign in again."
+        },
+        {
+          "name": "SessionBusy",
+          "description": "Another request is using the session; retry."
+        },
+        {
+          "name": "AuthExpired",
+          "description": "The user's PDS session expired while reading or writing a profile record; sign in again."
+        },
+        {
+          "name": "Conflict",
+          "description": "The Coves profile record changed while importing; retry."
+        },
+        {
+          "name": "NotFound",
+          "description": "The user's PDS reported a record or repo as missing during the write."
+        },
+        {
+          "name": "PermissionDenied",
+          "description": "The session does not have permission to read or write the profile record."
+        },
+        {
+          "name": "RateLimited",
+          "description": "The user's PDS rate-limited the import; retry later."
+        },
+        {
+          "name": "PayloadTooLarge",
+          "description": "The request body or the profile record exceeds a size limit."
+        },
+        {
+          "name": "UpstreamFailure",
+          "description": "The user's PDS answered with a server error or an unusable response (over 1 MiB, undecodable, or a 404 without an XRPC error)."
+        },
+        {
+          "name": "PDSError",
+          "description": "The user's PDS could not be reached or failed to write the profile record."
+        },
+        {
+          "name": "Timeout",
+          "description": "The request timed out."
+        },
+        {
+          "name": "RequestCanceled",
+          "description": "The request was canceled."
+        },
+        {
+          "name": "InternalError",
+          "description": "The PDS client could not read the profile records."
+        },
+        {
+          "name": "InternalServerError",
+          "description": "The response could not be encoded."
+        },
+        {
+          "name": "MethodNotAllowed",
+          "description": "The request method is not POST."
+        }
+      ]
+    }
+  }
+}

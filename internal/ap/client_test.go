@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1048,4 +1049,189 @@ func TestResolveKey_RejectsOwnerMismatch(t *testing.T) {
 	require.Error(t, err)
 	assert.True(t, errors.IsValidation(err),
 		"a key whose owner is not the publishing actor must be rejected")
+}
+
+// TestFetchObject_GoneHostIsNotFound pins which dead-host failures FetchObject
+// reports as errors.IsNotFound, so backfill can skip an item whose host is
+// permanently gone instead of retrying the walk forever. All hosts are stubbed:
+// URL hostnames are labels mapped to local httptest listeners (or to a forged
+// DNS error) by the dialer below; no real DNS lookup is made.
+func TestFetchObject_GoneHostIsNotFound(t *testing.T) {
+	const (
+		originHost    = "origin.example"
+		elsewhereHost = "elsewhere.example"
+		goneHost      = "gone-host.invalid"
+	)
+
+	htmlHandler := func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte("<html><body>domain for sale</body></html>"))
+	}
+	noteHandler := func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", ContentTypeActivityJSON)
+		_, _ = w.Write(loadFixture(t, "note_lemmy_zip.json"))
+	}
+
+	tests := []struct {
+		name string
+		// dnsError, when set, is what the dialer returns for dnsErrorHost.
+		dnsError *net.DNSError
+		// dnsErrorHost is the dialed host that gets dnsError; empty means
+		// goneHost. It differs from dnsError.Name to model a proxy whose own
+		// name failed to resolve.
+		dnsErrorHost string
+		// fetch is the entry point under test; nil means FetchObject.
+		fetch func(*Client, context.Context, string) (*Object, error)
+		// origin and elsewhere serve origin.example and elsewhere.example.
+		origin    http.HandlerFunc
+		elsewhere http.HandlerFunc
+		iri       string
+		// wantErr false means the fetch must succeed.
+		wantErr      bool
+		wantNotFound bool
+	}{
+		{
+			name:         "dns nxdomain",
+			dnsError:     &net.DNSError{Err: "no such host", Name: goneHost, IsNotFound: true},
+			iri:          "http://" + goneHost + "/post/1",
+			wantErr:      true,
+			wantNotFound: true,
+		},
+		{
+			name:         "temporary dns failure stays retryable",
+			dnsError:     &net.DNSError{Err: "server misbehaving", Name: goneHost, IsTemporary: true},
+			iri:          "http://" + goneHost + "/post/1",
+			wantErr:      true,
+			wantNotFound: false,
+		},
+		{
+			name: "off-host redirect to html",
+			origin: func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, "http://"+elsewhereHost+"/parked", http.StatusFound)
+			},
+			elsewhere:    htmlHandler,
+			iri:          "http://" + originHost + "/post/1",
+			wantErr:      true,
+			wantNotFound: true,
+		},
+		{
+			name: "same-host redirect to html keeps ordinary error",
+			origin: func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/post/1" {
+					http.Redirect(w, r, "/landing", http.StatusFound)
+					return
+				}
+				htmlHandler(w, r)
+			},
+			iri:          "http://" + originHost + "/post/1",
+			wantErr:      true,
+			wantNotFound: false,
+		},
+		{
+			name: "off-host redirect to activity json succeeds",
+			origin: func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, "http://"+elsewhereHost+"/comment/1", http.StatusFound)
+			},
+			elsewhere: noteHandler,
+			iri:       "http://" + originHost + "/post/1",
+			wantErr:   false,
+		},
+		{
+			// The inbox self-delete confirmation (ingest.tombstonedSelfDelete)
+			// must defer on a DNS failure rather than read it as "gone".
+			name:         "pinned-authority actor fetch keeps nxdomain retryable",
+			dnsError:     &net.DNSError{Err: "no such host", Name: goneHost, IsNotFound: true},
+			fetch:        (*Client).FetchActorSameAuthority,
+			iri:          "http://" + goneHost + "/u/alice",
+			wantErr:      true,
+			wantNotFound: false,
+		},
+		{
+			// A proxy whose own name does not resolve says nothing about the
+			// fetched host.
+			name:         "nxdomain for a different host than the iri stays retryable",
+			dnsError:     &net.DNSError{Err: "no such host", Name: "proxy.invalid", IsNotFound: true},
+			dnsErrorHost: originHost,
+			iri:          "http://" + originHost + "/post/1",
+			wantErr:      true,
+			wantNotFound: false,
+		},
+		{
+			name: "redirect dropping explicit default port is same host",
+			origin: func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/post/1" {
+					http.Redirect(w, r, "http://"+originHost+"/landing", http.StatusFound)
+					return
+				}
+				htmlHandler(w, r)
+			},
+			iri:          "http://" + originHost + ":80/post/1",
+			wantErr:      true,
+			wantNotFound: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			addrs := map[string]string{}
+			for host, handler := range map[string]http.HandlerFunc{originHost: tt.origin, elsewhereHost: tt.elsewhere} {
+				if handler == nil {
+					continue
+				}
+				server := httptest.NewServer(handler)
+				t.Cleanup(server.Close)
+				addrs[host] = server.Listener.Addr().String()
+			}
+
+			var goneDials atomic.Int32
+			var dialer net.Dialer
+			transport := &http.Transport{
+				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+					host, _, err := net.SplitHostPort(addr)
+					if err != nil {
+						return nil, err
+					}
+					dnsErrorHost := tt.dnsErrorHost
+					if dnsErrorHost == "" {
+						dnsErrorHost = goneHost
+					}
+					// The port is ignored, so origin.example:80 reaches the
+					// origin listener too.
+					if host == dnsErrorHost && tt.dnsError != nil {
+						goneDials.Add(1)
+						dnsErr := *tt.dnsError
+						return nil, &net.OpError{Op: "dial", Net: network, Err: &dnsErr}
+					}
+					if local, ok := addrs[host]; ok {
+						return dialer.DialContext(ctx, network, local)
+					}
+					return nil, fmt.Errorf("test dialer: unexpected host %q", host)
+				},
+			}
+			t.Cleanup(transport.CloseIdleConnections)
+
+			client := newTestClient(t, ClientOptions{
+				HTTPClient:     &http.Client{Transport: transport},
+				MaxAttempts:    2,
+				RetryBaseDelay: time.Millisecond,
+			})
+
+			fetch := tt.fetch
+			if fetch == nil {
+				fetch = (*Client).FetchObject
+			}
+			obj, err := fetch(client, context.Background(), tt.iri)
+			if tt.dnsError != nil {
+				assert.Positive(t, goneDials.Load(), "the stub dialer must have been reached")
+			}
+			if !tt.wantErr {
+				require.NoError(t, err)
+				require.NotNil(t, obj)
+				assert.Equal(t, "Note", obj.Type)
+				return
+			}
+			require.Error(t, err)
+			assert.Equal(t, tt.wantNotFound, errors.IsNotFound(err), "errors.IsNotFound(%v)", err)
+		})
+	}
 }

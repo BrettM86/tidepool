@@ -6,6 +6,7 @@ import (
 	stderrors "errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -59,6 +60,9 @@ var voteTablesToTruncate = []string{
 	// Consumer state, for the tests that drive the real write path.
 	"federation_prefs", "jetstream_record_revs", "jetstream_dead_letters",
 	"consumer_cursors", "repo_state",
+	// The real repo the bridged-vote-records tests commit voters' feed.vote
+	// records into: a leftover commit would shift every firehose count.
+	"blocks", "firehose_events",
 	// The acceptance ledger. 17e's divergence sweep runs here (the re-cast
 	// tests drive the real reconciler), and it READS this table — so a row left
 	// by another package's run would surface as an undelivered-acceptance
@@ -189,7 +193,7 @@ func vote(voteType, activityID, voter, subject string) *ap.Object {
 
 // activityID mints per-test activity ids.
 func activityID(t *testing.T, n int) string {
-	return fmt.Sprintf("https://lemmy.world/activities/like/%s-%d", t.Name(), n)
+	return fmt.Sprintf("https://lemmy.world/activities/like/%s-%d", strings.ReplaceAll(t.Name(), "/", "_"), n)
 }
 
 // counts reads the served aggregate for a subject straight from the table.

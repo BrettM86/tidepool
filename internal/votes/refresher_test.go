@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	stderrors "errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"testing"
@@ -417,4 +418,122 @@ func TestRefresherBatchBounded(t *testing.T) {
 	assert.Len(t, emitter.snapshot(), 4, "the next sweep picks up the next batch")
 	r.Sweep(ctx)
 	assert.Len(t, emitter.snapshot(), 5, "and the remainder")
+}
+
+// B15: RefreshSubject emits one subject exactly like a sweep would — only when
+// due, with the current counts, advancing the watermark.
+func TestRefreshSubjectEmitsOnlyADueSubject(t *testing.T) {
+	tests := []struct {
+		name string
+		// alreadyEmitted sweeps once before RefreshSubject, so the row is not due.
+		alreadyEmitted bool
+	}{
+		{name: "due"},
+		{name: "not due", alreadyEmitted: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			database := testDB(t)
+			agg, objects := testAggregator(t, database)
+			bridgeSubject(t, objects, subjectPost, "3jzfcijpj2z2a")
+			ctx := context.Background()
+			require.NoError(t, agg.ApplyVote(ctx, like(activityID(t, 1), voterAlice, subjectPost), ""))
+			require.NoError(t, agg.ApplyVote(ctx, dislike(activityID(t, 2), voterBob, subjectPost), ""))
+			emitter := &fakeEmitter{}
+			r := testRefresher(t, database, emitter)
+			if tc.alreadyEmitted {
+				r.Sweep(ctx)
+				require.Len(t, emitter.snapshot(), 1)
+			}
+
+			require.NoError(t, r.RefreshSubject(ctx, subjectPost))
+
+			calls := emitter.snapshot()
+			if tc.alreadyEmitted {
+				assert.Len(t, calls, 1, "a subject that is not due is not emitted")
+				return
+			}
+			require.Len(t, calls, 1, "the due subject is emitted")
+			updated, emitted, found := aggregateTimes(t, database, subjectPost)
+			require.True(t, found)
+			assert.Equal(t, emitCall{subject: subjectPost, up: 1, down: 1, asOf: calls[0].asOf}, calls[0])
+			assert.True(t, calls[0].asOf.Equal(updated), "asOf is the counts' updated_at")
+			require.True(t, emitted.Valid, "the watermark was stamped")
+			assert.True(t, emitted.Time.Equal(updated), "watermark is the row's updated_at")
+
+			r.Sweep(ctx)
+			assert.Len(t, emitter.snapshot(), 1, "a refreshed subject is not re-emitted by the next sweep")
+		})
+	}
+}
+
+// A sweep re-reads each row's counts right before its emit: a vote that lands
+// on subject B while the sweep is emitting subject A is in B's emit, not the
+// counts the sweep read at its start.
+func TestRefresherSweepEmitsCountsCurrentAtEachEmit(t *testing.T) {
+	database := testDB(t)
+	agg, objects := testAggregator(t, database)
+	bridgeSubject(t, objects, subjectPost, subjectRKey)
+	bridgeSubject(t, objects, subjectPostB, subjectRKeyB)
+	ctx := context.Background()
+	require.NoError(t, agg.ApplyVote(ctx, like(activityID(t, 1), voterAlice, subjectPost), ""))
+	require.NoError(t, agg.ApplyVote(ctx, like(activityID(t, 2), voterAlice, subjectPostB), ""))
+
+	injected := false
+	emitter := &fakeEmitter{fn: func(mapping *store.APObjectMapping, _, _ int) (bool, error) {
+		if mapping.APID == subjectPost && !injected {
+			injected = true
+			require.NoError(t, agg.ApplyVote(ctx, like(activityID(t, 3), voterBob, subjectPostB), ""))
+		}
+		return true, nil
+	}}
+	r := testRefresher(t, database, emitter)
+	r.Sweep(ctx)
+
+	calls := emitter.snapshot()
+	require.Len(t, calls, 2)
+	assert.Equal(t, subjectPost, calls[0].subject)
+	assert.Equal(t, 1, calls[0].up)
+	assert.Equal(t, subjectPostB, calls[1].subject)
+	assert.Equal(t, 2, calls[1].up, "B's emit carries the vote that landed during A's emit")
+}
+
+// RefreshSubject reports a lexicon validation failure: the record writer must
+// not commit a vote record behind stats that did not change.
+func TestRefreshSubjectReportsAValidationFailure(t *testing.T) {
+	database := testDB(t)
+	agg, objects := testAggregator(t, database)
+	bridgeSubject(t, objects, subjectPost, subjectRKey)
+	ctx := context.Background()
+	require.NoError(t, agg.ApplyVote(ctx, like(activityID(t, 1), voterAlice, subjectPost), ""))
+	emitter := &fakeEmitter{fn: func(*store.APObjectMapping, int, int) (bool, error) {
+		return false, errors.NewValidationError("record", "fails lexicon validation")
+	}}
+	r := testRefresher(t, database, emitter)
+
+	err := r.RefreshSubject(ctx, subjectPost)
+
+	require.Error(t, err)
+	assert.True(t, errors.IsValidation(err), "got %v", err)
+}
+
+// T2: RefreshSubject reports a transient emit failure: the record writer must
+// not commit a vote record behind stats that were not repinned.
+func TestRefreshSubjectReportsATransientEmitFailure(t *testing.T) {
+	database := testDB(t)
+	agg, objects := testAggregator(t, database)
+	bridgeSubject(t, objects, subjectPost, subjectRKey)
+	ctx := context.Background()
+	require.NoError(t, agg.ApplyVote(ctx, like(activityID(t, 1), voterAlice, subjectPost), ""))
+	emitter := &fakeEmitter{fn: func(*store.APObjectMapping, int, int) (bool, error) {
+		return false, fmt.Errorf("db connection reset")
+	}}
+	r := testRefresher(t, database, emitter)
+
+	err := r.RefreshSubject(ctx, subjectPost)
+
+	require.Error(t, err)
+	_, emitted, found := aggregateTimes(t, database, subjectPost)
+	require.True(t, found)
+	assert.False(t, emitted.Valid, "the watermark is not advanced: the subject stays due")
 }

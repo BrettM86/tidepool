@@ -59,6 +59,8 @@ func (m *Materializer) EmitBridgedStats(ctx context.Context, mapping *store.APOb
 //     asOf would move) → returns a NoOp Result WITHOUT committing. Re-putting
 //     would mint a fresh CID and a firehose event just to bump a timestamp;
 //     that churn is pure noise for relays and the AppView, so it is skipped.
+//   - asOf older than the one the record carries → NoOp Result, no commit:
+//     a stale sample never replaces a newer one.
 //   - Record gone (deleted between the vote landing and this call — AP
 //     delivery is unordered — or its mapping soft-deleted inside the commit)
 //     → errors.IsRecordGone, a sentinel DISTINCT from a bare NotFound so the
@@ -88,6 +90,19 @@ func (m *Materializer) SetBridgedStats(ctx context.Context, mapping *store.APObj
 				return nil, fmt.Errorf("materialize: stats target %s gone: %w", mapping.ATURI, errors.ErrRecordGone)
 			}
 			return nil, fmt.Errorf("materialize: read record for stats %s: %w", mapping.ATURI, err)
+		}
+
+		// Monotonic asOf: a stamp sampled BEFORE the one the record carries is
+		// stale (a sweep that read the aggregate before a vote moved into a
+		// feed.vote record must not re-add it). Refuse it as a NoOp success.
+		// The check runs against every re-read, and the CAS below only
+		// replaces the version read here, so a newer stamp landing between
+		// attempts is seen too. The pin is still reconciled, as below.
+		if stored, ok := bridgedStatsAsOf(record); ok && stored.After(asOf) {
+			if err := m.repinAcceptance(ctx, mapping, prevCID); err != nil {
+				return nil, err
+			}
+			return &Result{DID: mapping.DID, ATURI: mapping.ATURI, CID: mapping.CID, NoOp: true}, nil
 		}
 
 		// Counts unchanged? Re-emitting would only move asOf, minting a new CID
@@ -244,6 +259,25 @@ func bridgedStatsCounts(record map[string]any) (up, down int, ok bool) {
 	up, upOK := asInt(stats["upvotes"])
 	down, downOK := asInt(stats["downvotes"])
 	return up, down, upOK && downOK
+}
+
+// bridgedStatsAsOf reads the asOf a record's bridgedStats field carries. ok
+// is false when the field is absent or its asOf does not parse; such a record
+// takes any stamp.
+func bridgedStatsAsOf(record map[string]any) (time.Time, bool) {
+	stats, ok := record[bridgedStatsField].(map[string]any)
+	if !ok {
+		return time.Time{}, false
+	}
+	raw, ok := stats["asOf"].(string)
+	if !ok {
+		return time.Time{}, false
+	}
+	asOf, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return asOf, true
 }
 
 func asInt(v any) (int, bool) {

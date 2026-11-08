@@ -21,8 +21,9 @@ the numbers stay fixed even when a decision is superseded.
 ## The materialization principle
 
 Materialize as PDS records the things other records may need to reference:
-communities, author profiles, posts and comments. Keep things that are only
-ever counted (votes) as bridge-side state. Nothing ever strongRefs a vote.
+communities, author profiles, posts and comments. Votes by bridged voters who
+already have a repo are records too (decision 21); every other vote is only
+counted, as bridge-side state. Nothing ever strongRefs a vote.
 
 ## Architecture
 
@@ -106,11 +107,14 @@ Outbound:
    `Delete(Actor)` tombstones their bridged repo. Bridged profiles carry a bio
    line naming the origin ("bridged from @alice@lemmy.world by Tidepool") and
    set `hostedBy` to the bridge's service DID.
-7. Votes never become records. Inbound Like and Dislike activities update
+7. Partly superseded by decision 21 (its inbound half): verified votes by
+   bridged voters who already have a repo become `feed.vote` records in it. The rest still holds for
+   every other inbound vote. Inbound Like and Dislike activities update
    bridge-side tallies (`internal/votes`). Tidepool exposes them two ways: it
    folds the counts onto the bridged post or comment record as the optional
-   `bridgedStats` field (`{upvotes, downvotes, asOf}`), and it serves them over
-   the `social.coves.bridge.getVoteAggregates` XRPC for the AppView to poll.
+   `bridgedStats` field (`{upvotes, downvotes, asOf}`), and it serves them
+   over the `social.coves.bridge.getVoteAggregates` XRPC for the AppView to
+   poll.
 8. Coves conventions apply: goose migrations, raw `database/sql` with `lib/pq`,
    chi router, `log/slog`, typed sentinel errors wrapped with `%w`, env-var
    config with logged dev defaults, `context.Context` everywhere, interfaces
@@ -357,10 +361,10 @@ is left with the Group-actor AP surface and the admission-policy wiring.
       the inbound service actor follows every bridged community. That Follow is
       also the outbound side's return channel, so it must stay in place.
 16. Native votes are `social.coves.feed.vote` records in users' repos, read
-    from Jetstream and sent out per actor. Inbound fediverse votes still never
-    become records (decision 7). The outbound vote row from decision 14, keyed
-    `(actor_did, subject_at_uri)`, holds the current intended vote and its
-    delivery state. The direction changes when the new vote is queued, not
+    from Jetstream and sent out per actor. Inbound fediverse votes become
+    records only for bridged voters who already have a repo (decision 21). The
+    outbound vote row from decision 14, keyed `(actor_did, subject_at_uri)`,
+    holds the current intended vote and its delivery state. The direction changes when the new vote is queued, not
     when it is delivered; FOLLOWUPS.md lists the recast and reseed gaps this
     leaves.
     - The aggregator drops echoes of our own outbound Like and Dislike ids.
@@ -423,7 +427,9 @@ is left with the Group-actor AP surface and the admission-policy wiring.
     - Support matrix. Lemmy 0.19.20 is the pinned strictness ceiling and the
       e2e target. Mbin is covered by hand-built fixtures for link posts only.
       PieFed is untested: there are no captured fixtures. Its votes arrive from
-      anonymous per-user actors, which is fine for tallies. Pylova is untested.
+      anonymous per-user actors, which is fine for tallies. Votes from these
+      legacy alt actors stay in the tallies: the actors never author, so they
+      never get a repo (decision 21). Pylova is untested.
       Lemmy 1.0-beta is tracked but not targeted (vote `FederationMode`, inbox
       collapsing, NoteWrapper).
     - Rollout safety. Outbound has global, per-host, per-community and
@@ -477,3 +483,121 @@ is left with the Group-actor AP surface and the admission-policy wiring.
       bridged legacy posts exist, which Coves has accepted. A migration would
       need a remap decision from Coves and an old-to-new ledger; it is
       recorded in [FOLLOWUPS.md](FOLLOWUPS.md), and nothing depends on it.
+21. Inbound votes by bridged voters who already have a repo are
+    `social.coves.feed.vote` records in that repo. This partly supersedes
+    decision 7 (its inbound half).
+    - Who gets records: a Like or Dislike whose voter is a bridged person with
+      consent `ok` and an existing repo, once the vote is verified at the
+      voter's origin (below). The vote path never mints; a voter gets a repo
+      only by authoring.
+    - Who stays aggregate: voters with no repo, `#nobridge`/`#nobot` actors,
+      PieFed's legacy alt actors (they never author, so never get a repo), and
+      the API-seeded baseline, forever. Votes by our own personas are neither:
+      the echo guard drops them before either path.
+    - Netting. The aggregate recompute counts only live unrecorded rows. The
+      seeder still subtracts every live row, recorded ones included, because
+      the Lemmy API total contains them. Served = API total − delivered
+      outbound − recorded, so no vote is counted both bridge-side and in
+      Coves' native column.
+    - Two phases. Phase 1, in the aggregator transaction under the subject's
+      aggregate lock: store the vote, mark it pending if verified, recompute
+      without it.
+      Phase 2 (`votes.RecordWriter.SyncVoter`): repin `bridgedStats` for each
+      due subject first, then write the voter's creates and deletes in one
+      repo commit whose side effect moves each row's state under a guard; any
+      guard miss rolls the whole commit back. Work commits in chunks of at
+      most 100 ops, one repo commit each; a subject's ops stay in one chunk
+      unless that subject alone exceeds the cap. If a subject's create is held
+      back (its repin or mapping lookup failed), its delete waits too, so a
+      flip never commits half. The aggregate drop is visible
+      before the record exists, so the visible error is a brief one-low, never
+      a double count. `bridgedStats.asOf` is monotonic: a stamp older than the
+      one the record carries is refused, so a stale sweep cannot re-add a
+      recorded vote.
+    - Rkeys follow decision 4, adapted: Lemmy votes carry no `published`, so
+      the timestamp half is the time the bridge first recorded the vote and
+      the clock bits hash the activity id. A flip is delete(old) plus
+      create(new) in one commit.
+    - Origin verification. The Announce is signed only by the community's
+      instance; nothing proves the inner vote's actor cast it, so a followed
+      instance could forge votes into a bridged voter's repo. Rule: a vote
+      becomes a record only after `GET <activity id>` at the voter's own
+      instance (signed, SSRF-guarded, no redirects followed) returns
+      the same id, type, actor and object. The id path must be exactly
+      `/activities/like/<segment>` or `/activities/dislike/<segment>`: one
+      non-empty final segment, no `.`/`..` segment, no `%` escape, no query
+      or fragment. The verdict is stored on
+      `vote_events.origin_check`: `verified` (converted), `mismatch` (an id
+      of any other shape, id host ≠ actor host, any redirect, or a different
+      activity, an empty id included), `not_found` (400/401/403/404/410 or
+      Tombstone; Lemmy answers a missing activity with 400; final, so an
+      instance that refuses our signed fetch with 401/403 is not asked
+      again), `unavailable` (timeout, network, egress refusal, 429, 5xx, bad
+      body;
+      retried after a host backoff, 30s doubling to 15m) and `expired`
+      (still unavailable when the vote left the window). Only `unavailable`
+      is retried; everything not verified stays aggregate. The window is 6
+      days (`BRIDGED_VOTE_VERIFY_WINDOW`, under 168h) because Lemmy prunes
+      `sent_activity` at 7 days and PieFed's `ActivityPubLog` at 3; older
+      votes are never fetched. PieFed is covered by the same fetch (older
+      PieFed votes come back `not_found`); Mbin serves no activities and
+      stays aggregate. Undo is not verified: Lemmy rebuilds the inner vote
+      with a fresh, unfetchable id, and a forged Undo can only delete a real
+      record on the forger's own community's content, the reach it already
+      has over the aggregate.
+    - Pacing. Fetches start at most `BRIDGED_VOTE_VERIFY_HOST_RPS` (1) per
+      voter host and `BRIDGED_VOTE_VERIFY_GLOBAL_RPS` (5) in all, admitted
+      only when both buckets have a token; no token means deferred, never a
+      wait. The live path checks outside the vote transaction, one inline
+      fetch at a time with a 2s timeout; a vote that finds the slot taken or
+      runs out of time stays aggregate with nothing stored, for the sweep.
+      Verification uses its own AP client with no retries; the verifier's
+      10s timeout bounds each check. Each sweep selects at most
+      `BRIDGED_VOTE_VERIFY_BATCH` (300) votes and 60 per host, round-robin
+      across hosts; within a host never-checked votes go before retries,
+      then oldest first (Lemmy prunes oldest first). It checks them in
+      rounds of one vote per host for 80% of the interval, wall clock with
+      fetch time included, so neither a slow nor a backed-off host can
+      starve healthy ones. At the 1m default that is about 48 votes per host
+      and 240 in all per sweep (~69k/day per host, ~345k/day total). As
+      measured on 2026-11-07, lemmy.world sent about 3.6k votes/day by repo
+      voters (busiest day ~5.1k). A sweep fetch is cut off after 3s (or the
+      budget left), so a tarpit host costs at most that per check.
+      `tidepool_vote_verify_backlog`,
+      `tidepool_vote_verify_oldest_pending_seconds` and the
+      `tidepool_vote_verify_verdicts` map report it; each sweep warns while the oldest unchecked vote is within min(1 day, window/4)
+      of the window edge. Dry-run does not verify, so its conversion preview
+      counts only votes already verified.
+    - A paced sweeper repairs outstanding work (pending creates, owed
+      deletes), verifies, and converts eligible voters' verified aggregate
+      votes (a verified vote at any age: a restored subject or a failed
+      conversion converts without a refetch). That covers turning the switch
+      on and voters who get a repo later, with no hook on minting, for votes
+      still inside the window. It also scrubs record rows of voters who are
+      no longer eligible, and every row left of a voter who opted out or was
+      deleted while any of their rows still holds record state (a live row
+      that is or was a record, or a row still owed a delete); a left voter
+      with only plain aggregate rows keeps those votes counted.
+    - Native subjects. On a subject whose record is not in a repo hosted
+      here (native Coves content), there is no `bridgedStats` to repin:
+      Coves keeps serving the bridged count from its last poll. So there the
+      sweep never converts (or verifies) an already-counted vote, which stays
+      aggregate; only inline-verified votes, never counted, become records.
+    - Switches, read at boot: `BRIDGED_VOTE_RECORDS=off|up|both` (default
+      off), `BRIDGED_VOTE_RECORDS_DRY_RUN` (log only, mark and write nothing),
+      `BRIDGED_VOTE_RECORDS_INTERVAL` (1m), `BRIDGED_VOTE_RECORDS_BATCH`
+      (voters per pass, 20; each of the repair, scrub and convert passes
+      resumes after the last voter it handled). Off stops new records only;
+      pending creates and owed deletes still drain. Dry-run also pauses the
+      sweeper's repair and scrub, so owed deletes wait too; only the lifecycle
+      scrubs (`Delete(Actor)`, `SuppressActor`, `#nobridge`) always delete,
+      whatever the mode.
+    - Lifecycle. `Delete(Actor)`, `SuppressActor`, the refresh-time
+      `#nobridge` transition and the sweeper's ineligible-voter scrub delete
+      the voter's records first, then their rows. Undone rows still owed a
+      delete are not pruned.
+    - Coves needs no change: its vote consumer indexes `feed.vote` from any
+      `did:` repo on both Jetstream feeds. For native-authored subjects Coves
+      reads bridged counts by polling `getVoteAggregates`
+      (`BRIDGED_VOTE_POLL_INTERVAL`, default 5m, 2,000 subjects per sweep), so
+      there the one-low error can last up to one poll rotation.

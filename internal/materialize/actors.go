@@ -123,15 +123,23 @@ func (m *Materializer) ensureKnownActor(ctx context.Context, stored *store.Bridg
 		}
 		if hasNobridgeMarker(doc) {
 			// A previously-bridged actor opted out: scrub the content already
-			// mirrored (posts, comments, profile) before recording the
-			// consent flip, so nothing of theirs keeps being served — same
-			// ordering discipline as DeleteActor, but reversible (NoBridge,
-			// not the terminal Deleted).
+			// mirrored (posts, comments, profile) and their votes (rows and
+			// any feed.vote records) before recording the consent flip, so
+			// nothing of theirs keeps being served — same ordering discipline
+			// as DeleteActor and SuppressActor, but reversible (NoBridge, not
+			// the terminal Deleted).
 			if _, err := m.scrubActorRecords(ctx, stored.DID); err != nil {
+				return nil, err
+			}
+			if err := m.scrubActorVotes(ctx, stored.APActorID); err != nil {
 				return nil, err
 			}
 			if err := m.actors.SetConsentState(ctx, stored.APActorID, store.ConsentStateNoBridge); err != nil {
 				return nil, fmt.Errorf("materialize: record nobridge for %s: %w", stored.APActorID, err)
+			}
+			// Again after the flip: a vote may have become a record meanwhile.
+			if err := m.scrubActorVotes(ctx, stored.APActorID); err != nil {
+				return nil, err
 			}
 			m.logger.Info("actor added nobridge marker; existing content scrubbed and new materialization stopped",
 				"ap_actor_id", stored.APActorID)

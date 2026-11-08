@@ -7,8 +7,10 @@ Inbound, it follows Lemmy/PieFed/Mbin communities (FEP-1b12 group
 federation), materializes their posts, comments, and profiles as
 `social.coves.*` records in a virtual PDS it operates itself, and serves them
 over `com.atproto.sync.*` so the Coves AppView indexes fediverse communities
-exactly as it indexes native ones. Fediverse votes currently stay
-bridge-side as aggregates behind one sanctioned XRPC.
+exactly as it indexes native ones. Fediverse votes stay bridge-side as
+aggregates behind one sanctioned XRPC, except that `BRIDGED_VOTE_RECORDS`
+(default off) can write votes by bridged users who already have a repo as
+`feed.vote` records in that repo.
 
 Outbound, it consumes Jetstream so native Coves users can take part in
 bridged communities: their posts, comments, votes, edits, and deletes are
@@ -35,8 +37,9 @@ Tested means covered by the e2e suite against a real Lemmy instance. Untested me
 the peer speaks FEP-1b12 group federation and is expected to work, but
 nothing exercises it.
 
-\* Inbound votes are bridged as tallies per post and comment, not as
-per-voter records. PieFed sends votes from anonymous per-user actors, which
+\* Inbound votes are bridged as tallies per post and comment. With
+`BRIDGED_VOTE_RECORDS` on (default off), votes by bridged users who already
+have a repo become per-voter `feed.vote` records instead. PieFed sends votes from anonymous per-user actors, which
 is fine for tallies. Lemmy 1.0 changes how votes federate, which Tidepool
 does not handle yet.
 
@@ -53,11 +56,21 @@ over a valid HTTP signature. Each fediverse author and community gets a
 did:plc identity. Fediverse users who mark their profile `#nobridge` or
 `#nobot` are never bridged.
 
-**Votes.** Votes never become records, because nothing may strongRef a vote.
-The bridge keeps per-voter aggregates and folds the counts onto post and
-comment records as a `bridgedStats` field, so they reach the AppView on the
-same firehose. `social.coves.bridge.getVoteAggregates` serves the same
-totals directly.
+**Votes.** The bridge keeps per-subject aggregates and folds the counts onto
+post and comment records as a `bridgedStats` field, so they reach the AppView
+on the same firehose. `social.coves.bridge.getVoteAggregates` serves the same
+totals directly. With `BRIDGED_VOTE_RECORDS=up|both` (default off), a vote by
+a bridged user who already has a repo is written as a
+`social.coves.feed.vote` record in that repo and leaves the aggregate, so
+Coves counts it natively (PLAN.md decision 21). A vote becomes a record only
+after the bridge fetches its activity from the voter's own instance and it
+matches; the `Announce` signs only the community. Votes older than
+`BRIDGED_VOTE_VERIFY_WINDOW` (default 144h, under 168h) are not checked and
+stay in the aggregate. Fetches are paced by `BRIDGED_VOTE_VERIFY_HOST_RPS`
+(default 1) and `BRIDGED_VOTE_VERIFY_GLOBAL_RPS` (default 5), and each sweep
+reads up to `BRIDGED_VOTE_VERIFY_BATCH` (default 300) unchecked or retryable
+votes, about 48 per voter host and 240 in all per 1m sweep. Dry-run does not
+verify, so it previews only already-verified votes.
 
 **Outbound.** With the consumer on, Tidepool reads native Coves activity from
 Jetstream, translates it to ActivityPub, and queues deliveries to the

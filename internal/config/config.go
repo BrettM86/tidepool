@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/netip"
 	"net/url"
 	"os"
@@ -253,6 +254,40 @@ type Config struct {
 	// (STATS_REFRESH_BATCH, default 200, must be positive). Commits are
 	// globally serialized, so the batch keeps one sweep from flooding the lock.
 	StatsRefreshBatch int
+	// BridgedVoteRecords selects which inbound fediverse votes by bridged
+	// voters with a repo become social.coves.feed.vote records
+	// (BRIDGED_VOTE_RECORDS: "off" none, "up" Likes only, "both" Likes and
+	// Dislikes; default off; anything else fails boot). Off stops new records
+	// only: outstanding deletes and pending creates still drain. PLAN.md
+	// decision 21.
+	BridgedVoteRecords string
+	// BridgedVoteRecordsDryRun logs what the vote path and the sweeper would
+	// record or convert and writes nothing (BRIDGED_VOTE_RECORDS_DRY_RUN,
+	// default false). It also pauses the sweeper's repair and scrub, so owed
+	// deletes wait; only the lifecycle scrubs (Delete(Actor), SuppressActor,
+	// #nobridge) always delete records.
+	BridgedVoteRecordsDryRun bool
+	// BridgedVoteRecordsInterval is how often the vote-record sweeper repairs
+	// outstanding record work, verifies votes at their origin (for at most 80%
+	// of the interval) and converts eligible voters' verified aggregate votes
+	// (BRIDGED_VOTE_RECORDS_INTERVAL, a Go duration, default 1m, must be
+	// positive).
+	BridgedVoteRecordsInterval time.Duration
+	// BridgedVoteRecordsBatch bounds how many voters each sweep pass (repair,
+	// scrub, convert) handles (BRIDGED_VOTE_RECORDS_BATCH, default 20, must be
+	// positive).
+	BridgedVoteRecordsBatch int
+	// Origin verification of bridged votes before they become records:
+	// fetch start rates per voter host and in all
+	// (BRIDGED_VOTE_VERIFY_HOST_RPS default 1, BRIDGED_VOTE_VERIFY_GLOBAL_RPS
+	// default 5, both positive), the age past which a vote is no longer
+	// checked (BRIDGED_VOTE_VERIFY_WINDOW, default 144h, positive and under
+	// 168h: Lemmy prunes sent activities at 7 days), and the candidates one
+	// sweep reads (BRIDGED_VOTE_VERIFY_BATCH, default 300, positive).
+	BridgedVoteVerifyHostRPS   float64
+	BridgedVoteVerifyGlobalRPS float64
+	BridgedVoteVerifyWindow    time.Duration
+	BridgedVoteVerifyBatch     int
 	// FollowListPath optionally points at the declarative follow list — a
 	// repo-committed YAML file naming every community the bridge should
 	// follow (FOLLOW_LIST_PATH). When set, a reconciler converges the
@@ -711,6 +746,51 @@ func Load(logger *slog.Logger) (*Config, error) {
 		return nil, err
 	}
 
+	// Bridged vote records (decision 21): default off in every environment.
+	// The mode values mirror votes.ParseRecordMode, which main applies; config
+	// validates them here so a typo fails boot rather than reading as off.
+	cfg.BridgedVoteRecords = strings.ToLower(strings.TrimSpace(os.Getenv("BRIDGED_VOTE_RECORDS")))
+	switch cfg.BridgedVoteRecords {
+	case "":
+		cfg.BridgedVoteRecords = "off"
+		logger.Info("BRIDGED_VOTE_RECORDS not set, using default", "value", cfg.BridgedVoteRecords)
+	case "off", "up", "both":
+	default:
+		return nil, fmt.Errorf("config: BRIDGED_VOTE_RECORDS must be off, up or both, got %q", cfg.BridgedVoteRecords)
+	}
+	cfg.BridgedVoteRecordsDryRun, err = boolVarDefault(logger, "BRIDGED_VOTE_RECORDS_DRY_RUN", false)
+	if err != nil {
+		return nil, err
+	}
+	cfg.BridgedVoteRecordsInterval, err = durationVar(logger, "BRIDGED_VOTE_RECORDS_INTERVAL", time.Minute)
+	if err != nil {
+		return nil, err
+	}
+	cfg.BridgedVoteRecordsBatch, err = intVar(logger, "BRIDGED_VOTE_RECORDS_BATCH", 20)
+	if err != nil {
+		return nil, err
+	}
+	cfg.BridgedVoteVerifyHostRPS, err = positiveFloatVar(logger, "BRIDGED_VOTE_VERIFY_HOST_RPS", 1)
+	if err != nil {
+		return nil, err
+	}
+	cfg.BridgedVoteVerifyGlobalRPS, err = positiveFloatVar(logger, "BRIDGED_VOTE_VERIFY_GLOBAL_RPS", 5)
+	if err != nil {
+		return nil, err
+	}
+	cfg.BridgedVoteVerifyWindow, err = durationVar(logger, "BRIDGED_VOTE_VERIFY_WINDOW", 144*time.Hour)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.BridgedVoteVerifyWindow >= 168*time.Hour {
+		return nil, fmt.Errorf("config: BRIDGED_VOTE_VERIFY_WINDOW must be under 168h (Lemmy prunes sent activities at 7 days), got %s",
+			cfg.BridgedVoteVerifyWindow)
+	}
+	cfg.BridgedVoteVerifyBatch, err = intVar(logger, "BRIDGED_VOTE_VERIFY_BATCH", 300)
+	if err != nil {
+		return nil, err
+	}
+
 	// Declarative follow list: optional in every environment (unset = the
 	// /admin API is the only subscription control). The path's existence and
 	// contents are validated at startup by the caller, not here — config
@@ -790,6 +870,21 @@ func durationVar(logger *slog.Logger, name string, fallback time.Duration) (time
 	}
 	if parsed <= 0 {
 		return 0, fmt.Errorf("config: %s must be positive, got %s", name, parsed)
+	}
+	return parsed, nil
+}
+
+// positiveFloatVar returns a positive, finite float environment variable,
+// falling back to a logged default.
+func positiveFloatVar(logger *slog.Logger, name string, fallback float64) (float64, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		logger.Info(name+" not set, using default", "value", fallback)
+		return fallback, nil
+	}
+	parsed, err := strconv.ParseFloat(raw, 64)
+	if err != nil || !(parsed > 0) || math.IsInf(parsed, 0) {
+		return 0, fmt.Errorf("config: %s must be a positive number, got %q", name, raw)
 	}
 	return parsed, nil
 }

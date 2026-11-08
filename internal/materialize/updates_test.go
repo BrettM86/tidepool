@@ -219,6 +219,78 @@ func TestNobridgeAddedOnRefresh(t *testing.T) {
 	assert.Equal(t, store.ConsentStateNoBridge, actor.ConsentState)
 }
 
+// B17: the nobridge transition on refresh scrubs the actor's votes (and so
+// their vote records), as SuppressActor does.
+func TestNobridgeAddedOnRefreshScrubsVotes(t *testing.T) {
+	h := newHarness(t)
+	h.serveObject("/u/flipflop", person("https://lemmy.world/u/flipflop", "flipflop", nil))
+	ctx := context.Background()
+	_, err := h.m.EnsureActor(ctx, &ap.Object{ID: "https://lemmy.world/u/flipflop"})
+	require.NoError(t, err)
+
+	updated := person("https://lemmy.world/u/flipflop", "flipflop", map[string]any{
+		"summary": "<p>done with this #nobridge</p>",
+	})
+	_, err = h.m.RefreshActor(ctx, objectFromMap(t, updated))
+
+	require.True(t, IsSkip(err), "the opted-out actor is skipped, got %v", err)
+	assert.Equal(t, []string{"https://lemmy.world/u/flipflop", "https://lemmy.world/u/flipflop"}, h.scrubbed.calls(), "scrubbed before and again after the consent flip")
+}
+
+// Each lifecycle path scrubs the actor's votes again after the consent flip:
+// a vote that became a record between the first scrub and the flip must not
+// survive.
+func TestLifecyclePathsScrubVotesAfterTheConsentFlip(t *testing.T) {
+	const actorID = "https://lemmy.world/u/flipflop"
+	tests := []struct {
+		name        string
+		act         func(t *testing.T, h *harness)
+		wantConsent store.ConsentState
+	}{
+		{
+			name: "DeleteActor",
+			act: func(t *testing.T, h *harness) {
+				require.NoError(t, h.m.DeleteActor(context.Background(), actorID))
+			},
+			wantConsent: store.ConsentStateDeleted,
+		},
+		{
+			name: "SuppressActor",
+			act: func(t *testing.T, h *harness) {
+				require.NoError(t, h.m.SuppressActor(context.Background(), actorID))
+			},
+			wantConsent: store.ConsentStateNoBridge,
+		},
+		{
+			name: "nobridge added on refresh",
+			act: func(t *testing.T, h *harness) {
+				updated := person(actorID, "flipflop", map[string]any{
+					"summary": "<p>done with this #nobridge</p>",
+				})
+				_, err := h.m.RefreshActor(context.Background(), objectFromMap(t, updated))
+				require.True(t, IsSkip(err), "the opted-out actor is skipped, got %v", err)
+			},
+			wantConsent: store.ConsentStateNoBridge,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.serveObject("/u/flipflop", person(actorID, "flipflop", nil))
+			_, err := h.m.EnsureActor(context.Background(), &ap.Object{ID: actorID})
+			require.NoError(t, err)
+
+			tc.act(t, h)
+
+			assert.Contains(t, h.scrubbed.consentsAtCall(), tc.wantConsent,
+				"a vote scrub must run once consent is already %s", tc.wantConsent)
+			actor, err := h.actors.GetByAPActorID(context.Background(), actorID)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantConsent, actor.ConsentState)
+		})
+	}
+}
+
 // TestListByActorDIDSpine sanity-checks the store addition this task made:
 // author_did finds an actor's content. Post-flip a postv2 is an own-repo
 // record, so author_did and did agree for it — but the column is still the

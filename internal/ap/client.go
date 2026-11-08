@@ -161,6 +161,10 @@ type ClientOptions struct {
 	// config.AllowPrivateAddresses. Tests that hit httptest servers on
 	// 127.0.0.1 set it true.
 	AllowPrivateAddresses bool
+	// NoRedirects makes every non-media fetch (FetchObjectSameAuthority
+	// included) refuse every redirect, same-authority hops included, without
+	// requesting the target. Media fetches are unaffected.
+	NoRedirects bool
 }
 
 // Client fetches ActivityPub objects with signed GETs, per-host rate
@@ -181,6 +185,7 @@ type Client struct {
 	maxCollectionPages  int
 	keyCacheTTL         time.Duration
 	guard               *egressGuard
+	noRedirects         bool
 	// requestBudget bounds a deduped fetch's detached lifetime (see
 	// getDedupedMode): the shared request outlives the initiating caller's
 	// context, so it needs its own upper bound.
@@ -250,6 +255,7 @@ func NewClient(opts ClientOptions) *Client {
 		maxCollectionPages:  opts.MaxCollectionPages,
 		keyCacheTTL:         opts.KeyCacheTTL,
 		guard:               guard,
+		noRedirects:         opts.NoRedirects,
 		limiters:            make(map[string]*limiterEntry),
 		keyCache:            make(map[string]cachedKey),
 		maxKeyCacheEntries:  defaultMaxKeyCacheEntries,
@@ -373,6 +379,10 @@ func (c *Client) fetchObject(ctx context.Context, iri string, mode fetchMode) (*
 func (c *Client) FetchObjectSameAuthority(ctx context.Context, iri string) (*Object, error) {
 	return c.fetchObject(ctx, iri, fetchModeObjectPinnedAuthority)
 }
+
+// RefusesRedirects reports whether every non-media fetch refuses redirects
+// (ClientOptions.NoRedirects).
+func (c *Client) RefusesRedirects() bool { return c.noRedirects }
 
 // SameAuthority reports whether two absolute URLs share scheme and host (the
 // authority). Exported so consumers that key storage on a fetched object's
@@ -985,6 +995,10 @@ func (c *Client) getOnce(ctx context.Context, iri string, mode fetchMode) (body 
 			_ = resp.Body.Close()
 			if location == "" {
 				return nil, false, HTTPError{URL: target, StatusCode: resp.StatusCode}
+			}
+			if c.noRedirects {
+				return nil, false, errors.NewValidationError("redirect",
+					fmt.Sprintf("redirect from %q refused: this client follows no redirects", target))
 			}
 			if redirects >= maxRedirects {
 				return nil, false, fmt.Errorf("ap: GET %s: too many redirects", iri)

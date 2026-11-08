@@ -6,11 +6,12 @@ import (
 	"tidepool/internal/ap"
 )
 
-// VoteAggregator consumes Like/Dislike activities. Votes never become
-// records (PLAN.md locked decision 7): votes.Aggregator implements this
-// interface with the bridge-side aggregate store behind the
-// social.coves.bridge.getVoteAggregates XRPC (task 07); ingest only
-// defines the seam and hands activities over.
+// VoteAggregator consumes Like/Dislike activities. votes.Aggregator
+// implements this interface with the bridge-side aggregate store behind the
+// social.coves.bridge.getVoteAggregates XRPC (task 07); a vote by a bridged
+// voter who already has a repo can become a social.coves.feed.vote record in
+// that repo instead (PLAN.md decision 21). Ingest only defines the seam and
+// hands activities over.
 type VoteAggregator interface {
 	// ApplyVote records one Like or Dislike. vote is the (possibly
 	// Announce-unwrapped) activity: Type is Like or Dislike, Actor is the

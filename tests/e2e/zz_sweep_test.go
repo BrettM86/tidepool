@@ -28,7 +28,7 @@ const sweepReplayFloor = 30
 // collection whitelist / lexicons. Here vetEvent (helpers.go) judges every
 // single consumed commit:
 //
-//   - collection whitelist (votes NEVER become records — locked decision 7),
+//   - collection whitelist (expectedCollections in helpers.go),
 //   - lexicon validation of every create/update record,
 //   - per-DID rev monotonicity from cursor 1 (the listener's lastRev starts
 //     empty, so the full RETAINED history of every repo is checked in

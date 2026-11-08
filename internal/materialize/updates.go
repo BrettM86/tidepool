@@ -131,6 +131,11 @@ func (m *Materializer) SuppressActor(ctx context.Context, apActorID string) erro
 	if err := m.actors.SetConsentState(ctx, apActorID, store.ConsentStateNoBridge); err != nil {
 		return fmt.Errorf("materialize: record nobridge for %s: %w", apActorID, err)
 	}
+	// Again after the flip: a vote that became a record between the first
+	// scrub and the flip would otherwise survive it.
+	if err := m.scrubActorVotes(ctx, apActorID); err != nil {
+		return err
+	}
 	m.logger.Info("actor opted out; bridged records scrubbed and bridging suspended",
 		"ap_actor_id", apActorID, "did", actor.DID, "records", n)
 	return nil
@@ -214,14 +219,15 @@ func (m *Materializer) scrubActorVotes(ctx context.Context, apActorID string) er
 
 // DeleteActor handles Delete(Actor): every record the actor authored is
 // tombstoned FIRST (delete commits — the repo layer releases signing keys
-// for deletes even after a consent flip), their vote_events rows are
-// scrubbed, then the consent state is marked deleted (terminal), freezing
-// the repo — and an #account{active:false, status:"deleted"} event is
+// for deletes even after a consent flip), their votes are scrubbed, then
+// the consent state is marked deleted (terminal), freezing the repo, the
+// votes are scrubbed again — and an #account{active:false, status:"deleted"} event is
 // appended to the firehose so subscribers (relays above all) purge the repo
-// instead of inferring its death from the delete commits. The order means a
-// crash between any two steps re-runs cleanly: deletes and vote scrubs are
-// idempotent, re-tombstoning is a no-op success, and the final account
-// event still lands.
+// instead of inferring its death from the delete commits. A crash before the
+// consent flip re-runs cleanly: deletes and vote scrubs are idempotent and
+// re-tombstoning is a no-op success. After the flip a re-run stops at the
+// already-deleted guard, so a crash there loses the account event; the vote
+// record sweep scrubs any vote rows left.
 func (m *Materializer) DeleteActor(ctx context.Context, apActorID string) error {
 	actor, err := m.actors.GetByAPActorID(ctx, apActorID)
 	if errors.IsNotFound(err) {
@@ -264,6 +270,17 @@ func (m *Materializer) DeleteActor(ctx context.Context, apActorID string) error 
 
 	if err := m.actors.SetConsentState(ctx, apActorID, store.ConsentStateDeleted); err != nil {
 		return fmt.Errorf("materialize: tombstone actor %s: %w", apActorID, err)
+	}
+	// Again after the flip (a vote can become a record between the first
+	// scrub and the flip), and before the #account frame. Best-effort: once
+	// the consent flip has committed, a retry stops at the already-deleted
+	// guard above, so returning here would mean the #account frame is never
+	// sent. Continuing is safe because the pre-flip scrub already erased the
+	// actor's vote rows, and the vote record sweeper deletes any vote record
+	// left behind for a voter who is no longer eligible.
+	if err := m.scrubActorVotes(ctx, apActorID); err != nil {
+		m.logger.Warn("post-tombstone vote scrub failed; continuing to account event",
+			"ap_actor_id", apActorID, "error", err)
 	}
 	// AFTER the scrub commits and the consent flip, so the frame is the
 	// last thing a per-repo-ordered consumer sees. Emitted even when the

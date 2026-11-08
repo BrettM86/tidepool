@@ -26,8 +26,9 @@ import (
 //
 // The post author's auto-upvote never federates (FOLLOWUPS "Author
 // auto-upvotes do not federate"), so it is absent from every expectation.
-// An unfiltered listener runs throughout: vetEvent fails the suite if
-// anything vote-shaped ever becomes a firehose record (locked decision 7).
+// An unfiltered listener runs throughout: vetEvent fails the suite on any
+// unexpected collection, and the final drain fails on any vote record for
+// this post (no voter here has a repo, so none may get one — decision 21).
 func TestVoteHammer_ConcurrentVotersExactAggregates(t *testing.T) {
 	h := newHarness(t)
 	community, sub := setupSubscribedCommunity(t, h, "vh")
@@ -115,11 +116,14 @@ func TestVoteHammer_ConcurrentVotersExactAggregates(t *testing.T) {
 	})
 	h.awaitAcceptanceConverged(t, sub.DID, postEv.Did, postEv.Commit.RKey)
 
-	// Belt on locked decision 7: everything consumed during the hammer was
+	// Belt on decisions 7 and 21: everything consumed during the hammer was
 	// already vetted (vetEvent Fatalfs on any unexpected collection inside
-	// await AND drain), so the drain itself IS the assertion — it forces
-	// whatever is still buffered/live through vetEvent so no vote-shaped
-	// record can hide in the pending buffer. No explicit loop over the
-	// result: it could never run (vetEvent fails first).
-	l.drain(negativeWindow)
+	// await AND drain). The drain also returns the pending buffer, so no
+	// vote record on this post can hide there; none of these voters has a
+	// repo, so any such record is a bug.
+	for _, ev := range l.drain(negativeWindow) {
+		if isVoteRecordOn(ev, postURI) {
+			t.Errorf("vote record for a voter with no repo: %s", ev)
+		}
+	}
 }

@@ -16,6 +16,7 @@ import (
 	"tidepool/internal/ap"
 	"tidepool/internal/errors"
 	"tidepool/internal/repo"
+	"tidepool/internal/store"
 )
 
 // Task 11 hardening tests: the #account frame + vote scrub + blob scrub on
@@ -61,8 +62,8 @@ func TestDeleteActor_AccountEventVoteAndBlobScrub(t *testing.T) {
 
 	require.NoError(t, h.m.DeleteActor(ctx, personID))
 
-	// Vote scrub hook called with the actor's AP id.
-	assert.Equal(t, []string{personID}, h.scrubbed.calls())
+	// Vote scrub hook called with the actor's AP id, before and after the consent flip.
+	assert.Equal(t, []string{personID, personID}, h.scrubbed.calls(), "scrubbed before and again after the consent flip")
 
 	// The post's thumbnail is gone.
 	_, _, err = h.manager.GetBlob(ctx, authorDID, thumbCID)
@@ -104,6 +105,59 @@ func TestDeleteActor_AccountEventVoteAndBlobScrub(t *testing.T) {
 	assert.Equal(t, 3, deleteOps, "scrub deletes: the acceptance, the post and the actor profile")
 }
 
+// TestDeleteActor_VoteScrubFailure: a vote-scrub failure BEFORE the
+// consent flip aborts DeleteActor (a retry redoes everything). A failure
+// AFTER the flip must not: a retry would stop at the already-deleted guard
+// and the #account frame would never be sent, so DeleteActor completes and
+// leaves leftover vote records to the vote sweeper.
+func TestDeleteActor_VoteScrubFailure(t *testing.T) {
+	cases := []struct {
+		name          string
+		failCall      int
+		wantErr       bool
+		wantConsent   store.ConsentState
+		accountEvents int
+	}{
+		{name: "pre-flip scrub fails", failCall: 1, wantErr: true, wantConsent: store.ConsentStateOK, accountEvents: 0},
+		{name: "post-flip scrub fails", failCall: 2, wantErr: false, wantConsent: store.ConsentStateDeleted, accountEvents: 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.serveLemmyWorldFixtures()
+			ctx := context.Background()
+
+			_, err := h.m.MaterializePost(ctx, loadFixtureObject(t, "page_lemmy_world.json"), groupID)
+			require.NoError(t, err)
+			authorDID := testDIDFor("LeftLeaningFreedomFighters", "lemmy.world")
+
+			h.scrubbed.failCall(tc.failCall, fmt.Errorf("vote store unavailable"))
+			err = h.m.DeleteActor(ctx, personID)
+			if tc.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err, "a post-flip vote-scrub failure must not fail DeleteActor")
+			}
+
+			actor, err := h.actors.GetByAPActorID(ctx, personID)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantConsent, actor.ConsentState)
+
+			var accountEvents int
+			for _, ev := range h.firehoseEvents() {
+				if ev.Kind != repo.EventKindAccount {
+					continue
+				}
+				accountEvents++
+				assert.Equal(t, authorDID, ev.DID)
+				assert.False(t, ev.AccountActive)
+				assert.Equal(t, repo.AccountStatusDeleted, ev.AccountStatus)
+			}
+			assert.Equal(t, tc.accountEvents, accountEvents, "#account deleted events on the firehose")
+		})
+	}
+}
+
 // TestSuppressActor_ScrubsVotesToo: the reversible nobridge scrub erases
 // vote_events rows with the same posture as the terminal delete — but emits
 // NO #account frame (the repo stays active).
@@ -116,7 +170,7 @@ func TestSuppressActor_ScrubsVotesToo(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NoError(t, h.m.SuppressActor(ctx, personID))
-	assert.Equal(t, []string{personID}, h.scrubbed.calls())
+	assert.Equal(t, []string{personID, personID}, h.scrubbed.calls(), "scrubbed before and again after the consent flip")
 	for _, ev := range h.firehoseEvents() {
 		assert.NotEqual(t, repo.EventKindAccount, ev.Kind,
 			"nobridge is reversible: no #account frame may be emitted")

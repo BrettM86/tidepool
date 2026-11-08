@@ -163,6 +163,10 @@ const (
 	colAcceptance = "social.coves.community.acceptance"
 	colRemoval    = "social.coves.community.removal"
 	colComment    = "social.coves.community.comment"
+	// colVote is a bridged voter's own vote record, in that voter's repo.
+	// Only voters who already have a repo (they authored content) get one;
+	// every other Lemmy vote stays in the aggregate (PLAN.md decision 21).
+	colVote = "social.coves.feed.vote"
 )
 
 // subjectRKey derives an acceptance/removal record key from its subject's
@@ -201,9 +205,11 @@ const (
 const pendingSoftCap = 512
 
 // expectedCollections is the complete set of record collections that may
-// legally appear on the firehose. Anything else — vote records above all
-// (PLAN.md locked decision 7: votes NEVER become records) — is a bug, and
-// the listener enforces this on every consumed commit event (vetEvent).
+// legally appear on the firehose. Anything else is a bug, and the listener
+// enforces this on every consumed commit event (vetEvent). Vote records are
+// legal since PLAN.md decision 21 (votes by bridged voters who have a repo);
+// votes by voters without one must never become records, which the vote
+// scenarios assert per subject.
 var expectedCollections = map[string]bool{
 	colCommunityProfile: true,
 	colActorProfile:     true,
@@ -212,6 +218,7 @@ var expectedCollections = map[string]bool{
 	colAcceptance:       true,
 	colRemoval:          true,
 	colComment:          true,
+	colVote:             true,
 }
 
 // ── Harness ────────────────────────────────────────────────────────────────
@@ -1788,10 +1795,9 @@ func (l *jsListener) close() {
 // vetEvent enforces the suite-wide wire contract on EVERY consumed commit
 // event, matched or skipped:
 //
-//   - only the known emitted collections may appear — anything else, votes
-//     above all (PLAN.md locked decision 7: votes NEVER become records), is
-//     an immediate failure, no matter which scenario's await/drain window it
-//     lands in;
+//   - only the known emitted collections may appear (expectedCollections) —
+//     anything else is an immediate failure, no matter which scenario's
+//     await/drain window it lands in;
 //   - every create/update record must validate against the vendored Coves
 //     lexicons (deletes carry no record);
 //   - commit revs must be non-decreasing per repo DID (see lastRev), with
@@ -1805,7 +1811,7 @@ func (l *jsListener) vetEvent(ev *jsEvent) {
 		return
 	}
 	if !expectedCollections[ev.Commit.Collection] {
-		l.t.Fatalf("unexpected collection on firehose: %s — only community/actor profiles, posts (both eras), acceptances, removals, and comments may ever appear (votes never become records)", ev)
+		l.t.Fatalf("unexpected collection on firehose: %s — only community/actor profiles, posts (both eras), acceptances, removals, comments, and votes of voters with a repo may ever appear", ev)
 	}
 	// Per-repo rev order. NON-decreasing, not strictly increasing: one
 	// commit may carry SEVERAL ops (the moderation transitions commit

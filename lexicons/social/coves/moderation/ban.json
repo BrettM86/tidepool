@@ -4,84 +4,32 @@
   "defs": {
     "main": {
       "type": "record",
-      "description": "A ban record for a user in a community",
-      "key": "tid",
+      "description": "A community's ban of an account, written to the community's own repo. The record applies only in the repo of an indexed community. The record key is deterministic: RFC 4648 base32 (alphabet a-z2-7), lowercase, unpadded, of SHA-256 over the subject DID's UTF-8 bytes. It is always 52 characters and rkey-safe; for example, did:plc:troublemaker456 has the key a5uzm6rn7ba5hnqtdjrd22rg53skdtu6ksiksa5eini4ychhrcpa. A community therefore holds at most one ban record per subject. Writing the record again at that key overwrites the ban, and deleting it lifts the ban. A record at any other key is rejected and not indexed. With expiresAt the ban is temporary and ends at that time; without expiresAt it is permanent. A banned account's posts, comments and votes in the community are refused while the ban is in force.",
+      "key": "any",
       "record": {
         "type": "object",
-        "required": [
-          "community",
-          "subject",
-          "banType",
-          "createdAt"
-        ],
+        "required": ["subject", "createdAt"],
         "properties": {
-          "community": {
-            "type": "string",
-            "format": "did",
-            "description": "DID of the community"
-          },
           "subject": {
             "type": "string",
             "format": "did",
-            "description": "DID of the banned user"
-          },
-          "banType": {
-            "type": "string",
-            "knownValues": [
-              "moderator",
-              "tribunal"
-            ],
-            "description": "How the ban was imposed",
-            "maxLength": 64
+            "description": "DID of the banned account"
           },
           "reason": {
             "type": "string",
             "maxGraphemes": 2000,
             "maxLength": 20000,
-            "description": "Reason for the ban"
-          },
-          "duration": {
-            "type": "integer",
-            "minimum": 1,
-            "description": "Ban duration in hours (omit for permanent)"
-          },
-          "bannedBy": {
-            "type": "string",
-            "format": "did",
-            "description": "DID of moderator who issued ban (omitted for tribunal bans)"
-          },
-          "tribunalCase": {
-            "type": "ref",
-            "ref": "com.atproto.repo.strongRef",
-            "description": "Strong reference to the tribunal case that resulted in this ban"
-          },
-          "status": {
-            "type": "string",
-            "knownValues": [
-              "active",
-              "expired",
-              "revoked"
-            ],
-            "maxLength": 64
+            "description": "Human-readable reason for the ban, shown to the banned account"
           },
           "expiresAt": {
             "type": "string",
             "format": "datetime",
-            "description": "When the ban expires (omit for permanent)"
-          },
-          "revokedAt": {
-            "type": "string",
-            "format": "datetime",
-            "description": "When the ban was revoked"
-          },
-          "revokedBy": {
-            "type": "string",
-            "format": "did",
-            "description": "DID of moderator who revoked the ban"
+            "description": "When the ban ends. Omitted for a permanent ban."
           },
           "createdAt": {
             "type": "string",
-            "format": "datetime"
+            "format": "datetime",
+            "description": "When the ban was issued or last changed"
           }
         }
       }

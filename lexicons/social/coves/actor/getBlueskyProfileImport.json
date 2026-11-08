@@ -1,0 +1,161 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.actor.getBlueskyProfileImport",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Report which fields of the authenticated user's app.bsky.actor.profile record could be imported onto their social.coves.actor.profile record, and whether the import should be offered. Both records are read from the user's PDS.",
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#output"
+        }
+      },
+      "errors": [
+        {
+          "name": "AuthenticationRequired",
+          "description": "The request is not authenticated."
+        },
+        {
+          "name": "ServiceUnavailable",
+          "description": "The session store is temporarily unavailable; retry."
+        },
+        {
+          "name": "MissingCredentials",
+          "description": "The session has no PDS host; sign in again."
+        },
+        {
+          "name": "SessionError",
+          "description": "The user's PDS session could not be restored; sign in again."
+        },
+        {
+          "name": "SessionBusy",
+          "description": "Another request is using the session; retry."
+        },
+        {
+          "name": "AuthExpired",
+          "description": "The user's PDS session expired while reading a profile record; sign in again."
+        },
+        {
+          "name": "PermissionDenied",
+          "description": "The session does not have permission to read the profile records."
+        },
+        {
+          "name": "RateLimited",
+          "description": "The user's PDS rate-limited the read; retry later."
+        },
+        {
+          "name": "InvalidRequest",
+          "description": "The user's PDS rejected a request as invalid."
+        },
+        {
+          "name": "Conflict",
+          "description": "The user's PDS answered a read with a conflict; retry."
+        },
+        {
+          "name": "PayloadTooLarge",
+          "description": "The user's PDS answered a read with a payload-too-large error."
+        },
+        {
+          "name": "UpstreamFailure",
+          "description": "The user's PDS answered with a server error or an unusable response (over 1 MiB, undecodable, or a 404 without an XRPC error)."
+        },
+        {
+          "name": "PDSError",
+          "description": "The user's PDS could not be reached."
+        },
+        {
+          "name": "AccountNotFound",
+          "description": "The authenticated user has no Coves account record."
+        },
+        {
+          "name": "InvalidDID",
+          "description": "The authenticated user's DID is not valid."
+        },
+        {
+          "name": "Timeout",
+          "description": "The request timed out."
+        },
+        {
+          "name": "RequestCanceled",
+          "description": "The request was canceled."
+        },
+        {
+          "name": "InternalError",
+          "description": "The PDS client could not read the profile records."
+        },
+        {
+          "name": "InternalServerError",
+          "description": "The import dismissal state could not be read, or the response could not be encoded."
+        },
+        {
+          "name": "MethodNotAllowed",
+          "description": "The request method is not GET."
+        }
+      ]
+    },
+    "output": {
+      "type": "object",
+      "required": [
+        "status",
+        "fields"
+      ],
+      "properties": {
+        "status": {
+          "type": "string",
+          "maxLength": 32,
+          "description": "noBlueskyProfile: no Bluesky profile record. nothingToImport: the Bluesky profile has no importable field. dismissed: the user dismissed or completed the import. complete: every importable field is already set on Coves. offer: at least one importable field is empty on Coves.",
+          "knownValues": [
+            "noBlueskyProfile",
+            "nothingToImport",
+            "dismissed",
+            "complete",
+            "offer"
+          ]
+        },
+        "fields": {
+          "type": "array",
+          "maxLength": 4,
+          "description": "Importable Bluesky fields in the order displayName, description, avatar, banner. Empty for noBlueskyProfile and nothingToImport.",
+          "items": {
+            "type": "ref",
+            "ref": "#field"
+          }
+        }
+      }
+    },
+    "field": {
+      "type": "object",
+      "required": [
+        "field",
+        "covesIsEmpty"
+      ],
+      "properties": {
+        "field": {
+          "type": "string",
+          "maxLength": 32,
+          "knownValues": [
+            "displayName",
+            "description",
+            "avatar",
+            "banner"
+          ]
+        },
+        "bluesky": {
+          "type": "string",
+          "description": "The Bluesky value of a text field. Absent for image fields."
+        },
+        "blueskyImageUrl": {
+          "type": "string",
+          "format": "uri",
+          "description": "Preview URL of the Bluesky image for avatar and banner. Absent for text fields."
+        },
+        "covesIsEmpty": {
+          "type": "boolean",
+          "description": "Whether the field is unset on the user's Coves profile."
+        }
+      }
+    }
+  }
+}

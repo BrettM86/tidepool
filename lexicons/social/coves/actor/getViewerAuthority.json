@@ -33,6 +33,11 @@
         "instanceAdmin": {
           "type": "boolean",
           "description": "Whether the viewer is an instance admin. Computed by the AppView from its configured instance admins."
+        },
+        "banNotice": {
+          "type": "ref",
+          "ref": "social.coves.actor.defs#accountBanNotice",
+          "description": "Present while the viewer's account is banned on this instance."
         }
       }
     }

@@ -1,0 +1,98 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.moderation.unbanAccount",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Lift an account's instance ban, in force or lapsed, and publish the negation of its !takedown label on the DID. Instance authority and actor identity come from the authenticated service context, never request fields.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#input"
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "social.coves.moderation.defs#mutationResult"
+        }
+      },
+      "errors": [
+        {
+          "name": "AuthRequired",
+          "description": "Authentication is required; authenticate with an authorized service account before retrying."
+        },
+        {
+          "name": "Forbidden",
+          "description": "The authenticated actor lacks permission; do not retry unless its moderation authority changes."
+        },
+        {
+          "name": "InvalidRequest",
+          "description": "The request is incomplete or malformed, including a subject that is not a DID; correct it before retrying."
+        },
+        {
+          "name": "InvalidSubject",
+          "description": "The DID is an indexed community with no active account ban; do not retry."
+        },
+        {
+          "name": "StateConflict",
+          "description": "expectedVersion is stale or the account has no active ban; refetch getSubjectState before retrying."
+        },
+        {
+          "name": "IdempotencyConflict",
+          "description": "The same key was reused with a different request; do not retry with that key."
+        },
+        {
+          "name": "UnsupportedReason",
+          "description": "The reason is not supported for this action; choose a supported reason before retrying."
+        },
+        {
+          "name": "ModerationUnavailable",
+          "description": "The moderation service is temporarily unavailable; retry later."
+        }
+      ]
+    },
+    "input": {
+      "type": "object",
+      "description": "Request to unban an account",
+      "required": [
+        "subject",
+        "expectedVersion",
+        "idempotencyKey",
+        "reason"
+      ],
+      "properties": {
+        "subject": {
+          "type": "string",
+          "format": "did",
+          "description": "DID of the account to unban; an indexed community DID with no active account ban is refused with InvalidSubject"
+        },
+        "expectedVersion": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Opaque subject-state version of at://<subject> expected by the caller"
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Opaque key that makes equivalent unban requests idempotent"
+        },
+        "reason": {
+          "type": "ref",
+          "ref": "social.coves.moderation.defs#reasonType",
+          "description": "Public reason classification for unbanning the account; the doxing and illegal-content reasons are refused"
+        },
+        "privateNote": {
+          "type": "string",
+          "maxGraphemes": 1000,
+          "maxLength": 10000,
+          "description": "Private administrative note retained only on the admin action"
+        }
+      }
+    }
+  }
+}

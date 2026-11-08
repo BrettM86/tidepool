@@ -4,7 +4,7 @@
   "defs": {
     "main": {
       "type": "record",
-      "description": "A community's record that a post has been removed from it. Written in the same com.atproto.repo.applyWrites commit that deletes the social.coves.community.acceptance, so the firehose never carries a half-completed moderation action. Removal is URI-scoped and terminal: it applies to the post URI across later author edits, not only to the version it pins. A post rejected at submission time was never accepted and writes no record. Removed is exited only by an explicit moderator restore: an atomic commit deleting the removal record and writing a fresh acceptance. The record key is deterministic: the unpadded lowercase base32 encoding of the SHA-256 digest of the canonical subject AT-URI (fixed 52 characters, always rkey-safe), so each post has exactly one removal rkey per community and re-removal updates the same record.",
+      "description": "A community's record that a post or comment has been removed from it. The record key is deterministic: the unpadded lowercase base32 encoding of the SHA-256 digest of the canonical subject AT-URI (fixed 52 characters, always rkey-safe), so each subject has exactly one removal rkey per community and re-removal updates the same record. For a post subject: the record is written in the same com.atproto.repo.applyWrites commit that deletes the social.coves.community.acceptance, so the firehose never carries a half-completed moderation action. Removal is URI-scoped and terminal: it applies to the post URI across later author edits, not only to the version it pins. A post rejected at submission time was never accepted and writes no record. Removed is exited only by an explicit moderator restore: an atomic commit deleting the removal record and writing a fresh acceptance. For a comment subject: the record applies only when it is in the repo of the community that hosts the comment's thread root post. Writing the record removes the comment, deleting the record restores it, and no acceptance record is involved.",
       "key": "any",
       "record": {
         "type": "object",
@@ -13,7 +13,7 @@
           "subject": {
             "type": "ref",
             "ref": "com.atproto.repo.strongRef",
-            "description": "Strong reference to the removed post. The pinned CID is audit metadata recording the version present at removal time; the removal itself applies to the post URI."
+            "description": "Strong reference to the removed post or comment. The pinned CID is audit metadata recording the version present at removal time; the removal itself applies to the subject URI."
           },
           "code": {
             "type": "string",
@@ -32,12 +32,12 @@
             "type": "string",
             "maxGraphemes": 1000,
             "maxLength": 10000,
-            "description": "Human-readable explanation of the removal, shown to the author and in the moderation log"
+            "description": "Human-readable explanation of the removal. For a post subject it is shown to the author and in the moderation log. For a comment subject Coves does not store or show it."
           },
           "createdAt": {
             "type": "string",
             "format": "datetime",
-            "description": "Timestamp when the post was removed"
+            "description": "Timestamp when the subject was removed"
           }
         }
       }

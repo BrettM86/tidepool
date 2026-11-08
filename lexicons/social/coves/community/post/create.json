@@ -115,7 +115,7 @@
         },
         {
           "name": "Banned",
-          "description": "User is banned from this community"
+          "description": "The author is banned from this community, or their account is banned on this instance"
         },
         {
           "name": "InvalidContent",
@@ -136,6 +136,10 @@
         {
           "name": "InvalidImageFacet",
           "description": "An #image facet breaks a placement rule: its index does not name an image of an images embed, it shares its facet with another feature, it places an index already placed, its range is empty, or its range lies inside a #code or #codeBlock range"
+        },
+        {
+          "name": "CommunityRemoved",
+          "description": "The community is removed by the instance and takes no new posts"
         }
       ]
     }

@@ -1,0 +1,103 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.moderation.banAccount",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Ban an account instance-wide: one instance removal decision on at://<did> and a !takedown label on the DID, carrying exp for a temporary ban. While the ban is in force the account's posts, comments and votes are refused. A ban in force or lapsed is replaced by a new one. Instance authority and actor identity come from the authenticated service context, never request fields.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#input"
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "social.coves.moderation.defs#mutationResult"
+        }
+      },
+      "errors": [
+        {
+          "name": "AuthRequired",
+          "description": "Authentication is required; authenticate with an authorized service account before retrying."
+        },
+        {
+          "name": "Forbidden",
+          "description": "The authenticated actor lacks permission; do not retry unless its moderation authority changes."
+        },
+        {
+          "name": "InvalidRequest",
+          "description": "The request is incomplete or malformed, including a subject that is not a DID or an expiresAt not after the server's current time; correct it before retrying."
+        },
+        {
+          "name": "InvalidSubject",
+          "description": "The DID is an indexed community with no account activity, or a trusted bridge community; do not retry."
+        },
+        {
+          "name": "StateConflict",
+          "description": "expectedVersion is stale, or the DID has an active community removal; refetch getSubjectState before retrying."
+        },
+        {
+          "name": "IdempotencyConflict",
+          "description": "The same key was reused with a different request; do not retry with that key."
+        },
+        {
+          "name": "UnsupportedReason",
+          "description": "The reason is not supported for this action; choose a supported reason before retrying."
+        },
+        {
+          "name": "ModerationUnavailable",
+          "description": "The moderation service is temporarily unavailable; retry later."
+        }
+      ]
+    },
+    "input": {
+      "type": "object",
+      "description": "Request to ban an account",
+      "required": [
+        "subject",
+        "expectedVersion",
+        "idempotencyKey",
+        "reason"
+      ],
+      "properties": {
+        "subject": {
+          "type": "string",
+          "format": "did",
+          "description": "DID of the account to ban; an indexed community DID is refused with InvalidSubject unless it also has account activity and is not a trusted bridge community"
+        },
+        "expectedVersion": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Opaque subject-state version of at://<subject> expected by the caller"
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Opaque key that makes equivalent ban requests idempotent"
+        },
+        "reason": {
+          "type": "ref",
+          "ref": "social.coves.moderation.defs#reasonType",
+          "description": "Public reason classification for banning the account"
+        },
+        "expiresAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "When the ban ends with no further action; omitted for a permanent ban. It must be after the server's current time, is stored at millisecond precision and is part of the idempotency request"
+        },
+        "privateNote": {
+          "type": "string",
+          "maxGraphemes": 1000,
+          "maxLength": 10000,
+          "description": "Private administrative note retained only on the admin action"
+        }
+      }
+    }
+  }
+}

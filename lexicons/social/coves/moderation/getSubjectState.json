@@ -15,7 +15,7 @@
           "subject": {
             "type": "string",
             "format": "at-uri",
-            "description": "AT-URI of the subject in a supported collection"
+            "description": "AT-URI of the subject: a record in a supported collection, or at://<did> for an account or community"
           }
         }
       },

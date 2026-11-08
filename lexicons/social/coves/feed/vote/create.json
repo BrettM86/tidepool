@@ -57,6 +57,14 @@
         {
           "name": "InvalidSubject",
           "description": "The subject reference is invalid or malformed"
+        },
+        {
+          "name": "Banned",
+          "description": "The user is banned from the community the subject belongs to, or their account is banned on this instance"
+        },
+        {
+          "name": "CommunityRemoved",
+          "description": "The community the subject belongs to is removed by the instance and takes no new votes"
         }
       ]
     }

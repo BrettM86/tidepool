@@ -202,6 +202,14 @@ services:
       OUTBOUND_DISABLED_COMMUNITIES: ${OUTBOUND_DISABLED_COMMUNITIES:-}
       OUTBOUND_DISABLED_ACTORS: ${OUTBOUND_DISABLED_ACTORS:-}
 
+      # Per-user feed.vote records for bridged voters (PLAN.md decision 21),
+      # off|up|both. Read once at boot; change /opt/tidepool/.env and recreate
+      # the service. Off is the kill switch: it stops new records and still
+      # drains owed deletes. The BRIDGED_VOTE_RECORDS_INTERVAL/_BATCH and
+      # BRIDGED_VOTE_VERIFY_* knobs keep their logged defaults.
+      BRIDGED_VOTE_RECORDS: ${BRIDGED_VOTE_RECORDS:-off}
+      BRIDGED_VOTE_RECORDS_DRY_RUN: ${BRIDGED_VOTE_RECORDS_DRY_RUN:-false}
+
       # The acceptance engine's per-author-per-community flood cap (0 =
       # unlimited). Tidepool SIGNS the community's acceptance, so it must not
       # let one native account flood a community it vouches for.

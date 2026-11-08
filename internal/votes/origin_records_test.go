@@ -779,3 +779,49 @@ func TestSweepDoesNotCheckVotesThatStayAggregate(t *testing.T) {
 		})
 	}
 }
+
+// H6: a sweep fetch is cut off after at most 3s (or the budget left), so a
+// tarpit host cannot hold the sweep for the verifier's whole Timeout: the
+// sweep still verifies the fast host and leaves the slow vote unchecked. The
+// one test on real time: the origin blocks until its fetch context ends.
+func TestSweepFetchDeadlineBoundsATarpitHost(t *testing.T) {
+	origin, clock := newFakeOrigin(), newFakeClock()
+	// A host gets one fetch per 1000s of the fake clock: the slow host is
+	// tried once in the sweep's budget.
+	verifier, err := NewOriginVerifier(origin, OriginVerifierOptions{
+		HostRPS: 0.001, GlobalRPS: 100, Timeout: time.Minute, Now: clock.Now,
+	}, slog.Default())
+	require.NoError(t, err)
+	opts := RecordWriterOptions{Mode: RecordsBoth, Interval: 10 * time.Minute, Batch: 20}
+	w := newRecordsWorld(t, opts, withOrigin(verifier, clock))
+	ctx := context.Background()
+	slowVoter, slowDID := voterOn("slow.example", 1)
+	fastVoter, fastDID := voterOn("fast.example", 2)
+	slowID, fastID := voteIDOn(t, "slow.example", 1), voteIDOn(t, "fast.example", 2)
+	slowSubject, fastSubject := w.verifySubject(t, 1), w.verifySubject(t, 2)
+	w.bridgedVoter(t, slowVoter, slowDID, store.ConsentStateOK, false)
+	w.bridgedVoter(t, fastVoter, fastDID, store.ConsentStateOK, false)
+	origin.answer(slowID, originAnswer{blockUntilCancel: true})
+	origin.serve(likeClaim(fastID, fastVoter, fastSubject))
+	require.NoError(t, w.agg.ApplyVote(ctx, like(slowID, slowVoter, slowSubject), ""))
+	require.NoError(t, w.agg.ApplyVote(ctx, like(fastID, fastVoter, fastSubject), ""))
+	// The slow host's vote is the oldest: its host is tried first.
+	ageVote(t, w.db, slowID, time.Hour)
+	w.giveRepo(t, slowDID)
+	w.giveRepo(t, fastDID)
+	// Unblocks the tarpit if the sweep applies no deadline of its own.
+	sweepCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	started := time.Now()
+	sweepErr := w.writer.Sweep(sweepCtx)
+	elapsed := time.Since(started)
+
+	assert.Less(t, elapsed, 6*time.Second, "a tarpit host holds the sweep at most 3s per check")
+	require.NoError(t, sweepErr)
+	assert.Equal(t, verdict("verified"), readOriginCheck(t, w.db, fastID).verdict)
+	assert.Len(t, w.voteRecords(t, fastDID), 1, "the fast host's vote is recorded")
+	assert.Equal(t, originCheck{}, readOriginCheck(t, w.db, slowID), "the slow vote stays unchecked")
+	assert.Equal(t, 1, origin.fetches(slowID))
+	assertServed(t, w.db, slowSubject, 1, 0)
+}

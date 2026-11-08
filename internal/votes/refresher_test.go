@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	stderrors "errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"testing"
@@ -514,4 +515,25 @@ func TestRefreshSubjectReportsAValidationFailure(t *testing.T) {
 
 	require.Error(t, err)
 	assert.True(t, errors.IsValidation(err), "got %v", err)
+}
+
+// T2: RefreshSubject reports a transient emit failure: the record writer must
+// not commit a vote record behind stats that were not repinned.
+func TestRefreshSubjectReportsATransientEmitFailure(t *testing.T) {
+	database := testDB(t)
+	agg, objects := testAggregator(t, database)
+	bridgeSubject(t, objects, subjectPost, subjectRKey)
+	ctx := context.Background()
+	require.NoError(t, agg.ApplyVote(ctx, like(activityID(t, 1), voterAlice, subjectPost), ""))
+	emitter := &fakeEmitter{fn: func(*store.APObjectMapping, int, int) (bool, error) {
+		return false, fmt.Errorf("db connection reset")
+	}}
+	r := testRefresher(t, database, emitter)
+
+	err := r.RefreshSubject(ctx, subjectPost)
+
+	require.Error(t, err)
+	_, emitted, found := aggregateTimes(t, database, subjectPost)
+	require.True(t, found)
+	assert.False(t, emitted.Valid, "the watermark is not advanced: the subject stays due")
 }

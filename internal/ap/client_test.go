@@ -310,6 +310,25 @@ func TestFetchObjectSameAuthority_NoRedirects(t *testing.T) {
 	}
 }
 
+// RefusesRedirects reports the client's NoRedirects option (the vote origin
+// verifier refuses a client that follows redirects).
+func TestClientRefusesRedirectsReportsNoRedirects(t *testing.T) {
+	tests := []struct {
+		name        string
+		noRedirects bool
+		want        bool
+	}{
+		{name: "NoRedirects set", noRedirects: true, want: true},
+		{name: "NoRedirects unset", noRedirects: false, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := newTestClient(t, ClientOptions{NoRedirects: tt.noRedirects})
+			assert.Equal(t, tt.want, client.RefusesRedirects())
+		})
+	}
+}
+
 // scriptedTransport is a RoundTripper answering from a script instead of the
 // network: no dial ever happens, so egress-guard-ON behavior can be tested
 // against fake public hostnames (guard-on clients cannot hit 127.0.0.1

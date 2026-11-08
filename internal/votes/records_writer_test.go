@@ -932,3 +932,137 @@ func TestFlipIsNeverSplitAcrossCommits(t *testing.T) {
 	assert.Equal(t, map[string]int{"written": 100, "removed": 1}, recordStates(t, w.db))
 	assertServed(t, w.db, subjectPost, 0, 0)
 }
+
+const (
+	// A native Coves subject: its mapping's repo is not hosted here (no
+	// repo_state row), so no bridgedStats repin can drop a converted vote.
+	subjectNative = "https://lemmy.world/post/700"
+	nativeDID     = "did:plc:recordsnative00000000000"
+)
+
+// H3: the sweep never converts an already-counted vote on a native subject
+// (Coves keeps serving the bridged count from its last poll, so the record
+// would double-count); an inline-verified vote, never counted, still becomes a
+// record there.
+func TestNativeSubjectVotes(t *testing.T) {
+	tests := []struct {
+		name string
+		// inline: the voter is eligible when the Like arrives (verified
+		// inline); otherwise the Like is counted first and the voter gets a
+		// repo later. preVerified stores 'verified' before the sweep.
+		inline, preVerified bool
+		wantRecord          bool
+		wantServedUp        int
+	}{
+		{name: "counted vote verified by the sweep", wantRecord: false, wantServedUp: 1},
+		{name: "counted vote already verified", preVerified: true, wantRecord: false, wantServedUp: 1},
+		{name: "inline-verified vote", inline: true, wantRecord: true, wantServedUp: 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newRecordsWorld(t, recordsBoth)
+			ctx := context.Background()
+			bridgeSubjectAs(t, w.objects, subjectNative, "3jzfcijpj2n7a", nativeDID, testCollection)
+			likeID := activityID(t, 1)
+			if tc.inline {
+				w.eligibleVoter(t, voterAlice, aliceDID)
+				require.NoError(t, w.agg.ApplyVote(ctx, like(likeID, voterAlice, subjectNative), ""))
+			} else {
+				w.bridgedVoter(t, voterAlice, aliceDID, store.ConsentStateOK, false)
+				require.NoError(t, w.agg.ApplyVote(ctx, like(likeID, voterAlice, subjectNative), ""))
+				assertServed(t, w.db, subjectNative, 1, 0)
+				if tc.preVerified {
+					setOriginCheck(t, w.db, likeID, "verified", time.Minute)
+				}
+				w.giveRepo(t, aliceDID)
+			}
+
+			for range 2 {
+				require.NoError(t, w.writer.Sweep(ctx))
+			}
+
+			row := readVoteRow(t, w.db, likeID)
+			if tc.wantRecord {
+				assert.Len(t, w.voteRecords(t, aliceDID), 1)
+				assert.Equal(t, written(), row.recordState)
+			} else {
+				assert.Empty(t, w.voteRecords(t, aliceDID), "an already-counted vote on a native subject stays aggregate")
+				assert.Equal(t, sql.NullString{}, row.recordState)
+			}
+			assertServed(t, w.db, subjectNative, tc.wantServedUp, 0)
+		})
+	}
+}
+
+// H4: when a flip's create is held back (its subject's refresh failed), its
+// delete is held back too: no commit for that subject until both can land in
+// one.
+func TestFlipWithAFailedRefreshCommitsNothingUntilBothLand(t *testing.T) {
+	failing := false
+	w := newRecordsWorld(t, recordsBoth, withRefresher(func(*recordsWorld) SubjectRefresher {
+		return refresherFunc(func(_ context.Context, subject string) error {
+			if failing && subject == subjectPost {
+				return fmt.Errorf("injected refresh failure for %s", subject)
+			}
+			return nil
+		})
+	}))
+	ctx := context.Background()
+	w.eligibleVoter(t, voterAlice, aliceDID)
+	likeID, dislikeID := activityID(t, 1), activityID(t, 2)
+	require.NoError(t, w.agg.ApplyVote(ctx, like(likeID, voterAlice, subjectPost), ""))
+	require.Len(t, w.voteRecords(t, aliceDID), 1, "the Like must be recorded before the flip")
+	failing = true
+	seq := latestSeq(t, w.db)
+
+	require.NoError(t, w.agg.ApplyVote(ctx, dislike(dislikeID, voterAlice, subjectPost), ""))
+
+	assert.Empty(t, firehoseOpsSince(t, w.db, aliceDID, seq), "no commit while the create is held back")
+	records := w.voteRecords(t, aliceDID)
+	require.Len(t, records, 1, "the Like's record is still present")
+	assert.Equal(t, "up", records[0].Value["direction"])
+
+	failing = false
+	require.NoError(t, w.writer.Sweep(ctx))
+
+	deletePath := recordPath(t, readVoteRow(t, w.db, likeID).recordATURI.String)
+	createPath := recordPath(t, readVoteRow(t, w.db, dislikeID).recordATURI.String)
+	commits := firehoseOpsSince(t, w.db, aliceDID, seq)
+	require.Len(t, commits, 1, "the delete and the create land in one commit")
+	actions := map[string]repo.OpAction{}
+	for _, op := range commits[0] {
+		actions[op.Path] = op.Action
+	}
+	assert.Equal(t, map[string]repo.OpAction{deletePath: repo.OpActionDelete, createPath: repo.OpActionCreate}, actions)
+	assert.Equal(t, sql.NullString{String: "removed", Valid: true}, readVoteRow(t, w.db, likeID).recordState)
+	assert.Equal(t, written(), readVoteRow(t, w.db, dislikeID).recordState)
+	assertServed(t, w.db, subjectPost, 0, 0)
+}
+
+// T1: an undone vote whose record delete failed (undone + 'written') is
+// repaired by the sweep: the record is deleted in exactly one delete op.
+func TestSweepRepairsAFailedRecordDelete(t *testing.T) {
+	var gate *failFirstCommitter
+	w := newRecordsWorld(t, recordsBoth, withCommitter(func(_ *recordsWorld, next RecordCommitter) RecordCommitter {
+		gate = &failFirstCommitter{next: next, failed: true}
+		return gate
+	}))
+	ctx := context.Background()
+	w.eligibleVoter(t, voterAlice, aliceDID)
+	likeID := activityID(t, 1)
+	require.NoError(t, w.agg.ApplyVote(ctx, like(likeID, voterAlice, subjectPost), ""))
+	require.Len(t, w.voteRecords(t, aliceDID), 1, "alice's Like must be recorded")
+	gate.failed = false
+	require.NoError(t, w.agg.RetractVote(ctx, like(activityID(t, 99), voterAlice, subjectPost), ""))
+	row := readVoteRow(t, w.db, likeID)
+	require.True(t, row.undone)
+	require.Equal(t, written(), row.recordState, "the failed delete leaves the undone row written")
+	path := recordPath(t, row.recordATURI.String)
+
+	require.NoError(t, w.writer.Sweep(ctx))
+
+	assert.Empty(t, w.voteRecords(t, aliceDID), "the sweep deletes the record")
+	assert.Equal(t, sql.NullString{String: "removed", Valid: true}, readVoteRow(t, w.db, likeID).recordState)
+	assert.Len(t, opSeqs(t, w.db, aliceDID, path, repo.OpActionDelete), 1, "exactly one delete")
+	assertServed(t, w.db, subjectPost, 0, 0)
+}

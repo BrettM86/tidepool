@@ -57,6 +57,7 @@ type OriginVerifier interface {
 // authority (*ap.Client).
 type OriginFetcher interface {
 	FetchObjectSameAuthority(ctx context.Context, iri string) (*ap.Object, error)
+	RefusesRedirects() bool
 }
 
 // OriginVerifierOptions pace the verifier. HostRPS and GlobalRPS are fetch

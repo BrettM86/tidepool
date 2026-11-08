@@ -168,3 +168,50 @@ func TestScrubDeletesMoreRecordsThanOneCommitHolds(t *testing.T) {
 	assert.Empty(t, w.voteRecords(t, aliceDID))
 	assert.Equal(t, 0, voterRows(t, w.db, voterAlice))
 }
+
+// H2: a voter who opted out or was deleted is scrubbed by the sweep while any
+// vote row of theirs is left, recorded or not — a failed scrub after its record
+// deletes leaves live 'removed' rows nobody else revisits. A voter is never
+// scrubbed merely for having no repo.
+func TestSweepScrubsLeftoverRowsOfVotersWhoLeft(t *testing.T) {
+	tests := []struct {
+		name    string
+		consent store.ConsentState
+	}{
+		{name: "consent nobridge", consent: store.ConsentStateNoBridge},
+		{name: "consent deleted", consent: store.ConsentStateDeleted},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newRecordsWorld(t, recordsBoth)
+			ctx := context.Background()
+			w.secondSubject(t)
+			// Alice's rows as a failed scrub leaves them: one live row whose
+			// record was deleted ('removed') and one plain aggregate row.
+			w.bridgedVoter(t, voterAlice, aliceDID, store.ConsentStateOK, false)
+			removedID, plainID := activityID(t, 1), activityID(t, 2)
+			require.NoError(t, w.agg.ApplyVote(ctx, like(removedID, voterAlice, subjectPost), ""))
+			require.NoError(t, w.agg.ApplyVote(ctx, like(plainID, voterAlice, subjectPostB), ""))
+			_, err := w.db.Exec(`
+				UPDATE vote_events SET record_state = 'removed', record_at_uri = $2 WHERE activity_id = $1`,
+				removedID, "at://"+aliceDID+"/"+voteCollection+"/3mzthokhb5mga")
+			require.NoError(t, err)
+			_, err = w.db.Exec(`UPDATE bridged_actors SET consent_state = $2 WHERE ap_actor_id = $1`,
+				voterAlice, string(tc.consent))
+			require.NoError(t, err)
+			// Bob was never bridged; carol is bridged with consent ok but no
+			// repo. Neither is scrubbed.
+			require.NoError(t, w.agg.ApplyVote(ctx, like(activityID(t, 3), voterBob, subjectPost), ""))
+			w.bridgedVoter(t, voterCarol, carolDID, store.ConsentStateOK, false)
+			require.NoError(t, w.agg.ApplyVote(ctx, like(activityID(t, 4), voterCarol, subjectPostB), ""))
+
+			require.NoError(t, w.writer.Sweep(ctx))
+
+			assert.Equal(t, 0, voterRows(t, w.db, voterAlice), "both of alice's rows are scrubbed")
+			assert.Equal(t, 1, voterRows(t, w.db, voterBob), "a never-bridged voter's row is untouched")
+			assert.Equal(t, 1, voterRows(t, w.db, voterCarol), "a voter without a repo is not scrubbed")
+			assertServed(t, w.db, subjectPost, 1, 0)
+			assertServed(t, w.db, subjectPostB, 1, 0)
+		})
+	}
+}

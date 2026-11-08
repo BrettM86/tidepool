@@ -158,6 +158,8 @@ func newRecordsWorld(t *testing.T, opts RecordWriterOptions, options ...recordsW
 	agg.SetRecordWriter(writer)
 	w.writer = writer
 	require.Equal(t, subjectATURI, bridgeSubject(t, objects, subjectPost, subjectRKey))
+	// The subjects' community repo is hosted here (a bridged community).
+	w.giveRepo(t, testDID)
 	return w
 }
 
@@ -581,4 +583,80 @@ func TestSeedNetsRecordedVotesOutOfTheBaseline(t *testing.T) {
 	require.NoError(t, w.db.QueryRow(`
 		SELECT seeded_upvotes FROM vote_aggregates WHERE subject_ap_id = $1`, subjectPost).Scan(&seeded))
 	assert.Equal(t, 3, seeded)
+}
+
+// H1: an announced Undo of a recorded vote binds the community through the
+// subject mapping even when it is soft-deleted, so the record is deleted; a
+// hard-missing mapping still drops the Undo.
+func TestAnnouncedUndoOfARecordedVoteOnADeletedSubject(t *testing.T) {
+	tests := []struct {
+		name string
+		// remove takes the subject's mapping away before the Undo.
+		remove func(t *testing.T, w *recordsWorld)
+		// wantDeleted: the record is deleted and the row ends undone + removed;
+		// otherwise both are untouched.
+		wantDeleted bool
+	}{
+		{
+			name: "mapping soft-deleted",
+			remove: func(t *testing.T, w *recordsWorld) {
+				require.NoError(t, w.objects.SoftDelete(context.Background(), subjectPost))
+			},
+			wantDeleted: true,
+		},
+		{
+			name: "mapping hard-missing",
+			remove: func(t *testing.T, w *recordsWorld) {
+				_, err := w.db.Exec(`DELETE FROM ap_objects WHERE ap_id = $1`, subjectPost)
+				require.NoError(t, err)
+			},
+			wantDeleted: false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newRecordsWorld(t, recordsBoth)
+			ctx := context.Background()
+			followCommunity(t, w.db, testGroupIRI, testDID)
+			w.eligibleVoter(t, voterAlice, aliceDID)
+			likeID := activityID(t, 1)
+			require.NoError(t, w.agg.ApplyVote(ctx, like(likeID, voterAlice, subjectPost), testGroupIRI))
+			require.Len(t, w.voteRecords(t, aliceDID), 1, "the Like must be recorded before the undo")
+			tc.remove(t, w)
+
+			// Production passes the announcing community; Lemmy's Undo
+			// reconstructs the inner Like with a fresh id.
+			require.NoError(t, w.agg.RetractVote(ctx, like(activityID(t, 99), voterAlice, subjectPost), testGroupIRI))
+
+			row := readVoteRow(t, w.db, likeID)
+			if tc.wantDeleted {
+				assert.True(t, row.undone, "the Undo retracts the recorded Like")
+				assert.Equal(t, sql.NullString{String: "removed", Valid: true}, row.recordState)
+				assert.Empty(t, w.voteRecords(t, aliceDID), "the undone vote's record is deleted")
+				return
+			}
+			assert.False(t, row.undone, "an Undo on an unmapped subject is dropped")
+			assert.Equal(t, written(), row.recordState)
+			assert.Len(t, w.voteRecords(t, aliceDID), 1)
+		})
+	}
+}
+
+// T3: an Undo carrying the original vote's id (not Lemmy's reconstructed one)
+// deletes the recorded vote's record inline.
+func TestUndoNamingTheOriginalVoteIDDeletesTheRecord(t *testing.T) {
+	w := newRecordsWorld(t, recordsBoth)
+	ctx := context.Background()
+	w.eligibleVoter(t, voterAlice, aliceDID)
+	likeID := activityID(t, 1)
+	require.NoError(t, w.agg.ApplyVote(ctx, like(likeID, voterAlice, subjectPost), ""))
+	require.Len(t, w.voteRecords(t, aliceDID), 1, "the Like must be recorded before the undo")
+
+	require.NoError(t, w.agg.RetractVote(ctx, like(likeID, voterAlice, subjectPost), ""))
+
+	assert.Empty(t, w.voteRecords(t, aliceDID), "the undone vote's record is deleted without a sweep")
+	row := readVoteRow(t, w.db, likeID)
+	assert.True(t, row.undone)
+	assert.Equal(t, sql.NullString{String: "removed", Valid: true}, row.recordState)
+	assertServed(t, w.db, subjectPost, 0, 0)
 }

@@ -53,27 +53,32 @@ func (c *fakeClock) Sleep(ctx context.Context, d time.Duration) error {
 }
 
 // originAnswer is what the fake origin returns for one IRI. blockUntilDone
-// waits for the fetch context to end (a hung origin). release, when set, holds
-// the fetch until it is closed (whatever the context), after signalling
-// started.
+// waits for the fetch context to end (a hung origin), answering not_found
+// after 5s; blockUntilCancel waits for the context only (a tarpit). release,
+// when set, holds the fetch until it is closed (whatever the context), after
+// signalling started.
 type originAnswer struct {
-	object         *ap.Object
-	err            error
-	blockUntilDone bool
-	started        chan<- struct{}
-	release        <-chan struct{}
+	object           *ap.Object
+	err              error
+	blockUntilDone   bool
+	blockUntilCancel bool
+	started          chan<- struct{}
+	release          <-chan struct{}
 }
 
 // fakeOrigin is an in-process OriginFetcher: IRIs it was told to serve answer
 // as configured, any other IRI is a 404. It counts fetches per IRI. onFetch,
 // when set, runs at the start of every fetch (a slow origin advances the
-// test's clock).
+// test's clock). It refuses redirects unless followsRedirects is set.
 type fakeOrigin struct {
-	mu      sync.Mutex
-	answers map[string]originAnswer
-	hits    map[string]int
-	onFetch func()
+	mu               sync.Mutex
+	answers          map[string]originAnswer
+	hits             map[string]int
+	onFetch          func()
+	followsRedirects bool
 }
+
+func (o *fakeOrigin) RefusesRedirects() bool { return !o.followsRedirects }
 
 func newFakeOrigin() *fakeOrigin {
 	return &fakeOrigin{answers: map[string]originAnswer{}, hits: map[string]int{}}
@@ -136,6 +141,10 @@ func (o *fakeOrigin) FetchObjectSameAuthority(ctx context.Context, iri string) (
 	}
 	if !ok {
 		return nil, errors.NewNotFoundError("activity", iri)
+	}
+	if a.blockUntilCancel {
+		<-ctx.Done()
+		return nil, ctx.Err()
 	}
 	if a.blockUntilDone {
 		select {
@@ -475,5 +484,38 @@ func TestOriginVerifierBackoffDoublesAndResets(t *testing.T) {
 
 		assert.Equal(t, s.wantDeferred, deferred, "step %d", i)
 		assert.Equal(t, s.want, verdict, "step %d", i)
+	}
+}
+
+// The production fetcher is an OriginFetcher.
+var _ OriginFetcher = (*ap.Client)(nil)
+
+// H5: the verifier refuses a fetcher that follows redirects: an open redirect
+// on the voter's host could otherwise serve any document as the activity.
+func TestNewOriginVerifierRefusesAFetcherThatFollowsRedirects(t *testing.T) {
+	tests := []struct {
+		name             string
+		followsRedirects bool
+		wantErr          bool
+	}{
+		{name: "fetcher refuses redirects", followsRedirects: false, wantErr: false},
+		{name: "fetcher follows redirects", followsRedirects: true, wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			origin := newFakeOrigin()
+			origin.followsRedirects = tc.followsRedirects
+
+			verifier, err := NewOriginVerifier(origin, OriginVerifierOptions{}, slog.Default())
+
+			if tc.wantErr {
+				require.Error(t, err)
+				assert.True(t, errors.IsValidation(err), "got %v", err)
+				assert.Nil(t, verifier)
+				return
+			}
+			require.NoError(t, err)
+			assert.NotNil(t, verifier)
+		})
 	}
 }

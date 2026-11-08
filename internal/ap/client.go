@@ -375,6 +375,9 @@ func (c *Client) FetchObjectSameAuthority(ctx context.Context, iri string) (*Obj
 	return c.fetchObject(ctx, iri, fetchModeObjectPinnedAuthority)
 }
 
+// RefusesRedirects reports whether every object fetch refuses redirects.
+func (c *Client) RefusesRedirects() bool { return false }
+
 // SameAuthority reports whether two absolute URLs share scheme and host (the
 // authority). Exported so consumers that key storage on a fetched object's
 // self-asserted id (the materializer's ap_objects mapping) can reject a body

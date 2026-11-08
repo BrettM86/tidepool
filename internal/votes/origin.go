@@ -34,7 +34,7 @@ const (
 	// OriginVerified: the origin serves the claimed activity. Final.
 	OriginVerified OriginVerdict = "verified"
 	// OriginMismatch: the activity id is not a vote activity URL on the
-	// voter's host, the fetch was redirected off that host, or the served
+	// voter's host, the origin answered with a redirect, or the served
 	// document is a different activity (an empty id included). Final.
 	OriginMismatch OriginVerdict = "mismatch"
 	// OriginNotFound: 400/401/403/404/410 or a Tombstone. Final: an origin
@@ -194,7 +194,7 @@ func classifyOrigin(claim VoteClaim, fetched *ap.Object, err error) OriginVerdic
 		switch {
 		case errors.IsNotFound(err), errors.IsTombstoned(err):
 			return OriginNotFound
-		case isOffHostRedirect(err):
+		case isRefusedRedirect(err):
 			return OriginMismatch
 		case stderrors.As(err, &httpErr):
 			switch httpErr.StatusCode {
@@ -218,25 +218,40 @@ func classifyOrigin(claim VoteClaim, fetched *ap.Object, err error) OriginVerdic
 	return OriginVerified
 }
 
-// isOffHostRedirect reports the fetcher's refusal to follow a redirect to
-// another authority. Other validation errors (the egress guard, a bad URL)
+// isRefusedRedirect reports the fetcher's refusal to follow a redirect (the
+// verification client follows none). Other validation errors (the egress guard, a bad URL)
 // prove nothing about the vote and are 'unavailable'.
-func isOffHostRedirect(err error) bool {
+func isRefusedRedirect(err error) bool {
 	var validation errors.ValidationError
 	return stderrors.As(err, &validation) && validation.Field == "redirect"
 }
 
 // voteActivityURL reports whether id has the shape Lemmy and PieFed give vote
-// activities: no query or fragment, path under /activities/like/ or
-// /activities/dislike/. Anything else could be a user upload on the voter's
-// host that merely looks like the claimed activity.
+// activities: a path of exactly /activities/like/<segment> or
+// /activities/dislike/<segment> (prefix case-insensitive), one non-empty
+// segment that is not "." or "..", no percent-escape anywhere, no query or
+// fragment. Anything else could resolve to a user upload on the voter's host
+// that merely looks like the claimed activity.
 func voteActivityURL(id string) bool {
 	u, err := url.Parse(id)
 	if err != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.Contains(id, "#") {
 		return false
 	}
-	path := strings.ToLower(u.EscapedPath())
-	return strings.HasPrefix(path, "/activities/like/") || strings.HasPrefix(path, "/activities/dislike/")
+	path := u.EscapedPath()
+	if strings.Contains(path, "%") {
+		return false
+	}
+	lower := strings.ToLower(path)
+	var segment string
+	switch {
+	case strings.HasPrefix(lower, "/activities/like/"):
+		segment = path[len("/activities/like/"):]
+	case strings.HasPrefix(lower, "/activities/dislike/"):
+		segment = path[len("/activities/dislike/"):]
+	default:
+		return false
+	}
+	return segment != "" && segment != "." && segment != ".." && !strings.Contains(segment, "/")
 }
 
 // hostOf is the lower-cased host of an absolute URL ("" when unparseable).

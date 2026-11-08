@@ -6,6 +6,7 @@ import (
 	stderrors "errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -192,7 +193,7 @@ func vote(voteType, activityID, voter, subject string) *ap.Object {
 
 // activityID mints per-test activity ids.
 func activityID(t *testing.T, n int) string {
-	return fmt.Sprintf("https://lemmy.world/activities/like/%s-%d", t.Name(), n)
+	return fmt.Sprintf("https://lemmy.world/activities/like/%s-%d", strings.ReplaceAll(t.Name(), "/", "_"), n)
 }
 
 // counts reads the served aggregate for a subject straight from the table.

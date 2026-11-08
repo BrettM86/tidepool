@@ -250,6 +250,10 @@ func (a *Aggregator) ApplyVote(ctx context.Context, vote *ap.Object, communityIR
 	// record, or a superseded row whose record must go), which phase 2 below
 	// commits after this transaction releases the aggregate lock.
 	var recordWork bool
+	// verdictStored: the origin verdict was written to the new row; it is
+	// counted only after the transaction commits, since a later step can
+	// still roll it back.
+	var verdictStored bool
 	if err := a.inTx(ctx, func(tx *sql.Tx) error {
 		// Dedupe BEFORE creating the aggregate row: a duplicate activity id
 		// aimed at a DIFFERENT subject must not mint a spurious 0/0 aggregate
@@ -308,12 +312,16 @@ func (a *Aggregator) ApplyVote(ctx context.Context, vote *ap.Object, communityIR
 			if marked, err = a.writer.markIfEligible(ctx, tx, eventID, voter, direction, vote.ID, createdAt, originVerdict); err != nil {
 				return err
 			}
+			verdictStored = originVerdict != ""
 		}
 		recordWork = owed || marked
 
 		return recomputeAggregate(ctx, tx, subject)
 	}); err != nil {
 		return err
+	}
+	if verdictStored {
+		voteVerifyVerdicts.Add(string(originVerdict), 1)
 	}
 	if recordWork {
 		a.syncVoter(ctx, voter)

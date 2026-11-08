@@ -368,7 +368,7 @@ func voteClaim(activityID, voter, subject, direction string) VoteClaim {
 
 // markIfEligible is phase 1's record decision for a just-inserted vote row,
 // inside the vote transaction: it stores the origin verdict (verifyLive's,
-// "" = none), and when the vote was verified, the voter is still eligible and
+// "" = none; the caller counts it once the transaction commits), and when the vote was verified, the voter is still eligible and
 // the mode allows the direction, the row becomes pending.
 func (w *RecordWriter) markIfEligible(ctx context.Context, tx *sql.Tx, eventID int64, voter, direction, activityID string, createdAt time.Time, verdict OriginVerdict) (bool, error) {
 	if verdict != "" {
@@ -377,7 +377,6 @@ func (w *RecordWriter) markIfEligible(ctx context.Context, tx *sql.Tx, eventID i
 			eventID, string(verdict)); err != nil {
 			return false, fmt.Errorf("store origin check of vote %q: %w", activityID, err)
 		}
-		voteVerifyVerdicts.Add(string(verdict), 1)
 	}
 	if verdict != OriginVerified || w.dryRun || !w.mode.allows(direction) {
 		return false, nil

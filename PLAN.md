@@ -520,11 +520,13 @@ is left with the Group-actor AP surface and the admission-policy wiring.
       instance; nothing proves the inner vote's actor cast it, so a followed
       instance could forge votes into a bridged voter's repo. Rule: a vote
       becomes a record only after `GET <activity id>` at the voter's own
-      instance (signed, SSRF-guarded, redirects pinned to that host) returns
-      the same id, type, actor and object. The verdict is stored on
-      `vote_events.origin_check`: `verified` (converted), `mismatch` (the id
-      is not `/activities/like/…` or `/activities/dislike/…` without query
-      or fragment, id host ≠ actor host, off-host redirect, or a different
+      instance (signed, SSRF-guarded, no redirects followed) returns
+      the same id, type, actor and object. The id path must be exactly
+      `/activities/like/<segment>` or `/activities/dislike/<segment>`: one
+      non-empty final segment, no `.`/`..` segment, no `%` escape, no query
+      or fragment. The verdict is stored on
+      `vote_events.origin_check`: `verified` (converted), `mismatch` (an id
+      of any other shape, id host ≠ actor host, any redirect, or a different
       activity, an empty id included), `not_found` (400/401/403/404/410 or
       Tombstone; Lemmy answers a missing activity with 400; final, so an
       instance that refuses our signed fetch with 401/403 is not asked

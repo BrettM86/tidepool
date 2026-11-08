@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -45,7 +46,7 @@ func likeClaim(id, voter, subject string) VoteClaim {
 
 // voteIDOn mints a per-test activity id on host.
 func voteIDOn(t *testing.T, host string, n int) string {
-	return fmt.Sprintf("https://%s/activities/like/%s-%d", host, t.Name(), n)
+	return fmt.Sprintf("https://%s/activities/like/%s-%d", host, strings.ReplaceAll(t.Name(), "/", "_"), n)
 }
 
 // verifySubject bridges a numbered subject and returns its AP id.
@@ -753,7 +754,7 @@ func TestSweepDoesNotCheckVotesThatStayAggregate(t *testing.T) {
 		{name: "a Dislike under mode up", opts: RecordWriterOptions{Mode: RecordsUp, Interval: time.Minute, Batch: 20},
 			eligible: true, voter: voterAlice,
 			claim: func(t *testing.T, voter, subject string) VoteClaim {
-				return VoteClaim{ActivityID: fmt.Sprintf("https://lemmy.world/activities/dislike/%s-1", t.Name()),
+				return VoteClaim{ActivityID: fmt.Sprintf("https://lemmy.world/activities/dislike/%s-1", strings.ReplaceAll(t.Name(), "/", "_")),
 					Actor: voter, Object: subject, Type: ap.TypeDislike}
 			},
 			wantDown: 1},

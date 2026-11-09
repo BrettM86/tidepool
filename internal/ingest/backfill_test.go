@@ -634,6 +634,96 @@ func TestBackfillPartialFailureLeavesResumable(t *testing.T) {
 		"a partial-failure run must leave last_backfill_at unset (resumable)")
 }
 
+// hostGoneFetcher is the harness client except that FetchObject of goneIRI
+// fails the way the AP client reports a host that no longer exists.
+type hostGoneFetcher struct {
+	BackfillFetcher
+	goneIRI string
+}
+
+func (f hostGoneFetcher) FetchObject(ctx context.Context, iri string) (*ap.Object, error) {
+	if iri == f.goneIRI {
+		return nil, fmt.Errorf("ap: fetch %s: %w: lookup other.test: no such host", iri, errors.ErrHostGone)
+	}
+	return f.BackfillFetcher.FetchObject(ctx, iri)
+}
+
+// TestBackfillSkipsHostGoneItem: an item whose origin host is gone (NXDOMAIN,
+// or an off-host redirect to a parked page) is skipped by backfill, so the
+// walk completes and stamps last_backfill_at instead of retrying forever.
+func TestBackfillSkipsHostGoneItem(t *testing.T) {
+	h := newHarness(t)
+	h.subscribeTechnology()
+	serveOutboxFixtures(t, h)
+	serveBrokenItemOutbox(t, h)
+	opts := h.backfillOptions(h.mat, 100)
+	opts.Fetcher = hostGoneFetcher{BackfillFetcher: h.client, goneIRI: "https://other.test/post/broken"}
+	b, err := NewBackfill(opts)
+	require.NoError(t, err)
+	ctx := context.Background()
+
+	community, err := h.communities.GetByAPGroupID(ctx, groupID)
+	require.NoError(t, err)
+	require.NoError(t, b.Run(ctx, community, true), "a host-gone item is a skip, not a run error")
+
+	_, err = h.objects.GetByAPID(ctx, pageID)
+	require.NoError(t, err, "the healthy item still materializes")
+
+	community, err = h.communities.GetByAPGroupID(ctx, groupID)
+	require.NoError(t, err)
+	require.NotNil(t, community.LastBackfillAt,
+		"a walk whose only failure is a host-gone skip must stamp last_backfill_at")
+}
+
+// actorHostGoneFetcher is the harness client except that FetchActor of
+// goneActorIRI fails the way the AP client reports a host that no longer
+// exists. It stands in for the materializer's fetcher, so the outbox item's
+// own fetch succeeds and only the nested author fetch hits the gone host.
+type actorHostGoneFetcher struct {
+	materialize.Fetcher
+	goneActorIRI string
+}
+
+func (f actorHostGoneFetcher) FetchActor(ctx context.Context, iri string) (*ap.Object, error) {
+	if iri == f.goneActorIRI {
+		return nil, fmt.Errorf("ap: fetch %s: %w: lookup gone.test: no such host", iri, errors.ErrHostGone)
+	}
+	return f.Fetcher.FetchActor(ctx, iri)
+}
+
+// TestBackfillSkipsHostGoneAuthor: an item whose post is reachable but whose
+// author's actor document lives on a gone host is skipped by backfill, the
+// same as a host-gone item, so the walk completes and stamps last_backfill_at.
+func TestBackfillSkipsHostGoneAuthor(t *testing.T) {
+	h := newHarness(t)
+	h.subscribeTechnology()
+	serveOutboxFixtures(t, h)
+	const goneAuthor = "https://lemmy.world/u/Aweigh"
+	ctx := context.Background()
+	_, err := h.actors.GetByAPActorID(ctx, goneAuthor)
+	require.True(t, errors.IsNotFound(err), "the author must be unknown so the materializer fetches it")
+
+	materializerOptions := h.materializerOptions
+	materializerOptions.Fetcher = actorHostGoneFetcher{Fetcher: h.client, goneActorIRI: goneAuthor}
+	materializer, err := materialize.New(materializerOptions)
+	require.NoError(t, err)
+	b := newBackfillOver(t, h, materializer, 100)
+
+	community, err := h.communities.GetByAPGroupID(ctx, groupID)
+	require.NoError(t, err)
+	require.NoError(t, b.Run(ctx, community, true), "a host-gone author is a skip, not a run error")
+
+	_, err = h.objects.GetByAPID(ctx, pageID)
+	require.NoError(t, err, "the healthy item still materializes")
+	_, err = h.objects.GetByAPID(ctx, secondPageID)
+	assert.True(t, errors.IsNotFound(err), "the post whose author's host is gone is not materialized")
+
+	community, err = h.communities.GetByAPGroupID(ctx, groupID)
+	require.NoError(t, err)
+	require.NotNil(t, community.LastBackfillAt,
+		"a walk whose only failure is a host-gone author must stamp last_backfill_at")
+}
+
 // TestBackfillSkipsTombstonedObjects: deleted-upstream markers hold during
 // backfill too.
 func TestBackfillSkipsTombstonedObjects(t *testing.T) {

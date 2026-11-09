@@ -402,7 +402,7 @@ func (b *Backfill) walk(ctx context.Context, community *store.Community) (stampe
 		}
 	}
 
-	posts, failures := 0, 0
+	posts, failures, skipped, hostGone := 0, 0, 0, 0
 	for _, item := range items {
 		if ctx.Err() != nil {
 			return false, ctx.Err()
@@ -413,7 +413,15 @@ func (b *Backfill) walk(ctx context.Context, community *store.Community) (stampe
 			if ok {
 				posts++
 			}
+		case errors.IsHostGone(err):
+			// A gone origin host may only be lapsed, which is why the live
+			// path retries it; backfill drops the item so one dead author
+			// host cannot keep the community from ever completing.
+			skipped++
+			hostGone++
+			b.logger.Info("backfill item skipped: origin host is gone", "community", community.APGroupID, "error", err)
 		case materialize.IsSkip(err):
+			skipped++
 			b.logger.Info("backfill item skipped", "community", community.APGroupID, "reason", err.Error())
 		default:
 			failures++
@@ -433,13 +441,18 @@ func (b *Backfill) walk(ctx context.Context, community *store.Community) (stampe
 		// skipping inside the freshness window. Collected items already
 		// materialized above; deterministic rkeys make the redo idempotent.
 		b.logger.Info("backfill partial: truncated walk left resumable",
-			"community", community.APGroupID, "posts", posts)
+			"community", community.APGroupID, "posts", posts, "skipped", skipped, "host_gone", hostGone)
 		return false, nil
 	}
 	if err := b.communities.SetLastBackfill(ctx, community.APGroupID, time.Now()); err != nil {
 		return false, fmt.Errorf("ingest: record backfill for %s: %w", community.APGroupID, err)
 	}
-	b.logger.Info("backfill complete", "community", community.APGroupID, "posts", posts)
+	completeLevel := slog.LevelInfo
+	if hostGone > 0 {
+		completeLevel = slog.LevelWarn
+	}
+	b.logger.Log(ctx, completeLevel, "backfill complete", "community", community.APGroupID,
+		"posts", posts, "skipped", skipped, "host_gone", hostGone)
 	return true, nil
 }
 
@@ -711,7 +724,7 @@ func (b *Backfill) backfillReplies(ctx context.Context, post *ap.Object, communi
 		}
 		removed, err := b.materializeComment(ctx, resolved, communityIRI)
 		switch {
-		case materialize.IsSkip(err):
+		case materialize.IsSkip(err), errors.IsHostGone(err):
 			b.logger.Info("backfill reply skipped", "post", post.ID, "reason", err.Error())
 		case err != nil:
 			b.logger.Warn("backfill reply failed", "post", post.ID, "reply", resolved.ID, "error", err)
@@ -747,6 +760,8 @@ func (b *Backfill) resolveEmbedded(ctx context.Context, obj *ap.Object, sourceIR
 		return nil, skip(obj.ID, "object is tombstoned upstream")
 	case errors.IsNotFound(err):
 		return nil, skip(obj.ID, "object is unavailable upstream")
+	case errors.IsHostGone(err):
+		return nil, &materialize.SkipError{APID: obj.ID, Reason: fmt.Sprintf("origin host is gone: %v", err), Cause: err}
 	default:
 		return nil, fmt.Errorf("ingest: fetch %s: %w", obj.ID, err)
 	}

@@ -1116,16 +1116,17 @@ func TestResolveKey_RejectsOwnerMismatch(t *testing.T) {
 		"a key whose owner is not the publishing actor must be rejected")
 }
 
-// TestFetchObject_GoneHostIsNotFound pins which dead-host failures FetchObject
-// reports as errors.IsNotFound, so backfill can skip an item whose host is
-// permanently gone instead of retrying the walk forever. All hosts are stubbed:
+// TestFetchObject_GoneHost pins which dead-host failures FetchObject reports
+// as errors.IsHostGone (and not IsNotFound), so backfill can skip an item whose
+// host is gone while live inbox callers keep retrying. All hosts are stubbed:
 // URL hostnames are labels mapped to local httptest listeners (or to a forged
 // DNS error) by the dialer below; no real DNS lookup is made.
-func TestFetchObject_GoneHostIsNotFound(t *testing.T) {
+func TestFetchObject_GoneHost(t *testing.T) {
 	const (
 		originHost    = "origin.example"
 		elsewhereHost = "elsewhere.example"
 		goneHost      = "gone-host.invalid"
+		goneTarget    = "gone-target.invalid"
 	)
 
 	htmlHandler := func(w http.ResponseWriter, _ *http.Request) {
@@ -1154,13 +1155,19 @@ func TestFetchObject_GoneHostIsNotFound(t *testing.T) {
 		// wantErr false means the fetch must succeed.
 		wantErr      bool
 		wantNotFound bool
+		wantHostGone bool
+		// wantDials, when positive, is how many times the dialer must have
+		// been asked for dnsErrorHost (MaxAttempts is 2).
+		wantDials int32
 	}{
 		{
 			name:         "dns nxdomain",
 			dnsError:     &net.DNSError{Err: "no such host", Name: goneHost, IsNotFound: true},
 			iri:          "http://" + goneHost + "/post/1",
 			wantErr:      true,
-			wantNotFound: true,
+			wantNotFound: false,
+			wantHostGone: true,
+			wantDials:    1,
 		},
 		{
 			name:         "temporary dns failure stays retryable",
@@ -1168,6 +1175,7 @@ func TestFetchObject_GoneHostIsNotFound(t *testing.T) {
 			iri:          "http://" + goneHost + "/post/1",
 			wantErr:      true,
 			wantNotFound: false,
+			wantDials:    2,
 		},
 		{
 			name: "off-host redirect to html",
@@ -1177,7 +1185,8 @@ func TestFetchObject_GoneHostIsNotFound(t *testing.T) {
 			elsewhere:    htmlHandler,
 			iri:          "http://" + originHost + "/post/1",
 			wantErr:      true,
-			wantNotFound: true,
+			wantNotFound: false,
+			wantHostGone: true,
 		},
 		{
 			name: "same-host redirect to html keeps ordinary error",
@@ -1210,6 +1219,7 @@ func TestFetchObject_GoneHostIsNotFound(t *testing.T) {
 			iri:          "http://" + goneHost + "/u/alice",
 			wantErr:      true,
 			wantNotFound: false,
+			wantDials:    2,
 		},
 		{
 			// A proxy whose own name does not resolve says nothing about the
@@ -1220,6 +1230,21 @@ func TestFetchObject_GoneHostIsNotFound(t *testing.T) {
 			iri:          "http://" + originHost + "/post/1",
 			wantErr:      true,
 			wantNotFound: false,
+			wantDials:    2,
+		},
+		{
+			// NXDOMAIN counts only for the IRI's own host on the first hop: a
+			// redirect target that fails to resolve stays an ordinary error.
+			name:         "nxdomain of a redirect target stays an ordinary error",
+			dnsError:     &net.DNSError{Err: "no such host", Name: goneTarget, IsNotFound: true},
+			dnsErrorHost: goneTarget,
+			origin: func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, "http://"+goneTarget+"/x", http.StatusFound)
+			},
+			iri:          "http://" + originHost + "/post/1",
+			wantErr:      true,
+			wantNotFound: false,
+			wantDials:    2,
 		},
 		{
 			name: "redirect dropping explicit default port is same host",
@@ -1289,6 +1314,9 @@ func TestFetchObject_GoneHostIsNotFound(t *testing.T) {
 			if tt.dnsError != nil {
 				assert.Positive(t, goneDials.Load(), "the stub dialer must have been reached")
 			}
+			if tt.wantDials > 0 {
+				assert.Equal(t, tt.wantDials, goneDials.Load(), "dials of the failing host")
+			}
 			if !tt.wantErr {
 				require.NoError(t, err)
 				require.NotNil(t, obj)
@@ -1297,6 +1325,7 @@ func TestFetchObject_GoneHostIsNotFound(t *testing.T) {
 			}
 			require.Error(t, err)
 			assert.Equal(t, tt.wantNotFound, errors.IsNotFound(err), "errors.IsNotFound(%v)", err)
+			assert.Equal(t, tt.wantHostGone, errors.IsHostGone(err), "errors.IsHostGone(%v)", err)
 		})
 	}
 }

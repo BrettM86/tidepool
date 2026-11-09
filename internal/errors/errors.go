@@ -131,3 +131,14 @@ var ErrBlobWithheld = errors.New("blob withheld")
 
 // IsBlobWithheld reports a store refused by an active blob withhold.
 func IsBlobWithheld(err error) bool { return errors.Is(err, ErrBlobWithheld) }
+
+// ErrHostGone marks a fetch whose origin host looks gone: NXDOMAIN of the
+// object's own host, or an off-host redirect ending at a non-JSON page. The
+// condition may be temporary (a lapsed domain can come back), so it is
+// deliberately not ErrNotFound and IsNotFound is false for it. The caller
+// decides whether to skip the object (backfill) or retry later (live
+// delivery).
+var ErrHostGone = errors.New("host gone")
+
+// IsHostGone reports whether err is, wraps, or unwraps to ErrHostGone.
+func IsHostGone(err error) bool { return errors.Is(err, ErrHostGone) }

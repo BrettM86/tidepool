@@ -340,11 +340,6 @@ func guardedTransport(base http.RoundTripper, guard *egressGuard) http.RoundTrip
 //     caller must treat it as a tombstone, never re-fetch;
 //   - a 200 whose body is a Tombstone object → errors.IsTombstoned (Lemmy
 //     serves Tombstones with 410, Mastodon with 404, others with 200);
-//   - a host that does not resolve (NXDOMAIN) → errors.IsNotFound, not
-//     retried (object fetches only; pinned-authority fetches keep it
-//     retryable); temporary DNS failures stay ordinary retryable errors;
-//   - a redirect off the IRI's host ending at a non-JSON 2xx page (a dead
-//     instance parking every URL) → errors.IsNotFound (object fetches only);
 //   - other non-2xx → HTTPError.
 func (c *Client) FetchObject(ctx context.Context, iri string) (*Object, error) {
 	return c.fetchObject(ctx, iri, fetchModeObject)
@@ -864,14 +859,6 @@ func (c *Client) evictKeyCacheLocked() {
 	}
 }
 
-// sameHost reports whether iri's hostname matches u's, case-insensitively,
-// ignoring scheme and port so an http→https upgrade or a dropped explicit
-// default port (origin.example:80 → origin.example) still counts as same-host.
-func sameHost(iri string, u *url.URL) bool {
-	parsed, err := url.Parse(iri)
-	return err == nil && parsed.Hostname() != "" && strings.EqualFold(parsed.Hostname(), u.Hostname())
-}
-
 // sameAuthority reports whether two absolute URLs share scheme, host, and
 // port (the authority). Unparseable or non-absolute inputs never match.
 func sameAuthority(a, b string) bool {
@@ -977,15 +964,6 @@ func (c *Client) getOnce(ctx context.Context, iri string, mode fetchMode) (body 
 
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
-			// NXDOMAIN is permanent (a dead instance such as kbin.social):
-			// retrying cannot help and backfill walks must be able to skip it.
-			var dnsErr *net.DNSError
-			// Only a lookup of this hop's own host counts; a failed lookup of
-			// a proxy or other intermediary says nothing about the object.
-			if mode == fetchModeObject && stderrors.As(err, &dnsErr) && dnsErr.IsNotFound &&
-				strings.EqualFold(dnsErr.Name, req.URL.Hostname()) {
-				return nil, false, fmt.Errorf("ap: GET %s: %w: %w", target, errors.NewNotFoundError("ap_object", iri), err)
-			}
 			return nil, true, fmt.Errorf("ap: GET %s: %w", target, err)
 		}
 
@@ -1031,12 +1009,6 @@ func (c *Client) getOnce(ctx context.Context, iri string, mode fetchMode) (body 
 		switch {
 		case resp.StatusCode >= 200 && resp.StatusCode < 300:
 			if err := checkJSONResponse(resp, body); err != nil {
-				// A redirect off the IRI's host that lands on a non-JSON page is
-				// a dead instance parking every URL (lemm.ee → join-lemmy.org),
-				// so the object is unavailable rather than misnegotiated.
-				if mode == fetchModeObject && redirects > 0 && !sameHost(iri, req.URL) {
-					return nil, false, fmt.Errorf("ap: GET %s: %w: %w", target, errors.NewNotFoundError("ap_object", iri), err)
-				}
 				return nil, false, fmt.Errorf("ap: GET %s: %w", target, err)
 			}
 			return body, false, nil

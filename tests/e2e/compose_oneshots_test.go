@@ -50,6 +50,8 @@ type composeService struct {
 	// short list form (`depends_on: [a, b]`, meaning service_started) and the
 	// long map form (`depends_on: {a: {condition: ...}}`).
 	DependsOn yaml.Node `yaml:"depends_on"`
+	// Environment is decoded in its map form, the only form the file uses.
+	Environment map[string]string `yaml:"environment"`
 }
 
 // composeDependency is one entry of the long depends_on form.

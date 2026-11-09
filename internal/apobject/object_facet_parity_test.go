@@ -32,9 +32,9 @@ func TestBuildPage_UsesNoteFacetBodySemanticsAndPreservesPageFields(t *testing.T
 		},
 	}
 
-	page, err := BuildPage(actorID, communityID, objectURL, record)
+	page, err := BuildPage(actorID, communityID, objectURL, MediaSource{}, record)
 	require.NoError(t, err)
-	note := BuildNote(actorID, communityID, "parent", objectURL, record)
+	note := BuildNote(actorID, communityID, "parent", objectURL, MediaSource{}, record)
 
 	assert.Equal(t, map[string]any{"content": wantMarkdown, "mediaType": "text/markdown"}, page["source"])
 	assert.Equal(t, wantHTML, page["content"])
@@ -81,6 +81,7 @@ func TestRenderObject_JSONSnapshotsMatchDirectFacetBuilders(t *testing.T) {
 					origin+"/ap/actor/did:plc:post",
 					"https://lemmy.example/c/testing",
 					origin+"/ap/object/did:plc:post/social.coves.community.postv2/rk",
+					MediaSource{},
 					map[string]any{
 						"title": "Snapshot post", "content": "Read bold now",
 						"facets": []any{testFacet(5, 9, map[string]any{"$type": boldFacetType})},
@@ -109,6 +110,7 @@ func TestRenderObject_JSONSnapshotsMatchDirectFacetBuilders(t *testing.T) {
 					"https://lemmy.example/c/testing",
 					"https://lemmy.example/post/1",
 					origin+"/ap/object/did:plc:comment/social.coves.community.comment/rk",
+					MediaSource{},
 					map[string]any{
 						"content": "Make bold reply",
 						"facets":  []any{testFacet(5, 9, map[string]any{"$type": boldFacetType})},
@@ -126,7 +128,7 @@ func TestRenderObject_JSONSnapshotsMatchDirectFacetBuilders(t *testing.T) {
 			index := facet["index"].(map[string]any)
 			assert.IsType(t, float64(0), index["byteStart"], "JSON snapshot offsets decode as float64")
 
-			served, err := RenderObject(origin, test.snapshot)
+			served, err := RenderObject(origin, "", test.snapshot)
 			require.NoError(t, err)
 			source, ok := served["source"].(map[string]any)
 			require.True(t, ok, "RenderObject source must be an object")

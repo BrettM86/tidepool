@@ -76,7 +76,7 @@ func premiseWorld(t *testing.T) (*sql.DB, *Enqueuer, *echo.Classifier) {
 
 	enqueuer, err := NewEnqueuer(EnqueuerOptions{
 		DB:         conn,
-		Translator: NewTranslator(pageUserOrigin),
+		Translator: NewTranslator(pageUserOrigin, ""),
 		Inboxes:    staticInbox{inbox: premiseInbox},
 		Actors:     store.NewAPActors(conn),
 		UserOrigin: pageUserOrigin,

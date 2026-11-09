@@ -99,7 +99,7 @@ func setupTargetWorld(t *testing.T, h *harness) targetWorld {
 
 	enqueuer, err := outbound.NewEnqueuer(outbound.EnqueuerOptions{
 		DB:         h.db,
-		Translator: outbound.NewTranslator(tgUserOrigin),
+		Translator: outbound.NewTranslator(tgUserOrigin, ""),
 		Inboxes:    outbound.NewInboxResolver(h.client, time.Minute),
 		Actors:     store.NewAPActors(h.db),
 		UserOrigin: tgUserOrigin,

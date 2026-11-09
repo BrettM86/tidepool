@@ -28,6 +28,7 @@ import (
 	"github.com/bluesky-social/indigo/atproto/lexicon"
 
 	"tidepool/internal/acceptrec"
+	"tidepool/internal/apobject"
 	"tidepool/internal/consume"
 	"tidepool/internal/errors"
 	"tidepool/internal/materialize"
@@ -638,18 +639,6 @@ func (e *Engine) accept(ctx context.Context, did, communityDID, postURI string, 
 	}
 	wasLive := priorErr == nil && !priorRow.IsTombstoned()
 
-	snapshot, err := json.Marshal(map[string]any{
-		"atUri":         postURI,
-		"cid":           commit.CID,
-		"rev":           commit.Rev,
-		"collection":    commit.Collection,
-		"record":        commit.Record,
-		"communityApId": community.APGroupID,
-	})
-	if err != nil {
-		return fmt.Errorf("accept: snapshot %s: %w", postURI, err)
-	}
-
 	rkey := acceptrec.SubjectRKey(postURI)
 	apObjectID := e.userOrigin + "/ap/object/" + did + "/" + commit.Collection + "/" + commit.RKey
 
@@ -679,7 +668,13 @@ func (e *Engine) accept(ctx context.Context, did, communityDID, postURI string, 
 		if banned {
 			return fmt.Errorf("%w: %s in %s", ErrAuthorBanned, postURI, communityDID)
 		}
-		stored, err := e.objects.UpsertTx(sctx, tx, store.OutboundObject{
+		// The snapshot marks an edit only when an Update goes out (see op below).
+		// It is written assuming a live copy means an Update.
+		snapshot, err := postSnapshot(postURI, community.APGroupID, commit, wasLive)
+		if err != nil {
+			return err
+		}
+		row := store.OutboundObject{
 			ATURI:              postURI,
 			APObjectID:         apObjectID,
 			LastCID:            commit.CID,
@@ -688,7 +683,8 @@ func (e *Engine) accept(ctx context.Context, did, communityDID, postURI string, 
 			CommunityAPID:      community.APGroupID,
 			TranslatedSnapshot: snapshot,
 			Depth:              0,
-		})
+		}
+		stored, err := e.objects.UpsertTx(sctx, tx, row)
 		if err != nil {
 			return fmt.Errorf("accept: write outbound state for %s: %w", postURI, err)
 		}
@@ -722,6 +718,17 @@ func (e *Engine) accept(ctx context.Context, did, communityDID, postURI string, 
 		op := operationCreate
 		if wasLive && stored.LastActivitySeq > 0 {
 			op = operationUpdate
+		}
+		if wasLive && op == operationCreate {
+			// A redelivered first Create: rewrite the snapshot without the edit
+			// marker. Same cid and rev, so the seq does not move.
+			if snapshot, err = postSnapshot(postURI, community.APGroupID, commit, false); err != nil {
+				return err
+			}
+			row.TranslatedSnapshot = snapshot
+			if _, err := e.objects.UpsertTx(sctx, tx, row); err != nil {
+				return fmt.Errorf("accept: rewrite outbound state for %s: %w", postURI, err)
+			}
 		}
 		intent := consume.PostIntent{
 			Op:            op,
@@ -773,6 +780,28 @@ func (e *Engine) accept(ctx context.Context, did, communityDID, postURI string, 
 		}
 		return nil
 	}
+}
+
+// postSnapshot is the outbound snapshot a post federates from. edited marks the
+// snapshot of an Update, so RenderObject serves the Update's `updated`.
+func postSnapshot(postURI, communityAPID string, commit *consume.CommitEvent, edited bool) ([]byte, error) {
+	fields := map[string]any{
+		"atUri":         postURI,
+		"cid":           commit.CID,
+		"rev":           commit.Rev,
+		"timeUs":        commit.TimeUS,
+		"collection":    commit.Collection,
+		"record":        commit.Record,
+		"communityApId": communityAPID,
+	}
+	if edited {
+		fields[apobject.SnapshotEditedKey] = true
+	}
+	snapshot, err := json.Marshal(fields)
+	if err != nil {
+		return nil, fmt.Errorf("accept: snapshot %s: %w", postURI, err)
+	}
+	return snapshot, nil
 }
 
 // editAgainstRemoval decides what an edit may do when a removal already stands
@@ -1120,6 +1149,7 @@ func (e *Engine) evaluatedSnapshot(commit *consume.CommitEvent) []byte {
 		"rev":        commit.Rev,
 		"operation":  commit.Operation,
 		"collection": commit.Collection,
+		"timeUs":     commit.TimeUS,
 	})
 	if err != nil {
 		e.logger.Warn("failed to marshal evaluated snapshot; readmit will be unrecoverable for this decision",
@@ -1324,6 +1354,7 @@ func rebuildCommit(postURI string, snapshot []byte) (commit *consume.CommitEvent
 		CID       string         `json:"cid"`
 		Rev       string         `json:"rev"`
 		Operation string         `json:"operation"`
+		TimeUS    int64          `json:"timeUs"`
 	}
 	if err := json.Unmarshal(snapshot, &snap); err != nil {
 		return nil, "", false
@@ -1343,5 +1374,6 @@ func rebuildCommit(postURI string, snapshot []byte) (commit *consume.CommitEvent
 		RKey:       rkey,
 		CID:        snap.CID,
 		Record:     snap.Record,
+		TimeUS:     snap.TimeUS,
 	}, did, true
 }

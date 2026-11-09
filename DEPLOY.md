@@ -175,14 +175,15 @@ at each sweep. A file that breaks after a good boot keeps the last good sets.
 
 ### Confirming a switch engaged
 
-`internal/outbound/metrics.go` publishes four counters on `/admin/metrics`:
+`internal/outbound/metrics.go` publishes five counters on `/admin/metrics`:
 
 | Metric | Increments when |
 |---|---|
 | `tidepool_outbound_delivered` | a delivery reached the peer, including Lemmy's duplicate acknowledgement |
 | `tidepool_outbound_poisoned` | a delivery hit a terminal failure |
 | `tidepool_outbound_cancelled` | the worker cancelled a claimed delivery because of consent state (its only increment site) |
-| `tidepool_outbound_parked` | a kill switch, dry run, or causal wait deferred a delivery |
+| `tidepool_outbound_parked` | a kill switch, dry run, causal wait, or media wait deferred a delivery |
+| `tidepool_outbound_media_budget_exhausted` | the media gate delivered a Create/Update with an image the Coves proxy still did not serve after the 2-minute wait budget |
 
 `tidepool_outbound_parked` is the only positive sign that a kill switch
 engaged. `by_state` reads `pending` for a parked delivery and for one waiting
@@ -194,6 +195,14 @@ Two caveats:
 
 - `parkCausal` also increments `parked`. A nonzero `parked` with no switch set
   means causal waits.
+- The media gate increments `parked` too. Before the first delivery of a
+  Create or Update carrying image URLs under `COVES_MEDIA_BASE_URL`, the worker
+  HEADs each URL (redirects are not followed). While any answers non-2xx, the
+  delivery is parked with `last_error_class = 'media_pending'` and probed again
+  every 10 seconds. After 2 minutes from the delivery's creation it is
+  delivered anyway and `media_budget_exhausted` counts it. A rising
+  `media_budget_exhausted` means the AppView is slow to index blobs or the
+  proxy is down.
 - `cancelled` rises on its own during rollout. The worker cancels a claimed
   delivery when the actor is disabled, delivery-paused or opted out
   (`consentBlocked` in `internal/outbound/worker.go`). `POST
@@ -463,6 +472,19 @@ consumer. When a native actor federates, Lemmy fetches its webfinger, its actor
 document and the origin apex, all on `coves.social`. If Caddy does not yet
 route those to Tidepool, Lemmy gets the web app or a 404 and caches the
 failure.
+
+### Image proxy
+
+With the consumer on, Tidepool refuses to boot without `COVES_MEDIA_BASE_URL`.
+`docker-compose.prod.yml` defaults it to `https://img.coves.social`, the Coves
+AppView's `IMAGE_PROXY_BASE_URL`; set it in `.env` only to point elsewhere.
+Before the first native image post federates, check that the proxy answers
+`HEAD` through Cloudflare with an image type, because Lemmy and PieFed classify
+a post from that one response:
+
+```sh
+curl -sI https://img.coves.social/img/content_full/plain/<did>/<cid> | grep -iE '^(HTTP|content-type)'
+```
 
 ### Step 1: consumer on, delivery off
 

@@ -67,7 +67,7 @@ func linkPostRecord() map[string]any {
 }
 
 func TestTranslator_Page(t *testing.T) {
-	tr := NewTranslator(pageUserOrigin)
+	tr := NewTranslator(pageUserOrigin, "")
 
 	cases := []struct {
 		name     string

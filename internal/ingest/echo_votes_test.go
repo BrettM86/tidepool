@@ -194,7 +194,7 @@ func TestNativeVoteRoundTripLeavesNoVoteEvents(t *testing.T) {
 	// exact body the community echoes back.
 	enqueuer, err := outbound.NewEnqueuer(outbound.EnqueuerOptions{
 		DB:         h.db,
-		Translator: outbound.NewTranslator(evUserOrigin),
+		Translator: outbound.NewTranslator(evUserOrigin, ""),
 		Inboxes:    outbound.NewInboxResolver(h.client, time.Minute),
 		Actors:     store.NewAPActors(h.db),
 		UserOrigin: evUserOrigin,

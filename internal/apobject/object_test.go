@@ -21,6 +21,7 @@ func buildPageWithEmbedURI(t *testing.T, uri string) map[string]any {
 		"https://coves.social/ap/actor/did:plc:x",
 		"https://lemmy.world/c/tech",
 		"https://coves.social/ap/object/did:plc:x/social.coves.community.postv2/rk",
+		MediaSource{},
 		map[string]any{
 			"title": "a post",
 			"embed": map[string]any{
@@ -73,7 +74,7 @@ func TestBuildNote_EscapesFacetFreePlaintextForLemmy(t *testing.T) {
 		"\\::: spoiler Warning\n\n" +
 		"After blank line"
 
-	note := BuildNote("actor", "community", "parent", "object", map[string]any{"content": plaintext})
+	note := BuildNote("actor", "community", "parent", "object", MediaSource{}, map[string]any{"content": plaintext})
 	source, ok := note["source"].(map[string]any)
 	require.True(t, ok)
 	assert.Equal(t, expectedMarkdown, source["content"],
@@ -130,7 +131,7 @@ func TestBuildNote_EscapesAdditionalFacetFreeBlockMarkdownMarkers(t *testing.T) 
 		plaintext        = "+ list\n\n1. numbered\n\nsetext candidate\n==="
 		expectedMarkdown = "\\+ list\n\n1\\. numbered\n\nsetext candidate \\\n\\=\\=\\="
 	)
-	note := BuildNote("actor", "community", "parent", "object", map[string]any{"content": plaintext})
+	note := BuildNote("actor", "community", "parent", "object", MediaSource{}, map[string]any{"content": plaintext})
 	source, ok := note["source"].(map[string]any)
 	require.True(t, ok)
 	markdown, ok := source["content"].(string)

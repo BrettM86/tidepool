@@ -240,7 +240,7 @@ func newLifecycle(t *testing.T, maxAttempts int, workerOpts ...func(*outbound.Wo
 
 	enqueuer, err := outbound.NewEnqueuer(outbound.EnqueuerOptions{
 		DB:         database,
-		Translator: outbound.NewTranslator(tpUserOrigin),
+		Translator: outbound.NewTranslator(tpUserOrigin, ""),
 		Inboxes:    tpInbox{},
 		Actors:     store.NewAPActors(database),
 		UserOrigin: tpUserOrigin,

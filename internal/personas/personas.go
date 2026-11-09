@@ -66,6 +66,11 @@ type Options struct {
 	// 500 on the serve path, an exhausted namespace, a missing bridge
 	// identity. Nil uses slog.Default().
 	Logger *slog.Logger
+	// MediaBaseURL (COVES_MEDIA_BASE_URL) is where gallery images are served.
+	// GET /ap/object renders #image placements under it, the same base the
+	// outbound Translator uses, so a re-fetched object matches the delivered
+	// one. Empty renders placements as their covered text.
+	MediaBaseURL string
 }
 
 // Service mints and serves Coves user actors.
@@ -89,7 +94,9 @@ type Service struct {
 	// the canonical payload. Constructed from Options.DB (no new Options field).
 	outboundObjects    store.OutboundObjects
 	outboundActivities store.OutboundActivities
-	logger             *slog.Logger
+	// mediaBaseURL is Options.MediaBaseURL.
+	mediaBaseURL string
+	logger       *slog.Logger
 }
 
 // New builds a Service. The origin is canonicalized once here — config
@@ -132,6 +139,7 @@ func New(opts Options) (*Service, error) {
 		inboxHandler:       opts.InboxHandler,
 		outboundObjects:    store.NewOutboundObjects(opts.DB),
 		outboundActivities: store.NewOutboundActivities(opts.DB),
+		mediaBaseURL:       opts.MediaBaseURL,
 		logger:             logger,
 	}, nil
 }

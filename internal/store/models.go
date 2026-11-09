@@ -495,6 +495,10 @@ type OutboundActivity struct {
 	// activity is ineligible until the parent's mapping is accepted. "" = none.
 	ParentATURI string
 	CreatedAt   time.Time
+	// MediaReadyAt is when the outbound media gate settled for this activity
+	// (every image URL served, or the wait budget exhausted). Nil means a
+	// delivery of it still probes its image URLs first.
+	MediaReadyAt *time.Time
 }
 
 // OutboundDelivery is one delivery attempt of an activity to one inbox (task

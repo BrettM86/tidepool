@@ -123,6 +123,7 @@ comments and votes to ActivityPub peers. Delivery runs only when
 |---|---|---|
 | `CONSUMER_ENABLED` | off | Starts the Jetstream consumer. It writes durable outbound state: queued deliveries, community-signed acceptances for postv2 posts, and opt-out and account-deletion purges at peers. Also enables `POST /admin/actors/purge` and the `/admin/admissions` routes. Requires `JETSTREAM_URL`. |
 | `JETSTREAM_URL` | unset | Self-hosted Jetstream to subscribe to (`ws://` or `wss://`). Validated whenever set, so it can be staged before `CONSUMER_ENABLED` and a typo fails at boot. |
+| `COVES_MEDIA_BASE_URL` | unset | Origin of the Coves image proxy. Gallery images placed by `#image` facets federate as `<base>/img/content_full/plain/<did>/<cid>`. The delivery worker holds a Create or Update carrying such URLs (parked as `media_pending`, probed every 10 seconds, at most 2 minutes from the delivery's creation) until the proxy answers 2xx for each. Required when `CONSUMER_ENABLED` is on. Must be a bare origin (no path, query, userinfo or fragment); outside development it must be `https://`. A trailing slash is dropped. |
 | `OUTBOUND_WORKERS` | `0` | Number of delivery workers. With the consumer on and this at `0`, deliveries queue up and nothing is sent. Raising it sends the whole backlog right away. |
 | `OUTBOUND_DISABLED` | off | Global delivery kill switch. Blocked deliveries are parked: they stay `pending` and resume when the switch is cleared. |
 | `OUTBOUND_DISABLED_ACTORS` | empty | Comma-separated actor DIDs to park. Exact match. |

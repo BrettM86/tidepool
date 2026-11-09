@@ -107,7 +107,7 @@ func setupSandwich(t *testing.T, h *harness) sandwich {
 
 	enqueuer, err := outbound.NewEnqueuer(outbound.EnqueuerOptions{
 		DB:         h.db,
-		Translator: outbound.NewTranslator(csUserOrigin),
+		Translator: outbound.NewTranslator(csUserOrigin, ""),
 		Inboxes:    outbound.NewInboxResolver(h.client, time.Minute),
 		Actors:     store.NewAPActors(h.db),
 		UserOrigin: csUserOrigin,

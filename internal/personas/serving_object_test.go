@@ -45,9 +45,19 @@ func servingObjectTestDB(t *testing.T) *sql.DB {
 
 func newServingService(t *testing.T, conn *sql.DB) *Service {
 	t.Helper()
+	return newServingServiceWith(t, conn, nil)
+}
+
+// newServingServiceWith is newServingService with extra Options applied.
+func newServingServiceWith(t *testing.T, conn *sql.DB, configure func(*Options)) *Service {
+	t.Helper()
 	custodian, err := identity.NewCustodian([]byte("0123456789abcdef0123456789abcdef"))
 	require.NoError(t, err)
-	svc, err := New(Options{DB: conn, Custodian: custodian, UserOrigin: userOrigin})
+	opts := Options{DB: conn, Custodian: custodian, UserOrigin: userOrigin}
+	if configure != nil {
+		configure(&opts)
+	}
+	svc, err := New(opts)
 	require.NoError(t, err)
 	return svc
 }

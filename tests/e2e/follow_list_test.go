@@ -352,11 +352,11 @@ func awaitPostWalkFailureLogged(t *testing.T, since time.Time, host string) {
 }
 
 // awaitPostDeliveryParked polls the delivery of postURI's Create until it is
-// pending, parked by the switch, and scheduled later than after. The row is found
+// pending, parked with errorClass, and scheduled later than after. The row is found
 // through the activity's object id, so another delivery to the same community
 // cannot satisfy it. It returns the row's next_attempt_at. A terminal state fails
-// at once: the worker got past the switch.
-func (h *harness) awaitPostDeliveryParked(t *testing.T, db *sql.DB, communityDID, postURI string, after time.Time) time.Time {
+// at once: the worker got past the park.
+func (h *harness) awaitPostDeliveryParked(t *testing.T, db *sql.DB, communityDID, postURI, errorClass string, after time.Time) time.Time {
 	t.Helper()
 	ctx := t.Context()
 	ticker := time.NewTicker(250 * time.Millisecond)
@@ -364,7 +364,7 @@ func (h *harness) awaitPostDeliveryParked(t *testing.T, db *sql.DB, communityDID
 	deadline := time.Now().Add(eventTimeout)
 	last := "no delivery row"
 	for time.Now().Before(deadline) {
-		var state, errorClass, targetInbox string
+		var state, lastErrorClass, targetInbox string
 		var nextAttemptAt time.Time
 		err := db.QueryRowContext(ctx, `
 			SELECT d.state, d.last_error_class, d.target_inbox, d.next_attempt_at
@@ -373,15 +373,15 @@ func (h *harness) awaitPostDeliveryParked(t *testing.T, db *sql.DB, communityDID
 			WHERE a.kind = 'Create'
 			  AND a.payload->'object'->>'id' LIKE '%/ap/object/' || $1
 			ORDER BY d.seq DESC LIMIT 1`, strings.TrimPrefix(postURI, "at://")).
-			Scan(&state, &errorClass, &targetInbox, &nextAttemptAt)
+			Scan(&state, &lastErrorClass, &targetInbox, &nextAttemptAt)
 		switch {
 		case err == nil:
 			last = fmt.Sprintf("state=%q last_error_class=%q target_inbox=%q next_attempt_at=%s",
-				state, errorClass, targetInbox, nextAttemptAt.Format(time.RFC3339Nano))
+				state, lastErrorClass, targetInbox, nextAttemptAt.Format(time.RFC3339Nano))
 			if state != "pending" {
-				t.Fatalf("delivery of %s left pending while the host switch was on: %s", postURI, last)
+				t.Fatalf("delivery of %s left pending while it should be parked with %q: %s", postURI, errorClass, last)
 			}
-			if errorClass == "switch_parked" && nextAttemptAt.After(after) {
+			if lastErrorClass == errorClass && nextAttemptAt.After(after) {
 				return nextAttemptAt
 			}
 		case !errors.Is(err, sql.ErrNoRows):
@@ -393,8 +393,8 @@ func (h *harness) awaitPostDeliveryParked(t *testing.T, db *sql.DB, communityDID
 		case <-ticker.C:
 		}
 	}
-	t.Fatalf("delivery of %s never parked past %s within %s; last seen: %s; bridge admission: %s",
-		postURI, after.Format(time.RFC3339Nano), eventTimeout, last, h.admissionFor(communityDID, postURI))
+	t.Fatalf("delivery of %s never parked with %q past %s within %s; last seen: %s; bridge admission: %s",
+		postURI, errorClass, after.Format(time.RFC3339Nano), eventTimeout, last, h.admissionFor(communityDID, postURI))
 	return time.Time{}
 }
 
@@ -440,10 +440,10 @@ func TestFollowList_HostSwitchParksDeliveriesWithoutRestart(t *testing.T) {
 	t.Logf("wrote %s", postURI)
 
 	db := openTidepoolDB(t)
-	parkedUntil := h.awaitPostDeliveryParked(t, db, sub.DID, postURI, time.Time{})
+	parkedUntil := h.awaitPostDeliveryParked(t, db, sub.DID, postURI, "switch_parked", time.Time{})
 	// A later next_attempt_at on the same row means the worker claimed it again
 	// and the switch refused it again.
-	h.awaitPostDeliveryParked(t, db, sub.DID, postURI, parkedUntil)
+	h.awaitPostDeliveryParked(t, db, sub.DID, postURI, "switch_parked", parkedUntil)
 
 	if _, found, err := h.lemmyPostBody(community.ID, title); err != nil {
 		t.Fatalf("read Lemmy community %d while the host is blocked: %v", community.ID, err)

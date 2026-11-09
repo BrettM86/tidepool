@@ -141,7 +141,7 @@ func newModerationWorld(t *testing.T, h *harness, mutate ...func(*consume.Option
 	h.mux.Handle("/ap/", userOrigin)
 	enqueuer, err := outbound.NewEnqueuer(outbound.EnqueuerOptions{
 		DB:         h.db,
-		Translator: outbound.NewTranslator(mtUserOrigin),
+		Translator: outbound.NewTranslator(mtUserOrigin, ""),
 		Inboxes:    outbound.NewInboxResolver(h.client, time.Minute),
 		Actors:     store.NewAPActors(h.db),
 		UserOrigin: mtUserOrigin,

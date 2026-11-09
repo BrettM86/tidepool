@@ -54,7 +54,7 @@ func TestBuildNote_DecodesValidFacetRangesAndIgnoresMalformedFacets(t *testing.T
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			note := BuildNote("actor", "community", "parent", "object", map[string]any{
+			note := BuildNote("actor", "community", "parent", "object", MediaSource{}, map[string]any{
 				"content": plaintext,
 				"facets":  test.facets,
 			})

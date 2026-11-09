@@ -164,7 +164,7 @@ func (s *Service) handleObject(w http.ResponseWriter, r *http.Request, rest stri
 		return
 	}
 
-	doc, err := apobject.RenderObject(s.userOrigin, object.TranslatedSnapshot)
+	doc, err := apobject.RenderObject(s.userOrigin, s.mediaBaseURL, object.TranslatedSnapshot)
 	if err != nil {
 		s.logger.Error("failed to render served object from snapshot",
 			"at_uri", atURI, "host", r.Host, "error", err)

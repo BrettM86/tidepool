@@ -14,3 +14,6 @@ Dockerfile
 # host, so a build context that includes it fails with permission denied, and
 # the dumps are gigabytes that must never enter an image layer.
 backups/
+
+# CI checks Coves out here as the e2e AppView build context (ci.yml).
+coves-src/

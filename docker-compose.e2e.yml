@@ -89,6 +89,8 @@
 #                   because the Coves dev stack already owns 3001 here
 #   127.0.0.1:6028  Jetstream WebSocket (/subscribe)
 #   127.0.0.1:3013  PLC fixture control API (PLC_FIXTURE_E2E_PORT overrides)
+#   127.0.0.1:8093  Coves AppView XRPC + image proxy — published on the `relay`
+#                   service, like the PDS (COVES_APPVIEW_E2E_PORT overrides)
 #
 # LOCAL-ONLY: nothing here talks to plc.directory, public relays, or public
 # Lemmy instances — the reference PDS mints its DIDs against the compose PLC
@@ -112,7 +114,7 @@ services:
     ports:
       - "127.0.0.1:${TIDEPOOL_E2E_PG_PORT:-5453}:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U tidepool -d tidepool"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U tidepool -d tidepool"]
       interval: 2s
       timeout: 5s
       retries: 30
@@ -201,6 +203,9 @@ services:
       # so Lemmy's actor fetches reach the same listener and the host router
       # sends them to the user-origin surface.
       CONSUMER_ENABLED: "1"
+      # Origin of the Coves AppView image proxy (coves-appview shares relay's
+      # network namespace); must match its IMAGE_PROXY_BASE_URL.
+      COVES_MEDIA_BASE_URL: http://relay:8081
       JETSTREAM_URL: ws://jetstream:6018/subscribe
       OUTBOUND_WORKERS: "1"
       AP_USER_ORIGIN: http://coves-users
@@ -274,7 +279,7 @@ services:
       POSTGRES_PASSWORD: plc
     networks: [tidepool-e2e]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U plc -d plc"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U plc -d plc"]
       interval: 2s
       timeout: 5s
       retries: 30
@@ -338,7 +343,7 @@ services:
       - ./e2e/relay/init-carstore.sql:/docker-entrypoint-initdb.d/init-carstore.sql:ro
     networks: [tidepool-e2e]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U relay -d bgs"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U relay -d bgs"]
       interval: 2s
       timeout: 5s
       retries: 30
@@ -394,6 +399,9 @@ services:
       # here is the same listener: in a shared namespace there is one
       # loopback and one port space (see the `pds` service header).
       - "127.0.0.1:${PDS_E2E_PORT:-3081}:3001"
+      # The Coves AppView's port, published here for the same reason: it
+      # runs in this namespace too (see the `coves-appview` service).
+      - "127.0.0.1:${COVES_APPVIEW_E2E_PORT:-8093}:8081"
     networks: [tidepool-e2e]
     depends_on:
       relay-postgres:
@@ -712,6 +720,84 @@ services:
       retries: 30
       start_period: 10s
 
+  # ── Coves AppView (indexes the stack's Jetstream; serves the image proxy) ──
+  #
+  # The real Coves AppView, built from a Coves checkout next to this repo
+  # (COVES_SOURCE overrides the path). It indexes every record the relay's
+  # Jetstream carries — bridged and native alike — and its image proxy
+  # (/img/<preset>/plain/<did>/<cid>) serves only blobs an indexed record
+  # references. That proxy is what image e2e cases read from.
+  coves-appview-postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: coves
+      POSTGRES_USER: coves
+      POSTGRES_PASSWORD: coves
+    networks: [tidepool-e2e]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U coves -d coves"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  coves-appview:
+    build:
+      context: ${COVES_SOURCE:-../coves}
+      dockerfile: Dockerfile
+      args:
+        # The Dockerfile cross-compiles for GOARCH onto a runtime image of the
+        # build platform, so the two must agree. amd64 by default (emulated on
+        # arm64 hosts); set COVES_E2E_GOARCH=arm64 there for a native build.
+        GOARCH: ${COVES_E2E_GOARCH:-amd64}
+    platform: linux/${COVES_E2E_GOARCH:-amd64}
+    # In the relay's namespace, like `pds`: the reference PDS's DID documents
+    # name http://localhost:3001, and the image proxy fetches getBlob from the
+    # DID-document endpoint, so that URL must reach the PDS from here. The
+    # host port is published on the `relay` service. Recreating `relay`
+    # drops this container's networking; recreate it alongside.
+    network_mode: "service:relay"
+    environment:
+      APPVIEW_PORT: "8081"
+      DATABASE_URL: postgres://coves:coves@coves-appview-postgres:5432/coves?sslmode=disable
+      # Dev mode: generated secrets, private-address fetches (the SSRF guard
+      # otherwise refuses compose hosts), and redirected handle verification.
+      IS_DEV_ENV: "true"
+      # Tidepool's community did:webs are hosted at `tidepool` while their
+      # handles sit under ap.tidepool; the hostedBy check cannot match that.
+      SKIP_DID_WEB_VERIFICATION: "true"
+      # LOCAL-ONLY: the default is the public plc.directory.
+      PLC_DIRECTORY_URL: http://plc:3000
+      # Bridged handles verify against the bridge's Host-keyed well-known,
+      # native ones against the reference PDS.
+      HANDLE_WELL_KNOWN_HOSTS: .ap.tidepool=tidepool:80,.lemmy.tidepool=tidepool:80,.pds.test=localhost:3001
+      # The only feed. The legacy JETSTREAM_* variables make startup fail.
+      JETSTREAM_FEEDS: self=ws://jetstream:6018
+      # A record that arrives before its author's DID resolves is retried;
+      # keep both waits short so a test's bounded poll sees the retry.
+      IDENTITY_NEGATIVE_CACHE_TTL: 1s
+      REDRIVE_INTERVAL: 5s
+      IMAGE_PROXY_ENABLED: "true"
+      # In-network origin; host-side tests use 127.0.0.1:8093 instead.
+      IMAGE_PROXY_BASE_URL: http://relay:8081
+    depends_on:
+      coves-appview-postgres:
+        condition: service_healthy
+      # relay is implied by network_mode; pds lives in the same namespace and
+      # serves the blobs the proxy fetches.
+      plc:
+        condition: service_healthy
+      jetstream:
+        condition: service_healthy
+      pds:
+        condition: service_healthy
+    healthcheck:
+      # Overrides the image's own HEALTHCHECK, which probes port 8080.
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8081/xrpc/_health"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
   # Debug-only tap: Jetstream wired straight to the bridge, bypassing the
   # relay. NOT the tested path — bring it up alongside the stack with
   #   docker compose -f docker-compose.e2e.yml --profile direct up -d jetstream-direct
@@ -751,7 +837,7 @@ services:
       POSTGRES_PASSWORD: lemmy
     networks: [tidepool-e2e]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U lemmy -d lemmy"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U lemmy -d lemmy"]
       interval: 2s
       timeout: 5s
       retries: 30

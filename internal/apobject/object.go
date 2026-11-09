@@ -12,7 +12,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/bluesky-social/indigo/atproto/syntax"
 	"github.com/rivo/uniseg"
 
 	"tidepool/internal/ap"
@@ -87,10 +89,14 @@ func checkRecordLimits(record map[string]any, maximumContentBytes, maximumConten
 // cc (the Note half of the Page/Note addressing split), to ⊇ as:Public,
 // attributedTo as a SINGLE STRING, and HTML content alongside its markdown
 // source. inReplyTo is emitted only when a parent is known. The caller runs
-// CheckCommentRecordLimits first; BuildNote does not.
-func BuildNote(actorID, communityAPID, parentAPID, objectURL string, record map[string]any) map[string]any {
+// CheckCommentRecordLimits first; BuildNote does not. media says where the
+// record's gallery images are served, for the #image placements it renders;
+// the gallery images no placement consumed go in attachment[] as Image
+// objects, in gallery order, and never into the body.
+func BuildNote(actorID, communityAPID, parentAPID, objectURL string, media MediaSource, record map[string]any) map[string]any {
 	source, _ := record["content"].(string)
-	markdown, content := renderBody(source, record["facets"])
+	gallery := GalleryImages(record, media)
+	markdown, content, unplaced := renderBody(source, record["facets"], gallery)
 	note := map[string]any{
 		"type":         "Note",
 		"id":           objectURL,
@@ -105,6 +111,13 @@ func BuildNote(actorID, communityAPID, parentAPID, objectURL string, record map[
 			"mediaType": "text/markdown",
 		},
 	}
+	if len(unplaced) != 0 {
+		attachment := make([]any, len(unplaced))
+		for i, position := range unplaced {
+			attachment[i] = imageAttachment(record, gallery, position)
+		}
+		note["attachment"] = attachment
+	}
 	if parentAPID != "" {
 		note["inReplyTo"] = parentAPID
 	}
@@ -117,9 +130,11 @@ func BuildNote(actorID, communityAPID, parentAPID, objectURL string, record map[
 // BuildPage renders a post as an AP Page. The Page half of the split puts the
 // community in `to` (alongside as:Public) and leaves cc empty — the crux Lemmy
 // 0.19.20 keys on to tell a top-level post from a reply. name is REQUIRED
-// (Lemmy rejects a titleless Page); a link embed becomes a Link attachment;
-// an nsfw self-label becomes sensitive:true.
-func BuildPage(actorID, communityAPID, objectURL string, record map[string]any) (map[string]any, error) {
+// (Lemmy rejects a titleless Page); attachment[0] is the post's link or
+// image (see pageAttachment), and gallery images no #image placement consumed
+// that do not fit there are appended to the body; an nsfw self-label becomes
+// sensitive:true. media says where the record's gallery images are served.
+func BuildPage(actorID, communityAPID, objectURL string, media MediaSource, record map[string]any) (map[string]any, error) {
 	title, _ := record["title"].(string)
 	if title == "" {
 		return nil, errors.NewValidationError("title", "a Page requires a name (Lemmy rejects a titleless post)")
@@ -128,7 +143,10 @@ func BuildPage(actorID, communityAPID, objectURL string, record map[string]any) 
 		return nil, err
 	}
 	source, _ := record["content"].(string)
-	markdown, content := renderBody(source, record["facets"])
+	gallery := GalleryImages(record, media)
+	markdown, content, unplaced := renderBody(source, record["facets"], gallery)
+	attachment, appended := pageAttachment(record, gallery, unplaced)
+	markdown, content = appendImages(markdown, content, appended)
 	page := map[string]any{
 		"type":         "Page",
 		"id":           objectURL,
@@ -146,7 +164,7 @@ func BuildPage(actorID, communityAPID, objectURL string, record map[string]any) 
 		},
 		"sensitive": hasNSFWLabel(record),
 	}
-	if attachment := linkAttachment(record); attachment != nil {
+	if attachment != nil {
 		page["attachment"] = attachment
 	}
 	if published, ok := record["createdAt"].(string); ok && published != "" {
@@ -155,25 +173,48 @@ func BuildPage(actorID, communityAPID, objectURL string, record map[string]any) 
 	return page, nil
 }
 
-// linkAttachment maps a social.coves.embed.external embed to Lemmy's
-// attachment [{type:Link, href}] (Lemmy reads the FIRST attachment as the
-// post's link). An image embed (social.coves.embed.images) is NOT handled here:
-// its blobs live in the author's PDS and need a blob→PDS-URL seam to render as
-// attachment [{type:Image, url}] — a task follow-up. A post with no external
-// embed carries no attachment.
+// pageAttachment returns a Page's attachment (Lemmy reads the FIRST
+// attachment as the post's link or image) and the unplaced gallery images to
+// append to its body. unplaced are gallery positions in gallery order:
+//   - social.coves.embed.external: the Link attachment, nothing appended;
+//   - social.coves.embed.imagesWithAttachment whose attachment is
+//     social.coves.embed.external: the Link attachment, every unplaced image
+//     appended;
+//   - social.coves.embed.images, or imagesWithAttachment with any other
+//     attachment (a quoted post is dropped): the first unplaced image as an
+//     Image attachment, the rest appended.
+//
+// No attachment (nil) when there is nothing to attach.
+func pageAttachment(record map[string]any, gallery []GalleryImage, unplaced []int) ([]any, []GalleryImage) {
+	embed, _ := record["embed"].(map[string]any)
+	embedType, _ := embed["$type"].(string)
+	switch embedType {
+	case externalEmbedType:
+		return linkAttachment(embed), nil
+	case imagesWithAttachmentEmbedType:
+		inner, _ := embed["attachment"].(map[string]any)
+		if innerType, _ := inner["$type"].(string); innerType == externalEmbedType {
+			return linkAttachment(inner), galleryImagesAt(gallery, unplaced)
+		}
+	case imagesEmbedType:
+	default:
+		return nil, nil
+	}
+	if len(unplaced) == 0 {
+		return nil, nil
+	}
+	return []any{imageAttachment(record, gallery, unplaced[0])}, galleryImagesAt(gallery, unplaced[1:])
+}
+
+// linkAttachment maps a social.coves.embed.external embed (top-level, or an
+// imagesWithAttachment's attachment) to [{type:Link, href}], or nil when it
+// has no uri.
 //
 // The href is scheme-checked: a javascript:/data:/vbscript:/file: uri rendered
 // as a clickable Link would be a stored-XSS-shaped hazard on every peer that
 // renders it, so an unsafe scheme drops the attachment (fail closed) rather than
 // federating it.
-func linkAttachment(record map[string]any) []any {
-	embed, ok := record["embed"].(map[string]any)
-	if !ok {
-		return nil
-	}
-	if kind, _ := embed["$type"].(string); kind != "social.coves.embed.external" {
-		return nil
-	}
+func linkAttachment(embed map[string]any) []any {
 	external, ok := embed["external"].(map[string]any)
 	if !ok {
 		return nil
@@ -183,6 +224,50 @@ func linkAttachment(record map[string]any) []any {
 		return nil
 	}
 	return []any{map[string]any{"type": "Link", "href": href}}
+}
+
+// imageAttachment renders the gallery image at position as an AS2 Image.
+// name is always present, "" for an empty alt.
+func imageAttachment(record map[string]any, gallery []GalleryImage, position int) map[string]any {
+	return map[string]any{
+		"type":      "Image",
+		"mediaType": galleryMediaType(record, position),
+		"url":       gallery[position].URL,
+		"name":      gallery[position].Alt,
+	}
+}
+
+func galleryImagesAt(gallery []GalleryImage, positions []int) []GalleryImage {
+	images := make([]GalleryImage, len(positions))
+	for i, position := range positions {
+		images[i] = gallery[position]
+	}
+	return images
+}
+
+// appendImages appends images to a rendered body, each as its own paragraph:
+// separated from the body and each other by a blank line in markdown, and as
+// <p><img></p> lines after the HTML. An empty body yields only the images, not
+// the renderer's empty paragraph.
+func appendImages(markdown, content string, images []GalleryImage) (string, string) {
+	if len(images) == 0 {
+		return markdown, content
+	}
+	var markdownBuilder, htmlBuilder strings.Builder
+	markdownBuilder.WriteString(markdown)
+	if markdown != "" {
+		htmlBuilder.WriteString(content)
+	}
+	for i := range images {
+		if markdownBuilder.Len() != 0 {
+			markdownBuilder.WriteString("\n\n")
+		}
+		writeMarkdownImages(&markdownBuilder, images[i:i+1])
+		htmlBuilder.WriteString("<p>")
+		writeHTMLImages(&htmlBuilder, images[i:i+1])
+		htmlBuilder.WriteString("</p>\n")
+	}
+	return markdownBuilder.String(), htmlBuilder.String()
 }
 
 // isSafeLinkScheme restricts a bridge-authored clickable URI to http/https. The
@@ -219,8 +304,10 @@ func hasNSFWLabel(record map[string]any) bool {
 // URL returns, from the durable outbound snapshot — the same Note/Page shape the
 // Translator delivered, so a peer re-fetching the object by id sees consistent
 // addressing. userOrigin derives the object's id and its author's actor id; no
-// DB lookup happens (every id is in the snapshot or its at-uri).
-func RenderObject(userOrigin string, snapshot []byte) (map[string]any, error) {
+// DB lookup happens (every id is in the snapshot or its at-uri). mediaBaseURL
+// (COVES_MEDIA_BASE_URL) is where the record's gallery images are served, the
+// same base the Translator renders under.
+func RenderObject(userOrigin, mediaBaseURL string, snapshot []byte) (map[string]any, error) {
 	snap, err := ParseSnapshot(snapshot)
 	if err != nil {
 		return nil, err
@@ -240,10 +327,11 @@ func RenderObject(userOrigin string, snapshot []byte) (map[string]any, error) {
 	parentAPID, _ := snap["parentApId"].(string)
 	record, _ := snap["record"].(map[string]any)
 	collection, _ := snap["collection"].(string)
+	media := MediaSource{BaseURL: mediaBaseURL, AuthorDID: did}
 
 	var object map[string]any
 	if strings.Contains(collection, "postv2") {
-		object, err = BuildPage(actorID, community, objectURL, record)
+		object, err = BuildPage(actorID, community, objectURL, media, record)
 		if err != nil {
 			return nil, err
 		}
@@ -251,12 +339,46 @@ func RenderObject(userOrigin string, snapshot []byte) (map[string]any, error) {
 		if err := CheckCommentRecordLimits(record); err != nil {
 			return nil, err
 		}
-		object = BuildNote(actorID, community, parentAPID, objectURL, record)
+		object = BuildNote(actorID, community, parentAPID, objectURL, media, record)
+	}
+	if edited, _ := snap[SnapshotEditedKey].(bool); edited {
+		SetUpdated(object, snap)
 	}
 	// Served standalone (not embedded in an activity), so it carries its own
 	// context.
 	object["@context"] = ContextActivityStreams
 	return object, nil
+}
+
+// SnapshotEditedKey marks a snapshot whose activity was an Update, so the served
+// object carries the same `updated` the Update delivered.
+const SnapshotEditedKey = "edited"
+
+// SetUpdated sets object["updated"] to the edit's time: the snapshot's rev as a
+// TID, else its Jetstream timeUs. Lemmy 0.19.20 applies an Update only when its
+// updated is strictly later than the copy it holds (its stored updated, else
+// published, which is record.createdAt). A time at or before record.createdAt,
+// or no time at all, becomes createdAt + 1 ms. That clears published for the
+// first edit, but every later floored edit repeats the same time, so Lemmy
+// applies only the first of them. Nothing is set when neither the rev, timeUs
+// nor createdAt yields a time.
+func SetUpdated(object, snapshot map[string]any) {
+	var edited time.Time
+	rev, _ := snapshot["rev"].(string)
+	if tid, err := syntax.ParseTID(rev); err == nil {
+		edited = tid.Time()
+	} else if timeUs, ok := snapshot["timeUs"].(float64); ok && timeUs > 0 {
+		edited = time.UnixMicro(int64(timeUs))
+	}
+	record, _ := snapshot["record"].(map[string]any)
+	createdAt, _ := record["createdAt"].(string)
+	if published, err := time.Parse(time.RFC3339, createdAt); err == nil && !edited.After(published) {
+		edited = published.Add(time.Millisecond)
+	}
+	if edited.IsZero() {
+		return
+	}
+	object["updated"] = edited.UTC().Format(time.RFC3339Nano)
 }
 
 // ParseSnapshot decodes the consumer's durable snapshot into a generic map so

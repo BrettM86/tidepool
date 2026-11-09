@@ -107,7 +107,7 @@ func setupBareEchoWorld(t *testing.T, h *harness) bareWorld {
 
 	enqueuer, err := outbound.NewEnqueuer(outbound.EnqueuerOptions{
 		DB:         h.db,
-		Translator: outbound.NewTranslator(bdUserOrigin),
+		Translator: outbound.NewTranslator(bdUserOrigin, ""),
 		Inboxes:    outbound.NewInboxResolver(h.client, time.Minute),
 		Actors:     store.NewAPActors(h.db),
 		UserOrigin: bdUserOrigin,

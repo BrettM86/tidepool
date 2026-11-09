@@ -290,15 +290,20 @@ func TestBuildNote_ValidLinkSurvivesUnknownMalformedAndDuplicateFeaturesDetermin
 func TestBuildNote_LiteralExclamationBeforeLinkCannotFormImage(t *testing.T) {
 	const (
 		target           = "https://example.com/image.png"
-		expectedMarkdown = `\![photo](https://example.com/image.png)`
-		expectedHTML     = "<p>!<a href=\"https://example.com/image.png\">photo</a></p>\n"
+		expectedMarkdown = `\![photo](https://example.com/image.png) ![one](` + testImageURL0 + `)`
+		expectedHTML     = "<p>!<a href=\"https://example.com/image.png\">photo</a> <img src=\"" + testImageURL0 + "\" alt=\"one\"></p>\n"
 	)
-	markdown, content := buildTestNote(t, "!photo", []any{testFacet(1, 6, linkFeature(target))})
+	markdown, content := buildTestNoteWithEmbed(t, "!photo pic", []any{
+		testFacet(1, 6, linkFeature(target)),
+		testFacet(7, 10, imageFeature(float64(0))),
+	}, twoImageGallery(), testMedia)
 
-	assert.Equal(t, expectedMarkdown, markdown)
+	assert.Equal(t, expectedMarkdown, markdown, "the author's ! stays escaped while the built image is not")
 	assert.Equal(t, expectedHTML, content)
 	rendered := parseRenderedMarkdown(t, markdown)
-	assert.Empty(t, findTestElements(rendered, "img"), "a literal ! must not turn a link into an image")
+	images := findTestElements(rendered, "img")
+	require.Len(t, images, 1, "only the facet-placed image may form an image; a literal ! must not turn a link into one")
+	assert.Equal(t, testImageURL0, testHTMLAttribute(images[0], "src"))
 	assertLink(t, rendered, target, "photo")
 }
 

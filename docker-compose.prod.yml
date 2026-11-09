@@ -166,6 +166,11 @@ services:
       # :6060 is its debug listener and serves no /subscribe.
       CONSUMER_ENABLED: ${CONSUMER_ENABLED:-false}
       JETSTREAM_URL: ${JETSTREAM_URL:-ws://tidepool-prod-jetstream:8080/subscribe}
+      # Origin of the Coves image proxy. Required when CONSUMER_ENABLED is on:
+      # outbound posts and comments carry image URLs built from it at enqueue
+      # (<base>/img/content_full/plain/<did>/<cid>), and the worker probes them
+      # before delivery. Must be the paired AppView's IMAGE_PROXY_BASE_URL.
+      COVES_MEDIA_BASE_URL: ${COVES_MEDIA_BASE_URL:-https://img.coves.social}
 
       # Delivery workers. 0 = OFF, and it is AND-gated on CONSUMER_ENABLED
       # (run and startConsumer in cmd/tidepool/main.go) — there is no OUTBOUND_ENABLED. With the

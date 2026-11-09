@@ -39,13 +39,15 @@ type TranslatedActivity struct {
 // the community AP id, a Delete carries NO `summary`, and an Undo embeds the
 // full inner vote object.
 type Translator struct {
-	userOrigin string
+	userOrigin   string
+	mediaBaseURL string
 }
 
 // NewTranslator builds a Translator that mints ids and self-references under
-// userOrigin (AP_USER_ORIGIN).
-func NewTranslator(userOrigin string) *Translator {
-	return &Translator{userOrigin: userOrigin}
+// userOrigin (AP_USER_ORIGIN) and builds gallery image URLs under
+// mediaBaseURL (COVES_MEDIA_BASE_URL).
+func NewTranslator(userOrigin, mediaBaseURL string) *Translator {
+	return &Translator{userOrigin: userOrigin, mediaBaseURL: mediaBaseURL}
 }
 
 // Translate renders one intent into a canonical activity, addressed and signed
@@ -97,10 +99,11 @@ func (t *Translator) comment(actorID string, intent consume.CommentIntent) (*Tra
 	if err := apobject.CheckCommentRecordLimits(record); err != nil {
 		return nil, err
 	}
-	note := apobject.BuildNote(actorID, intent.CommunityAPID, intent.ParentAPID, objectURL, record)
+	note := apobject.BuildNote(actorID, intent.CommunityAPID, intent.ParentAPID, objectURL, t.mediaSource(atURI), record)
 	kind := "Create"
 	if intent.Op == "update" {
 		kind = "Update"
+		apobject.SetUpdated(note, snap)
 	}
 	return t.finish(intent.ID, kind, parentATURI,
 		t.wrapActivity(kind, intent.ID, actorID, intent.CommunityAPID, note))
@@ -128,13 +131,14 @@ func (t *Translator) post(actorID string, intent consume.PostIntent) (*Translate
 	}
 
 	record, _ := snap["record"].(map[string]any)
-	page, err := apobject.BuildPage(actorID, intent.CommunityAPID, objectURL, record)
+	page, err := apobject.BuildPage(actorID, intent.CommunityAPID, objectURL, t.mediaSource(atURI), record)
 	if err != nil {
 		return nil, err
 	}
 	kind := "Create"
 	if intent.Op == "update" {
 		kind = "Update"
+		apobject.SetUpdated(page, snap)
 	}
 	return t.finish(intent.ID, kind, "",
 		t.wrapActivity(kind, intent.ID, actorID, intent.CommunityAPID, page))
@@ -273,6 +277,13 @@ func (t *Translator) finish(activityID, kind, parentATURI string, activity map[s
 // parts hung under the origin.
 func (t *Translator) objectURL(atURI string) string {
 	return t.userOrigin + "/ap/object/" + strings.TrimPrefix(atURI, "at://")
+}
+
+// mediaSource says where the record at atURI has its gallery images served:
+// under the media base, in the repo the at-uri names.
+func (t *Translator) mediaSource(atURI string) apobject.MediaSource {
+	repo, _, _ := strings.Cut(strings.TrimPrefix(atURI, "at://"), "/")
+	return apobject.MediaSource{BaseURL: t.mediaBaseURL, AuthorDID: repo}
 }
 
 // voteActivityType maps a vote direction to its AP activity type.

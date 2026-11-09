@@ -20,7 +20,7 @@ func NewOutboundActivities(db *sql.DB) OutboundActivities {
 }
 
 const outboundActivityColumns = `
-	activity_id, actor_did, kind, payload, parent_at_uri, created_at`
+	activity_id, actor_did, kind, payload, parent_at_uri, created_at, media_ready_at`
 
 func (r *postgresOutboundActivities) Insert(ctx context.Context, activity OutboundActivity) (bool, error) {
 	return r.insert(ctx, r.db, activity)
@@ -67,14 +67,37 @@ func (r *postgresOutboundActivities) Get(ctx context.Context, activityID string)
 	return activity, nil
 }
 
+func (r *postgresOutboundActivities) MarkMediaReady(ctx context.Context, activityID string) error {
+	query := `
+		UPDATE outbound_activities
+		   SET media_ready_at = COALESCE(media_ready_at, now())
+		 WHERE activity_id = $1`
+	result, err := r.db.ExecContext(ctx, query, activityID)
+	if err != nil {
+		return fmt.Errorf("mark outbound_activity %q media ready: %w", activityID, err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("mark outbound_activity %q media ready: rows affected: %w", activityID, err)
+	}
+	if affected == 0 {
+		return errors.NewNotFoundError("outbound_activity", activityID)
+	}
+	return nil
+}
+
 func scanOutboundActivity(row rowScanner) (*OutboundActivity, error) {
 	var activity OutboundActivity
+	var mediaReadyAt sql.NullTime
 	err := row.Scan(
 		&activity.ActivityID, &activity.ActorDID, &activity.Kind,
-		&activity.Payload, &activity.ParentATURI, &activity.CreatedAt,
+		&activity.Payload, &activity.ParentATURI, &activity.CreatedAt, &mediaReadyAt,
 	)
 	if err != nil {
 		return nil, err
+	}
+	if mediaReadyAt.Valid {
+		activity.MediaReadyAt = &mediaReadyAt.Time
 	}
 	return &activity, nil
 }

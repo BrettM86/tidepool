@@ -260,7 +260,7 @@ func realEnqueuer(t *testing.T, conn *sql.DB) *outbound.Enqueuer {
 	t.Helper()
 	enq, err := outbound.NewEnqueuer(outbound.EnqueuerOptions{
 		DB:         conn,
-		Translator: outbound.NewTranslator(acUserOrigin),
+		Translator: outbound.NewTranslator(acUserOrigin, ""),
 		Inboxes:    stubInboxResolver{},
 		Actors:     store.NewAPActors(conn),
 		UserOrigin: acUserOrigin,

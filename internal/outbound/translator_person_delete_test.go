@@ -20,7 +20,7 @@ import (
 // content, so the purge would leave every post standing while reporting
 // success.
 func TestPersonDeletePayloadIsAPurge(t *testing.T) {
-	tr := NewTranslator("https://coves.social")
+	tr := NewTranslator("https://coves.social", "")
 	actorID := "https://coves.social/ap/actor/did:plc:purged"
 
 	out, err := tr.Translate(actorID, consume.PersonDeleteIntent{

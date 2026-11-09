@@ -70,6 +70,21 @@ type WorkerOptions struct {
 	Lease time.Duration
 	// Logger receives per-delivery outcomes. Nil uses slog.Default().
 	Logger *slog.Logger
+	// MediaBaseURL is COVES_MEDIA_BASE_URL. When set, the first delivery of a
+	// Create/Update carrying image URLs under it waits until they are served
+	// (see MediaGate). Empty turns the media gate off.
+	MediaBaseURL string
+	// MediaProbeClient is the guarded client (ap.NewGuardedHTTPClient) the
+	// gate HEADs image URLs with; redirects are never followed. Required when
+	// MediaBaseURL is set.
+	MediaProbeClient *http.Client
+	// MediaParkDelay is how long a media-held delivery waits before probing
+	// again. Zero uses DefaultMediaParkDelay.
+	MediaParkDelay time.Duration
+	// MediaWaitBudget is the wall-clock window, from the delivery's creation,
+	// the gate holds it before delivering anyway. Zero uses
+	// DefaultMediaWaitBudget.
+	MediaWaitBudget time.Duration
 }
 
 // Delivery retry bounds.
@@ -105,7 +120,10 @@ type Worker struct {
 	backoffBase      time.Duration
 	causalWaitBudget time.Duration
 	lease            time.Duration
-	logger           *slog.Logger
+	// mediaGate holds a first delivery until its images are served. Nil when
+	// WorkerOptions.MediaBaseURL is empty.
+	mediaGate *MediaGate
+	logger    *slog.Logger
 }
 
 // NewWorker wires a Worker.
@@ -154,6 +172,27 @@ func NewWorker(opts WorkerOptions) (*Worker, error) {
 	if causalWaitBudget <= 0 {
 		causalWaitBudget = DefaultCausalWaitBudget
 	}
+	var mediaGate *MediaGate
+	if opts.MediaBaseURL != "" {
+		if opts.MediaProbeClient == nil {
+			return nil, errors.NewValidationError("mediaProbeClient", "must not be nil when a media base URL is set")
+		}
+		parkDelay := opts.MediaParkDelay
+		if parkDelay <= 0 {
+			parkDelay = DefaultMediaParkDelay
+		}
+		budget := opts.MediaWaitBudget
+		if budget <= 0 {
+			budget = DefaultMediaWaitBudget
+		}
+		mediaGate = &MediaGate{
+			BaseURL:      opts.MediaBaseURL,
+			Prober:       newHTTPMediaProber(opts.MediaProbeClient),
+			ParkDelay:    parkDelay,
+			Budget:       budget,
+			ProbeTimeout: DefaultMediaProbeTimeout,
+		}
+	}
 	return &Worker{
 		db:               opts.DB,
 		activities:       activities,
@@ -170,6 +209,7 @@ func NewWorker(opts WorkerOptions) (*Worker, error) {
 		backoffBase:      backoffBase,
 		causalWaitBudget: causalWaitBudget,
 		lease:            lease,
+		mediaGate:        mediaGate,
 		logger:           logger,
 	}, nil
 }
@@ -287,6 +327,13 @@ func (w *Worker) handle(ctx context.Context, delivery *store.OutboundDelivery) e
 			"every delivery of the parent was cancelled; descendant cannot land", 0)
 	}
 
+	// The media gate runs before the consent recheck, so consent and the
+	// same-authority check stay immediately before the POST: an opt-out, pause
+	// or disable that lands while the probes run still stops this delivery.
+	if held, err := w.awaitMedia(ctx, delivery, activity); held || err != nil {
+		return err
+	}
+
 	// Consent recheck (retraction asymmetry): a Delete/Undo always goes out —
 	// it is how an opted-out user takes down what is already federated. Outward
 	// kinds are cancelled when the actor is disabled, paused, or opted out —
@@ -317,6 +364,65 @@ func (w *Worker) handle(ctx context.Context, delivery *store.OutboundDelivery) e
 	}
 
 	return w.deliver(ctx, delivery, activity)
+}
+
+// awaitMedia runs the media gate: a Create/Update whose image URLs the Coves
+// proxy does not serve yet is parked (attempt-neutral, media_pending) instead
+// of POSTed, so a peer fetching the images on receipt does not cache a 404.
+// held reports that the delivery was not delivered here. Both terminal
+// outcomes (all served, budget exhausted) mark the activity ready, so its
+// other deliveries and retries do not probe again. The probes are bounded by
+// the gate's ProbeTimeout, well under the claim lease. A shutdown mid-probe
+// returns held with the cancellation and touches nothing: the claim lapses and
+// the delivery is probed again on its next claim. Logs carry the activity id,
+// outcome and failure class only, never an image URL or a probe error (a
+// *url.Error embeds the URL).
+func (w *Worker) awaitMedia(ctx context.Context, delivery *store.OutboundDelivery, activity *store.OutboundActivity) (held bool, err error) {
+	if w.mediaGate == nil {
+		return false, nil
+	}
+	decision := w.mediaGate.Decide(ctx, MediaGateInput{
+		Kind:       activity.Kind,
+		Payload:    activity.Payload,
+		MediaReady: activity.MediaReadyAt != nil,
+		CreatedAt:  delivery.CreatedAt,
+		Now:        time.Now,
+	})
+	switch decision.Outcome {
+	case MediaAborted:
+		return true, fmt.Errorf("media gate for delivery %s: %w", delivery.ActivityID, ctx.Err())
+	case MediaParked:
+		w.logger.Info("delivery held until its images are served",
+			"activity", delivery.ActivityID, "outcome", decision.Outcome.String(),
+			"failure_class", string(decision.FailureClass))
+		_, applied, err := w.deliveries.ReleaseParked(ctx, delivery.ActivityID, delivery.TargetInbox,
+			deliveryMediaPending, "waiting for the image proxy to serve every image", 0,
+			decision.NextAttempt, *delivery.ClaimedUntil)
+		if err != nil {
+			return true, fmt.Errorf("park (media) delivery %s: %w", delivery.ActivityID, err)
+		}
+		w.countPark(delivery, deliveryMediaPending, applied)
+		return true, nil
+	case MediaBudgetExhausted:
+		metricMediaBudgetExhausted.Add(1)
+		w.logger.Warn("media wait budget exhausted; delivering with an image still unserved",
+			"activity", delivery.ActivityID, "outcome", decision.Outcome.String(),
+			"failure_class", string(decision.FailureClass))
+		w.markMediaReady(ctx, delivery)
+	case MediaAllServed:
+		w.markMediaReady(ctx, delivery)
+	}
+	return false, nil
+}
+
+// markMediaReady persists the media-ready marker. A failure does not hold the
+// delivery: the images were judged deliverable, and the only cost of a missing
+// marker is that the next delivery of the activity probes again.
+func (w *Worker) markMediaReady(ctx context.Context, delivery *store.OutboundDelivery) {
+	if err := w.activities.MarkMediaReady(ctx, delivery.ActivityID); err != nil {
+		w.logger.Warn("could not mark activity media-ready; its next delivery probes again",
+			"activity", delivery.ActivityID, "error", err)
+	}
 }
 
 // deliver signs and POSTs the stored payload verbatim, then classifies the

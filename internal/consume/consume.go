@@ -138,6 +138,7 @@ type CommitEvent struct {
 	RKey       string         `json:"rkey"`
 	Record     map[string]any `json:"record,omitempty"`
 	CID        string         `json:"cid,omitempty"`
+	TimeUS     int64          `json:"-"`
 }
 
 // EventHandler processes a single Jetstream event. Handlers MUST be

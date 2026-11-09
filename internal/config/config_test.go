@@ -32,7 +32,7 @@ func clearConfigEnv(t *testing.T) {
 		"MINT_BURST", "PLC_WRITES_PER_MINUTE", "INGEST_WORKERS", "BRIDGE_SCHEME",
 		"ALLOW_PRIVATE_FETCH", "ALLOW_DEV_REQUEST_CRAWL", "RELAY_HOSTS",
 		"AP_USER_ORIGIN", "AP_HOST_FALLTHROUGH_DEV",
-		"CONSUMER_ENABLED", "JETSTREAM_URL",
+		"CONSUMER_ENABLED", "JETSTREAM_URL", "COVES_MEDIA_BASE_URL",
 		"OUTBOUND_WORKERS", "OUTBOUND_DRY_RUN", "OUTBOUND_DISABLED",
 		"OUTBOUND_DISABLED_HOSTS", "OUTBOUND_DISABLED_COMMUNITIES",
 		"OUTBOUND_DISABLED_ACTORS",
@@ -817,6 +817,7 @@ func TestLoad_ConsumerIsDisabledByDefault(t *testing.T) {
 func TestLoad_EnabledConsumerRequiresAJetstreamURL(t *testing.T) {
 	clearConfigEnv(t)
 	t.Setenv("CONSUMER_ENABLED", "true")
+	t.Setenv("COVES_MEDIA_BASE_URL", "http://localhost:8081")
 
 	_, err := Load(discardLogger())
 	require.Error(t, err,
@@ -830,6 +831,7 @@ func TestLoad_EnabledConsumerRequiresAJetstreamURL(t *testing.T) {
 func TestLoad_EnabledConsumerAcceptsAWebSocketURL(t *testing.T) {
 	clearConfigEnv(t)
 	t.Setenv("CONSUMER_ENABLED", "1")
+	t.Setenv("COVES_MEDIA_BASE_URL", "http://localhost:8081")
 	t.Setenv("JETSTREAM_URL", "ws://localhost:6008/subscribe")
 
 	cfg, err := Load(discardLogger())
@@ -848,6 +850,7 @@ func TestLoad_JetstreamURLMustBeAWebSocketURL(t *testing.T) {
 		t.Run(raw, func(t *testing.T) {
 			clearConfigEnv(t)
 			t.Setenv("CONSUMER_ENABLED", "true")
+			t.Setenv("COVES_MEDIA_BASE_URL", "http://localhost:8081")
 			t.Setenv("JETSTREAM_URL", raw)
 
 			_, err := Load(discardLogger())
@@ -1022,6 +1025,77 @@ func TestLoad_RetiredOutboundSwitchVarWarnsOnlyWhenSet(t *testing.T) {
 
 			assert.Len(t, linesNaming(warnings, tc.present), 1, "the set variable warns")
 			assert.NotContains(t, log, tc.silent, "the other variable is not mentioned")
+		})
+	}
+}
+
+func TestLoad_CovesMediaBaseURLMustBeABareHTTPSOriginInProduction(t *testing.T) {
+	for _, raw := range []string{
+		"http://img.example",
+		"https://img.example/x",
+		"https://img.example/?q=1",
+		"https://u@img.example",
+	} {
+		t.Run(raw, func(t *testing.T) {
+			setProductionEnv(t)
+			t.Setenv("COVES_MEDIA_BASE_URL", raw)
+
+			_, err := Load(discardLogger())
+			require.Error(t, err, "image URLs federate under this origin, so it must be a bare https origin")
+			assert.Contains(t, err.Error(), "COVES_MEDIA_BASE_URL")
+		})
+	}
+}
+
+func TestLoad_CovesMediaBaseURLRequiredWhenConsumerEnabled(t *testing.T) {
+	for _, environment := range []string{EnvironmentDevelopment, EnvironmentProduction} {
+		t.Run(environment, func(t *testing.T) {
+			if environment == EnvironmentProduction {
+				setProductionEnv(t)
+			} else {
+				clearConfigEnv(t)
+			}
+			t.Setenv("CONSUMER_ENABLED", "true")
+			t.Setenv("JETSTREAM_URL", "ws://localhost:6008/subscribe")
+
+			_, err := Load(discardLogger())
+			require.Error(t, err, "the enqueuer translates image placements, so it needs the media base")
+			assert.Contains(t, err.Error(), "COVES_MEDIA_BASE_URL")
+		})
+	}
+}
+
+func TestLoad_CovesMediaBaseURLAccepted(t *testing.T) {
+	tests := []struct {
+		name        string
+		environment string
+		consumer    bool
+		raw         string
+		expected    string
+	}{
+		{name: "production https origin", environment: EnvironmentProduction, consumer: true,
+			raw: "https://img.example", expected: "https://img.example"},
+		{name: "development http origin with port", environment: EnvironmentDevelopment, consumer: true,
+			raw: "http://relay:8081", expected: "http://relay:8081"},
+		{name: "unset while the consumer is off", environment: EnvironmentProduction, consumer: false,
+			raw: "", expected: ""},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if test.environment == EnvironmentProduction {
+				setProductionEnv(t)
+			} else {
+				clearConfigEnv(t)
+			}
+			if test.consumer {
+				t.Setenv("CONSUMER_ENABLED", "true")
+				t.Setenv("JETSTREAM_URL", "ws://localhost:6008/subscribe")
+			}
+			t.Setenv("COVES_MEDIA_BASE_URL", test.raw)
+
+			cfg, err := Load(discardLogger())
+			require.NoError(t, err)
+			assert.Equal(t, test.expected, cfg.CovesMediaBaseURL)
 		})
 	}
 }

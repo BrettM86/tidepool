@@ -155,6 +155,12 @@ type Config struct {
 	// nowhere to dial would come up "healthy" and consume nothing, which is
 	// the failure mode cursors and lag metrics exist to make impossible.
 	JetstreamURL string
+	// CovesMediaBaseURL is the origin serving Coves gallery images
+	// (COVES_MEDIA_BASE_URL), stored without a trailing slash. Image URLs in
+	// federated objects are built under it, so it is REQUIRED when
+	// ConsumerEnabled and must be a bare origin (no path, query, userinfo or
+	// fragment); outside development it must be https.
+	CovesMediaBaseURL string
 	// OutboundWorkers is how many delivery workers to run (OUTBOUND_WORKERS,
 	// default 0 = OFF). Delivery starts ONLY when this is >0 AND
 	// ConsumerEnabled. With the consumer on and workers at 0 the REAL enqueuer
@@ -643,6 +649,10 @@ func Load(logger *slog.Logger) (*Config, error) {
 		// expose. Refuse at boot instead.
 		return nil, fmt.Errorf("config: JETSTREAM_URL is required when CONSUMER_ENABLED is set")
 	}
+	cfg.CovesMediaBaseURL, err = covesMediaBaseURL(cfg.IsDevelopment(), cfg.ConsumerEnabled)
+	if err != nil {
+		return nil, err
+	}
 
 	// Outbound delivery (task 15), default OFF: workers start only when
 	// OUTBOUND_WORKERS>0 AND the consumer is on. At 0 the enqueuer still writes
@@ -1057,4 +1067,30 @@ func stringVar(logger *slog.Logger, isDevelopment bool, name, devDefault string)
 	}
 	logger.Info("environment variable not set, using dev default", "name", name, "value", devDefault)
 	return devDefault, nil
+}
+
+// covesMediaBaseURL reads COVES_MEDIA_BASE_URL. It is validated whenever set
+// and required when the consumer is enabled: the enqueuer translates #image
+// placements into URLs under it, and peers fetch those URLs.
+func covesMediaBaseURL(development, consumerEnabled bool) (string, error) {
+	raw := strings.TrimRight(strings.TrimSpace(os.Getenv("COVES_MEDIA_BASE_URL")), "/")
+	if raw == "" {
+		if consumerEnabled {
+			return "", fmt.Errorf("config: COVES_MEDIA_BASE_URL is required when CONSUMER_ENABLED is set")
+		}
+		return "", nil
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("config: COVES_MEDIA_BASE_URL is not a valid URL: %w", err)
+	}
+	schemeAllowed := parsed.Scheme == "https" || development && parsed.Scheme == "http"
+	if !schemeAllowed || parsed.Host == "" || parsed.Opaque != "" || parsed.User != nil ||
+		parsed.Path != "" || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || strings.Contains(raw, "#") {
+		if development {
+			return "", fmt.Errorf("config: COVES_MEDIA_BASE_URL must be a bare http:// or https:// origin (no path, query, userinfo or fragment)")
+		}
+		return "", fmt.Errorf("config: COVES_MEDIA_BASE_URL must be a bare https:// origin (no path, query, userinfo or fragment)")
+	}
+	return raw, nil
 }

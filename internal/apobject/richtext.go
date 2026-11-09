@@ -63,14 +63,16 @@ const (
 	emphasisStrikethrough
 )
 
-// inlineRange is one resolved inline span: inline code, emphasis, a link, or
-// emphasis that shares its bounds with a link.
+// inlineRange is one resolved inline span: inline code, emphasis, a link,
+// emphasis that shares its bounds with a link, or placed gallery images that
+// replace the span's covered text.
 type inlineRange struct {
 	start    int
 	end      int
 	code     bool
 	features emphasisFeatures
 	link     string
+	images   []GalleryImage
 }
 
 type validatedFacet struct {
@@ -124,15 +126,19 @@ type inlineFeature struct {
 // source and HTML content. It normalizes lone carriage returns, decodes and
 // validates the facets, resolves block precedence (code blocks win, spoilers
 // fail closed by widening), then renders Markdown and HTML from the same
-// resolved ranges.
-func renderBody(source string, rawFacets any) (markdown, content string) {
+// resolved ranges. gallery is the record's gallery, which #image facets place
+// inline; see decodeImageRanges. unplaced lists, in gallery order, the
+// positions of the gallery images with a URL that no kept facet placed.
+func renderBody(source string, rawFacets any, gallery []GalleryImage) (markdown, content string, unplaced []int) {
 	source = normalizeLoneCarriageReturns(source)
 	facets := decodeValidatedFacets(source, rawFacets)
 	inlineRanges := decodeInlineRanges(source, facets)
 	blockRanges := decodeBlockRanges(source, facets)
 	specialRanges := decodeSpecialBlockRanges(source, facets)
-	inlineRanges, blockRanges = resolveSpecialBlockRanges(inlineRanges, blockRanges, specialRanges)
-	return renderBlockMarkdown(source, inlineRanges, blockRanges), renderBlockHTML(source, inlineRanges, blockRanges)
+	imageRanges, placed := decodeImageRanges(source, rawFacets, gallery)
+	inlineRanges, blockRanges = resolveSpecialBlockRanges(inlineRanges, blockRanges, specialRanges, imageRanges)
+	return renderBlockMarkdown(source, inlineRanges, blockRanges), renderBlockHTML(source, inlineRanges, blockRanges),
+		unplacedImagePositions(gallery, placed)
 }
 
 // normalizeLoneCarriageReturns rewrites every \r not followed by \n into \n.
@@ -296,15 +302,31 @@ func isSpoilerTitleWhitespace(char rune) bool {
 // ranges. A code block wins over an overlapping heading or a quote that does
 // not contain it; a containing quote keeps the code block nested. Spoilers
 // fail closed: see widenSpoilers.
-func resolveSpecialBlockRanges(inlineRanges []inlineRange, ordinary, special []blockRange) ([]inlineRange, []blockRange) {
+//
+// Every placed image renders: a code block overlapping an image span, and a
+// heading or quote crossing one, drop to plain text; a spoiler widens to cover
+// the image span; any other inline range overlapping it drops.
+func resolveSpecialBlockRanges(inlineRanges []inlineRange, ordinary, special []blockRange, imageRanges []inlineRange) ([]inlineRange, []blockRange) {
+	imageBlocks := make([]blockRange, len(imageRanges))
+	for i, image := range imageRanges {
+		imageBlocks[i] = blockRange{start: image.start, end: image.end}
+	}
 	var codeRanges, spoilers []blockRange
 	for _, current := range special {
-		if current.kind == blockCode {
-			codeRanges = append(codeRanges, current)
-		} else {
+		switch {
+		case current.kind == blockSpoiler:
 			spoilers = append(spoilers, current)
+		case !blockOverlapsAny(current, imageBlocks, false):
+			codeRanges = append(codeRanges, current)
 		}
 	}
+	keptOrdinary := make([]blockRange, 0, len(ordinary))
+	for _, current := range ordinary {
+		if !blockOverlapsAny(current, imageBlocks, true) {
+			keptOrdinary = append(keptOrdinary, current)
+		}
+	}
+	ordinary = keptOrdinary
 
 	blocks := make([]blockRange, 0, len(ordinary)+len(special))
 	for _, current := range ordinary {
@@ -320,16 +342,17 @@ func resolveSpecialBlockRanges(inlineRanges []inlineRange, ordinary, special []b
 		}
 	}
 	blocks = append(blocks, codeRanges...)
-	blocks = append(blocks, widenSpoilers(spoilers, blocks)...)
+	widenAgainst := append(append(make([]blockRange, 0, len(blocks)+len(imageBlocks)), blocks...), imageBlocks...)
+	blocks = append(blocks, widenSpoilers(spoilers, widenAgainst)...)
 
-	if len(codeRanges) != 0 {
+	if len(codeRanges) != 0 || len(imageBlocks) != 0 {
 		filteredInline := inlineRanges[:0]
 		for _, current := range inlineRanges {
-			if !inlineRangeOverlapsAnyBlock(current, codeRanges) {
+			if !inlineRangeOverlapsAnyBlock(current, codeRanges) && !inlineRangeOverlapsAnyBlock(current, imageBlocks) {
 				filteredInline = append(filteredInline, current)
 			}
 		}
-		inlineRanges = filteredInline
+		inlineRanges = append(filteredInline, imageRanges...)
 	}
 
 	sortBlockRanges(blocks)
@@ -470,6 +493,17 @@ func dropConflicting[T any](ranges []T, conflict func(first, second T) bool) []T
 
 func blockContains(outer, inner blockRange) bool {
 	return outer.start <= inner.start && inner.end <= outer.end
+}
+
+// blockOverlapsAny reports whether block overlaps one of the image spans,
+// ignoring a span the block wholly contains when containing is allowed.
+func blockOverlapsAny(block blockRange, images []blockRange, containingAllowed bool) bool {
+	for _, image := range images {
+		if blockRangesOverlap(block, image) && (!containingAllowed || !blockContains(block, image)) {
+			return true
+		}
+	}
+	return false
 }
 
 func inlineRangeOverlapsAnyBlock(current inlineRange, ranges []blockRange) bool {
@@ -1190,10 +1224,20 @@ func sliceBlockRanges(ranges []blockRange, start, end int) []blockRange {
 }
 
 func writeHTMLSpan(b *strings.Builder, source string, ranges []inlineRange, start, end int) {
-	if strings.TrimSpace(source[start:end]) == "" {
+	sliced := sliceInlineRanges(ranges, start, end)
+	if strings.TrimSpace(source[start:end]) == "" && !hasImageRange(sliced) {
 		return
 	}
-	b.WriteString(renderHTML(source[start:end], sliceInlineRanges(ranges, start, end)))
+	b.WriteString(renderHTML(source[start:end], sliced))
+}
+
+func hasImageRange(ranges []inlineRange) bool {
+	for _, current := range ranges {
+		if current.images != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func sliceInlineRanges(ranges []inlineRange, start, end int) []inlineRange {
@@ -1214,11 +1258,15 @@ func renderMarkdown(source string, ranges []inlineRange) string {
 	breaks := hardLineBreaks(source)
 	atLineStart := true
 	insideCode := false
+	insideImage := false
 	offset := 0
 	renderFacets(source, ranges,
 		func(text string) {
 			start := offset
 			offset += len(text)
+			if insideImage {
+				return
+			}
 			if insideCode {
 				b.WriteString(text)
 				return
@@ -1226,10 +1274,20 @@ func renderMarkdown(source string, ranges []inlineRange) string {
 			atLineStart = appendEscapedPlaintextMarkdown(&b, source, start, offset, atLineStart, breaks)
 		},
 		func(current inlineRange) {
+			if current.images != nil {
+				writeMarkdownImages(&b, current.images)
+				insideImage = true
+				atLineStart = false
+				return
+			}
 			writeMarkdownFacet(&b, source, current, false)
 			insideCode = current.code
 		},
 		func(current inlineRange) {
+			if current.images != nil {
+				insideImage = false
+				return
+			}
 			writeMarkdownFacet(&b, source, current, true)
 			if current.code {
 				insideCode = false
@@ -1601,7 +1659,8 @@ func renderHTML(source string, ranges []inlineRange) string {
 			break
 		}
 		nextNewline += previousNewline + 1
-		if isWhitespaceOnlyBlankLine(source[previousNewline+1 : nextNewline]) {
+		if isWhitespaceOnlyBlankLine(source[previousNewline+1:nextNewline]) &&
+			!inlineImageOverlaps(ranges, previousNewline, nextNewline+1) {
 			paragraphEnd := previousNewline
 			if paragraphEnd > paragraphStart && source[paragraphEnd-1] == '\r' {
 				paragraphEnd--
@@ -1631,18 +1690,45 @@ func writeHTMLParagraph(b *strings.Builder, source string, ranges []inlineRange,
 	b.WriteString("</p>\n")
 }
 
+// inlineImageOverlaps reports whether a placed image span overlaps
+// [start, end); a blank line inside an image span does not split paragraphs.
+func inlineImageOverlaps(ranges []inlineRange, start, end int) bool {
+	for _, current := range ranges {
+		if current.images != nil && spansOverlap(current.start, current.end, start, end) {
+			return true
+		}
+	}
+	return false
+}
+
 func renderInlineHTML(source string, ranges []inlineRange) string {
 	var b strings.Builder
 	breaks := hardLineBreaks(source)
+	insideImage := false
 	offset := 0
 	renderFacets(source, ranges,
 		func(text string) {
 			start := offset
 			offset += len(text)
-			writeHTMLText(&b, source, start, offset, breaks)
+			if !insideImage {
+				writeHTMLText(&b, source, start, offset, breaks)
+			}
 		},
-		func(current inlineRange) { writeHTMLFacet(&b, current, false) },
-		func(current inlineRange) { writeHTMLFacet(&b, current, true) },
+		func(current inlineRange) {
+			if current.images != nil {
+				writeHTMLImages(&b, current.images)
+				insideImage = true
+				return
+			}
+			writeHTMLFacet(&b, current, false)
+		},
+		func(current inlineRange) {
+			if current.images != nil {
+				insideImage = false
+				return
+			}
+			writeHTMLFacet(&b, current, true)
+		},
 	)
 	return b.String()
 }

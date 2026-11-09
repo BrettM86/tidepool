@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"net/http"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -101,4 +102,62 @@ func TestWorker_KillSwitchDoesNotSpendPoisonBudget(t *testing.T) {
 	assert.True(t, d.NextAttemptAt.After(time.Now()),
 		"the delivery is rescheduled into the future for its retry — an operator who lifts a "+
 			"kill switch gets their queue back, not a dead-letter pile to redrive by hand")
+}
+
+// The media wait is the same promise as the kill switch from the other side: a
+// delivery held while the image proxy answers 404 must come out of the hold
+// with every retry it went in with. A post whose images the AppView indexes
+// slowly is otherwise poisoned by its first real 503.
+func TestWorker_MediaHoldDoesNotSpendPoisonBudget(t *testing.T) {
+	conn := workerTestDB(t)
+	seedWorkerActor(t, conn, true, false)
+
+	var proxyStatus atomic.Int32
+	proxyStatus.Store(http.StatusNotFound)
+	proxy := newParkImageProxy(t, &proxyStatus)
+	id := seedDelivery(t, conn, "Create", "", parkMediaPayload(proxy.URL))
+
+	// Exactly one retryable failure once the image is served, as in the kill
+	// switch test above.
+	sender := &fakeSender{respond: func(call int, _ string) error {
+		if call == 1 {
+			return httpErr(http.StatusServiceUnavailable, "peer restarting")
+		}
+		return nil
+	}}
+	w := newWorker(t, conn, sender, func(o *WorkerOptions) {
+		withParkMediaGate(proxy.URL)(o)
+		o.MaxAttempts = 3
+		o.BackoffBase = 30 * time.Second
+	})
+
+	ctx := context.Background()
+
+	// Twice MaxAttempts worth of media parks.
+	for i := 0; i < 6; i++ {
+		worked, err := w.DeliverNext(ctx)
+		require.NoError(t, err)
+		require.Truef(t, worked, "cycle %d: the media-held delivery is still claimable", i)
+		d := getDelivery(t, conn, id)
+		require.Equalf(t, store.DeliveryStatePending, d.State, "cycle %d: a media park stays pending", i)
+		require.Equalf(t, "media_pending", d.LastErrorClass, "cycle %d: the hold is a media park", i)
+		clearParkDelay(t, conn, id)
+	}
+	require.Zero(t, sender.count(), "nothing is POSTed while the image is unserved")
+
+	// The AppView indexes the image.
+	proxyStatus.Store(http.StatusOK)
+
+	worked, err := w.DeliverNext(ctx)
+	require.NoError(t, err)
+	require.True(t, worked)
+	require.Equal(t, 1, sender.count(), "the delivery is POSTed once the image is served")
+
+	d := getDelivery(t, conn, id)
+	assert.Equal(t, store.DeliveryStatePending, d.State,
+		"six media parks cost the delivery nothing: after the image is served, one retryable 503 "+
+			"is a RETRY, not a poisoning")
+	assert.Equal(t, 1, d.Attempts, "the only attempt on the ledger is the POST that got the 503")
+	assert.True(t, d.NextAttemptAt.After(time.Now()),
+		"the delivery is rescheduled into the future for its retry")
 }

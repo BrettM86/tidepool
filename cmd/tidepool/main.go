@@ -64,6 +64,8 @@ const (
 	// outboundWorkerIdle is how long a delivery worker sleeps when the queue is
 	// empty before polling ClaimNext again.
 	outboundWorkerIdle = time.Second
+	// mediaProbeTimeout bounds one media-gate HEAD to the Coves image proxy.
+	mediaProbeTimeout = 5 * time.Second
 )
 
 // ingest.NewHandler finds the banned-content surface by asserting it on the
@@ -825,6 +827,7 @@ func run(logger *slog.Logger) error {
 		UserOrigin:   cfg.APUserOrigin,
 		ServiceActor: serviceActor,
 		InboxHandler: inbox.InboxHandler(),
+		MediaBaseURL: cfg.CovesMediaBaseURL,
 	})
 	if err != nil {
 		return fmt.Errorf("user origin: %w", err)
@@ -1051,7 +1054,7 @@ func startConsumer(
 	inboxes := outbound.NewInboxResolver(apClient, outboundInboxTTL)
 	enqueuer, err := outbound.NewEnqueuer(outbound.EnqueuerOptions{
 		DB:         database,
-		Translator: outbound.NewTranslator(cfg.APUserOrigin),
+		Translator: outbound.NewTranslator(cfg.APUserOrigin, cfg.CovesMediaBaseURL),
 		Inboxes:    inboxes,
 		Actors:     store.NewAPActors(database),
 		UserOrigin: cfg.APUserOrigin,
@@ -1072,6 +1075,10 @@ func startConsumer(
 			Sender:   apClient,
 			Switches: switches,
 			Logger:   logger,
+			// The media gate holds a first delivery until the Coves proxy
+			// serves every image it carries.
+			MediaBaseURL:     cfg.CovesMediaBaseURL,
+			MediaProbeClient: ap.NewGuardedHTTPClient(cfg.AllowPrivateAddresses, mediaProbeTimeout),
 		})
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("consumer: outbound worker: %w", err)

@@ -428,6 +428,7 @@ func (d *Dispatcher) handleCommit(ctx context.Context, event *JetstreamEvent) er
 		// retrying cannot make one appear.
 		return fmt.Errorf("%w: commit event for %s carries no commit", ErrPermanentEvent, event.DID)
 	}
+	commit.TimeUS = event.TimeUS
 
 	// SECURITY: the envelope is validated BEFORE any storage access. A commit
 	// is attacker-influenced — a native user writes the record it carries — and

@@ -92,7 +92,7 @@ func TestBackfillRepliesDoNotReMaterializeOurOwnContent(t *testing.T) {
 	// ap_objects mapping the classifier answers from.
 	enqueuer, err := outbound.NewEnqueuer(outbound.EnqueuerOptions{
 		DB:         h.db,
-		Translator: outbound.NewTranslator(brUserOrigin),
+		Translator: outbound.NewTranslator(brUserOrigin, ""),
 		Inboxes:    outbound.NewInboxResolver(h.client, time.Minute),
 		Actors:     store.NewAPActors(h.db),
 		UserOrigin: brUserOrigin,

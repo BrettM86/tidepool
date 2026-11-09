@@ -15,6 +15,10 @@ The e2e suite runs the bridge against real services in one compose network
 - Jetstream decodes the relay's firehose. The tests read from it, and the
   bridge's own Jetstream consumer reads from it to deliver native posts to
   Lemmy.
+- The Coves AppView (`coves-appview`, with its own `coves-appview-postgres`)
+  indexes the same Jetstream and resolves DIDs through `plc`. Its image proxy
+  is on; image tests read blobs through it. See
+  [Coves AppView](#coves-appview).
 
 ```
 ┌────────────────┐   AP, plain HTTP ┌──────────────────────┐ mint DIDs  ┌─────┐
@@ -70,6 +74,7 @@ Host ports bind to loopback only:
 | 127.0.0.1:3081 | Reference PDS (published on the `relay` service) |
 | 127.0.0.1:6028 | Jetstream WebSocket |
 | 127.0.0.1:3013 | PLC fixture control API (`PLC_FIXTURE_E2E_PORT` overrides) |
+| 127.0.0.1:8093 | Coves AppView XRPC and image proxy (published on the `relay` service; `COVES_APPVIEW_E2E_PORT` overrides) |
 
 The stack carries admin tokens and runs with `ALLOW_PRIVATE_FETCH=1`, so it
 must not be reachable from the local network. The harness never contacts
@@ -132,6 +137,32 @@ The `pds-bootstrap` one-shot creates `native-alice.pds.test` with the public
 `createAccount` (invites are off, no admin API). It treats an already-taken
 handle as success, waits for `createSession` to return 200, then calls
 `requestCrawl` for `localhost:3001` on the relay.
+
+## Coves AppView
+
+`coves-appview` is built from a Coves checkout at `../coves` (next to this
+repo). Set `COVES_SOURCE` to build from another path; CI checks Coves `main`
+out to `coves-src/` in the workspace and sets it there. The build defaults to
+`GOARCH=amd64`; on an arm64 host set `COVES_E2E_GOARCH=arm64` for a native
+build instead of an emulated one.
+
+It indexes every record on the stack's Jetstream (`JETSTREAM_FEEDS=self=ws://jetstream:6018`):
+bridged communities and posts from Tidepool, and native records from the
+reference PDS. It resolves DIDs through `plc` and verifies `.ap.tidepool`
+handles against the bridge and `.pds.test` handles against the PDS. It runs
+in dev mode (`IS_DEV_ENV=true`) with its own Postgres; migrations run at boot.
+
+The image proxy is on and serves `/img/<preset>/plain/<did>/<cid>` only for a
+blob that an indexed record references; any other CID is a 404. Its
+in-network origin is `http://relay:8081`, and the host reaches it at
+`http://localhost:8093` (`COVES_APPVIEW_E2E_URL` overrides that in tests).
+The AppView refuses a post whose community it has not indexed, so image tests
+first poll `social.coves.community.get` until the community is there.
+
+Like `pds`, it runs in the relay's network namespace. The PDS's DID documents
+name `http://localhost:3001`, and the proxy fetches blobs from that endpoint,
+so it has to reach the PDS there. Recreating `relay` drops the AppView's
+networking along with the PDS's; recreate both with it.
 
 ## Event ordering through the relay
 
@@ -257,7 +288,7 @@ file by atomic rename and a single-file mount would keep the old inode.
 - Bridged repos appear in the relay's `listRepos` and are served by its
   `getLatestCommit`.
 
-### Native Coves content (`native_pds_test.go`, `native_facets_test.go`)
+### Native Coves content (`native_pds_test.go`, `native_facets_test.go`, `native_edit_test.go`, `native_image_posts_test.go`)
 
 - `native_pds_test.go` is a smoke test of the wire. It logs in to the
   reference PDS, writes one `community.postv2` into the native account's
@@ -271,10 +302,31 @@ file by atomic rename and a single-file mount would keep the old inode.
   expected strings: spoilers, a code block in a spoiler, headings and
   spoilers inside quotes, an escaped `!` before a link, bold, and plain
   links.
+- `native_edit_test.go` covers edits. A native post and a native comment are
+  written on the PDS, federate to Lemmy, and are then edited on the PDS;
+  Lemmy shows the new body for both.
+- `native_image_posts_test.go` covers gallery images that no `#image` facet
+  places. Each case waits for the AppView to index the community and uploads
+  fresh PNGs to the reference PDS. A single-image post reaches Lemmy with
+  `url` set to the proxy URL, its `alt_text`, an `image/*`
+  `url_content_type` and a `thumbnail_url`, and the image is not repeated in
+  the body. A three-image gallery uses the first as the URL and the body is
+  the text followed by the other two as markdown images. Images beside an
+  external link use the link as the URL and put both images in the body. A
+  comment with an image, and an image-only reply with empty content, show
+  the image in the Lemmy comment. A text post edited to add an image keeps
+  its Lemmy post and gains the image as its URL and alt text.
 
-No e2e test covers native comments, votes, edits or deletes going to Lemmy.
-Those are covered by unit tests in `internal/outbound`, `internal/consume`
-and `internal/accept`.
+No e2e test covers native votes or deletes going to Lemmy. Those are covered
+by unit tests in `internal/outbound`, `internal/consume` and `internal/accept`.
+
+### Coves AppView image proxy (`coves_appview_test.go`)
+
+The test bridges a community and waits for the AppView to index it. It
+uploads a PNG to the reference PDS and writes a `postv2` that embeds it, then
+expects `HEAD` and `GET` of the blob's proxy URL to return 200 with an
+`image/*` type. A second blob, embedded only in a post to a community the
+AppView never indexed, exists on the PDS but returns 404 from the proxy.
 
 ### Suite-end sweep (`zz_sweep_test.go`)
 
@@ -301,6 +353,10 @@ database directly. That dispatch is covered by unit tests in
 `docker-compose.e2e.yml` has a dependent with
 `condition: service_completed_successfully`, so `docker compose up --wait`
 does not fail when a one-shot has already exited.
+`compose_coves_appview_test.go` (also untagged) checks that
+`coves-appview` and `coves-appview-postgres` are default-enabled, have
+healthchecks, are not one-shots, and that the AppView depends on `plc`,
+`jetstream`, `pds` and its Postgres.
 
 ### Checks on every event
 

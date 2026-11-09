@@ -11,4 +11,7 @@ var (
 	metricPoisoned  = expvar.NewInt("tidepool_outbound_poisoned")
 	metricCancelled = expvar.NewInt("tidepool_outbound_cancelled")
 	metricParked    = expvar.NewInt("tidepool_outbound_parked")
+	// metricMediaBudgetExhausted counts deliveries the media gate let through
+	// with an image still unserved because its wait budget ran out.
+	metricMediaBudgetExhausted = expvar.NewInt("tidepool_outbound_media_budget_exhausted")
 )

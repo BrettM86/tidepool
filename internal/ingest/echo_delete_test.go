@@ -99,7 +99,7 @@ func setupNativeDeleteEcho(t *testing.T, h *harness, authorDID string) deleteEch
 
 	enqueuer, err := outbound.NewEnqueuer(outbound.EnqueuerOptions{
 		DB:         h.db,
-		Translator: outbound.NewTranslator(mdUserOrigin),
+		Translator: outbound.NewTranslator(mdUserOrigin, ""),
 		Inboxes:    outbound.NewInboxResolver(h.client, time.Minute),
 		Actors:     store.NewAPActors(h.db),
 		UserOrigin: mdUserOrigin,

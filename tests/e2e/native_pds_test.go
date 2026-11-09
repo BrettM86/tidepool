@@ -170,6 +170,25 @@ func (c *pdsClient) createRecord(collection, rkey string, record map[string]any)
 	return out.URI, out.CID, nil
 }
 
+// putRecord replaces a record in the session's OWN repo — an edit, which the
+// PDS commits as an update operation under a fresh rev.
+func (c *pdsClient) putRecord(collection, rkey string, record map[string]any) (uri, cid string, err error) {
+	var out struct {
+		URI string `json:"uri"`
+		CID string `json:"cid"`
+	}
+	err = c.do(http.MethodPost, "com.atproto.repo.putRecord", map[string]any{
+		"repo":       c.did,
+		"collection": collection,
+		"rkey":       rkey,
+		"record":     record,
+	}, &out)
+	if err != nil {
+		return "", "", err
+	}
+	return out.URI, out.CID, nil
+}
+
 // ── Scenario ───────────────────────────────────────────────────────────────
 
 // TestNativePDS_RecordTransitsRelayToJetstream is the acceptance test for a

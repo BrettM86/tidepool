@@ -60,7 +60,7 @@ func TestTranslator_FacetBodiesAreRenderedOnUpdate(t *testing.T) {
 		},
 	}
 
-	translator := NewTranslator(pageUserOrigin)
+	translator := NewTranslator(pageUserOrigin, "")
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			translated, err := translator.Translate(pageActorID, test.intent)

@@ -63,7 +63,7 @@ func newTestEnqueuer(t *testing.T, conn *sql.DB, inboxes InboxResolver) *Enqueue
 	t.Helper()
 	enq, err := NewEnqueuer(EnqueuerOptions{
 		DB:         conn,
-		Translator: NewTranslator(outUserOrigin),
+		Translator: NewTranslator(outUserOrigin, ""),
 		Inboxes:    inboxes,
 		Actors:     store.NewAPActors(conn),
 		UserOrigin: outUserOrigin,

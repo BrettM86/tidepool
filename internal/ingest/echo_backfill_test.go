@@ -96,7 +96,7 @@ func TestBackfillDoesNotReMaterializeOurOwnContent(t *testing.T) {
 
 	enqueuer, err := outbound.NewEnqueuer(outbound.EnqueuerOptions{
 		DB:         h.db,
-		Translator: outbound.NewTranslator(bfUserOrigin),
+		Translator: outbound.NewTranslator(bfUserOrigin, ""),
 		Inboxes:    outbound.NewInboxResolver(h.client, time.Minute),
 		Actors:     store.NewAPActors(h.db),
 		UserOrigin: bfUserOrigin,

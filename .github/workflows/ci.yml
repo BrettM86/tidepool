@@ -69,6 +69,10 @@ jobs:
        contains(github.event.pull_request.labels.*.name, 'run-e2e'))
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    env:
+      # Every compose call in this job (up, logs, down) resolves the AppView's
+      # build context; see the Coves checkout step.
+      COVES_SOURCE: ${{ github.workspace }}/coves-src
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -83,6 +87,15 @@ jobs:
       # buildx `gha` cache backend. Tracked in FOLLOWUPS.md ("CI").
       - name: Reclaim runner disk (drop preinstalled images)
         run: docker system prune -af || true
+      # The stack builds the Coves AppView from source. actions/checkout can
+      # only write under the workspace, so Coves lands in a subdirectory and
+      # COVES_SOURCE points the build context at it. Current main, unpinned.
+      - name: Check out Coves (AppView build context)
+        uses: actions/checkout@v5
+        with:
+          repository: BrettM86/coves
+          ref: main
+          path: coves-src
       # Split up/test/down (rather than `make e2e`) so a failure leaves the
       # stack alive long enough to dump its logs. `make e2e-up` passes
       # --wait-timeout 600 so a crash-looping service fails the step (with

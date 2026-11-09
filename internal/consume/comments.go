@@ -549,17 +549,23 @@ func (d *Dispatcher) apObjectID(did string, commit *CommitEvent) string {
 // its own root from, so recording it once at create time is what keeps the
 // answer O(1) forever after.
 func commentSnapshot(atURI string, commit *CommitEvent, thread *resolvedThread) ([]byte, error) {
-	snapshot, err := json.Marshal(map[string]any{
+	fields := map[string]any{
 		"atUri":         atURI,
 		"cid":           commit.CID,
 		"rev":           commit.Rev,
+		"timeUs":        commit.TimeUS,
 		"collection":    commit.Collection,
 		"record":        commit.Record,
 		"parentAtUri":   thread.ParentATURI,
 		"parentApId":    thread.ParentAPID,
 		"rootAtUri":     thread.RootATURI,
 		"communityApId": thread.CommunityAPID,
-	})
+	}
+	// The comment's activity op is the commit's, so an update is an Update.
+	if commit.Operation == operationUpdate {
+		fields[apobject.SnapshotEditedKey] = true
+	}
+	snapshot, err := json.Marshal(fields)
 	if err != nil {
 		// A record that will not marshal cannot be stored or delivered, and
 		// retrying serializes exactly the same bytes.

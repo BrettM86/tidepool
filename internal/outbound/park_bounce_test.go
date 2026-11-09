@@ -2,6 +2,9 @@ package outbound
 
 import (
 	"context"
+	"errors"
+	"net/http"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,10 +26,16 @@ import (
 // of miscount that makes a parked-delivery dashboard lie during an incident,
 // which is when it is read.
 func TestWorker_BouncedParkIsNotCounted(t *testing.T) {
+	var proxyStatus atomic.Int32
+	proxyStatus.Store(http.StatusNotFound)
+	proxy := newParkImageProxy(t, &proxyStatus)
+
 	for _, tc := range []struct {
-		name  string
-		class string
-		park  func(w *Worker, ctx context.Context, d *store.OutboundDelivery) error
+		name    string
+		class   string
+		payload []byte
+		opts    func(*WorkerOptions)
+		park    func(w *Worker, ctx context.Context, d *store.OutboundDelivery) error
 	}{
 		{
 			name:  "switch park",
@@ -43,12 +52,38 @@ func TestWorker_BouncedParkIsNotCounted(t *testing.T) {
 					causalParkDelay)
 			},
 		},
+		{
+			name:  "media park",
+			class: "media_pending",
+			// The image proxy answers 404, so the gate decides to park; the
+			// park then hits the fence.
+			payload: parkMediaPayload(proxy.URL),
+			opts:    withParkMediaGate(proxy.URL),
+			park: func(w *Worker, ctx context.Context, d *store.OutboundDelivery) error {
+				activity, err := w.activities.Get(ctx, d.ActivityID)
+				if err != nil {
+					return err
+				}
+				held, err := w.awaitMedia(ctx, d, activity)
+				if err != nil {
+					return err
+				}
+				if !held {
+					return errors.New("the media gate did not hold a delivery whose image is unserved")
+				}
+				return nil
+			},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			conn := workerTestDB(t)
 			ctx := context.Background()
 			seedWorkerActor(t, conn, true, false)
-			id := seedDelivery(t, conn, "Create", "", createPayload("x"))
+			payload := tc.payload
+			if payload == nil {
+				payload = createPayload("x")
+			}
+			id := seedDelivery(t, conn, "Create", "", payload)
 			deliveries := store.NewOutboundDeliveries(conn)
 
 			// A worker claims the delivery and then wedges.
@@ -67,7 +102,7 @@ func TestWorker_BouncedParkIsNotCounted(t *testing.T) {
 
 			// The wedged worker wakes up holding a token nobody honours and
 			// tries to park what it thinks is still its delivery.
-			w := newWorker(t, conn, &fakeSender{}, nil)
+			w := newWorker(t, conn, &fakeSender{}, tc.opts)
 			before := metricParked.Value()
 			require.NoError(t, tc.park(w, ctx, stale))
 

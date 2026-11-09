@@ -137,7 +137,7 @@ func TestOutboundDeliversASignedNativeComment(t *testing.T) {
 	// --- Wire the real enqueuer + worker. ---
 	enqueuer, err := NewEnqueuer(EnqueuerOptions{
 		DB:         conn,
-		Translator: NewTranslator(outUserOrigin),
+		Translator: NewTranslator(outUserOrigin, ""),
 		Inboxes:    inboxResolver{client: client},
 		Actors:     store.NewAPActors(conn),
 		UserOrigin: outUserOrigin,
@@ -365,7 +365,7 @@ func TestOutboundFederatesNativeCovesFacetsAsSafeLemmyMarkdown(t *testing.T) {
 	seedAcceptedParent(t, conn)
 
 	enqueuer, err := NewEnqueuer(EnqueuerOptions{
-		DB: conn, Translator: NewTranslator(outUserOrigin), Inboxes: inboxResolver{client: client},
+		DB: conn, Translator: NewTranslator(outUserOrigin, ""), Inboxes: inboxResolver{client: client},
 		Actors: store.NewAPActors(conn), UserOrigin: outUserOrigin,
 	})
 	require.NoError(t, err)
@@ -425,7 +425,7 @@ func TestOutboundFederatesNativeCovesFacetsAsSafeLemmyMarkdown(t *testing.T) {
 		assert.NotContains(t, string(wireObject), metadata, "Coves facet metadata must not leak into ActivityPub")
 	}
 
-	served, err := apobject.RenderObject(outUserOrigin, snapshot)
+	served, err := apobject.RenderObject(outUserOrigin, "", snapshot)
 	require.NoError(t, err)
 	assert.Equal(t, source, served["source"], "served source must match the delivered durable snapshot rendering")
 	assert.Equal(t, content, served["content"], "served HTML must match the delivered durable snapshot rendering")

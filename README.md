@@ -127,8 +127,10 @@ dig @127.0.0.1 -p 5300 TXT _atproto.<name>.<instance>.ap.localhost
 ## End-to-end tests
 
 The e2e harness runs the bridge against a real Lemmy, a local PLC directory,
-an indigo relay, a reference PDS, and Jetstream, all in one compose network.
-It never contacts public PLC, relays, or Lemmy instances.
+an indigo relay, a reference PDS, Jetstream, and a Coves AppView, all in one
+compose network. It never contacts public PLC, relays, or Lemmy instances.
+The AppView is built from a Coves checkout at `../coves` (`COVES_SOURCE`
+overrides the path).
 
 ```sh
 make e2e        # build + start the stack, run tests/e2e, tear down

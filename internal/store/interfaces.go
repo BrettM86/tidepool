@@ -864,6 +864,12 @@ type OutboundActivities interface {
 	// Get returns the canonical activity for an id. A miss is an error
 	// satisfying errors.IsNotFound.
 	Get(ctx context.Context, activityID string) (*OutboundActivity, error)
+
+	// MarkMediaReady records that the media gate settled for the activity, so
+	// later deliveries of it skip the probe. Idempotent: an already-marked
+	// activity keeps its first timestamp. A missing activity is an error
+	// satisfying errors.IsNotFound.
+	MarkMediaReady(ctx context.Context, activityID string) error
 }
 
 // OutboundDeliveries is the per-inbox delivery queue (task 15). It generalizes

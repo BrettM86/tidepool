@@ -132,7 +132,7 @@ func newHeldVoteWorld(t *testing.T) *heldVoteWorld {
 
 	enqueuer, err := NewEnqueuer(EnqueuerOptions{
 		DB:         conn,
-		Translator: NewTranslator("https://coves.social"),
+		Translator: NewTranslator("https://coves.social", ""),
 		Inboxes:    staticInbox{inbox: wInbox},
 		Actors:     store.NewAPActors(conn),
 		UserOrigin: "https://coves.social",

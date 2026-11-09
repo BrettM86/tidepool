@@ -117,7 +117,7 @@ func TestAnnouncedEchoOfOurOwnDeliveriesChangesNothing(t *testing.T) {
 	// --- Federate it for real: enqueue + deliver. ---
 	enqueuer, err := outbound.NewEnqueuer(outbound.EnqueuerOptions{
 		DB:         h.db,
-		Translator: outbound.NewTranslator(echoUserOrigin),
+		Translator: outbound.NewTranslator(echoUserOrigin, ""),
 		Inboxes:    outbound.NewInboxResolver(h.client, time.Minute),
 		Actors:     store.NewAPActors(h.db),
 		UserOrigin: echoUserOrigin,

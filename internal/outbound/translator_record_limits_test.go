@@ -101,7 +101,7 @@ func overLimitRecords(maximumGraphemes, maximumBytes int) []struct {
 }
 
 func TestTranslator_CommentOverLexiconLimitsIsRejected(t *testing.T) {
-	translator := NewTranslator(pageUserOrigin)
+	translator := NewTranslator(pageUserOrigin, "")
 	for _, test := range overLimitRecords(10000, 100000) {
 		for _, operation := range []string{"create", "update"} {
 			t.Run(test.name+" on "+operation, func(t *testing.T) {
@@ -123,7 +123,7 @@ func TestTranslator_CommentOverLexiconLimitsIsRejected(t *testing.T) {
 }
 
 func TestTranslator_PostOverLexiconLimitsIsRejected(t *testing.T) {
-	translator := NewTranslator(pageUserOrigin)
+	translator := NewTranslator(pageUserOrigin, "")
 	for _, test := range overLimitRecords(50000, 500000) {
 		t.Run(test.name, func(t *testing.T) {
 			record := map[string]any{"title": "A title"}
@@ -142,7 +142,7 @@ func TestTranslator_PostOverLexiconLimitsIsRejected(t *testing.T) {
 }
 
 func TestTranslator_CommentAtLexiconLimitsIsRendered(t *testing.T) {
-	translator := NewTranslator(pageUserOrigin)
+	translator := NewTranslator(pageUserOrigin, "")
 	tests := []struct {
 		name   string
 		record map[string]any
@@ -168,7 +168,7 @@ func TestTranslator_CommentAtLexiconLimitsIsRendered(t *testing.T) {
 func TestRenderObject_CommentOverLexiconLimitsIsNotServed(t *testing.T) {
 	for _, test := range overLimitRecords(10000, 100000) {
 		t.Run(test.name, func(t *testing.T) {
-			served, err := apobject.RenderObject(pageUserOrigin, limitsCommentSnapshot(t, test.record))
+			served, err := apobject.RenderObject(pageUserOrigin, "", limitsCommentSnapshot(t, test.record))
 			require.Error(t, err)
 			assert.Nil(t, served, "an over-limit snapshot is not served, with or without its facets")
 			assert.True(t, errors.IsValidation(err), "want a ValidationError, got %v", err)
@@ -180,7 +180,7 @@ func TestRenderObject_CommentOverLexiconLimitsIsNotServed(t *testing.T) {
 // 500000 bytes) federates and is served whole: the post limit is not the
 // comment limit.
 func TestTranslator_PostBetweenCommentAndPostLimitsIsRendered(t *testing.T) {
-	translator := NewTranslator(pageUserOrigin)
+	translator := NewTranslator(pageUserOrigin, "")
 	bodies := map[string]string{
 		"20000 graphemes":             strings.Repeat("a", 20000),
 		"50000 graphemes":             strings.Repeat("a", 50000),
@@ -207,7 +207,7 @@ func TestTranslator_PostBetweenCommentAndPostLimitsIsRendered(t *testing.T) {
 			})
 		}
 		t.Run(name+" served", func(t *testing.T) {
-			served, err := apobject.RenderObject(pageUserOrigin,
+			served, err := apobject.RenderObject(pageUserOrigin, "",
 				postSnapshot(t, map[string]any{"title": "A title", "content": body}))
 			require.NoError(t, err)
 			source, _ := served["source"].(map[string]any)
@@ -223,7 +223,7 @@ func TestRenderObject_PostOverLexiconLimitsIsNotServed(t *testing.T) {
 			for key, value := range test.record {
 				record[key] = value
 			}
-			served, err := apobject.RenderObject(pageUserOrigin, postSnapshot(t, record))
+			served, err := apobject.RenderObject(pageUserOrigin, "", postSnapshot(t, record))
 			require.Error(t, err)
 			assert.Nil(t, served)
 			assert.True(t, errors.IsValidation(err), "want a ValidationError, got %v", err)

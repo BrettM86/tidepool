@@ -18,7 +18,7 @@ import (
 // translator_page_test.go).
 
 func TestTranslator_NoteToExcludesCommunity(t *testing.T) {
-	tr := NewTranslator("https://coves.social")
+	tr := NewTranslator("https://coves.social", "")
 	community := "https://lemmy.world/c/tech"
 	actorID := "https://coves.social/ap/actor/did:plc:x"
 	atURI := "at://did:plc:x/social.coves.community.comment/rk"

@@ -31,10 +31,21 @@ func emphasisFacet(start, end int, featureNames ...string) map[string]any {
 // Markdown source and the HTML content.
 func buildTestNote(t *testing.T, plaintext string, facets []any) (string, string) {
 	t.Helper()
-	note := BuildNote("actor", "community", "parent", "object", map[string]any{
+	return buildTestNoteWithEmbed(t, plaintext, facets, nil, MediaSource{})
+}
+
+// buildTestNoteWithEmbed is buildTestNote for a record that also carries an
+// embed (nil for none), rendered with the given media source.
+func buildTestNoteWithEmbed(t *testing.T, plaintext string, facets []any, embed map[string]any, media MediaSource) (string, string) {
+	t.Helper()
+	record := map[string]any{
 		"content": plaintext,
 		"facets":  facets,
-	})
+	}
+	if embed != nil {
+		record["embed"] = embed
+	}
+	note := BuildNote("actor", "community", "parent", "object", media, record)
 	source, ok := note["source"].(map[string]any)
 	require.True(t, ok)
 	markdown, ok := source["content"].(string)

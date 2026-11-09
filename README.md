@@ -97,7 +97,7 @@ for collisions and the full naming rules.
 
 ## Quick start
 
-Requires Go 1.26+, Docker, and (for `make db-migrate`) the `goose` CLI.
+Requires Go 1.27+, Docker, and (for `make db-migrate`) the `goose` CLI.
 
 ```sh
 make dev-up      # start the dev postgres (localhost:5442)

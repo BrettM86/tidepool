@@ -7,7 +7,7 @@
 # lets it bind :80 (the e2e harness serves the bridge portless at
 # http://tidepool/ so AP object ids stay clean hostnames).
 
-FROM golang:1.26.10-alpine3.24 AS build
+FROM golang:1.27.3-alpine3.24 AS build
 
 WORKDIR /src
 
@@ -20,7 +20,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 go build -tags nodynamic -trimpath -ldflags='-s -w' -o /out/tidepool ./cmd/tidepool
 
-FROM alpine:3.21
+FROM alpine:3.24.1
 
 RUN apk add --no-cache ca-certificates \
     && adduser -D -u 1000 tidepool

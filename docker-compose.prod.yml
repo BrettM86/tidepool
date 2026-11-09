@@ -293,7 +293,7 @@ services:
       # Pinned upstream checkout, built with indigo's own Dockerfile.
       # Bump the SHA deliberately; rebuild with:
       #   docker compose -f docker-compose.prod.yml build relay
-      context: https://github.com/bluesky-social/indigo.git#bdacece3f80ef8bc79676a005616b9a802895356
+      context: https://github.com/bluesky-social/indigo.git#a20146f0f81d0b05296bee4fbced107885f4d31a
       dockerfile: cmd/relay/Dockerfile
       args:
         # indigo's Dockerfile runs `git describe`; git-URL contexts strip

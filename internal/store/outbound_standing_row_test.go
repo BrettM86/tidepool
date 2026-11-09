@@ -36,7 +36,9 @@ import (
 // out", and a held delivery already went out, so cancelling it strands the
 // ledger row it was held to settle — and the harm is remote from the code:
 // a stranded row over-counts a served score forever AND hides the vote from the
-// destructive tier's Undo enumeration.
+// destructive tier's Undo enumeration. The same holds for a vote Undo held
+// under DeliveryHeldForRefusalSettlement (the peer refused it, the local row
+// delete is outstanding): cancelling it leaves the withdrawn vote row counted.
 
 // standingTestDB is deliveryTestDB plus the ban table, which the ban door writes.
 func standingTestDB(t *testing.T) *sql.DB {
@@ -210,6 +212,101 @@ func TestCommunityBans_BanLeavesADeliveryHeldForSettlement(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, DeliveryStateCancelled, other.State,
 		"the ban still does its job on the work that has NOT gone out")
+}
+
+// TestCommunityBans_BanSparesOnlyDeliveredVoteUndos: a ban stops the author's
+// work in the community. The one exception is the Undo of a vote the peer
+// already holds: cancelling it would leave that vote standing. Everything else,
+// post and comment Deletes included, is cancelled as before, and so is an Undo
+// whose Like this same ban cancels, since the peer never saw that Like.
+func TestCommunityBans_BanSparesOnlyDeliveredVoteUndos(t *testing.T) {
+	database := voteQueueTestDB(t)
+	repo := NewOutboundDeliveries(database)
+	ctx := context.Background()
+
+	activity := func(c byte) string { return "https://coves.social/ap/activity/" + repeatHex(c) }
+	deliveredLike, pendingLike, heldLike := activity('1'), activity('2'), activity('a')
+	// The held Like is seeded and held first, while it is the only claimable
+	// row: the peer accepted it and only the ledger write is outstanding.
+	seedQueued(t, database, "Like", heldLike, votePayload("Like", heldLike, testSubjectAPID), DeliveryStatePending)
+	holdForSettlement(t, repo, heldLike, delTargetInbox)
+	seedQueued(t, database, "Like", deliveredLike, votePayload("Like", deliveredLike, testSubjectAPID), DeliveryStateDelivered)
+	seedQueued(t, database, "Like", pendingLike, votePayload("Like", pendingLike, otherSubjectAPID), DeliveryStatePending)
+
+	tests := []struct {
+		name       string
+		kind       string
+		activityID string
+		payload    map[string]any
+		want       DeliveryState
+	}{
+		{"pending Like", "Like", pendingLike, nil, DeliveryStateCancelled},
+		{"Create", "Create", activity('3'), map[string]any{"type": "Create"}, DeliveryStateCancelled},
+		{"post or comment Delete", "Delete", activity('4'),
+			map[string]any{"type": "Delete", "object": "https://coves.social/ap/note/1"}, DeliveryStateCancelled},
+		{"Undo of no vote", "Undo", activity('6'),
+			map[string]any{"type": "Undo", "object": map[string]any{"type": "Follow", "id": deliveredLike}}, DeliveryStateCancelled},
+		{"Undo of a delivered Like", "Undo", activity('7'),
+			voteUndoPayload(activity('7'), "Like", deliveredLike, testSubjectAPID), DeliveryStatePending},
+		{"Undo of a Like this ban cancels", "Undo", activity('8'),
+			voteUndoPayload(activity('8'), "Like", pendingLike, otherSubjectAPID), DeliveryStateCancelled},
+		{"Undo of a Like held for settlement", "Undo", activity('b'),
+			voteUndoPayload(activity('b'), "Like", heldLike, testSubjectAPID), DeliveryStatePending},
+		{"Like held for settlement", "Like", heldLike, nil, DeliveryStatePending},
+	}
+	for _, tc := range tests {
+		if tc.payload != nil {
+			seedQueued(t, database, tc.kind, tc.activityID, tc.payload, DeliveryStatePending)
+		}
+	}
+
+	_, _, err := NewCommunityBans(database).Ban(ctx, CommunityBan{
+		CommunityDID:  testCommunityDID,
+		SubjectDID:    testDID,
+		CommunityAPID: delOrderingKey,
+		Reason:        "spam",
+	})
+	require.NoError(t, err)
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, deliveryStateOf(t, repo, tc.activityID), "%s after ban", tc.name)
+		})
+	}
+	assert.Equal(t, DeliveryStateDelivered, deliveryStateOf(t, repo, deliveredLike), "a delivered row is untouched")
+}
+
+// TestCommunityBans_BanSparesAVoteUndoQueuedAtARotatedInbox: inbox rotation
+// sends to a fresh inbox without rewriting the delivered Like's target_inbox,
+// so the Undo queued after the rotation sits at a different inbox than the
+// Like it retracts. The ban must still recognise that Like as delivered to the
+// community and spare the Undo.
+func TestCommunityBans_BanSparesAVoteUndoQueuedAtARotatedInbox(t *testing.T) {
+	database := voteQueueTestDB(t)
+	repo := NewOutboundDeliveries(database)
+	ctx := context.Background()
+
+	like := "https://coves.social/ap/activity/" + repeatHex('c')
+	undo := "https://coves.social/ap/activity/" + repeatHex('d')
+	rotatedInbox := delTargetInbox + "/rotated"
+	seedQueued(t, database, "Like", like, votePayload("Like", like, testSubjectAPID), DeliveryStateDelivered)
+	seedQueued(t, database, "Undo", undo, voteUndoPayload(undo, "Like", like, testSubjectAPID), DeliveryStatePending)
+	_, err := database.ExecContext(ctx,
+		`UPDATE outbound_deliveries SET target_inbox = $2 WHERE activity_id = $1`, undo, rotatedInbox)
+	require.NoError(t, err)
+
+	_, _, err = NewCommunityBans(database).Ban(ctx, CommunityBan{
+		CommunityDID:  testCommunityDID,
+		SubjectDID:    testDID,
+		CommunityAPID: delOrderingKey,
+		Reason:        "spam",
+	})
+	require.NoError(t, err)
+
+	got, err := repo.Get(ctx, undo, rotatedInbox)
+	require.NoError(t, err)
+	assert.Equal(t, DeliveryStatePending, got.State,
+		"the Undo of a Like the community already holds stays queued, whichever inbox it now targets")
 }
 
 // TestOutboundDeliveries_CancelForCommunityLeavesADeliveryHeldForSettlement is

@@ -21,7 +21,7 @@ func NewOutboundVotes(db *sql.DB) OutboundVotes {
 const outboundVoteColumns = `
 	vote_at_uri, actor_did, subject_at_uri, subject_ap_id, community_did,
 	direction, current_activity_id, delivered_state, activity_seq,
-	created_at, updated_at`
+	created_at, updated_at, retraction_activity_id`
 
 func (r *postgresOutboundVotes) Upsert(ctx context.Context, vote OutboundVote) (*OutboundVote, error) {
 	return r.upsert(ctx, r.db, vote)
@@ -54,9 +54,15 @@ func (r *postgresOutboundVotes) upsert(ctx context.Context, q execer, vote Outbo
 	}
 
 	// ON CONFLICT names the PRIMARY KEY only. The (actor_did, subject_at_uri)
-	// constraint is deliberately NOT an upsert target: a different vote record
-	// for a pair that already holds one must FAIL, because overwriting the row
-	// would strand the Undo still owed for the first vote.
+	// index, which holds one LIVE vote per pair (retraction_activity_id NULL),
+	// is deliberately NOT an upsert target: a different vote record for a pair
+	// that already holds a live one must FAIL, because overwriting the row
+	// would strand the Undo still owed for the first vote. A retracting row
+	// does not hold the slot, so a flip to a new rkey goes through while the
+	// old vote's Undo is still owed.
+	//
+	// retraction_activity_id is restated from the caller: a same-rkey re-create
+	// passes "" and is live again; the purge restates a stored row and keeps it.
 	//
 	// The CASE on delivered_state defends ONE transition: `delivered` must not
 	// be overwritten by `pending`. A re-cast REPLACES a vote the peer still
@@ -102,8 +108,8 @@ func (r *postgresOutboundVotes) upsert(ctx context.Context, q execer, vote Outbo
 	query := `
 		INSERT INTO outbound_votes (
 			vote_at_uri, actor_did, subject_at_uri, subject_ap_id, community_did,
-			direction, current_activity_id, delivered_state
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			direction, current_activity_id, delivered_state, retraction_activity_id
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, ''))
 		ON CONFLICT (vote_at_uri) DO UPDATE SET
 			actor_did = EXCLUDED.actor_did,
 			subject_at_uri = EXCLUDED.subject_at_uri,
@@ -117,6 +123,7 @@ func (r *postgresOutboundVotes) upsert(ctx context.Context, q execer, vote Outbo
 				THEN outbound_votes.delivered_state
 				ELSE EXCLUDED.delivered_state
 			END,
+			retraction_activity_id = EXCLUDED.retraction_activity_id,
 			activity_seq = outbound_votes.activity_seq + 1,
 			updated_at = now()
 		RETURNING` + outboundVoteColumns
@@ -124,6 +131,7 @@ func (r *postgresOutboundVotes) upsert(ctx context.Context, q execer, vote Outbo
 	row := q.QueryRowContext(ctx, query,
 		vote.VoteATURI, vote.ActorDID, vote.SubjectATURI, vote.SubjectAPID,
 		vote.CommunityDID, vote.Direction, vote.CurrentActivityID, string(vote.DeliveredState),
+		vote.RetractionActivityID,
 	)
 	stored, err := scanOutboundVote(row)
 	if err != nil {
@@ -151,7 +159,8 @@ func (r *postgresOutboundVotes) GetByATURI(ctx context.Context, voteATURI string
 
 func (r *postgresOutboundVotes) GetByActorSubject(ctx context.Context, actorDID, subjectATURI string) (*OutboundVote, error) {
 	query := `SELECT` + outboundVoteColumns + `
-		FROM outbound_votes WHERE actor_did = $1 AND subject_at_uri = $2`
+		FROM outbound_votes
+		WHERE actor_did = $1 AND subject_at_uri = $2 AND retraction_activity_id IS NULL`
 	vote, err := scanOutboundVote(r.db.QueryRowContext(ctx, query, actorDID, subjectATURI))
 	if err != nil {
 		if stderrors.Is(err, sql.ErrNoRows) {
@@ -255,17 +264,36 @@ func (r *postgresOutboundVotes) SetDeliveredState(ctx context.Context, voteATURI
 	// from a served score forever.
 	//
 	// Re-setting undone stays allowed, so the write is idempotent.
-	result, err := r.db.ExecContext(ctx, `
-		UPDATE outbound_votes SET delivered_state = $2, updated_at = now()
-		 WHERE vote_at_uri = $1
-		   AND (delivered_state <> $3 OR $2 = $3)`,
-		voteATURI, string(state), string(DeliveredStateUndone))
+	//
+	// A ROW THAT MOVES TO DELIVERED RETIRES ITS RETRACTING SIBLINGS in the same
+	// statement. Lemmy holds one vote per (person, post), so a delivered
+	// replacement has replaced the withdrawn vote on the peer; that vote's
+	// Undo may still be queued, poisoned or refused, and leaving its row
+	// `delivered` makes the reseed subtract it again once the replacement is
+	// itself withdrawn. `undone` is our decision to stop counting it. One
+	// statement, so a concurrent reseed never sees both rows counted. A guard
+	// no-op (this row already undone) retires nothing: moved is empty.
+	var affected int64
+	err := r.db.QueryRowContext(ctx, `
+		WITH moved AS (
+			UPDATE outbound_votes SET delivered_state = $2, updated_at = now()
+			 WHERE vote_at_uri = $1
+			   AND (delivered_state <> $3 OR $2 = $3)
+			RETURNING vote_at_uri, actor_did, subject_at_uri
+		), retired AS (
+			UPDATE outbound_votes sibling SET delivered_state = $3, updated_at = now()
+			  FROM moved
+			 WHERE $2 = $4
+			   AND sibling.actor_did = moved.actor_did
+			   AND sibling.subject_at_uri = moved.subject_at_uri
+			   AND sibling.vote_at_uri <> moved.vote_at_uri
+			   AND sibling.retraction_activity_id IS NOT NULL
+			   AND sibling.delivered_state = $4
+		)
+		SELECT count(*) FROM moved`,
+		voteATURI, string(state), string(DeliveredStateUndone), string(DeliveredStateDelivered)).Scan(&affected)
 	if err != nil {
 		return fmt.Errorf("set delivered_state for outbound_vote %q: %w", voteATURI, err)
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("set delivered_state for outbound_vote %q: rows affected: %w", voteATURI, err)
 	}
 	if affected == 0 {
 		// TWO DIFFERENT NOTHINGS, and they cannot share a branch.
@@ -299,14 +327,17 @@ func (r *postgresOutboundVotes) Delete(ctx context.Context, voteATURI string) er
 func scanOutboundVote(row rowScanner) (*OutboundVote, error) {
 	var vote OutboundVote
 	var deliveredState string
+	var retraction sql.NullString
 	err := row.Scan(
 		&vote.VoteATURI, &vote.ActorDID, &vote.SubjectATURI, &vote.SubjectAPID,
 		&vote.CommunityDID, &vote.Direction, &vote.CurrentActivityID,
 		&deliveredState, &vote.ActivitySeq, &vote.CreatedAt, &vote.UpdatedAt,
+		&retraction,
 	)
 	if err != nil {
 		return nil, err
 	}
 	vote.DeliveredState = DeliveredState(deliveredState)
+	vote.RetractionActivityID = retraction.String
 	return &vote, nil
 }

@@ -377,6 +377,11 @@ type CommunityBans interface {
 	// a banned author's posts at a community that rejects them until each
 	// poisons — with nothing to retry, because Lemmy sends the Block once.
 	//
+	// One exception survives the cancel: the Undo of a vote whose Like/Dislike
+	// was already delivered to that inbox, so a vote the peer holds is not left
+	// standing. Post and comment Deletes, other Undos, and an Undo whose vote
+	// this same ban cancels are cancelled with the rest.
+	//
 	// Re-banning preserves the original banned_at (a re-delivered Block is the
 	// same ban twice) while taking the expiry, reason and removeData from the
 	// new activity, which are the parts a moderator can genuinely re-issue.
@@ -1018,5 +1023,9 @@ type OutboundDeliveries interface {
 	// orderingKey are optional filters (empty = no filter on that column); the
 	// attempt counter is reset so a redriven delivery gets a fresh budget.
 	// Returns how many rows were redriven.
-	RedrivePoisoned(ctx context.Context, activityID, orderingKey string) (int64, error)
+	//
+	// A poisoned vote Undo whose (actor, post) now holds a live vote row under
+	// another activity is superseded: sending it would withdraw that live vote
+	// on the peer. It stays poisoned and is counted in superseded instead.
+	RedrivePoisoned(ctx context.Context, activityID, orderingKey string) (redriven, superseded int64, err error)
 }

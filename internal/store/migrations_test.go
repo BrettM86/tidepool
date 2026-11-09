@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -21,6 +22,8 @@ func TestMigrations_UpDownUp(t *testing.T) {
 	// Other packages' tests leave identity events behind, and 035's Down
 	// refuses to drop them; the tables are torn down below anyway.
 	testutil.Truncate(t, database, "firehose_events")
+	// 050's Down refuses while an (actor, subject) pair holds two vote rows.
+	testutil.Truncate(t, database, "outbound_votes")
 
 	require.NoError(t, db.MigrateDownTo(ctx, database, 0), "all down migrations must apply")
 
@@ -196,4 +199,125 @@ func TestMigration035_DownRefusesWithIdentityEvents(t *testing.T) {
 		WHERE is_applied ORDER BY id DESC LIMIT 1`).Scan(&version)
 	require.NoError(t, err)
 	assert.Equal(t, int64(35), version, "the refused Down must leave the schema at 035")
+}
+
+// migration050Vote inserts one outbound_votes row by raw SQL (the store layer
+// may not match the schema version under test).
+func migration050Vote(t *testing.T, database *sql.DB, voteATURI, subjectATURI, activityID, state string) {
+	t.Helper()
+	_, err := database.ExecContext(context.Background(), `
+		INSERT INTO outbound_votes (vote_at_uri, actor_did, subject_at_uri, subject_ap_id,
+			community_did, direction, current_activity_id, delivered_state)
+		VALUES ($1, $2, $3, 'https://lemmy.world/post/1', $4, 'up', $5, $6)`,
+		voteATURI, testDID, subjectATURI, testCommunityDID, activityID, state)
+	require.NoError(t, err)
+}
+
+func migration050Undo(t *testing.T, database *sql.DB, undoID, innerID, createdAt string) {
+	t.Helper()
+	_, err := database.ExecContext(context.Background(), `
+		INSERT INTO outbound_activities (activity_id, actor_did, kind, payload, created_at)
+		VALUES ($1, $2, 'Undo', jsonb_build_object('type', 'Undo', 'object', jsonb_build_object('id', $3::text)), $4)`,
+		undoID, testDID, innerID, createdAt)
+	require.NoError(t, err)
+}
+
+func retractionOf(t *testing.T, database *sql.DB, voteATURI string) sql.NullString {
+	t.Helper()
+	var got sql.NullString
+	require.NoError(t, database.QueryRowContext(context.Background(),
+		`SELECT retraction_activity_id FROM outbound_votes WHERE vote_at_uri = $1`, voteATURI).Scan(&got))
+	return got
+}
+
+// migration050Fixture clears the vote tables and restores the latest schema
+// afterwards, whatever the test did to it.
+func migration050Fixture(t *testing.T) *sql.DB {
+	t.Helper()
+	database := testDB(t)
+	testutil.Truncate(t, database, "outbound_votes", "outbound_activities")
+	t.Cleanup(func() {
+		ctx := context.Background()
+		_, err := database.ExecContext(ctx, `TRUNCATE outbound_votes, outbound_activities CASCADE`)
+		assert.NoError(t, err)
+		assert.NoError(t, db.MigrateUp(ctx, database))
+	})
+	return database
+}
+
+const (
+	m050SubjectA    = "at://" + testCommunityDID + "/social.coves.community.postv2/3lzm050subja"
+	m050SubjectB    = "at://" + testCommunityDID + "/social.coves.community.postv2/3lzm050subjb"
+	m050SubjectC    = "at://" + testCommunityDID + "/social.coves.community.postv2/3lzm050subjc"
+	m050SubjectD    = "at://" + testCommunityDID + "/social.coves.community.postv2/3lzm050subjd"
+	m050VoteA       = "at://" + testDID + "/social.coves.feed.vote/3lzm050votea"
+	m050VoteA2      = "at://" + testDID + "/social.coves.feed.vote/3lzm050votea2"
+	m050VoteLive    = "at://" + testDID + "/social.coves.feed.vote/3lzm050livex"
+	m050VoteUndone  = "at://" + testDID + "/social.coves.feed.vote/3lzm050undne"
+	m050VotePending = "at://" + testDID + "/social.coves.feed.vote/3lzm050pendg"
+	m050LikeA       = "https://coves.social/ap/activity/m050-like-a"
+	m050LikeLive    = "https://coves.social/ap/activity/m050-like-live"
+	m050LikeUndone  = "https://coves.social/ap/activity/m050-like-undone"
+	m050LikePending = "https://coves.social/ap/activity/m050-like-pending"
+	m050UndoOld     = "https://coves.social/ap/activity/m050-undo-old"
+	m050UndoNew     = "https://coves.social/ap/activity/m050-undo-new"
+	m050UndoUndone  = "https://coves.social/ap/activity/m050-undo-undone"
+	m050UndoPending = "https://coves.social/ap/activity/m050-undo-pending"
+)
+
+// TestMigration050_BackfillsRetractionFromQueuedUndo: a row already withdrawn
+// by a queued Undo when 050 lands must come up retracting, so the user can
+// vote on that subject again.
+func TestMigration050_BackfillsRetractionFromQueuedUndo(t *testing.T) {
+	database := migration050Fixture(t)
+	ctx := context.Background()
+
+	require.NoError(t, db.MigrateDownTo(ctx, database, 49), "roll back exactly 050")
+
+	migration050Vote(t, database, m050VoteA, m050SubjectA, m050LikeA, "delivered")
+	migration050Undo(t, database, m050UndoOld, m050LikeA, "2026-01-01T00:00:00Z")
+	migration050Undo(t, database, m050UndoNew, m050LikeA, "2026-01-02T00:00:00Z")
+	migration050Vote(t, database, m050VoteLive, m050SubjectB, m050LikeLive, "delivered")
+	migration050Vote(t, database, m050VoteUndone, m050SubjectC, m050LikeUndone, "undone")
+	migration050Undo(t, database, m050UndoUndone, m050LikeUndone, "2026-01-01T00:00:00Z")
+	// The delete landed before the Like was delivered: the row is still
+	// pending, and it must come up retracting too.
+	migration050Vote(t, database, m050VotePending, m050SubjectD, m050LikePending, "pending")
+	migration050Undo(t, database, m050UndoPending, m050LikePending, "2026-01-01T00:00:00Z")
+
+	require.NoError(t, db.MigrateUp(ctx, database))
+
+	assert.Equal(t, sql.NullString{String: m050UndoNew, Valid: true}, retractionOf(t, database, m050VoteA),
+		"latest Undo backfilled")
+	assert.False(t, retractionOf(t, database, m050VoteLive).Valid, "unrelated row stays live")
+	assert.False(t, retractionOf(t, database, m050VoteUndone).Valid, "undone row not backfilled")
+	assert.Equal(t, sql.NullString{String: m050UndoPending, Valid: true}, retractionOf(t, database, m050VotePending),
+		"pending row with a queued Undo backfilled")
+
+	_, err := database.ExecContext(ctx, `
+		INSERT INTO outbound_votes (vote_at_uri, actor_did, subject_at_uri, subject_ap_id,
+			community_did, direction, current_activity_id)
+		VALUES ($1, $2, $3, 'https://lemmy.world/post/1', $4, 'down', 'https://coves.social/ap/activity/m050-b')`,
+		m050VoteA2, testDID, m050SubjectA, testCommunityDID)
+	assert.NoError(t, err, "a new vote on A's subject is allowed")
+}
+
+// TestMigration050_DownRefusesWithTwoRowsPerPair: restoring the full unique
+// constraint would have to drop a vote, so Down must refuse instead.
+func TestMigration050_DownRefusesWithTwoRowsPerPair(t *testing.T) {
+	database := migration050Fixture(t)
+	ctx := context.Background()
+
+	migration050Vote(t, database, m050VoteA, m050SubjectA, m050LikeA, "delivered")
+	_, err := database.ExecContext(ctx,
+		`UPDATE outbound_votes SET retraction_activity_id = $2 WHERE vote_at_uri = $1`, m050VoteA, m050UndoNew)
+	require.NoError(t, err)
+	migration050Vote(t, database, m050VoteA2, m050SubjectA, m050LikeLive, "pending")
+
+	require.Error(t, db.MigrateDownTo(ctx, database, 49), "050 Down must refuse")
+
+	var n int
+	require.NoError(t, database.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM outbound_votes WHERE vote_at_uri IN ($1, $2)`, m050VoteA, m050VoteA2).Scan(&n))
+	assert.Equal(t, 2, n, "both rows survive")
 }

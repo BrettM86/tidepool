@@ -125,3 +125,98 @@ func TestOutboundVotes_SetDeliveredStateOnAMissingVoteIsStillNotFound(t *testing
 			"'already retracted'")
 	assert.True(t, errors.IsNotFound(err), "want NotFound, got %v", err)
 }
+
+// TestOutboundVotes_SetDeliveredStateRetiresTheReplacedRetractingSibling pins
+// what a flip's delivery means for the vote it replaced. Lemmy holds one vote
+// per (person, post): once the live row B is delivered, the peer no longer
+// holds the retracting row A, whatever became of A's Undo. So settling B as
+// delivered must retire A ('undone') for the same (actor, subject), and only
+// then.
+func TestOutboundVotes_SetDeliveredStateRetiresTheReplacedRetractingSibling(t *testing.T) {
+	const (
+		otherSubjectATURI = "at://" + testCommunityDID + "/social.coves.community.postv2/3lzpostbbbbbb"
+		otherActorDID     = "did:plc:otheractorterminal01"
+	)
+	otherSubjectVoteATURI := "at://" + testDID + "/social.coves.feed.vote/3lzvotedddddd"
+	otherActorVoteATURI := "at://" + otherActorDID + "/social.coves.feed.vote/3lzvoteeeeeee"
+
+	retractingDelivered := func(voteATURI, actorDID, subjectATURI string, hex byte) OutboundVote {
+		v := testOutboundVote()
+		v.VoteATURI = voteATURI
+		v.ActorDID = actorDID
+		v.SubjectATURI = subjectATURI
+		v.CurrentActivityID = "https://coves.social/ap/activity/" + repeatHex(hex)
+		v.RetractionActivityID = "https://coves.social/ap/activity/undo-" + repeatHex(hex)
+		v.DeliveredState = DeliveredStateDelivered
+		return v
+	}
+
+	tests := []struct {
+		name string
+		// retracting rows seeded before B (all delivered, retraction id set).
+		retracting []OutboundVote
+		// bStart is the live row B's delivered_state before the settlement.
+		bStart DeliveredState
+		want   map[string]DeliveredState
+	}{
+		{
+			name:       "B settles delivered: the same pair's retracting A is undone",
+			retracting: []OutboundVote{retractingDelivered(testVoteATURI, testDID, testSubjectATURI, 'a')},
+			bStart:     DeliveredStatePending,
+			want: map[string]DeliveredState{
+				testVoteATURI:      DeliveredStateUndone,
+				testOtherVoteATURI: DeliveredStateDelivered,
+			},
+		},
+		{
+			name:       "B already undone: the no-op settlement leaves the retracting sibling delivered",
+			retracting: []OutboundVote{retractingDelivered(testVoteATURI, testDID, testSubjectATURI, 'a')},
+			bStart:     DeliveredStateUndone,
+			want: map[string]DeliveredState{
+				testVoteATURI:      DeliveredStateDelivered,
+				testOtherVoteATURI: DeliveredStateUndone,
+			},
+		},
+		{
+			name: "retracting rows of a different subject or a different actor are not touched",
+			retracting: []OutboundVote{
+				retractingDelivered(otherSubjectVoteATURI, testDID, otherSubjectATURI, 'd'),
+				retractingDelivered(otherActorVoteATURI, otherActorDID, testSubjectATURI, 'e'),
+			},
+			bStart: DeliveredStatePending,
+			want: map[string]DeliveredState{
+				otherSubjectVoteATURI: DeliveredStateDelivered,
+				otherActorVoteATURI:   DeliveredStateDelivered,
+				testOtherVoteATURI:    DeliveredStateDelivered,
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			database := outboundTestDB(t)
+			repo := NewOutboundVotes(database)
+			ctx := context.Background()
+
+			for _, v := range tc.retracting {
+				_, err := repo.Upsert(ctx, v)
+				require.NoError(t, err)
+			}
+			live := testOutboundVote()
+			live.VoteATURI = testOtherVoteATURI
+			live.Direction = "down"
+			live.CurrentActivityID = recastActivityID
+			live.DeliveredState = tc.bStart
+			_, err := repo.Upsert(ctx, live)
+			require.NoError(t, err, "B is recordable beside a retracting A")
+
+			require.NoError(t, repo.SetDeliveredState(ctx, testOtherVoteATURI, DeliveredStateDelivered))
+
+			for voteATURI, want := range tc.want {
+				got, err := repo.GetByATURI(ctx, voteATURI)
+				require.NoError(t, err, voteATURI)
+				assert.Equal(t, want, got.DeliveredState, voteATURI)
+			}
+		})
+	}
+}

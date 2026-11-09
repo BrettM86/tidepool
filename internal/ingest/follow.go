@@ -302,14 +302,14 @@ func (a *Admin) handleOutboundRedrive(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `refusing an unscoped redrive: set {"activity":"..."}, {"community":"..."}, or {"all":true}`, http.StatusBadRequest)
 		return
 	}
-	redriven, err := a.deliveries.RedrivePoisoned(r.Context(), req.Activity, req.Community)
+	redriven, superseded, err := a.deliveries.RedrivePoisoned(r.Context(), req.Activity, req.Community)
 	if err != nil {
 		a.logger.Error("outbound redrive failed", "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	_ = json.NewEncoder(w).Encode(map[string]any{"redriven": redriven})
+	_ = json.NewEncoder(w).Encode(map[string]any{"redriven": redriven, "superseded": superseded})
 }
 
 // handleOutboundCancel parks an actor's or a community's PENDING deliveries as

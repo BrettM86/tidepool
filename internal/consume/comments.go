@@ -172,8 +172,9 @@ func (d *Dispatcher) applyCommentWrite(ctx context.Context, tx *sql.Tx, did stri
 // prevent, over a cause that is even better known here, because WE recorded it.
 //
 // The ban's own arrival already swept this author's queued comments and votes —
-// its cancellation joins on actor_did and ordering_key, not on activity kind —
-// so only NEW writes escaped, which is exactly what this closes.
+// its cancellation joins on actor_did and ordering_key, sparing only the Undo of
+// a vote already delivered (store.cancelPendingForActorInCommunity) — so only
+// NEW writes escaped, which is exactly what this closes.
 //
 // PERMANENT, like the lock refusal and for the same reasons: the event
 // dead-letters with a reason an operator can read, the cursor advances rather

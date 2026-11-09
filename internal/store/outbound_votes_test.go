@@ -6,6 +6,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"tidepool/internal/errors"
 )
 
 // THE UPSERT IS THE INTENT WRITER. SetDeliveredState IS THE SETTLEMENT WRITER.
@@ -198,4 +200,69 @@ func TestOutboundVotes_UpsertDeliveredStateMatrix(t *testing.T) {
 				"the stored row must agree with what the upsert returned")
 		})
 	}
+}
+
+// ---------------------------------------------------------------------------
+// B3 — a retracting row does not hold the (actor, subject) pair
+// ---------------------------------------------------------------------------
+
+// retractionUndoID is the Undo withdrawing testVoteATURI's vote.
+var retractionUndoID = "https://coves.social/ap/activity/" + repeatHex('c')
+
+// A vote flip arrives as delete-of-A plus create-of-B. A's row lives on until
+// its Undo settles, and B must still be recordable meanwhile.
+func TestOutboundVotes_RetractingRowFreesTheActorSubjectPair(t *testing.T) {
+	database := outboundTestDB(t)
+	repo := NewOutboundVotes(database)
+	ctx := context.Background()
+
+	retracting := testOutboundVote()
+	retracting.RetractionActivityID = retractionUndoID
+	_, err := repo.Upsert(ctx, retracting)
+	require.NoError(t, err)
+
+	replacement := testOutboundVote()
+	replacement.VoteATURI = testOtherVoteATURI
+	replacement.Direction = "down"
+	replacement.CurrentActivityID = recastActivityID
+	_, err = repo.Upsert(ctx, replacement)
+	require.NoError(t, err, "B must not conflict with a retracting A")
+
+	live, err := repo.GetByActorSubject(ctx, testDID, testSubjectATURI)
+	require.NoError(t, err)
+	assert.Equal(t, testOtherVoteATURI, live.VoteATURI, "the live row is B")
+
+	third := testOutboundVote()
+	third.VoteATURI = "at://" + testDID + "/social.coves.feed.vote/3lzvotecccccc"
+	third.CurrentActivityID = "https://coves.social/ap/activity/" + repeatHex('d')
+	_, err = repo.Upsert(ctx, third)
+	assert.True(t, errors.IsAlreadyExists(err), "a second live row conflicts: %v", err)
+
+	revived := testOutboundVote()
+	_, err = repo.Upsert(ctx, revived)
+	assert.True(t, errors.IsAlreadyExists(err), "reviving A while B is live conflicts: %v", err)
+}
+
+func TestOutboundVotes_RetractionActivityIDRoundTripsAndClears(t *testing.T) {
+	database := outboundTestDB(t)
+	repo := NewOutboundVotes(database)
+	ctx := context.Background()
+
+	retracting := testOutboundVote()
+	retracting.RetractionActivityID = retractionUndoID
+	_, err := repo.Upsert(ctx, retracting)
+	require.NoError(t, err)
+
+	got, err := repo.GetByATURI(ctx, testVoteATURI)
+	require.NoError(t, err)
+	assert.Equal(t, retractionUndoID, got.RetractionActivityID, "stored retraction id")
+
+	// A same-rkey re-create states no retraction: the vote is live again.
+	returned, err := repo.Upsert(ctx, testOutboundVote())
+	require.NoError(t, err)
+	assert.Equal(t, "", returned.RetractionActivityID, "returned row is live")
+
+	got, err = repo.GetByATURI(ctx, testVoteATURI)
+	require.NoError(t, err)
+	assert.Equal(t, "", got.RetractionActivityID, "stored row is live")
 }

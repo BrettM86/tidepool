@@ -683,6 +683,9 @@ func (a *Aggregator) SeedAggregates(ctx context.Context, subjectAPID string, upv
 		//	                                          peer has not yet processed the
 		//	                                          withdrawal
 		//	row gone (Undo delivered)               → nothing to subtract
+		//	retracting, and the same actor has a    → skip: Lemmy keeps one vote
+		//	  delivered live row on the subject       per (person, post), so the
+		//	                                          flip replaced this one
 		//
 		// THE DIRECTION IS THE APPROXIMATE HALF, and only inside a re-cast
 		// window. The row's `direction` tracks the newest INTENT while
@@ -741,8 +744,14 @@ func (a *Aggregator) SeedAggregates(ctx context.Context, subjectAPID string, upv
 				SELECT
 					COUNT(*) FILTER (WHERE direction = 'up') AS up,
 					COUNT(*) FILTER (WHERE direction = 'down') AS down
-				FROM outbound_votes
-				WHERE subject_ap_id = $1 AND delivered_state = 'delivered'
+				FROM outbound_votes v
+				WHERE v.subject_ap_id = $1 AND v.delivered_state = 'delivered'
+				  AND NOT (v.retraction_activity_id IS NOT NULL AND EXISTS (
+					SELECT 1 FROM outbound_votes live_vote
+					WHERE live_vote.actor_did = v.actor_did
+					  AND live_vote.subject_at_uri = v.subject_at_uri
+					  AND live_vote.retraction_activity_id IS NULL
+					  AND live_vote.delivered_state = 'delivered'))
 			) ours
 			WHERE a.subject_ap_id = $1
 			RETURNING $2 - live.up - ours.up, $3 - live.down - ours.down,

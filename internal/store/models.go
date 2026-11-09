@@ -381,6 +381,9 @@ type OutboundVote struct {
 	// must embed it.
 	CurrentActivityID string
 	DeliveredState    DeliveredState
+	// RetractionActivityID is the id of the Undo withdrawing this vote; ""
+	// means the vote is live.
+	RetractionActivityID string
 	// ActivitySeq feeds ActivityID for this vote's operations.
 	ActivitySeq int
 	CreatedAt   time.Time

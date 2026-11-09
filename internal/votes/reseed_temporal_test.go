@@ -288,12 +288,18 @@ func newLifecycle(t *testing.T, maxAttempts int, workerOpts ...func(*outbound.Wo
 // castVote drives a vote COMMIT through the real consumer.
 func (l *lifecycle) castVote(t *testing.T, rev, direction string) {
 	t.Helper()
+	l.castVoteRKey(t, rev, tpVoteRKey, direction)
+}
+
+// castVoteRKey is castVote for the vote record at rkey.
+func (l *lifecycle) castVoteRKey(t *testing.T, rev, rkey, direction string) {
+	t.Helper()
 	frame := fmt.Sprintf(
 		`{"did":%q,"time_us":9500,"kind":"commit","commit":{"rev":%q,"operation":"create",`+
 			`"collection":"social.coves.feed.vote","rkey":%q,"cid":%q,`+
 			`"record":{"$type":"social.coves.feed.vote","subject":{"uri":%q,"cid":%q},`+
 			`"direction":%q,"createdAt":"2026-08-13T10:00:00.000Z"}}}`,
-		tpNativeDID, rev, tpVoteRKey, testCID, l.subjectURI, testCID, direction)
+		tpNativeDID, rev, rkey, testCID, l.subjectURI, testCID, direction)
 	l.handle(t, frame)
 }
 
@@ -301,10 +307,16 @@ func (l *lifecycle) castVote(t *testing.T, rev, direction string) {
 // step that enqueues the Undo while the row keeps its delivered state.
 func (l *lifecycle) deleteVote(t *testing.T, rev string) {
 	t.Helper()
+	l.deleteVoteRKey(t, rev, tpVoteRKey)
+}
+
+// deleteVoteRKey is deleteVote for the vote record at rkey.
+func (l *lifecycle) deleteVoteRKey(t *testing.T, rev, rkey string) {
+	t.Helper()
 	frame := fmt.Sprintf(
 		`{"did":%q,"time_us":9600,"kind":"commit","commit":{"rev":%q,"operation":"delete",`+
 			`"collection":"social.coves.feed.vote","rkey":%q}}`,
-		tpNativeDID, rev, tpVoteRKey)
+		tpNativeDID, rev, rkey)
 	l.handle(t, frame)
 }
 
@@ -331,10 +343,16 @@ func (l *lifecycle) deliver(t *testing.T) {
 // state reports the vote row's delivered_state, or "" when the row is gone.
 func (l *lifecycle) state(t *testing.T) string {
 	t.Helper()
+	return l.stateOf(t, tpVoteRKey)
+}
+
+// stateOf is state for the vote record at rkey.
+func (l *lifecycle) stateOf(t *testing.T, rkey string) string {
+	t.Helper()
 	var s string
 	err := l.db.QueryRow(
 		`SELECT delivered_state FROM outbound_votes WHERE vote_at_uri = $1`,
-		"at://"+tpNativeDID+"/social.coves.feed.vote/"+tpVoteRKey).Scan(&s)
+		"at://"+tpNativeDID+"/social.coves.feed.vote/"+rkey).Scan(&s)
 	if err == sql.ErrNoRows {
 		return ""
 	}
@@ -510,6 +528,96 @@ func TestDeliveredVoteWithPoisonedUndoSubtractsForever(t *testing.T) {
 	require.NoError(t, l.agg.SeedAggregates(ctx, tpSubject, 3, 2))
 	_, down, _ = counts(t, l.db, tpSubject)
 	assert.Equal(t, 1, down, "still subtracted on the next backfill, and the one after that")
+}
+
+// TestReseedAfterPoisonedUndoThenFlip pins what a flip to a new rkey does to
+// the subtrahend when the old vote's Undo poisoned. Lemmy keeps one vote per
+// (person, post): once B is delivered it REPLACES A on the peer, so A's
+// retracting row must stop being subtracted. While B is still pending the peer
+// holds only A, so A is still subtracted and B is not.
+func TestReseedAfterPoisonedUndoThenFlip(t *testing.T) {
+	ctx := context.Background()
+
+	// poisonUndoThenFlip delivers our up-vote A, poisons its Undo, and casts B
+	// (a down-vote) on a new rkey.
+	poisonUndoThenFlip := func(t *testing.T) *lifecycle {
+		t.Helper()
+		l := newLifecycle(t, 1)
+		require.NoError(t, l.agg.ApplyVote(ctx, dislike(activityID(t, 1), voterAlice, tpSubject), ""))
+
+		l.castVote(t, "3lztprev00001", directionUp)
+		l.deliver(t)
+		require.Equal(t, string(store.DeliveredStateDelivered), l.state(t))
+
+		l.deleteVote(t, "3lztprev00002")
+		l.sender.fail(fmt.Errorf("lemmy rejected the undo"))
+		l.deliver(t)
+		require.Equal(t, string(store.DeliveredStateDelivered), l.state(t),
+			"precondition: A stays delivered behind its poisoned Undo")
+		l.sender.fail(nil)
+
+		l.castVoteRKey(t, "3lztprev00003", tpFlipRKey, directionDown)
+		require.Equal(t, string(store.DeliveredStatePending), l.stateOf(t, tpFlipRKey))
+		return l
+	}
+
+	t.Run("B delivered: the peer holds B only", func(t *testing.T) {
+		l := poisonUndoThenFlip(t)
+		l.deliver(t)
+		require.Equal(t, string(store.DeliveredStateDelivered), l.stateOf(t, tpFlipRKey))
+		require.Equal(t, []string{"Like", "Dislike"}, l.sender.kinds(), "the poisoned Undo never reached the wire")
+
+		// Origin: 3 up (none ours), 2 down (Alice + our B).
+		require.NoError(t, l.agg.SeedAggregates(ctx, tpSubject, 3, 2))
+		seededUp, seededDown := seededCounts(t, l.db, tpSubject)
+		assert.Equal(t, 3, seededUp,
+			"3 origin − 0 live inbound up − 0 outbound up: B replaced A on the peer, so A's "+
+				"retracting row must not be subtracted as well")
+		assert.Equal(t, 0, seededDown, "2 origin − 1 live inbound down − 1 delivered B = 0")
+	})
+
+	t.Run("B delivered then deleted: A is never subtracted again", func(t *testing.T) {
+		l := poisonUndoThenFlip(t)
+		l.deliver(t)
+		require.Equal(t, string(store.DeliveredStateDelivered), l.stateOf(t, tpFlipRKey))
+
+		// Step 1: B's record is deleted; its Undo is queued, not delivered.
+		l.deleteVoteRKey(t, "3lztprev00004", tpFlipRKey)
+		require.Equal(t, string(store.DeliveredStateDelivered), l.stateOf(t, tpFlipRKey),
+			"precondition: B keeps delivered while its Undo is in flight")
+
+		// Origin: 3 up (none ours: B replaced A), 2 down (Alice + our B, whose
+		// Undo the peer has not processed).
+		require.NoError(t, l.agg.SeedAggregates(ctx, tpSubject, 3, 2))
+		seededUp, seededDown := seededCounts(t, l.db, tpSubject)
+		assert.Equal(t, 3, seededUp,
+			"3 origin − 0 live inbound up − 0 outbound up: B replaced A on the peer, and B "+
+				"being withdrawn does not put A back")
+		assert.Equal(t, 0, seededDown, "2 origin − 1 live inbound down − 1 delivered B (Undo in flight) = 0")
+
+		// Step 2: B's Undo is delivered; the peer holds no vote of ours.
+		l.deliver(t)
+		require.Equal(t, "", l.stateOf(t, tpFlipRKey), "precondition: B's row is gone with its Undo delivered")
+		require.Equal(t, []string{"Like", "Dislike", "Undo"}, l.sender.kinds())
+
+		// Origin: 3 up (none ours), 1 down (Alice).
+		require.NoError(t, l.agg.SeedAggregates(ctx, tpSubject, 3, 1))
+		seededUp, seededDown = seededCounts(t, l.db, tpSubject)
+		assert.Equal(t, 3, seededUp,
+			"3 origin − 0 live inbound up − 0 outbound up: A's poisoned-Undo row must not be "+
+				"subtracted once B has replaced it, even after B is gone")
+		assert.Equal(t, 0, seededDown, "1 origin − 1 live inbound down − 0 outbound down = 0")
+	})
+
+	t.Run("B pending: the peer still holds A", func(t *testing.T) {
+		l := poisonUndoThenFlip(t)
+
+		// Origin: 3 up (including our A), 1 down (Alice).
+		require.NoError(t, l.agg.SeedAggregates(ctx, tpSubject, 3, 1))
+		seededUp, seededDown := seededCounts(t, l.db, tpSubject)
+		assert.Equal(t, 2, seededUp, "3 origin − 0 live inbound up − 1 delivered A = 2")
+		assert.Equal(t, 0, seededDown, "1 origin − 1 live inbound down − 0: B is not on the peer")
+	})
 }
 
 // ---------------------------------------------------------------------------

@@ -6,8 +6,10 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -466,6 +468,264 @@ func TestWorker_UndoDeliverySuccessClearsVoteState(t *testing.T) {
 	_, err = store.NewOutboundVotes(conn).GetByATURI(context.Background(), voteATURI)
 	assert.Truef(t, errors.IsNotFound(err),
 		"an Undo delivery success CLEARS the vote row (clear-on-Undo), got %v", err)
+}
+
+// TestWorker_VoteUndoRejectionPoisonsAtOnceAndFreesTheLine: Lemmy holds one
+// vote per (person, post), so a 4xx rejection of an Undo{Like|Dislike} is an
+// answer about a vote the peer no longer holds — retrying it only blocks the
+// ordering key behind it. It poisons on its first attempt, the withdrawn vote
+// row is cleared, and the next delivery on the same key goes out. Retryable
+// statuses, the duplicate dedupe and non-vote activities keep today's handling.
+func TestWorker_VoteUndoRejectionPoisonsAtOnceAndFreesTheLine(t *testing.T) {
+	const subjectAPID = "https://lemmy.world/post/1"
+	tests := []struct {
+		name string
+		// kind is the activity under test; inner is the Undo's object type.
+		kind, inner string
+		answer      error
+		// freshAnswer is the re-resolved inbox's answer; nil means answer.
+		freshAnswer error
+		wantState   store.DeliveryState
+		// wantVoteGone: the outbound_votes row the Undo withdraws is deleted.
+		wantVoteGone bool
+		// wantFollowerDelivered: the next DeliverNext delivers the follower.
+		wantFollowerDelivered bool
+	}{
+		{"Undo{Like} answered 400", "Undo", "Like",
+			httpErr(http.StatusBadRequest, `{"error":"couldnt_find_object"}`), nil, store.DeliveryStatePoisoned, true, true},
+		{"Undo{Dislike} answered 403", "Undo", "Dislike",
+			httpErr(http.StatusForbidden, `{"error":"banned_from_community"}`), nil, store.DeliveryStatePoisoned, true, true},
+		{"Undo{Like} answered 404 at both inboxes", "Undo", "Like",
+			httpErr(http.StatusNotFound, ""), nil, store.DeliveryStatePoisoned, true, true},
+		{"Undo{Dislike} answered 410 at both inboxes", "Undo", "Dislike",
+			httpErr(http.StatusGone, ""), nil, store.DeliveryStatePoisoned, true, true},
+		{"Undo{Like} answered 503 is retried", "Undo", "Like",
+			httpErr(http.StatusServiceUnavailable, ""), nil, store.DeliveryStatePending, false, false},
+		{"Undo{Dislike} answered 401 is retried", "Undo", "Dislike",
+			httpErr(http.StatusUnauthorized, ""), nil, store.DeliveryStatePending, false, false},
+		{"Undo{Like} answered 408 is retried", "Undo", "Like",
+			httpErr(http.StatusRequestTimeout, ""), nil, store.DeliveryStatePending, false, false},
+		{"Undo{Dislike} answered 429 is retried", "Undo", "Dislike",
+			httpErr(http.StatusTooManyRequests, ""), nil, store.DeliveryStatePending, false, false},
+		{"Undo{Like} answered the duplicate 400 is delivered", "Undo", "Like",
+			httpErr(http.StatusBadRequest, `{"error":"activity was already received"}`), nil, store.DeliveryStateDelivered, true, true},
+		{"Undo{Follow} answered 400 is retried", "Undo", "Follow",
+			httpErr(http.StatusBadRequest, `{"error":"couldnt_find_object"}`), nil, store.DeliveryStatePending, false, false},
+		{"Delete answered 400 is retried", "Delete", "",
+			httpErr(http.StatusBadRequest, `{"error":"couldnt_find_object"}`), nil, store.DeliveryStatePending, false, false},
+		{"Undo{Like} answered 404 then 503 at the fresh inbox is retried", "Undo", "Like",
+			httpErr(http.StatusNotFound, ""), httpErr(http.StatusServiceUnavailable, ""), store.DeliveryStatePending, false, false},
+		{"Undo{Dislike} answered 410 then 503 at the fresh inbox is retried", "Undo", "Dislike",
+			httpErr(http.StatusGone, ""), httpErr(http.StatusServiceUnavailable, ""), store.DeliveryStatePending, false, false},
+		{"Undo{Like} answered 404 then a transport error at the fresh inbox is retried", "Undo", "Like",
+			httpErr(http.StatusNotFound, ""), stderrors.New("dial tcp: connection refused"), store.DeliveryStatePending, false, false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			conn := workerTestDB(t)
+			ctx := context.Background()
+			seedWorkerActor(t, conn, true, false)
+
+			innerID := "https://coves.social/ap/activity/" + repeatHex64("inner-"+tc.inner)
+			undoID := "https://coves.social/ap/activity/" + repeatHex64(tc.kind)
+			voteATURI := "at://" + wActorDID + "/social.coves.feed.vote/3lzvoteundo"
+			isVote := tc.inner == "Like" || tc.inner == "Dislike"
+			if isVote {
+				direction := "up"
+				if tc.inner == "Dislike" {
+					direction = "down"
+				}
+				_, err := store.NewOutboundVotes(conn).Upsert(ctx, store.OutboundVote{
+					VoteATURI:            voteATURI,
+					ActorDID:             wActorDID,
+					SubjectATURI:         "at://" + wCommunityDID + "/social.coves.community.postv2/3lzpost",
+					SubjectAPID:          subjectAPID,
+					CommunityDID:         wCommunityDID,
+					Direction:            direction,
+					CurrentActivityID:    innerID,
+					DeliveredState:       store.DeliveredStateDelivered,
+					RetractionActivityID: undoID,
+				})
+				require.NoError(t, err)
+			}
+
+			var payload []byte
+			if tc.kind == "Undo" {
+				payload = []byte(fmt.Sprintf(
+					`{"id":%q,"type":"Undo","actor":%q,"object":{"type":%q,"id":%q,"actor":%q,"object":%q}}`,
+					undoID, wActorID, tc.inner, innerID, wActorID, subjectAPID))
+			} else {
+				payload = []byte(fmt.Sprintf(
+					`{"id":%q,"type":"Delete","actor":%q,"object":"https://coves.social/ap/note/1"}`,
+					undoID, wActorID))
+			}
+			subjectID := seedDelivery(t, conn, tc.kind, "", payload)
+			// The follower is queued on the same ordering key BEFORE any claim.
+			followerID := seedDelivery(t, conn, "Create", "", createPayload("follower"))
+
+			// The peer answers the activity under test with tc.answer at every
+			// inbox (including the re-resolved one) and accepts the follower.
+			const freshInbox = "https://lemmy.world/c/tech/inbox-rotated"
+			sender := &fakeSender{}
+			sender.respond = func(call int, inbox string) error {
+				sender.mu.Lock()
+				posted := sender.posts[call-1].payload
+				sender.mu.Unlock()
+				var doc struct {
+					ID string `json:"id"`
+				}
+				require.NoError(t, json.Unmarshal(posted, &doc))
+				if doc.ID == undoID {
+					if inbox == freshInbox && tc.freshAnswer != nil {
+						return tc.freshAnswer
+					}
+					return tc.answer
+				}
+				return nil
+			}
+			resolver := &rotatingResolver{normal: wInbox, fresh: freshInbox}
+			w := newWorker(t, conn, sender, func(o *WorkerOptions) {
+				o.Inboxes = resolver
+				o.MaxAttempts = 5
+				o.BackoffBase = time.Hour // a retried row is not re-claimable within the test
+			})
+
+			worked, err := w.DeliverNext(ctx)
+			require.NoError(t, err)
+			require.True(t, worked)
+
+			// 404/410 is an endpoint-gone signal for every kind, vote Undos
+			// included: the inbox is re-resolved once and the Undo re-sent there
+			// before the refusal is treated as terminal.
+			gone := false
+			if he := (ap.HTTPError{}); stderrors.As(tc.answer, &he) {
+				gone = he.StatusCode == http.StatusNotFound || he.StatusCode == http.StatusGone
+			}
+			if gone {
+				assert.Equal(t, 1, resolver.freshCalls, "a 404/410 re-resolves the inbox once")
+				sender.mu.Lock()
+				var undoInboxes []string
+				for _, post := range sender.posts {
+					if strings.Contains(string(post.payload), undoID) {
+						undoInboxes = append(undoInboxes, post.inbox)
+					}
+				}
+				sender.mu.Unlock()
+				assert.Equal(t, []string{wInbox, freshInbox}, undoInboxes,
+					"the Undo is sent to the cached inbox, then once to the re-resolved one")
+			} else {
+				assert.Zero(t, resolver.freshCalls, "only a 404/410 re-resolves the inbox")
+			}
+
+			subject := getDelivery(t, conn, subjectID)
+			assert.Equal(t, tc.wantState, subject.State, "state after one attempt")
+			assert.Equal(t, 1, subject.Attempts, "attempts after one DeliverNext")
+
+			_, voteErr := store.NewOutboundVotes(conn).GetByATURI(ctx, voteATURI)
+			if tc.wantVoteGone {
+				assert.Truef(t, errors.IsNotFound(voteErr), "the withdrawn vote row is cleared, got %v", voteErr)
+			} else if isVote {
+				assert.NoError(t, voteErr, "the vote row is still present while its Undo is retried")
+			}
+
+			if tc.wantFollowerDelivered {
+				worked, err = w.DeliverNext(ctx)
+				require.NoError(t, err)
+				assert.True(t, worked, "the follower is claimable next")
+				assert.Equal(t, store.DeliveryStateDelivered, getDelivery(t, conn, followerID).State,
+					"the follower on the same ordering key is delivered")
+			}
+		})
+	}
+}
+
+// failingDeleteVotes fails the Undo-side ledger write (the row delete) on demand.
+type failingDeleteVotes struct {
+	store.OutboundVotes
+	failDelete bool
+}
+
+func (f *failingDeleteVotes) Delete(ctx context.Context, voteATURI string) error {
+	if f.failDelete {
+		return stderrors.New("ledger delete failed")
+	}
+	return f.OutboundVotes.Delete(ctx, voteATURI)
+}
+
+// TestWorker_VoteUndoRefusalHeldUntilClearedLocally: when the peer refuses a
+// vote Undo but the local row delete fails, the delivery is not poisoned with
+// the row still counted. It is held pending under its own class, and the next
+// claim resumes at the local delete without POSTing the Undo again.
+func TestWorker_VoteUndoRefusalHeldUntilClearedLocally(t *testing.T) {
+	conn := workerTestDB(t)
+	ctx := context.Background()
+	seedWorkerActor(t, conn, true, false)
+
+	const subjectAPID = "https://lemmy.world/post/1"
+	innerID := "https://coves.social/ap/activity/" + repeatHex64("inner-Like")
+	undoID := "https://coves.social/ap/activity/" + repeatHex64("Undo")
+	voteATURI := "at://" + wActorDID + "/social.coves.feed.vote/3lzvoteheld"
+	votes := store.NewOutboundVotes(conn)
+	_, err := votes.Upsert(ctx, store.OutboundVote{
+		VoteATURI:            voteATURI,
+		ActorDID:             wActorDID,
+		SubjectATURI:         "at://" + wCommunityDID + "/social.coves.community.postv2/3lzpost",
+		SubjectAPID:          subjectAPID,
+		CommunityDID:         wCommunityDID,
+		Direction:            "up",
+		CurrentActivityID:    innerID,
+		DeliveredState:       store.DeliveredStateDelivered,
+		RetractionActivityID: undoID,
+	})
+	require.NoError(t, err)
+	subjectID := seedDelivery(t, conn, "Undo", "", []byte(fmt.Sprintf(
+		`{"id":%q,"type":"Undo","actor":%q,"object":{"type":"Like","id":%q,"actor":%q,"object":%q}}`,
+		undoID, wActorID, innerID, wActorID, subjectAPID)))
+
+	sender := &fakeSender{respond: func(int, string) error {
+		return httpErr(http.StatusForbidden, `{"error":"banned_from_community"}`)
+	}}
+	faulty := &failingDeleteVotes{OutboundVotes: votes, failDelete: true}
+	w := newWorker(t, conn, sender, func(o *WorkerOptions) { o.Votes = faulty })
+
+	worked, err := w.DeliverNext(ctx)
+	require.NoError(t, err)
+	require.True(t, worked)
+
+	held := getDelivery(t, conn, subjectID)
+	assert.Equal(t, store.DeliveryStatePending, held.State,
+		"a refusal whose local delete failed is not poisoned while the row still counts")
+	assert.Equal(t, store.DeliveryHeldForRefusalSettlement, held.LastErrorClass,
+		"the peer's verdict is recorded so the retry skips the wire")
+	_, err = votes.GetByATURI(ctx, voteATURI)
+	require.NoError(t, err, "the vote row is still present while the delete is outstanding")
+	require.Equal(t, 1, sender.count())
+
+	// The held refusal already went out: neither the actor nor the community
+	// cancellation may strand it with the vote row still counted.
+	deliveries := store.NewOutboundDeliveries(conn)
+	_, err = deliveries.CancelForActor(ctx, wActorDID)
+	require.NoError(t, err)
+	_, err = deliveries.CancelForCommunity(ctx, wCommunityAPID)
+	require.NoError(t, err)
+	held = getDelivery(t, conn, subjectID)
+	assert.Equal(t, store.DeliveryStatePending, held.State,
+		"a delivery held for refusal settlement is not cancellable")
+	assert.Equal(t, store.DeliveryHeldForRefusalSettlement, held.LastErrorClass)
+
+	faulty.failDelete = false
+	require.Eventually(t, func() bool {
+		worked, err := w.DeliverNext(ctx)
+		require.NoError(t, err)
+		return worked
+	}, 5*time.Second, 5*time.Millisecond, "the held refusal is re-claimed")
+
+	assert.Equal(t, 1, sender.count(), "the resumed refusal does not POST the Undo again")
+	assert.Equal(t, store.DeliveryStatePoisoned, getDelivery(t, conn, subjectID).State,
+		"once the row is cleared, the refusal is terminal")
+	_, err = votes.GetByATURI(ctx, voteATURI)
+	assert.Truef(t, errors.IsNotFound(err), "the withdrawn vote row is cleared, got %v", err)
 }
 
 // ---------------------------------------------------------------------------

@@ -140,8 +140,9 @@ func (d *Dispatcher) applyVoteWrite(ctx context.Context, tx *sql.Tx, did string,
 		DeliveredState:    store.DeliveredStatePending,
 	})
 	if errors.IsAlreadyExists(err) {
-		// A SECOND vote record for a subject this actor already has a live
-		// vote on. The existing row is left exactly as it is — clobbering it
+		// A SECOND vote record for a subject this actor already has a LIVE
+		// vote on (one whose delete has not been seen; a retracting row does
+		// not count). The existing row is left exactly as it is — clobbering it
 		// would strand the Undo still owed for the Like already delivered.
 		//
 		// TRANSIENT, not a skip: the newer record retries until the older
@@ -209,8 +210,14 @@ func (d *Dispatcher) applyVoteDelete(ctx context.Context, tx *sql.Tx, did string
 	// delivered under, and the Undo has to embed it. The row SURVIVES: task 15
 	// needs it to retry the Undo and clears it only once delivery succeeds. It
 	// rides the gate transaction so the bump and the enqueue commit together.
-	undone, err := d.votes.UpsertTx(ctx, tx, *stored)
-	if err != nil {
+	//
+	// The row is marked retracting under the Undo's id (seq+1 is the value the
+	// upsert bumps to), which frees the actor's live slot on the subject so a
+	// flip to a new rkey is not refused while this Undo is owed.
+	// delivered_state is left alone: the peer holds the vote until it lands.
+	retracting := *stored
+	retracting.RetractionActivityID = ActivityID(d.userOrigin, voteATURI, operationUndo, stored.ActivitySeq+1)
+	if _, err := d.votes.UpsertTx(ctx, tx, retracting); err != nil {
 		return fmt.Errorf("bump vote state for %s: %w", voteATURI, err)
 	}
 
@@ -222,7 +229,7 @@ func (d *Dispatcher) applyVoteDelete(ctx context.Context, tx *sql.Tx, did string
 		// Undo{Like} withdrawing a Dislike would move the peer's count the
 		// wrong way.
 		Direction:       stored.Direction,
-		ID:              ActivityID(d.userOrigin, voteATURI, operationUndo, undone.ActivitySeq),
+		ID:              retracting.RetractionActivityID,
 		InnerActivityID: stored.CurrentActivityID,
 		CommunityAPID:   communityAPID,
 	})

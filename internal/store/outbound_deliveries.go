@@ -349,11 +349,22 @@ func (r *postgresOutboundDeliveries) CancelOutwardForActorTx(ctx context.Context
 // predicate below exists to prevent.
 const DeliveryHeldForSettlement = "ledger_unsettled"
 
+// DeliveryHeldForRefusalSettlement is the last_error_class of a vote Undo the
+// PEER HAS REFUSED terminally whose local retraction (the outbound_votes row
+// delete) has not committed yet. The row stays `pending` so a worker can
+// re-claim it, finish the delete and then poison it, WITHOUT POSTing the Undo
+// again.
+const DeliveryHeldForRefusalSettlement = "refusal_unsettled"
+
 // notHeldForSettlement is the term EVERY cancellation carries, and it is one
 // constant rather than three because forgetting it is silent.
 //
+// It covers both holds: DeliveryHeldForSettlement (the peer accepted) and
+// DeliveryHeldForRefusalSettlement (the peer refused a vote Undo terminally and
+// the outbound_votes row delete is outstanding).
+//
 // A cancellation answers "this must not go out". A held delivery already WENT
-// out: the peer holds the activity, and the only thing outstanding is our own
+// out: the peer has answered it, and the only thing outstanding is our own
 // record of that. Cancelling is terminal, so the worker never returns to it and
 // the settlement is stranded — and the stranding is invisible until it surfaces
 // somewhere else entirely. Two places, both crossing sub-run boundaries: the
@@ -381,7 +392,8 @@ const DeliveryHeldForSettlement = "ledger_unsettled"
 // any of these statements joins) has no such column, so it is unambiguous
 // everywhere and stays correct whether the target is aliased or not.
 const notHeldForSettlement = `
-		  AND last_error_class IS DISTINCT FROM '` + DeliveryHeldForSettlement + `'`
+		  AND last_error_class IS DISTINCT FROM '` + DeliveryHeldForSettlement + `'
+		  AND last_error_class IS DISTINCT FROM '` + DeliveryHeldForRefusalSettlement + `'`
 
 // RetractionKinds are the activity kinds that TAKE CONTENT DOWN: a Delete of a
 // post or comment, and the Undo of a vote. They are exempt from every consent
@@ -497,6 +509,18 @@ func (r *postgresOutboundDeliveries) CancelForCommunity(ctx context.Context, ord
 // so rewriting it would move a number the user sees), and `poisoned` is an
 // operator surface whose redrive is the recovery.
 //
+// One retraction is spared: the Undo of a Like/Dislike whose own delivery to
+// the same community is `delivered`, or is pending but HELD FOR SETTLEMENT (the
+// peer accepted it; only our bookkeeping is unfinished). A vote flip queues the
+// old vote's Undo, and cancelling it would leave a vote the peer already holds
+// standing. The match is on the community (ordering key), not the inbox: inbox
+// rotation delivers to a fresh inbox without rewriting target_inbox, so the
+// Undo can be queued at a different inbox than its Like. Everything else is cancelled, post and comment Deletes included,
+// and so is an Undo whose Like/Dislike is still queued unsent: this statement
+// cancels that vote too, so the peer never saw it. A spared Undo can still be
+// refused by the peer for a banned actor; the worker then poisons it at once
+// and finishes the retraction locally, which is the operator's visible outcome.
+//
 // It runs on a caller's transaction: the ban row and this cancellation are one
 // decision, and store.CommunityBans.Ban commits them together.
 func cancelPendingForActorInCommunity(ctx context.Context, ex execer, actorDID, orderingKey string) (int64, error) {
@@ -507,7 +531,17 @@ func cancelPendingForActorInCommunity(ctx context.Context, ex execer, actorDID, 
 		WHERE d.activity_id = a.activity_id
 		  AND a.actor_did = $1
 		  AND d.ordering_key = $2
-		  AND d.state = 'pending'`+notHeldForSettlement, actorDID, orderingKey)
+		  AND d.state = 'pending'`+notHeldForSettlement+`
+		  AND NOT (
+		      a.kind = 'Undo'
+		      AND a.payload->'object'->>'type' IN ('Like', 'Dislike')
+		      AND EXISTS (
+		          SELECT 1 FROM outbound_deliveries inner_delivery
+		          WHERE inner_delivery.activity_id = a.payload->'object'->>'id'
+		            AND inner_delivery.ordering_key = d.ordering_key
+		            AND (inner_delivery.state = 'delivered'
+		                 OR (inner_delivery.state = 'pending'
+		                     AND inner_delivery.last_error_class = '`+DeliveryHeldForSettlement+`'))))`, actorDID, orderingKey)
 	if err != nil {
 		return 0, fmt.Errorf("cancel outbound_deliveries for %q in %q: %w", actorDID, orderingKey, err)
 	}
@@ -711,27 +745,62 @@ func (r *postgresOutboundDeliveries) CountsByState(ctx context.Context) (map[Del
 	return counts, nil
 }
 
-func (r *postgresOutboundDeliveries) RedrivePoisoned(ctx context.Context, activityID, orderingKey string) (int64, error) {
-	// Empty filters pass through the NULLIF/COALESCE guard: a blank $2/$3 means
-	// "any row", so the sweep can target one activity, one community, or all
-	// poisoned deliveries. Reset attempts + next_attempt_at so a redriven
-	// delivery gets a fresh budget and is immediately claimable.
-	result, err := r.db.ExecContext(ctx, `
-		UPDATE outbound_deliveries
-		SET state = 'pending', attempts = 0, claimed_until = NULL, next_attempt_at = now(),
-		    updated_at = now()
-		WHERE state = 'poisoned'
-		  AND ($1 = '' OR activity_id = $1)
-		  AND ($2 = '' OR ordering_key = $2)`,
-		activityID, orderingKey)
-	if err != nil {
-		return 0, fmt.Errorf("redrive poisoned deliveries: %w", err)
+func (r *postgresOutboundDeliveries) RedrivePoisoned(ctx context.Context, activityID, orderingKey string) (redriven, superseded int64, err error) {
+	// Empty filters mean "any row", so the sweep can target one activity, one
+	// community, or all poisoned deliveries. Reset attempts + next_attempt_at so
+	// a redriven delivery gets a fresh budget and is immediately claimable.
+	//
+	// A SUPERSEDED vote Undo stays poisoned and is counted instead. Lemmy holds
+	// one vote per (actor, post) and matches an Undo{vote} on that pair, not on
+	// the inner id. Once the actor has a live vote row on the same post under a
+	// different activity (a flip to a new rkey, or a same-rkey re-cast), that
+	// vote replaces the old one on the peer, so the old Undo is not owed. Sent
+	// now, it would withdraw the live vote on the peer while the row still
+	// says it stands. A replacement counts only while the peer holds it or
+	// still can: its row reads delivered, or a delivery of its activity is
+	// still pending (held for settlement included). Redriving then could race
+	// the replacement's delivery. A replacement whose deliveries were all
+	// cancelled or poisoned will never reach the peer, so the old vote stands
+	// there and the Undo is owed again. A live row under the Undo's own inner
+	// id is the vote being withdrawn (the purge's shape), not a replacement.
+	query := `
+		WITH candidates AS (
+			SELECT d.activity_id, d.target_inbox,
+			       (a.kind = 'Undo'
+			        AND a.payload->'object'->>'type' IN ('Like', 'Dislike')
+			        AND EXISTS (
+			            SELECT 1 FROM outbound_votes v
+			            WHERE v.actor_did = a.actor_did
+			              AND v.subject_ap_id = a.payload->'object'->>'object'
+			              AND v.retraction_activity_id IS NULL
+			              AND v.current_activity_id <> a.payload->'object'->>'id'
+			              AND (v.delivered_state = 'delivered'
+			                   OR EXISTS (
+			                       SELECT 1 FROM outbound_deliveries r
+			                       WHERE r.activity_id = v.current_activity_id
+			                         AND r.state = 'pending')))) AS superseded
+			FROM outbound_deliveries d
+			JOIN outbound_activities a ON a.activity_id = d.activity_id
+			WHERE d.state = 'poisoned'
+			  AND ($1 = '' OR d.activity_id = $1)
+			  AND ($2 = '' OR d.ordering_key = $2)
+		), redriven AS (
+			UPDATE outbound_deliveries d
+			SET state = 'pending', attempts = 0, claimed_until = NULL, next_attempt_at = now(),
+			    updated_at = now()
+			FROM candidates c
+			WHERE d.activity_id = c.activity_id
+			  AND d.target_inbox = c.target_inbox
+			  AND NOT c.superseded
+			  AND d.state = 'poisoned'
+			RETURNING 1
+		)
+		SELECT (SELECT COUNT(*) FROM redriven),
+		       (SELECT COUNT(*) FROM candidates WHERE superseded)`
+	if err := r.db.QueryRowContext(ctx, query, activityID, orderingKey).Scan(&redriven, &superseded); err != nil {
+		return 0, 0, fmt.Errorf("redrive poisoned deliveries: %w", err)
 	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return 0, fmt.Errorf("redrive poisoned deliveries: rows affected: %w", err)
-	}
-	return affected, nil
+	return redriven, superseded, nil
 }
 
 func scanOutboundDelivery(row rowScanner) (*OutboundDelivery, error) {

@@ -225,6 +225,8 @@ func TestVoteDelete_ReconstructsTheUndoFromState(t *testing.T) {
 		"and its id derives from the bumped seq, so it can never collide with the Like's")
 	assert.Equal(t, store.DeliveredStatePending, updated.DeliveredState,
 		"the consumer still claims no delivery; task 15 flips this to undone on success")
+	assert.Equal(t, intent.ActivityID(), updated.RetractionActivityID,
+		"the delete records the Undo withdrawing the row")
 }
 
 func TestVoteDelete_OfAnUnknownVoteIsSkipped(t *testing.T) {

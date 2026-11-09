@@ -272,6 +272,13 @@ func (w *Worker) handle(ctx context.Context, delivery *store.OutboundDelivery) e
 	if delivery.LastErrorClass == deliveryLedgerUnsettled {
 		return w.deliverSuccess(ctx, delivery, activity, statusOf(delivery))
 	}
+	// Likewise a vote Undo the peer already REFUSED terminally, held because
+	// the local row delete failed, resumes at that delete.
+	if delivery.LastErrorClass == store.DeliveryHeldForRefusalSettlement {
+		return w.rejectVoteUndo(ctx, delivery, activity, ap.HTTPError{
+			URL: delivery.TargetInbox, StatusCode: statusOf(delivery), Body: delivery.ResponseExcerpt,
+		})
+	}
 
 	// Kill switch (decision 19): an operator block PARKS the delivery — it stays
 	// pending and resumes when the switch clears, never poisoned or cancelled.
@@ -482,10 +489,18 @@ func (w *Worker) classify(ctx context.Context, delivery *store.OutboundDelivery,
 		switch {
 		case isDuplicate(he):
 			return w.duplicateDelivered(ctx, delivery, activity, he)
+		case isVoteUndo(activity) && he.StatusCode >= 400 && he.StatusCode < 500 &&
+			he.StatusCode != http.StatusNotFound &&
+			he.StatusCode != http.StatusGone &&
+			he.StatusCode != http.StatusUnauthorized &&
+			he.StatusCode != http.StatusRequestTimeout &&
+			he.StatusCode != http.StatusTooManyRequests:
+			return w.rejectVoteUndo(ctx, delivery, activity, he)
 		case he.StatusCode == http.StatusNotFound ||
 			he.StatusCode == http.StatusGone:
 			// 404/410 is an endpoint-GONE signal: re-resolve the inbox once
-			// before poisoning (a rotation must not become a poison).
+			// before poisoning (a rotation must not become a poison). A vote
+			// Undo still refused there is retired by rejectVoteUndo.
 			return w.rotateInbox(ctx, delivery, activity, signer, he)
 		case he.StatusCode == http.StatusUnauthorized ||
 			he.StatusCode == http.StatusRequestTimeout ||
@@ -502,6 +517,30 @@ func (w *Worker) classify(ctx context.Context, delivery *store.OutboundDelivery,
 	}
 	// Transport failure (dial/TLS/timeout): transient.
 	return w.releaseOrPoison(ctx, delivery, "transport", err.Error(), 0)
+}
+
+// rejectVoteUndo makes a peer's refusal of a vote Undo terminal at once. Lemmy
+// may refuse a banned actor's UndoVote, and retrying it would head-of-line
+// block every later delivery on the community's ordering key. The retraction is
+// completed locally first (as the Undo-success path does), then the delivery is
+// poisoned. If the local write fails, the delivery is held pending under
+// DeliveryHeldForRefusalSettlement, carrying the peer's status and body, and the
+// next claim resumes here without POSTing the Undo again. Like settleLater, the
+// hold has no attempt cap: the failure is local, and poisoning would leave the
+// vote row counted.
+func (w *Worker) rejectVoteUndo(ctx context.Context, delivery *store.OutboundDelivery, activity *store.OutboundActivity, he ap.HTTPError) error {
+	if err := w.voteCallback(ctx, activity); err != nil {
+		w.logger.Warn("vote undo refused by the peer but not cleared locally; holding for the local delete",
+			"activity", delivery.ActivityID, "inbox", delivery.TargetInbox,
+			"attempts", delivery.Attempts, "error", err)
+		next := time.Now().Add(w.backoff(delivery.Attempts))
+		if _, _, releaseErr := w.deliveries.Release(ctx, delivery.ActivityID, delivery.TargetInbox,
+			store.DeliveryHeldForRefusalSettlement, he.Body, he.StatusCode, next, *delivery.ClaimedUntil); releaseErr != nil {
+			return fmt.Errorf("hold refused undo %s for the local delete: %w", delivery.ActivityID, releaseErr)
+		}
+		return nil
+	}
+	return w.poison(ctx, delivery, "4xx", he.Body, he.StatusCode)
 }
 
 // duplicateDelivered records the received-activity dedupe as the success it is:
@@ -544,8 +583,27 @@ func (w *Worker) rotateInbox(ctx context.Context, delivery *store.OutboundDelive
 	}
 	// Still bad after the single re-resolve: the endpoint is genuinely gone.
 	status := first.StatusCode
-	if stderrors.As(err, &he) {
+	isHTTP := stderrors.As(err, &he)
+	if isHTTP {
 		status = he.StatusCode
+	}
+	if isVoteUndo(activity) {
+		// Only a terminal refusal at the fresh inbox retires the vote row. A
+		// transient answer says nothing about whether the peer holds the vote,
+		// so it is retried with the row kept.
+		if !isHTTP {
+			return w.releaseOrPoison(ctx, delivery, "transport", err.Error(), 0)
+		}
+		if he.StatusCode < 400 || he.StatusCode >= 500 ||
+			he.StatusCode == http.StatusUnauthorized ||
+			he.StatusCode == http.StatusRequestTimeout ||
+			he.StatusCode == http.StatusTooManyRequests {
+			return w.releaseOrPoison(ctx, delivery, classForStatus(he.StatusCode), he.Body, he.StatusCode)
+		}
+		// The poison must not leave the withdrawn vote row counted.
+		return w.rejectVoteUndo(ctx, delivery, activity, ap.HTTPError{
+			URL: inbox, StatusCode: status, Body: "inbox still unreachable after re-resolution",
+		})
 	}
 	return w.poison(ctx, delivery, "inbox_gone", "inbox still unreachable after re-resolution", status)
 }
@@ -657,6 +715,10 @@ func (w *Worker) voteCallback(ctx context.Context, activity *store.OutboundActiv
 			return fmt.Errorf("flip vote %s delivered: %w", vote.VoteATURI, err)
 		}
 	case "Undo":
+		// Resolved by inner id, so this deletes the withdrawn row even when a
+		// replacement vote on the same post is live. That is why
+		// RedrivePoisoned refuses an Undo a live vote has superseded: the peer
+		// would drop the replacement while its row still reads delivered.
 		innerID := innerObjectID(activity.Payload)
 		if innerID == "" {
 			return nil
@@ -1013,6 +1075,22 @@ func objectATURIFromPayload(payload []byte) string {
 		return ""
 	}
 	return "at://" + suffix
+}
+
+// isVoteUndo reports whether the activity is an Undo of a Like or Dislike.
+func isVoteUndo(activity *store.OutboundActivity) bool {
+	if activity.Kind != "Undo" {
+		return false
+	}
+	var undo struct {
+		Object struct {
+			Type string `json:"type"`
+		} `json:"object"`
+	}
+	if err := json.Unmarshal(activity.Payload, &undo); err != nil {
+		return false
+	}
+	return undo.Object.Type == "Like" || undo.Object.Type == "Dislike"
 }
 
 // innerObjectID reads the embedded inner object's id from an Undo payload (the

@@ -133,13 +133,20 @@ shutdown resumes in its original mode at the next boot. The pace is
 | Route | What it does | Body and answers |
 |---|---|---|
 | `GET /admin/outbound` | Counts deliveries by state (`pending`, `poisoned`, `cancelled`, and so on). | **200** `{"by_state":{…}}`. Answers even with the consumer off and no workers; an empty queue then is accurate. |
-| `POST /admin/outbound/redrive` | Moves poisoned deliveries back to pending. | `{"activity":"…"}`, `{"community":"…"}`, or `{"all":true}`. **200** `{"redriven":N}`. **400** with no filter: an unscoped redrive is refused. |
+| `POST /admin/outbound/redrive` | Moves poisoned deliveries back to pending. | `{"activity":"…"}`, `{"community":"…"}`, or `{"all":true}`. **200** `{"redriven":N,"superseded":M}`. **400** with no filter: an unscoped redrive is refused. |
 | `POST /admin/outbound/cancel` | Cancels an actor's or a community's pending deliveries, for consent withdrawal or community removal. | Exactly one of `{"actor":"did:…"}` or `{"community":"https://…"}`, otherwise **400**. **200** `{"cancelled":N}`. |
 | `GET /admin/admissions` | Lists acceptance decisions. | Optional `?status=` and `?community=`. **200** `{"admissions":[{post, community, status, decisionCode, evaluatedCid}]}`. **404** when `CONSUMER_ENABLED` is off. |
 | `POST /admin/admissions/readmit` | Runs admission again for one rejected post. | `{"post":"at://…"}`. **200** `{post, status, decisionCode, enqueued}`, also when the post is still rejected; **404** no admission for that post, or `CONSUMER_ENABLED` is off; **422** no stored record snapshot to re-run from. |
 
 Cancel is terminal: a cancelled delivery is never claimed again, and
-`redrive` revives only `poisoned` rows. A delivery that a worker is already
+`redrive` revives only `poisoned` rows. It also skips a poisoned vote Undo
+once the user has a newer vote on the same post (a vote flip) that the peer
+holds or can still receive (delivered, or a delivery of it still pending), and
+counts it in `superseded`. Lemmy matches an Undo of a vote by actor and post,
+so sending the old Undo would remove the newer vote on the peer. The skipped
+Undo stays `poisoned`; it is not owed, because the newer vote replaces the old
+one on the peer. If the newer vote's deliveries were all cancelled or poisoned,
+it will never reach the peer, so the old Undo is redriven. A delivery that a worker is already
 sending can still reach the peer. To pause delivery and resume it later, use the
 kill switches in [CONFIGURATION.md](CONFIGURATION.md#outbound-federation).
 

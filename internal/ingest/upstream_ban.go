@@ -30,10 +30,11 @@ type BannedContentRemover interface {
 	// or in that one community.
 	SelectBannedContent(ctx context.Context, authorDID, communityDID string, before time.Time) ([]*store.APObjectMapping, error)
 	// RemoveBannedContent deletes the selection (a site ban), or under a
-	// community ban withdraws each postv2 with an author-banned removal and
-	// deletes the rest (see materialize.BanWithdraws). communityDID only
-	// selects the mode — each postv2's community is resolved from the post
-	// itself — so it must be the communityDID SelectBannedContent was given.
+	// community ban withdraws each postv2 and comment with an author-banned
+	// removal record that withholds its blobs, and deletes the rest (see
+	// materialize.BanWithdraws). A comment's removal is written into
+	// communityDID, so it must be the communityDID SelectBannedContent was
+	// given.
 	RemoveBannedContent(ctx context.Context, mappings []*store.APObjectMapping, communityDID, reason string) error
 }
 
@@ -273,6 +274,26 @@ func (h *Handler) decideRecordedAnnouncedBan(ctx context.Context, activity *ap.O
 	if block == nil || block.Type != ap.TypeBlock {
 		return nil, nil
 	}
+	announcer, err := h.recordedCommunityBlockAnnouncer(ctx, event, activity, refID(block.Target), refID(block.Object))
+	if announcer == nil || err != nil {
+		return nil, err
+	}
+	return h.decideCommunityBan(ctx, block, announcer, event.ActivityID, event.ReceivedAt)
+}
+
+// recordedCommunityBlockAnnouncer applies, to a recorded Announce of a Block
+// (or of an Undo carrying one), the gates the live dispatch applies before
+// handleBlock acts on a subject that is not one of our personas: the announcer
+// is a community this bridge follows, the Announce is not an echo of our own
+// activity, the Block's target is the announcer, and the subject is not one of
+// our personas. It returns the announcing community, or nil when a gate
+// refuses.
+//
+// envelope is the parsed Announce, or nil for a payload that does not parse:
+// the echo policy needs the parsed envelope, and a caller that only attributes
+// such a payload to a community and subject (the ban-record back-fill) acts on
+// nothing in it.
+func (h *Handler) recordedCommunityBlockAnnouncer(ctx context.Context, event *store.InboxEvent, envelope *ap.Object, target, subjectAPID string) (*store.Community, error) {
 	announcer, err := h.communities.GetByAPGroupID(ctx, event.ActorID)
 	if errors.IsNotFound(err) {
 		return nil, nil
@@ -283,17 +304,18 @@ func (h *Handler) decideRecordedAnnouncedBan(ctx context.Context, activity *ap.O
 	if announcer.FollowState == store.FollowStateNone {
 		return nil, nil
 	}
-	// handleAnnounce's echo policy on the raw envelope: an Announce of our own
-	// persona's Block was dropped live and must not be acted on here.
-	envelope, err := h.classifyEcho(ctx, event.ActivityID, activity)
-	if err != nil {
-		return nil, err
+	if envelope != nil {
+		// handleAnnounce's echo policy on the raw envelope: an Announce of our
+		// own persona's Block was dropped live and must not be acted on here.
+		identity, err := h.classifyEcho(ctx, event.ActivityID, envelope)
+		if err != nil {
+			return nil, err
+		}
+		if identity.Class != echo.ClassNone {
+			return nil, nil
+		}
 	}
-	if envelope.Class != echo.ClassNone || refID(block.Target) != announcer.APGroupID {
-		return nil, nil
-	}
-	subjectAPID := refID(block.Object)
-	if subjectAPID == "" {
+	if target != announcer.APGroupID || subjectAPID == "" {
 		return nil, nil
 	}
 	identity, err := h.classifier.Classify(ctx, &ap.Object{ID: subjectAPID})
@@ -303,13 +325,15 @@ func (h *Handler) decideRecordedAnnouncedBan(ctx context.Context, activity *ap.O
 	if identity.Class == echo.ClassLocalActor && identity.DID != "" {
 		return nil, nil
 	}
-	return h.decideCommunityBan(ctx, block, announcer, event.ActivityID, event.ReceivedAt)
+	return announcer, nil
 }
 
-// BanEventLister lists the recorded (processed or poisoned) inbox events that
-// may carry a ban. store.InboxEvents implements it.
+// BanEventLister lists the inbox events that may carry a ban: the recorded
+// (processed or poisoned) ones, and those of any status above an inbox id.
+// store.InboxEvents implements it.
 type BanEventLister interface {
 	ListRecordedBans(ctx context.Context) ([]*store.InboxEvent, error)
+	ListBanEventsAfter(ctx context.Context, afterID int64) ([]*store.InboxEvent, error)
 }
 
 // BanReplayer re-reads recorded inbox events through the upstream ban logic —
@@ -347,7 +371,9 @@ type BanReplayEntry struct {
 }
 
 // banReplayCarry is what earlier bans in one run took: records deleted, and
-// postv2s withdrawn from a community (keyed by community DID and at-uri).
+// postv2s and comments withdrawn from a community (keyed by community DID and
+// at-uri). A withdrawn record still stands, so a later site ban selects and
+// deletes it.
 type banReplayCarry struct {
 	deleted   map[string]bool
 	withdrawn map[string]bool
@@ -364,8 +390,8 @@ type banReplayCarry struct {
 //
 // A dry run mutates nothing, and to list what a real run WOULD do it carries
 // forward what each earlier ban in the run would have taken: a record an
-// earlier ban deletes is not listed again, nor a postv2 an earlier ban already
-// withdrew from the same community.
+// earlier ban deletes is not listed again, nor a postv2 or comment an earlier
+// ban already withdrew from the same community.
 func (r *BanReplayer) ReplayBans(ctx context.Context, dryRun bool) (*BanReplayReport, error) {
 	events, err := r.events.ListRecordedBans(ctx)
 	if err != nil {
@@ -500,5 +526,65 @@ func (a *Admin) handleReplayBans(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	if err := json.NewEncoder(w).Encode(report); err != nil {
 		a.logger.Warn("write ban replay report", "dry_run", report.DryRun, "error", err)
+	}
+}
+
+// RemovalWithholdBackfiller is the materializer surface behind POST
+// /admin/moderation/backfill-removal-withholds. *materialize.Materializer
+// implements it; the Admin reads it off the Materializer it already holds.
+type RemovalWithholdBackfiller interface {
+	BackfillRemovalWithholds(ctx context.Context, communityDIDs []string, dryRun bool) (*materialize.RemovalWithholdBackfillReport, error)
+}
+
+// handleBackfillRemovalWithholds serves POST
+// /admin/moderation/backfill-removal-withholds {"dry_run": bool}: the
+// one-time withhold of content removed before removals withheld blobs, over
+// every community the bridge holds, in any follow state. dry_run is required,
+// as for the ban replay. It extends the write deadline as the replay does.
+func (a *Admin) handleBackfillRemovalWithholds(w http.ResponseWriter, r *http.Request) {
+	backfiller, ok := a.mat.(RemovalWithholdBackfiller)
+	if !ok {
+		http.Error(w, "removal withhold back-fill is not configured", http.StatusNotImplemented)
+		return
+	}
+	if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(banReplayWriteTimeout)); err != nil {
+		a.logger.WarnContext(r.Context(), "extend removal withhold back-fill write deadline", "error", err)
+	}
+	var req struct {
+		DryRun *bool `json:"dry_run"`
+	}
+	if err := decodeJSONBody(r, &req); err != nil || req.DryRun == nil {
+		http.Error(w, `body must be {"dry_run":true} or {"dry_run":false}`, http.StatusBadRequest)
+		return
+	}
+	ctx := r.Context()
+	var communityDIDs []string
+	seen := map[string]bool{}
+	for _, state := range []store.FollowState{store.FollowStateAccepted, store.FollowStatePending, store.FollowStateNone} {
+		communities, err := a.communities.ListByFollowState(ctx, state)
+		if err != nil {
+			a.logger.Error("removal withhold back-fill: list communities", "state", state, "error", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		for _, c := range communities {
+			if c.DID != "" && !seen[c.DID] {
+				seen[c.DID] = true
+				communityDIDs = append(communityDIDs, c.DID)
+			}
+		}
+	}
+	report, err := backfiller.BackfillRemovalWithholds(ctx, communityDIDs, *req.DryRun)
+	if err != nil {
+		a.logger.Error("removal withhold back-fill failed", "dry_run", *req.DryRun, "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	a.logger.Info("removal withhold back-fill finished",
+		"dry_run", report.DryRun, "communities", len(communityDIDs), "added", len(report.Added),
+		"already_withheld", report.AlreadyWithheld, "skipped_unhosted", report.SkippedUnhosted, "failed", report.Failed)
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if err := json.NewEncoder(w).Encode(report); err != nil {
+		a.logger.Warn("write removal withhold back-fill report", "dry_run", report.DryRun, "error", err)
 	}
 }

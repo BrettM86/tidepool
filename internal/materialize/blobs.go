@@ -8,8 +8,10 @@ import (
 	"strings"
 
 	"github.com/bluesky-social/indigo/atproto/atdata"
+	"github.com/ipfs/go-cid"
 
 	"tidepool/internal/ap"
+	tperrors "tidepool/internal/errors"
 	"tidepool/internal/media"
 )
 
@@ -53,7 +55,8 @@ func (m *Materializer) fetchBlob(ctx context.Context, did, url string, slot blob
 // (wrong content type, oversize, failed AVIF transcode — including a busy
 // decoder — or blob-store failure) return (nil, nil), meaning no removal
 // signal: a post image is omitted this pass, and profile media carries the
-// stored blob forward.
+// stored blob forward. A store refused by a blob withhold returns the
+// computed ref with a nil error: the record keeps the ref, no bytes stored.
 func (m *Materializer) fetchBlobClassified(ctx context.Context, did, url string, slot blobSlot) (*atdata.Blob, error) {
 	if url == "" {
 		return nil, nil
@@ -92,6 +95,14 @@ func (m *Materializer) fetchBlobClassified(ctx context.Context, did, url string,
 		return nil, nil
 	}
 	blob, err := m.repos.PutBlob(ctx, did, mimeType, data)
+	if tperrors.IsBlobWithheld(err) && blob != nil {
+		// A withhold refused the bytes, not the reference: the record keeps
+		// the ref so lifting the withhold serves the image again without a
+		// further upstream edit.
+		m.logger.Info("media withheld; keeping blob ref without storing bytes",
+			"slot", slot.name, "did", did, "cid", cid.Cid(blob.Ref).String())
+		return blob, nil
+	}
 	if err != nil {
 		m.logger.Warn("blob store failed; omitting image",
 			"slot", slot.name, "url", url, "did", did, "error", err)

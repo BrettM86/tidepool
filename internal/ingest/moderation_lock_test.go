@@ -796,12 +796,11 @@ func TestAFediverseThreadIsUnaffectedByALockElsewhere(t *testing.T) {
 // own mapping and tombstoning our own AP id, after which the comment is
 // permanently unmoderatable and every reply beneath it silently disappears.
 //
-// The state goes in the one place that can hold it. There is nothing to write
-// Coves-side: the removal lexicon is POST-scoped, the comment-subject extension
-// is Coves-owned and has not landed, and inventing a record shape here would
-// publish a vocabulary the read path does not consult — a moderation decision
-// that looks acted upon and is not. That gap is asserted below as the CURRENT
-// CONTRACT, so the day the extension lands, a test fails and says so.
+// The state goes in two places. The bridge records it in object_moderation
+// (which the reply and edit gates read), and publishes it Coves-side as a
+// social.coves.community.removal record in the community's repo, at the digest
+// rkey of the comment's at-uri; the restore deletes that record (task 02 of the
+// moderation-gaps PRD).
 
 // nativeCommentRemoval is the fixture: one native comment, federated into
 // community A through the real path, that a moderator then removes.
@@ -831,6 +830,16 @@ func TestACommunitysRemovalOfANativeCommentIsRecorded(t *testing.T) {
 		"precondition: the community repo HAS a firehose history (the post's acceptance), so "+
 			"'no new frame' below is a measurement and not an empty counter agreeing with itself")
 	deferredBefore := deferredCommentModerations()
+	otherFramesBefore := framesOutside(t, h, world.communityADID)
+
+	// --- An Undo{Delete} with NO standing removal behind it (a delete nobody
+	//     made) adds nothing to the community repo: there is no record to delete.
+	h.announceUndoDelete(world.groupA,
+		"https://lemmy.world/activities/announce/undo/mc-no-removal",
+		"https://lemmy.world/activities/announce/delete/mc-no-removal/delete",
+		commentAPID, nil)
+	assert.Equal(t, communityFramesBefore, len(communityEvents(t, h, world.communityADID)),
+		"an Undo of a removal that does not stand writes no commit in the community repo")
 
 	// --- A moderator of community A removes the comment: Delete WITH summary,
 	//     announced by the community that owns its mapping.
@@ -858,18 +867,15 @@ func TestACommunitysRemovalOfANativeCommentIsRecorded(t *testing.T) {
 			"deferred reports a feature as missing while it works, which is how the counter "+
 			"stops meaning anything")
 
-	// --- AND: nothing Coves-visible was written. This is the documented gap,
-	//     asserted as a contract rather than left as an absence nobody checks.
-	assert.Equal(t, communityFramesBefore, len(communityEvents(t, h, world.communityADID)),
-		"NO commit frame in the community repo: the removal lexicon is post-scoped and the "+
-			"comment-subject extension is Coves-owned and unlanded, so any record written "+
-			"here would publish a vocabulary Coves' read path does not consult — a removal "+
-			"that looks honored and hides nothing. When that extension lands, this assertion "+
-			"is the one that must change")
-	_, _, err = h.manager.GetRecord(ctx,
-		world.communityADID, materialize.CollectionRemoval, testDigestRKey(commentATURI))
-	assert.True(t, errors.IsNotFound(err),
-		"and specifically no removal record for the comment (err=%v)", err)
+	// --- AND: the decision is published where Coves reads it: a removal record
+	//     in the community's repo, at the digest rkey of the comment's at-uri.
+	assert.Equal(t, communityFramesBefore+1, len(communityEvents(t, h, world.communityADID)),
+		"exactly one commit frame in the community repo: the removal record")
+	assertNativeCommentRemovalRecord(t, h, world.communityADID, commentATURI,
+		mtDirectReply.createCID, &reason)
+	assert.Equal(t, otherFramesBefore, framesOutside(t, h, world.communityADID),
+		"and no frame in any OTHER repo: the comment lives on its author's PDS, which the "+
+			"bridge cannot write, so the community repo is the only place the removal goes")
 	_, _, err = h.manager.GetRecord(ctx,
 		world.communityADID, materialize.CollectionAcceptance, world.digestRKey)
 	assert.NoError(t, err,
@@ -913,6 +919,14 @@ func TestACommunitysRemovalOfANativeCommentIsRecorded(t *testing.T) {
 	assert.False(t, found && after.removed,
 		"Undo clears the removal: a decision the moderators reversed that still stands is "+
 			"moderation nobody can reach — Lemmy sends no second activity to clear it")
+	_, _, err = h.manager.GetRecord(ctx,
+		world.communityADID, materialize.CollectionRemoval, testDigestRKey(commentATURI))
+	assert.True(t, errors.IsNotFound(err),
+		"and the community's removal record for the comment is deleted (err=%v)", err)
+	_, _, err = h.manager.GetRecord(ctx,
+		world.communityADID, materialize.CollectionAcceptance, testDigestRKey(commentATURI))
+	assert.True(t, errors.IsNotFound(err),
+		"and no acceptance is written for the comment: comments have none to restore (err=%v)", err)
 	assert.Equal(t, deliveriesBefore, rowCount(t, h.db, "outbound_deliveries"),
 		"and the restore enqueues nothing either")
 }
@@ -922,24 +936,73 @@ func TestACommunitysRemovalOfANativeCommentIsRecorded(t *testing.T) {
 // remove A's comment. Decision 18's conjunction collapses in a one-community
 // fixture, so this is the only shape that can tell "the signer IS the community"
 // from "the target is IN the community".
+//
+// The bridged row is the same refusal for a Lemmy comment materialized into A:
+// B's removal of it must not publish a removal record in either community.
 func TestCrossCommunityRemovalOfANativeCommentIsRefused(t *testing.T) {
-	h := newHarness(t)
-	world := newModerationWorld(t, h)
-	seedNativeComment(t, world)
+	cases := []struct {
+		name string
+		// seed federates or materializes the comment into community A and returns
+		// its AP id and at-uri.
+		seed func(t *testing.T, h *harness, world moderationWorld) (apID, atURI string)
+		// native is true for the native comment, which also has bridge-side
+		// removal state to check.
+		native bool
+	}{
+		{
+			name: "native comment",
+			seed: func(t *testing.T, h *harness, world moderationWorld) (string, string) {
+				seedNativeComment(t, world)
+				return mtDirectReply.apID(), mtDirectReply.atURI()
+			},
+			native: true,
+		},
+		{
+			name: "bridged Lemmy comment",
+			seed: func(t *testing.T, h *harness, world moderationWorld) (string, string) {
+				thread := seedFediverseThread(t, h, world)
+				return mlLemmyComment, thread.commentATURI
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			ctx := context.Background()
+			world := newModerationWorld(t, h)
+			apID, atURI := tc.seed(t, h, world)
 
-	reason := "not your community's comment"
-	h.announceDeleteWithSummary(world.groupB,
-		"https://lemmy.world/activities/announce/delete/mc-cross", mtDirectReply.apID(), &reason)
+			framesABefore := len(communityEvents(t, h, world.communityADID))
+			framesBBefore := len(communityEvents(t, h, world.communityBDID))
 
-	state, found := removalStateFor(t, h.db, mtDirectReply.atURI())
-	assert.False(t, found && state.removed,
-		"community B may not remove community A's comment: one moderator team would "+
-			"otherwise be able to withdraw content from every community co-hosted with it")
+			reason := "not your community's comment"
+			h.announceDeleteWithSummary(world.groupB,
+				"https://lemmy.world/activities/announce/delete/mc-cross", apID, &reason)
 
-	mapping, err := h.objects.GetByAPID(context.Background(), mtDirectReply.apID())
-	require.NoError(t, err)
-	assert.False(t, mapping.IsDeleted(),
-		"and the refusal leaves the comment exactly as A admitted it")
+			if tc.native {
+				state, found := removalStateFor(t, h.db, atURI)
+				assert.False(t, found && state.removed,
+					"community B may not remove community A's comment: one moderator team would "+
+						"otherwise be able to withdraw content from every community co-hosted with it")
+			}
+
+			for _, communityDID := range []string{world.communityADID, world.communityBDID} {
+				_, _, err := h.manager.GetRecord(ctx,
+					communityDID, materialize.CollectionRemoval, testDigestRKey(atURI))
+				assert.True(t, errors.IsNotFound(err),
+					"no removal record for the comment in %s (err=%v)", communityDID, err)
+			}
+			assert.Equal(t, framesABefore, len(communityEvents(t, h, world.communityADID)),
+				"no commit in the owning community's repo")
+			assert.Equal(t, framesBBefore, len(communityEvents(t, h, world.communityBDID)),
+				"and none in the announcing community's repo")
+
+			mapping, err := h.objects.GetByAPID(ctx, apID)
+			require.NoError(t, err)
+			assert.False(t, mapping.IsDeleted(),
+				"and the refusal leaves the comment exactly as A admitted it")
+		})
+	}
 }
 
 // TestAPostRemovalWritesNoBridgeSideRemovalState is the SCOPE control for ruling
@@ -1051,6 +1114,8 @@ func TestASummarylessDeleteOfANativeCommentRecordsNothing(t *testing.T) {
 	removalReason := "rule 3: no personal attacks"
 	const removalActivity = "https://lemmy.world/activities/announce/delete/ms-removal"
 	h.announceDeleteWithSummary(world.groupA, removalActivity, mtDirectReply.apID(), &removalReason)
+	// Measured AFTER the contrast, which (as a real removal) writes its own record.
+	communityFramesBefore := len(communityEvents(t, h, world.communityADID))
 
 	// The shape under test: NO summary key at all, attributed to a Lemmy
 	// moderator — a foreign attribution, so the echo classifier cannot be what
@@ -1064,6 +1129,14 @@ func TestASummarylessDeleteOfANativeCommentRecordsNothing(t *testing.T) {
 		"a summary-less delete writes NO moderation state: `summary` present is what marks a "+
 			"moderator removal, so recording one here asserts a decision no moderator made — "+
 			"and it would stand until somebody sent an Undo for an action that never happened")
+
+	_, _, err := h.manager.GetRecord(ctx,
+		world.communityADID, materialize.CollectionRemoval, testDigestRKey(mtNestedReply.atURI()))
+	assert.True(t, errors.IsNotFound(err),
+		"and no removal record is published for it: a record naming a moderator decision "+
+			"nobody made is exactly what the summary convention exists to prevent (err=%v)", err)
+	assert.Equal(t, communityFramesBefore, len(communityEvents(t, h, world.communityADID)),
+		"and the community repo gets no commit at all from the summary-less delete")
 
 	// --- AND: the v1 destructive path is still not entered. This is what the
 	//     branch exists for, and it must survive the branch learning to write.

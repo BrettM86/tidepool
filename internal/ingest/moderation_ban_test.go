@@ -714,9 +714,6 @@ const (
 	// mbUnscopedTargetMetric counts announced Blocks whose target is not a
 	// community we follow — the instance-wide scope this bridge does not model.
 	mbUnscopedTargetMetric = "tidepool_block_unscoped_target"
-	// mbForeignSubjectMetric counts announced Blocks naming somebody who is not
-	// one of our personas.
-	mbForeignSubjectMetric = "tidepool_block_foreign_subject"
 )
 
 func metricValue(name string) int64 {
@@ -1307,7 +1304,7 @@ func TestAnAnnouncedBlockNamingAFediverseUserIsNotOurs(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
 	world := newModerationWorld(t, h)
-	before := metricValue(mbForeignSubjectMetric)
+	before := metricValue(mbUnmintedSubjectMetric)
 
 	const foreign = "https://lemmy.world/activities/announce/block/mb-foreign"
 	require.Equal(t, http.StatusAccepted, h.deliver(world.groupA, map[string]any{
@@ -1332,8 +1329,8 @@ func TestAnAnnouncedBlockNamingAFediverseUserIsNotOurs(t *testing.T) {
 		"a ban on a LEMMY user records nothing here: we hold no persona it could be about, "+
 			"and inventing a row keyed on an id we cannot resolve to a DID would gate "+
 			"admission on a subject that can never post")
-	assert.Equal(t, before+1, metricValue(mbForeignSubjectMetric),
-		"and it is counted as not-ours: every community we follow announces its own bans, so "+
+	assert.Equal(t, before+1, metricValue(mbUnmintedSubjectMetric),
+		"and it is counted as an unminted subject: every community we follow announces its own bans, so "+
 			"this is the common case, and the day the ban path looks broken this counter is "+
 			"what distinguishes 'none of them were ours' from 'we stopped receiving them'")
 

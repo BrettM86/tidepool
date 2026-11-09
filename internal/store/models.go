@@ -202,6 +202,9 @@ type CommunityBan struct {
 	// the stored flag is the audit answer to "was their content purged?", never
 	// an input to the Undo.
 	RemoveData bool
+	// BannedAt is when the ban was first recorded. It is set on reads; Ban
+	// ignores it and keeps the stored time.
+	BannedAt time.Time
 }
 
 // DeliveryTarget is one place an actor's content has already been delivered:

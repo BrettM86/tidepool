@@ -124,6 +124,10 @@ func (d *Dispatcher) applyCommentWrite(ctx context.Context, tx *sql.Tx, did stri
 		return err
 	}
 
+	if err := d.refuseUnderRemovedComment(ctx, atURI, commit.Operation, thread); err != nil {
+		return err
+	}
+
 	if err := d.refuseBannedAuthor(ctx, did, thread.CommunityDID, "comment "+atURI); err != nil {
 		return err
 	}
@@ -280,6 +284,45 @@ func (d *Dispatcher) refuseInLockedThread(ctx context.Context, atURI string, thr
 		"cannot tell whether comment %s is in a locked thread: the chain above it cannot be followed past %s, "+
 			"and %s holds standing locks — redrive this once the lock is lifted or the row is repaired",
 		atURI, thread.RootUnresolved, thread.CommunityDID)
+}
+
+// refuseUnderRemovedComment refuses a native reply whose PARENT is a comment a
+// community has removed, and an EDIT of a removed comment (task 02 of the
+// moderation-gaps PRD). It is the read half of a native comment removal: the
+// moderators withdrew the comment on Lemmy, so a reply sent beneath it lands
+// under content the community took down, and an edit pushes the removed content
+// back at the moderators who removed it.
+//
+// Only the comment's own parent is asked about for a reply, not the whole chain:
+// a removal is a verdict on one comment, not a thread lock. An edit asks about
+// the comment itself, because the comment being edited is what was removed.
+//
+// The refusal is PERMANENT for the reasons refuseInLockedThread gives: it
+// dead-letters with a readable reason, the cursor moves on, and the rev gate is
+// left un-advanced (the gate transaction rolls back on any error), so the
+// identical commit is admitted once the removal is lifted. A store failure
+// PROPAGATES as a retryable error, never as "nothing is removed".
+func (d *Dispatcher) refuseUnderRemovedComment(ctx context.Context, atURI, operation string, thread *resolvedThread) error {
+	if operation == operationUpdate {
+		removed, err := d.moderation.RemovedAmong(ctx, atURI)
+		if err != nil {
+			return fmt.Errorf("read removal state of %s: %w", atURI, err)
+		}
+		if removed != "" {
+			return fmt.Errorf("%w: removed: edit of comment %s, which its community removed",
+				ErrPermanentEvent, atURI)
+		}
+		return nil
+	}
+	removed, err := d.moderation.RemovedAmong(ctx, thread.ParentATURI)
+	if err != nil {
+		return fmt.Errorf("read removal state of the parent of %s: %w", atURI, err)
+	}
+	if removed != "" {
+		return fmt.Errorf("%w: parent-removed: comment %s replies to a comment its community removed (%s)",
+			ErrPermanentEvent, atURI, removed)
+	}
+	return nil
 }
 
 // applyCommentDelete withdraws a comment, using ONLY state.

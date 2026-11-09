@@ -9,6 +9,7 @@ import (
 	"github.com/ipfs/go-cid"
 
 	"tidepool/internal/errors"
+	"tidepool/internal/repo"
 	"tidepool/internal/store"
 )
 
@@ -22,9 +23,9 @@ import (
 // whatever the author wrote since is not the ban's business.
 //
 // Profiles are never selected — a ban removes content, not the account. Under a
-// community ban a postv2 that community already removed is left out, because
-// its removal record already says it is gone from there; under a site ban it is
-// selected anyway, since the record itself goes. Selection writes nothing,
+// community ban a postv2 or comment that community already removed is left
+// out, because its removal record already says it is gone from there; under a
+// site ban it is selected anyway, since the record itself goes. Selection writes nothing,
 // which is what lets a dry run list it.
 func (m *Materializer) SelectBannedContent(ctx context.Context, authorDID, communityDID string, before time.Time) ([]*store.APObjectMapping, error) {
 	mappings, err := m.objects.ListByActorDID(ctx, authorDID)
@@ -70,8 +71,8 @@ func (m *Materializer) SelectBannedContent(ctx context.Context, authorDID, commu
 }
 
 // bannedInCommunity reports whether a community ban of communityDID still has
-// mapping to act on: it is that community's content and, for a postv2, the
-// community has not already removed it. determined is false when the content's
+// mapping to act on: it is that community's content and, for a postv2 or a
+// comment, the community has not already removed it. determined is false when the content's
 // community cannot be determined, which is never a match.
 func (m *Materializer) bannedInCommunity(ctx context.Context, mapping *store.APObjectMapping, communityDID string) (inCommunity, determined bool, err error) {
 	contentCommunity, err := CommunityDIDOf(ctx, m.repos, mapping)
@@ -90,7 +91,7 @@ func (m *Materializer) bannedInCommunity(ctx context.Context, mapping *store.APO
 	if contentCommunity != communityDID {
 		return false, true, nil
 	}
-	if mapping.Collection != CollectionPostV2 {
+	if mapping.Collection != CollectionPostV2 && mapping.Collection != CollectionComment {
 		return true, true, nil
 	}
 	removed, err := m.removalStands(ctx, communityDID, SubjectRKey(mapping.ATURI))
@@ -135,11 +136,13 @@ func (m *Materializer) deletedThreadRootCommunity(ctx context.Context, comment *
 //
 // A SITE ban (communityDID empty) deletes every record, as the author deleting
 // it would: the user's own instance removed it, so it is gone everywhere. A
-// COMMUNITY ban speaks only for that community, so a postv2 — which lives in
-// the author's repo and may stand in other communities' eyes — gets the
-// community's own removal under RemovalCodeAuthorBanned and the record stays;
-// comments and legacy posts have no acceptance to withdraw, so they are
-// deleted.
+// COMMUNITY ban speaks only for that community, so a postv2 or a comment —
+// which lives in the author's repo — gets the community's own removal record
+// under RemovalCodeAuthorBanned and the ban's reason, and the record and its
+// blob bytes stay; the removal's commit withholds the blobs the record
+// references. A comment's removal goes into the banning community itself,
+// which bannedInCommunity already resolved, even through a deleted thread
+// root. Legacy posts live in the community repo, so they are deleted.
 //
 // Nothing is enqueued: Lemmy already removed this content upstream, and an
 // outbound Delete would be aimed at the instance that just acted. Each step is
@@ -149,6 +152,12 @@ func (m *Materializer) RemoveBannedContent(ctx context.Context, mappings []*stor
 	var deletions []*store.APObjectMapping
 	for _, mapping := range mappings {
 		if BanWithdraws(communityDID, mapping) {
+			if mapping.Collection == CollectionComment {
+				if err := m.removeBridgedCommentFrom(ctx, communityDID, mapping, RemovalCodeAuthorBanned, reason); err != nil {
+					return err
+				}
+				continue
+			}
 			if err := m.removePost(ctx, mapping, RemovalCodeAuthorBanned, reason); err != nil {
 				return err
 			}
@@ -161,10 +170,10 @@ func (m *Materializer) RemoveBannedContent(ctx context.Context, mappings []*stor
 
 // BanWithdraws reports whether a ban scoped to communityDID (empty for a site
 // ban) withdraws mapping from that community rather than deleting it: only a
-// community ban does, and only a postv2, the one kind of content with an
-// acceptance to withdraw.
+// community ban does, and only a postv2 or a comment, the content kept in its
+// author's repo that a community removal record can withdraw.
 func BanWithdraws(communityDID string, mapping *store.APObjectMapping) bool {
-	return communityDID != "" && mapping.Collection == CollectionPostV2
+	return communityDID != "" && (mapping.Collection == CollectionPostV2 || mapping.Collection == CollectionComment)
 }
 
 // deleteKeepingSharedBlobs deletes each mapping's record the way deleteMapping
@@ -224,16 +233,21 @@ type blobReferences struct {
 // repoBlobReferences walks did's current records. A repo that does not exist
 // references nothing.
 func (m *Materializer) repoBlobReferences(ctx context.Context, did string) (*blobReferences, error) {
-	references := &blobReferences{
-		byBlob:   map[string]map[string]struct{}{},
-		byRecord: map[string][]string{},
-	}
 	entries, err := m.repos.ListRecords(ctx, did)
 	if errors.IsNotFound(err) {
-		return references, nil
+		return blobReferencesOf(nil), nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("materialize: list records of %s: %w", did, err)
+	}
+	return blobReferencesOf(entries), nil
+}
+
+// blobReferencesOf indexes the blobs entries reference.
+func blobReferencesOf(entries []repo.RecordEntry) *blobReferences {
+	references := &blobReferences{
+		byBlob:   map[string]map[string]struct{}{},
+		byRecord: map[string][]string{},
 	}
 	for _, entry := range entries {
 		path := entry.Collection + "/" + entry.Rkey
@@ -246,7 +260,7 @@ func (m *Materializer) repoBlobReferences(ctx context.Context, did string) (*blo
 			references.byRecord[path] = append(references.byRecord[path], blobCID)
 		}
 	}
-	return references, nil
+	return references
 }
 
 // release drops the record at path from the references and returns the blobs

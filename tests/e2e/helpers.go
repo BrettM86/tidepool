@@ -218,6 +218,7 @@ var expectedCollections = map[string]bool{
 	colAcceptance:       true,
 	colRemoval:          true,
 	colComment:          true,
+	colBan:              true,
 	colVote:             true,
 }
 
@@ -605,6 +606,20 @@ func (c *lemmyClient) removePost(t *testing.T, postID int, removed bool, reason 
 	}
 	if err := c.do(http.MethodPost, "/api/v3/post/remove", body, nil); err != nil {
 		t.Fatalf("remove post %d (removed=%v): %v", postID, removed, err)
+	}
+}
+
+// removeComment is removePost's comment twin: a MODERATOR action Lemmy
+// federates as Announce{Delete{comment}} with a `summary`, and restores with
+// Announce{Undo{Delete}} when removed is false.
+func (c *lemmyClient) removeComment(t *testing.T, commentID int, removed bool, reason string) {
+	t.Helper()
+	body := map[string]any{"comment_id": commentID, "removed": removed}
+	if reason != "" {
+		body["reason"] = reason
+	}
+	if err := c.do(http.MethodPost, "/api/v3/comment/remove", body, nil); err != nil {
+		t.Fatalf("remove comment %d (removed=%v): %v", commentID, removed, err)
 	}
 }
 
@@ -1811,7 +1826,7 @@ func (l *jsListener) vetEvent(ev *jsEvent) {
 		return
 	}
 	if !expectedCollections[ev.Commit.Collection] {
-		l.t.Fatalf("unexpected collection on firehose: %s — only community/actor profiles, posts (both eras), acceptances, removals, comments, and votes of voters with a repo may ever appear", ev)
+		l.t.Fatalf("unexpected collection on firehose: %s — only community/actor profiles, posts (both eras), acceptances, removals, ban records, comments, and votes of voters with a repo may ever appear", ev)
 	}
 	// Per-repo rev order. NON-decreasing, not strictly increasing: one
 	// commit may carry SEVERAL ops (the moderation transitions commit

@@ -3,6 +3,7 @@ package sync
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -47,6 +48,7 @@ func (s *staticKeys) SigningKey(context.Context, string, repo.KeyUse) (atcrypto.
 }
 
 type harness struct {
+	db          *sql.DB
 	manager     *repo.Manager
 	broadcaster *Broadcaster
 	server      *Server
@@ -103,7 +105,7 @@ func newHarnessWithPoll(t *testing.T, pollInterval time.Duration, mutate ...func
 	ts := httptest.NewServer(router)
 	t.Cleanup(ts.Close)
 
-	return &harness{manager: manager, broadcaster: broadcaster, server: server, http: ts}
+	return &harness{db: database, manager: manager, broadcaster: broadcaster, server: server, http: ts}
 }
 
 func (h *harness) wsURL(cursor string) string {

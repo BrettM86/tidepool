@@ -130,8 +130,16 @@ func (h *harness) announceDeleteWithSummary(group *remoteActor, activityID, targ
 // it from the community.
 func (h *harness) announceDeleteBy(group *remoteActor, activityID, targetID, actor string, summary *string) {
 	h.t.Helper()
+	h.announceDeleteAs(group, activityID, activityID+"/delete", targetID, actor, summary)
+}
+
+// announceDeleteAs is announceDeleteBy with the inner Delete's id given
+// explicitly, so one inner Delete can be redelivered under a fresh Announce id
+// (inbox dedup drops a reused Announce id before the handler sees it).
+func (h *harness) announceDeleteAs(group *remoteActor, activityID, deleteID, targetID, actor string, summary *string) {
+	h.t.Helper()
 	inner := map[string]any{
-		"id":       activityID + "/delete",
+		"id":       deleteID,
 		"type":     "Delete",
 		"actor":    actor,
 		"object":   targetID,
@@ -157,10 +165,17 @@ func (h *harness) announceDeleteBy(group *remoteActor, activityID, targetID, act
 // referencing its id).
 func (h *harness) announceUndoDelete(group *remoteActor, activityID, deleteActivityID, targetID string, summary *string) {
 	h.t.Helper()
+	h.announceUndoDeleteBy(group, activityID, deleteActivityID, targetID, modActorID, summary)
+}
+
+// announceUndoDeleteBy is announceUndoDelete with the undone Delete attributed
+// to actor instead of the moderator.
+func (h *harness) announceUndoDeleteBy(group *remoteActor, activityID, deleteActivityID, targetID, actor string, summary *string) {
+	h.t.Helper()
 	inner := map[string]any{
 		"id":       deleteActivityID,
 		"type":     "Delete",
-		"actor":    modActorID,
+		"actor":    actor,
 		"object":   targetID,
 		"audience": group.id,
 		"cc":       []any{group.id},

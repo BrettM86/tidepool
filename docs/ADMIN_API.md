@@ -37,9 +37,11 @@ are never fetched.
 
 | Route | What it does | Body and answers |
 |---|---|---|
-| `POST /admin/reemit` | Re-emits a repo's records on the firehose as delete-then-create pairs with identical values, so at-uris and CIDs do not change. Fixes the relay cold-start gap. | `{"did":"did:plc:…"}` for one repo; `{}` or an empty body for every active repo. Tombstoned repos are skipped. **200** `{repos, failed, result}`. |
+| `POST /admin/reemit` | Re-emits a repo's records on the firehose as delete-then-create pairs with identical values, so at-uris and CIDs do not change. Fixes the relay cold-start gap. | `{"did":"did:plc:…"}` for one repo; `{}` or an empty body for every active repo. Tombstoned repos are skipped. **200** `{repos, failed, result:[{did, records, reemitted, skipped_banned, skipped_unknown_community, error?}]}`; `records` is every record in the repo, `reemitted` the ones deleted and recreated, `skipped_banned` the comments left alone because their author is banned in their community, `skipped_unknown_community` the comments left alone because their community cannot be determined. |
 | `POST /admin/objects/sweep-deleted` | Deletes bridged objects whose origin now serves a tombstone. | `{"ap_ids":[…]}`, at most 200 ids (**400** above that). **200** `{requested, swept, deleted, failed, truncated, result:[{ap_id, outcome}]}`. Safe to re-run. |
 | `POST /admin/inbox/replay-bans` | Re-decides every recorded upstream ban that carried `removeData` and removes the bridged author's content it covers. Cleans up bans received before Tidepool acted on `removeData`. | `{"dry_run":true}` or `{"dry_run":false}`. An empty body or `{}` is **400**. **200** `{dry_run, bans:[{activity_id, subject, scope, community, removed, error?}], removed_total}`. |
+| `POST /admin/moderation/backfill-removal-withholds` | Withholds the blobs of content a community removed before removals withheld blobs. Walks every `social.coves.community.removal` record in every community repo Tidepool holds (posts and comments); each subject whose record is in a Tidepool-hosted repo gets one `community-removal` withhold, under the removal record's code, per blob CID its current record references that has none. A subject not hosted here (a native Coves post or comment) is skipped and counted. Bytes are kept. Run it once after deploying the release that added community-removal withholds; it is idempotent, so a second run adds nothing. | `{"dry_run":true}` reports what it would add and writes nothing; `{"dry_run":false}` writes. An empty body or `{}` is **400**. **200** `{dry_run, added:[{subject, community, cids}], already_withheld, skipped_unhosted, failed}`: `added` lists each subject that got (or would get) a new row with the CIDs added, `already_withheld` counts hosted subjects that needed none, `skipped_unhosted` counts removal records whose subject Tidepool does not host, `failed` counts removal records (and community repos) that could not be processed; each is logged and the walk goes on. A deleted (tombstoned) community's removals are still back-filled. |
+| `POST /admin/moderation/backfill-ban-records` | Publishes a `social.coves.moderation.ban` record into the community repo, at the digest rkey of the subject DID, for every community ban in force now that was accepted before community bans became ban records. Native personas come from the `community_bans` rows in force (permanent, or `expires_at` after now); the record's `createdAt` is the row's `banned_at`. Bridged persons hold no row, so their bans are rebuilt by replaying the recorded announced `Block` and `Undo{Block}` inbox events in inbox id order, each judged at its own `received_at`: a `Block` in force at receipt replaces the standing ban, a `Block` already over at receipt replaces nothing, and an `Undo{Block}` lifts the standing ban unless the stale-unban rule keeps it (the standing ban is in force and outlives the expiry the Undo names). The final standing ban is published only if it is in force now; its `createdAt` is the deciding event's `received_at`. A later poisoned or unparseable ban event for the same community and subject, or one still pending in the inbox queue, makes that ban undecidable: it is reported, not published. Live moderation keeps running during the back-fill, so a record is written only where none stands (a standing record is the live path's, and is never overwritten) and only create-only, so a record written live between the read and the write is kept. Right before each write the source is read again: a native ban no longer in force in `community_bans` is not published, and a bridged ban with a ban event received after the run read the history is reported undecidable. A live unban landing in the moment between that re-read and the write can still leave a record; running the back-fill while no moderation arrives closes that gap. `replay-bans` is unchanged by it. Run it once, after Coves deploys ban-record indexing; it is idempotent, so a second run publishes nothing. | `{"dry_run":true}` reports what it would publish and writes nothing; `{"dry_run":false}` writes. An empty body or `{}` is **400**. **200** `{dry_run, published:[{community, subject}], already_published, undecidable:[{community, subject, activity_id}], skipped_unminted, failed}`: `published` lists each (community DID, subject DID) whose record was written (or would be), `already_published` counts bans in force whose record already stands, whatever it says, `undecidable` names each bridged ban left unpublished with the inbox event that makes it undecidable, `skipped_unminted` counts (community, actor) pairs whose recorded ban names a Lemmy user Tidepool never minted, and `failed` counts bans whose record could not be read or written; each is logged and the run goes on. Bans not in force now appear nowhere. |
 | `POST /admin/actors/purge` | Purges a native Coves person actor: sends `Delete{Person, removeData:true}` to every inbox its content reached, undoes its standing votes, and tombstones the actor so it answers 410 from then on. | `{"did":"did:…","dryRun":true}` or `false`. **200** `{did, actorId, kind, enabled, deliveryPaused, tombstoned, inboxes, standingVotes, dryRun}`; **400** missing `dryRun` or a missing or invalid `did`; **404** no native actor for that DID; **422** the actor is not a person; **501** `CONSUMER_ENABLED` is off. |
 
 Re-emit: records committed before a relay first subscribed are never emitted
@@ -47,6 +49,22 @@ again on their own, so a Jetstream-fed AppView cannot index them. If a record
 is deleted and then fails to recreate, it is gone from the repo. The response
 marks it `RECORD DROPPED` and the log line `reemit: recreate failed after
 delete` carries the details for manual recovery.
+
+Re-emit skips a comment whose author (the repo's DID) has a
+`social.coves.moderation.ban` record in force (permanent, or `expiresAt` after
+now) in the comment's community, and counts it in `skipped_banned`. Coves
+records a permanent `community_ban` hide on every comment it indexes while a
+ban stands, including a comment re-created after a delete, and that hide
+survives the unban and any restore. Re-emitting would hide the author's
+earlier comments in that community for good. The comment's community comes
+from its stored mapping (`ap_objects.community_did`), so a comment under a
+native Coves postv2 in a repo Tidepool does not host, or under a deleted root,
+still resolves. With no stored community it comes from the thread root: a
+legacy post's repo, or a postv2's `community` field. A comment whose community
+cannot be determined is not re-emitted, because no ban can be ruled out for
+it, and is counted in `skipped_unknown_community`. If the mapping or the ban
+record cannot be read, the repo stops there with `error` set, and its
+remaining records are not re-emitted.
 
 Delete sweep:
 
@@ -91,7 +109,9 @@ Actor purge:
 - Wrapper script: `scripts/purge-actor.sh <did> [--execute]`, dry run by
   default. Runbook: [DEPLOY.md](../DEPLOY.md) §3.
 
-`POST /admin/dns/reconcile`, `POST /admin/inbox/replay-bans` and
+`POST /admin/dns/reconcile`, `POST /admin/inbox/replay-bans`,
+`POST /admin/moderation/backfill-removal-withholds`,
+`POST /admin/moderation/backfill-ban-records` and
 `POST /admin/actors/purge` extend their own write deadline to 10 minutes, past
 the server's 30-second write timeout, so a long run still returns its result.
 
@@ -126,6 +146,73 @@ kill switches in [CONFIGURATION.md](CONFIGURATION.md#outbound-federation).
 The admissions routes exist only when `CONSUMER_ENABLED` is on, so a 404 from
 `GET /admin/admissions` means the consumer is off.
 
+### Blob withholds
+
+A withheld CID is neither stored nor served for any owner DID:
+`com.atproto.sync.getBlob` answers 404 `BlobNotFound`, exactly as for a CID
+never stored, and the materializer keeps the blob ref in rebuilt records
+without storing bytes. `cid` takes any multibase spelling of the CID; every
+answer uses canonical CIDv1 base32. `actor` is the operator's label for the
+audit trail; each action records its own and never overwrites another's.
+
+| Route | What it does | Body and answers |
+|---|---|---|
+| `POST /admin/blobs/withhold` | Places an operator withhold on a CID. Idempotent: while one is active, the call changes nothing and returns the existing state. | `{"cid","reason_code","actor"}` plus optional `"moderation_action_id"` and `"csam_case_id"`. `reason_code` is `illegal-content`, `csam` or `operator-discretion`. **200** state; **400** unparseable cid, other reason code, or empty actor. |
+| `POST /admin/blobs/lift` | Lifts the active operator withhold. The row is kept with `lifted_at` and `lifted_by`. | `{"cid","actor"}`. **200** state; **404** no active operator withhold; **400** unparseable cid. |
+| `POST /admin/blobs/delete-bytes` | Deletes the CID's stored bytes for every owner DID. The withhold stays active. A repeat call keeps the first `deleted_at` and `bytes_deleted_by`. | `{"cid","actor","confirm":true}`. **200** state; **404** no active operator withhold; **400** unparseable cid or `confirm` absent or false. |
+| `GET /admin/blobs?cid=` | Inspects one CID. | **200** state; **400** unparseable cid. |
+| `GET /admin/blobs/withholds` | Lists the active operator withholds. | **200** `{"withholds":[…]}`. |
+
+The state is `{cid, withholds, bytes_deleted, stored_owners}`. `withholds`
+holds every row for the CID, active and lifted, each with `source`, `scope`,
+`reason_code`, the actor labels and `created_at`, `lifted_at`, `deleted_at`.
+A row without `lifted_at` is active. `stored_owners` counts the DIDs still
+holding the bytes.
+
+Automatic deletes (site bans, `Delete{Actor}`, nobridge scrubs) keep the
+bytes of a CID under an active operator withhold, so `delete-bytes` is the
+only way they are removed.
+
+Operator procedure for illegal media:
+
+1. Withhold the CID first. Serving stops at once for every owner.
+2. For apparent CSAM, preserve the material outside Tidepool as your legal
+   process requires before going further. The withhold makes `getBlob` refuse
+   the bytes and no admin route returns them, so export them from the
+   database on the host, using the canonical CID from the withhold answer.
+   First count the stored rows:
+
+   ```sh
+   docker exec -i tidepool-prod-postgres psql -U tidepool -d tidepool -XAt \
+     -c "SELECT count(*) FROM blobs WHERE cid='<canonical cid>'"
+   ```
+
+   This command must exit 0. A count of 0 means no bytes are stored for that
+   CID, so there is nothing to preserve. Otherwise export the bytes in bash,
+   with `pipefail` so a failed `docker exec` or `psql` fails the pipeline:
+
+   ```bash
+   set -o pipefail
+   docker exec -i tidepool-prod-postgres psql -U tidepool -d tidepool -XAt \
+     -c "SELECT encode(bytes,'base64') FROM blobs WHERE cid='<canonical cid>' LIMIT 1" \
+     | base64 -d > evidence.bin \
+     && test -s evidence.bin && echo "evidence saved"
+   ```
+
+   Go on to step 3 only when this prints `evidence saved`. If the pipeline
+   exits non-zero or `evidence.bin` is empty, stop and do not run
+   `delete-bytes`. `blobs` holds one row per owner DID with identical bytes,
+   so `LIMIT 1` is enough. Do not use `COPY ... (FORMAT binary)`: its output
+   carries a header and field framing, not the raw bytes.
+3. Delete the bytes with `"confirm":true`. This removes the rows, but the
+   bytes can remain in dead tuples until `VACUUM` reclaims them, in the WAL,
+   and in database backups and dumps taken before the delete.
+
+Lifting restores serving only while the bytes are still stored. After
+`delete-bytes`, a lift lets the CID be stored again the next time its media
+is fetched. Never lift a `csam` or `illegal-content` withhold after
+`delete-bytes`: the next fetch stores the material again.
+
 ### Reports
 
 | Route | What it does | Body and answers |
@@ -139,7 +226,8 @@ Investigate.
 
 `POST /admin/communities/backfill`, `/admin/reemit`,
 `/admin/objects/sweep-deleted`, `/admin/inbox/replay-bans`,
-`/admin/divergence` and the `/admin/outbound*` routes answer 501 when their
+`/admin/moderation/backfill-removal-withholds`,
+`/admin/moderation/backfill-ban-records`, `/admin/divergence` and the `/admin/outbound*` routes answer 501 when their
 component is not built. The `tidepool` server builds all of them, so a 501
 from one of these is a bug.
 

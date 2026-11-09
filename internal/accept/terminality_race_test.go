@@ -300,7 +300,7 @@ func TestAPostCannotSlipPastABanThatLandsMidAdmission(t *testing.T) {
 
 	bans := store.NewCommunityBans(conn)
 	racing.beforeAcceptanceWrite = func() {
-		cancelled, err := bans.Ban(ctx, store.CommunityBan{
+		cancelled, _, err := bans.Ban(ctx, store.CommunityBan{
 			CommunityDID:  acCommunityDID,
 			SubjectDID:    acAuthorDID,
 			CommunityAPID: acCommunityAPID,

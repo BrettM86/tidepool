@@ -1685,6 +1685,14 @@ func TestAnnouncedDeleteOfComment(t *testing.T) {
 	assert.True(t, mapping.IsDeleted(), "an announced comment delete must apply")
 	_, _, err = h.manager.GetRecord(ctx, mapping.DID, mapping.Collection, mapping.RKey)
 	assert.Error(t, err, "the comment record must be deleted from the author's repo")
+
+	// The author's own delete is not moderation: no removal record is written
+	// in the community repo that owns the thread.
+	commentATURI := "at://" + mapping.DID + "/" + mapping.Collection + "/" + mapping.RKey
+	_, _, err = h.manager.GetRecord(ctx, testDIDFor("technology", "lemmy.world"),
+		materialize.CollectionRemoval, testDigestRKey(commentATURI))
+	assert.True(t, errors.IsNotFound(err),
+		"an author's summary-less delete writes no removal record (err=%v)", err)
 }
 
 // TestAnnouncedDeleteOfRemoteAuthorComment: the same flow with the author on

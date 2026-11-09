@@ -2,12 +2,15 @@ package materialize
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
+	"slices"
 
 	"github.com/bluesky-social/indigo/atproto/atdata"
 	"github.com/ipfs/go-cid"
 
 	"tidepool/internal/ap"
+	"tidepool/internal/blobwithhold"
 	"tidepool/internal/errors"
 	"tidepool/internal/repo"
 	"tidepool/internal/store"
@@ -103,6 +106,130 @@ func (m *Materializer) HandleDeleteRecord(ctx context.Context, apID string) erro
 		return nil
 	}
 	return m.deleteMapping(ctx, mapping)
+}
+
+// HandleAuthorDeleteRecord is HandleDeleteRecord for a delete the caller has
+// classified as the author's own (ingest's deleteIsByAuthor on a summary-less
+// announced Delete). For a postv2 or a comment the record delete's own commit
+// also deletes the bytes of every blob the subject used that no other record
+// in the same repo still references (see deleteAuthorRecord). Decision
+// 2026-11-07: neither a moderator restore nor the author can bring the record
+// back, so nothing is kept for one. Decision 2026-11-08: while a community
+// removal of the subject stands, the delete keeps every byte and every
+// community-removal row, so an uploader cannot wipe a removed image before an
+// operator withholds it. Every other delete keeps the bytes.
+func (m *Materializer) HandleAuthorDeleteRecord(ctx context.Context, apID string) error {
+	if apID == "" {
+		return errors.NewValidationError("ap_id", "must not be empty")
+	}
+	mapping, err := m.objects.GetByAPID(ctx, apID)
+	if errors.IsNotFound(err) {
+		return m.HandleDeleteRecord(ctx, apID)
+	}
+	if err != nil {
+		return fmt.Errorf("materialize: look up mapping for delete %s: %w", apID, err)
+	}
+	if mapping.Collection != CollectionPostV2 && mapping.Collection != CollectionComment {
+		return m.HandleDeleteRecord(ctx, apID)
+	}
+	return m.deleteMappingWith(ctx, mapping, func(ctx context.Context) error {
+		return m.deleteAuthorRecord(ctx, mapping)
+	})
+}
+
+// deleteAuthorRecord deletes the subject's record and, as the side effect of
+// that same commit, the bytes of the blobs the subject used that no record
+// left in its repo references: every CID the deleted record referenced. A CID
+// another record references, or an operator withhold holds, keeps its bytes.
+//
+// A removed subject keeps everything (decision 2026-11-08): when its
+// community's removal record stands, read in the commit's transaction, the
+// commit deletes no bytes and lifts no community-removal row, so an uploader
+// cannot wipe the bridge's copy of a removed image before an operator
+// withholds it. The rows, written with the removal, keep the CIDs refused for
+// the owner, add-only as removal_withholds.go documents; the commit adds any
+// row the deleted record's CIDs lack (a removal written before removals
+// withheld blobs), since the back-fill cannot once the record is gone. A later moderator
+// restore finds no subject record to re-accept (the origin answers a
+// tombstone), so the removal record and its rows stay and getBlob keeps
+// refusing; the bytes stay stored until an operator's delete-bytes action
+// removes them. A subject whose community cannot be determined (CommunityDIDOf
+// answers "") has no removal to find, and its bytes go.
+//
+// The references are read inside the commit, under the global commit lock,
+// against the tree after the delete, so a record committed to the repo before
+// this commit keeps the bytes it references. A failure anywhere rolls the
+// record and the bytes back together, and a retry converges: while the
+// mapping is live it runs again, and once the record is gone its delete is
+// inert and names no CID. The
+// record is read before the commit and pinned with ExpectPrevCID, so an edit
+// landing in between fails the commit (retryable) rather than leaving the
+// edit's CIDs unconsidered.
+//
+// The removal check runs only when the record references a blob, and the repo
+// walk only when the subject is not removed, so a delete of a record with no
+// blobs does not read the author's tree.
+//
+// Not closed: every store of a subject CID that finishes before this
+// commit loses its bytes, whether it inserted them or found them already
+// stored (DeleteBlobTx takes the blob store lock that PutBlob holds through
+// its withhold check and insert, so a store in flight finishes first). That
+// is harmless for the deleted subject. For another record of the same author
+// that references the CID and commits after this one, for example a Lemmy
+// cross-post of the same image, the bytes are gone: nothing logs it, and
+// getBlob answers not-found for that record until it is materialized again.
+func (m *Materializer) deleteAuthorRecord(ctx context.Context, mapping *store.APObjectMapping) error {
+	record, recordCID, err := m.repos.GetRecord(ctx, mapping.DID, mapping.Collection, mapping.RKey)
+	if err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("materialize: read record %s before delete: %w", mapping.ATURI, err)
+	}
+	communityDID, err := CommunityDIDOf(ctx, m.repos, mapping)
+	if err != nil {
+		return fmt.Errorf("materialize: community of %s before delete: %w", mapping.ATURI, err)
+	}
+	var subjectCIDs []string
+	for _, blob := range atdata.ExtractBlobs(record) {
+		if blobCID := cid.Cid(blob.Ref).String(); !slices.Contains(subjectCIDs, blobCID) {
+			subjectCIDs = append(subjectCIDs, blobCID)
+		}
+	}
+	_, err = m.repos.ApplyOpsTx(ctx, mapping.DID, []repo.RecordOp{{
+		Action:        repo.OpActionDelete,
+		Collection:    mapping.Collection,
+		RKey:          mapping.RKey,
+		ExpectPrevCID: &recordCID,
+	}}, func(ctx context.Context, tx *sql.Tx, _ *repo.CommitResult) error {
+		if len(subjectCIDs) == 0 {
+			return nil
+		}
+		code, removed, err := m.standingRemovalCode(ctx, tx, mapping.Collection, mapping.ATURI, communityDID)
+		if err != nil {
+			return err
+		}
+		if removed {
+			// A removal written before removals withheld blobs has no rows,
+			// and the back-fill cannot write them once the record is gone.
+			if err := blobwithhold.AddSubjectRemovalWithholds(ctx, tx, mapping.DID, mapping.ATURI, code, subjectCIDs); err != nil {
+				return fmt.Errorf("materialize: withhold removed %s on delete: %w", mapping.ATURI, err)
+			}
+			return nil
+		}
+		entries, err := m.repos.ListRecordsTx(ctx, tx, mapping.DID)
+		if err != nil && !errors.IsNotFound(err) {
+			return fmt.Errorf("materialize: list records of %s: %w", mapping.DID, err)
+		}
+		references := blobReferencesOf(entries)
+		for _, blobCID := range subjectCIDs {
+			if len(references.byBlob[blobCID]) > 0 {
+				continue
+			}
+			if _, err := m.repos.DeleteBlobTx(ctx, tx, mapping.DID, blobCID); err != nil {
+				return fmt.Errorf("materialize: delete blob %s under %s: %w", blobCID, mapping.DID, err)
+			}
+		}
+		return nil
+	})
+	return err
 }
 
 // SuppressActor stops bridging an actor that opted out (#nobridge/#nobot)
@@ -297,8 +424,19 @@ func (m *Materializer) DeleteActor(ctx context.Context, apActorID string) error 
 // deleteMapping deletes one record and soft-deletes its mapping,
 // idempotently: an already-deleted mapping is a no-op, a record missing
 // from the repo (crash between delete and soft-delete on a previous run)
-// is tolerated.
+// is tolerated. A postv2 or comment's community-removal withholds stay
+// active (see HandleAuthorDeleteRecord for the author's delete).
 func (m *Materializer) deleteMapping(ctx context.Context, mapping *store.APObjectMapping) error {
+	return m.deleteMappingWith(ctx, mapping, func(ctx context.Context) error {
+		_, err := m.repos.DeleteRecord(ctx, mapping.DID, mapping.Collection, mapping.RKey)
+		return err
+	})
+}
+
+// deleteMappingWith is deleteMapping with the record delete supplied by the
+// caller (HandleAuthorDeleteRecord's carries the byte delete in its commit).
+// A NotFound from deleteRecord is tolerated as deleteMapping documents.
+func (m *Materializer) deleteMappingWith(ctx context.Context, mapping *store.APObjectMapping, deleteRecord func(ctx context.Context) error) error {
 	if mapping.IsDeleted() {
 		return nil
 	}
@@ -335,7 +473,17 @@ func (m *Materializer) deleteMapping(ctx context.Context, mapping *store.APObjec
 			}
 		}
 	}
-	if _, err := m.repos.DeleteRecord(ctx, mapping.DID, mapping.Collection, mapping.RKey); err != nil && !errors.IsNotFound(err) {
+	// A removed postv2 or comment's community-removal withholds are NOT
+	// lifted here: a removed subject's bytes stay stored, also after the
+	// author's own delete (HandleAuthorDeleteRecord, decision 2026-11-08), so
+	// lifting would serve the removed image through getBlob. Only a restore
+	// lifts them. The documented trade-off: after any delete the CID stays
+	// refused for the owner, also for the owner's other live records that
+	// reference it.
+	if err := deleteRecord(ctx); err != nil && !errors.IsNotFound(err) {
+		// NotFound (no bridged actor or signing key, as for a native author
+		// behind a bridge-origin mapping) means no bridge-hosted record or
+		// blobs exist to delete: soft-delete the mapping as before.
 		return fmt.Errorf("materialize: delete record %s: %w", mapping.ATURI, err)
 	}
 	if err := m.objects.SoftDelete(ctx, mapping.APID); err != nil && !errors.IsNotFound(err) {

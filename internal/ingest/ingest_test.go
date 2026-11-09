@@ -27,6 +27,7 @@ import (
 	"tidepool/internal/ap"
 	"tidepool/internal/echo"
 	"tidepool/internal/identity"
+	"tidepool/internal/linkpreview"
 	"tidepool/internal/materialize"
 	"tidepool/internal/repo"
 	"tidepool/internal/store"
@@ -298,7 +299,11 @@ func newHarness(t *testing.T) *harness {
 		"community_bans",
 		// Nodeinfo discovery results (migration 042): a cached software name
 		// or failure left by one test would decide the next test's fetches.
-		"instances")
+		"instances",
+		// Blob withholds (migration 047): the blobs table is cleared above, so a
+		// withhold row left by one test would refuse the next test's image of
+		// the same bytes (fixture images are deterministic, so their CIDs are).
+		"blob_withholds")
 
 	custodian, err := identity.NewCustodian(testKEK)
 	require.NoError(t, err)
@@ -452,6 +457,46 @@ func newHarness(t *testing.T) *harness {
 	return h
 }
 
+// useConcreteLinkPreviews rebuilds the materializer with the real
+// linkpreview.Resolver over the fixture-rewriting transport (production wires
+// one; newHarness leaves LinkPreviews nil, which disables link-thumbnail
+// unfurling), then rebuilds the dispatcher and the queue drain() pumps over
+// it. Call it before any delivery.
+func (h *harness) useConcreteLinkPreviews() {
+	h.t.Helper()
+	h.materializerOptions.LinkPreviews = linkpreview.NewResolver(
+		&http.Client{Transport: rewriteTransport{target: h.fixtures.Listener.Addr().String()}}, "tidepool-test/1.0")
+	materializer, err := materialize.New(h.materializerOptions)
+	require.NoError(h.t, err)
+	h.mat = materializer
+	handler, err := NewHandler(HandlerOptions{
+		Materializer:   h.mat,
+		Fetcher:        h.client,
+		Objects:        h.objects,
+		Actors:         h.actors,
+		Communities:    h.communities,
+		Tombstones:     h.tombstones,
+		Records:        h.manager,
+		Votes:          h.votes,
+		Backfill:       h.backfills,
+		Echo:           h.classifier,
+		ServiceActorID: h.service.ID,
+		Logger:         slog.New(slog.NewTextHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+	})
+	require.NoError(h.t, err)
+	h.handler = handler
+	queue, err := NewQueue(QueueOptions{
+		Events:      h.events,
+		Processor:   handler,
+		Workers:     1,
+		MaxAttempts: 3,
+		Lease:       time.Minute,
+		Logger:      slog.New(slog.NewTextHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+	})
+	require.NoError(h.t, err)
+	h.queue = queue
+}
+
 // adminOptions is the harness's Admin wiring, shared by newHarness and by
 // tests that need a second Admin over the same dependencies (a cancellable
 // BaseContext, say). Call it after newHarness has built the materializer,
@@ -504,7 +549,8 @@ func readAll(r *http.Request) ([]byte, error) {
 	return buf.Bytes(), err
 }
 
-// serveJSON serves (or re-serves) body at path, counting hits.
+// serveJSON serves (or re-serves) body at path, counting hits. A nil body
+// answers 410 Gone.
 func (h *harness) serveJSON(path string, body []byte) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -518,11 +564,21 @@ func (h *harness) serveJSON(path string, body []byte) {
 			if onFetch != nil {
 				onFetch()
 			}
+			if current == nil {
+				w.WriteHeader(http.StatusGone)
+				return
+			}
 			w.Header().Set("Content-Type", ap.ContentTypeActivityJSON)
 			_, _ = w.Write(current)
 		})
 	}
 	h.served[path] = body
+}
+
+// serveGone answers path with 410 Gone, the way Lemmy serves a removed or
+// deleted object.
+func (h *harness) serveGone(path string) {
+	h.serveJSON(path, nil)
 }
 
 func (h *harness) serveObject(path string, obj map[string]any) {

@@ -236,7 +236,7 @@ func newHarness(t *testing.T, configure ...func(*Options)) *harness {
 	database := testutil.DB(t)
 	testutil.Truncate(t, database,
 		"ap_objects", "bridged_actors", "communities",
-		"blocks", "repo_state", "firehose_events", "blobs", "instances")
+		"blocks", "repo_state", "firehose_events", "blobs", "blob_withholds", "instances")
 
 	custodian, err := identity.NewCustodian(testKEK)
 	require.NoError(t, err)

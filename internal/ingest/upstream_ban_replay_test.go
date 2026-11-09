@@ -166,7 +166,9 @@ func TestReplayingProcessedUpstreamBansRemovesWhatTheyWouldHaveRemoved(t *testin
 	require.NoError(t, err)
 	_, _, err = h.manager.GetRecord(ctx, replayOtherUserDID, materialize.CollectionPostV2, otherPostMapping.RKey)
 	assert.NoError(t, err, "V's postv2 record itself stays: a community ban is community-scoped")
-	assertDeleted(t, h, otherCommentC, "V's pre-ban comment in C, community resolved through its thread")
+	assertLive(t, h, otherCommentC, "a community ban leaves V's pre-ban comment record in C")
+	assert.Equal(t, materialize.RemovalCodeAuthorBanned, removalCode(t, h, ubCommunityCDID, otherCommentC),
+		"C records V's pre-ban comment's removal, community resolved through its thread")
 	assertDeleted(t, h, otherLegacyC, "V's pre-ban legacy post in C's repo")
 	assertLive(t, h, otherPostD, "a community ban does not reach D")
 	assert.True(t, acceptanceExists(t, h, ubCommunityDDID, otherPostD), "V's post stays accepted in D")
@@ -294,6 +296,7 @@ func replayStateSnapshot(t *testing.T, h *harness) map[string][]string {
 	ctx := context.Background()
 	queries := map[string]string{
 		"ap_objects":        `SELECT * FROM ap_objects`,
+		"blob_withholds":    `SELECT * FROM blob_withholds`,
 		"repo_state":        `SELECT did, head_cid, rev FROM repo_state`,
 		"blobs":             `SELECT did, cid, size FROM blobs`,
 		"community_bans":    `SELECT * FROM community_bans`,
@@ -332,7 +335,7 @@ func replayStateSnapshot(t *testing.T, h *harness) map[string][]string {
 	return snapshot
 }
 
-// TestReplayingBansDeletesACommentWhoseThreadRootAnEarlierBanDeleted (B5,
+// TestReplayingBansRemovesACommentWhoseThreadRootAnEarlierBanDeleted (B5,
 // review).
 //
 // GIVEN already-processed inbox events for (i) U's home site ban and then (ii)
@@ -340,8 +343,9 @@ func replayStateSnapshot(t *testing.T, h *harness) map[string][]string {
 // mapping carrying no community — both published before either ban; WHEN the
 // operator replays bans as a dry run THEN (i) lists P and (ii) lists V's
 // comment; WHEN replayed for real THEN (i) deleting P does not hide V's comment
-// from (ii): the listing equals the dry run's and both are deleted.
-func TestReplayingBansDeletesACommentWhoseThreadRootAnEarlierBanDeleted(t *testing.T) {
+// from (ii): the listing equals the dry run's, P is deleted, and V's comment
+// gets C's author-banned removal record.
+func TestReplayingBansRemovesACommentWhoseThreadRootAnEarlierBanDeleted(t *testing.T) {
 	world := newUpstreamBanWorld(t)
 	h := world.h
 
@@ -393,8 +397,9 @@ func TestReplayingBansDeletesACommentWhoseThreadRootAnEarlierBanDeleted(t *testi
 	assert.JSONEq(t, listing(false), realRun.Body.String(),
 		"the real run removes exactly what the dry run listed")
 	assertDeleted(t, h, rootPost, "U's pre-ban post: site ban")
-	assertDeleted(t, h, otherComment,
-		"V's pre-ban comment in C, its community resolved through a thread root the site ban already deleted")
+	assertLive(t, h, otherComment, "a community ban leaves V's comment record")
+	assert.Equal(t, materialize.RemovalCodeAuthorBanned, removalCode(t, h, ubCommunityCDID, otherComment),
+		"V's pre-ban comment in C is removed there, its community resolved through a thread root the site ban already deleted")
 }
 
 // TestReplayingBansSkipsAnEchoOfOurOwnPersonasBan (B5, review).
@@ -608,11 +613,12 @@ func corruptRecord(t *testing.T, h *harness, apID string) {
 // GIVEN recorded bans of bridged user V — first C's community ban, then V's
 // home site ban — and V's pre-ban postv2, comment and legacy post in C plus a
 // post and a comment in D; WHEN the operator replays bans THEN the community
-// ban lists what it acts on in C (the postv2 it withdraws, the comment and
-// legacy post it deletes), the site ban lists the postv2 again (it deletes the
-// record the community ban only withdrew) and V's content in D, but not the
-// comment or legacy post the community ban already deleted; the dry run's
-// listing equals the real run's; and the postv2 record is gone afterwards.
+// ban lists what it acts on in C (the postv2 and comment it withdraws, the
+// legacy post it deletes), the site ban lists the postv2 and the comment again
+// (it deletes the records the community ban only withdrew) and V's content in
+// D, but not the legacy post the community ban already deleted; the dry run's
+// listing equals the real run's; and the postv2 and comment records are gone
+// afterwards.
 func TestReplayingOverlappingBansOfOneAuthorListsEachActionOnce(t *testing.T) {
 	world := newUpstreamBanWorld(t)
 	h := world.h
@@ -635,6 +641,7 @@ func TestReplayingOverlappingBansOfOneAuthorListsEachActionOnce(t *testing.T) {
 		siteBlock(siteBanID, ubOtherAdminID, ubOtherUserID, ubOtherRoot, nil), ubBanTime.Add(24*time.Hour))
 
 	postCURI := atURIOf(t, h, otherPostC)
+	commentCURI := atURIOf(t, h, otherCommentC)
 	listing := func(dryRun bool) string {
 		return mustJSON(t, map[string]any{
 			"dry_run": dryRun,
@@ -644,17 +651,18 @@ func TestReplayingOverlappingBansOfOneAuthorListsEachActionOnce(t *testing.T) {
 					"subject":     ubOtherUserID,
 					"scope":       "community",
 					"community":   world.communityC.id,
-					"removed":     sortedStrings(postCURI, atURIOf(t, h, otherCommentC), otherLegacyURI),
+					"removed":     sortedStrings(postCURI, commentCURI, otherLegacyURI),
 				},
 				map[string]any{
 					"activity_id": siteBanID,
 					"subject":     ubOtherUserID,
 					"scope":       "site",
 					"community":   "",
-					"removed":     sortedStrings(postCURI, atURIOf(t, h, otherPostD), atURIOf(t, h, otherCommentD)),
+					"removed": sortedStrings(postCURI, commentCURI,
+						atURIOf(t, h, otherPostD), atURIOf(t, h, otherCommentD)),
 				},
 			},
-			"removed_total": 6,
+			"removed_total": 7,
 		})
 	}
 
@@ -667,7 +675,7 @@ func TestReplayingOverlappingBansOfOneAuthorListsEachActionOnce(t *testing.T) {
 	assert.JSONEq(t, listing(false), realRun.Body.String(), "the real run does exactly what the dry run listed")
 
 	assertDeleted(t, h, otherPostC, "V's postv2: withdrawn from C by the community ban, deleted by the site ban")
-	assertDeleted(t, h, otherCommentC, "V's comment in C: the community ban")
+	assertDeleted(t, h, otherCommentC, "V's comment in C: withdrawn by the community ban, deleted by the site ban")
 	assertDeleted(t, h, otherLegacyC, "V's legacy post in C's repo: the community ban")
 	assertDeleted(t, h, otherPostD, "V's post in D: the site ban")
 	assertDeleted(t, h, otherCommentD, "V's comment in D: the site ban")

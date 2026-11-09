@@ -45,7 +45,7 @@ func admissionRow(t *testing.T, conn *sql.DB, communityDID, postURI string) *Adm
 // banAuthor lands a community ban on the post's author.
 func banAuthor(t *testing.T, conn *sql.DB, reason string) {
 	t.Helper()
-	_, err := store.NewCommunityBans(conn).Ban(context.Background(), store.CommunityBan{
+	_, _, err := store.NewCommunityBans(conn).Ban(context.Background(), store.CommunityBan{
 		CommunityDID:  acCommunityDID,
 		SubjectDID:    acAuthorDID,
 		CommunityAPID: acCommunityAPID,

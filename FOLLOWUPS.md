@@ -133,10 +133,6 @@ git history, not here.
   different spelling or `target` shape from real Lemmy would go unnoticed. The
   site-ban `Block` is captured from real Lemmy in
   `tests/e2e/upstream_ban_test.go`.
-- Nothing reads a native comment's removal (`object_moderation.removed_at`). A
-  comment a moderator removed still federates the author's later edits and
-  still accepts native replies. Fix by gating child enqueues and edit
-  federation on the parent's removal, as the thread lock already does.
 - Comments materialized before migration 026 have no `thread_root_at_uri`, so
   a lock on the post above them does not refuse native replies under them. Each
   heals when re-materialized; an admin backfill of the affected communities

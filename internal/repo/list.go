@@ -61,7 +61,20 @@ func (m *Manager) ListRecords(ctx context.Context, did string) ([]RecordEntry, e
 		return nil, fmt.Errorf("repo: begin read tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	return listRecordsIn(ctx, tx, did)
+}
 
+// ListRecordsTx is ListRecords read in the caller's transaction. A commit
+// side effect uses it: the walk sees the tree the commit just wrote, and the
+// global commit lock keeps every other commit out until it commits.
+func (m *Manager) ListRecordsTx(ctx context.Context, tx *sql.Tx, did string) ([]RecordEntry, error) {
+	if _, err := syntax.ParseDID(did); err != nil {
+		return nil, fmt.Errorf("repo: invalid did %q: %w", did, err)
+	}
+	return listRecordsIn(ctx, tx, did)
+}
+
+func listRecordsIn(ctx context.Context, tx *sql.Tx, did string) ([]RecordEntry, error) {
 	state, err := readRepoState(ctx, tx, did, false)
 	if err != nil {
 		return nil, err

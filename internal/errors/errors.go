@@ -124,3 +124,10 @@ func IsRecordGone(err error) bool { return errors.Is(err, ErrRecordGone) }
 // IsCollectionImmutable reports whether err is, wraps, or unwraps to
 // ErrCollectionImmutable.
 func IsCollectionImmutable(err error) bool { return errors.Is(err, ErrCollectionImmutable) }
+
+// ErrBlobWithheld marks a blob store refused because an active withhold
+// covers the (DID, CID).
+var ErrBlobWithheld = errors.New("blob withheld")
+
+// IsBlobWithheld reports a store refused by an active blob withhold.
+func IsBlobWithheld(err error) bool { return errors.Is(err, ErrBlobWithheld) }

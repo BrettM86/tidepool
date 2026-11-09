@@ -250,16 +250,21 @@ func (m *Materializer) removePost(ctx context.Context, mapping *store.APObjectMa
 	// empty summary, and an empty reason renders in a moderation log as a
 	// blank explanation instead of as none.
 	if reason != "" {
-		removal["reason"] = reason
+		// The removal lexicon's reason limits; a Lemmy summary has none.
+		removal["reason"] = truncateText(reason, 1000, 10000)
 	}
 	if err := m.validateRecord(removal); err != nil {
 		return err
 	}
 
-	if _, err := m.repos.ApplyOps(ctx, communityDID, []repo.RecordOp{
+	// The removal withholds the blobs the post's current record references,
+	// under the removal's code, in the removal's own commit: a failed withhold
+	// write rolls the removal back so the activity retries. A native post gets
+	// no withhold.
+	if _, err := m.repos.ApplyOpsTx(ctx, communityDID, []repo.RecordOp{
 		{Action: repo.OpActionDelete, Collection: CollectionAcceptance, RKey: rkey},
 		{Action: repo.OpActionUpdate, Collection: CollectionRemoval, RKey: rkey, Record: removal},
-	}); err != nil {
+	}, m.removalWithholdSync(postURI, code)); err != nil {
 		return fmt.Errorf("materialize: remove %s from %s: %w", postURI, communityDID, err)
 	}
 	m.logger.Info("post removed from community by moderator",
@@ -320,10 +325,25 @@ func (m *Materializer) RestorePost(ctx context.Context, mapping *store.APObjectM
 		return err
 	}
 
-	if _, err := m.repos.ApplyOps(ctx, communityDID, []repo.RecordOp{
+	// The restore lifts this post's community-removal withholds in the same
+	// commit; a CID another removed subject or an operator withholds stays
+	// refused by that row. A post hosted here is re-read in that commit: one
+	// the author deleted after restorePin read it commits nothing, leaving the
+	// removal standing as restorePin's "no record" answer does. A native post
+	// has no record or bytes here; restorePin's outbound read is its check.
+	lift := removalWithholdLift(postURI)
+	if mapping.Origin != store.OriginBridge {
+		lift = m.hostedRestoreLift(postURI, currentCID)
+	}
+	if _, err := m.repos.ApplyOpsTx(ctx, communityDID, []repo.RecordOp{
 		{Action: repo.OpActionDelete, Collection: CollectionRemoval, RKey: rkey},
 		{Action: repo.OpActionUpdate, Collection: CollectionAcceptance, RKey: rkey, Record: acceptance},
-	}); err != nil {
+	}, lift); err != nil {
+		if stderrors.Is(err, errRestoreSubjectGone) {
+			m.logger.Warn("restore target was deleted before the restore committed; leaving the removal in place",
+				"ap_id", mapping.APID, "at_uri", mapping.ATURI)
+			return nil
+		}
 		return fmt.Errorf("materialize: restore %s into %s: %w", postURI, communityDID, err)
 	}
 	m.logger.Info("post restored to community by moderator",

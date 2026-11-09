@@ -34,6 +34,10 @@ type Materializer interface {
 	// latter — see materialize.HandleDeleteRecord for the TOCTOU it closes.
 	HandleDelete(ctx context.Context, apID string) error
 	HandleDeleteRecord(ctx context.Context, apID string) error
+	// HandleAuthorDeleteRecord is HandleDeleteRecord for a delete classified
+	// as the author's own: a postv2 or comment's image bytes no other record
+	// uses go with it.
+	HandleAuthorDeleteRecord(ctx context.Context, apID string) error
 	// RemovePost/RestorePost are the community-scoped moderation transitions:
 	// they rewrite the community's acceptance and removal records and leave
 	// the author's post where it is. Deleting content is a different verb, so
@@ -139,10 +143,16 @@ type Handler struct {
 	// bannedContent acts on upstream bans of BRIDGED Lemmy users (see
 	// BannedContentRemover); read off the Materializer like authorMod.
 	bannedContent BannedContentRemover
-	classifier    EchoClassifier
-	echoLog       *ratelimit.Sampler
-	serviceID     string
-	logger        *slog.Logger
+	// commentRemovals publishes comment removal records into community repos;
+	// read off the Materializer like authorMod.
+	commentRemovals CommentRemovalPublisher
+	// banRecords publishes community ban records into community repos; read
+	// off the Materializer like authorMod.
+	banRecords BanRecordPublisher
+	classifier EchoClassifier
+	echoLog    *ratelimit.Sampler
+	serviceID  string
+	logger     *slog.Logger
 }
 
 // NewHandler validates options and builds a Handler.
@@ -219,24 +229,28 @@ func NewHandler(opts HandlerOptions) (*Handler, error) {
 	// Same value, same reason: bridged content is selected from ap_objects and
 	// removed by the materializer that wrote it.
 	bannedContent, _ := opts.Materializer.(BannedContentRemover)
+	commentRemovals, _ := opts.Materializer.(CommentRemovalPublisher)
+	banRecords, _ := opts.Materializer.(BanRecordPublisher)
 	return &Handler{
-		mat:           opts.Materializer,
-		fetcher:       opts.Fetcher,
-		objects:       opts.Objects,
-		actors:        opts.Actors,
-		communities:   opts.Communities,
-		tombstones:    opts.Tombstones,
-		records:       opts.Records,
-		votes:         opts.Votes,
-		backfill:      opts.Backfill,
-		moderation:    moderation,
-		bans:          bans,
-		authorMod:     authorMod,
-		bannedContent: bannedContent,
-		classifier:    opts.Echo,
-		echoLog:       ratelimit.NewSampler(echoDropLogInterval),
-		serviceID:     opts.ServiceActorID,
-		logger:        logger,
+		mat:             opts.Materializer,
+		fetcher:         opts.Fetcher,
+		objects:         opts.Objects,
+		actors:          opts.Actors,
+		communities:     opts.Communities,
+		tombstones:      opts.Tombstones,
+		records:         opts.Records,
+		votes:           opts.Votes,
+		backfill:        opts.Backfill,
+		moderation:      moderation,
+		bans:            bans,
+		authorMod:       authorMod,
+		bannedContent:   bannedContent,
+		commentRemovals: commentRemovals,
+		banRecords:      banRecords,
+		classifier:      opts.Echo,
+		echoLog:         ratelimit.NewSampler(echoDropLogInterval),
+		serviceID:       opts.ServiceActorID,
+		logger:          logger,
 	}, nil
 }
 

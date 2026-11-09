@@ -323,6 +323,32 @@ func (r *postgresInboxEvents) ListRecordedBans(ctx context.Context) ([]*InboxEve
 	return events, nil
 }
 
+func (r *postgresInboxEvents) ListBanEventsAfter(ctx context.Context, afterID int64) ([]*InboxEvent, error) {
+	query := `SELECT ` + eventColumns + ` FROM inbox_events
+		WHERE id > $1
+		  AND (type = $2 OR (type = $3 AND position($4::bytea IN payload) > 0))
+		ORDER BY id`
+
+	rows, err := r.db.QueryContext(ctx, query, afterID, "Block", "Announce", []byte(`"Block"`))
+	if err != nil {
+		return nil, fmt.Errorf("list ban events after %d: %w", afterID, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var events []*InboxEvent
+	for rows.Next() {
+		event, err := scanInboxEvent(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan ban event: %w", err)
+		}
+		events = append(events, event)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list ban events after %d: %w", afterID, err)
+	}
+	return events, nil
+}
+
 func scanInboxEvent(row rowScanner) (*InboxEvent, error) {
 	var event InboxEvent
 	err := row.Scan(

@@ -137,11 +137,13 @@ func (h *Handler) handleDelete(ctx context.Context, del *ap.Object, signer strin
 	// purpose: the post is not going anywhere. Laying a marker would suppress
 	// the post's own later Creates and Updates, and deleting the record would
 	// hand one community the power to destroy content in all the others.
+	byAuthor := false
 	if announcer != nil {
-		handled, err := h.moderateAnnouncedDelete(ctx, del, targetID, announcer)
+		handled, authored, err := h.moderateAnnouncedDelete(ctx, del, targetID, announcer)
 		if err != nil || handled {
 			return err
 		}
+		byAuthor = authored
 	}
 
 	// Record the tombstone marker BEFORE deleting: if this is a Delete for
@@ -163,8 +165,15 @@ func (h *Handler) handleDelete(ctx context.Context, del *ap.Object, signer strin
 	// delete into that actor's terminal scrub. A BARE delete keeps the full
 	// dispatch — Delete(Actor) arrives on exactly that path, and an origin may
 	// delete its own actor.
+	//
+	// The author's own delete of a postv2 or a comment (byAuthor) also deletes
+	// the subject's image bytes no other record uses: decision 2026-11-07, see
+	// materialize.HandleAuthorDeleteRecord.
 	deleteTarget := h.mat.HandleDelete
-	if announcer != nil {
+	switch {
+	case byAuthor:
+		deleteTarget = h.mat.HandleAuthorDeleteRecord
+	case announcer != nil:
 		deleteTarget = h.mat.HandleDeleteRecord
 	}
 	if err := deleteTarget(ctx, targetID); err != nil {
@@ -194,6 +203,10 @@ func (h *Handler) handleDelete(ctx context.Context, del *ap.Object, signer strin
 //     destroy any bridged author's content with a single activity, leaving no
 //     moderation record behind. So anything that is not provably the author
 //     is treated as a removal — the community-scoped action it is entitled to.
+//
+// byAuthor reports a decline because the Delete is the author's own (no
+// summary, attributed to the author): the only decline that is an author's
+// delete.
 //
 // It declines for everything the postv2 moderation records do not describe: an
 // id the bridge never materialized, a mapping already tombstoned, and above
@@ -233,7 +246,7 @@ var (
 	NativeCommentSummarylessDelete = expvar.NewInt("tidepool_moderation_native_comment_summaryless_delete")
 )
 
-func (h *Handler) moderateAnnouncedDelete(ctx context.Context, del *ap.Object, targetID string, announcer *store.Community) (bool, error) {
+func (h *Handler) moderateAnnouncedDelete(ctx context.Context, del *ap.Object, targetID string, announcer *store.Community) (handled, byAuthor bool, err error) {
 	mapping, err := h.objects.GetByAPID(ctx, targetID)
 	if errors.IsNotFound(err) {
 		if del.HasSummary() {
@@ -244,13 +257,13 @@ func (h *Handler) moderateAnnouncedDelete(ctx context.Context, del *ap.Object, t
 			h.logger.Warn("announced moderator removal for an unmapped object; nothing to remove",
 				"ap_id", targetID)
 		}
-		return false, nil
+		return false, false, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("ingest: look up mapping for removal of %s: %w", targetID, err)
+		return false, false, fmt.Errorf("ingest: look up mapping for removal of %s: %w", targetID, err)
 	}
 	if mapping.IsDeleted() {
-		return false, nil
+		return false, false, nil
 	}
 	if mapping.Collection != materialize.CollectionPostV2 {
 		// A NATIVE comment: TAKEN here, never declined into the path below.
@@ -272,23 +285,69 @@ func (h *Handler) moderateAnnouncedDelete(ctx context.Context, del *ap.Object, t
 		// one is either a moderation action or an echo — and neither may reach
 		// a path that deletes the author's record.
 		if mapping.Origin == store.OriginBridge {
-			return true, h.moderateNativeComment(ctx, del, mapping, announcer)
+			return true, false, h.moderateNativeComment(ctx, del, mapping, announcer)
 		}
-		return false, nil
+		if mapping.Collection == materialize.CollectionComment {
+			return h.removeBridgedComment(ctx, del, mapping)
+		}
+		return false, false, nil
 	}
 	if !del.HasSummary() {
 		authored, aerr := h.deleteIsByAuthor(ctx, del, mapping)
 		if aerr != nil {
-			return false, aerr
+			return false, false, aerr
 		}
 		if authored {
-			return false, nil // the author's own delete: v1 self-delete semantics
+			return false, true, nil // the author's own delete: v1 self-delete semantics
 		}
 		h.logger.Info("summary-less announced delete is not the author's; treating it as a community removal",
 			"ap_id", targetID, "actor", refID(del.Actor))
-		return true, h.mat.RemovePost(ctx, mapping, "")
+		return true, false, h.mat.RemovePost(ctx, mapping, "")
 	}
-	return true, h.mat.RemovePost(ctx, mapping, del.Summary)
+	return true, false, h.mat.RemovePost(ctx, mapping, del.Summary)
+}
+
+// removeBridgedComment decides an announced Delete of a BRIDGED Lemmy comment
+// by the rule postv2 uses: a Delete carrying a `summary` (presence, even empty),
+// or carrying none and not provably by the comment's author, is a community
+// removal. The comment's record and mapping stay, and a removal record is
+// written into the community that owns the comment's thread. Only the author's
+// own summary-less Delete is declined, so it takes the v1 record delete.
+func (h *Handler) removeBridgedComment(ctx context.Context, del *ap.Object, mapping *store.APObjectMapping) (handled, byAuthor bool, err error) {
+	removal, err := h.deleteIsCommunityRemoval(ctx, del, mapping)
+	if err != nil {
+		return false, false, err
+	}
+	if !removal {
+		return false, true, nil // the author's own delete: v1 self-delete semantics
+	}
+	publisher, err := h.commentRemovalPublisher()
+	if err != nil {
+		return true, false, err
+	}
+	if err := publisher.RemoveBridgedComment(ctx, mapping,
+		materialize.RemovalCodeModeratorDiscretion, del.Summary); err != nil {
+		return true, false, fmt.Errorf("ingest: remove bridged comment %s: %w", mapping.APID, err)
+	}
+	h.logger.Info("community removed a bridged comment; removal record published",
+		"ap_id", mapping.APID, "at_uri", mapping.ATURI, "activity", del.ID,
+		"summary_present", del.HasSummary())
+	return true, false, nil
+}
+
+// deleteIsCommunityRemoval is the removal predicate for bridged content: the
+// Delete carries a `summary` (presence, never emptiness), or carries none and is
+// not provably by the author (see moderateAnnouncedDelete for why anything not
+// provably the author's is read as the community-scoped action).
+func (h *Handler) deleteIsCommunityRemoval(ctx context.Context, del *ap.Object, mapping *store.APObjectMapping) (bool, error) {
+	if del.HasSummary() {
+		return true, nil
+	}
+	authored, err := h.deleteIsByAuthor(ctx, del, mapping)
+	if err != nil {
+		return false, err
+	}
+	return !authored, nil
 }
 
 // deleteIsByAuthor reports whether the inner Delete is attributed to the
@@ -454,6 +513,10 @@ func (h *Handler) handleUndoDelete(ctx context.Context, undo, del *ap.Object, si
 		}
 	}
 
+	// Whether the mapping was soft-deleted BEFORE this Undo decides what a
+	// failed re-materialization rolls back to.
+	wasDeleted := mapping.IsDeleted()
+
 	// Content is re-materialized only for the community that announced the
 	// restore: that community is the binding HandleUpdate checks it against.
 	// The bare-content drop above leaves only non-content mappings here, and
@@ -495,6 +558,18 @@ func (h *Handler) handleUndoDelete(ctx context.Context, undo, del *ap.Object, si
 			objCommunity, boundCommunityIRI))
 	}
 
+	// A moderator's removal of a bridged comment keeps its record and mapping
+	// live, so for that comment the Undo is the removal record's deletion. It
+	// runs after the fetch and the checks above, so an origin that still serves
+	// the comment as removed (Lemmy answers 410) leaves the removal standing,
+	// and before the re-materialization, so lifting it does not depend on
+	// HandleUpdate succeeding.
+	if mapping.Collection == materialize.CollectionComment && !wasDeleted {
+		if err := h.liftBridgedCommentRemoval(ctx, undo, del, mapping); err != nil {
+			return err
+		}
+	}
+
 	if err := h.tombstones.Remove(ctx, targetID, scope); err != nil {
 		return fmt.Errorf("ingest: clear tombstone for %s: %w", targetID, err)
 	}
@@ -503,6 +578,13 @@ func (h *Handler) handleUndoDelete(ctx context.Context, undo, del *ap.Object, si
 	}
 	h.logger.Info("object restored upstream; re-materializing", "ap_id", targetID)
 	if _, err = h.mat.HandleUpdate(ctx, restored, boundCommunityIRI); err != nil {
+		// A comment whose mapping was live before the Undo still has its
+		// record: there is no deleted state to roll back to, and soft-deleting
+		// the mapping would strand a live record. (A postv2 keeps the
+		// compensation below unconditionally.)
+		if !wasDeleted && mapping.Collection == materialize.CollectionComment {
+			return err
+		}
 		// Compensation, for EVERY error class. The mapping's soft delete is
 		// already cleared and its record was deleted from the repo, so leaving
 		// the mapping live strands it WITHOUT a record (downstream
@@ -544,6 +626,41 @@ func (h *Handler) handleUndoDelete(ctx context.Context, undo, del *ap.Object, si
 		if err := h.mat.RestorePost(ctx, mapping); err != nil {
 			return err
 		}
+	}
+	if mapping.Collection == materialize.CollectionComment && announcer != nil && wasDeleted {
+		return h.liftBridgedCommentRemoval(ctx, undo, del, mapping)
+	}
+	return nil
+}
+
+// liftBridgedCommentRemoval handles the Undo of a community removal of a
+// bridged COMMENT: the same predicate that took the Delete
+// (moderateAnnouncedDelete), so a summary-less moderator removal is lifted too,
+// and an author's summary-less Undo of their own delete lifts nothing. The
+// removal left the record and mapping live, so what remains is deleting the
+// community's removal record. No acceptance is written (a comment has none),
+// and the delete is inert with no commit when no record stands, so a comment
+// deleted under the v1 path keeps today's restore and a re-delivered Undo
+// writes nothing. A failed delete is returned as is: retryable, never a skip.
+func (h *Handler) liftBridgedCommentRemoval(ctx context.Context, undo, del *ap.Object, mapping *store.APObjectMapping) error {
+	removal, err := h.deleteIsCommunityRemoval(ctx, del, mapping)
+	if err != nil {
+		return err
+	}
+	if !removal {
+		return nil
+	}
+	publisher, err := h.commentRemovalPublisher()
+	if err != nil {
+		return err
+	}
+	deleted, err := publisher.RestoreBridgedComment(ctx, mapping)
+	if err != nil {
+		return fmt.Errorf("ingest: restore bridged comment %s: %w", mapping.APID, err)
+	}
+	if deleted {
+		h.logger.Info("community lifted its removal of a bridged comment",
+			"ap_id", mapping.APID, "at_uri", mapping.ATURI, "activity", undo.ID)
 	}
 	return nil
 }

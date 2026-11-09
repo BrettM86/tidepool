@@ -76,6 +76,11 @@ func (s *stubMaterializer) HandleDeleteRecord(context.Context, string) error {
 	return nil
 }
 
+func (s *stubMaterializer) HandleAuthorDeleteRecord(context.Context, string) error {
+	s.t.Fatal("votes must never reach HandleAuthorDeleteRecord")
+	return nil
+}
+
 func (s *stubMaterializer) RefreshActor(context.Context, *ap.Object) (*store.BridgedActor, error) {
 	s.t.Fatal("votes must never reach RefreshActor")
 	return nil, nil

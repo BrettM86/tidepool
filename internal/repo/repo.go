@@ -26,6 +26,7 @@ import (
 	blockformat "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
 
+	"tidepool/internal/blobwithhold"
 	"tidepool/internal/errors"
 )
 
@@ -114,6 +115,10 @@ type Manager struct {
 	// the write path touches it, and only under the per-DID lock — see
 	// treecache.go for the coherence model.
 	treeCache *mstTreeCache
+
+	// withholds answers "may (DID, CID) be stored or served" for the blob
+	// paths, over the same database.
+	withholds *blobwithhold.Store
 }
 
 // Option customizes a Manager at construction. Options are additive; the
@@ -148,6 +153,7 @@ func NewManager(db *sql.DB, keys SigningKeys, logger *slog.Logger, opts ...Optio
 		logger:    logger,
 		locks:     make(map[string]*sync.Mutex),
 		treeCache: newTreeCache(DefaultTreeCacheSize),
+		withholds: blobwithhold.NewStore(db),
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -525,7 +531,50 @@ func (m *Manager) GetRecord(ctx context.Context, did, collection, rkey string) (
 		return nil, "", fmt.Errorf("repo: begin read tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	return getRecordIn(ctx, tx, did, path)
+}
 
+// GetRecordTx reads the current version of a record in the caller's
+// transaction, with GetRecord's root-to-leaf walk and errors. A commit side
+// effect uses it: the commit holds the global commit lock, so the read sees
+// every commit before it and none can land until it commits.
+func (m *Manager) GetRecordTx(ctx context.Context, tx *sql.Tx, did, collection, rkey string) (record map[string]any, recordCID string, err error) {
+	path, _, err := validatePath(did, collection, rkey)
+	if err != nil {
+		return nil, "", err
+	}
+	return getRecordIn(ctx, tx, did, path)
+}
+
+// WithCommitLock runs fn in a transaction that holds did's per-DID mutex and
+// the global commit advisory lock, then commits fn's writes. It makes no repo
+// commit and asks for no signing key, so it serves a reader that must see
+// every earlier commit and keep later ones out while it writes rows outside
+// the repo (with GetRecordTx for the reads). An error from fn rolls back.
+func (m *Manager) WithCommitLock(ctx context.Context, did string, fn func(ctx context.Context, tx *sql.Tx) error) error {
+	lock := m.lockFor(did)
+	lock.Lock()
+	defer lock.Unlock()
+
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("repo: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, commitAdvisoryLockKey); err != nil {
+		return fmt.Errorf("repo: take commit advisory lock: %w", err)
+	}
+	if err := fn(ctx, tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("repo: commit locked transaction for %s: %w", did, err)
+	}
+	return nil
+}
+
+// getRecordIn walks did's current tree to the record at path, reading in tx.
+func getRecordIn(ctx context.Context, tx *sql.Tx, did, path string) (map[string]any, string, error) {
 	state, err := readRepoState(ctx, tx, did, false)
 	if err != nil {
 		return nil, "", err
@@ -543,7 +592,7 @@ func (m *Manager) GetRecord(ctx context.Context, did, collection, rkey string) (
 	if err != nil {
 		return nil, "", fmt.Errorf("repo: read record block %s: %w", valCID, err)
 	}
-	record, err = atdata.UnmarshalCBOR(blk.RawData())
+	record, err := atdata.UnmarshalCBOR(blk.RawData())
 	if err != nil {
 		return nil, "", fmt.Errorf("repo: decode record %s: %w", valCID, err)
 	}

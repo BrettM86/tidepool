@@ -32,6 +32,7 @@ import (
 	"github.com/bluesky-social/indigo/atproto/syntax"
 
 	"tidepool/internal/ap"
+	"tidepool/internal/blobwithhold"
 	"tidepool/internal/errors"
 	"tidepool/internal/identity"
 	"tidepool/internal/nodeinfo"
@@ -510,6 +511,8 @@ func (m *Materializer) commitRecord(ctx context.Context, did, collection, rkey s
 		mapping.PublishedAt = &published
 	}
 
+	subjectURI := "at://" + did + "/" + collection + "/" + rkey
+
 	var stored *store.APObjectMapping
 	putMapping := func(ctx context.Context, tx *sql.Tx, res *repo.CommitResult) error {
 		mapping.CID = res.RecordCID
@@ -547,6 +550,29 @@ func (m *Materializer) commitRecord(ctx context.Context, did, collection, rkey s
 		// been carried forward from the very binding being checked.
 		if isContentCollection(collection) && stored.CommunityDID != communityDID {
 			return errCommunityBindingRaced
+		}
+		// A subject the community has removed gets a community-removal
+		// withhold for every blob of the record being committed, so an edit
+		// that swaps an image withholds the new one in the edit's own commit.
+		// The write is add-only: a CID the new record no longer references
+		// keeps its row, because its bytes stay stored under the author (a
+		// transient image fetch failure drops the ref, not the bytes) and
+		// lifting it would serve the removed image. Only a restore lifts. The
+		// removal is read here, in
+		// the commit's transaction under the global commit lock, so a removal
+		// or restore of the subject committed just before this one is seen.
+		code, removed, err := m.standingRemovalCode(ctx, tx, collection, subjectURI, mapping.CommunityDID)
+		if err != nil {
+			return err
+		}
+		if removed {
+			cids, err := committedBlobCIDs(record)
+			if err != nil {
+				return err
+			}
+			if err := blobwithhold.AddSubjectRemovalWithholds(ctx, tx, did, subjectURI, code, cids); err != nil {
+				return fmt.Errorf("materialize: withhold removed %s: %w", subjectURI, err)
+			}
 		}
 		return nil
 	}

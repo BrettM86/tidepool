@@ -26,8 +26,8 @@ import (
 //     instance admin, targeting the instance root: the user's content
 //     published before the ban goes from every community (records deleted);
 //   - a COMMUNITY ban announced by the community about a bridged user: their
-//     earlier postv2 in that community gets an author-banned removal, their
-//     earlier comments there are deleted.
+//     earlier postv2 and comments in that community each get an author-banned
+//     removal record; the records themselves stay.
 //
 // Only content published BEFORE the ban time goes (Block.published, else the
 // inbox event's received_at). Lemmy restores nothing on unban, so Undo{Block}
@@ -64,7 +64,7 @@ var (
 	ubBeforeBan4    = "2026-08-13T12:00:00Z"
 	ubAfterBan      = "2026-09-15T00:00:00Z"
 	ubWellAfterBan  = "2026-10-01T00:00:00Z"
-	ubLapsedExpiry  = "2026-09-08T00:00:00Z"
+	ubLapsedExpiry  = "2026-08-31T00:00:00Z" // before ubBanTime: over when received
 	ubUserDID       = testDIDFor("SmileMask", "programming.dev")
 	ubCommunityCDID = testDIDFor("technology", "lemmy.world")
 	ubCommunityDDID = testDIDFor(ubCommunityDName, "lemmy.world")
@@ -339,13 +339,29 @@ func postBlobCID(t *testing.T, h *harness, postID string) string {
 	ctx := context.Background()
 	mapping, err := h.objects.GetByAPID(ctx, postID)
 	require.NoError(t, err)
+	blobCID := storedPostBlobCID(t, h, postID)
+	_, _, err = h.manager.GetBlob(ctx, mapping.DID, blobCID)
+	require.NoError(t, err, "precondition: %s's blob is retrievable before the ban", postID)
+	return blobCID
+}
+
+// storedPostBlobCID reads the post's one image blob CID and requires its
+// bytes to be stored, without requiring them to be served (a
+// community-removed post's images are withheld).
+func storedPostBlobCID(t *testing.T, h *harness, postID string) string {
+	t.Helper()
+	ctx := context.Background()
+	mapping, err := h.objects.GetByAPID(ctx, postID)
+	require.NoError(t, err)
 	record, _, err := h.manager.GetRecord(ctx, mapping.DID, mapping.Collection, mapping.RKey)
 	require.NoError(t, err)
 	blobs := atdata.ExtractBlobs(record)
 	require.Len(t, blobs, 1, "precondition: %s carries exactly its own image blob", postID)
 	blobCID := cid.Cid(blobs[0].Ref).String()
-	_, _, err = h.manager.GetBlob(ctx, mapping.DID, blobCID)
-	require.NoError(t, err, "precondition: %s's blob is retrievable before the ban", postID)
+	var count int
+	require.NoError(t, h.db.QueryRowContext(ctx,
+		`SELECT count(*) FROM blobs WHERE did = $1 AND cid = $2`, mapping.DID, blobCID).Scan(&count))
+	require.Equal(t, 1, count, "precondition: %s's blob bytes are stored before the ban", postID)
 	return blobCID
 }
 
@@ -420,7 +436,7 @@ func TestASiteBanWithRemoveDataDeletesTheAuthorsEarlierContentEverywhere(t *test
 
 			blobC := postBlobCID(t, h, postInC)
 			blobD := postBlobCID(t, h, postInD)
-			blobRemoved := postBlobCID(t, h, removedPostInC)
+			blobRemoved := storedPostBlobCID(t, h, removedPostInC)
 			blobAfter := postBlobCID(t, h, postAfterBan)
 			require.Len(t, map[string]bool{blobC: true, blobD: true, blobRemoved: true, blobAfter: true}, 4,
 				"precondition: every post's image is its own blob")
@@ -572,21 +588,29 @@ func (w *upstreamBanWorld) legacyPostByOtherUser(t *testing.T) string {
 // postv2 in D, plus a post in C after the ban; WHEN C announces a Block of U
 // with removeData (permanent, or already lapsed) THEN U's pre-ban post in C is
 // withdrawn with an author-banned removal (U's record itself stays), the
-// pre-ban comment in C is deleted, and D and the post-ban post are untouched.
-// U's later content in C still materializes (no ban row is written for a
-// foreign subject), and Undo{Block} restores nothing.
+// pre-ban comment in C gets an author-banned removal record (its record stays
+// too), and D and the post-ban post are untouched.
+// U's later content in C still materializes (no community_bans row is written
+// for a foreign subject), and Undo{Block} restores nothing.
+//
+// It also owns the ban record of a minted bridged person (chunk 04 B5): an
+// in-force Block, with or without removeData, writes a
+// social.coves.moderation.ban record into C's repo at U's digest rkey, so
+// Coves can enforce the ban; the content outcome is unchanged by it.
 func TestACommunityBanOfABridgedUserRemovesTheirEarlierContentThere(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		subject string
 		extra   map[string]any
 		removes bool
+		// banRecord: the Block writes a ban record for U in C's repo.
+		banRecord bool
 	}{
-		{name: "permanent ban", subject: ubUserID, removes: true},
+		{name: "permanent ban", subject: ubUserID, removes: true, banRecord: true},
 		{name: "ban already lapsed when it arrived", subject: ubUserID,
 			extra: map[string]any{"expires": ubLapsedExpiry}, removes: true},
 		{name: "removeData false", subject: ubUserID,
-			extra: map[string]any{"removeData": false}, removes: false},
+			extra: map[string]any{"removeData": false}, removes: false, banRecord: true},
 		{name: "subject is neither a persona nor a bridged actor", subject: ubUnknownID, removes: false},
 		// A bridged Group's DID is its community repo: "its content" would be
 		// every post in C, whoever wrote it.
@@ -609,6 +633,20 @@ func TestACommunityBanOfABridgedUserRemovesTheirEarlierContentThere(t *testing.T
 			assertProcessed(t, h, banID)
 			assert.Zero(t, bansIn(t, h.db, ubCommunityCDID),
 				"a ban of a bridged Lemmy user records no community_bans row: there is no future gate")
+			record, _, recordStands := banRecord(t, h, ubCommunityCDID, ubUserDID)
+			if tc.banRecord {
+				require.True(t, recordStands,
+					"an in-force Block of minted bridged person U writes U's ban record into C's repo: %s", tc.name)
+				assertBanRecordFields(t, record, ubUserDID, "Spam", nil)
+			} else {
+				assert.False(t, recordStands, "no ban record for U: %s", tc.name)
+			}
+			wantBanRecords := 0
+			if tc.banRecord {
+				wantBanRecords = 1
+			}
+			assert.Equal(t, wantBanRecords, banRecordCount(t, h, ubCommunityCDID),
+				"no ban record for anyone else: %s", tc.name)
 
 			if tc.removes {
 				assert.False(t, acceptanceExists(t, h, ubCommunityCDID, postInC),
@@ -619,7 +657,9 @@ func TestACommunityBanOfABridgedUserRemovesTheirEarlierContentThere(t *testing.T
 				require.NoError(t, err)
 				_, _, err = h.manager.GetRecord(ctx, ubUserDID, materialize.CollectionPostV2, mapping.RKey)
 				assert.NoError(t, err, "U's postv2 record itself stays: a community ban is community-scoped")
-				assertDeleted(t, h, commentInC, "pre-ban comment in C")
+				assertLive(t, h, commentInC, "a community ban leaves the pre-ban comment's record")
+				assert.Equal(t, materialize.RemovalCodeAuthorBanned, removalCode(t, h, ubCommunityCDID, commentInC),
+					"C records the pre-ban comment's removal: its author was banned")
 			} else {
 				assert.True(t, acceptanceExists(t, h, ubCommunityCDID, postInC), "nothing removed: %s", tc.name)
 				assert.Empty(t, removalCode(t, h, ubCommunityCDID, postInC), "no removal record: %s", tc.name)
@@ -645,7 +685,8 @@ func TestACommunityBanOfABridgedUserRemovesTheirEarlierContentThere(t *testing.T
 				assert.False(t, acceptanceExists(t, h, ubCommunityCDID, postInC), "Undo{Block} restores nothing")
 				assert.Equal(t, materialize.RemovalCodeAuthorBanned, removalCode(t, h, ubCommunityCDID, postInC),
 					"the removal record remains after Undo{Block}")
-				assertDeleted(t, h, commentInC, "Undo{Block} restores nothing")
+				assert.Equal(t, materialize.RemovalCodeAuthorBanned, removalCode(t, h, ubCommunityCDID, commentInC),
+					"the comment's removal record remains after Undo{Block}")
 			}
 		})
 	}
@@ -808,15 +849,16 @@ func TestAnUpstreamBanKeepsAnImageBlobAnotherLiveRecordStillUses(t *testing.T) {
 	assert.True(t, errors.IsNotFound(err), "image X goes once its last referencing record is deleted; err=%v", err)
 }
 
-// TestACommunityBanDeletesACommentWhoseThreadRootWasAlreadyDeleted (B3, review).
+// TestACommunityBanRemovesACommentWhoseThreadRootWasAlreadyDeleted (B3, review).
 //
 // GIVEN bridged user U's postv2 P in C and bridged user V's comment on P, whose
 // mapping records no community (the pre-016 shape), both published before
 // either ban; WHEN U's home admin site-bans U (deleting P's record while P's
 // mapping keeps its community binding) and THEN C announces a ban of V with
-// removeData THEN V's comment is still found to be C's content and deleted: a
-// thread root already gone must not shield the replies under it.
-func TestACommunityBanDeletesACommentWhoseThreadRootWasAlreadyDeleted(t *testing.T) {
+// removeData THEN V's comment is still found to be C's content and gets C's
+// author-banned removal record (its record stays): a thread root already gone
+// must not shield the replies under it.
+func TestACommunityBanRemovesACommentWhoseThreadRootWasAlreadyDeleted(t *testing.T) {
 	world := newUpstreamBanWorld(t)
 	h := world.h
 	ctx := context.Background()
@@ -841,6 +883,7 @@ func TestACommunityBanDeletesACommentWhoseThreadRootWasAlreadyDeleted(t *testing
 		time.Date(2026, 9, 5, 0, 0, 0, 0, time.UTC))
 	assertProcessed(t, h, communityBanID)
 
-	assertDeleted(t, h, otherComment,
-		"V's pre-ban comment in C, its community resolved through a thread root that is already deleted")
+	assertLive(t, h, otherComment, "a community ban leaves V's comment record")
+	assert.Equal(t, materialize.RemovalCodeAuthorBanned, removalCode(t, h, ubCommunityCDID, otherComment),
+		"V's pre-ban comment in C is removed there, its community resolved through a thread root that is already deleted")
 }

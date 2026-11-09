@@ -26,16 +26,16 @@ func NewCommunityBans(db *sql.DB) CommunityBans {
 	return &postgresCommunityBans{db: db}
 }
 
-func (r *postgresCommunityBans) Ban(ctx context.Context, ban CommunityBan) (cancelled int64, err error) {
+func (r *postgresCommunityBans) Ban(ctx context.Context, ban CommunityBan) (cancelled int64, refused bool, err error) {
 	switch {
 	case ban.CommunityDID == "":
-		return 0, errors.NewValidationError("community_did", "must not be empty")
+		return 0, false, errors.NewValidationError("community_did", "must not be empty")
 	case ban.SubjectDID == "":
-		return 0, errors.NewValidationError("subject_did", "must not be empty")
+		return 0, false, errors.NewValidationError("subject_did", "must not be empty")
 	case ban.CommunityAPID == "":
 		// The delivery side has no other handle for this community, so a ban
 		// stored without it is one the queue can never apply.
-		return 0, errors.NewValidationError("community_ap_id", "must not be empty")
+		return 0, false, errors.NewValidationError("community_ap_id", "must not be empty")
 	}
 
 	// ONE TRANSACTION, because the two writes are one decision. The row is what
@@ -46,7 +46,7 @@ func (r *postgresCommunityBans) Ban(ctx context.Context, ban CommunityBan) (canc
 	// cancellation, because Lemmy sends the Block exactly once.
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, fmt.Errorf("ban %q in %q: begin: %w", ban.SubjectDID, ban.CommunityDID, err)
+		return 0, false, fmt.Errorf("ban %q in %q: begin: %w", ban.SubjectDID, ban.CommunityDID, err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
@@ -98,13 +98,15 @@ func (r *postgresCommunityBans) Ban(ctx context.Context, ban CommunityBan) (canc
 		ban.CommunityDID, ban.SubjectDID, ban.CommunityAPID,
 		ban.ExpiresAt, ban.Reason, ban.RemoveData).Scan(&inForce); err != nil {
 		if !stderrors.Is(err, sql.ErrNoRows) {
-			return 0, fmt.Errorf("ban %q in %q: %w", ban.SubjectDID, ban.CommunityDID, err)
+			return 0, false, fmt.Errorf("ban %q in %q: %w", ban.SubjectDID, ban.CommunityDID, err)
 		}
 		// The guard refused: a lapsed Block over a ban that is still in force.
 		// Nothing was written and nothing may be cancelled — the exclusion that
 		// stands is not this activity's, and it did its own cancelling when it
-		// landed.
+		// landed. The caller is told, so it does not act on a write that did not
+		// happen.
 		inForce = false
+		refused = true
 	}
 
 	// THE ROW IS RECORDED EITHER WAY (unless it would weaken a standing ban);
@@ -121,13 +123,13 @@ func (r *postgresCommunityBans) Ban(ctx context.Context, ban CommunityBan) (canc
 	if inForce {
 		cancelled, err = cancelPendingForActorInCommunity(ctx, tx, ban.SubjectDID, ban.CommunityAPID)
 		if err != nil {
-			return 0, err
+			return 0, false, err
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("ban %q in %q: commit: %w", ban.SubjectDID, ban.CommunityDID, err)
+		return 0, false, fmt.Errorf("ban %q in %q: commit: %w", ban.SubjectDID, ban.CommunityDID, err)
 	}
-	return cancelled, nil
+	return cancelled, refused, nil
 }
 
 func (r *postgresCommunityBans) Lift(ctx context.Context, communityDID, subjectDID string,
@@ -218,4 +220,35 @@ func standingBan(ctx context.Context, q queryRower, communityDID, subjectDID str
 		return false, fmt.Errorf("read ban on %q in %q: %w", subjectDID, communityDID, err)
 	}
 	return standing, nil
+}
+
+func (r *postgresCommunityBans) ListInForce(ctx context.Context) ([]CommunityBan, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT community_did, subject_did, community_ap_id, expires_at, reason, remove_data, banned_at
+		  FROM community_bans
+		 WHERE expires_at IS NULL OR expires_at > now()
+		 ORDER BY community_did, subject_did`)
+	if err != nil {
+		return nil, fmt.Errorf("list bans in force: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var bans []CommunityBan
+	for rows.Next() {
+		var ban CommunityBan
+		var expiresAt sql.NullTime
+		if err := rows.Scan(&ban.CommunityDID, &ban.SubjectDID, &ban.CommunityAPID, &expiresAt,
+			&ban.Reason, &ban.RemoveData, &ban.BannedAt); err != nil {
+			return nil, fmt.Errorf("scan ban in force: %w", err)
+		}
+		if expiresAt.Valid {
+			when := expiresAt.Time
+			ban.ExpiresAt = &when
+		}
+		bans = append(bans, ban)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list bans in force: %w", err)
+	}
+	return bans, nil
 }

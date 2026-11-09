@@ -53,6 +53,13 @@ type AdminOptions struct {
 	// Repos serves POST /admin/reemit (optional; the endpoint answers 501
 	// when nil). See reemit.go for what re-emission is for.
 	Repos RepoReemitter
+	// Bans reads standing ban records for POST /admin/reemit, which skips a
+	// comment whose author is banned in its community (the endpoint answers
+	// 501 unless Repos, Bans and Objects are all set).
+	Bans StandingBanReader
+	// Objects reads a comment's stored mapping for POST /admin/reemit, whose
+	// recorded community decides which ban applies.
+	Objects APObjectMappingReader
 	// Sweeper serves POST /admin/objects/sweep-deleted (optional; the
 	// endpoint answers 501 when nil). See sweep.go.
 	Sweeper DeleteSweeper
@@ -61,8 +68,9 @@ type AdminOptions struct {
 	// POST /admin/outbound/redrive resets poisoned rows, POST
 	// /admin/outbound/cancel parks an actor's or community's pending work.
 	Deliveries store.OutboundDeliveries
-	// BanReplayer serves POST /admin/inbox/replay-bans (optional; the
-	// endpoint answers 501 when nil). See upstream_ban.go.
+	// BanReplayer serves POST /admin/inbox/replay-bans and POST
+	// /admin/moderation/backfill-ban-records (optional; both answer 501 when
+	// nil). See upstream_ban.go and ban_record_backfill.go.
 	BanReplayer *BanReplayer
 	// APActors are the native (Coves-user) actors POST /admin/actors/purge
 	// looks up (optional; the endpoint answers 501 when nil).
@@ -92,6 +100,8 @@ type AdminOptions struct {
 //	POST   /admin/reemit                {"did":"did:plc:..."} (or {} for all)
 //	POST   /admin/objects/sweep-deleted {"ap_ids":["https://..."]}
 //	POST   /admin/inbox/replay-bans     {"dry_run":true} (or false)
+//	POST   /admin/moderation/backfill-removal-withholds {"dry_run":true} (or false)
+//	POST   /admin/moderation/backfill-ban-records {"dry_run":true} (or false)
 //	POST   /admin/actors/purge          {"did":"did:plc:...","dryRun":true} (or false)
 //	GET    /admin/divergence            (reconciliation report; READ-ONLY)
 //	GET    /admin/metrics               (tidepool's own expvar counters)
@@ -106,6 +116,8 @@ type Admin struct {
 	service     *ap.ServiceActor
 	backfill    Backfiller
 	repos       RepoReemitter
+	bans        StandingBanReader
+	objects     APObjectMappingReader
 	sweeper     DeleteSweeper
 	deliveries  store.OutboundDeliveries
 	banReplayer *BanReplayer
@@ -198,6 +210,8 @@ func NewAdmin(opts AdminOptions) (*Admin, error) {
 		service:     opts.Service,
 		backfill:    opts.Backfill,
 		repos:       opts.Repos,
+		bans:        opts.Bans,
+		objects:     opts.Objects,
 		sweeper:     opts.Sweeper,
 		deliveries:  opts.Deliveries,
 		banReplayer: opts.BanReplayer,
@@ -228,6 +242,8 @@ func (a *Admin) Routes(r chi.Router) {
 		r.Post("/reemit", a.handleReemit)
 		r.Post("/objects/sweep-deleted", a.handleSweepDeleted)
 		r.Post("/inbox/replay-bans", a.handleReplayBans)
+		r.Post("/moderation/backfill-removal-withholds", a.handleBackfillRemovalWithholds)
+		r.Post("/moderation/backfill-ban-records", a.handleBackfillBanRecords)
 		r.Post("/actors/purge", a.handleActorPurge)
 		r.Get("/divergence", a.handleDivergence)
 		r.Get("/outbound", a.handleOutboundInspect)

@@ -6,6 +6,7 @@ import (
 	stderrors "errors"
 	"fmt"
 	"slices"
+	"time"
 
 	"github.com/lib/pq"
 
@@ -76,24 +77,25 @@ func (r *postgresObjectModeration) SetLock(ctx context.Context, object Moderated
 	return nil
 }
 
-func (r *postgresObjectModeration) SetRemoval(ctx context.Context, object ModeratedObject, code, reason string) error {
+func (r *postgresObjectModeration) SetRemoval(ctx context.Context, object ModeratedObject, code, reason string) (time.Time, error) {
 	if object.ATURI == "" {
-		return errors.NewValidationError("at_uri", "must not be empty")
+		return time.Time{}, errors.NewValidationError("at_uri", "must not be empty")
 	}
 	if object.APID == "" {
-		return errors.NewValidationError("ap_id", "must not be empty")
+		return time.Time{}, errors.NewValidationError("ap_id", "must not be empty")
 	}
 	if object.CommunityDID == "" {
 		// Same rule as a lock: an unbound decision is one any co-hosted
 		// community's Undo could lift.
-		return errors.NewValidationError("community_did", "must not be empty")
+		return time.Time{}, errors.NewValidationError("community_did", "must not be empty")
 	}
 	if code == "" {
 		// A removal with no code is a decision with no machine-readable why, and
 		// the admin surface reading this row has nothing else to go on.
-		return errors.NewValidationError("removal_code", "must not be empty")
+		return time.Time{}, errors.NewValidationError("removal_code", "must not be empty")
 	}
-	if _, err := r.db.ExecContext(ctx, `
+	var removedAt time.Time
+	if err := r.db.QueryRowContext(ctx, `
 		INSERT INTO object_moderation (
 			at_uri, ap_id, community_did, removed_at, removal_code, removal_reason)
 		VALUES ($1, $2, $3, now(), $4, $5)
@@ -106,11 +108,12 @@ func (r *postgresObjectModeration) SetRemoval(ctx context.Context, object Modera
 			removed_at = COALESCE(object_moderation.removed_at, EXCLUDED.removed_at),
 			removal_code = EXCLUDED.removal_code,
 			removal_reason = EXCLUDED.removal_reason,
-			updated_at = now()`,
-		object.ATURI, object.APID, object.CommunityDID, code, reason); err != nil {
-		return fmt.Errorf("record removal of %q: %w", object.ATURI, err)
+			updated_at = now()
+		RETURNING removed_at`,
+		object.ATURI, object.APID, object.CommunityDID, code, reason).Scan(&removedAt); err != nil {
+		return time.Time{}, fmt.Errorf("record removal of %q: %w", object.ATURI, err)
 	}
-	return nil
+	return removedAt, nil
 }
 
 func (r *postgresObjectModeration) ClearRemoval(ctx context.Context, atURI, communityDID string) (bool, error) {
@@ -170,6 +173,32 @@ func (r *postgresObjectModeration) LockedAmong(ctx context.Context, atURIs ...st
 		return "", fmt.Errorf("read lock state for %v: %w", candidates, err)
 	}
 	return locked, nil
+}
+
+func (r *postgresObjectModeration) RemovedAmong(ctx context.Context, atURIs ...string) (string, error) {
+	candidates := make([]string, 0, len(atURIs))
+	for _, atURI := range atURIs {
+		if atURI != "" && !slices.Contains(candidates, atURI) {
+			candidates = append(candidates, atURI)
+		}
+	}
+	if len(candidates) == 0 {
+		return "", nil
+	}
+	var removed string
+	err := r.db.QueryRowContext(ctx, `
+		SELECT at_uri FROM object_moderation
+		 WHERE at_uri = ANY($1) AND removed_at IS NOT NULL
+		 LIMIT 1`, pq.Array(candidates)).Scan(&removed)
+	if stderrors.Is(err, sql.ErrNoRows) {
+		// No standing removal on any of them, which is true of almost every
+		// object: a complete answer, not a NotFound.
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read removal state for %v: %w", candidates, err)
+	}
+	return removed, nil
 }
 
 func (r *postgresObjectModeration) CommunityHoldsAnyLock(ctx context.Context, communityDID string) (bool, error) {

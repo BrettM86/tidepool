@@ -13,6 +13,25 @@ import (
 	"tidepool/internal/store"
 )
 
+// CommentRemovalPublisher writes and deletes a community's removal record for
+// one comment in the community's repo. *materialize.Materializer implements it;
+// it is obtained by type assertion for the same reason AuthorModerator is.
+type CommentRemovalPublisher interface {
+	// WriteCommentRemoval writes (or rewrites) the removal record at the digest
+	// rkey of commentURI, with createdAt as given. written is false when the
+	// identical record already stood and no commit was made.
+	WriteCommentRemoval(ctx context.Context, communityDID, commentURI, commentCID, code, reason string, createdAt time.Time) (written bool, err error)
+	// DeleteCommentRemoval deletes that record. deleted is false, with no
+	// commit, when none stands.
+	DeleteCommentRemoval(ctx context.Context, communityDID, commentURI string) (deleted bool, err error)
+	// RemoveBridgedComment writes the removal record for a bridged Lemmy
+	// comment into the community owning its thread, leaving the comment alone.
+	RemoveBridgedComment(ctx context.Context, mapping *store.APObjectMapping, code, reason string) error
+	// RestoreBridgedComment deletes that record. deleted is false, with no
+	// commit, when none stands.
+	RestoreBridgedComment(ctx context.Context, mapping *store.APObjectMapping) (deleted bool, err error)
+}
+
 // AuthorModerator removes every post one author has ACCEPTED in one community —
 // a ban's `removeData: true`. *materialize.Materializer implements it.
 //
@@ -45,11 +64,11 @@ var (
 	// ban, which this scope does not model. A home site ban arrives directly
 	// instead and is decided by decideSiteBan.
 	BlockUnscopedTarget = expvar.NewInt("tidepool_block_unscoped_target")
-	// BlockForeignSubject counts announced Blocks naming somebody who is not one
-	// of our personas and that remove nothing: e.g. an unknown actor, or a
-	// bridged Lemmy user banned without removeData (or unbanned). The ban itself is
-	// enforced on their instance and we hold no state that could apply it; only
-	// its removeData reaches content we host (see decideCommunityBan).
+	// BlockForeignSubject counts announced Blocks and Undo{Block}s naming a
+	// bridged actor that is not a Person (a bridged Group, whose DID is a
+	// community repo rather than an account). A Lemmy user the bridge never
+	// minted is counted by BlockUnmintedSubject instead, and a minted bridged
+	// person gets a ban record (see handleBridgedSubjectBlock).
 	BlockForeignSubject = expvar.NewInt("tidepool_block_foreign_subject")
 	// BlockLapsedIgnored counts announced Blocks whose expiry had already passed
 	// when they arrived — a description of a ban that is over, applied to
@@ -110,12 +129,16 @@ func (h *Handler) ignoreDirectBlock(block *ap.Object, signer, reason string) err
 const directBlockIgnoredReason = "a directly delivered Block other than a home site ban with " +
 	"removeData authorizes nothing here"
 
-// handleBlock applies an announced Block — a community banning a native author —
-// and, with banned=false, the Undo that lifts it. An announced ban of a BRIDGED
-// Lemmy user with removeData removes their content published before the ban
-// time (the Block's `published` when earlier than receipt, else receivedAt) from
-// this community, and records no ban (see decideCommunityBan); an unban of one
-// restores nothing.
+// handleBlock applies an announced Block — a community banning a native author
+// or a bridged person — and, with banned=false, the Undo that lifts it. Either
+// way an in-force ban is published as a social.coves.moderation.ban record in
+// the community repo, and its Undo deletes that record under the stale-unban
+// rule. A native author's ban is also stored in community_bans (applyBan,
+// liftBan). A BRIDGED person's ban stores no row, and with removeData removes
+// their content published before the ban time (the Block's `published` when
+// earlier than receipt, else receivedAt) from this community (see
+// handleBridgedSubjectBlock); an unban of one restores no content. A subject
+// the bridge never minted is skipped and counted.
 //
 // A BAN IS AN INTERSECTION: this author, in this community. Both halves are
 // recorded, because both readers need one each — the admission gate holds a
@@ -135,7 +158,9 @@ const directBlockIgnoredReason = "a directly delivered Block other than a home s
 // and is decided by decideSiteBan). They are different findings and get
 // different reasons.
 //
-// activityID is the id of the Announce that carried a ban; an unban passes "".
+// activityID is the id of the Announce that carried a ban, and receivedAt the
+// time the inbox received it (a ban record's createdAt); an unban passes "" and
+// the zero time.
 func (h *Handler) handleBlock(ctx context.Context, block *ap.Object, announcer *store.Community, banned bool, activityID string, receivedAt time.Time) error {
 	if announcer == nil {
 		// Unreachable from the dispatch (a bare Block is taken by Process's
@@ -165,26 +190,13 @@ func (h *Handler) handleBlock(ctx context.Context, block *ap.Object, announcer *
 		return fmt.Errorf("ingest: identify ban subject %s: %w", subjectAPID, err)
 	}
 	if identity.Class != echo.ClassLocalActor || identity.DID == "" {
-		if banned {
-			ban, err := h.decideCommunityBan(ctx, block, announcer, activityID, receivedAt)
-			if err != nil {
-				return err
-			}
-			if ban != nil {
-				return h.removeBannedContent(ctx, ban)
-			}
-		}
-		BlockForeignSubject.Add(1)
-		return skip(block.ID,
-			"announced Block names an actor that is not one of our personas and removes nothing "+
-				"we host: a Lemmy user's ban from a Lemmy community is enforced entirely on their "+
-				"instance, and only its removeData reaches bridged content")
+		return h.handleBridgedSubjectBlock(ctx, block, announcer, banned, activityID, receivedAt)
 	}
 
 	if !banned {
 		return h.liftBan(ctx, block, announcer, identity.DID)
 	}
-	return h.applyBan(ctx, block, announcer, identity.DID)
+	return h.applyBan(ctx, block, announcer, identity.DID, receivedAt)
 }
 
 // refuseBlockTarget decides an announced Block whose target is not the
@@ -221,13 +233,20 @@ func (h *Handler) refuseBlockTarget(ctx context.Context, block *ap.Object, targe
 			"ruling about its OWN space", target, announcer.APGroupID))
 }
 
-// applyBan records the exclusion and acts on everything it implies.
-func (h *Handler) applyBan(ctx context.Context, block *ap.Object, announcer *store.Community, subjectDID string) error {
+// applyBan records the exclusion and acts on everything it implies. A ban in
+// force is also published as the community's ban record, createdAt receivedAt;
+// a Block that lapsed before it arrived writes no record and leaves a standing
+// one as it is.
+func (h *Handler) applyBan(ctx context.Context, block *ap.Object, announcer *store.Community, subjectDID string, receivedAt time.Time) error {
 	if h.bans == nil {
 		// Loud and retryable, never a skip: a ban we cannot store is one that
 		// stops nothing from the author's next post onward, and marking the
 		// event processed would leave the community believing we honoured it.
 		return fmt.Errorf("ingest: no community-ban store is wired, so this ban cannot be recorded")
+	}
+	publisher, err := h.banRecordPublisher()
+	if err != nil {
+		return err
 	}
 	// THE EXPIRY IS DECIDED BEFORE ANY CONSEQUENCE, because every consequence
 	// below is irreversible: cancelled deliveries are never re-queued, and
@@ -267,7 +286,13 @@ func (h *Handler) applyBan(ctx context.Context, block *ap.Object, announcer *sto
 	// exclusion that has already ended is unrecoverable damage done on behalf of
 	// a decision that expired. The cancellation is gated inside Ban() (one place,
 	// beside the statement); the purge is gated here.
-	lapsed := expiry != nil && expiry.Valid && !expiry.After(timeNow())
+	//
+	// The RECORD decision is judged at RECEIPT, not at this attempt: a ban in
+	// force when it arrived stays so on a retry that runs after its expiry.
+	// Judged at retry time, a replacement whose row committed but whose record
+	// write failed would skip the record, leaving the ban it replaced enforced
+	// on Coves indefinitely. The PURGE is judged at processing time (below).
+	lapsed := expiry != nil && expiry.Valid && !expiry.After(banCreatedAt(receivedAt))
 
 	ban := store.CommunityBan{
 		CommunityDID:  announcer.DID,
@@ -287,24 +312,51 @@ func (h *Handler) applyBan(ctx context.Context, block *ap.Object, announcer *sto
 	// The row and the cancellation of already-queued work commit together (see
 	// store.CommunityBans.Ban): the first stops the author's next post, the
 	// second stops the ones the queue is holding.
-	cancelled, err := h.bans.Ban(ctx, ban)
+	cancelled, refused, err := h.bans.Ban(ctx, ban)
 	if err != nil {
 		return fmt.Errorf("ingest: record ban on %s in %s: %w", subjectDID, announcer.APGroupID, err)
 	}
 	h.logger.Info("community banned a native author",
 		"community", announcer.APGroupID, "subject_did", subjectDID,
 		"expires", ban.ExpiresAt, "remove_data", ban.RemoveData,
-		"lapsed", lapsed, "cancelled_deliveries", cancelled, "activity", block.ID)
+		"lapsed", lapsed, "refused", refused, "cancelled_deliveries", cancelled, "activity", block.ID)
 
 	if lapsed {
 		BlockLapsedIgnored.Add(1)
 		return skip(block.ID,
 			"announced Block expired before it arrived: the ban is recorded as sent (unless a "+
 				"ban that IS in force stands for this author here, which a lapsed replay may not "+
-				"weaken), but it is not in force — nothing was cancelled and nothing was removed, "+
-				"because both are irreversible and this exclusion is already over")
+				"weaken), but it is not in force — nothing was cancelled, nothing was removed and "+
+				"no ban record was written, because this exclusion is already over")
+	}
+	if refused {
+		// In force at receipt but expired by the time Ban() ran on the database's
+		// clock, over a ban still in force: the guard kept the standing row, so
+		// the record stays with it. An expired record over that row would have
+		// Coves read the ban as over while the row keeps enforcing it.
+		return skip(block.ID,
+			"announced Block expired before it was processed and a ban that IS in force stands "+
+				"for this author here: the standing ban, its row and its ban record were left "+
+				"alone, and nothing was cancelled or removed")
+	}
+	// Published after the row, so a failed write retries the whole event: Ban()
+	// is idempotent, and the retry's identical createdAt rebuilds the same
+	// record. A failure is retryable, never a skip: a ban Coves never sees is
+	// one it never enforces.
+	if _, err := publisher.WriteBanRecord(ctx, announcer.DID, subjectDID, block.Summary, ban.ExpiresAt,
+		banCreatedAt(receivedAt)); err != nil {
+		return fmt.Errorf("ingest: publish ban of %s in %s: %w", subjectDID, announcer.APGroupID, err)
 	}
 	if !ban.RemoveData {
+		return nil
+	}
+	if expiry != nil && !expiry.After(timeNow()) {
+		// Over by now (a retry, or a late first attempt): the purge has no time
+		// cutoff, so running it would also remove posts admitted after the ban
+		// ended, and a removal is terminal.
+		h.logger.Info("ban carried removeData but has expired since it arrived; nothing was removed",
+			"community", announcer.APGroupID, "subject_did", subjectDID,
+			"expires", ban.ExpiresAt, "activity", block.ID)
 		return nil
 	}
 	if h.authorMod == nil {
@@ -343,9 +395,22 @@ func (h *Handler) applyBan(ctx context.Context, block *ap.Object, announcer *sto
 // nobody reversed and push the author's posts back at the community that removed
 // them — the same harm as reversing a removal on an author's edit, arriving by
 // another door.
+//
+// THE BAN RECORD IS DELETED AFTER THE LIFT, and also when the lift finds no
+// ban to lift (but not when it refuses a stale Undo). The row and the record
+// are two writes in two stores, so a failed record delete (or a crash between
+// them) leaves the record behind with the row already gone; the retry, or a
+// re-delivered Undo, then finds nothing to lift and must still finish the job.
+// With no record at the subject's rkey the delete commits nothing. A failed
+// delete is RETRYABLE, never a skip: a record left standing is a ban Coves
+// keeps enforcing after the moderators lifted it.
 func (h *Handler) liftBan(ctx context.Context, block *ap.Object, announcer *store.Community, subjectDID string) error {
 	if h.bans == nil {
 		return fmt.Errorf("ingest: no community-ban store is wired, so this ban cannot be lifted")
+	}
+	publisher, err := h.banRecordPublisher()
+	if err != nil {
+		return err
 	}
 	// The expiry the UNDONE Block names, which is the only description of the
 	// reversed ban an Undo carries — and therefore the only thing that can tell a
@@ -355,11 +420,7 @@ func (h *Handler) liftBan(ctx context.Context, block *ap.Object, announcer *stor
 	// ban nobody asked for, while here the worst case is the pre-existing
 	// behaviour (an unconditional lift), and refusing would leave an author
 	// excluded by a ban the moderators have already reversed.
-	var undoneExpiry *time.Time
-	if expiry := block.BanExpiry(); expiry != nil && expiry.Valid {
-		when := expiry.Time
-		undoneExpiry = &when
-	}
+	undoneExpiry := undoneBanExpiry(block)
 	lifted, retained, err := h.bans.Lift(ctx, announcer.DID, subjectDID, undoneExpiry)
 	if err != nil {
 		return fmt.Errorf("ingest: lift ban on %s in %s: %w", subjectDID, announcer.APGroupID, err)
@@ -381,7 +442,21 @@ func (h *Handler) liftBan(ctx context.Context, block *ap.Object, announcer *stor
 				"re-ban would lift it permanently and Lemmy will send no second Block",
 			subjectDID, announcer.APGroupID, undoneExpiry))
 	}
+	recordDeleted, err := publisher.DeleteBanRecord(ctx, announcer.DID, subjectDID)
+	if err != nil {
+		return fmt.Errorf("ingest: delete ban record of %s from %s: %w", subjectDID, announcer.APGroupID, err)
+	}
 	if !lifted {
+		if recordDeleted {
+			// The completion of an earlier, partly applied unban: the lift
+			// landed then and the record delete did not.
+			h.logger.Info("completed a native author's unban: deleted the ban record an earlier attempt left",
+				"community", announcer.APGroupID, "subject_did", subjectDID, "activity", block.ID)
+			return skip(block.ID, fmt.Sprintf(
+				"announced Undo{Block} for %s in %s, whose community_bans row was already lifted: "+
+					"the ban record left in the community repo is deleted",
+				subjectDID, announcer.APGroupID))
+		}
 		return skip(block.ID, fmt.Sprintf(
 			"announced Undo{Block} for %s in %s, which held no standing ban: nothing to lift "+
 				"(a re-delivered undo, or one for a ban that lapsed on its own)",
@@ -447,12 +522,14 @@ func (h *Handler) moderationState() (store.ObjectModeration, error) {
 // announcing community owns this mapping (the same conjunction the lock path
 // uses), and a second copy of that rule is a second place for it to drift.
 //
-// NOTHING COVES-VISIBLE IS WRITTEN, deliberately: the removal lexicon is
-// post-scoped, the comment-subject extension is Coves-owned and has not landed,
-// and inventing a record shape here would publish a vocabulary the read path
-// does not consult — a moderation decision that looks honored and hides nothing.
-// The skip reason says so, because that gap is the whole of what an operator
-// needs to know about this path today.
+// The decision is then PUBLISHED Coves-side: a social.coves.community.removal
+// record in the community's repo (announcer.DID) at the digest rkey of the
+// comment's at-uri, whose createdAt is object_moderation.removed_at — the
+// original removal time, kept across redeliveries, so a redelivered Delete
+// rebuilds identical bytes and commits nothing. The comment itself lives in its
+// author's repo, which the bridge cannot write, so the community repo is the
+// only place the removal goes. A failed write is RETRYABLE: the bridge-side row
+// already stands, and a re-run re-records it idempotently and writes the record.
 func (h *Handler) moderateNativeComment(ctx context.Context, del *ap.Object,
 	mapping *store.APObjectMapping, announcer *store.Community) error {
 
@@ -468,23 +545,45 @@ func (h *Handler) moderateNativeComment(ctx context.Context, del *ap.Object,
 	if err != nil {
 		return err
 	}
+	publisher, err := h.commentRemovalPublisher()
+	if err != nil {
+		return err
+	}
 	// announcer.DID is the community authorizeDelete just proved owns this
 	// mapping, so the row is bound to the community that made the decision.
-	if err := moderation.SetRemoval(ctx, store.ModeratedObject{
+	removedAt, err := moderation.SetRemoval(ctx, store.ModeratedObject{
 		ATURI:        mapping.ATURI,
 		APID:         mapping.APID,
 		CommunityDID: announcer.DID,
-	}, materialize.RemovalCodeModeratorDiscretion, del.Summary); err != nil {
+	}, materialize.RemovalCodeModeratorDiscretion, del.Summary)
+	if err != nil {
 		return fmt.Errorf("ingest: record removal of %s: %w", mapping.ATURI, err)
 	}
+	if _, err := publisher.WriteCommentRemoval(ctx, announcer.DID, mapping.ATURI, mapping.CID,
+		materialize.RemovalCodeModeratorDiscretion, del.Summary, removedAt); err != nil {
+		return fmt.Errorf("ingest: publish removal of %s into %s: %w", mapping.ATURI, announcer.APGroupID, err)
+	}
 	NativeCommentRemoved.Add(1)
-	h.logger.Info("community removed a native comment; recorded bridge-side",
+	h.logger.Info("community removed a native comment; recorded and published to the community repo",
 		"ap_id", mapping.APID, "at_uri", mapping.ATURI,
 		"community", announcer.APGroupID, "activity", del.ID)
 	return skip(mapping.APID,
 		"announced moderator removal of a native comment: recorded bridge-side under "+
-			materialize.RemovalCodeModeratorDiscretion+"; nothing is published to the community "+
-			"repo until the comment-subject removal lexicon lands")
+			materialize.RemovalCodeModeratorDiscretion+" and published as a removal record in "+
+			"the community repo")
+}
+
+// commentRemovalPublisher is the surface that writes and deletes a comment's
+// removal record in a community repo, or an error naming the gap. Like
+// moderationState the error is RETRYABLE, never a skip: a removal that cannot be
+// published is a moderation decision Coves never sees, and it has to stay on the
+// queue where an operator sees it.
+func (h *Handler) commentRemovalPublisher() (CommentRemovalPublisher, error) {
+	if h.commentRemovals == nil {
+		return nil, fmt.Errorf(
+			"ingest: no comment-removal publishing surface is wired, so this removal cannot be published")
+	}
+	return h.commentRemovals, nil
 }
 
 // liftNativeCommentRemoval is the Undo of the above: the moderators reversed
@@ -507,6 +606,15 @@ func (h *Handler) moderateNativeComment(ctx context.Context, del *ap.Object,
 // legitimate restore. Both are idempotent single statements and cost nothing in
 // the ordinary case, where there is nothing to clear.
 //
+// THE REMOVAL RECORD IS DELETED AFTER THE CLEAR, and the delete runs even when
+// the clear finds nothing standing. Those are two writes in two stores, so a
+// failed record delete (or a crash between them) leaves the record behind with
+// the bridge-side removal already gone; the retry, or a re-delivered Undo, then
+// finds nothing to clear and must still finish the job. With no record at the
+// comment's rkey the delete is inert and writes no commit. A failed delete is a
+// RETRYABLE error, never a skip: a record left standing is a removal Coves keeps
+// honoring after the moderators lifted it.
+//
 // Clearing a removal nobody made is a no-op success — a re-delivered Undo, or
 // one from a community that never removed this comment — and it is reported as
 // such rather than counted as another reversal.
@@ -523,11 +631,30 @@ func (h *Handler) liftNativeCommentRemoval(ctx context.Context, undo *ap.Object,
 	if err := h.objects.Restore(ctx, mapping.APID); err != nil && !errors.IsNotFound(err) {
 		return fmt.Errorf("ingest: restore mapping for %s: %w", mapping.APID, err)
 	}
+	publisher, err := h.commentRemovalPublisher()
+	if err != nil {
+		return err
+	}
 	cleared, err := moderation.ClearRemoval(ctx, mapping.ATURI, announcer.DID)
 	if err != nil {
 		return fmt.Errorf("ingest: clear removal of %s: %w", mapping.ATURI, err)
 	}
+	recordDeleted, err := publisher.DeleteCommentRemoval(ctx, announcer.DID, mapping.ATURI)
+	if err != nil {
+		return fmt.Errorf("ingest: delete removal record of %s from %s: %w",
+			mapping.ATURI, announcer.APGroupID, err)
+	}
 	if !cleared {
+		if recordDeleted {
+			// The completion of an earlier, partly applied restore: the clear
+			// landed then and the record delete did not.
+			h.logger.Info("completed a native comment restore: deleted the removal record an earlier attempt left",
+				"ap_id", mapping.APID, "at_uri", mapping.ATURI,
+				"community", announcer.APGroupID, "activity", undo.ID)
+			return skip(mapping.APID,
+				"announced restore of a native comment whose bridge-side removal was already "+
+					"cleared: the removal record left in the community repo is deleted")
+		}
 		return skip(mapping.APID,
 			"announced restore of a native comment that this community had not removed: "+
 				"nothing to lift (a re-delivered undo, or an undo of a delete that recorded nothing)")
@@ -537,8 +664,8 @@ func (h *Handler) liftNativeCommentRemoval(ctx context.Context, undo *ap.Object,
 		"ap_id", mapping.APID, "at_uri", mapping.ATURI,
 		"community", announcer.APGroupID, "activity", undo.ID)
 	return skip(mapping.APID,
-		"announced restore of a native comment: the bridge-side removal is cleared; nothing "+
-			"is published to the community repo until the comment-subject removal lexicon lands")
+		"announced restore of a native comment: the bridge-side removal is cleared and the "+
+			"removal record is deleted from the community repo")
 }
 
 // handleLock applies an announced Lock — a community closing one of its threads

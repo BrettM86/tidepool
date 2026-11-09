@@ -69,7 +69,7 @@ func TestCommunityBans_ALapsedReplayCannotWeakenAStandingBan(t *testing.T) {
 	ctx := context.Background()
 
 	// The ban that stands: permanent, no expiry, the moderators' current ruling.
-	_, err := repo.Ban(ctx, CommunityBan{
+	_, _, err := repo.Ban(ctx, CommunityBan{
 		CommunityDID:  cbrCommunityDID,
 		SubjectDID:    cbrSubjectDID,
 		CommunityAPID: cbrCommunityAP,
@@ -82,7 +82,7 @@ func TestCommunityBans_ALapsedReplayCannotWeakenAStandingBan(t *testing.T) {
 
 	// The replay: the older, already-expired Block arriving again.
 	lapsed := time.Now().Add(-72 * time.Hour)
-	cancelled, err := repo.Ban(ctx, CommunityBan{
+	cancelled, refused, err := repo.Ban(ctx, CommunityBan{
 		CommunityDID:  cbrCommunityDID,
 		SubjectDID:    cbrSubjectDID,
 		CommunityAPID: cbrCommunityAP,
@@ -91,6 +91,7 @@ func TestCommunityBans_ALapsedReplayCannotWeakenAStandingBan(t *testing.T) {
 		RemoveData:    true,
 	})
 	require.NoError(t, err, "a stale replay is not an error: it is a message we decline to apply")
+	assert.True(t, refused, "and Ban reports that the guard refused it")
 	assert.EqualValues(t, 0, cancelled,
 		"and it cancels nothing, because it is not in force")
 
@@ -125,7 +126,7 @@ func TestCommunityBans_ALapsedBanIsStillRecordedWhenNothingStands(t *testing.T) 
 	ctx := context.Background()
 
 	lapsed := time.Now().Add(-72 * time.Hour)
-	cancelled, err := repo.Ban(ctx, CommunityBan{
+	cancelled, refused, err := repo.Ban(ctx, CommunityBan{
 		CommunityDID:  cbrCommunityDID,
 		SubjectDID:    cbrSubjectDID,
 		CommunityAPID: cbrCommunityAP,
@@ -133,6 +134,7 @@ func TestCommunityBans_ALapsedBanIsStillRecordedWhenNothingStands(t *testing.T) 
 		Reason:        "three days, served",
 	})
 	require.NoError(t, err)
+	assert.False(t, refused, "nothing stands, so the guard does not refuse")
 	assert.EqualValues(t, 0, cancelled, "a ban that is over cancels nothing")
 
 	ban, found := storedBanFor(t, database, cbrCommunityDID, cbrSubjectDID)
@@ -148,7 +150,7 @@ func TestCommunityBans_ALapsedBanIsStillRecordedWhenNothingStands(t *testing.T) 
 
 	// A second lapsed delivery of the same ban: still nothing in force, so the
 	// guard must not fire — the row keeps taking the newest account of itself.
-	_, err = repo.Ban(ctx, CommunityBan{
+	_, _, err = repo.Ban(ctx, CommunityBan{
 		CommunityDID:  cbrCommunityDID,
 		SubjectDID:    cbrSubjectDID,
 		CommunityAPID: cbrCommunityAP,
@@ -175,7 +177,7 @@ func TestCommunityBans_AStaleUndoCannotLiftAStrongerBan(t *testing.T) {
 	ctx := context.Background()
 
 	twoWeeks := time.Now().Add(14 * 24 * time.Hour)
-	_, err := repo.Ban(ctx, CommunityBan{
+	_, _, err := repo.Ban(ctx, CommunityBan{
 		CommunityDID:  cbrCommunityDID,
 		SubjectDID:    cbrSubjectDID,
 		CommunityAPID: cbrCommunityAP,
@@ -194,7 +196,7 @@ func TestCommunityBans_AStaleUndoCannotLiftAStrongerBan(t *testing.T) {
 	require.False(t, retained)
 
 	// The moderators ban the author again, permanently.
-	_, err = repo.Ban(ctx, CommunityBan{
+	_, _, err = repo.Ban(ctx, CommunityBan{
 		CommunityDID:  cbrCommunityDID,
 		SubjectDID:    cbrSubjectDID,
 		CommunityAPID: cbrCommunityAP,
@@ -233,7 +235,7 @@ func TestCommunityBans_AStaleUndoCannotLiftAStrongerBan(t *testing.T) {
 	// Undo takes nothing away by removing it — and a guard that fired here would
 	// warn an operator about an author who is not banned.
 	longAgo := time.Now().Add(-30 * 24 * time.Hour)
-	_, err = repo.Ban(ctx, CommunityBan{
+	_, _, err = repo.Ban(ctx, CommunityBan{
 		CommunityDID:  cbrCommunityDID,
 		SubjectDID:    cbrSubjectDID,
 		CommunityAPID: cbrCommunityAP,
@@ -267,7 +269,7 @@ func TestCommunityBans_AnInForceBanStillRewritesTheRow(t *testing.T) {
 	repo := NewCommunityBans(database)
 	ctx := context.Background()
 
-	_, err := repo.Ban(ctx, CommunityBan{
+	_, _, err := repo.Ban(ctx, CommunityBan{
 		CommunityDID:  cbrCommunityDID,
 		SubjectDID:    cbrSubjectDID,
 		CommunityAPID: cbrCommunityAP,
@@ -277,7 +279,7 @@ func TestCommunityBans_AnInForceBanStillRewritesTheRow(t *testing.T) {
 
 	// Re-issued as a timed ban that has NOT run out.
 	future := time.Now().Add(48 * time.Hour)
-	_, err = repo.Ban(ctx, CommunityBan{
+	_, _, err = repo.Ban(ctx, CommunityBan{
 		CommunityDID:  cbrCommunityDID,
 		SubjectDID:    cbrSubjectDID,
 		CommunityAPID: cbrCommunityAP,
@@ -302,7 +304,7 @@ func TestCommunityBans_AnInForceBanStillRewritesTheRow(t *testing.T) {
 	// And the reverse order: a permanent ban over a row that has lapsed. The
 	// escalation this whole finding is about must land.
 	lapsed := time.Now().Add(-1 * time.Hour)
-	_, err = repo.Ban(ctx, CommunityBan{
+	_, _, err = repo.Ban(ctx, CommunityBan{
 		CommunityDID:  cbrCommunityDID,
 		SubjectDID:    "did:plc:cbrsubject000002",
 		CommunityAPID: cbrCommunityAP,
@@ -310,7 +312,7 @@ func TestCommunityBans_AnInForceBanStillRewritesTheRow(t *testing.T) {
 		Reason:        "served",
 	})
 	require.NoError(t, err)
-	_, err = repo.Ban(ctx, CommunityBan{
+	_, _, err = repo.Ban(ctx, CommunityBan{
 		CommunityDID:  cbrCommunityDID,
 		SubjectDID:    "did:plc:cbrsubject000002",
 		CommunityAPID: cbrCommunityAP,

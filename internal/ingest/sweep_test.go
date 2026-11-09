@@ -9,6 +9,10 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"tidepool/internal/errors"
+	"tidepool/internal/materialize"
+	"tidepool/internal/store"
 )
 
 // sweepResponse mirrors handleSweepDeleted's JSON body.
@@ -195,4 +199,42 @@ func TestSweepDeletedRefusals(t *testing.T) {
 		map[string]any{"ap_ids": oversized})
 	assert.Equal(t, http.StatusBadRequest, rec.Code, "the batch cap is a request error")
 	assert.Contains(t, rec.Body.String(), "chunk", "the refusal must tell the operator what to do")
+}
+
+// TestSweepDeletedAppliesTombstoneToNativeMapping: a bridge-origin mapping
+// (the outbound enqueuer's shape) names a native Coves author's DID, which
+// has no bridged_actors row and so no signing key. An origin-confirmed
+// tombstone must still soft-delete the mapping — there is no bridge-hosted
+// record to delete — rather than fail on the missing actor on every retry.
+func TestSweepDeletedAppliesTombstoneToNativeMapping(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	const nativeDID = "did:plc:sweepnativeauthor"
+	const rkey = "3sweepnative"
+	apID := "https://coves.test/ap/object/" + nativeDID + "/" + materialize.CollectionComment + "/" + rkey
+	_, err := h.objects.PutMapping(ctx, store.APObjectMapping{
+		APID:           apID,
+		APType:         "Note",
+		OriginInstance: "coves.test",
+		Origin:         store.OriginBridge,
+		DID:            nativeDID,
+		AuthorDID:      nativeDID,
+		CommunityDID:   "did:plc:sweepnativecommunity",
+		Collection:     materialize.CollectionComment,
+		RKey:           rkey,
+		CID:            "bafyreievgu2ty7qbiaaom5zhmkznsnajuzideek3lo7e65dwqlrvrxnmo4",
+	})
+	require.NoError(t, err)
+	_, err = h.actors.GetByDID(ctx, nativeDID)
+	require.True(t, errors.IsNotFound(err), "precondition: the native author has no bridged actor")
+
+	h.serveObject(urlPath(t, apID), map[string]any{"id": apID, "type": "Tombstone"})
+	out := h.sweep(apID)
+	assert.Equal(t, OutcomeDeleted, out.Result[0].Outcome, "error: %s", out.Result[0].Error)
+	assert.Zero(t, out.Failed)
+
+	mapping, err := h.objects.GetByAPID(ctx, apID)
+	require.NoError(t, err)
+	assert.True(t, mapping.IsDeleted(), "the mapping must be soft-deleted")
 }

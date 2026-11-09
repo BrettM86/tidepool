@@ -3,6 +3,7 @@
 package e2e
 
 import (
+	"bytes"
 	"testing"
 )
 
@@ -153,6 +154,67 @@ func TestModeration_RemoveRestoreAndSelfDelete(t *testing.T) {
 		if ev.Commit.RKey == digest && ev.Commit.Operation != opDelete {
 			t.Errorf("post-deletion write for the deleted subject: %s", ev)
 		}
+	}
+}
+
+// TestModeration_RemovalWithholdsTheImageUntilTheRestore (task 03, B13): a
+// Lemmy moderator removes a bridged image post. While the removal stands,
+// Tidepool's getBlob answers for the post's image CID exactly as for an absent
+// blob (404 BlobNotFound) even though the author's record still references it;
+// once the moderator restores the post, getBlob returns the same bytes it
+// served before the removal, with no re-upload.
+//
+// The withhold is written in the commit that writes the removal record, and
+// lifted in the commit that deletes it, so each getBlob read follows the
+// firehose event of that commit rather than a poll.
+func TestModeration_RemovalWithholdsTheImageUntilTheRestore(t *testing.T) {
+	h := newHarness(t)
+	community, sub := setupSubscribedCommunity(t, h, "modimg")
+	user := h.registerUser(t, h.uniqueName(t, "rhea"))
+
+	// Bytes unique to this run: a withhold left by a failed run must not reach
+	// another run's image.
+	imageURL := user.uploadImage(t, "removed.png", makeUniqueTestPNG(t, h.suffix+"/"+t.Name()))
+
+	l := h.newListener(t, cursorNow(), colPostV2, colRemoval)
+	title := "Removed image post " + h.suffix
+	post := user.createImagePost(t, community.ID, title, imageURL, "removed e2e image", false)
+
+	createEv := l.await("image post create", func(e *jsEvent) bool {
+		got, _ := fieldOf(e.Commit.Record, "title")
+		return e.Commit.Collection == colPostV2 && e.Commit.Operation == opCreate && got == title
+	})
+	authorDID, rkey := createEv.Did, createEv.Commit.RKey
+	postURI := createEv.atURI()
+	digest := subjectRKey(postURI)
+	blobCID := stringAt(t, decodeRecord(t, createEv.Commit.Record), "embed", "images", "0", "image", "ref", "$link")
+	if blobCID == "" {
+		t.Fatal("embed image blob ref.$link is empty")
+	}
+	original, _ := h.bridgeGetBlob(t, authorDID, blobCID)
+
+	h.admin.removePost(t, post.ID, true, "removed image e2e")
+	l.await("removal record written", func(e *jsEvent) bool {
+		uri, _ := fieldOf(e.Commit.Record, "subject", "uri")
+		return e.Commit.Collection == colRemoval && e.Commit.Operation != opDelete &&
+			e.Did == sub.DID && uri == postURI
+	})
+	h.awaitRecordPresent(t, sub.DID, colRemoval, digest, "removal after the moderator's remove")
+	assertBlobAbsent(t, h, authorDID, blobCID, "while the post is removed")
+	rec := h.awaitRecordPresent(t, authorDID, colPostV2, rkey, "removed image post")
+	if got, _ := softString(embedImage(t, rec.Value), "ref", "$link"); got != blobCID {
+		t.Errorf("while removed the record's image ref = %q, want %q", got, blobCID)
+	}
+
+	h.admin.removePost(t, post.ID, false, "")
+	l.await("removal deleted by the restore", func(e *jsEvent) bool {
+		return e.Commit.Collection == colRemoval && e.Commit.Operation == opDelete &&
+			e.Did == sub.DID && e.Commit.RKey == digest
+	})
+	h.awaitRecordGone(t, sub.DID, colRemoval, digest, "removal after the restore")
+	served, _ := h.bridgeGetBlob(t, authorDID, blobCID)
+	if !bytes.Equal(served, original) {
+		t.Errorf("after the restore getBlob served %d bytes, want the original %d bytes", len(served), len(original))
 	}
 }
 

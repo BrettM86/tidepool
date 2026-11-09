@@ -49,12 +49,23 @@ type ObjectModeration interface {
 	// existing removal keeps the ORIGINAL removed_at — a re-delivered Delete is
 	// the same decision arriving twice.
 	//
+	// removedAt is the removal's stored time after the write — the original
+	// one on a re-recording — which is the createdAt of the removal record the
+	// caller publishes into the community repo, so a redelivery rebuilds
+	// byte-identical record bytes.
+	//
 	// COMMENTS ONLY, deliberately. A post's removal is a record in the
 	// community's own repo, written atomically with the withdrawal of the
 	// acceptance it replaces; a second copy here would be a second source of
 	// truth for one decision, and the two would disagree the first time the
 	// commit succeeded and this write did not.
-	SetRemoval(ctx context.Context, object ModeratedObject, code, reason string) error
+	SetRemoval(ctx context.Context, object ModeratedObject, code, reason string) (removedAt time.Time, err error)
+
+	// RemovedAmong returns the first of the given at-uris that currently carries
+	// a standing removal, or "" when none does. It is LockedAmong's twin, read
+	// by the native comment consumer so a reply to a removed comment — and an
+	// edit of one — is not federated. Empty at-uris are ignored.
+	RemovedAmong(ctx context.Context, atURIs ...string) (string, error)
 
 	// ClearRemoval lifts a removal (Undo{Delete}), scoped to the community that
 	// made it: clearing is a no-op for anyone else, and a no-op success for an
@@ -381,8 +392,9 @@ type CommunityBans interface {
 	// permanent ban the moderators escalated to, its past expiry reads as
 	// unbanned forever after, and no activity exists that could correct it. So a
 	// write that is already expired on arrival is dropped when a standing ban
-	// would lose by it — expiry, reason and removeData together.
-	Ban(ctx context.Context, ban CommunityBan) (cancelled int64, err error)
+	// would lose by it — expiry, reason and removeData together. refused reports
+	// that drop: nothing was written and the standing ban is unchanged.
+	Ban(ctx context.Context, ban CommunityBan) (cancelled int64, refused bool, err error)
 
 	// Lift removes the ban (Undo{Block}). lifted says a ban was removed;
 	// retained says one was there and was DELIBERATELY LEFT — the two are
@@ -414,6 +426,11 @@ type CommunityBans interface {
 	// a post admitted after it lands is one the cancellation could never catch.
 	// A nil tx is an error satisfying errors.IsValidation.
 	StandingTx(ctx context.Context, tx *sql.Tx, communityDID, subjectDID string) (bool, error)
+
+	// ListInForce returns every ban in force now (permanent, or expiring after
+	// now by the database clock), ordered by community and subject, with its
+	// reason, expiry and BannedAt.
+	ListInForce(ctx context.Context) ([]CommunityBan, error)
 }
 
 // Communities tracks the AP groups the bridge subscribes to and their
@@ -566,6 +583,12 @@ type InboxEvents interface {
 	// the caller parses each payload and decides, so a malformed legacy row
 	// cannot fail the listing.
 	ListRecordedBans(ctx context.Context) ([]*InboxEvent, error)
+
+	// ListBanEventsAfter is ListRecordedBans over every status — pending
+	// events included — restricted to ids above afterID, in id order. The
+	// ban-record back-fill reads its history with afterID 0, then re-reads
+	// above the highest id it saw to find events that arrived since.
+	ListBanEventsAfter(ctx context.Context, afterID int64) ([]*InboxEvent, error)
 }
 
 // OutboundObjects persists the state every outbound Delete and Update is

@@ -187,7 +187,7 @@ func TestCommunityBans_BanLeavesADeliveryHeldForSettlement(t *testing.T) {
 	holdForSettlement(t, repo, delActivityID, delTargetInbox)
 	seedOneDelivery(t, database, delOtherActivityID, testDID, delTargetInbox+"/second", delOrderingKey)
 
-	cancelled, err := NewCommunityBans(database).Ban(ctx, CommunityBan{
+	cancelled, _, err := NewCommunityBans(database).Ban(ctx, CommunityBan{
 		CommunityDID:  testCommunityDID,
 		SubjectDID:    testDID,
 		CommunityAPID: delOrderingKey,

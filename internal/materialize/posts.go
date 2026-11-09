@@ -93,6 +93,15 @@ func (m *Materializer) MaterializePost(ctx context.Context, page *ap.Object, com
 		if err := m.requireBoundCommunity(ctx, stored, communityIRI, page.ID); err != nil {
 			return nil, err
 		}
+		// The refusal commitRecord would make, made before the record is
+		// built: building fetches and stores the Page's media, and a deleted
+		// post's image stored now would sit under the author's DID with no
+		// record referencing it and no withhold covering it (the author
+		// delete deletes those bytes and lifts their withhold). An announced
+		// restore clears the soft delete before it gets here.
+		if existing.IsDeleted() {
+			return nil, skip(page.ID, "object was deleted upstream; not resurrecting")
+		}
 	case errors.IsNotFound(err):
 		existing = nil
 	default:

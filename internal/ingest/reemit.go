@@ -7,9 +7,12 @@ import (
 	"log/slog"
 	"net/http"
 	"sort"
+	"time"
 
 	"tidepool/internal/errors"
+	"tidepool/internal/materialize"
 	"tidepool/internal/repo"
+	"tidepool/internal/store"
 )
 
 // RepoReemitter is the slice of the repo manager the admin re-emit endpoint
@@ -19,6 +22,24 @@ type RepoReemitter interface {
 	ListRecords(ctx context.Context, did string) ([]repo.RecordEntry, error)
 	DeleteRecord(ctx context.Context, did, collection, rkey string) (*repo.CommitResult, error)
 	PutRecord(ctx context.Context, did, collection, rkey string, record map[string]any) (*repo.CommitResult, error)
+	// GetRecord reads a record of any repo: re-emit reads a comment's
+	// postv2 thread root to learn the comment's community.
+	GetRecord(ctx context.Context, did, collection, rkey string) (record map[string]any, recordCID string, err error)
+}
+
+// StandingBanReader reads the ban record standing in a community repo for one
+// subject, or nil when none stands. Re-emit consults it so it never re-creates
+// a comment its author is banned from the comment's community for.
+type StandingBanReader interface {
+	StandingBanRecord(ctx context.Context, communityDID, subjectDID string) (*materialize.BanRecord, error)
+}
+
+// APObjectMappingReader reads a record's stored ap_objects mapping by at-uri.
+// Re-emit reads a comment's mapping for the community recorded at
+// materialization time, the only answer for a comment whose thread root is
+// not hosted here.
+type APObjectMappingReader interface {
+	GetByATURI(ctx context.Context, atURI string) (*store.APObjectMapping, error)
 }
 
 // reemitCollectionRank orders a repo's records so downstream indexers see
@@ -59,7 +80,14 @@ type ReemitResult struct {
 	DID      string `json:"did"`
 	Records  int    `json:"records"`
 	Reemited int    `json:"reemitted"`
-	Error    string `json:"error,omitempty"`
+	// SkippedBanned counts comments left alone because their author is
+	// banned, in force, in the comment's community (see reemitRepo).
+	SkippedBanned int `json:"skipped_banned"`
+	// SkippedUnknownCommunity counts comments left alone because their
+	// community cannot be determined, so no ban can be ruled out (see
+	// reemitRepo).
+	SkippedUnknownCommunity int    `json:"skipped_unknown_community"`
+	Error                   string `json:"error,omitempty"`
 }
 
 // reemitRepo re-emits every record of one DID onto the firehose as a
@@ -78,7 +106,16 @@ type ReemitResult struct {
 // This exists for the relay cold-start gap (FOLLOWUPS): records committed
 // before a relay's first subscription never re-emit on their own, so a
 // Jetstream-fed AppView can never index them.
-func reemitRepo(ctx context.Context, repos RepoReemitter, did string, logger *slog.Logger) ReemitResult {
+//
+// A comment whose author (this repo's DID) is banned, in force, in the
+// comment's community is skipped and counted in SkippedBanned: Coves records a
+// permanent community_ban hide on every comment it indexes while a ban stands,
+// a re-creation included, and that hide survives the unban. Re-emitting it
+// would hide a comment that predates the ban for good. A comment whose
+// community cannot be determined is skipped too, counted in
+// SkippedUnknownCommunity: no ban can be ruled out for it. A failed mapping or
+// ban read aborts the repo rather than guess either way.
+func reemitRepo(ctx context.Context, repos RepoReemitter, bans StandingBanReader, mappings APObjectMappingReader, did string, logger *slog.Logger) ReemitResult {
 	res := ReemitResult{DID: did}
 	entries, err := repos.ListRecords(ctx, did)
 	if err != nil {
@@ -89,10 +126,30 @@ func reemitRepo(ctx context.Context, repos RepoReemitter, did string, logger *sl
 	sort.SliceStable(entries, func(i, j int) bool {
 		return reemitCollectionRank(entries[i].Collection) < reemitCollectionRank(entries[j].Collection)
 	})
+	// bannedIn caches only a banned answer per community: a repo's comments
+	// cluster in a few communities. A not-banned answer is re-read for every
+	// comment right before its delete, so a ban published mid-walk stops the
+	// community's later comments.
+	bannedIn := map[string]bool{}
 	for _, e := range entries {
 		if ctx.Err() != nil {
 			res.Error = ctx.Err().Error()
 			return res
+		}
+		if e.Collection == materialize.CollectionComment {
+			communityDID, banned, err := commentAuthorBanned(ctx, repos, bans, mappings, bannedIn, did, e, time.Now())
+			if err != nil {
+				res.Error = fmt.Sprintf("ban check %s/%s: %v", e.Collection, e.Rkey, err)
+				return res
+			}
+			if communityDID == "" {
+				res.SkippedUnknownCommunity++
+				continue
+			}
+			if banned {
+				res.SkippedBanned++
+				continue
+			}
 		}
 		if _, err := repos.DeleteRecord(ctx, did, e.Collection, e.Rkey); err != nil {
 			// A vanished record (raced by a concurrent scrub) is fine to
@@ -117,12 +174,71 @@ func reemitRepo(ctx context.Context, repos RepoReemitter, did string, logger *sl
 	return res
 }
 
+// commentAuthorBanned resolves the comment's community and reports whether
+// the comment's author (the repo DID) is banned, in force at now, in it. The
+// community comes from the comment's stored mapping when one exists, so a
+// comment whose thread root is not hosted here (a native postv2 in another
+// repo) or is gone still resolves; with no mapping it is derived from the
+// record alone. An empty communityDID means it cannot be determined, and
+// banned is then false and meaningless. bannedIn holds the communities already
+// found banned this walk; a community not in it is read again.
+func commentAuthorBanned(ctx context.Context, repos RepoReemitter, bans StandingBanReader, mappings APObjectMappingReader, bannedIn map[string]bool, did string, comment repo.RecordEntry, now time.Time) (communityDID string, banned bool, err error) {
+	atURI := fmt.Sprintf("at://%s/%s/%s", did, comment.Collection, comment.Rkey)
+	mapping, err := mappings.GetByATURI(ctx, atURI)
+	switch {
+	case err == nil:
+	case errors.IsNotFound(err):
+		mapping = &store.APObjectMapping{DID: did, Collection: comment.Collection, RKey: comment.Rkey}
+	default:
+		return "", false, fmt.Errorf("read mapping %s: %w", atURI, err)
+	}
+	communityDID, err = materialize.CommunityDIDOf(ctx, heldRecord{RepoReemitter: repos, entry: comment, did: did}, mapping)
+	if err != nil {
+		return "", false, fmt.Errorf("resolve community: %w", err)
+	}
+	if communityDID == "" {
+		return "", false, nil
+	}
+	if bannedIn[communityDID] {
+		return communityDID, true, nil
+	}
+	standing, err := bans.StandingBanRecord(ctx, communityDID, did)
+	if err != nil {
+		return "", false, fmt.Errorf("read ban record in %s: %w", communityDID, err)
+	}
+	banned = standing != nil && standing.InForce(now)
+	if banned {
+		bannedIn[communityDID] = true
+	}
+	return communityDID, banned, nil
+}
+
+// heldRecord answers GetRecord for the record re-emit already holds from
+// ListRecords, so resolving its community does not read it again, and passes
+// every other read (a postv2 thread root) to the repo.
+type heldRecord struct {
+	RepoReemitter
+	entry repo.RecordEntry
+	did   string
+}
+
+func (h heldRecord) GetRecord(ctx context.Context, did, collection, rkey string) (map[string]any, string, error) {
+	if did == h.did && collection == h.entry.Collection && rkey == h.entry.Rkey {
+		return h.entry.Value, "", nil
+	}
+	record, recordCID, err := h.RepoReemitter.GetRecord(ctx, did, collection, rkey)
+	if err != nil {
+		return nil, "", fmt.Errorf("read %s/%s/%s: %w", did, collection, rkey, err)
+	}
+	return record, recordCID, nil
+}
+
 // handleReemit serves POST /admin/reemit: {"did":"did:plc:..."} re-emits one
 // repo, an empty body (or {}) re-emits every active repo. Answers 200 with
 // per-repo results; a body-level "failed" count > 0 means at least one repo
 // aborted early and the response details why.
 func (a *Admin) handleReemit(w http.ResponseWriter, r *http.Request) {
-	if a.repos == nil {
+	if a.repos == nil || a.bans == nil || a.objects == nil {
 		http.Error(w, "re-emit not configured", http.StatusNotImplemented)
 		return
 	}
@@ -153,7 +269,7 @@ func (a *Admin) handleReemit(w http.ResponseWriter, r *http.Request) {
 	results := make([]ReemitResult, 0, len(dids))
 	failed := 0
 	for _, did := range dids {
-		res := reemitRepo(ctx, a.repos, did, a.logger)
+		res := reemitRepo(ctx, a.repos, a.bans, a.objects, did, a.logger)
 		if res.Error != "" {
 			failed++
 		}

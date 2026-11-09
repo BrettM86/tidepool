@@ -26,6 +26,7 @@ import (
 	"tidepool/internal/accept"
 	"tidepool/internal/acceptrec"
 	"tidepool/internal/ap"
+	"tidepool/internal/blobwithhold"
 	"tidepool/internal/config"
 	"tidepool/internal/consume"
 	"tidepool/internal/db"
@@ -69,6 +70,15 @@ const (
 // Materializer it is handed, so a drifted method set would leave it nil and
 // make every removeData ban fail with a retryable error. Fail the build instead.
 var _ ingest.BannedContentRemover = (*materialize.Materializer)(nil)
+
+// ingest.Admin finds the removal-withhold back-fill the same way; a drifted
+// method set would make the route answer 501.
+var _ ingest.RemovalWithholdBackfiller = (*materialize.Materializer)(nil)
+
+// ingest.NewHandler reads the ban-record publisher off the Materializer; a
+// drifted method set would make every community ban fail with a retryable
+// error.
+var _ ingest.BanRecordPublisher = (*materialize.Materializer)(nil)
 
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
@@ -681,6 +691,8 @@ func run(logger *slog.Logger) error {
 		Service:      serviceActor,
 		Backfill:     backfill,
 		Repos:        repoManager,
+		Bans:         materializer,
+		Objects:      objects,
 		Sweeper:      handler,
 		Deliveries:   store.NewOutboundDeliveries(database),
 		BanReplayer:  ingest.NewBanReplayer(handler, inboxEvents),
@@ -719,6 +731,15 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("resume handle migration: %w", err)
 	}
 	renameAdmin.Routes(router)
+	// Blob withholds are served whether or not the consumer runs: the
+	// operator must be able to withhold and delete bytes at any time.
+	blobAdmin, err := blobwithhold.NewAdmin(blobwithhold.AdminOptions{
+		Token: cfg.AdminToken, Store: blobwithhold.NewStore(database), Logger: logger,
+	})
+	if err != nil {
+		return err
+	}
+	blobAdmin.Routes(router)
 
 	// The one set of outbound switches, armed from the follow list before the
 	// consumer's workers start, so the first delivery sees them. A missing or

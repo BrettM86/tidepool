@@ -415,9 +415,16 @@ is left with the Group-actor AP surface and the admission-policy wiring.
       URI and stands across author edits. `Undo{Delete}` restores the post with
       one commit that deletes the removal and writes a fresh acceptance.
     - A moderated native comment is recorded bridge-side under the same removal
-      code (`internal/ingest/moderation.go`). Nothing is written to the
-      community repo, because the removal lexicon covers posts only. Extending
-      it to comments is a cross-repo item with Coves.
+      code (`internal/ingest/moderation.go`) and gets a
+      `social.coves.community.removal` record in the announcing community's
+      repo, with `createdAt` equal to the stored `removed_at`. `Undo{Delete}`
+      deletes that record. Native replies beneath a removed comment and the
+      author's edits of it are not federated.
+    - A moderator's removal of a bridged Lemmy comment keeps the comment's
+      record and mapping and writes a removal record into the community repo
+      that `CommunityDIDOf` names for the comment's thread. `Undo{Delete}`
+      deletes that record and leaves the comment at its current content. The
+      author's own summary-less `Delete` still deletes the comment's record.
 19. Account lifecycle, support matrix and rollout safety.
     - An `#account` event's status is not proof of deletion. Temporary states
       (deactivated, suspended, takendown, throttled) pause the actor's

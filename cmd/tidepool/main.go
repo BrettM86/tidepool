@@ -459,6 +459,7 @@ func run(logger *slog.Logger) error {
 	objects := store.NewAPObjects(database)
 	communities := store.NewCommunities(database)
 	tombstones := store.NewTombstones(database)
+	instances := store.NewInstances(database)
 	inboxEvents := store.NewInboxEvents(database)
 
 	// The echo classifier reads the four tables the user origin serves from, so
@@ -489,7 +490,9 @@ func run(logger *slog.Logger) error {
 	}
 
 	materializer, err := materialize.New(materialize.Options{
-		Fetcher:     apClient,
+		// Successful author and ancestor fetches (live or backfill) end the
+		// host's host-gone streak, so backfill never skips a revived host.
+		Fetcher:     ingest.NewHostHealthFetcher(apClient, instances, logger),
 		Objects:     objects,
 		Actors:      actors,
 		Communities: communities,
@@ -509,7 +512,7 @@ func run(logger *slog.Logger) error {
 		Logger:            logger,
 		// Nodeinfo discovery for profiles' originSoftware goes through the
 		// SSRF-guarded client like every other fetch of a remote instance.
-		Instances:      store.NewInstances(database),
+		Instances:      instances,
 		NodeInfoClient: ap.NewGuardedHTTPClient(cfg.AllowPrivateAddresses, 30*time.Second),
 		UserAgent:      cfg.UserAgent,
 		// Link-post thumbnail unfurling (YouTube oEmbed, og:image) is guarded too.
@@ -607,6 +610,7 @@ func run(logger *slog.Logger) error {
 		Materializer: materializer,
 		Communities:  communities,
 		Tombstones:   tombstones,
+		Instances:    instances,
 		Seeder:       seeder,
 		Echo:         echoClassifier,
 		MaxPosts:     cfg.BackfillMaxPosts,

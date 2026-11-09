@@ -159,6 +159,7 @@ type (
 	unusedMaterializer struct{ Materializer }
 	unusedTombstones   struct{ store.Tombstones }
 	unusedClassifier   struct{ EchoClassifier }
+	unusedInstances    struct{ store.Instances }
 )
 
 // retryFixture drives Backfill's retry state on a manual clock, with no
@@ -188,6 +189,7 @@ func (f *retryFixture) newBackfill(t *testing.T) *Backfill {
 		Materializer: unusedMaterializer{},
 		Communities:  f.communities,
 		Tombstones:   unusedTombstones{},
+		Instances:    unusedInstances{},
 		Echo:         unusedClassifier{},
 		BaseContext:  t.Context(),
 		Logger:       slog.New(slog.DiscardHandler),

@@ -89,6 +89,7 @@ func TestBackfillMaterializesMbinLinkPageWithStringSource(t *testing.T) {
 		Materializer: h.mat,
 		Communities:  h.communities,
 		Tombstones:   h.tombstones,
+		Instances:    h.materializerOptions.Instances,
 		Echo:         h.classifier,
 		MaxPosts:     10,
 		Logger:       slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),

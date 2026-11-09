@@ -167,7 +167,7 @@ func (f *Fetcher) getJSON(ctx context.Context, target string, out any) error {
 // CacheOptions configures a Cache. Fetcher and Store are required.
 type CacheOptions struct {
 	Fetcher *Fetcher
-	Store   store.Instances
+	Store   store.InstanceDiscovery
 	// DiscoveryDeadline bounds one host's discovery cycle
 	// (0 = DefaultDiscoveryDeadline).
 	DiscoveryDeadline time.Duration
@@ -178,7 +178,7 @@ type CacheOptions struct {
 // most once per RefreshInterval per host.
 type Cache struct {
 	fetcher  *Fetcher
-	store    store.Instances
+	store    store.InstanceDiscovery
 	deadline time.Duration
 	logger   *slog.Logger
 	// inFlight coordinates discovery per host: concurrent callers that find

@@ -340,6 +340,16 @@ func guardedTransport(base http.RoundTripper, guard *egressGuard) http.RoundTrip
 //     caller must treat it as a tombstone, never re-fetch;
 //   - a 200 whose body is a Tombstone object → errors.IsTombstoned (Lemmy
 //     serves Tombstones with 410, Mastodon with 404, others with 200);
+//   - the IRI's own host not resolving (NXDOMAIN on the first hop) →
+//     errors.IsHostGone, not retried; temporary DNS failures and NXDOMAIN of
+//     a redirect target stay ordinary retryable errors;
+//   - a redirect off the IRI's host ending at a non-JSON 2xx page (a dead
+//     instance parking every URL) → errors.IsHostGone;
+//   - the two IsHostGone cases apply to FetchObject, FetchActor and
+//     FetchCollection (its pages go through FetchObject) only, not
+//     to pinned-authority fetches or WebFinger. They are not IsNotFound: the
+//     caller decides whether a gone host is a skip (backfill) or an error to
+//     retry later (live inbox processing, where the host may only be lapsed);
 //   - other non-2xx → HTTPError.
 func (c *Client) FetchObject(ctx context.Context, iri string) (*Object, error) {
 	return c.fetchObject(ctx, iri, fetchModeObject)
@@ -386,7 +396,8 @@ func (c *Client) RefusesRedirects() bool { return c.noRedirects }
 func SameAuthority(a, b string) bool { return sameAuthority(a, b) }
 
 // FetchActor fetches an AP actor document and validates that it is one
-// (Group/Person/Application/Service with an id).
+// (Group/Person/Application/Service with an id). A gone host maps to
+// errors.IsHostGone as in FetchObject.
 func (c *Client) FetchActor(ctx context.Context, iri string) (*Object, error) {
 	return c.fetchActor(ctx, iri, fetchModeObject)
 }
@@ -859,6 +870,32 @@ func (c *Client) evictKeyCacheLocked() {
 	}
 }
 
+// HostKey returns the key host-gone streaks use for iri's host: the
+// lowercased hostname without a port. ok is false when iri does not parse or
+// has no host.
+func HostKey(iri string) (string, bool) {
+	parsed, err := url.Parse(iri)
+	if err != nil || parsed.Hostname() == "" {
+		return "", false
+	}
+	return strings.ToLower(parsed.Hostname()), true
+}
+
+// hostGoneError names iri's own host (HostKey) as gone. An IRI with no host
+// gives an empty Host, which errors.HostGoneHost reports as naming none.
+func hostGoneError(iri string) errors.HostGoneError {
+	host, _ := HostKey(iri)
+	return errors.HostGoneError{Host: host}
+}
+
+// sameHost reports whether iri's hostname matches u's, case-insensitively,
+// ignoring scheme and port so an http→https upgrade or a dropped explicit
+// default port (origin.example:80 → origin.example) still counts as same-host.
+func sameHost(iri string, u *url.URL) bool {
+	parsed, err := url.Parse(iri)
+	return err == nil && parsed.Hostname() != "" && strings.EqualFold(parsed.Hostname(), u.Hostname())
+}
+
 // sameAuthority reports whether two absolute URLs share scheme, host, and
 // port (the authority). Unparseable or non-absolute inputs never match.
 func sameAuthority(a, b string) bool {
@@ -964,6 +1001,17 @@ func (c *Client) getOnce(ctx context.Context, iri string, mode fetchMode) (body 
 
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
+			// NXDOMAIN of the IRI's own host (a dead instance such as
+			// kbin.social) is ErrHostGone and not retried here; callers decide
+			// whether to skip it (backfill) or retry later (live inbox).
+			var dnsErr *net.DNSError
+			// Only the first hop's lookup of the IRI's own host counts: a
+			// failed lookup of a redirect target, proxy or other intermediary
+			// says nothing about the object's origin.
+			if mode == fetchModeObject && redirects == 0 && stderrors.As(err, &dnsErr) && dnsErr.IsNotFound &&
+				strings.EqualFold(dnsErr.Name, req.URL.Hostname()) {
+				return nil, false, fmt.Errorf("ap: GET %s: %w: %w", target, hostGoneError(iri), err)
+			}
 			return nil, true, fmt.Errorf("ap: GET %s: %w", target, err)
 		}
 
@@ -1009,6 +1057,13 @@ func (c *Client) getOnce(ctx context.Context, iri string, mode fetchMode) (body 
 		switch {
 		case resp.StatusCode >= 200 && resp.StatusCode < 300:
 			if err := checkJSONResponse(resp, body); err != nil {
+				// A redirect off the IRI's host that lands on a non-JSON page is
+				// a dead instance parking every URL (lemm.ee → join-lemmy.org),
+				// so the host is gone rather than misnegotiated. It may also be
+				// a maintenance page, so callers decide whether to skip it.
+				if mode == fetchModeObject && redirects > 0 && !sameHost(iri, req.URL) {
+					return nil, false, fmt.Errorf("ap: GET %s: %w: %w", target, hostGoneError(iri), err)
+				}
 				return nil, false, fmt.Errorf("ap: GET %s: %w", target, err)
 			}
 			return body, false, nil

@@ -131,3 +131,37 @@ var ErrBlobWithheld = errors.New("blob withheld")
 
 // IsBlobWithheld reports a store refused by an active blob withhold.
 func IsBlobWithheld(err error) bool { return errors.Is(err, ErrBlobWithheld) }
+
+// ErrHostGone marks a fetch whose origin host looks gone: NXDOMAIN of the
+// object's own host, or an off-host redirect ending at a non-JSON page. The
+// condition may be temporary (a lapsed domain can come back), so it is
+// deliberately not ErrNotFound and IsNotFound is false for it. The caller
+// decides whether to skip the object (backfill) or retry later (live
+// delivery).
+var ErrHostGone = errors.New("host gone")
+
+// IsHostGone reports whether err is, wraps, or unwraps to ErrHostGone.
+func IsHostGone(err error) bool { return errors.Is(err, ErrHostGone) }
+
+// HostGoneError is a host-gone failure naming the dead host: the fetched
+// IRI's own host, lowercased and without a port.
+type HostGoneError struct {
+	Host string
+}
+
+// Error names the gone host.
+func (e HostGoneError) Error() string { return fmt.Sprintf("host gone: %s", e.Host) }
+
+// Unwrap makes errors.Is(err, ErrHostGone) true for host-gone errors.
+func (e HostGoneError) Unwrap() error { return ErrHostGone }
+
+// HostGoneHost returns the dead host carried by a HostGoneError in err's
+// chain. ok is false when err carries none (including a bare ErrHostGone) or
+// the host is empty: streaks are keyed on it, so "" never names a host.
+func HostGoneHost(err error) (host string, ok bool) {
+	var hostGone HostGoneError
+	if !errors.As(err, &hostGone) || hostGone.Host == "" {
+		return "", false
+	}
+	return hostGone.Host, true
+}

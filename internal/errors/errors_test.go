@@ -54,3 +54,28 @@ func TestErrorMessages(t *testing.T) {
 		"ap_object with ID 'https://x/1' is tombstoned",
 		NewTombstonedError("ap_object", "https://x/1").Error())
 }
+
+// TestHostGoneHost pins which errors name a dead host. An empty host names
+// none: backfill keys streaks on it, so "" must not read as a host.
+func TestHostGoneHost(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		wantHost string
+		wantOK   bool
+	}{
+		{name: "host-gone error", err: HostGoneError{Host: "gone.example"}, wantHost: "gone.example", wantOK: true},
+		{name: "wrapped host-gone error", err: fmt.Errorf("fetch: %w", HostGoneError{Host: "gone.example"}), wantHost: "gone.example", wantOK: true},
+		{name: "host-gone error with an empty host", err: HostGoneError{Host: ""}, wantHost: "", wantOK: false},
+		{name: "wrapped host-gone error with an empty host", err: fmt.Errorf("fetch: %w", HostGoneError{}), wantHost: "", wantOK: false},
+		{name: "bare sentinel", err: ErrHostGone, wantHost: "", wantOK: false},
+		{name: "nil", err: nil, wantHost: "", wantOK: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			host, ok := HostGoneHost(tt.err)
+			assert.Equal(t, tt.wantOK, ok, "HostGoneHost(%v) ok", tt.err)
+			assert.Equal(t, tt.wantHost, host, "HostGoneHost(%v) host", tt.err)
+		})
+	}
+}

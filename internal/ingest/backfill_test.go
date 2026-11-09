@@ -43,6 +43,7 @@ func (h *harness) backfillOptions(materializer Materializer, maxPosts int) Backf
 		Materializer: materializer,
 		Communities:  h.communities,
 		Tombstones:   h.tombstones,
+		Instances:    h.materializerOptions.Instances,
 		// The same guard the dispatcher runs, and required for the same reason:
 		// a community's outbox carries OUR federated content once native users
 		// participate, and this path reaches the materializer with no envelope
@@ -364,6 +365,7 @@ func newSeededBackfill(t *testing.T, h *harness, seeder CountSeeder) *Backfill {
 		Materializer: h.mat,
 		Communities:  h.communities,
 		Tombstones:   h.tombstones,
+		Instances:    h.materializerOptions.Instances,
 		Seeder:       seeder,
 		Echo:         h.classifier,
 		MaxPosts:     10,
@@ -632,6 +634,210 @@ func TestBackfillPartialFailureLeavesResumable(t *testing.T) {
 	require.NoError(t, err)
 	require.Nil(t, community.LastBackfillAt,
 		"a partial-failure run must leave last_backfill_at unset (resumable)")
+}
+
+// hostGoneFetcher is the harness client except that FetchObject of goneIRI
+// fails the way the AP client reports a host that no longer exists.
+type hostGoneFetcher struct {
+	BackfillFetcher
+	goneIRI string
+}
+
+func (f hostGoneFetcher) FetchObject(ctx context.Context, iri string) (*ap.Object, error) {
+	if iri == f.goneIRI {
+		return nil, hostGoneErr(iri, "other.test")
+	}
+	return f.BackfillFetcher.FetchObject(ctx, iri)
+}
+
+// hostGoneErr is the error the AP client returns for a fetch of iri whose
+// host is gone: it carries the dead host.
+func hostGoneErr(iri, host string) error {
+	return fmt.Errorf("ap: fetch %s: %w: lookup %s: no such host", iri, errors.HostGoneError{Host: host}, host)
+}
+
+// backfillNow is the backfill clock in the host-gone tests.
+var backfillNow = time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC)
+
+// seedDeadHostStreak gives host a host-gone streak that began 96h before
+// backfillNow (older than DeadHostAfter) and whose last failure was 24h
+// before it, so a failure at backfillNow continues it. The failures are 36h
+// apart: inside store.HostGoneStreakGap, so they form one streak.
+func seedDeadHostStreak(t *testing.T, h *harness, host string) {
+	t.Helper()
+	ctx := context.Background()
+	for _, ago := range []time.Duration{96 * time.Hour, 60 * time.Hour, 24 * time.Hour} {
+		goneSince, err := h.materializerOptions.Instances.RecordHostGone(ctx, host, backfillNow.Add(-ago))
+		require.NoError(t, err)
+		require.True(t, backfillNow.Add(-96*time.Hour).Equal(goneSince),
+			"seeded streak for %s starts 96h before the backfill clock, got %v", host, goneSince)
+	}
+}
+
+// TestBackfillSkipsHostGoneItem: an item whose origin host has been gone
+// (NXDOMAIN, or an off-host redirect to a parked page) for longer than
+// DeadHostAfter is skipped by backfill, so the walk completes and stamps
+// last_backfill_at instead of retrying forever.
+func TestBackfillSkipsHostGoneItem(t *testing.T) {
+	h := newHarness(t)
+	h.subscribeTechnology()
+	serveOutboxFixtures(t, h)
+	serveBrokenItemOutbox(t, h)
+	seedDeadHostStreak(t, h, "other.test")
+	opts := h.backfillOptions(h.mat, 100)
+	opts.Fetcher = hostGoneFetcher{BackfillFetcher: h.client, goneIRI: "https://other.test/post/broken"}
+	b, err := NewBackfill(opts)
+	require.NoError(t, err)
+	b.now = func() time.Time { return backfillNow }
+	ctx := context.Background()
+
+	community, err := h.communities.GetByAPGroupID(ctx, groupID)
+	require.NoError(t, err)
+	require.NoError(t, b.Run(ctx, community, true), "a host-gone item is a skip, not a run error")
+
+	_, err = h.objects.GetByAPID(ctx, pageID)
+	require.NoError(t, err, "the healthy item still materializes")
+
+	community, err = h.communities.GetByAPGroupID(ctx, groupID)
+	require.NoError(t, err)
+	require.NotNil(t, community.LastBackfillAt,
+		"a walk whose only failure is a host-gone skip must stamp last_backfill_at")
+}
+
+// actorHostGoneFetcher is the harness client except that FetchActor of
+// goneActorIRI fails the way the AP client reports a host that no longer
+// exists. It stands in for the materializer's fetcher, so the outbox item's
+// own fetch succeeds and only the nested author fetch hits the gone host.
+type actorHostGoneFetcher struct {
+	materialize.Fetcher
+	goneActorIRI string
+}
+
+func (f actorHostGoneFetcher) FetchActor(ctx context.Context, iri string) (*ap.Object, error) {
+	if iri == f.goneActorIRI {
+		return nil, hostGoneErr(iri, "lemmy.world")
+	}
+	return f.Fetcher.FetchActor(ctx, iri)
+}
+
+// TestBackfillSkipsHostGoneAuthor: an item whose post is reachable but whose
+// author's actor document lives on a host gone for longer than DeadHostAfter
+// is skipped by backfill, the same as a host-gone item, so the walk completes
+// and stamps last_backfill_at.
+func TestBackfillSkipsHostGoneAuthor(t *testing.T) {
+	h := newHarness(t)
+	h.subscribeTechnology()
+	serveOutboxFixtures(t, h)
+	const goneAuthor = "https://lemmy.world/u/Aweigh"
+	ctx := context.Background()
+	_, err := h.actors.GetByAPActorID(ctx, goneAuthor)
+	require.True(t, errors.IsNotFound(err), "the author must be unknown so the materializer fetches it")
+
+	materializerOptions := h.materializerOptions
+	materializerOptions.Fetcher = actorHostGoneFetcher{Fetcher: h.client, goneActorIRI: goneAuthor}
+	materializer, err := materialize.New(materializerOptions)
+	require.NoError(t, err)
+	seedDeadHostStreak(t, h, "lemmy.world")
+	b := newBackfillOver(t, h, materializer, 100)
+	b.now = func() time.Time { return backfillNow }
+
+	community, err := h.communities.GetByAPGroupID(ctx, groupID)
+	require.NoError(t, err)
+	require.NoError(t, b.Run(ctx, community, true), "a host-gone author is a skip, not a run error")
+
+	_, err = h.objects.GetByAPID(ctx, pageID)
+	require.NoError(t, err, "the healthy item still materializes")
+	_, err = h.objects.GetByAPID(ctx, secondPageID)
+	assert.True(t, errors.IsNotFound(err), "the post whose author's host is gone is not materialized")
+
+	community, err = h.communities.GetByAPGroupID(ctx, groupID)
+	require.NoError(t, err)
+	require.NotNil(t, community.LastBackfillAt,
+		"a walk whose only failure is a host-gone author must stamp last_backfill_at")
+}
+
+// TestBackfillHostGoneWithoutStreakIsAFailure: the first host-gone failure of
+// a host with no streak is an ordinary item failure, not a skip: the run
+// returns an error, last_backfill_at stays unset so the walk retries on the
+// backoff, and the host's streak starts at the backfill clock.
+func TestBackfillHostGoneWithoutStreakIsAFailure(t *testing.T) {
+	h := newHarness(t)
+	h.subscribeTechnology()
+	serveOutboxFixtures(t, h)
+	serveBrokenItemOutbox(t, h)
+	opts := h.backfillOptions(h.mat, 100)
+	opts.Fetcher = hostGoneFetcher{BackfillFetcher: h.client, goneIRI: "https://other.test/post/broken"}
+	b, err := NewBackfill(opts)
+	require.NoError(t, err)
+	b.now = func() time.Time { return backfillNow }
+	ctx := context.Background()
+
+	community, err := h.communities.GetByAPGroupID(ctx, groupID)
+	require.NoError(t, err)
+	require.Error(t, b.Run(ctx, community, true),
+		"a host that has not kept failing for DeadHostAfter is an item failure")
+
+	_, err = h.objects.GetByAPID(ctx, pageID)
+	require.NoError(t, err, "the healthy item still materializes")
+	require.Nil(t, h.lastBackfillAt(groupID),
+		"a host-gone failure inside DeadHostAfter must leave last_backfill_at unset")
+
+	goneSince, err := h.materializerOptions.Instances.RecordHostGone(ctx, "other.test", backfillNow.Add(time.Hour))
+	require.NoError(t, err)
+	assert.True(t, backfillNow.Equal(goneSince),
+		"the run started other.test's streak at the backfill clock: goneSince = %v, want %v", goneSince, backfillNow)
+}
+
+// TestBackfillFetchClearsHostGoneStreak: a successful fetch of an outbox item
+// from its origin ends that origin host's host-gone streak.
+func TestBackfillFetchClearsHostGoneStreak(t *testing.T) {
+	h := newHarness(t)
+	h.subscribeTechnology()
+	const (
+		revivedHost   = "revived.example"
+		revivedPost   = "https://revived.example/post/888"
+		revivedAuthor = "https://revived.example/u/zed"
+		technology    = "https://lemmy.world/c/technology"
+	)
+	h.serveObject("/u/zed", person(revivedAuthor, "zed", nil))
+	page := map[string]any{
+		"id":           revivedPost,
+		"type":         "Page",
+		"attributedTo": revivedAuthor,
+		"audience":     technology,
+		"to":           []any{technology, "https://www.w3.org/ns/activitystreams#Public"},
+		"name":         "a post from a host that came back",
+		"content":      "<p>back again</p>",
+		"published":    "2026-11-07T09:00:00.000000Z",
+	}
+	h.serveObject("/post/888", page)
+	// The id is cross-authority with lemmy.world, so the walk fetches the
+	// body from revived.example.
+	h.serveObject("/c/technology/outbox", map[string]any{
+		"type":         "OrderedCollection",
+		"id":           technology + "/outbox",
+		"totalItems":   1,
+		"orderedItems": []any{page},
+	})
+	seedDeadHostStreak(t, h, revivedHost)
+	b := newBackfill(t, h, 100)
+	b.now = func() time.Time { return backfillNow }
+	ctx := context.Background()
+
+	community, err := h.communities.GetByAPGroupID(ctx, groupID)
+	require.NoError(t, err)
+	require.NoError(t, b.Run(ctx, community, true))
+	require.Equal(t, 1, h.hitCount("/post/888"), "the walk fetched the item from its origin")
+	_, err = h.objects.GetByAPID(ctx, revivedPost)
+	require.NoError(t, err, "the fetched item materializes")
+
+	// Without the clear, a failure 1h after the backfill clock continues the
+	// seeded streak (last failure 25h earlier) and returns its 96h-old start.
+	later := backfillNow.Add(time.Hour)
+	goneSince, err := h.materializerOptions.Instances.RecordHostGone(ctx, revivedHost, later)
+	require.NoError(t, err)
+	assert.True(t, later.Equal(goneSince),
+		"a successful fetch must clear %s's streak: goneSince = %v, want %v", revivedHost, goneSince, later)
 }
 
 // TestBackfillSkipsTombstonedObjects: deleted-upstream markers hold during

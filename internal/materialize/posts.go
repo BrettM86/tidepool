@@ -338,6 +338,26 @@ func (m *Materializer) fillPostContent(ctx context.Context, record map[string]an
 	}
 }
 
+// fetchEmbedImage stores one embed image in repoDID and returns its
+// social.coves.embed.images#image entry with the aspect ratio of the stored
+// bytes, so clients can size the frame before the image loads. It returns
+// nil when the image is omitted.
+func (m *Materializer) fetchEmbedImage(ctx context.Context, repoDID, url string) map[string]any {
+	// A fetch failure is logged in fetchMedia; post images are optional.
+	blob, data, _ := m.fetchMedia(ctx, repoDID, url, slotEmbedImage)
+	if blob == nil {
+		return nil
+	}
+	image := map[string]any{"image": *blob}
+	if aspectRatio := imageAspectRatio(blob.MimeType, data); aspectRatio != nil {
+		image["aspectRatio"] = aspectRatio
+	} else {
+		m.logger.Debug("embed image dimensions unreadable; omitting aspectRatio",
+			"url", url, "mime_type", blob.MimeType)
+	}
+	return image
+}
+
 // buildPostEmbed maps the Page's attachments onto the post embed union:
 // image attachments → social.coves.embed.images (blobs in repoDID, the repo
 // that will hold the record); a link attachment (or `url`) →
@@ -360,11 +380,10 @@ func (m *Materializer) buildPostEmbed(ctx context.Context, page *ap.Object, repo
 			if len(images) >= 8 {
 				continue // lexicon maxLength
 			}
-			blob := m.fetchBlob(ctx, repoDID, href, slotEmbedImage)
-			if blob == nil {
+			image := m.fetchEmbedImage(ctx, repoDID, href)
+			if image == nil {
 				continue
 			}
-			image := map[string]any{"image": *blob}
 			if link.Name != "" {
 				image["alt"] = truncateText(link.Name, 1000, 10000)
 			}
@@ -395,10 +414,10 @@ func (m *Materializer) buildPostEmbed(ctx context.Context, page *ap.Object, repo
 		// No link, no images. A Lemmy thumbnail alone (image posts sometimes
 		// deliver the pictrs file in `image`) still makes an images embed.
 		if thumbURL := imageURL(page.Image); thumbURL != "" {
-			if blob := m.fetchBlob(ctx, repoDID, thumbURL, slotEmbedImage); blob != nil {
+			if image := m.fetchEmbedImage(ctx, repoDID, thumbURL); image != nil {
 				return map[string]any{
 					"$type":  "social.coves.embed.images",
-					"images": []any{map[string]any{"image": *blob}},
+					"images": []any{image},
 				}
 			}
 		}

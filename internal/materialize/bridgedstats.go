@@ -140,30 +140,8 @@ func (m *Materializer) SetBridgedStats(ctx context.Context, mapping *store.APObj
 			return nil, err
 		}
 
-		updated := *mapping
-		res, err := m.repos.PutRecordCAS(ctx, mapping.DID, mapping.Collection, mapping.RKey, record, prevCID,
-			func(ctx context.Context, tx *sql.Tx, res *repo.CommitResult) error {
-				// Resurrection guard: re-check the mapping's soft-delete INSIDE
-				// the commit tx. The CAS precondition already refuses to re-create
-				// a record deleted from the repo; this additionally refuses to
-				// un-tombstone the MAPPING (PutMappingTx clears deleted_at
-				// unconditionally). The legitimate restore path clears deleted_at
-				// via objects.Restore BEFORE its rebuild commit, so it passes here.
-				deleted, derr := m.objects.DeletedInTx(ctx, tx, mapping.APID)
-				switch {
-				case derr == nil:
-					if deleted {
-						return fmt.Errorf("materialize: stats target %s soft-deleted mid-commit: %w", mapping.ATURI, errors.ErrRecordGone)
-					}
-				case errors.IsNotFound(derr):
-					return fmt.Errorf("materialize: stats target %s mapping vanished mid-commit: %w", mapping.ATURI, errors.ErrRecordGone)
-				default:
-					return derr
-				}
-				updated.CID = res.RecordCID
-				_, mapErr := m.objects.PutMappingTx(ctx, tx, updated)
-				return mapErr
-			})
+		sideEffect, updated := m.casMappingSideEffect(mapping, "stats target")
+		res, err := m.repos.PutRecordCAS(ctx, mapping.DID, mapping.Collection, mapping.RKey, record, prevCID, sideEffect)
 		if stderrors.Is(err, repo.ErrPreconditionFailed) {
 			if attempt+1 < maxStatsCommitAttempts {
 				continue // the record changed under us; re-read and retry
@@ -175,15 +153,46 @@ func (m *Materializer) SetBridgedStats(ctx context.Context, mapping *store.APObj
 		if err != nil {
 			return nil, fmt.Errorf("materialize: put stats for %s: %w", mapping.ATURI, err)
 		}
-		if err := m.repinAcceptance(ctx, &updated, res.RecordCID); err != nil {
+		if err := m.repinAcceptance(ctx, updated, res.RecordCID); err != nil {
 			return nil, err
 		}
 		return &Result{DID: mapping.DID, ATURI: mapping.ATURI, CID: res.RecordCID, NoOp: res.NoOp}, nil
 	}
 }
 
+// casMappingSideEffect is the commit side effect of a compare-and-swap
+// rewrite of a mapped record: it moves a copy of mapping to the new record CID
+// inside the commit transaction, after a resurrection guard, and returns that
+// copy, which carries the new CID once the commit has landed.
+//
+// The guard re-checks the mapping's soft-delete INSIDE the commit tx. The CAS
+// precondition already refuses to re-create a record deleted from the repo;
+// this additionally refuses to un-tombstone the MAPPING (PutMappingTx clears
+// deleted_at unconditionally). The legitimate restore path clears deleted_at
+// via objects.Restore BEFORE its rebuild commit, so it passes here. purpose
+// names the rewrite in the errors.
+func (m *Materializer) casMappingSideEffect(mapping *store.APObjectMapping, purpose string) (repo.TxSideEffect, *store.APObjectMapping) {
+	updated := *mapping
+	return func(ctx context.Context, tx *sql.Tx, res *repo.CommitResult) error {
+		deleted, err := m.objects.DeletedInTx(ctx, tx, mapping.APID)
+		switch {
+		case err == nil:
+			if deleted {
+				return fmt.Errorf("materialize: %s %s soft-deleted mid-commit: %w", purpose, mapping.ATURI, errors.ErrRecordGone)
+			}
+		case errors.IsNotFound(err):
+			return fmt.Errorf("materialize: %s %s mapping vanished mid-commit: %w", purpose, mapping.ATURI, errors.ErrRecordGone)
+		default:
+			return err
+		}
+		updated.CID = res.RecordCID
+		_, err = m.objects.PutMappingTx(ctx, tx, updated)
+		return err
+	}, &updated
+}
+
 // repinAcceptance re-points a postv2's acceptance at the version this stamp
-// just produced. A stats stamp rewrites the record, so its CID moves — and an
+// (or the aspect ratio back-fill) just produced. A stats stamp rewrites the record, so its CID moves — and an
 // acceptance pinning the OLD CID is, to Coves' consumers, an acceptance of a
 // version that no longer exists: the lexicon tells them not to render the new
 // CID under it, so a post would fall out of its community every time the vote

@@ -213,6 +213,38 @@ func (r *postgresAPObjects) ListByActorDID(ctx context.Context, did string) ([]*
 	return mappings, nil
 }
 
+func (r *postgresAPObjects) ListLiveFediverseAfter(ctx context.Context, collections []string, afterID int64, limit int) ([]*APObjectMapping, error) {
+	if len(collections) == 0 {
+		return nil, errors.NewValidationError("collections", "must not be empty")
+	}
+	if limit < 1 {
+		return nil, errors.NewValidationError("limit", "must be positive")
+	}
+	query := `SELECT` + apObjectColumns + `
+		FROM ap_objects
+		WHERE collection = ANY($1) AND origin = $2 AND deleted_at IS NULL AND id > $3
+		ORDER BY id
+		LIMIT $4`
+	rows, err := r.db.QueryContext(ctx, query, pq.Array(collections), OriginFediverse, afterID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list live ap_objects after %d: %w", afterID, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var mappings []*APObjectMapping
+	for rows.Next() {
+		mapping, err := scanAPObject(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan ap_object after %d: %w", afterID, err)
+		}
+		mappings = append(mappings, mapping)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list live ap_objects after %d: %w", afterID, err)
+	}
+	return mappings, nil
+}
+
 func (r *postgresAPObjects) SoftDelete(ctx context.Context, apID string) error {
 	// COALESCE keeps the original tombstone time on re-delete, making the
 	// whole operation a single atomic statement: affected == 0 can only

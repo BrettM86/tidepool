@@ -58,8 +58,17 @@ func (m *Materializer) fetchBlob(ctx context.Context, did, url string, slot blob
 // stored blob forward. A store refused by a blob withhold returns the
 // computed ref with a nil error: the record keeps the ref, no bytes stored.
 func (m *Materializer) fetchBlobClassified(ctx context.Context, did, url string, slot blobSlot) (*atdata.Blob, error) {
+	blob, _, err := m.fetchMedia(ctx, did, url, slot)
+	return blob, err
+}
+
+// fetchMedia is fetchBlobClassified that also returns the bytes the blob ref
+// describes (after any transcode), for callers that read the image header.
+// The bytes are non-nil exactly when the blob is, including a withheld blob
+// whose bytes were not stored.
+func (m *Materializer) fetchMedia(ctx context.Context, did, url string, slot blobSlot) (*atdata.Blob, []byte, error) {
 	if url == "" {
-		return nil, nil
+		return nil, nil, nil
 	}
 	budget := slot.maxSize
 	if m.maxBlob < budget {
@@ -69,7 +78,7 @@ func (m *Materializer) fetchBlobClassified(ctx context.Context, did, url string,
 	if err != nil {
 		m.logger.Warn("media fetch failed; omitting image",
 			"slot", slot.name, "url", url, "error", err)
-		return nil, err
+		return nil, nil, err
 	}
 	mimeType := normalizeImageMime(contentType, data)
 	// No slot accepts AVIF, and servers mislabel it, so it is detected from
@@ -82,17 +91,17 @@ func (m *Materializer) fetchBlobClassified(ctx context.Context, did, url string,
 			if reason := transcodeSkipReason(err); reason != "" {
 				m.logger.Warn("media transcode skipped; omitting image",
 					"slot", slot.name, "url", url, "reason", reason, "error", err)
-				return nil, nil
+				return nil, nil, nil
 			}
 			m.logger.Warn("media transcode failed; omitting image",
 				"slot", slot.name, "url", url, "error", err)
-			return nil, nil
+			return nil, nil, nil
 		}
 	}
 	if !slotAccepts(slot, mimeType) {
 		m.logger.Warn("media has unacceptable content type; omitting image",
 			"slot", slot.name, "url", url, "content_type", mimeType)
-		return nil, nil
+		return nil, nil, nil
 	}
 	blob, err := m.repos.PutBlob(ctx, did, mimeType, data)
 	if tperrors.IsBlobWithheld(err) && blob != nil {
@@ -101,14 +110,14 @@ func (m *Materializer) fetchBlobClassified(ctx context.Context, did, url string,
 		// further upstream edit.
 		m.logger.Info("media withheld; keeping blob ref without storing bytes",
 			"slot", slot.name, "did", did, "cid", cid.Cid(blob.Ref).String())
-		return blob, nil
+		return blob, data, nil
 	}
 	if err != nil {
 		m.logger.Warn("blob store failed; omitting image",
 			"slot", slot.name, "url", url, "did", did, "error", err)
-		return nil, nil
+		return nil, nil, nil
 	}
-	return blob, nil
+	return blob, data, nil
 }
 
 // transcodeSkipReason names why a transcode never looked at the media (the

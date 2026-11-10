@@ -139,6 +139,11 @@ type APObjects interface {
 	// for them. Task 05's Delete(Actor) scrub enumerates these.
 	ListByActorDID(ctx context.Context, did string) ([]*APObjectMapping, error)
 
+	// ListLiveFediverseAfter returns up to limit live (not soft-deleted)
+	// fediverse-origin mappings in any of collections whose id is greater than
+	// afterID, ordered by id: one keyset page of a walk over bridged content.
+	ListLiveFediverseAfter(ctx context.Context, collections []string, afterID int64, limit int) ([]*APObjectMapping, error)
+
 	// SoftDelete marks the mapping for an AP object id as deleted, in one
 	// atomic statement. Deleting an already-deleted mapping is a no-op that
 	// preserves the original tombstone time; a missing mapping is an error

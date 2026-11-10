@@ -77,6 +77,9 @@ var _ ingest.BannedContentRemover = (*materialize.Materializer)(nil)
 // method set would make the route answer 501.
 var _ ingest.RemovalWithholdBackfiller = (*materialize.Materializer)(nil)
 
+// ingest.Admin finds the aspect ratio back-fill the same way.
+var _ ingest.AspectRatioBackfiller = (*materialize.Materializer)(nil)
+
 // ingest.NewHandler reads the ban-record publisher off the Materializer; a
 // drifted method set would make every community ban fail with a retryable
 // error.

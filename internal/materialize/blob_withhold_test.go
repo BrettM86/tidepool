@@ -121,7 +121,7 @@ func TestWithheldBlobRefusedButRefKept(t *testing.T) {
 			run: func(t *testing.T, h *harness, withholds *blobwithhold.Store) {
 				ctx := context.Background()
 				const postID = "https://lemmy.world/post/70301"
-				imageBytes := []byte("b12-postv2-embed-image-withheld-then-lifted")
+				imageBytes := pngFixture(t, 31, 67)
 				h.serveLemmyWorldFixtures()
 				h.mux.HandleFunc("GET /media/b12-embed.png", func(w http.ResponseWriter, _ *http.Request) {
 					w.Header().Set("Content-Type", "image/png")
@@ -147,6 +147,10 @@ func TestWithheldBlobRefusedButRefKept(t *testing.T) {
 				require.Equal(t, "edited body text", record["content"], "the update landed")
 				assert.Equal(t, stored, embedImageRef(t, record),
 					"the rebuilt record keeps the withheld image's ref")
+				embed := record["embed"].(map[string]any)
+				image := embed["images"].([]any)[0].(map[string]any)
+				assert.Equal(t, map[string]any{"width": int64(31), "height": int64(67)}, image["aspectRatio"],
+					"the withheld image keeps the aspect ratio of the bytes its ref names")
 
 				_, _, err = h.manager.GetBlob(ctx, authorDID, stored.CID)
 				assert.True(t, errors.IsNotFound(err),

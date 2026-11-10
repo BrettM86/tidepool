@@ -88,6 +88,12 @@
               "type": "boolean",
               "description": "Whether the viewer is subscribed"
             },
+            "contentVisibility": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 5,
+              "description": "The viewer's contentVisibility setting for this community (1=only best content, 5=all content). Present only when subscribed."
+            },
             "member": {
               "type": "boolean",
               "description": "Whether the viewer has membership status"
@@ -290,6 +296,12 @@
         "subscribed": {
           "type": "boolean",
           "description": "Whether the viewer is subscribed to this community"
+        },
+        "contentVisibility": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 5,
+          "description": "The viewer's contentVisibility setting for this community (1=only best content, 5=all content). Present only when subscribed."
         },
         "subscriptionUri": {
           "type": "string",

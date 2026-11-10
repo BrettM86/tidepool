@@ -15,6 +15,13 @@
               "type": "string",
               "maxLength": 320,
               "description": "Community identifier (DID, handle, name@origin, or bare local name) of the community to subscribe to"
+            },
+            "contentVisibility": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 5,
+              "default": 3,
+              "description": "Content visibility level (1=only best content, 5=all content)"
             }
           }
         }
@@ -37,7 +44,7 @@
             },
             "existing": {
               "type": "boolean",
-              "description": "True if item was already subscribed"
+              "description": "True when the viewer already had a subscription record for the community (whether or not it was rewritten)"
             }
           }
         }

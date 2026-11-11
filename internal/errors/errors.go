@@ -132,25 +132,64 @@ var ErrBlobWithheld = errors.New("blob withheld")
 // IsBlobWithheld reports a store refused by an active blob withhold.
 func IsBlobWithheld(err error) bool { return errors.Is(err, ErrBlobWithheld) }
 
-// ErrHostGone marks a fetch whose origin host looks gone: NXDOMAIN of the
-// object's own host, or an off-host redirect ending at a non-JSON page. The
-// condition may be temporary (a lapsed domain can come back), so it is
-// deliberately not ErrNotFound and IsNotFound is false for it. The caller
-// decides whether to skip the object (backfill) or retry later (live
-// delivery).
+// ErrHostGone marks a fetch whose origin host looks gone or unreachable: the
+// object's own host not resolving, refusing or timing out connections,
+// failing TLS, answering a CDN "origin down" status, or parking every URL
+// (HostGoneError.Reason names which). The condition may be temporary (a
+// lapsed domain can come back), so it is deliberately not ErrNotFound and
+// IsNotFound is false for it. Backfill treats the object as an ordinary
+// failure until its host has been gone for DeadHostAfter, then skips it and
+// defers it for RetryDeferred. No live caller acts on host-gone.
 var ErrHostGone = errors.New("host gone")
 
 // IsHostGone reports whether err is, wraps, or unwraps to ErrHostGone.
 func IsHostGone(err error) bool { return errors.Is(err, ErrHostGone) }
 
+// Host-gone reason codes, carried in HostGoneError.Reason.
+const (
+	// HostGoneReasonDNSNotFound: the host's name does not resolve (NXDOMAIN).
+	HostGoneReasonDNSNotFound = "dns_not_found"
+	// HostGoneReasonParkedRedirect: a redirect off the host ends at a non-JSON
+	// page (a lapsed domain parked elsewhere).
+	HostGoneReasonParkedRedirect = "parked_redirect"
+	// HostGoneReasonConnectTimeout: connecting to the host timed out.
+	HostGoneReasonConnectTimeout = "connect_timeout"
+	// HostGoneReasonConnectionRefused: the host refused the connection.
+	HostGoneReasonConnectionRefused = "connection_refused"
+	// HostGoneReasonConnectionReset: the host reset the connection while
+	// connecting.
+	HostGoneReasonConnectionReset = "connection_reset"
+	// HostGoneReasonNoRoute: no route to the host or its network.
+	HostGoneReasonNoRoute = "no_route"
+	// HostGoneReasonTLSFailure: the TLS handshake failed (certificate
+	// verification, handshake alert, or a non-TLS answer).
+	HostGoneReasonTLSFailure = "tls_failure"
+	// HostGoneReasonTooManyRedirects: the host redirects to itself past the
+	// redirect limit.
+	HostGoneReasonTooManyRedirects = "too_many_redirects"
+	// HostGoneReasonEdgeStatus: the host's CDN edge reports its origin down
+	// (HTTP 521, 522, 523, 525, 526 or 530).
+	HostGoneReasonEdgeStatus = "edge_status"
+	// HostGoneReasonRedirectToRoot: the host redirects the object to its own
+	// root, which answers a non-JSON page.
+	HostGoneReasonRedirectToRoot = "redirect_to_root"
+)
+
 // HostGoneError is a host-gone failure naming the dead host: the fetched
 // IRI's own host, lowercased and without a port.
 type HostGoneError struct {
 	Host string
+	// Reason is the HostGoneReason... code naming what failed.
+	Reason string
 }
 
-// Error names the gone host.
-func (e HostGoneError) Error() string { return fmt.Sprintf("host gone: %s", e.Host) }
+// Error names the gone host and the reason.
+func (e HostGoneError) Error() string {
+	if e.Reason == "" {
+		return fmt.Sprintf("host gone: %s", e.Host)
+	}
+	return fmt.Sprintf("host gone: %s (%s)", e.Host, e.Reason)
+}
 
 // Unwrap makes errors.Is(err, ErrHostGone) true for host-gone errors.
 func (e HostGoneError) Unwrap() error { return ErrHostGone }
@@ -164,4 +203,14 @@ func HostGoneHost(err error) (host string, ok bool) {
 		return "", false
 	}
 	return hostGone.Host, true
+}
+
+// HostGoneReason returns the reason code carried by a HostGoneError in err's
+// chain. ok is false when err carries none or the reason is empty.
+func HostGoneReason(err error) (reason string, ok bool) {
+	var hostGone HostGoneError
+	if !errors.As(err, &hostGone) || hostGone.Reason == "" {
+		return "", false
+	}
+	return hostGone.Reason, true
 }

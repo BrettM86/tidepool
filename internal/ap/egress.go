@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"time"
 
 	"tidepool/internal/errors"
@@ -83,12 +84,23 @@ type egressGuard struct {
 	// direct net.Resolver call) so tests can inject a DNS-rebinding scenario —
 	// a hostname that resolves to a blocked address — without a real DNS server.
 	lookupIPAddr func(ctx context.Context, host string) ([]net.IPAddr, error)
+	// perAddressConnectTimeout bounds each resolved-IP dial, so an address
+	// whose path is broken (an unroutable IPv6 answer) gives way to the next
+	// one instead of consuming the whole request timeout. It applies even
+	// when only one address resolves, so that address's dial is cut at this
+	// bound (5s in production) rather than the request timeout (30s). Zero
+	// means no per-address bound.
+	perAddressConnectTimeout time.Duration
 }
+
+// defaultPerAddressConnectTimeout is the guard's per-address connect bound.
+const defaultPerAddressConnectTimeout = 5 * time.Second
 
 func newEgressGuard(allowPrivate bool) *egressGuard {
 	return &egressGuard{
-		allowPrivate: allowPrivate,
-		lookupIPAddr: net.DefaultResolver.LookupIPAddr,
+		allowPrivate:             allowPrivate,
+		lookupIPAddr:             net.DefaultResolver.LookupIPAddr,
+		perAddressConnectTimeout: defaultPerAddressConnectTimeout,
 	}
 }
 
@@ -197,7 +209,7 @@ func (g *egressGuard) dialContext(base dialFunc) dialFunc {
 			}
 			// Dial the exact IP we validated (not the hostname) to defeat DNS
 			// rebinding.
-			conn, err := base(ctx, network, net.JoinHostPort(ipa.IP.String(), port))
+			conn, err := g.dialAddress(ctx, base, network, net.JoinHostPort(ipa.IP.String(), port))
 			if err != nil {
 				lastErr = err
 				continue
@@ -210,4 +222,48 @@ func (g *egressGuard) dialContext(base dialFunc) dialFunc {
 		}
 		return nil, lastErr
 	}
+}
+
+// dialAddress dials one resolved address under the per-address connect
+// timeout. When that timeout (not the caller's ctx) ends the dial, the error
+// is a dial timeout naming the address, so it reads as a connect timeout and
+// never as the caller's own deadline.
+func (g *egressGuard) dialAddress(ctx context.Context, base dialFunc, network, addr string) (net.Conn, error) {
+	if g.perAddressConnectTimeout <= 0 {
+		return base(ctx, network, addr)
+	}
+	addressCtx, cancel := context.WithTimeout(ctx, g.perAddressConnectTimeout)
+	defer cancel()
+	conn, err := base(addressCtx, network, addr)
+	if err != nil && ctx.Err() == nil && addressCtx.Err() != nil {
+		return nil, &net.OpError{Op: "dial", Net: network, Addr: tcpAddrOrNil(addr), Err: addressConnectTimeoutError{base: err}}
+	}
+	return conn, err
+}
+
+// addressConnectTimeoutError is a dial cut off by the per-address connect
+// bound. It reports Timeout() and unwraps to os.ErrDeadlineExceeded and the
+// base dial's own error.
+type addressConnectTimeoutError struct{ base error }
+
+func (e addressConnectTimeoutError) Error() string {
+	return "per-address connect timeout: " + e.base.Error()
+}
+
+func (addressConnectTimeoutError) Timeout() bool { return true }
+
+func (addressConnectTimeoutError) Temporary() bool { return true }
+
+func (e addressConnectTimeoutError) Unwrap() []error {
+	return []error{os.ErrDeadlineExceeded, e.base}
+}
+
+// tcpAddrOrNil parses an ip:port for an OpError's Addr; nil when it does not
+// parse.
+func tcpAddrOrNil(addr string) net.Addr {
+	tcpAddr, err := net.ResolveTCPAddr("tcp", addr)
+	if err != nil {
+		return nil
+	}
+	return tcpAddr
 }

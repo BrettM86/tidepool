@@ -252,6 +252,10 @@ services:
     networks:
       - tidepool-internal
       - coves-prod-network
+      # IPv6 egress for fetches from instances that drop our IPv4 address
+      # (infosec.pub, for example, has done so while still answering over
+      # IPv6). See the network definition.
+      - tidepool-ipv6-egress
     depends_on:
       postgres:
         condition: service_healthy
@@ -418,6 +422,20 @@ networks:
     name: tidepool-prod-internal
   coves-prod-network:
     external: true
+  # IPv6-only bridge giving the tidepool service IPv6 egress: some instances
+  # drop our IPv4 address but answer over IPv6 (infosec.pub). IPv6-only so
+  # IPv4 routing is unchanged, and a separate network so tidepool-internal
+  # and coves-prod-network are not recreated. Attached to tidepool only, with
+  # no published ports. The egress guard bounds each address's connect, so a
+  # broken IPv6 path falls back to IPv4 quickly.
+  tidepool-ipv6-egress:
+    driver: bridge
+    name: tidepool-prod-ipv6-egress
+    enable_ipv6: true
+    enable_ipv4: false
+    ipam:
+      config:
+        - subnet: fd00:7d70:1::/64
 
 volumes:
   postgres-data:

@@ -160,6 +160,8 @@ type (
 	unusedTombstones   struct{ store.Tombstones }
 	unusedClassifier   struct{ EchoClassifier }
 	unusedInstances    struct{ store.Instances }
+	unusedProber       struct{ HostProber }
+	unusedDeferred     struct{ store.DeferredBackfillItems }
 )
 
 // retryFixture drives Backfill's retry state on a manual clock, with no
@@ -190,6 +192,8 @@ func (f *retryFixture) newBackfill(t *testing.T) *Backfill {
 		Communities:  f.communities,
 		Tombstones:   unusedTombstones{},
 		Instances:    unusedInstances{},
+		Prober:       unusedProber{},
+		Deferred:     unusedDeferred{},
 		Echo:         unusedClassifier{},
 		BaseContext:  t.Context(),
 		Logger:       slog.New(slog.DiscardHandler),

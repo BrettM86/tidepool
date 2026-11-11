@@ -3,12 +3,10 @@ package ingest
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	stderrors "errors"
 	"expvar"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"sync"
 	"time"
 
@@ -142,27 +140,17 @@ func ClassifyOrigin(collection, apID string, obj *ap.Object, err error) OriginSt
 }
 
 // isLemmyNotFound reports Lemmy's not-found answer to a GET of an object of
-// collection: 400 with the JSON error couldnt_find_post for a post or
-// couldnt_find_comment for a comment.
+// collection: ap.LemmyCouldntFindPost for a post, ap.LemmyCouldntFindComment
+// for a comment.
 func isLemmyNotFound(collection string, err error) bool {
-	var notFoundCode string
 	switch collection {
 	case materialize.CollectionPostV2:
-		notFoundCode = "couldnt_find_post"
+		return ap.IsLemmyNotFound(err, ap.LemmyCouldntFindPost)
 	case materialize.CollectionComment:
-		notFoundCode = "couldnt_find_comment"
+		return ap.IsLemmyNotFound(err, ap.LemmyCouldntFindComment)
 	default:
 		return false
 	}
-	var httpErr ap.HTTPError
-	if !stderrors.As(err, &httpErr) || httpErr.StatusCode != http.StatusBadRequest {
-		return false
-	}
-	var lemmyError struct {
-		Error string `json:"error"`
-	}
-	return json.Unmarshal([]byte(httpErr.Body), &lemmyError) == nil &&
-		lemmyError.Error == notFoundCode
 }
 
 // OriginFetcher fetches a kept object from its origin.

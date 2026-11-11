@@ -2,6 +2,7 @@ package ap
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	stderrors "errors"
 	"fmt"
@@ -9,9 +10,12 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1138,7 +1142,7 @@ func TestFetchObject_GoneHost(t *testing.T) {
 		_, _ = w.Write(loadFixture(t, "note_lemmy_zip.json"))
 	}
 
-	tests := []struct {
+	type goneHostCase struct {
 		name string
 		// dnsError, when set, is what the dialer returns for dnsErrorHost.
 		dnsError *net.DNSError
@@ -1163,7 +1167,64 @@ func TestFetchObject_GoneHost(t *testing.T) {
 		// wantDials, when positive, is how many times the dialer must have
 		// been asked for dnsErrorHost (MaxAttempts is 2).
 		wantDials int32
-	}{
+		// hosts serves further stub hosts (x.example, z.example) by name,
+		// alongside origin and elsewhere.
+		hosts map[string]http.HandlerFunc
+		// tlsHost, when set, is served from hosts over TLS: tlsMode
+		// "untrusted" presents the httptest certificate the client does not
+		// trust; "certificate-error" fails GetCertificate so the server
+		// answers the handshake with an alert.
+		tlsHost string
+		tlsMode string
+		// dialErrors maps a dialed host to the error the dialer returns for
+		// it; dialFailures, when positive, limits that to the host's first N
+		// dials (later dials reach its listener).
+		dialErrors   map[string]error
+		dialFailures int32
+		// clientTimeout sets the http.Client Timeout (zero: the default).
+		clientTimeout time.Duration
+		// wantReason is the errors.HostGoneReason code when wantHostGone.
+		wantReason string
+		// wantRequests maps a host to the requests its handler must have
+		// received; wantDialsTo maps a host to the dials it must have seen.
+		// Both prove the failing phase was reached.
+		wantRequests map[string]int32
+		wantDialsTo  map[string]int32
+	}
+
+	// edgeStatusRow: a CDN edge status from the IRI's own host (its origin
+	// is down behind the edge) is edge_status, classified only after the
+	// last attempt.
+	edgeStatusRow := func(status int) goneHostCase {
+		return goneHostCase{
+			name: fmt.Sprintf("edge status %d from the iri host is edge_status", status),
+			hosts: map[string]http.HandlerFunc{"x.example": func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(status)
+			}},
+			iri:          "http://x.example/post/1",
+			wantErr:      true,
+			wantHostGone: true,
+			wantGoneHost: "x.example",
+			wantReason:   "edge_status",
+			wantRequests: map[string]int32{"x.example": 2},
+		}
+	}
+	// notCountedStatusRow: a status that says nothing about the host being
+	// unreachable. 401/403 stay not found (AccessRefusedError).
+	notCountedStatusRow := func(status int, wantNotFound bool) goneHostCase {
+		return goneHostCase{
+			name: fmt.Sprintf("status %d from the iri host is not host gone", status),
+			hosts: map[string]http.HandlerFunc{"x.example": func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(status)
+			}},
+			iri:          "http://x.example/post/1",
+			wantErr:      true,
+			wantNotFound: wantNotFound,
+		}
+	}
+
+	tests := []goneHostCase{
+
 		{
 			name:         "dns nxdomain",
 			dnsError:     &net.DNSError{Err: "no such host", Name: goneHost, IsNotFound: true},
@@ -1172,11 +1233,23 @@ func TestFetchObject_GoneHost(t *testing.T) {
 			wantNotFound: false,
 			wantHostGone: true,
 			wantGoneHost: "gone-host.invalid",
+			wantReason:   "dns_not_found",
 			wantDials:    1,
 		},
 		{
 			name:         "temporary dns failure stays retryable",
 			dnsError:     &net.DNSError{Err: "server misbehaving", Name: goneHost, IsTemporary: true},
+			iri:          "http://" + goneHost + "/post/1",
+			wantErr:      true,
+			wantNotFound: false,
+			wantDials:    2,
+		},
+		{
+			// A resolver timeout surfaces as a dial OpError whose Timeout()
+			// is true, but no connection to the host was attempted: it is
+			// not connect_timeout.
+			name:         "dns lookup timeout at dial is not connect_timeout",
+			dnsError:     &net.DNSError{Err: "i/o timeout", Name: goneHost, IsTimeout: true},
 			iri:          "http://" + goneHost + "/post/1",
 			wantErr:      true,
 			wantNotFound: false,
@@ -1193,6 +1266,7 @@ func TestFetchObject_GoneHost(t *testing.T) {
 			wantNotFound: false,
 			wantHostGone: true,
 			wantGoneHost: "origin.example",
+			wantReason:   "parked_redirect",
 		},
 		{
 			name: "same-host redirect to html keeps ordinary error",
@@ -1288,16 +1362,253 @@ func TestFetchObject_GoneHost(t *testing.T) {
 			wantErr:      true,
 			wantNotFound: false,
 		},
+		// Counted unreachable-host classes: each is classified only after the
+		// final attempt (MaxAttempts 2), names the IRI's own host, and carries
+		// its reason code.
+		{
+			name:         "dial timeout to the iri host is connect_timeout",
+			dialErrors:   map[string]error{"x.example": &net.OpError{Op: "dial", Net: "tcp", Err: os.ErrDeadlineExceeded}},
+			iri:          "http://x.example/post/1",
+			wantErr:      true,
+			wantHostGone: true,
+			wantGoneHost: "x.example",
+			wantReason:   "connect_timeout",
+			wantDialsTo:  map[string]int32{"x.example": 2},
+		},
+		{
+			name:         "connection refused by the iri host is connection_refused",
+			dialErrors:   map[string]error{"x.example": &net.OpError{Op: "dial", Net: "tcp", Err: &os.SyscallError{Syscall: "connect", Err: syscall.ECONNREFUSED}}},
+			iri:          "http://x.example/post/1",
+			wantErr:      true,
+			wantHostGone: true,
+			wantGoneHost: "x.example",
+			wantReason:   "connection_refused",
+			wantDialsTo:  map[string]int32{"x.example": 2},
+		},
+		{
+			name:         "connection reset at dial is connection_reset",
+			dialErrors:   map[string]error{"x.example": &net.OpError{Op: "dial", Net: "tcp", Err: &os.SyscallError{Syscall: "connect", Err: syscall.ECONNRESET}}},
+			iri:          "http://x.example/post/1",
+			wantErr:      true,
+			wantHostGone: true,
+			wantGoneHost: "x.example",
+			wantReason:   "connection_reset",
+			wantDialsTo:  map[string]int32{"x.example": 2},
+		},
+		{
+			name:         "host unreachable is no_route",
+			dialErrors:   map[string]error{"x.example": &net.OpError{Op: "dial", Net: "tcp", Err: &os.SyscallError{Syscall: "connect", Err: syscall.EHOSTUNREACH}}},
+			iri:          "http://x.example/post/1",
+			wantErr:      true,
+			wantHostGone: true,
+			wantGoneHost: "x.example",
+			wantReason:   "no_route",
+			wantDialsTo:  map[string]int32{"x.example": 2},
+		},
+		{
+			name:         "network unreachable is no_route",
+			dialErrors:   map[string]error{"x.example": &net.OpError{Op: "dial", Net: "tcp", Err: &os.SyscallError{Syscall: "connect", Err: syscall.ENETUNREACH}}},
+			iri:          "http://x.example/post/1",
+			wantErr:      true,
+			wantHostGone: true,
+			wantGoneHost: "x.example",
+			wantReason:   "no_route",
+			wantDialsTo:  map[string]int32{"x.example": 2},
+		},
+		{
+			name:         "untrusted tls certificate is tls_failure",
+			hosts:        map[string]http.HandlerFunc{"x.example": noteHandler},
+			tlsHost:      "x.example",
+			tlsMode:      "untrusted",
+			iri:          "https://x.example/post/1",
+			wantErr:      true,
+			wantHostGone: true,
+			wantGoneHost: "x.example",
+			wantReason:   "tls_failure",
+			wantDialsTo:  map[string]int32{"x.example": 2},
+			wantRequests: map[string]int32{"x.example": 0},
+		},
+		{
+			name:         "tls handshake alert is tls_failure",
+			hosts:        map[string]http.HandlerFunc{"x.example": noteHandler},
+			tlsHost:      "x.example",
+			tlsMode:      "certificate-error",
+			iri:          "https://x.example/post/1",
+			wantErr:      true,
+			wantHostGone: true,
+			wantGoneHost: "x.example",
+			wantReason:   "tls_failure",
+			wantDialsTo:  map[string]int32{"x.example": 2},
+			wantRequests: map[string]int32{"x.example": 0},
+		},
+		{
+			name: "same-host redirect loop is too_many_redirects",
+			hosts: map[string]http.HandlerFunc{"x.example": func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, "/post/1", http.StatusFound)
+			}},
+			iri:          "http://x.example/post/1",
+			wantErr:      true,
+			wantHostGone: true,
+			wantGoneHost: "x.example",
+			wantReason:   "too_many_redirects",
+		},
+		edgeStatusRow(521),
+		edgeStatusRow(522),
+		edgeStatusRow(523),
+		edgeStatusRow(525),
+		edgeStatusRow(526),
+		edgeStatusRow(530),
+		{
+			name: "same-host redirect to the root html page is redirect_to_root",
+			hosts: map[string]http.HandlerFunc{"x.example": func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/" {
+					http.Redirect(w, r, "/", http.StatusFound)
+					return
+				}
+				htmlHandler(w, r)
+			}},
+			iri:          "http://x.example/post/1",
+			wantErr:      true,
+			wantHostGone: true,
+			wantGoneHost: "x.example",
+			wantReason:   "redirect_to_root",
+		},
+		{
+			name:         "connection refused then served on the retry returns the object",
+			hosts:        map[string]http.HandlerFunc{"x.example": noteHandler},
+			dialErrors:   map[string]error{"x.example": &net.OpError{Op: "dial", Net: "tcp", Err: &os.SyscallError{Syscall: "connect", Err: syscall.ECONNREFUSED}}},
+			dialFailures: 1,
+			iri:          "http://x.example/post/1",
+			wantErr:      false,
+			wantDialsTo:  map[string]int32{"x.example": 2},
+			wantRequests: map[string]int32{"x.example": 1},
+		},
+		// Not counted: transient or caller-side failures, and failures that
+		// are not the IRI host's own.
+		notCountedStatusRow(http.StatusBadGateway, false),
+		notCountedStatusRow(http.StatusServiceUnavailable, false),
+		notCountedStatusRow(http.StatusGatewayTimeout, false),
+		notCountedStatusRow(520, false),
+		notCountedStatusRow(524, false),
+		notCountedStatusRow(http.StatusUnauthorized, true),
+		notCountedStatusRow(http.StatusForbidden, true),
+		notCountedStatusRow(http.StatusTooManyRequests, false),
+		{
+			name: "response header timeout after connect is not host gone",
+			hosts: map[string]http.HandlerFunc{"x.example": func(_ http.ResponseWriter, r *http.Request) {
+				<-r.Context().Done()
+			}},
+			clientTimeout: 100 * time.Millisecond,
+			iri:           "http://x.example/post/1",
+			wantErr:       true,
+			wantRequests:  map[string]int32{"x.example": 2},
+		},
+		{
+			name: "connection refused on an off-host redirect hop is not host gone",
+			hosts: map[string]http.HandlerFunc{"x.example": func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, "http://z.example/post/1", http.StatusFound)
+			}},
+			dialErrors:   map[string]error{"z.example": &net.OpError{Op: "dial", Net: "tcp", Err: &os.SyscallError{Syscall: "connect", Err: syscall.ECONNREFUSED}}},
+			iri:          "http://x.example/post/1",
+			wantErr:      true,
+			wantDialsTo:  map[string]int32{"z.example": 2},
+			wantRequests: map[string]int32{"x.example": 2},
+		},
+		{
+			name: "edge status from an off-host redirect target is not host gone",
+			hosts: map[string]http.HandlerFunc{
+				"x.example": func(w http.ResponseWriter, r *http.Request) {
+					http.Redirect(w, r, "http://z.example/post/1", http.StatusFound)
+				},
+				"z.example": func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(522) },
+			},
+			iri:          "http://x.example/post/1",
+			wantErr:      true,
+			wantRequests: map[string]int32{"x.example": 2, "z.example": 2},
+		},
+		{
+			name: "root html reached through another host is not redirect_to_root",
+			hosts: map[string]http.HandlerFunc{
+				"x.example": func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Path != "/" {
+						http.Redirect(w, r, "http://z.example/hop", http.StatusFound)
+						return
+					}
+					htmlHandler(w, r)
+				},
+				"z.example": func(w http.ResponseWriter, r *http.Request) {
+					http.Redirect(w, r, "http://x.example/", http.StatusFound)
+				},
+			},
+			iri:          "http://x.example/post/1",
+			wantErr:      true,
+			wantRequests: map[string]int32{"x.example": 2, "z.example": 1},
+		},
+		{
+			name: "redirect loop bouncing between two hosts is not too_many_redirects",
+			hosts: map[string]http.HandlerFunc{
+				"x.example": func(w http.ResponseWriter, r *http.Request) {
+					http.Redirect(w, r, "http://z.example/bounce", http.StatusFound)
+				},
+				"z.example": func(w http.ResponseWriter, r *http.Request) {
+					http.Redirect(w, r, "http://x.example/post/1", http.StatusFound)
+				},
+			},
+			iri:          "http://x.example/post/1",
+			wantErr:      true,
+			wantRequests: map[string]int32{"x.example": 3, "z.example": 3},
+		},
+		{
+			name: "503 then 200 returns the object",
+			hosts: map[string]http.HandlerFunc{"x.example": func() http.HandlerFunc {
+				var calls atomic.Int32
+				return func(w http.ResponseWriter, r *http.Request) {
+					if calls.Add(1) == 1 {
+						w.WriteHeader(http.StatusServiceUnavailable)
+						return
+					}
+					noteHandler(w, r)
+				}
+			}()},
+			iri:          "http://x.example/post/1",
+			wantErr:      false,
+			wantRequests: map[string]int32{"x.example": 2},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			handlers := map[string]http.HandlerFunc{originHost: tt.origin, elsewhereHost: tt.elsewhere}
+			for host, handler := range tt.hosts {
+				handlers[host] = handler
+			}
 			addrs := map[string]string{}
-			for host, handler := range map[string]http.HandlerFunc{originHost: tt.origin, elsewhereHost: tt.elsewhere} {
+			var countsMu sync.Mutex
+			requests := map[string]int32{}
+			dials := map[string]int32{}
+			for host, handler := range handlers {
 				if handler == nil {
 					continue
 				}
-				server := httptest.NewServer(handler)
+				counted := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					countsMu.Lock()
+					requests[host]++
+					countsMu.Unlock()
+					handler(w, r)
+				})
+				var server *httptest.Server
+				switch {
+				case host == tt.tlsHost && tt.tlsMode == "untrusted":
+					server = httptest.NewTLSServer(counted)
+				case host == tt.tlsHost && tt.tlsMode == "certificate-error":
+					server = httptest.NewUnstartedServer(counted)
+					server.TLS = &tls.Config{GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+						return nil, stderrors.New("test server: no certificate for this name")
+					}}
+					server.StartTLS()
+				default:
+					server = httptest.NewServer(counted)
+				}
 				t.Cleanup(server.Close)
 				addrs[host] = server.Listener.Addr().String()
 			}
@@ -1309,6 +1620,14 @@ func TestFetchObject_GoneHost(t *testing.T) {
 					host, _, err := net.SplitHostPort(addr)
 					if err != nil {
 						return nil, err
+					}
+					countsMu.Lock()
+					dials[strings.ToLower(host)]++
+					dialCount := dials[strings.ToLower(host)]
+					countsMu.Unlock()
+					if dialErr, ok := tt.dialErrors[strings.ToLower(host)]; ok &&
+						(tt.dialFailures == 0 || dialCount <= tt.dialFailures) {
+						return nil, dialErr
 					}
 					dnsErrorHost := tt.dnsErrorHost
 					if dnsErrorHost == "" {
@@ -1331,7 +1650,7 @@ func TestFetchObject_GoneHost(t *testing.T) {
 			t.Cleanup(transport.CloseIdleConnections)
 
 			client := newTestClient(t, ClientOptions{
-				HTTPClient:     &http.Client{Transport: transport},
+				HTTPClient:     &http.Client{Transport: transport, Timeout: tt.clientTimeout},
 				MaxAttempts:    2,
 				RetryBaseDelay: time.Millisecond,
 			})
@@ -1347,6 +1666,14 @@ func TestFetchObject_GoneHost(t *testing.T) {
 			if tt.wantDials > 0 {
 				assert.Equal(t, tt.wantDials, goneDials.Load(), "dials of the failing host")
 			}
+			countsMu.Lock()
+			for host, want := range tt.wantRequests {
+				assert.Equal(t, want, requests[host], "requests served by %s", host)
+			}
+			for host, want := range tt.wantDialsTo {
+				assert.Equal(t, want, dials[host], "dials of %s", host)
+			}
+			countsMu.Unlock()
 			if !tt.wantErr {
 				require.NoError(t, err)
 				require.NotNil(t, obj)
@@ -1360,7 +1687,584 @@ func TestFetchObject_GoneHost(t *testing.T) {
 				host, ok := errors.HostGoneHost(err)
 				assert.True(t, ok, "errors.HostGoneHost(%v) must find the dead host", err)
 				assert.Equal(t, tt.wantGoneHost, host, "errors.HostGoneHost(%v)", err)
+				if tt.wantReason != "" {
+					reason, ok := errors.HostGoneReason(err)
+					assert.True(t, ok, "errors.HostGoneReason(%v) must find a reason", err)
+					assert.Equal(t, tt.wantReason, reason, "errors.HostGoneReason(%v)", err)
+				}
 			}
 		})
 	}
+}
+
+// TestFetchObject_CallerSideFailuresAreNotHostGone pins the failures that
+// happen before or around a response but say nothing about the IRI host being
+// unreachable: the per-host limiter wait, the caller's own context, the egress
+// guard, and the detached request budget expiring. None may be classified as
+// host gone, and each row proves the intended phase was reached.
+func TestFetchObject_CallerSideFailuresAreNotHostGone(t *testing.T) {
+	noteResponse := func(*http.Request) (*http.Response, error) {
+		return scriptedResponse(http.StatusOK, `{"type":"Note","id":"https://x.example/post/0"}`), nil
+	}
+
+	tests := []struct {
+		name string
+		run  func(t *testing.T) error
+	}{
+		{
+			name: "per-host limiter wait failing on the caller deadline",
+			run: func(t *testing.T) error {
+				transport := &scriptedTransport{handler: noteResponse}
+				client := newTestClient(t, ClientOptions{
+					HTTPClient:   &http.Client{Transport: transport},
+					PerHostRPS:   1,
+					PerHostBurst: 1,
+				})
+				_, err := client.FetchObject(context.Background(), "https://x.example/post/0")
+				require.NoError(t, err, "the first fetch spends the host's only token")
+
+				ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+				defer cancel()
+				_, err = client.FetchObject(ctx, "https://x.example/post/1")
+				assert.ErrorIs(t, err, context.DeadlineExceeded, "the caller's deadline ends the wait")
+				assert.Equal(t, []string{"https://x.example/post/0"}, transport.seen(),
+					"the second fetch must still be waiting on the limiter")
+				return err
+			},
+		},
+		{
+			name: "caller context canceled",
+			run: func(t *testing.T) error {
+				transport := &scriptedTransport{handler: noteResponse}
+				client := newTestClient(t, ClientOptions{HTTPClient: &http.Client{Transport: transport}})
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				_, err := client.FetchObject(ctx, "https://x.example/post/1")
+				assert.ErrorIs(t, err, context.Canceled)
+				assert.Empty(t, transport.seen())
+				return err
+			},
+		},
+		{
+			name: "egress guard refusal",
+			run: func(t *testing.T) error {
+				client := NewClient(ClientOptions{UserAgent: "tidepool-test/0", Signer: NewSigner(testKeyID, testRSAKey(t))})
+				_, err := client.FetchObject(context.Background(), "http://127.0.0.1:1/post/1")
+				assert.True(t, errors.IsValidation(err), "the guard refuses loopback, got %v", err)
+				return err
+			},
+		},
+		{
+			name: "limiter wait failing inside the detached request budget",
+			run: func(t *testing.T) error {
+				transport := &scriptedTransport{handler: noteResponse}
+				client := newTestClient(t, ClientOptions{
+					HTTPClient:   &http.Client{Transport: transport},
+					PerHostRPS:   0.001,
+					PerHostBurst: 1,
+				})
+				_, err := client.FetchObject(context.Background(), "https://x.example/post/0")
+				require.NoError(t, err, "the first fetch spends the host's only token")
+
+				client.requestBudget = 50 * time.Millisecond
+				callerCtx := context.Background()
+				_, err = client.FetchObject(callerCtx, "https://x.example/post/1")
+				require.Error(t, err)
+				assert.NoError(t, callerCtx.Err(), "the caller's context is still live")
+				assert.Equal(t, []string{"https://x.example/post/0"}, transport.seen(),
+					"the second fetch must fail in the limiter wait, before any request")
+				return err
+			},
+		},
+		{
+			name: "request budget expiring mid-dial",
+			run: func(t *testing.T) error {
+				// The round trip blocks until the request budget ends, then
+				// reports a dial timeout, the error a dial cut off by the
+				// budget's deadline gives. The budget ran out, not the host.
+				var dialsEntered atomic.Int32
+				transport := &scriptedTransport{handler: func(req *http.Request) (*http.Response, error) {
+					dialsEntered.Add(1)
+					<-req.Context().Done()
+					return nil, &net.OpError{Op: "dial", Net: "tcp", Err: os.ErrDeadlineExceeded}
+				}}
+				client := newTestClient(t, ClientOptions{
+					HTTPClient:  &http.Client{Transport: transport},
+					MaxAttempts: 1,
+				})
+				client.requestBudget = 50 * time.Millisecond
+				callerCtx := context.Background()
+				_, err := client.FetchObject(callerCtx, "http://x.example/post/1")
+				require.Error(t, err)
+				assert.NoError(t, callerCtx.Err(), "the caller's context is still live")
+				assert.Equal(t, int32(1), dialsEntered.Load(), "the dial must have been entered")
+				return err
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.run(t)
+			require.Error(t, err)
+			assert.False(t, errors.IsHostGone(err), "errors.IsHostGone(%v)", err)
+		})
+	}
+}
+
+// TestProbeNodeInfo pins the reachability probe: only a 2xx JSON object at
+// https://<host>/.well-known/nodeinfo counts as the host answering.
+func TestProbeNodeInfo(t *testing.T) {
+	tests := []struct {
+		name        string
+		status      int
+		contentType string
+		body        string
+		wantErr     bool
+		host        string // "" means x.example
+		wantURL     string // "" means https://x.example/.well-known/nodeinfo
+	}{
+		{name: "json object", status: http.StatusOK, contentType: "application/json", body: `{"links":[]}`, wantErr: false},
+		{
+			name: "ipv6 literal host", status: http.StatusOK, contentType: "application/json", body: `{"links":[]}`, wantErr: false,
+			host: "::1", wantURL: "https://[::1]/.well-known/nodeinfo",
+		},
+		{name: "html page", status: http.StatusOK, contentType: "text/html", body: "<html><body>parked</body></html>", wantErr: true},
+		{name: "html labelled json", status: http.StatusOK, contentType: "application/json", body: "<html><body>parked</body></html>", wantErr: true},
+		{name: "malformed json", status: http.StatusOK, contentType: "application/json", body: `{"links":`, wantErr: true},
+		{name: "not found", status: http.StatusNotFound, contentType: "application/json", body: `{"error":"not found"}`, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			transport := &scriptedTransport{handler: func(*http.Request) (*http.Response, error) {
+				resp := scriptedResponse(tt.status, tt.body)
+				resp.Header.Set("Content-Type", tt.contentType)
+				return resp, nil
+			}}
+			client := newTestClient(t, ClientOptions{HTTPClient: &http.Client{Transport: transport}, MaxAttempts: 1})
+
+			host, wantURL := tt.host, tt.wantURL
+			if host == "" {
+				host, wantURL = "x.example", "https://x.example/.well-known/nodeinfo"
+			}
+			err := client.ProbeNodeInfo(context.Background(), host)
+			assert.Equal(t, []string{wantURL}, transport.seen())
+			if tt.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			assert.NoError(t, err)
+		})
+	}
+}
+
+// hostScript answers scripted requests per host; a host's responder can be
+// swapped mid-test (a dead host coming back).
+type hostScript struct {
+	mu         sync.Mutex
+	responders map[string]func(*http.Request) (*http.Response, error)
+}
+
+func (h *hostScript) set(host string, responder func(*http.Request) (*http.Response, error)) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.responders[host] = responder
+}
+
+func (h *hostScript) roundTrip(req *http.Request) (*http.Response, error) {
+	h.mu.Lock()
+	responder, ok := h.responders[req.URL.Hostname()]
+	h.mu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("host script: unexpected host %q", req.URL.Hostname())
+	}
+	return responder(req)
+}
+
+// requestsTo counts the transport's requests to host.
+func requestsTo(transport *scriptedTransport, host string) int {
+	count := 0
+	for _, raw := range transport.seen() {
+		if parsed, err := url.Parse(raw); err == nil && parsed.Hostname() == host {
+			count++
+		}
+	}
+	return count
+}
+
+func refusedDial(*http.Request) (*http.Response, error) {
+	return nil, &net.OpError{Op: "dial", Net: "tcp", Err: &os.SyscallError{Syscall: "connect", Err: syscall.ECONNREFUSED}}
+}
+
+func jsonResponder(body string) func(*http.Request) (*http.Response, error) {
+	return func(*http.Request) (*http.Response, error) {
+		resp := scriptedResponse(http.StatusOK, body)
+		resp.Header.Set("Content-Type", ContentTypeActivityJSON)
+		return resp, nil
+	}
+}
+
+func htmlResponse() *http.Response {
+	resp := scriptedResponse(http.StatusOK, "<html><body>domain for sale</body></html>")
+	resp.Header.Set("Content-Type", "text/html")
+	return resp
+}
+
+func redirectResponse(location string) *http.Response {
+	resp := scriptedResponse(http.StatusFound, "")
+	resp.Header.Set("Location", location)
+	return resp
+}
+
+// newHostScriptClient builds a client (MaxAttempts 2) over a per-host script.
+func newHostScriptClient(t *testing.T) (*Client, *scriptedTransport, *hostScript) {
+	t.Helper()
+	script := &hostScript{responders: map[string]func(*http.Request) (*http.Response, error){}}
+	transport := &scriptedTransport{handler: script.roundTrip}
+	client := newTestClient(t, ClientOptions{
+		HTTPClient:     &http.Client{Transport: transport},
+		MaxAttempts:    2,
+		RetryBaseDelay: time.Millisecond,
+		PerHostRPS:     1000,
+		PerHostBurst:   100,
+	})
+	return client, transport, script
+}
+
+// assertCachedVerdict checks err is a host-gone verdict for x.example served
+// from the per-walk cache.
+func assertCachedVerdict(t *testing.T, err error, wantReason string) {
+	t.Helper()
+	require.Error(t, err)
+	assert.True(t, errors.IsHostGone(err), "errors.IsHostGone(%v)", err)
+	host, _ := errors.HostGoneHost(err)
+	assert.Equal(t, "x.example", host, "errors.HostGoneHost(%v)", err)
+	reason, _ := errors.HostGoneReason(err)
+	assert.Equal(t, wantReason, reason, "errors.HostGoneReason(%v)", err)
+	assert.ErrorIs(t, err, ErrCachedHostVerdict)
+}
+
+// seedRefused fails one FetchObject on x.example with connection_refused in
+// ctx, after its two attempts.
+func seedRefused(t *testing.T, ctx context.Context, client *Client, transport *scriptedTransport) {
+	t.Helper()
+	seedVerdict(t, ctx, client, transport, "connection_refused", 2)
+}
+
+// seedVerdict fails one FetchObject on x.example with wantReason in ctx,
+// after wantRequests requests.
+func seedVerdict(t *testing.T, ctx context.Context, client *Client, transport *scriptedTransport, wantReason string, wantRequests int) {
+	t.Helper()
+	before := requestsTo(transport, "x.example")
+	_, err := client.FetchObject(ctx, "https://x.example/post/1")
+	assert.True(t, errors.IsHostGone(err), "seed: errors.IsHostGone(%v)", err)
+	reason, _ := errors.HostGoneReason(err)
+	assert.Equal(t, wantReason, reason, "seed: errors.HostGoneReason(%v)", err)
+	assert.False(t, stderrors.Is(err, ErrCachedHostVerdict), "the seeding fetch is a fresh observation")
+	assert.Equal(t, wantRequests, requestsTo(transport, "x.example")-before, "requests of the seeding fetch")
+}
+
+// TestFetchObject_ConnectionAndEdgeAttribution pins which connection- and
+// edge-class failures name the IRI's host: only a failure on the first hop,
+// and only when the IRI uses no port or its scheme's default port. A failure
+// on a later same-host hop, or on another port of the host, says nothing
+// about the host the instances table tracks, so it is neither classified nor
+// cached.
+func TestFetchObject_ConnectionAndEdgeAttribution(t *testing.T) {
+	dialTimeout := func(*http.Request) (*http.Response, error) {
+		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: os.ErrDeadlineExceeded}
+	}
+	edge522 := func(*http.Request) (*http.Response, error) { return scriptedResponse(522, ""), nil }
+	// redirectThen redirects /post/1 to /next on the same host and answers
+	// every later hop with final.
+	redirectThen := func(final func(*http.Request) (*http.Response, error)) func(*http.Request) (*http.Response, error) {
+		return func(req *http.Request) (*http.Response, error) {
+			if req.URL.Path == "/post/1" {
+				return redirectResponse("/next"), nil
+			}
+			return final(req)
+		}
+	}
+
+	tests := []struct {
+		name       string
+		iri        string
+		x          func(*http.Request) (*http.Response, error)
+		wantReason string // "" means not host gone and not cached
+	}{
+		{name: "refused after a same-host redirect", iri: "https://x.example/post/1", x: redirectThen(refusedDial)},
+		{name: "dial timeout after a same-host redirect", iri: "https://x.example/post/1", x: redirectThen(dialTimeout)},
+		{name: "edge status after a same-host redirect", iri: "https://x.example/post/1", x: redirectThen(edge522)},
+		{name: "refused on a non-default https port", iri: "https://x.example:8443/post/1", x: refusedDial},
+		{name: "dial timeout on a non-default http port", iri: "http://x.example:8080/post/1", x: dialTimeout},
+		{name: "edge status on a non-default port", iri: "https://x.example:8443/post/1", x: edge522},
+		{name: "refused on the explicit https default port", iri: "https://x.example:443/post/1", x: refusedDial, wantReason: "connection_refused"},
+		{name: "refused on the explicit http default port", iri: "http://x.example:80/post/1", x: refusedDial, wantReason: "connection_refused"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, transport, script := newHostScriptClient(t)
+			script.set("x.example", tt.x)
+			ctx := WithUnreachableHostCache(context.Background())
+
+			_, err := client.FetchObject(ctx, tt.iri)
+			require.Error(t, err)
+			assert.Equal(t, tt.wantReason != "", errors.IsHostGone(err), "errors.IsHostGone(%v)", err)
+			reason, _ := errors.HostGoneReason(err)
+			assert.Equal(t, tt.wantReason, reason, "errors.HostGoneReason(%v)", err)
+
+			script.set("x.example", jsonResponder(`{"type":"Note","id":"https://x.example/post/2"}`))
+			before := requestsTo(transport, "x.example")
+			obj, err := client.FetchObject(ctx, "https://x.example/post/2")
+			if tt.wantReason != "" {
+				assertCachedVerdict(t, err, tt.wantReason)
+				assert.Equal(t, before, requestsTo(transport, "x.example"), "the cached verdict makes no request")
+				return
+			}
+			require.NoError(t, err, "x.example must not be cached")
+			assert.Equal(t, "https://x.example/post/2", obj.ID)
+			assert.Equal(t, before+1, requestsTo(transport, "x.example"))
+		})
+	}
+}
+
+// TestUnreachableHostCache pins the per-walk unreachable-host cache carried in
+// ctx: a connection-level verdict for a host short-circuits later object-mode
+// fetches to it within the same ctx, and nothing else.
+func TestUnreachableHostCache(t *testing.T) {
+	t.Run("no cache in ctx keeps hitting the network", func(t *testing.T) {
+		client, transport, script := newHostScriptClient(t)
+		script.set("x.example", refusedDial)
+
+		for _, iri := range []string{"https://x.example/post/1", "https://x.example/post/2"} {
+			_, err := client.FetchObject(context.Background(), iri)
+			assert.True(t, errors.IsHostGone(err), "errors.IsHostGone(%v)", err)
+			reason, _ := errors.HostGoneReason(err)
+			assert.Equal(t, "connection_refused", reason, "errors.HostGoneReason(%v)", err)
+			assert.False(t, stderrors.Is(err, ErrCachedHostVerdict), "no cache, no cached verdict")
+		}
+		assert.Equal(t, 4, requestsTo(transport, "x.example"), "both fetches make both attempts")
+	})
+
+	t.Run("a connection-level verdict short-circuits later object fetches to the host", func(t *testing.T) {
+		dialFailure := func(dialErr error) func(*http.Request) (*http.Response, error) {
+			return func(*http.Request) (*http.Response, error) {
+				return nil, &net.OpError{Op: "dial", Net: "tcp", Err: dialErr}
+			}
+		}
+		tests := []struct {
+			name         string
+			x            func(*http.Request) (*http.Response, error)
+			wantRequests int
+		}{
+			{
+				name:         "dns_not_found",
+				x:            dialFailure(&net.DNSError{Err: "no such host", Name: "x.example", IsNotFound: true}),
+				wantRequests: 1,
+			},
+			{name: "connect_timeout", x: dialFailure(os.ErrDeadlineExceeded), wantRequests: 2},
+			{name: "connection_refused", x: refusedDial, wantRequests: 2},
+			{
+				name:         "connection_reset",
+				x:            dialFailure(&os.SyscallError{Syscall: "connect", Err: syscall.ECONNRESET}),
+				wantRequests: 2,
+			},
+			{
+				name:         "no_route",
+				x:            dialFailure(&os.SyscallError{Syscall: "connect", Err: syscall.EHOSTUNREACH}),
+				wantRequests: 2,
+			},
+			{
+				name: "tls_failure",
+				x: func(*http.Request) (*http.Response, error) {
+					return nil, tls.RecordHeaderError{Msg: "first record does not look like a TLS handshake"}
+				},
+				wantRequests: 2,
+			},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				client, transport, script := newHostScriptClient(t)
+				script.set("x.example", tt.x)
+				script.set("y.example", func(req *http.Request) (*http.Response, error) {
+					if req.URL.Path == "/outbox" {
+						return jsonResponder(`{"type":"OrderedCollectionPage","id":"https://y.example/outbox","orderedItems":[],"next":"https://x.example/outbox?page=2"}`)(req)
+					}
+					return jsonResponder(`{"type":"Note","id":"https://y.example/note/1"}`)(req)
+				})
+				ctx := WithUnreachableHostCache(context.Background())
+				seedVerdict(t, ctx, client, transport, tt.name, tt.wantRequests)
+				before := requestsTo(transport, "x.example")
+
+				_, err := client.FetchObject(ctx, "https://x.example/post/2")
+				assertCachedVerdict(t, err, tt.name)
+				_, err = client.FetchActor(ctx, "https://x.example/u/alice")
+				assertCachedVerdict(t, err, tt.name)
+				err = client.FetchCollection(ctx, "https://x.example/c/outbox", func(*Object) error { return nil })
+				assertCachedVerdict(t, err, tt.name)
+				assert.Equal(t, before, requestsTo(transport, "x.example"), "cached fetches make no request to x.example")
+
+				obj, err := client.FetchObject(ctx, "https://y.example/note/1")
+				require.NoError(t, err, "another host is unaffected")
+				assert.Equal(t, "https://y.example/note/1", obj.ID)
+				assert.Equal(t, 1, requestsTo(transport, "y.example"))
+
+				err = client.FetchCollection(ctx, "https://y.example/outbox", func(*Object) error { return nil })
+				assertCachedVerdict(t, err, tt.name)
+				assert.Equal(t, before, requestsTo(transport, "x.example"),
+					"a collection page on the cached host makes no request to it")
+			})
+		}
+	})
+
+	t.Run("non-connection reasons do not seed", func(t *testing.T) {
+		tests := []struct {
+			name       string
+			x          func(*http.Request) (*http.Response, error)
+			wantReason string
+		}{
+			{
+				name:       "edge_status",
+				x:          func(*http.Request) (*http.Response, error) { return scriptedResponse(522, ""), nil },
+				wantReason: "edge_status",
+			},
+			{
+				name:       "too_many_redirects",
+				x:          func(req *http.Request) (*http.Response, error) { return redirectResponse(req.URL.String()), nil },
+				wantReason: "too_many_redirects",
+			},
+			{
+				name: "redirect_to_root",
+				x: func(req *http.Request) (*http.Response, error) {
+					if req.URL.Path != "/" {
+						return redirectResponse("/"), nil
+					}
+					return htmlResponse(), nil
+				},
+				wantReason: "redirect_to_root",
+			},
+			{
+				name:       "parked_redirect",
+				x:          func(*http.Request) (*http.Response, error) { return redirectResponse("https://z.example/parked"), nil },
+				wantReason: "parked_redirect",
+			},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				client, transport, script := newHostScriptClient(t)
+				script.set("x.example", tt.x)
+				script.set("z.example", func(*http.Request) (*http.Response, error) { return htmlResponse(), nil })
+				ctx := WithUnreachableHostCache(context.Background())
+
+				_, err := client.FetchObject(ctx, "https://x.example/post/1")
+				assert.True(t, errors.IsHostGone(err), "errors.IsHostGone(%v)", err)
+				reason, _ := errors.HostGoneReason(err)
+				assert.Equal(t, tt.wantReason, reason, "errors.HostGoneReason(%v)", err)
+
+				before := requestsTo(transport, "x.example")
+				_, err = client.FetchObject(ctx, "https://x.example/post/2")
+				assert.Greater(t, requestsTo(transport, "x.example"), before, "the next fetch to x.example hits the network")
+				assert.False(t, stderrors.Is(err, ErrCachedHostVerdict), "no cached verdict for %s", tt.wantReason)
+			})
+		}
+	})
+
+	t.Run("a successful media fetch drops the entry", func(t *testing.T) {
+		client, transport, script := newHostScriptClient(t)
+		script.set("x.example", refusedDial)
+		ctx := WithUnreachableHostCache(context.Background())
+		seedRefused(t, ctx, client, transport)
+
+		script.set("x.example", func(req *http.Request) (*http.Response, error) {
+			if req.URL.Path == "/image.png" {
+				resp := scriptedResponse(http.StatusOK, "\x89PNG")
+				resp.Header.Set("Content-Type", "image/png")
+				return resp, nil
+			}
+			return jsonResponder(`{"type":"Note","id":"https://x.example/post/2"}`)(req)
+		})
+		before := requestsTo(transport, "x.example")
+		_, _, err := client.FetchMedia(ctx, "https://x.example/image.png", 0)
+		require.NoError(t, err)
+		assert.Equal(t, before+1, requestsTo(transport, "x.example"), "media is never served from the cache")
+
+		obj, err := client.FetchObject(ctx, "https://x.example/post/2")
+		require.NoError(t, err, "the entry was dropped, so the fetch reaches the recovered host")
+		assert.Equal(t, "https://x.example/post/2", obj.ID)
+		assert.Equal(t, before+2, requestsTo(transport, "x.example"))
+	})
+
+	t.Run("a successful nodeinfo probe drops the entry", func(t *testing.T) {
+		client, transport, script := newHostScriptClient(t)
+		script.set("x.example", refusedDial)
+		ctx := WithUnreachableHostCache(context.Background())
+		seedRefused(t, ctx, client, transport)
+
+		script.set("x.example", func(req *http.Request) (*http.Response, error) {
+			if req.URL.Path == "/.well-known/nodeinfo" {
+				resp := scriptedResponse(http.StatusOK, `{"links":[]}`)
+				resp.Header.Set("Content-Type", "application/json")
+				return resp, nil
+			}
+			return jsonResponder(`{"type":"Note","id":"https://x.example/post/2"}`)(req)
+		})
+		before := requestsTo(transport, "x.example")
+		require.NoError(t, client.ProbeNodeInfo(ctx, "x.example"))
+		assert.Equal(t, before+1, requestsTo(transport, "x.example"), "the probe reaches the host")
+
+		obj, err := client.FetchObject(ctx, "https://x.example/post/2")
+		require.NoError(t, err, "the entry was dropped, so the fetch reaches the recovered host")
+		assert.Equal(t, "https://x.example/post/2", obj.ID)
+		assert.Equal(t, before+2, requestsTo(transport, "x.example"))
+	})
+
+	t.Run("a cached verdict covers only the default port", func(t *testing.T) {
+		tests := []struct {
+			name       string
+			iri        string
+			wantCached bool
+		}{
+			{name: "non-default https port reaches the network", iri: "https://x.example:8443/obj"},
+			{name: "non-default http port reaches the network", iri: "http://x.example:8080/obj"},
+			{name: "explicit https default port is cached", iri: "https://x.example:443/obj", wantCached: true},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				client, transport, script := newHostScriptClient(t)
+				script.set("x.example", refusedDial)
+				ctx := WithUnreachableHostCache(context.Background())
+				seedRefused(t, ctx, client, transport)
+
+				script.set("x.example", jsonResponder(`{"type":"Note","id":"`+tt.iri+`"}`))
+				before := requestsTo(transport, "x.example")
+				obj, err := client.FetchObject(ctx, tt.iri)
+				if tt.wantCached {
+					assertCachedVerdict(t, err, "connection_refused")
+					assert.Equal(t, before, requestsTo(transport, "x.example"), "the cached verdict makes no request")
+					return
+				}
+				require.NoError(t, err, "another port of x.example is not covered by the default-port verdict")
+				assert.Equal(t, tt.iri, obj.ID)
+				assert.Equal(t, before+1, requestsTo(transport, "x.example"))
+			})
+		}
+	})
+
+	t.Run("separate caches are independent", func(t *testing.T) {
+		client, transport, script := newHostScriptClient(t)
+		script.set("x.example", refusedDial)
+		first := WithUnreachableHostCache(context.Background())
+		second := WithUnreachableHostCache(context.Background())
+		seedRefused(t, first, client, transport)
+
+		before := requestsTo(transport, "x.example")
+		_, err := client.FetchObject(second, "https://x.example/post/2")
+		assert.Equal(t, before+2, requestsTo(transport, "x.example"), "the second cache has no verdict for x.example")
+		assert.False(t, stderrors.Is(err, ErrCachedHostVerdict))
+
+		before = requestsTo(transport, "x.example")
+		_, err = client.FetchObject(first, "https://x.example/post/3")
+		assertCachedVerdict(t, err, "connection_refused")
+		assert.Equal(t, before, requestsTo(transport, "x.example"), "the first cache still holds its verdict")
+	})
 }

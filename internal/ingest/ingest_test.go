@@ -316,6 +316,9 @@ func newHarness(t *testing.T) *harness {
 		"coves_labels", "coves_label_cursor")
 	// Community removal suppressions (migration 060).
 	testutil.TruncateIfExists(t, database, "community_removal_suppressions")
+	// Deferred backfill items (migration 066) have no foreign key, so nothing
+	// cascades into them.
+	testutil.TruncateIfExists(t, database, "backfill_deferred_items")
 
 	custodian, err := identity.NewCustodian(testKEK)
 	require.NoError(t, err)

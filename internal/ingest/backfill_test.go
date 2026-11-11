@@ -17,6 +17,7 @@ import (
 	"tidepool/internal/ap"
 	"tidepool/internal/errors"
 	"tidepool/internal/materialize"
+	"tidepool/internal/store"
 )
 
 const secondPageID = "https://lemmy.world/post/49122698"
@@ -44,6 +45,8 @@ func (h *harness) backfillOptions(materializer Materializer, maxPosts int) Backf
 		Communities:  h.communities,
 		Tombstones:   h.tombstones,
 		Instances:    h.materializerOptions.Instances,
+		Prober:       h.client,
+		Deferred:     store.NewDeferredBackfillItems(h.db),
 		// The same guard the dispatcher runs, and required for the same reason:
 		// a community's outbox carries OUR federated content once native users
 		// participate, and this path reaches the materializer with no envelope
@@ -366,6 +369,8 @@ func newSeededBackfill(t *testing.T, h *harness, seeder CountSeeder) *Backfill {
 		Communities:  h.communities,
 		Tombstones:   h.tombstones,
 		Instances:    h.materializerOptions.Instances,
+		Prober:       h.client,
+		Deferred:     store.NewDeferredBackfillItems(h.db),
 		Seeder:       seeder,
 		Echo:         h.classifier,
 		MaxPosts:     10,

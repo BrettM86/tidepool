@@ -629,6 +629,8 @@ func run(logger *slog.Logger) error {
 		Communities:  communities,
 		Tombstones:   tombstones,
 		Instances:    instances,
+		Prober:       apClient,
+		Deferred:     store.NewDeferredBackfillItems(database),
 		Seeder:       seeder,
 		Echo:         echoClassifier,
 		MaxPosts:     cfg.BackfillMaxPosts,
@@ -642,6 +644,15 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	// Items a walk skipped because their host was dead are retried on their
+	// schedule: one sweep at startup, then one per interval. The shutdown
+	// drain waits for the loop, so a sweep ends before the database closes.
+	var deferredRetries sync.WaitGroup
+	deferredRetries.Add(1)
+	go func() {
+		defer deferredRetries.Done()
+		runDeferredBackfillRetries(ctx, backfill, cfg.BackfillDeferredRetryInterval, cfg.BackfillDeferredRetryBatch, logger)
+	}()
 	handler, err := ingest.NewHandler(ingest.HandlerOptions{
 		Materializer: materializer,
 		Fetcher:      apClient,
@@ -1028,6 +1039,7 @@ func run(logger *slog.Logger) error {
 			drained := make(chan struct{})
 			go func() {
 				backfill.Wait()
+				deferredRetries.Wait()
 				admin.Wait()
 				renameAdmin.Wait()
 				communityReconciler.Wait()
@@ -1093,6 +1105,24 @@ func newOutboundSwitches(cfg *config.Config, logger *slog.Logger) (*outbound.Con
 	}
 	switches.SetDisabledSets(list.OutboundDisabledHosts, list.OutboundDisabledCommunities)
 	return switches, nil
+}
+
+// runDeferredBackfillRetries sweeps the deferred backfill items once at
+// start and then every interval, at most batch per sweep, until ctx ends. A
+// failed sweep is logged and the next one runs on schedule.
+func runDeferredBackfillRetries(ctx context.Context, backfill *ingest.Backfill, interval time.Duration, batch int, logger *slog.Logger) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		if err := backfill.RetryDeferred(ctx, batch); err != nil && ctx.Err() == nil {
+			logger.Error("backfill deferred retry sweep failed", "error", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 // startConsumer wires the Jetstream consumer (task 14) and starts its read

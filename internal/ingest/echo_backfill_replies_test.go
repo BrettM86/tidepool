@@ -247,6 +247,8 @@ func TestBackfillReplyClassifierFailureLeavesResumable(t *testing.T) {
 		Communities:  h.communities,
 		Tombstones:   h.tombstones,
 		Instances:    h.materializerOptions.Instances,
+		Prober:       h.client,
+		Deferred:     store.NewDeferredBackfillItems(h.db),
 		Echo:         flaky,
 		MaxPosts:     10,
 	})

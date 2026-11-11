@@ -51,7 +51,9 @@ type HostGoneStreaks interface {
 	// host-gone failure is more than HostGoneStreakGap before at, starts a new
 	// streak at at. A host with no row gets one, with no discovery state.
 	RecordHostGone(ctx context.Context, host string, at time.Time) (time.Time, error)
-	// ClearHostGone ends any host-gone streak for host.
+	// ClearHostGone ends any host-gone streak for host. When a streak was
+	// cleared it also makes every backfill item deferred on host due; a host
+	// with no streak keeps its deferred items' schedule.
 	ClearHostGone(ctx context.Context, host string) error
 }
 
@@ -163,9 +165,19 @@ func (r *postgresInstances) ClearHostGone(ctx context.Context, host string) erro
 	if host == "" {
 		return errors.NewValidationError("host", "must not be empty")
 	}
+	// A host that was gone answers again, so every item deferred on it is
+	// due now: its next_retry_at moves back to its created_at, which is due
+	// for any clock after the skip. Only clearing a streak does this; a host
+	// with no streak to clear leaves its deferred rows' schedule alone.
 	_, err := r.db.ExecContext(ctx, `
-		UPDATE instances SET host_gone_since = NULL, host_gone_last_at = NULL
-		WHERE host = $1 AND host_gone_since IS NOT NULL`, host)
+		WITH cleared AS (
+			UPDATE instances SET host_gone_since = NULL, host_gone_last_at = NULL
+			WHERE host = $1 AND host_gone_since IS NOT NULL
+			RETURNING 1
+		)
+		UPDATE backfill_deferred_items SET next_retry_at = created_at
+		WHERE host = $1 AND next_retry_at > created_at
+			AND EXISTS (SELECT 1 FROM cleared)`, host)
 	if err != nil {
 		return fmt.Errorf("clear host gone for %q: %w", host, err)
 	}

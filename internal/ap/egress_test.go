@@ -25,6 +25,8 @@ func TestIsBlockedIP(t *testing.T) {
 		"fc00::1", "fd12:3456::1", // unique-local v6
 		"224.0.0.1", "ff02::1", // multicast
 		"0.0.0.0", "::", // unspecified
+		// IPv4-mapped IPv6 forms of blocked IPv4 addresses
+		"::ffff:127.0.0.1", "::ffff:10.0.0.1", "::ffff:169.254.169.254",
 	}
 	for _, s := range blocked {
 		ip := net.ParseIP(s)
@@ -43,11 +45,14 @@ func TestIsBlockedIP(t *testing.T) {
 func TestCheckURL_SchemeAndUserinfo(t *testing.T) {
 	g := newEgressGuard(false)
 	cases := []string{
-		"ftp://example.com/x",           // non-http scheme
-		"file:///etc/passwd",            // non-http scheme
-		"https://user:pass@example.com", // userinfo
-		"https://127.0.0.1/x",           // blocked IP literal
-		"https://169.254.169.254/x",     // metadata literal
+		"ftp://example.com/x",                // non-http scheme
+		"file:///etc/passwd",                 // non-http scheme
+		"https://user:pass@example.com",      // userinfo
+		"https://127.0.0.1/x",                // blocked IP literal
+		"https://169.254.169.254/x",          // metadata literal
+		"https://[::ffff:127.0.0.1]/x",       // IPv4-mapped loopback literal
+		"https://[::ffff:10.0.0.1]/x",        // IPv4-mapped private literal
+		"https://[::ffff:169.254.169.254]/x", // IPv4-mapped metadata literal
 	}
 	for _, raw := range cases {
 		u, err := url.Parse(raw)
@@ -149,6 +154,69 @@ func TestDialGuard_DialsValidatedIP(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "93.184.216.34:443", dialedAddr,
 		"the guard must dial the validated IP literal, not the hostname")
+}
+
+// TestDialGuard_PerAddressConnectTimeout: a resolved address that never
+// completes its connect is abandoned after the guard's per-address connect
+// timeout, so the next resolved address is dialed within the request's
+// overall deadline instead of the first dial consuming all of it.
+func TestDialGuard_PerAddressConnectTimeout(t *testing.T) {
+	g := newEgressGuard(false)
+	g.perAddressConnectTimeout = 50 * time.Millisecond
+	g.lookupIPAddr = func(_ context.Context, _ string) ([]net.IPAddr, error) {
+		return []net.IPAddr{{IP: net.IPv4(203, 0, 113, 1)}, {IP: net.IPv4(203, 0, 113, 2)}}, nil
+	}
+	var dialed []string
+	base := func(ctx context.Context, _, addr string) (net.Conn, error) {
+		dialed = append(dialed, addr)
+		if addr == "203.0.113.1:443" {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return stubConn{}, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	start := time.Now()
+	conn, err := g.dialContext(base)(ctx, "tcp", "x.example:443")
+	elapsed := time.Since(start)
+
+	require.NoError(t, err, "the second resolved address must be dialed before the overall deadline")
+	assert.Equal(t, stubConn{}, conn)
+	assert.Equal(t, []string{"203.0.113.1:443", "203.0.113.2:443"}, dialed)
+	assert.Less(t, elapsed, time.Second, "the stuck first address is abandoned after the per-address timeout")
+}
+
+// TestNewEgressGuard_PerAddressConnectTimeout pins the production guard's
+// per-address connect bound.
+func TestNewEgressGuard_PerAddressConnectTimeout(t *testing.T) {
+	assert.Equal(t, 5*time.Second, newEgressGuard(false).perAddressConnectTimeout)
+}
+
+// TestDialGuard_BlocksResolvedIPv4MappedAddresses: a hostname resolving to
+// the IPv4-mapped IPv6 form of a blocked IPv4 address is refused at dial time
+// like the IPv4 form.
+func TestDialGuard_BlocksResolvedIPv4MappedAddresses(t *testing.T) {
+	for _, mapped := range []string{"::ffff:127.0.0.1", "::ffff:10.0.0.1", "::ffff:169.254.169.254"} {
+		t.Run(mapped, func(t *testing.T) {
+			g := newEgressGuard(false)
+			g.lookupIPAddr = func(_ context.Context, _ string) ([]net.IPAddr, error) {
+				return []net.IPAddr{{IP: net.ParseIP(mapped)}}, nil
+			}
+			dialed := false
+			base := func(_ context.Context, _, _ string) (net.Conn, error) {
+				dialed = true
+				return stubConn{}, nil
+			}
+			_, err := g.dialContext(base)(context.Background(), "tcp", "mapped.attacker.test:443")
+			require.Error(t, err, "%s must be refused at dial time", mapped)
+			assert.False(t, dialed, "the guard must not dial %s", mapped)
+		})
+	}
 }
 
 // TestDialGuard_IPLiteralAddr validates a blocked IP-literal address passed

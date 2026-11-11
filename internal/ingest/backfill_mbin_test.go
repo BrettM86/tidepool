@@ -10,6 +10,7 @@ import (
 
 	"tidepool/internal/ap"
 	"tidepool/internal/materialize"
+	"tidepool/internal/store"
 )
 
 // Mbin link post fixture ids, rehomed into the harness's subscribed
@@ -90,6 +91,8 @@ func TestBackfillMaterializesMbinLinkPageWithStringSource(t *testing.T) {
 		Communities:  h.communities,
 		Tombstones:   h.tombstones,
 		Instances:    h.materializerOptions.Instances,
+		Prober:       h.client,
+		Deferred:     store.NewDeferredBackfillItems(h.db),
 		Echo:         h.classifier,
 		MaxPosts:     10,
 		Logger:       slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),

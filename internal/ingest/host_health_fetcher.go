@@ -11,7 +11,10 @@ import (
 
 // hostHealthFetcher is a materialize.Fetcher that ends a host's host-gone
 // streak whenever an object or actor fetch from it succeeds, so a host that
-// came back is not later skipped by backfill on a stale streak.
+// came back is not later skipped by backfill on a stale streak. Clearing a
+// streak (Instances.ClearHostGone) also makes the host's deferred backfill
+// items due, so they run at the next RetryDeferred sweep; a fetch from a host
+// with no streak leaves their schedule alone.
 type hostHealthFetcher struct {
 	materialize.Fetcher
 	instances store.HostGoneStreaks
@@ -19,9 +22,10 @@ type hostHealthFetcher struct {
 }
 
 // NewHostHealthFetcher wraps inner so a successful FetchObject or FetchActor
-// clears the fetched IRI's host-gone streak (keyed by ap.HostKey). Results
-// and errors pass through unchanged; a failing clear is logged, never
-// returned. FetchMedia passes through untouched.
+// clears the fetched IRI's host-gone streak (keyed by ap.HostKey) and, when a
+// streak was cleared, pulls that host's deferred backfill items forward. Results and errors pass
+// through unchanged; a failing clear is logged, never returned. FetchMedia
+// passes through untouched.
 func NewHostHealthFetcher(inner materialize.Fetcher, instances store.HostGoneStreaks, logger *slog.Logger) materialize.Fetcher {
 	return &hostHealthFetcher{Fetcher: inner, instances: instances, logger: logger}
 }

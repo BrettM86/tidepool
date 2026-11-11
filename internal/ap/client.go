@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	stderrors "errors"
 	"fmt"
@@ -15,6 +17,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/sync/singleflight"
@@ -63,6 +66,144 @@ const (
 // early without reporting an error.
 var ErrStop = stderrors.New("ap: stop iteration")
 
+// ErrCachedHostVerdict marks a host-gone error answered from the per-walk
+// unreachable-host cache (WithUnreachableHostCache) instead of the network:
+// it repeats an earlier observation, it is not a new one.
+var ErrCachedHostVerdict = stderrors.New("ap: cached unreachable host verdict")
+
+// ErrRateLimitWait marks a fetch refused by this client's per-host rate
+// limiter: the wait was canceled or would run past ctx's deadline. It is a
+// local failure, saying nothing about the remote host.
+var ErrRateLimitWait = stderrors.New("ap: rate limit wait refused")
+
+// RedirectHopRefusedError marks a redirect target that the URL check or the
+// egress guard refused (a disallowed scheme, userinfo, a blocked address). The
+// origin chose that target, so the failure is the origin's, not a refusal of
+// the URL the caller asked for. Err is the refusal itself.
+type RedirectHopRefusedError struct {
+	Err error
+}
+
+func (e RedirectHopRefusedError) Error() string {
+	return "ap: redirect target refused: " + e.Err.Error()
+}
+
+func (e RedirectHopRefusedError) Unwrap() error { return e.Err }
+
+// unreachableHostCacheKey is the ctx key of the per-walk unreachable-host
+// cache.
+type unreachableHostCacheKey struct{}
+
+// unreachableHostCache maps a host (HostKey form) to the connection-level
+// host-gone verdict observed for it during one walk.
+type unreachableHostCache struct {
+	mu       sync.Mutex
+	verdicts map[string]errors.HostGoneError
+}
+
+// WithUnreachableHostCache returns ctx carrying a fresh per-walk
+// unreachable-host cache. Object fetches (FetchObject, FetchActor,
+// FetchCollection and its pages) made with the returned ctx, or one derived
+// from it, record connection-level host-gone verdicts (DNS, connect timeout,
+// refused, reset, no route, TLS) and answer later fetches to that host from
+// the cache, without network or rate-limiter work, with the same verdict
+// wrapping ErrCachedHostVerdict. Any successful response from the host
+// (object fetch, FetchMedia, ProbeNodeInfo) drops its entry. Pinned-authority
+// fetches (FetchObjectSameAuthority, FetchActorSameAuthority) bypass the
+// cache: they neither consult nor record it. Without a cache in ctx nothing
+// is cached.
+func WithUnreachableHostCache(ctx context.Context) context.Context {
+	return context.WithValue(ctx, unreachableHostCacheKey{},
+		&unreachableHostCache{verdicts: map[string]errors.HostGoneError{}})
+}
+
+// unreachableHostCacheFrom returns ctx's cache, or nil when it carries none.
+func unreachableHostCacheFrom(ctx context.Context) *unreachableHostCache {
+	cache, _ := ctx.Value(unreachableHostCacheKey{}).(*unreachableHostCache)
+	return cache
+}
+
+func (h *unreachableHostCache) lookup(host string) (errors.HostGoneError, bool) {
+	if h == nil {
+		return errors.HostGoneError{}, false
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	verdict, ok := h.verdicts[host]
+	return verdict, ok
+}
+
+// record stores err's host-gone verdict when its reason is connection-level.
+func (h *unreachableHostCache) record(err error) {
+	if h == nil {
+		return
+	}
+	var verdict errors.HostGoneError
+	if !stderrors.As(err, &verdict) || verdict.Host == "" || !isConnectionLevelReason(verdict.Reason) {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.verdicts[verdict.Host] = verdict
+}
+
+// drop forgets iri's host after a successful response from it.
+func (h *unreachableHostCache) drop(iri string) {
+	if h == nil {
+		return
+	}
+	host, ok := HostKey(iri)
+	if !ok {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.verdicts, host)
+}
+
+// isConnectionLevelReason reports whether a host-gone reason says the host
+// could not be reached at all (the reasons the per-walk cache keeps).
+func isConnectionLevelReason(reason string) bool {
+	switch reason {
+	case errors.HostGoneReasonDNSNotFound, errors.HostGoneReasonConnectTimeout,
+		errors.HostGoneReasonConnectionRefused, errors.HostGoneReasonConnectionReset,
+		errors.HostGoneReasonNoRoute, errors.HostGoneReasonTLSFailure:
+		return true
+	}
+	return false
+}
+
+// ProbeNodeInfo checks that host still answers as a fediverse server: a GET
+// of https://<host>/.well-known/nodeinfo through the guarded, rate-limited
+// fetch path must answer 2xx with a body that decodes as a JSON object.
+// Redirects off the host are refused. Any other answer is an error. A JSON
+// answer also drops host from ctx's unreachable-host cache.
+func (c *Client) ProbeNodeInfo(ctx context.Context, host string) error {
+	probeURL := (&url.URL{Scheme: "https", Host: bracketIPv6Literal(host), Path: "/.well-known/nodeinfo"}).String()
+	body, err := c.getDedupedMode(ctx, probeURL, fetchModeObjectPinnedAuthority)
+	if err != nil {
+		return fmt.Errorf("ap: probe nodeinfo of %s: %w", host, err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(body, &document); err != nil {
+		return fmt.Errorf("ap: probe nodeinfo of %s: %w", host, err)
+	}
+	if document == nil {
+		return fmt.Errorf("ap: probe nodeinfo of %s: body is not a JSON object", host)
+	}
+	unreachableHostCacheFrom(ctx).drop(probeURL)
+	return nil
+}
+
+// bracketIPv6Literal returns host in brackets when it is a bare IPv6 literal,
+// so it can be a URL authority, and host unchanged otherwise.
+func bracketIPv6Literal(host string) string {
+	if net.ParseIP(host) != nil && strings.Contains(host, ":") {
+		return "[" + host + "]"
+	}
+	return host
+}
+
 // ErrCollectionTruncated marks a FetchCollection walk that stopped before
 // reaching the end of the collection (page cap or a next-pointer loop). It is
 // distinct from a clean completion so backfill (task 05) can resume or log
@@ -101,6 +242,42 @@ type HTTPError struct {
 	Body string
 	// Method is the request method; empty means GET.
 	Method string
+}
+
+// Lemmy's JSON error codes for a GET of an object it does not have (answered
+// with status 400).
+const (
+	LemmyCouldntFindPost    = "couldnt_find_post"
+	LemmyCouldntFindComment = "couldnt_find_comment"
+)
+
+// IsLemmyNotFound reports whether err carries Lemmy's not-found answer with
+// the given code: an HTTPError with status 400 whose body is the JSON
+// {"error": code}.
+func IsLemmyNotFound(err error, code string) bool {
+	var httpErr HTTPError
+	if !stderrors.As(err, &httpErr) || httpErr.StatusCode != http.StatusBadRequest {
+		return false
+	}
+	var lemmyError struct {
+		Error string `json:"error"`
+	}
+	return json.Unmarshal([]byte(httpErr.Body), &lemmyError) == nil &&
+		lemmyError.Error == code
+}
+
+// NonJSONResponseError is a 2xx answer to an object fetch whose body is not
+// JSON and whose Content-Type is a non-JSON type (an instance serving its
+// HTML frontend), when it is not classified as host gone. URL is the hop that
+// answered; Redirected reports whether any redirect was followed to reach it.
+type NonJSONResponseError struct {
+	URL         string
+	ContentType string
+	Redirected  bool
+}
+
+func (e NonJSONResponseError) Error() string {
+	return fmt.Sprintf("response is %s, not JSON (content negotiation failed?)", e.ContentType)
 }
 
 // AccessRefusedError is an object fetch the origin answered 401 or 403. It
@@ -364,16 +541,24 @@ func guardedTransport(base http.RoundTripper, guard *egressGuard) http.RoundTrip
 //     caller must treat it as a tombstone, never re-fetch;
 //   - a 200 whose body is a Tombstone object → errors.IsTombstoned (Lemmy
 //     serves Tombstones with 410, Mastodon with 404, others with 200);
-//   - the IRI's own host not resolving (NXDOMAIN on the first hop) →
-//     errors.IsHostGone, not retried; temporary DNS failures and NXDOMAIN of
-//     a redirect target stay ordinary retryable errors;
+//   - the IRI's own host unreachable → errors.IsHostGone, with
+//     errors.HostGoneReason naming the class: NXDOMAIN on the first hop
+//     (dns_not_found, not retried; temporary DNS failures and NXDOMAIN of a
+//     redirect target stay ordinary retryable errors); a connect timeout,
+//     refused, reset or unroutable connection, a TLS failure, or a CDN edge
+//     status 521/522/523/525/526/530 (classified only after the final
+//     attempt, and only while every hop was on the IRI's host); a redirect
+//     loop on the IRI's host (too_many_redirects); a same-host redirect to
+//     the root answering a non-JSON page (redirect_to_root);
 //   - a redirect off the IRI's host ending at a non-JSON 2xx page (a dead
-//     instance parking every URL) → errors.IsHostGone;
-//   - the two IsHostGone cases apply to FetchObject, FetchActor and
-//     FetchCollection (its pages go through FetchObject) only, not
-//     to pinned-authority fetches or WebFinger. They are not IsNotFound: the
-//     caller decides whether a gone host is a skip (backfill) or an error to
-//     retry later (live inbox processing, where the host may only be lapsed);
+//     instance parking every URL) → errors.IsHostGone (parked_redirect);
+//   - any other 2xx non-JSON page → NonJSONResponseError;
+//   - the IsHostGone cases apply to FetchObject, FetchActor and
+//     FetchCollection (its pages go through FetchObject) only, not to
+//     pinned-authority fetches or WebFinger. They are not IsNotFound. No live
+//     caller acts on them; backfill decides whether a gone host is a skip.
+//     With WithUnreachableHostCache in ctx, connection-level verdicts are
+//     reused for the rest of the walk;
 //   - other non-2xx → HTTPError.
 func (c *Client) FetchObject(ctx context.Context, iri string) (*Object, error) {
 	return c.fetchObject(ctx, iri, fetchModeObject)
@@ -382,10 +567,23 @@ func (c *Client) FetchObject(ctx context.Context, iri string) (*Object, error) {
 // fetchObject is FetchObject parameterized by fetch mode (status mapping and
 // redirect policy — see fetchMode).
 func (c *Client) fetchObject(ctx context.Context, iri string, mode fetchMode) (*Object, error) {
+	var cache *unreachableHostCache
+	if mode == fetchModeObject && iriOnDefaultPort(iri) {
+		// A verdict is about the host's default port: a fetch on another
+		// port neither consults, records nor drops it.
+		cache = unreachableHostCacheFrom(ctx)
+	}
+	if host, ok := HostKey(iri); ok {
+		if verdict, cached := cache.lookup(host); cached {
+			return nil, fmt.Errorf("ap: GET %s: %w: %w", iri, verdict, ErrCachedHostVerdict)
+		}
+	}
 	body, err := c.getDedupedMode(ctx, iri, mode)
 	if err != nil {
+		cache.record(err)
 		return nil, err
 	}
+	cache.drop(iri)
 	obj, err := ParseObject(body)
 	if err != nil {
 		return nil, fmt.Errorf("ap: fetch %s: %w", iri, err)
@@ -574,6 +772,7 @@ func (c *Client) FetchMedia(ctx context.Context, iri string, maxBytes int64) (da
 		}
 		data, contentType, retryable, err := c.fetchMediaOnce(ctx, iri, maxBytes)
 		if err == nil {
+			unreachableHostCacheFrom(ctx).drop(iri)
 			return data, contentType, nil
 		}
 		if !retryable {
@@ -905,13 +1104,6 @@ func HostKey(iri string) (string, bool) {
 	return strings.ToLower(parsed.Hostname()), true
 }
 
-// hostGoneError names iri's own host (HostKey) as gone. An IRI with no host
-// gives an empty Host, which errors.HostGoneHost reports as naming none.
-func hostGoneError(iri string) errors.HostGoneError {
-	host, _ := HostKey(iri)
-	return errors.HostGoneError{Host: host}
-}
-
 // sameHost reports whether iri's hostname matches u's, case-insensitively,
 // ignoring scheme and port so an http→https upgrade or a dropped explicit
 // default port (origin.example:80 → origin.example) still counts as same-host.
@@ -983,9 +1175,13 @@ const (
 )
 
 // get performs a signed GET with retries, redirects, rate limiting, and the
-// response-size cap, returning the response body.
+// response-size cap, returning the response body. A failure getOnce
+// attributes to the IRI's own host is wrapped as errors.HostGoneError only
+// once it is final: after the last attempt for a retryable class, at once for
+// a non-retryable one, and never when ctx itself ended the request.
 func (c *Client) get(ctx context.Context, iri string, mode fetchMode) ([]byte, error) {
 	var lastErr error
+	var lastReason string
 	for attempt := 0; attempt < c.maxAttempts; attempt++ {
 		if err := c.backoff(ctx, attempt); err != nil {
 			return nil, err
@@ -994,27 +1190,91 @@ func (c *Client) get(ctx context.Context, iri string, mode fetchMode) ([]byte, e
 		if err == nil {
 			return body, nil
 		}
-		if !retryable {
-			return nil, err
+		reason := ""
+		if attributed, ok := err.(hostAttributedError); ok {
+			reason, err = attributed.reason, attributed.err
 		}
-		lastErr = err
+		if !retryable {
+			return nil, hostGoneVerdict(ctx, iri, reason, err)
+		}
+		lastErr, lastReason = err, reason
 	}
-	return nil, lastErr
+	return nil, hostGoneVerdict(ctx, iri, lastReason, lastErr)
 }
 
+// hostGoneVerdict wraps err as a host-gone error for iri's host when getOnce
+// attributed it to that host (reason set) and ctx (the request budget) is
+// still live: a failure caused by the budget running out says nothing about
+// the host.
+func hostGoneVerdict(ctx context.Context, iri, reason string, err error) error {
+	if reason == "" || ctx.Err() != nil {
+		return err
+	}
+	host, _ := HostKey(iri)
+	return fmt.Errorf("%w: %w", errors.HostGoneError{Host: host, Reason: reason}, err)
+}
+
+// edgeStatuses are the CDN edge statuses that report the origin behind the
+// edge down or unreachable. 520 (unknown origin error) and 524 (origin
+// timeout after connect) are not counted: the origin answered something, or
+// was reached.
+var edgeStatuses = map[int]bool{521: true, 522: true, 523: true, 525: true, 526: true, 530: true}
+
+// hostAttributedError is a getOnce failure attributed to the IRI's own host,
+// carrying the errors.HostGoneReason code it would be. getOnce resolves the
+// hop provenance (which host failed); get decides whether the failure is
+// final and so becomes a host-gone verdict, and unwraps it either way.
+type hostAttributedError struct {
+	reason string
+	err    error
+}
+
+func (e hostAttributedError) Error() string { return e.err.Error() }
+
+func (e hostAttributedError) Unwrap() error { return e.err }
+
 // getOnce performs one GET (following up to maxRedirects manually, re-signing
-// each hop). retryable reports whether the failure is transient.
+// each hop). retryable reports whether the failure is transient. A failure
+// attributable to the IRI's own host (object mode only, with every hop so
+// far on that host, or the off-host parked redirect) is returned as a
+// hostAttributedError. Connection and edge failures are attributed only on
+// the first hop and only when the IRI uses its scheme's default port.
 func (c *Client) getOnce(ctx context.Context, iri string, mode fetchMode) (body []byte, retryable bool, err error) {
 	target := iri
+	// onIRIHost reports whether every hop so far, the current one included,
+	// was on the IRI's own host.
+	onIRIHost := true
+	attributable := func(reason string) string {
+		if mode == fetchModeObject && onIRIHost {
+			return reason
+		}
+		return ""
+	}
+	attribute := func(reason string, err error) error {
+		if reason == "" {
+			return err
+		}
+		return hostAttributedError{reason: reason, err: err}
+	}
+	// refusedHop marks a URL-check or egress-guard refusal of a redirect
+	// target (any hop after the first) as the origin's doing.
+	refusedHop := func(redirects int, err error) error {
+		var validation errors.ValidationError
+		if redirects > 0 && stderrors.As(err, &validation) {
+			return RedirectHopRefusedError{Err: err}
+		}
+		return err
+	}
 	for redirects := 0; ; redirects++ {
 		if err := c.waitForHost(ctx, target); err != nil {
-			return nil, false, err
+			return nil, false, refusedHop(redirects, err)
 		}
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 		if err != nil {
 			return nil, false, fmt.Errorf("ap: build GET %s: %w", target, err)
 		}
+		onIRIHost = onIRIHost && sameHost(iri, req.URL)
 		req.Header.Set("User-Agent", c.userAgent)
 		req.Header.Set("Accept", acceptActivityJSON)
 		if c.signer != nil {
@@ -1026,17 +1286,22 @@ func (c *Client) getOnce(ctx context.Context, iri string, mode fetchMode) (body 
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
 			// NXDOMAIN of the IRI's own host (a dead instance such as
-			// kbin.social) is ErrHostGone and not retried here; callers decide
-			// whether to skip it (backfill) or retry later (live inbox).
+			// kbin.social) is not retried. Only the first hop's lookup of
+			// the IRI's own host counts: a failed lookup of a redirect
+			// target, proxy or other intermediary says nothing about the
+			// object's origin.
 			var dnsErr *net.DNSError
-			// Only the first hop's lookup of the IRI's own host counts: a
-			// failed lookup of a redirect target, proxy or other intermediary
-			// says nothing about the object's origin.
-			if mode == fetchModeObject && redirects == 0 && stderrors.As(err, &dnsErr) && dnsErr.IsNotFound &&
+			if redirects == 0 && stderrors.As(err, &dnsErr) && dnsErr.IsNotFound &&
 				strings.EqualFold(dnsErr.Name, req.URL.Hostname()) {
-				return nil, false, fmt.Errorf("ap: GET %s: %w: %w", target, hostGoneError(iri), err)
+				if reason := attributable(errors.HostGoneReasonDNSNotFound); reason != "" {
+					return nil, false, attribute(reason, fmt.Errorf("ap: GET %s: %w", target, err))
+				}
 			}
-			return nil, true, fmt.Errorf("ap: GET %s: %w", target, err)
+			reason := ""
+			if ctx.Err() == nil && redirects == 0 && onDefaultPort(req.URL) {
+				reason = attributable(connectionFailureReason(err))
+			}
+			return nil, true, attribute(reason, refusedHop(redirects, fmt.Errorf("ap: GET %s: %w", target, err)))
 		}
 
 		if isRedirect(resp.StatusCode) {
@@ -1051,7 +1316,8 @@ func (c *Client) getOnce(ctx context.Context, iri string, mode fetchMode) (body 
 					fmt.Sprintf("redirect from %q refused: this client follows no redirects", target))
 			}
 			if redirects >= maxRedirects {
-				return nil, false, fmt.Errorf("ap: GET %s: too many redirects", iri)
+				return nil, false, attribute(attributable(errors.HostGoneReasonTooManyRedirects),
+					fmt.Errorf("ap: GET %s: too many redirects", iri))
 			}
 			next, err := url.Parse(location)
 			if err != nil {
@@ -1080,17 +1346,28 @@ func (c *Client) getOnce(ctx context.Context, iri string, mode fetchMode) (body 
 
 		switch {
 		case resp.StatusCode >= 200 && resp.StatusCode < 300:
-			if err := checkJSONResponse(resp, body); err != nil {
-				// A redirect off the IRI's host that lands on a non-JSON page is
-				// a dead instance parking every URL (lemm.ee → join-lemmy.org),
-				// so the host is gone rather than misnegotiated. It may also be
-				// a maintenance page, so callers decide whether to skip it.
-				if mode == fetchModeObject && redirects > 0 && !sameHost(iri, req.URL) {
-					return nil, false, fmt.Errorf("ap: GET %s: %w: %w", target, hostGoneError(iri), err)
-				}
-				return nil, false, fmt.Errorf("ap: GET %s: %w", target, err)
+			mediaType := nonJSONMediaType(resp, body)
+			if mediaType == "" {
+				return body, false, nil
 			}
-			return body, false, nil
+			switch {
+			case mode == fetchModeObject && redirects > 0 && !sameHost(iri, req.URL):
+				// A redirect off the IRI's host that lands on a non-JSON page
+				// is a dead instance parking every URL (lemm.ee →
+				// join-lemmy.org), so the host is gone rather than
+				// misnegotiated. It may also be a maintenance page, so callers
+				// decide whether to skip it.
+				return nil, false, attribute(errors.HostGoneReasonParkedRedirect,
+					fmt.Errorf("ap: GET %s: response is %s, not JSON", target, mediaType))
+			case redirects > 0 && (req.URL.Path == "" || req.URL.Path == "/") &&
+				attributable(errors.HostGoneReasonRedirectToRoot) != "":
+				// The host sends the object to its own front page: a lapsed
+				// domain answering every URL with its landing page.
+				return nil, false, attribute(errors.HostGoneReasonRedirectToRoot,
+					fmt.Errorf("ap: GET %s: response is %s, not JSON", target, mediaType))
+			}
+			return nil, false, fmt.Errorf("ap: GET %s: %w", target,
+				NonJSONResponseError{URL: target, ContentType: mediaType, Redirected: redirects > 0})
 		case resp.StatusCode == http.StatusGone:
 			// 410 Gone is how Lemmy serves deleted objects (with a Tombstone
 			// body). Surface tombstone semantics so the materializer maps it
@@ -1112,7 +1389,11 @@ func (c *Client) getOnce(ctx context.Context, iri string, mode fetchMode) (body 
 			}
 			return nil, false, AccessRefusedError{URL: iri, StatusCode: resp.StatusCode}
 		case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
-			return nil, true, HTTPError{URL: iri, StatusCode: resp.StatusCode}
+			reason := ""
+			if edgeStatuses[resp.StatusCode] && redirects == 0 && onDefaultPort(req.URL) {
+				reason = attributable(errors.HostGoneReasonEdgeStatus)
+			}
+			return nil, true, attribute(reason, HTTPError{URL: iri, StatusCode: resp.StatusCode})
 		case resp.StatusCode == http.StatusBadRequest:
 			// Lemmy answers a GET of a purged object 400
 			// {"error":"couldnt_find_post"}; keep the body so callers can
@@ -1124,23 +1405,97 @@ func (c *Client) getOnce(ctx context.Context, iri string, mode fetchMode) (body 
 	}
 }
 
-// checkJSONResponse names the failure when a 2xx response is not JSON at
-// all. It fires only when BOTH the body does not look like JSON AND the
-// declared Content-Type is a non-JSON type (text/html …): a server that
-// mislabels valid JSON still parses, and a JSON-typed garbage body still
-// reaches the parser for its own error. Without this, a content-negotiation
-// miss (an instance's proxy serving its HTML frontend with 200 to an AP
-// fetch) surfaces as the opaque "payload is not a JSON object".
-func checkJSONResponse(resp *http.Response, body []byte) error {
+// connectionFailureReason maps a transport error that kept the request from
+// reaching the host to its host-gone reason: a dial that timed out, was
+// refused or reset, found no route, or a failed TLS handshake. Anything else
+// (a DNS failure, a response-header timeout after connecting, a guard
+// refusal, a context error) returns "".
+func connectionFailureReason(err error) string {
+	// A failed lookup (a resolver timeout included) attempted no connection
+	// to the host. Its Timeout() would otherwise read as connect_timeout.
+	var dnsErr *net.DNSError
+	if stderrors.As(err, &dnsErr) {
+		return ""
+	}
+	var (
+		certificateVerification *tls.CertificateVerificationError
+		unknownAuthority        x509.UnknownAuthorityError
+		hostname                x509.HostnameError
+		certificateInvalid      x509.CertificateInvalidError
+		recordHeader            tls.RecordHeaderError
+		alert                   tls.AlertError
+	)
+	switch {
+	case stderrors.As(err, &certificateVerification), stderrors.As(err, &unknownAuthority),
+		stderrors.As(err, &hostname), stderrors.As(err, &certificateInvalid),
+		stderrors.As(err, &recordHeader), stderrors.As(err, &alert):
+		return errors.HostGoneReasonTLSFailure
+	}
+	var opErr *net.OpError
+	if !stderrors.As(err, &opErr) {
+		return ""
+	}
+	switch opErr.Op {
+	case "remote error":
+		// crypto/tls reports an alert received from the peer this way.
+		return errors.HostGoneReasonTLSFailure
+	case "dial":
+	default:
+		return ""
+	}
+	switch {
+	case stderrors.Is(opErr.Err, syscall.ECONNREFUSED):
+		return errors.HostGoneReasonConnectionRefused
+	case stderrors.Is(opErr.Err, syscall.ECONNRESET):
+		return errors.HostGoneReasonConnectionReset
+	case stderrors.Is(opErr.Err, syscall.EHOSTUNREACH), stderrors.Is(opErr.Err, syscall.ENETUNREACH):
+		return errors.HostGoneReasonNoRoute
+	case opErr.Timeout():
+		return errors.HostGoneReasonConnectTimeout
+	}
+	return ""
+}
+
+// onDefaultPort reports whether u names no port or its scheme's default port
+// (443 for https, 80 for http). A connection or edge failure on another port
+// says nothing about the host's fediverse server.
+func onDefaultPort(u *url.URL) bool {
+	switch u.Port() {
+	case "":
+		return true
+	case "443":
+		return u.Scheme == "https"
+	case "80":
+		return u.Scheme == "http"
+	}
+	return false
+}
+
+// iriOnDefaultPort reports whether iri parses and names no port or its
+// scheme's default port.
+func iriOnDefaultPort(iri string) bool {
+	parsed, err := url.Parse(iri)
+	return err == nil && onDefaultPort(parsed)
+}
+
+// nonJSONMediaType returns the declared media type when a 2xx response is
+// not JSON at all, and "" otherwise. It fires only when BOTH the body does
+// not look like JSON AND the declared Content-Type is a non-JSON type
+// (text/html …): a server that mislabels valid JSON still parses, and a
+// JSON-typed garbage body still reaches the parser for its own error. Without
+// this, a content-negotiation miss (an instance's proxy serving its HTML
+// frontend with 200 to an AP fetch) surfaces as the opaque "payload is not a
+// JSON object".
+func nonJSONMediaType(resp *http.Response, body []byte) string {
 	trimmed := bytes.TrimSpace(body)
 	if len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[') {
-		return nil
+		return ""
 	}
 	mediaType, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
 	if err != nil || mediaType == "" || strings.Contains(mediaType, "json") {
-		return nil
+		return ""
 	}
-	return fmt.Errorf("response is %s, not JSON (content negotiation failed?)", mediaType)
+	return mediaType
 }
 
 // readBody drains the response body through the size cap and closes it.
@@ -1213,7 +1568,7 @@ func (c *Client) waitForHost(ctx context.Context, rawURL string) error {
 	c.mu.Unlock()
 
 	if err := limiter.Wait(ctx); err != nil {
-		return fmt.Errorf("ap: rate limit wait for %s: %w", host, err)
+		return fmt.Errorf("ap: rate limit wait for %s: %w: %w", host, ErrRateLimitWait, err)
 	}
 	return nil
 }

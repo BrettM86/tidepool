@@ -84,3 +84,11 @@ instances:
   # discussion. 459 local communities (444 publicly listed), about 800 monthly
   # active users. None are NSFW-flagged, so nothing is excluded.
   - host: "programming.dev"
+  # added 2026-11-10 on request: third whole instance, general-interest
+  # discussion. 1,097 local communities (950 publicly listed), 2.2k monthly
+  # active users. Its 22 NSFW-flagged communities were reviewed: boysjerking is
+  # explicit and combatvideos is graphic combat footage, so both are excluded.
+  - host: "sh.itjust.works"
+    exclude:
+      - "!boysjerking@sh.itjust.works"
+      - "!combatvideos@sh.itjust.works"

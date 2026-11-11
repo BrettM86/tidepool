@@ -744,7 +744,14 @@ func TestParseFollowList_RepoFile(t *testing.T) {
 	list, err := ParseFollowList("../../communities.yaml")
 	require.NoError(t, err)
 	assert.Len(t, list.Communities, 13)
-	assert.Equal(t, []InstanceEntry{{Host: "lemmy.zip"}, {Host: "programming.dev"}}, list.Instances)
+	assert.Equal(t, []InstanceEntry{
+		{Host: "lemmy.zip"},
+		{Host: "programming.dev"},
+		{Host: "sh.itjust.works", Exclude: []string{"!boysjerking@sh.itjust.works", "!combatvideos@sh.itjust.works"}},
+	}, list.Instances)
+	assert.False(t, list.Desires("https://sh.itjust.works/c/boysjerking", "sh.itjust.works", ""))
+	assert.False(t, list.Desires("https://sh.itjust.works/c/combatvideos", "sh.itjust.works", ""))
+	assert.True(t, list.Desires("https://sh.itjust.works/c/opensim", "sh.itjust.works", ""))
 	assert.Empty(t, list.OutboundDisabledHosts)
 	assert.Empty(t, list.OutboundDisabledCommunities)
 }

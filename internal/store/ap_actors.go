@@ -41,9 +41,15 @@ type APActor struct {
 	Enabled    bool
 	EnabledAt  *time.Time
 	DisabledAt *time.Time
-	// DeliveryPaused is the transient #account state (decision 19):
-	// delivery stops, identity stays.
+	// DeliveryPaused is derived from the pause source set (an account
+	// label, the transient #account state; decision 19): delivery stops,
+	// identity stays.
 	DeliveryPaused bool
+	// TakedownPaused reports that a takedown source is among the pause
+	// sources (an account label, or a takendown or suspended #account
+	// status): the persona's work waits for the pause to clear instead of
+	// being cancelled. A deactivated or throttled pause alone leaves it false.
+	TakedownPaused bool
 	// TombstonedAt is set when the DESTRUCTIVE tier withdrew this identity
 	// (task 17d): the actor document answers 410 Gone from then on. It is
 	// TERMINAL — no path clears it — because peers that honoured the Delete
@@ -75,21 +81,35 @@ func NewAPActors(db *sql.DB) APActors {
 	return &postgresAPActors{db: db}
 }
 
-const apActorColumns = `
+var apActorColumns = `
 	did, kind, actor_id, normalized_origin, local_part,
 	rsa_key_sealed, rsa_key_version, public_key_pem,
-	enabled, enabled_at, disabled_at, delivery_paused, tombstoned_at,
+	enabled, enabled_at, disabled_at, delivery_paused,
+	` + takedownPauseSourceCondition("pause_sources") + `, tombstoned_at,
 	display_name, summary, avatar_url, created_at, updated_at`
 
 func (r *postgresAPActors) Create(ctx context.Context, actor APActor) (*APActor, error) {
 	// The lifecycle and profile columns are deliberately absent from the
 	// insert list: federation is default-on (decision 11), so a created
-	// actor is always enabled and unpaused and takes those values from the
-	// schema defaults. Reading them off the argument would let a caller
+	// actor is always enabled and, unless a standing account label pauses
+	// it (below), unpaused, taking those values from the schema defaults. Reading them off the argument would let a caller
 	// that merely forgot to set Enabled mint a silently dead actor — the
 	// zero value of a bool is exactly the dangerous direction here.
 	// Disabling is an explicit SetEnabled call, never a side effect of
 	// creation.
+	//
+	// A person minted under a standing account `!takedown` is minted paused,
+	// in the same tx and under the DID's account lock: the label applier takes
+	// that lock too, so a label committed before the mint is read here and
+	// one committed after finds the persona.
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create ap_actor %q: begin: %w", actor.DID, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := LockAccountTx(ctx, tx, actor.DID); err != nil {
+		return nil, err
+	}
 	query := `
 		INSERT INTO ap_actors (
 			did, kind, actor_id, normalized_origin, local_part,
@@ -97,12 +117,22 @@ func (r *postgresAPActors) Create(ctx context.Context, actor APActor) (*APActor,
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		RETURNING` + apActorColumns
 
-	row := r.db.QueryRowContext(ctx, query,
+	row := tx.QueryRowContext(ctx, query,
 		actor.DID, string(actor.Kind), actor.ActorID,
 		actor.NormalizedOrigin, actor.LocalPart,
 		actor.RSAKeySealed, actor.RSAKeyVersion, actor.PublicKeyPEM,
 	)
 	stored, err := scanAPActor(row)
+	if err == nil && stored.Kind == ActorTypePerson {
+		if err := pauseUnderStandingAccountLabelTx(ctx, tx, actor.DID); err != nil {
+			return nil, err
+		}
+		stored, err = scanAPActor(tx.QueryRowContext(ctx,
+			`SELECT`+apActorColumns+` FROM ap_actors WHERE did = $1`, actor.DID))
+	}
+	if err == nil {
+		err = tx.Commit()
+	}
 	if err != nil {
 		// Mapped from the constraint name rather than pre-checked: a
 		// SELECT-then-INSERT pre-check races with a concurrent mint.
@@ -224,10 +254,26 @@ func (r *postgresAPActors) tombstone(ctx context.Context, ex execer, did string)
 }
 
 func (r *postgresAPActors) SetPaused(ctx context.Context, did string, paused bool) error {
-	// delivery_paused alone: pausing delivery must not disable the actor,
-	// so the enabled columns are untouched.
-	query := `UPDATE ap_actors SET delivery_paused = $2, updated_at = now() WHERE did = $1`
-	return r.execOne(ctx, "set paused", did, query, did, paused)
+	// The account-status pause source alone: pausing delivery must not
+	// disable the actor, and it leaves an account label's pause in place.
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("set paused for ap_actor %q: begin: %w", did, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	src := PauseSource{Kind: PauseSourceAccountStatus, Key: did}
+	if paused {
+		err = AddPauseSourceTx(ctx, tx, did, src)
+	} else {
+		err = RemovePauseSourceTx(ctx, tx, did, src)
+	}
+	if err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("set paused for ap_actor %q: commit: %w", did, err)
+	}
+	return nil
 }
 
 func (r *postgresAPActors) UpdateProfile(ctx context.Context, did string, profile APActorProfile) error {
@@ -273,7 +319,7 @@ func scanAPActor(row rowScanner) (*APActor, error) {
 		&actor.DID, &kind, &actor.ActorID,
 		&actor.NormalizedOrigin, &actor.LocalPart,
 		&actor.RSAKeySealed, &actor.RSAKeyVersion, &actor.PublicKeyPEM,
-		&actor.Enabled, &enabledAt, &disabledAt, &actor.DeliveryPaused, &tombstonedAt,
+		&actor.Enabled, &enabledAt, &disabledAt, &actor.DeliveryPaused, &actor.TakedownPaused, &tombstonedAt,
 		&actor.DisplayName, &actor.Summary, &actor.AvatarURL,
 		&actor.CreatedAt, &actor.UpdatedAt,
 	)

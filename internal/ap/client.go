@@ -93,18 +93,41 @@ type HTTPError struct {
 	URL        string
 	StatusCode int
 	// Body is a bounded excerpt of the response body, populated on delivery
-	// POSTs so the caller can classify peer-specific signals (task 15's worker
-	// keys Lemmy's duplicate-activity response — a 400 whose body names an
-	// already-received activity — as DELIVERED, not poisoned). Empty when the
-	// body was not captured.
+	// POSTs and on a 400 to a GET so the caller can classify peer-specific
+	// signals (task 15's worker keys Lemmy's duplicate-activity response — a
+	// 400 whose body names an already-received activity — as DELIVERED, not
+	// poisoned; the community reconcile keys Lemmy's 400 couldnt_find_post
+	// for a post and couldnt_find_comment for a comment as not found). Empty when the body was not captured.
 	Body string
 	// Method is the request method; empty means GET.
 	Method string
 }
 
+// AccessRefusedError is an object fetch the origin answered 401 or 403. It
+// unwraps to a not-found error, so errors.IsNotFound holds for it as it
+// always has, and carries the status for a caller that must tell a refusal
+// from a 404 (the community restore reconcile retries a refusal instead of
+// deleting the object). It is not an HTTPError: callers branching on
+// HTTPError statuses keep seeing a 401/403 object fetch as not found.
+type AccessRefusedError struct {
+	URL        string
+	StatusCode int
+}
+
+func (e AccessRefusedError) Error() string {
+	return fmt.Sprintf("ap: GET %s: access refused (status %d): %v", e.URL, e.StatusCode, e.Unwrap())
+}
+
+// Unwrap returns the not-found error a refusal maps to.
+func (e AccessRefusedError) Unwrap() error { return errors.NewNotFoundError("ap_object", e.URL) }
+
 // httpErrorBodyLimit bounds how much of the body Error() shows, so a peer's
 // HTML error page does not flood the logs.
 const httpErrorBodyLimit = 512
+
+// getErrorBodyLimit bounds the body excerpt a GET's 400 HTTPError keeps, the
+// same cap the delivery POST path reads.
+const getErrorBodyLimit = 4096
 
 func (e HTTPError) Error() string {
 	method := e.Method
@@ -335,7 +358,8 @@ func guardedTransport(base http.RoundTripper, guard *egressGuard) http.RoundTrip
 //
 // Error mapping (typed so the materializer can branch):
 //   - 404 (and 401/403, which secure-mode instances return for objects we
-//     cannot see) → errors.IsNotFound;
+//     cannot see) → errors.IsNotFound; a 401/403 is an AccessRefusedError
+//     carrying its status;
 //   - 410 Gone → errors.IsTombstoned — the object was deleted upstream, the
 //     caller must treat it as a tombstone, never re-fetch;
 //   - a 200 whose body is a Tombstone object → errors.IsTombstoned (Lemmy
@@ -1086,9 +1110,14 @@ func (c *Client) getOnce(ctx context.Context, iri string, mode fetchMode) (body 
 			if mode == fetchModeWebFinger {
 				return nil, false, HTTPError{URL: iri, StatusCode: resp.StatusCode}
 			}
-			return nil, false, errors.NewNotFoundError("ap_object", iri)
+			return nil, false, AccessRefusedError{URL: iri, StatusCode: resp.StatusCode}
 		case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
 			return nil, true, HTTPError{URL: iri, StatusCode: resp.StatusCode}
+		case resp.StatusCode == http.StatusBadRequest:
+			// Lemmy answers a GET of a purged object 400
+			// {"error":"couldnt_find_post"}; keep the body so callers can
+			// tell that answer from other 400s.
+			return nil, false, HTTPError{URL: iri, StatusCode: resp.StatusCode, Body: string(body[:min(len(body), getErrorBodyLimit)])}
 		default:
 			return nil, false, HTTPError{URL: iri, StatusCode: resp.StatusCode}
 		}

@@ -336,8 +336,10 @@ type APActors interface {
 	// is an error satisfying errors.IsValidation.
 	SetEnabledTx(ctx context.Context, tx *sql.Tx, did string, enabled bool) error
 
-	// SetPaused toggles delivery_paused (the transient #account state).
-	// A missing actor is an error satisfying errors.IsNotFound.
+	// SetPaused adds or removes the actor's account-status pause source;
+	// delivery_paused is derived from the pause source set, so an account
+	// label's pause stays. A missing actor is an error satisfying
+	// errors.IsNotFound.
 	SetPaused(ctx context.Context, did string, paused bool) error
 
 	// Tombstone withdraws the identity (task 17d's destructive tier): the actor
@@ -484,8 +486,9 @@ type Communities interface {
 	// to accepted between sweeps is never clobbered back to pending (the
 	// WHERE only matches follow_state='pending'). The returned rows carry the
 	// post-increment follow_attempts and are the ones the retrier must send a
-	// fresh Follow to. The follow retrier's work query (Lemmy first-contact
-	// Accept race).
+	// fresh Follow to. A removed community (see CommunityRemovals) is never
+	// claimed. The follow retrier's work query (Lemmy first-contact Accept
+	// race).
 	ClaimStalePendingFollows(ctx context.Context, requestedBefore time.Time, maxAttempts int) ([]*Community, error)
 }
 
@@ -660,6 +663,15 @@ type OutboundObjects interface {
 	// redelivery must not move the causal boundary). A missing row is an error
 	// satisfying errors.IsNotFound.
 	SetAccepted(ctx context.Context, atURI string) error
+
+	// SetAcceptedTx is SetAccepted in tx, so a takedown's settlement commits
+	// the stamp and the Delete it owes together.
+	SetAcceptedTx(ctx context.Context, tx *sql.Tx, atURI string) error
+
+	// LockByATURITx reads the object in tx and holds its row lock until tx
+	// ends, so a takedown and the object's settlement serialize. NotFound when
+	// the object has no outbound row.
+	LockByATURITx(ctx context.Context, tx *sql.Tx, atURI string) (*OutboundObject, error)
 }
 
 // OutboundVotes persists the state an outbound Undo is rebuilt from (decision
@@ -970,7 +982,8 @@ type OutboundDeliveries interface {
 
 	// CancelOutwardForActorTx is the CONSENT withdrawal, and the one an opt-out
 	// uses: it cancels everything that PUBLISHES for the actor and leaves their
-	// RETRACTIONS (Delete, Undo — see RetractionKinds) to go out.
+	// RETRACTIONS (Delete, Undo — see RetractionKinds) to go out. Work held on
+	// a takedown pause (HeldReasonPause) is cancelled with the pending rows.
 	//
 	// A user who deletes a post and then opts out must still have that delete
 	// delivered, or it stands on the peer forever; and the destructive tier's own
@@ -1033,4 +1046,67 @@ type OutboundDeliveries interface {
 	// another activity is superseded: sending it would withdraw that live vote
 	// on the peer. It stays poisoned and is counted in superseded instead.
 	RedrivePoisoned(ctx context.Context, activityID, orderingKey string) (redriven, superseded int64, err error)
+
+	// HoldForObjectTx holds the object's own pending, unclaimed deliveries that
+	// are not held for settlement, taking them off their ordering queue.
+	// Returns how many rows were held.
+	HoldForObjectTx(ctx context.Context, tx *sql.Tx, atURI string) (int64, error)
+
+	// HoldCommunityWorkTx holds, on HeldReasonCommunity with communityDID as
+	// the subject, every pending, unclaimed Create, Update, Like and Dislike
+	// on communityAPID's ordering key that is not held for settlement: the
+	// work into a bridged community whose `!takedown` stands. The caller holds
+	// communityDID's takedown-subject lock. Returns how many rows were held.
+	HoldCommunityWorkTx(ctx context.Context, tx *sql.Tx, communityAPID, communityDID string) (int64, error)
+
+	// HoldObjectOnConsentTx is HoldForObjectTx on HeldReasonConsent: it holds
+	// the object's queued Create/Update behind its restore Undo{Delete}, held
+	// while the author's consent is withdrawn. Returns how many rows were held.
+	HoldObjectOnConsentTx(ctx context.Context, tx *sql.Tx, atURI string) (int64, error)
+
+	// HasConsentHoldTx reports whether any delivery is held on consent with
+	// atURI as its subject: the object's takedown restore Undo{Delete} (or
+	// the object's work behind it) waits for its author's consent. The caller
+	// takes atURI's takedown-subject lock first, so the read serializes with
+	// ReleaseConsentHeldTx.
+	HasConsentHoldTx(ctx context.Context, tx *sql.Tx, atURI string) (bool, error)
+
+	// ReleaseHeldTx releases the rows held on subjectATURI whose every blocker
+	// (own object's takedown set and parent) has cleared, to the tail of their
+	// ordering key with fresh seq, original relative order kept. A held
+	// Create or Update of an object whose outbound state is tombstoned (its
+	// author deleted it) is cancelled instead. Before it reads the held rows
+	// it takes the takedown-subject locks (LockTakedownSubjectsTx) of
+	// subjectATURI and of those rows' parents, in one sorted call. Rows held
+	// on consent or on a pause are left for ReleaseConsentHeldTx. Returns how
+	// many rows were released.
+	ReleaseHeldTx(ctx context.Context, tx *sql.Tx, subjectATURI string) (int64, error)
+
+	// ReleaseConsentHeldTx releases actorDID's rows held on consent
+	// (HeldReasonConsent) or on a takedown pause (HeldReasonPause) once its
+	// consent has returned, its pause source set included; while the actor is
+	// still paused, disabled or opted out it releases nothing, and once no
+	// takedown source pauses it the rows held on its pause are cancelled
+	// (consent is withdrawn for another reason). Every pause
+	// clear and the opt-in call it. It share-locks
+	// the actor's ap_actors row and takes each subject's takedown lock, then
+	// decides each row by ReleaseHeldTx's rules, with one more: a restore
+	// Undo{Delete} whose object is removed again is cancelled. Released rows go
+	// to the tail with fresh seq, the Undo before its object's rows. Returns how
+	// many rows were released.
+	ReleaseConsentHeldTx(ctx context.Context, tx *sql.Tx, actorDID string) (int64, error)
+
+	// HoldActivityTx holds activityID's pending, unclaimed deliveries that are
+	// not held for settlement, on reason (HeldReasonObject, HeldReasonParent,
+	// HeldReasonConsent, HeldReasonPause or HeldReasonCommunity) and subject,
+	// the blocker's at-uri (the actor DID for a pause, the community DID for
+	// a community). Returns how many rows were held.
+	HoldActivityTx(ctx context.Context, tx *sql.Tx, activityID, reason, subject string) (int64, error)
+
+	// HoldClaimedTx holds one claimed delivery in tx under its fencing token,
+	// on reason and subject, handing back the attempt the claim charged: a hold
+	// is a wait, not a failure. Same (exists, applied) shape as MarkDelivered.
+	// The caller takes the subject's lock (LockTakedownSubjectsTx) and rechecks
+	// the blocker in tx first.
+	HoldClaimedTx(ctx context.Context, tx *sql.Tx, activityID, targetInbox, reason, subject string, claimToken time.Time) (exists, applied bool, err error)
 }

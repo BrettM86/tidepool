@@ -181,6 +181,10 @@ type Community struct {
 	// Lemmy first-contact Accept race).
 	FollowRequestedAt *time.Time
 	FollowAttempts    int
+	// FollowProvenance is how the community was last followed; "" when
+	// unknown (rows followed before it was recorded), which counts as
+	// configured.
+	FollowProvenance FollowProvenance
 }
 
 // CommunityBan is one community's exclusion of one native author.
@@ -468,12 +472,16 @@ const (
 	// delivery: create/update for a disabled or paused actor, or a community
 	// unfollowed out from under pending work. Never a failure.
 	DeliveryStateCancelled DeliveryState = "cancelled"
+	// DeliveryStateHeld means the delivery is off its ordering queue while its
+	// object, or the parent it replies to, is taken down.
+	DeliveryStateHeld DeliveryState = "held"
 )
 
 // Valid reports whether the value is a known delivery state.
 func (s DeliveryState) Valid() bool {
 	switch s {
-	case DeliveryStatePending, DeliveryStateDelivered, DeliveryStatePoisoned, DeliveryStateCancelled:
+	case DeliveryStatePending, DeliveryStateDelivered, DeliveryStatePoisoned, DeliveryStateCancelled,
+		DeliveryStateHeld:
 		return true
 	}
 	return false

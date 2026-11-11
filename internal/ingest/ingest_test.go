@@ -240,7 +240,13 @@ type harness struct {
 	served   map[string][]byte
 	hits     map[string]int
 	onFetch  map[string]func() // runs inside a GET of the path, outside mu
-	inboxLog [][]byte          // POSTs captured at the fake Lemmy shared inbox
+	// statuses, when set for a path, is the status a GET of it answers
+	// (with its served body, if any) instead of 200 (serveStatus).
+	statuses map[string]int
+	inboxLog [][]byte // POSTs captured at the fake Lemmy shared inbox
+	// onInbox, when set, runs inside every POST to the fake Lemmy shared
+	// inbox with its body, outside mu and before the answer.
+	onInbox func(body []byte)
 }
 
 // serviceRSAKey is generated once: the bridge service actor's key is not
@@ -303,7 +309,13 @@ func newHarness(t *testing.T) *harness {
 		// Blob withholds (migration 047): the blobs table is cleared above, so a
 		// withhold row left by one test would refuse the next test's image of
 		// the same bytes (fixture images are deterministic, so their CIDs are).
-		"blob_withholds")
+		"blob_withholds",
+		// Coves labels (migration 052): a standing community !takedown left by
+		// one test would refuse the next test's subscribe of the same
+		// deterministic community DID.
+		"coves_labels", "coves_label_cursor")
+	// Community removal suppressions (migration 060).
+	testutil.TruncateIfExists(t, database, "community_removal_suppressions")
 
 	custodian, err := identity.NewCustodian(testKEK)
 	require.NoError(t, err)
@@ -328,6 +340,7 @@ func newHarness(t *testing.T) *harness {
 		served:      map[string][]byte{},
 		hits:        map[string]int{},
 		onFetch:     map[string]func(){},
+		statuses:    map[string]int{},
 	}
 	h.mux = http.NewServeMux()
 	h.fixtures = httptest.NewServer(h.mux)
@@ -339,7 +352,11 @@ func newHarness(t *testing.T) *harness {
 		body, _ := readAll(r)
 		h.mu.Lock()
 		h.inboxLog = append(h.inboxLog, body)
+		onInbox := h.onInbox
 		h.mu.Unlock()
+		if onInbox != nil {
+			onInbox(body)
+		}
 		w.WriteHeader(http.StatusOK)
 	})
 	h.mux.HandleFunc("/pictrs/image/", func(w http.ResponseWriter, r *http.Request) {
@@ -560,9 +577,16 @@ func (h *harness) serveJSON(path string, body []byte) {
 			current := h.served[path]
 			h.hits[path]++
 			onFetch := h.onFetch[path]
+			status := h.statuses[path]
 			h.mu.Unlock()
 			if onFetch != nil {
 				onFetch()
+			}
+			if status != 0 {
+				w.Header().Set("Content-Type", ap.ContentTypeActivityJSON)
+				w.WriteHeader(status)
+				_, _ = w.Write(current)
+				return
 			}
 			if current == nil {
 				w.WriteHeader(http.StatusGone)
@@ -834,19 +858,7 @@ func originOf(apID string) string {
 // — a fixture that looks like a bug in follow delivery.
 func (h *harness) subscribeCommunityURL(apGroupID, username string) *remoteActor {
 	h.t.Helper()
-	group := h.newRemoteActor(apGroupID, map[string]any{
-		"type":              "Group",
-		"id":                apGroupID,
-		"preferredUsername": username,
-		"inbox":             apGroupID + "/inbox",
-		// The shared inbox is derived from the community's OWN host, so
-		// co-hosted communities share one (which is what makes ordering_key
-		// rather than target_inbox the thing that carries scope) while
-		// communities on different instances do not (which is what makes a
-		// fan-out across instances expressible at all).
-		"endpoints": map[string]any{"sharedInbox": originOf(apGroupID) + "/inbox"},
-		"published": "2024-01-01T00:00:00.000000Z",
-	})
+	group := h.serveCommunityGroup(apGroupID, username)
 
 	rec := h.adminRequest(http.MethodPost, "/admin/communities",
 		map[string]any{"community": apGroupID})
@@ -874,6 +886,25 @@ func (h *harness) subscribeCommunityURL(apGroupID, username string) *remoteActor
 	require.Equal(h.t, store.FollowStateAccepted, community.FollowState)
 	require.NotEmpty(h.t, community.DID, "a subscribed community holds a minted repo")
 	return group
+}
+
+// serveCommunityGroup serves the Group document subscribeCommunityURL
+// subscribes to, and returns its signing handle.
+func (h *harness) serveCommunityGroup(apGroupID, username string) *remoteActor {
+	h.t.Helper()
+	return h.newRemoteActor(apGroupID, map[string]any{
+		"type":              "Group",
+		"id":                apGroupID,
+		"preferredUsername": username,
+		"inbox":             apGroupID + "/inbox",
+		// The shared inbox is derived from the community's OWN host, so
+		// co-hosted communities share one (which is what makes ordering_key
+		// rather than target_inbox the thing that carries scope) while
+		// communities on different instances do not (which is what makes a
+		// fan-out across instances expressible at all).
+		"endpoints": map[string]any{"sharedInbox": originOf(apGroupID) + "/inbox"},
+		"published": "2024-01-01T00:00:00.000000Z",
+	})
 }
 
 // firehoseOpCount counts firehose ops (any action, any repo) in collection.

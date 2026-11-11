@@ -100,3 +100,20 @@ func Truncate(t testing.TB, conn *sql.DB, tables ...string) {
 		t.Fatalf("truncate test tables: %v", err)
 	}
 }
+
+// TruncateIfExists empties each listed table that exists, so a harness can
+// clear a table a pending migration is about to add without failing before it
+// lands.
+func TruncateIfExists(t testing.TB, conn *sql.DB, tables ...string) {
+	t.Helper()
+	for _, table := range tables {
+		var exists bool
+		if err := conn.QueryRowContext(context.Background(),
+			`SELECT to_regclass($1) IS NOT NULL`, table).Scan(&exists); err != nil {
+			t.Fatalf("look up test table %s: %v", table, err)
+		}
+		if exists {
+			Truncate(t, conn, table)
+		}
+	}
+}

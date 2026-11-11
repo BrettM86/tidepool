@@ -88,6 +88,8 @@ type BackfillOptions struct {
 	// unstoppable context.Background(). Defaults to context.Background().
 	BaseContext context.Context
 	Logger      *slog.Logger
+	// OnComplete is called after a clean, stamped walk.
+	OnComplete func(community *store.Community)
 }
 
 // Backfill pages a community's outbox after a Follow is accepted (and on
@@ -109,6 +111,7 @@ type Backfill struct {
 	baseCtx     context.Context
 	logger      *slog.Logger
 	now         func() time.Time
+	onComplete  func(community *store.Community)
 
 	// slots holds one entry per walk TriggerAsync has running.
 	slots chan struct{}
@@ -171,6 +174,7 @@ func NewBackfill(opts BackfillOptions) (*Backfill, error) {
 		baseCtx:     baseCtx,
 		logger:      logger,
 		now:         time.Now,
+		onComplete:  opts.OnComplete,
 		slots:       make(chan struct{}, maxConcurrentBackfills),
 		running:     map[string]bool{},
 		retries:     map[string]backfillRetry{},
@@ -189,8 +193,8 @@ func NewBackfill(opts BackfillOptions) (*Backfill, error) {
 // maxConcurrentBackfills walks run at once. A trigger for a community already
 // queued or walking is dropped here, and shutdown empties the queue. A slot can
 // take hours to come free, so an un-forced walk reads its community again once
-// it has one (see currentCommunity). A forced walk applies no state check at
-// any point.
+// it has one (see currentCommunity). A forced walk applies no follow-state
+// check, but no walk of a removed community starts (see removed).
 func (b *Backfill) TriggerAsync(community *store.Community, force bool) {
 	if b.claim(community, force, false) {
 		b.startClaimed(community, force)
@@ -244,6 +248,9 @@ func (b *Backfill) startClaimed(community *store.Community, force bool) {
 			b.logger.Info("backfill dropped from the queue", "community", community.APGroupID, "error", err)
 			return
 		}
+		if b.removed(b.baseCtx, community) {
+			return
+		}
 		walked := community
 		if !force {
 			if walked = b.currentCommunity(community.APGroupID); walked == nil {
@@ -293,7 +300,29 @@ func (b *Backfill) Run(ctx context.Context, community *store.Community, force bo
 		return nil
 	}
 	defer b.release(community.APGroupID)
+	if b.removed(ctx, community) {
+		return nil
+	}
 	return b.walkClaimed(ctx, community)
+}
+
+// removed reports that a claimed walk must not start because a Coves
+// moderator removed its community. It is read when the walk starts, forced or
+// not, so a walk queued before the removal is dropped too; walk reads it again
+// before each item, for a removal that lands mid-walk. A failed read drops
+// the walk as an unfinished one, so the community stays on the schedule.
+func (b *Backfill) removed(ctx context.Context, community *store.Community) bool {
+	removed, err := communityRemoved(ctx, b.communities, community.DID)
+	switch {
+	case err != nil:
+		b.logger.Error("backfill dropped: read community removal", "community", community.APGroupID, "error", err)
+		b.recordWalk(community.APGroupID, false)
+		return true
+	case removed:
+		b.logger.Info("backfill dropped: community is removed", "community", community.APGroupID)
+		return true
+	}
+	return false
 }
 
 // claim reserves community for one walk. It is false when the community was
@@ -421,6 +450,17 @@ func (b *Backfill) walk(ctx context.Context, community *store.Community) (stampe
 		if ctx.Err() != nil {
 			return false, ctx.Err()
 		}
+		// A removal that lands while the walk runs stops it unstamped, so
+		// no further record of the community is materialized.
+		removed, err := communityRemoved(ctx, b.communities, community.DID)
+		if err != nil {
+			return false, fmt.Errorf("ingest: backfill %s: read community removal: %w", community.APGroupID, err)
+		}
+		if removed {
+			b.logger.Info("backfill stopped: community is removed",
+				"community", community.APGroupID, "posts", posts, "skipped", skipped)
+			return false, nil
+		}
 		ok, replyHostGone, err := b.materializeOutboxItem(ctx, item, community.APGroupID, community.DID)
 		hostGoneSkipped += replyHostGone
 		// Classified once: recordHostGone records the failure into the
@@ -475,6 +515,9 @@ func (b *Backfill) walk(ctx context.Context, community *store.Community) (stampe
 	}
 	b.logger.Log(ctx, completeLevel, "backfill complete", "community", community.APGroupID,
 		"posts", posts, "skipped", skipped, "host_gone", hostGoneSkipped)
+	if b.onComplete != nil {
+		b.onComplete(community)
+	}
 	return true, nil
 }
 

@@ -75,8 +75,15 @@ func envOr(name, fallback string) string {
 
 func tidepoolURL() string { return envOr("TIDEPOOL_E2E_URL", "http://localhost:8092") }
 func lemmyURL() string    { return envOr("LEMMY_E2E_URL", "http://localhost:8541") }
-func relayURL() string    { return envOr("RELAY_E2E_URL", "http://localhost:2480") }
-func plcE2EURL() string   { return "http://127.0.0.1:" + envOr("PLC_E2E_PORT", "3012") }
+
+// lemmy2URL is the second Lemmy instance (compose service lemmy2), which
+// federates with lemmy and tidepool. LEMMY2_E2E_URL overrides the whole URL,
+// LEMMY2_E2E_PORT the loopback port.
+func lemmy2URL() string {
+	return envOr("LEMMY2_E2E_URL", "http://127.0.0.1:"+envOr("LEMMY2_E2E_PORT", "8542"))
+}
+func relayURL() string  { return envOr("RELAY_E2E_URL", "http://localhost:2480") }
+func plcE2EURL() string { return "http://127.0.0.1:" + envOr("PLC_E2E_PORT", "3012") }
 func plcFixtureURL() string {
 	return "http://127.0.0.1:" + envOr("PLC_FIXTURE_E2E_PORT", "3013")
 }
@@ -241,7 +248,11 @@ var (
 	setupErr   error
 	adminJWT   string
 	nameSerial int
-	nameMu     sync.Mutex
+	// The second Lemmy's site setup runs once, on first use by a test.
+	lemmy2SetupOnce sync.Once
+	lemmy2SetupErr  error
+	lemmy2AdminJWT  string
+	nameMu          sync.Mutex
 )
 
 // newHarness waits for the stack once per process, logs in the Lemmy admin,
@@ -350,7 +361,7 @@ func probeHTTP(client *http.Client, url string) error {
 // bridge, which doubles as a guard against accidental external federation).
 func (h *harness) setupLemmySite() error {
 	admin := &lemmyClient{h: h}
-	if err := admin.login("admin", "lemmylemmy"); err != nil {
+	if err := admin.login(lemmyAdminUsername, lemmyAdminPassword); err != nil {
 		return fmt.Errorf("admin login: %w", err)
 	}
 	adminJWT = admin.jwt
@@ -361,7 +372,9 @@ func (h *harness) setupLemmySite() error {
 		"federation_enabled": true,
 		// coves-users is AP_USER_ORIGIN's host (docker-compose.e2e.yml): the
 		// authority native Coves authors' Person actors are served under.
-		"allowed_instances": []string{"tidepool", "coves-users"},
+		// lemmy2 is the second Lemmy instance, whose users follow communities
+		// here.
+		"allowed_instances": []string{"tidepool", "coves-users", "lemmy2"},
 	}
 	var out json.RawMessage
 	if err := admin.do(http.MethodPut, "/api/v3/site", body, &out); err != nil {
@@ -370,11 +383,52 @@ func (h *harness) setupLemmySite() error {
 	return nil
 }
 
+// The setup admin both Lemmy instances create from their lemmy.hjson.
+const (
+	lemmyAdminUsername = "admin"
+	lemmyAdminPassword = "lemmylemmy"
+)
+
+// lemmy2Admin returns a logged-in admin client for the second Lemmy
+// instance, applying its site settings once: open registration, captcha off,
+// federation on, and an allowlist of the first Lemmy and the bridge's two
+// hosts. Fatal, naming the URL, when the instance cannot be reached.
+func (h *harness) lemmy2Admin(t *testing.T) *lemmyClient {
+	t.Helper()
+	lemmy2SetupOnce.Do(func() {
+		admin := &lemmyClient{h: h, baseURL: lemmy2URL()}
+		if err := admin.login(lemmyAdminUsername, lemmyAdminPassword); err != nil {
+			lemmy2SetupErr = fmt.Errorf("admin login: %w", err)
+			return
+		}
+		body := map[string]any{
+			"registration_mode":  "Open",
+			"captcha_enabled":    false,
+			"federation_enabled": true,
+			"allowed_instances":  []string{"lemmy", "tidepool", "coves-users"},
+		}
+		var out json.RawMessage
+		if err := admin.do(http.MethodPut, "/api/v3/site", body, &out); err != nil {
+			lemmy2SetupErr = fmt.Errorf("edit site: %w", err)
+			return
+		}
+		lemmy2AdminJWT = admin.jwt
+	})
+	if lemmy2SetupErr != nil {
+		t.Fatalf("second Lemmy instance at %s not ready: %v (it is compose service lemmy2; start it with `make e2e-up`)",
+			lemmy2URL(), lemmy2SetupErr)
+	}
+	return &lemmyClient{h: h, baseURL: lemmy2URL(), jwt: lemmy2AdminJWT}
+}
+
 // ── Lemmy HTTP API client (v3, lemmy 0.19) ─────────────────────────────────
 
 type lemmyClient struct {
-	h   *harness
-	jwt string
+	h *harness
+	// baseURL is the Lemmy instance the client talks to; "" is the first
+	// Lemmy (lemmyURL).
+	baseURL string
+	jwt     string
 	// password is kept so account-lifecycle scenarios can call endpoints
 	// that re-authenticate (POST /api/v3/user/delete_account requires it).
 	password string
@@ -390,7 +444,7 @@ func (c *lemmyClient) do(method, path string, body, out any) error {
 		}
 		reqBody = bytes.NewReader(raw)
 	}
-	req, err := http.NewRequest(method, lemmyURL()+path, reqBody)
+	req, err := http.NewRequest(method, c.base()+path, reqBody)
 	if err != nil {
 		return err
 	}
@@ -420,6 +474,14 @@ func (c *lemmyClient) do(method, path string, body, out any) error {
 	return nil
 }
 
+// base is the client's Lemmy origin.
+func (c *lemmyClient) base() string {
+	if c.baseURL != "" {
+		return c.baseURL
+	}
+	return lemmyURL()
+}
+
 func truncate(b []byte, n int) string {
 	if len(b) > n {
 		return string(b[:n]) + "…"
@@ -443,10 +505,18 @@ func (c *lemmyClient) login(user, password string) error {
 	return nil
 }
 
-// registerUser creates a fresh Lemmy user and returns a logged-in client.
+// registerUser creates a fresh user on the first Lemmy and returns a
+// logged-in client.
 func (h *harness) registerUser(t *testing.T, username string) *lemmyClient {
 	t.Helper()
-	c := &lemmyClient{h: h}
+	return h.registerUserOn(t, lemmyURL(), username)
+}
+
+// registerUserOn creates a fresh user on the Lemmy instance at baseURL and
+// returns a logged-in client for that instance.
+func (h *harness) registerUserOn(t *testing.T, baseURL, username string) *lemmyClient {
+	t.Helper()
+	c := &lemmyClient{h: h, baseURL: baseURL}
 	password := "password_" + username
 	var out struct {
 		JWT string `json:"jwt"`
@@ -458,7 +528,7 @@ func (h *harness) registerUser(t *testing.T, username string) *lemmyClient {
 		"show_nsfw":       true,
 	}, &out)
 	if err != nil {
-		t.Fatalf("register lemmy user %s: %v", username, err)
+		t.Fatalf("register lemmy user %s at %s: %v", username, baseURL, err)
 	}
 	if out.JWT == "" {
 		t.Fatalf("register lemmy user %s: no jwt in response (site requires verification?)", username)
@@ -804,7 +874,7 @@ func (c *lemmyClient) uploadImage(t *testing.T, filename string, data []byte) st
 	if err := mw.Close(); err != nil {
 		t.Fatalf("upload image: close multipart: %v", err)
 	}
-	req, err := http.NewRequest(http.MethodPost, lemmyURL()+"/pictrs/image", &buf)
+	req, err := http.NewRequest(http.MethodPost, c.base()+"/pictrs/image", &buf)
 	if err != nil {
 		t.Fatalf("upload image: build request: %v", err)
 	}
@@ -2390,6 +2460,12 @@ func (h *harness) restartTidepool(t *testing.T) {
 	}
 	if err := awaitTidepoolHealthy(); err != nil {
 		t.Fatal(err)
+	}
+	// coves-appview-forwarder shares tidepool's network namespace, which the
+	// restart replaced; restart it so the label consumer reaches the AppView.
+	cmd = exec.CommandContext(ctx, "docker", "compose", "-f", composeFile(t), "restart", "coves-appview-forwarder")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("restart coves-appview-forwarder: %v\n%s", err, out)
 	}
 }
 

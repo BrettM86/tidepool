@@ -78,6 +78,9 @@ type ResolverOptions struct {
 	// rather than discovered from a TXT-only handle failing to verify.
 	LookupTXT LookupTXTFunc
 	Logger    *slog.Logger
+	// AllowInsecureStatusEndpoint lets RepoStatus read an http PDS endpoint
+	// (development only, from cfg.AllowPrivateAddresses).
+	AllowInsecureStatusEndpoint bool
 }
 
 // HandleResolver resolves and verifies a did:plc's handle.
@@ -87,6 +90,8 @@ type HandleResolver struct {
 	userAgent  string
 	lookupTXT  LookupTXTFunc
 	logger     *slog.Logger
+	// allowInsecureStatusEndpoint is ResolverOptions.AllowInsecureStatusEndpoint.
+	allowInsecureStatusEndpoint bool
 }
 
 var _ DIDResolver = (*HandleResolver)(nil)
@@ -139,6 +144,8 @@ func NewHandleResolver(opts ResolverOptions) (*HandleResolver, error) {
 		userAgent:  opts.UserAgent,
 		lookupTXT:  opts.LookupTXT,
 		logger:     logger,
+
+		allowInsecureStatusEndpoint: opts.AllowInsecureStatusEndpoint,
 	}, nil
 }
 

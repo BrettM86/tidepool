@@ -163,6 +163,18 @@ func (s *Service) handleObject(w http.ResponseWriter, r *http.Request, rest stri
 		http.Error(w, "gone", http.StatusGone)
 		return
 	}
+	// A taken-down object answers an AS2 Tombstone rather than a plain 410: a
+	// peer re-fetching it after our takedown Delete learns the object is gone
+	// on purpose, and the restore's Undo{Delete} brings the 200 back.
+	removed, err := s.outboundTakedowns.IsRemoved(r.Context(), atURI)
+	if err != nil {
+		s.writeStoreError(w, r, err)
+		return
+	}
+	if removed {
+		writeObjectTombstone(w, s.userOrigin+objectPathPrefix+rest, formerObjectType(parts[1]))
+		return
+	}
 
 	doc, err := apobject.RenderObject(s.userOrigin, s.mediaBaseURL, object.TranslatedSnapshot)
 	if err != nil {
@@ -413,6 +425,32 @@ func (s *Service) writeActorTombstone(w http.ResponseWriter, actor *store.APActo
 			"publicKeyPem": actor.PublicKeyPEM,
 		},
 	})
+}
+
+// writeObjectTombstone answers 410 Gone with an AS2 Tombstone for a taken-down
+// native object.
+func writeObjectTombstone(w http.ResponseWriter, objectID, formerType string) {
+	w.Header().Set("Content-Type", ap.ContentTypeActivityJSON)
+	w.WriteHeader(http.StatusGone)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"@context":   asNamespace,
+		"id":         objectID,
+		"type":       ap.TypeTombstone,
+		"formerType": formerType,
+	})
+}
+
+// commentCollection is the native comment NSID (consume.CollectionComment;
+// personas cannot import consume, which imports it back through materialize).
+const commentCollection = "social.coves.community.comment"
+
+// formerObjectType is the AP type a native record of collection federates as:
+// a post is a Page, a comment a Note.
+func formerObjectType(collection string) string {
+	if collection == commentCollection {
+		return ap.TypeNote
+	}
+	return ap.TypePage
 }
 
 // handleWebFinger answers discovery for the local parts hosted on the ROUTED

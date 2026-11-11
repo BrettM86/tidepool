@@ -238,6 +238,30 @@ type Options struct {
 	UserOrigin string
 	// Logger receives the drop reasons nobody sees from a metric.
 	Logger *slog.Logger
+	// AccountStatus confirms a transient #account status against the DID's
+	// PDS (*HandleResolver satisfies it): the account-status takedown source
+	// is added only on a confirmed takendown or suspended and removed only on
+	// a confirmed active, deactivated or throttled, and a relay `active` lifts
+	// the account-status pause only when the PDS confirms it. Optional: nil
+	// keeps the unconfirmed pause behavior and changes no object source.
+	AccountStatus AccountStatusReader
+	// AccountTakedowns changes the account-status source on an actor's
+	// outbound objects (*outbound.Takedowns satisfies it). Optional: nil
+	// changes no object source.
+	AccountTakedowns AccountTakedowns
+}
+
+// AccountStatusReader reads a DID's repo status from its PDS. An error means
+// the status is unknown, never a guessed status.
+type AccountStatusReader interface {
+	RepoStatus(ctx context.Context, did string) (RepoStatus, error)
+}
+
+// AccountTakedowns adds or removes a takedown source on every outbound object
+// of an actor, in the caller's transaction.
+type AccountTakedowns interface {
+	AddAccountSourceTx(ctx context.Context, tx *sql.Tx, actorDID string, src store.TakedownSource) error
+	RemoveAccountSourceTx(ctx context.Context, tx *sql.Tx, actorDID string, src store.TakedownSource) error
 }
 
 // Dispatcher is the EventHandler this consumer runs: it routes one Jetstream
@@ -251,8 +275,12 @@ type Dispatcher struct {
 	remoteDeleter RemoteContentDeleter
 	terminator    AccountTerminator
 	resolver      DIDResolver
-	prefs         store.FederationPrefs
-	apActors      store.APActors
+	// accountStatus and accountTakedowns are Options.AccountStatus and
+	// Options.AccountTakedowns.
+	accountStatus    AccountStatusReader
+	accountTakedowns AccountTakedowns
+	prefs            store.FederationPrefs
+	apActors         store.APActors
 	// objects is the outbound state; objectMappings and communities are the
 	// bridge's own record of what it already federated, which is where a
 	// comment's thread and target community are resolved FROM.
@@ -319,27 +347,29 @@ func NewDispatcher(opts Options) (*Dispatcher, error) {
 		logger.Warn("no acceptance engine wired: community.postv2 events will be skipped until task 16 lands")
 	}
 	return &Dispatcher{
-		db:             opts.DB,
-		actors:         opts.Actors,
-		enqueuer:       opts.Enqueuer,
-		engine:         opts.Engine,
-		remoteDeleter:  opts.RemoteDeleter,
-		terminator:     opts.Terminator,
-		resolver:       opts.Resolver,
-		prefs:          store.NewFederationPrefs(opts.DB),
-		apActors:       store.NewAPActors(opts.DB),
-		objectMappings: orDefault[store.APObjects](opts.ObjectMappings, store.NewAPObjects(opts.DB)),
-		objects:        orDefault[store.OutboundObjects](opts.Objects, store.NewOutboundObjects(opts.DB)),
-		votes:          orDefault[store.OutboundVotes](opts.Votes, store.NewOutboundVotes(opts.DB)),
-		communities:    orDefault[store.Communities](opts.Communities, store.NewCommunities(opts.DB)),
-		moderation:     orDefault[store.ObjectModeration](opts.Moderation, store.NewObjectModeration(opts.DB)),
-		bans:           orDefault[store.CommunityBans](opts.Bans, store.NewCommunityBans(opts.DB)),
-		deliveries:     orDefault[store.OutboundDeliveries](opts.Deliveries, store.NewOutboundDeliveries(opts.DB)),
-		records:        opts.Records,
-		hosted:         newHostedRepos(opts.DB),
-		gate:           NewRevGate(opts.DB),
-		userOrigin:     opts.UserOrigin,
-		logger:         logger,
+		db:               opts.DB,
+		actors:           opts.Actors,
+		enqueuer:         opts.Enqueuer,
+		engine:           opts.Engine,
+		remoteDeleter:    opts.RemoteDeleter,
+		terminator:       opts.Terminator,
+		resolver:         opts.Resolver,
+		accountStatus:    opts.AccountStatus,
+		accountTakedowns: opts.AccountTakedowns,
+		prefs:            store.NewFederationPrefs(opts.DB),
+		apActors:         store.NewAPActors(opts.DB),
+		objectMappings:   orDefault[store.APObjects](opts.ObjectMappings, store.NewAPObjects(opts.DB)),
+		objects:          orDefault[store.OutboundObjects](opts.Objects, store.NewOutboundObjects(opts.DB)),
+		votes:            orDefault[store.OutboundVotes](opts.Votes, store.NewOutboundVotes(opts.DB)),
+		communities:      orDefault[store.Communities](opts.Communities, store.NewCommunities(opts.DB)),
+		moderation:       orDefault[store.ObjectModeration](opts.Moderation, store.NewObjectModeration(opts.DB)),
+		bans:             orDefault[store.CommunityBans](opts.Bans, store.NewCommunityBans(opts.DB)),
+		deliveries:       orDefault[store.OutboundDeliveries](opts.Deliveries, store.NewOutboundDeliveries(opts.DB)),
+		records:          opts.Records,
+		hosted:           newHostedRepos(opts.DB),
+		gate:             NewRevGate(opts.DB),
+		userOrigin:       opts.UserOrigin,
+		logger:           logger,
 	}, nil
 }
 
@@ -651,9 +681,13 @@ func (d *Dispatcher) handleAccount(ctx context.Context, event *JetstreamEvent) e
 	// redriver and the live connector share this dispatcher, so a read-then-act
 	// gate lets both racers through — and on the deleted path both then reach a
 	// seam that no peer can undo.
-	return d.applyAccountClaimed(ctx, did, account.Seq, func(tx *sql.Tx) error {
+	if account.Status != accountStatusDeleted && d.accountStatus != nil {
+		return d.applyConfirmedAccountStatus(ctx, did, account)
+	}
+	_, err := d.applyAccountClaimed(ctx, did, account.Seq, true, func(tx *sql.Tx) error {
 		return d.applyAccountStatus(ctx, tx, did, account)
 	})
+	return err
 }
 
 // applyAccountStatus performs the transition for one #account frame. It runs
@@ -702,7 +736,137 @@ func (d *Dispatcher) applyAccountStatus(ctx context.Context, tx *sql.Tx, did str
 	// withdrawal — and an active=true frame is not evidence that any of those
 	// were reversed. A tombstoned actor's store refuses re-enabling outright;
 	// this path simply never asks.
-	return setActorPausedTx(ctx, tx, did, !account.Active)
+	//
+	// This is the unconfirmed path, taken when no AccountStatusReader is wired:
+	// the account-status pause source follows the relay and no object source
+	// changes. applyConfirmedAccountStatus is the confirmed one.
+	if err := setActorPausedTx(ctx, tx, did, !account.Active, account.Status); err != nil {
+		return err
+	}
+	if !account.Active {
+		return nil
+	}
+	return d.releasePauseHeldTx(ctx, tx, did)
+}
+
+// applyConfirmedAccountStatus applies a transient #account frame confirmed
+// against the DID's PDS (decision 04-a), in two claimed transactions:
+//
+//  1. An inactive frame's account-status pause source is written unconfirmed
+//     and committed WITHOUT advancing the seq, so the pause never depends on
+//     the PDS answering. It carries the relay's status (a takedown status
+//     marked unconfirmed), except that a stored confirmed takendown or
+//     suspended status is kept: an unconfirmed frame never downgrades a
+//     confirmed takedown. Rewriting it on a retry is idempotent.
+//  2. The PDS is read (outside any transaction), and the confirmed transition
+//     commits with the seq advance. A failed read returns the error: the
+//     restriction is left as it was and the event is retried, re-confirming.
+//
+// The second claim re-reads the seq, so a newer frame applied between the two
+// makes this one stale and it changes nothing more. So does a newer inactive
+// frame whose phase 1 committed meanwhile (pending_account_seq), even while
+// that frame's own PDS read fails: its pause stands until it is confirmed.
+func (d *Dispatcher) applyConfirmedAccountStatus(ctx context.Context, did string, account *AccountEvent) error {
+	if !account.Active {
+		claimed, err := d.applyAccountClaimed(ctx, did, account.Seq, false, func(tx *sql.Tx) error {
+			return pauseActorKeepingTakedownTx(ctx, tx, did, account.Status)
+		})
+		if err != nil || !claimed {
+			return err
+		}
+	}
+	confirmed, err := d.accountStatus.RepoStatus(ctx, did)
+	if err != nil {
+		// Retryable: not ErrPermanentEvent, and the seq has not moved.
+		return fmt.Errorf("confirm #account status of %s against its PDS: %w", did, err)
+	}
+	_, err = d.applyAccountClaimed(ctx, did, account.Seq, true, func(tx *sql.Tx) error {
+		return d.applyConfirmedTransitionTx(ctx, tx, did, account, confirmed)
+	})
+	return err
+}
+
+// applyConfirmedTransitionTx moves the account-status sources for a frame
+// whose status the PDS answered with confirmed. Only an explicit answer moves
+// the object source: ADD on a confirmed takendown or suspended, REMOVE on a
+// confirmed active, deactivated or throttled. Any other answer (inactive with
+// no or an unknown status, deleted) changes nothing and is not an error; a
+// deletion is decided by the terminal tier on its own frame.
+//
+// A relay `active` lifts the account-status pause only when the PDS confirms
+// active; while the PDS still reports a takedown nothing changes. An inactive
+// frame's pause was written before the read and is re-asserted here with the
+// confirmed status: takendown or suspended holds the persona's work, and
+// deactivated or throttled cancels it. An unconfirmed status keeps a stored
+// takedown status, so only a confirmed active, deactivated or throttled
+// answer supersedes a confirmed takedown.
+func (d *Dispatcher) applyConfirmedTransitionTx(ctx context.Context, tx *sql.Tx, did string,
+	account *AccountEvent, confirmed RepoStatus) error {
+	confirmedTakedown := !confirmed.Active && store.IsTakedownAccountStatus(confirmed.Status)
+	confirmedPauseOnly := !confirmed.Active &&
+		(confirmed.Status == accountStatusDeactivated || confirmed.Status == accountStatusThrottled)
+	if account.Active && confirmed.Active {
+		if err := setActorPausedTx(ctx, tx, did, false, ""); err != nil {
+			return err
+		}
+	}
+	if !account.Active {
+		// Phase 2 re-asserts the pause with the status the PDS confirmed,
+		// whatever phase 1 wrote: phase 1's write carries the relay's text and
+		// an older frame's phase 2 may have removed it in between. A status
+		// the PDS did not confirm (it answers active or an unknown status)
+		// keeps the pause, as the unconfirmed path does. It keeps a stored
+		// confirmed takendown or suspended status and otherwise records none
+		// (replacing phase 1's unconfirmed one), so no work is held on a
+		// takedown nothing confirmed and none confirmed is lifted.
+		var err error
+		if confirmedTakedown || confirmedPauseOnly {
+			err = setActorPausedTx(ctx, tx, did, true, confirmed.Status)
+		} else {
+			d.logger.Warn("#account inactive frame not confirmed by the PDS; "+
+				"the persona stays paused and keeps any confirmed takedown status",
+				slog.String("did", did), slog.String("relay_status", account.Status),
+				slog.Bool("pds_active", confirmed.Active), slog.String("pds_status", confirmed.Status))
+			err = pauseActorKeepingTakedownTx(ctx, tx, did, "")
+		}
+		if err != nil {
+			return err
+		}
+	}
+
+	source := store.TakedownSource{Kind: store.TakedownSourceAccountStatus, Key: did}
+	switch {
+	case d.accountTakedowns == nil:
+	case confirmedTakedown && !account.Active:
+		// A relay active the PDS answers with a takedown changes nothing; an
+		// inactive frame confirmed as a takedown adds the source.
+		if err := d.accountTakedowns.AddAccountSourceTx(ctx, tx, did, source); err != nil {
+			return fmt.Errorf("add account-status takedown source of %s: %w", did, err)
+		}
+	case confirmed.Active || confirmedPauseOnly:
+		if err := d.accountTakedowns.RemoveAccountSourceTx(ctx, tx, did, source); err != nil {
+			return fmt.Errorf("remove account-status takedown source of %s: %w", did, err)
+		}
+	default:
+		d.logger.Info("#account status not confirmed by the PDS; the restriction is unchanged",
+			slog.String("did", did), slog.Bool("relay_active", account.Active),
+			slog.String("relay_status", account.Status),
+			slog.Bool("pds_active", confirmed.Active), slog.String("pds_status", confirmed.Status))
+	}
+	return d.releasePauseHeldTx(ctx, tx, did)
+}
+
+// releasePauseHeldTx releases did's work held on its pause (and takedown
+// restores held on consent) once the pause set is clear and consent stands;
+// while any source still pauses the persona it releases nothing. It runs after
+// every ap_actors and object write of the transaction, so the row lock those
+// writes hold orders it against the worker's pause and consent holds, and the
+// object locks come before its subject locks.
+func (d *Dispatcher) releasePauseHeldTx(ctx context.Context, tx *sql.Tx, did string) error {
+	if _, err := d.deliveries.ReleaseConsentHeldTx(ctx, tx, did); err != nil {
+		return fmt.Errorf("release work held on the pause or consent of %s: %w", did, err)
+	}
+	return nil
 }
 
 // mirrorTerminalPreference brings the ap_actors mirror into agreement with
@@ -743,6 +907,14 @@ func (d *Dispatcher) mirrorTerminalPreference(ctx context.Context, tx *sql.Tx, d
 
 // accountStatusDeleted is the ONLY #account status that means deletion.
 const accountStatusDeleted = "deleted"
+
+// The pause-only #account statuses: the persona pauses and none of its objects
+// is taken down. takendown and suspended (store.IsTakedownAccountStatus) also
+// take its objects down.
+const (
+	accountStatusDeactivated = "deactivated"
+	accountStatusThrottled   = "throttled"
+)
 
 // activityIDVersionTag prefixes every activity-id preimage. It exists so the
 // derivation can CHANGE without colliding with ids already published: bump the

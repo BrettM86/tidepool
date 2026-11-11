@@ -29,10 +29,16 @@ import (
 // to seed. It returns the comment's ap id and the seeded image's CID (read from
 // the record after the seeding).
 func (w *upstreamBanWorld) imageComment(community *remoteActor, slug, parentID, published, seed string) (string, string) {
+	w.h.t.Helper()
+	return w.imageCommentBy(ubUserID, community, slug, parentID, published, seed)
+}
+
+// imageCommentBy is imageComment for a comment by author.
+func (w *upstreamBanWorld) imageCommentBy(author string, community *remoteActor, slug, parentID, published, seed string) (string, string) {
 	t := w.h.t
 	t.Helper()
 	ctx := context.Background()
-	commentID := w.commentBy(ubUserID, community, slug, parentID, published)
+	commentID := w.commentBy(author, community, slug, parentID, published)
 	require.Empty(t, recordBlobCIDs(t, w.h, commentID), "precondition: a bridged comment carries no embed of its own")
 
 	mapping, err := w.h.objects.GetByAPID(ctx, commentID)

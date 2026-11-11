@@ -82,6 +82,7 @@
 #   127.0.0.1:8092  Tidepool HTTP (admin API, XRPC, healthz)
 #   127.0.0.1:5380  Tidepool DNS (UDP and TCP; TIDEPOOL_E2E_DNS_PORT overrides)
 #   127.0.0.1:8541  Lemmy HTTP API (8541 nods to lemmy_alpha in upstream's federation compose)
+#   127.0.0.1:8542  Second Lemmy (lemmy2) HTTP API (LEMMY2_E2E_PORT overrides)
 #   127.0.0.1:2480  Relay (BigSky) XRPC + admin API
 #   127.0.0.1:3081  Reference PDS XRPC — PUBLISHED ON THE `relay` SERVICE (the
 #                   pds shares its network namespace and so cannot publish its
@@ -220,6 +221,11 @@ services:
       # both point at the volume, which holds nothing but the local root.
       SSL_CERT_FILE: /handle-tls-ca/root.crt
       SSL_CERT_DIR: /handle-tls-ca
+      # The label consumer follows the stack AppView's labeler: its instance
+      # did:web resolves over HTTPS through handle-tls (the CA trusted
+      # above), and the #atproto_labeler endpoint that document names is
+      # served in this namespace by coves-appview-forwarder.
+      COVES_LABELER_DID: did:web:coves-appview.test
       LOG_LEVEL: debug
     volumes:
       - handle-tls-ca:/handle-tls-ca:ro
@@ -546,6 +552,13 @@ services:
   # One-shot: create the native test account on the reference PDS, prove its
   # credentials work, and tell the relay to crawl it.
   #
+  # It also creates coves-admin.pds.test, the Coves AppView's instance admin,
+  # the same way. The PDS mints a fresh did:plc for it on every stack, so its
+  # DID cannot be written into this file: the DID is read from the
+  # createSession answer and written to admin.did on the `coves-admin` volume
+  # (tmp file, then rename), which coves-appview reads into MODERATION_ADMINS.
+  # An answer without a DID fails the one-shot, and so the stack.
+  #
   # NOT the admin API — PDS_INVITE_REQUIRED is false, so this is the same
   # public com.atproto.server.createAccount any client would call, which is
   # the point: nothing about the native account is privileged.
@@ -595,6 +608,25 @@ services:
           --post-data='{"identifier":"native-alice.pds.test","password":"native-alice-e2e-pass"}' \
           http://relay:3001/xrpc/com.atproto.server.createSession > /dev/null
         echo '  ✓ credentials valid'
+        echo '▶ creating coves-admin.pds.test (the Coves AppView instance admin)'
+        if ! wget -q -O- --header='Content-Type: application/json' \
+          --post-data='{"handle":"coves-admin.pds.test","email":"coves-admin@pds.test","password":"coves-admin-e2e-pass"}' \
+          http://relay:3001/xrpc/com.atproto.server.createAccount > /dev/null; then
+          echo '  createAccount failed (benign if the account already exists; see native-alice above)'
+        fi
+        echo '▶ authenticating as coves-admin.pds.test (the gate) and publishing its DID'
+        admin_session="$$(wget -q -O- --header='Content-Type: application/json' \
+          --post-data='{"identifier":"coves-admin.pds.test","password":"coves-admin-e2e-pass"}' \
+          http://relay:3001/xrpc/com.atproto.server.createSession)"
+        admin_did="$$(printf '%s' "$$admin_session" | grep -o '"did":"did:[^"]*"' | head -n 1 | cut -d '"' -f 4)"
+        if [ -z "$$admin_did" ]; then
+          echo '  createSession answered without a did; coves-appview cannot get MODERATION_ADMINS' >&2
+          exit 1
+        fi
+        printf '%s\n' "$$admin_did" > /coves-admin/admin.did.tmp
+        chmod 0644 /coves-admin/admin.did.tmp
+        mv /coves-admin/admin.did.tmp /coves-admin/admin.did
+        echo "  ✓ wrote $$admin_did to /coves-admin/admin.did"
         echo '▶ announcing localhost:3001 (the DID-doc host) to the relay'
         wget -q -O- --header='Content-Type: application/json' \
           --post-data='{"hostname":"localhost:3001"}' \
@@ -602,6 +634,11 @@ services:
         echo '  ✓ relay accepted the crawl request'
     restart: "no"
     networks: [tidepool-e2e]
+    volumes:
+      # Where the admin's DID lands for coves-appview (see the `coves-admin`
+      # volume). The image runs as root; the file is written 0644 so the
+      # AppView's uid 1000 can read it.
+      - coves-admin:/coves-admin
     depends_on:
       pds:
         condition: service_healthy
@@ -642,6 +679,10 @@ services:
           tls internal
           reverse_proxy relay:3001
         }
+        coves-appview.test {
+          tls internal
+          reverse_proxy relay:8081
+        }
         CADDYFILE
         caddy run --config /etc/caddy/Caddyfile --adapter caddyfile &
         caddy_pid=$$!
@@ -654,7 +695,9 @@ services:
       - handle-tls-ca:/handle-tls-ca
     networks:
       tidepool-e2e:
-        aliases: [native-alice.pds.test]
+        # coves-appview.test is the AppView's instance did:web host: Tidepool
+        # reads https://coves-appview.test/.well-known/did.json through here.
+        aliases: [native-alice.pds.test, coves-appview.test]
     depends_on:
       pds:
         condition: service_healthy
@@ -749,6 +792,11 @@ services:
         # build platform, so the two must agree. amd64 by default (emulated on
         # arm64 hosts); set COVES_E2E_GOARCH=arm64 there for a native build.
         GOARCH: ${COVES_E2E_GOARCH:-amd64}
+        # Coves' localhost OAuth resolvers (handle resolution through the
+        # local PDS, http:// authorization servers) are compiled only with
+        # -tags dev; without them the OAuth web sign-in cannot reach this
+        # stack's PDS. The tag changes nothing else in the server.
+        BUILD_TAGS: dev
     platform: linux/${COVES_E2E_GOARCH:-amd64}
     # In the relay's namespace, like `pds`: the reference PDS's DID documents
     # name http://localhost:3001, and the image proxy fetches getBlob from the
@@ -756,12 +804,35 @@ services:
     # host port is published on the `relay` service. Recreating `relay`
     # drops this container's networking; recreate it alongside.
     network_mode: "service:relay"
+    # MODERATION_ADMINS is the instance admin's DID, which pds-bootstrap
+    # writes to the shared volume once the PDS has minted it. Coves itself
+    # starts with no admin when MODERATION_ADMINS is empty, so this wrapper
+    # refuses to start the server when admin.did is missing, unreadable or
+    # blank. The DID is read in a plain assignment so that, under sh -e, a
+    # failing cat stops the script (inside export it would not).
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        admin_did="$$(cat /coves-admin/admin.did)"
+        [ -n "$$admin_did" ] || {
+          echo 'coves-appview: /coves-admin/admin.did is unreadable or blank; pds-bootstrap writes it' >&2
+          exit 1
+        }
+        export MODERATION_ADMINS="$$admin_did"
+        exec /app/coves-server
+    volumes:
+      - coves-admin:/coves-admin:ro
     environment:
       APPVIEW_PORT: "8081"
       DATABASE_URL: postgres://coves:coves@coves-appview-postgres:5432/coves?sslmode=disable
       # Dev mode: generated secrets, private-address fetches (the SSRF guard
       # otherwise refuses compose hosts), and redirected handle verification.
       IS_DEV_ENV: "true"
+      # The origin the host-side OAuth sign-in (tests/e2e/coves_signin.go)
+      # dials. In dev mode /oauth/login redirects any other Host to this one,
+      # and the loopback OAuth client's redirect_uri is built from it, so it
+      # must be the published address, not the in-network one.
+      APPVIEW_PUBLIC_URL: http://127.0.0.1:${COVES_APPVIEW_E2E_PORT:-8093}
       # Tidepool's community did:webs are hosted at `tidepool` while their
       # handles sit under ap.tidepool; the hostedBy check cannot match that.
       SKIP_DID_WEB_VERIFICATION: "true"
@@ -779,6 +850,16 @@ services:
       IMAGE_PROXY_ENABLED: "true"
       # In-network origin; host-side tests use 127.0.0.1:8093 instead.
       IMAGE_PROXY_BASE_URL: http://relay:8081
+      # Label publication. The instance DID is a did:web on a stack hostname
+      # that handle-tls serves (never the public default did:web:coves.social),
+      # so Tidepool's label consumer resolves it inside the stack. The label
+      # key is a fixed TEST-ONLY K-256 key; INSTANCE_ATPROTO_PUBLIC_KEY is the
+      # public half of a different test key, as Coves requires. Coves publishes
+      # APPVIEW_PUBLIC_URL as the #atproto_labeler endpoint, which is why
+      # coves-appview-forwarder exists.
+      INSTANCE_DID: did:web:coves-appview.test
+      LABEL_SIGNING_KEY: z3vLUNLEz8hbtfFPZ7bGBCV8exUbxbWNEx9MQH4g2MTi3hxh
+      INSTANCE_ATPROTO_PUBLIC_KEY: zQ3shtJmoNJXsVG63UEyGbAdezpqYHq46eaJ6MG2D4tpdWMMy
     depends_on:
       coves-appview-postgres:
         condition: service_healthy
@@ -790,6 +871,9 @@ services:
         condition: service_healthy
       pds:
         condition: service_healthy
+      # Writes /coves-admin/admin.did, which the command above reads.
+      pds-bootstrap:
+        condition: service_completed_successfully
     healthcheck:
       # Overrides the image's own HEALTHCHECK, which probes port 8080.
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:8081/xrpc/_health"]
@@ -797,6 +881,50 @@ services:
       timeout: 5s
       retries: 30
       start_period: 20s
+
+  # The AppView's published #atproto_labeler endpoint is APPVIEW_PUBLIC_URL,
+  # a loopback origin (the dev-mode OAuth client's redirect_uri is built from
+  # it, so it cannot change). Inside tidepool's namespace that address is
+  # nothing; this forwarder shares tidepool's namespace and serves it,
+  # proxying (websockets included) to the AppView. Recreating `tidepool`
+  # drops this container's networking; recreate it alongside.
+  #
+  # It also serves http://localhost:3001, the PDS endpoint the stack's DID
+  # documents name (a claim about the relay's namespace), proxying to the PDS
+  # at relay:3001. Tidepool confirms an #account status with getRepoStatus at
+  # that endpoint; the http read is allowed only under ALLOW_PRIVATE_FETCH.
+  coves-appview-forwarder:
+    image: caddy:2.11-alpine
+    network_mode: "service:tidepool"
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        cat > /etc/caddy/Caddyfile <<'CADDYFILE'
+        {
+          admin off
+        }
+        http://127.0.0.1:${COVES_APPVIEW_E2E_PORT:-8093} {
+          bind 127.0.0.1
+          reverse_proxy relay:8081
+        }
+        http://:3001 {
+          bind 127.0.0.1
+          reverse_proxy relay:3001
+        }
+        CADDYFILE
+        exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
+    depends_on:
+      tidepool:
+        condition: service_started
+      coves-appview:
+        condition: service_healthy
+    healthcheck:
+      # Healthy once both forwards reach the AppView and the PDS from here.
+      test: ["CMD-SHELL", "wget --spider -q http://127.0.0.1:${COVES_APPVIEW_E2E_PORT:-8093}/xrpc/_health && wget --spider -q http://127.0.0.1:3001/xrpc/_health"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
 
   # Debug-only tap: Jetstream wired straight to the bridge, bypassing the
   # relay. NOT the tested path — bring it up alongside the stack with
@@ -852,6 +980,8 @@ services:
 
   lemmy:
     build: e2e/lemmy
+    # Named so lemmy2 runs the same image: one Rust build serves both.
+    image: tidepool-e2e-lemmy
     environment:
       RUST_LOG: "warn,lemmy_server=debug,lemmy_apub=debug,lemmy_federate=debug,activitypub_federation=debug"
       RUST_BACKTRACE: "1"
@@ -871,6 +1001,66 @@ services:
         condition: service_started
     healthcheck:
       # /api/v3/site answers once migrations + setup (admin/site creation) ran.
+      test: ["CMD", "curl", "-sf", "http://localhost/api/v3/site"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+      start_period: 60s
+
+  # ── Second Lemmy instance ──────────────────────────────────────────────
+  # Its users follow communities hosted on lemmy, so native content reaches
+  # it through the community's Announce (the takedown e2e checks Delete and
+  # Undo{Delete} arrive there too). Same build and image as lemmy; its own
+  # database and pictrs. Compose DNS names lemmy2, lemmy and coves-users
+  # (tidepool's alias) resolve both ways on the shared network; each
+  # instance's federation allowlist is set by the suite (setupLemmySite,
+  # lemmy2Admin).
+  lemmy2-postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: lemmy
+      POSTGRES_USER: lemmy
+      POSTGRES_PASSWORD: lemmy
+    networks: [tidepool-e2e]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U lemmy -d lemmy"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  pictrs2:
+    image: asonix/pictrs:0.5
+    environment:
+      PICTRS__SERVER__API_KEY: e2e-pictrs-key
+    networks: [tidepool-e2e]
+    # A healthcheck keeps it out of the one-shot rule
+    # (TestComposeOneShots_AwaitedToCompletionByDefaultService).
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  lemmy2:
+    build: e2e/lemmy
+    image: tidepool-e2e-lemmy
+    hostname: lemmy2
+    environment:
+      RUST_LOG: "warn,lemmy_server=debug,lemmy_apub=debug,lemmy_federate=debug,activitypub_federation=debug"
+      RUST_BACKTRACE: "1"
+      LEMMY_CONFIG_LOCATION: /config/config.hjson
+      LEMMY_TEST_FAST_FEDERATION: "1"
+    volumes:
+      - ./e2e/lemmy/lemmy2.hjson:/config/config.hjson:ro
+    ports:
+      - "127.0.0.1:${LEMMY2_E2E_PORT:-8542}:80"
+    networks: [tidepool-e2e]
+    depends_on:
+      lemmy2-postgres:
+        condition: service_healthy
+      pictrs2:
+        condition: service_healthy
+    healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost/api/v3/site"]
       interval: 2s
       timeout: 5s
@@ -903,3 +1093,7 @@ volumes:
   # the other leaves a repo whose DID nothing can resolve, and the relay
   # rejects every commit it signs.
   pds-data:
+  # admin.did: the DID of coves-admin.pds.test, written by pds-bootstrap and
+  # read by coves-appview as MODERATION_ADMINS. Rewritten on every bootstrap
+  # run, so a stale DID from an earlier stack never survives into this one.
+  coves-admin:

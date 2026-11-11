@@ -431,6 +431,18 @@ is left with the Group-actor AP surface and the admission-policy wiring.
       outbound work. Only a confirmed permanent deletion (status `deleted`,
       re-checked against the DID's current PDS and PLC state) triggers the
       terminal `Delete{Person}` (`internal/optout`).
+    - Temporary states split in two. `takendown` and `suspended`, once the
+      DID's PDS confirms them (`getRepoStatus`), also delete the persona's
+      delivered objects on Lemmy as an account-status takedown source; the
+      source lifts only on a confirmed `active`, `deactivated` or `throttled`.
+      `deactivated` and `throttled` pause only and send no `Delete`.
+    - The persona pause is a set of sources: the `#account` status and each
+      labeler's account `!takedown` label (`ap_actors.pause_sources`,
+      `delivery_paused` derived from it). Neither clears the other, so an
+      `#account active` never lifts a label pause. While a takedown source
+      pauses the persona, its queued work and edits are held and delivered on
+      restore; a pause from `deactivated` or `throttled` alone still cancels
+      them.
     - Support matrix. Lemmy 0.19.20 is the pinned strictness ceiling and the
       e2e target. Mbin is covered by hand-built fixtures for link posts only.
       PieFed is untested: there are no captured fixtures. Its votes arrive from
@@ -608,3 +620,20 @@ is left with the Group-actor AP surface and the admission-policy wiring.
       reads bridged counts by polling `getVoteAggregates`
       (`BRIDGED_VOTE_POLL_INTERVAL`, default 5m, 2,000 subjects per sweep), so
       there the one-low error can last up to one poll rotation.
+22. A Coves instance takedown of native content reaches Lemmy as the author's
+    own `Delete`, and the restore as `Undo{Delete}` (PRD moderation gaps,
+    G6/G7). Each native object keeps a takedown source set (record label,
+    account label, account status, community label); the first source in
+    sends one `Delete` from the author's persona if the object was delivered,
+    the last source out sends `Undo{Delete}` embedding that episode's
+    `Delete`. Queued work for the object, and replies under a removed parent,
+    are held rather than cancelled and released to the tail of their
+    community's queue behind the `Undo`. While removed the object id answers
+    410 with an AS2 `Tombstone`. A takedown never calls the purger, and a
+    Lemmy moderator's own removal stays in force after the restore.
+23. A Coves community `!takedown` on a bridged community (PRD moderation gaps,
+    G7) unfollows it and refuses every follow path until the negation,
+    withholds the blobs of its bridged records, and takes down native work in
+    it through the community-label source. Edits of accepted posts are kept,
+    not removed. The negation re-follows only what was followed and is still
+    wanted: a manual follow, or one the follow list still desires.

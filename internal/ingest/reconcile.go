@@ -522,12 +522,15 @@ func NewFollowReconciler(opts FollowReconcilerOptions) (*FollowReconciler, error
 // SweepResult reports what one reconcile pass changed. Subscribed and
 // Failed carry follow-list entries, and actor ids for listed communities;
 // Unsubscribed carries canonical AP group ids (the file no longer names those
-// communities, so their entries are gone by definition). A listed community the
+// communities, so their entries are gone by definition). Suppressed carries
+// the AP group ids of the communities the pass did not follow because a Coves
+// moderator removed them; they are never in Failed. A listed community the
 // budget or a limit stopped is left for a later sweep and appears nowhere.
 type SweepResult struct {
 	Subscribed   []string `json:"subscribed"`
 	Unsubscribed []string `json:"unsubscribed"`
 	Failed       []string `json:"failed"`
+	Suppressed   []string `json:"suppressed"`
 }
 
 // Run converges once immediately, then on every interval tick until ctx is
@@ -646,13 +649,14 @@ func (r *FollowReconciler) Sweep(ctx context.Context) (SweepResult, error) {
 	}
 	r.movePositions(listings, leftovers)
 
-	if len(result.Subscribed) > 0 || len(result.Unsubscribed) > 0 || len(result.Failed) > 0 || len(leftovers) > 0 {
+	if len(result.Subscribed) > 0 || len(result.Unsubscribed) > 0 || len(result.Failed) > 0 || len(result.Suppressed) > 0 || len(leftovers) > 0 {
 		r.logger.Info("follow reconciler: sweep complete",
 			"desired", len(list.Communities),
 			"instances", len(list.Instances),
 			"subscribed", len(result.Subscribed),
 			"unsubscribed", len(result.Unsubscribed),
 			"failed", len(result.Failed),
+			"suppressed", len(result.Suppressed),
 			"leftover", len(leftovers))
 	}
 
@@ -743,7 +747,11 @@ func (r *FollowReconciler) addExplicitEntries(ctx context.Context, entries []str
 			result.Failed = append(result.Failed, entry)
 			continue
 		}
-		community, err := r.admin.subscribe(ctx, entry)
+		community, err := r.admin.subscribe(ctx, entry, store.FollowProvenanceFollowList)
+		if groupIRI, removed := removedCommunity(err); removed {
+			result.Suppressed = append(result.Suppressed, groupIRI)
+			continue
+		}
 		if err != nil {
 			// subscribe already logged the details (including consent
 			// refusals, which stay refused until the community drops its
@@ -756,6 +764,16 @@ func (r *FollowReconciler) addExplicitEntries(ctx context.Context, entries []str
 		result.Subscribed = append(result.Subscribed, entry)
 	}
 	return budgetStopped, nil
+}
+
+// removedCommunity reports whether err refused a removed community's follow,
+// and names the community.
+func removedCommunity(err error) (groupIRI string, removed bool) {
+	var refusal *communityRemovedError
+	if stderrors.As(err, &refusal) {
+		return refusal.groupIRI, true
+	}
+	return "", false
 }
 
 // listInstances reads each host from its position. It returns an error only when
@@ -876,7 +894,17 @@ func (r *FollowReconciler) addListed(ctx context.Context, candidates []listedCan
 		if ctx.Err() != nil || tried == maxListedAddsPerSweep || r.listedAddsBlocked(ctx) {
 			return candidates[index:]
 		}
-		_, err := r.admin.subscribe(ctx, candidate.actorID)
+		provenance := store.FollowProvenanceInstance
+		if candidate.discovered {
+			provenance = store.FollowProvenancePostWalk
+		}
+		_, err := r.admin.subscribe(ctx, candidate.actorID, provenance)
+		if groupIRI, removed := removedCommunity(err); removed {
+			// Refused before any fetch, so it uses no slot and no skip: each
+			// sweep reports it again while the removal stands.
+			result.Suppressed = append(result.Suppressed, groupIRI)
+			continue
+		}
 		switch {
 		case err == nil:
 			result.Subscribed = append(result.Subscribed, candidate.actorID)

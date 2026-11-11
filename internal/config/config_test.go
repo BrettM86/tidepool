@@ -1231,3 +1231,34 @@ func TestLoad_BridgedVoteVerify(t *testing.T) {
 		})
 	}
 }
+
+func TestLoad_CovesLabelerDID(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		value   string
+		want    string
+		wantErr bool
+	}{
+		{name: "unset turns the consumer off", value: "", want: ""},
+		{name: "a did:web is kept", value: "did:web:coves.social", want: "did:web:coves.social"},
+		{name: "a bare hostname is not a DID", value: "coves.social", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearConfigEnv(t)
+			if tc.value == "" {
+				t.Setenv("COVES_LABELER_DID", "")
+				require.NoError(t, os.Unsetenv("COVES_LABELER_DID"))
+			} else {
+				t.Setenv("COVES_LABELER_DID", tc.value)
+			}
+
+			cfg, err := Load(discardLogger())
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, cfg.CovesLabelerDID)
+		})
+	}
+}

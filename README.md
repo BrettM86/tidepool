@@ -80,6 +80,18 @@ community are admitted by an acceptance engine that writes a
 community-signed acceptance record. Users opt out with the
 `social.coves.bridge.federation` record.
 
+**Labels.** With `COVES_LABELER_DID` set, Tidepool follows the Coves
+labeler's `subscribeLabels` stream, verifies every label against the
+labeler's DID-document key, and stores it. A `!takedown` withholds the
+images of a bridged record, account or community Tidepool hosts. On native
+Coves content the bridge delivered it sends a `Delete` as the author and an
+`Undo{Delete}` on negation, pauses a labeled account's persona and holds its
+queued deliveries. A removed bridged community is unfollowed, refuses new
+follows with 409, and after negation is reconciled against its origin, which
+can delete records the origin answers 404 for. Withholds an author delete
+kept stay after the negation. See "Coves instance takedowns" in
+[docs/PROTOCOL.md](docs/PROTOCOL.md#coves-instance-takedowns).
+
 **Handles.** Tidepool serves bridged handles from its own DNS server.
 
 | Direction | From | To |

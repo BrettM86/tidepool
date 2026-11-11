@@ -94,6 +94,9 @@ type Service struct {
 	// the canonical payload. Constructed from Options.DB (no new Options field).
 	outboundObjects    store.OutboundObjects
 	outboundActivities store.OutboundActivities
+	// outboundTakedowns answers whether a native object is taken down, which
+	// GET /ap/object serves as a Tombstone.
+	outboundTakedowns store.OutboundTakedowns
 	// mediaBaseURL is Options.MediaBaseURL.
 	mediaBaseURL string
 	logger       *slog.Logger
@@ -139,6 +142,7 @@ func New(opts Options) (*Service, error) {
 		inboxHandler:       opts.InboxHandler,
 		outboundObjects:    store.NewOutboundObjects(opts.DB),
 		outboundActivities: store.NewOutboundActivities(opts.DB),
+		outboundTakedowns:  store.NewOutboundTakedowns(opts.DB),
 		mediaBaseURL:       opts.MediaBaseURL,
 		logger:             logger,
 	}, nil

@@ -206,15 +206,22 @@ func TestActorScrubKeepsOperatorWithheldBlobs(t *testing.T) {
 // community whose one image attachment serves imageBytes at mediaPath.
 func materializeImagePost(t *testing.T, h *harness, postID, mediaPath string, imageBytes []byte) {
 	t.Helper()
+	materializeImagePostBy(t, h, postID, personID, groupID, mediaPath, imageBytes)
+}
+
+// materializeImagePostBy is materializeImagePost by author in the community
+// groupIRI.
+func materializeImagePostBy(t *testing.T, h *harness, postID, author, groupIRI, mediaPath string, imageBytes []byte) {
+	t.Helper()
 	h.mux.HandleFunc("GET "+mediaPath, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
 		_, _ = w.Write(imageBytes)
 	})
-	post := page(postID, personID, groupID, "an image post "+postID, "2026-10-22T10:00:00.000000Z")
+	post := page(postID, author, groupIRI, "an image post "+postID, "2026-10-22T10:00:00.000000Z")
 	post["attachment"] = []any{map[string]any{
 		"type": "Image", "href": "https://lemmy.world" + mediaPath,
 		"mediaType": "image/png", "name": "a picture",
 	}}
-	_, err := h.m.MaterializePost(context.Background(), mustObject(t, post), groupID)
+	_, err := h.m.MaterializePost(context.Background(), mustObject(t, post), groupIRI)
 	require.NoError(t, err)
 }

@@ -19,7 +19,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"tidepool/internal/ap"
 	"tidepool/internal/identity"
 	"tidepool/internal/materialize"
 	"tidepool/internal/store"
@@ -298,34 +297,12 @@ func (r *instanceRig) acceptedCount() int {
 }
 
 // deliveryCount marks a point in the deliveries for deliveredSince.
-func (r *instanceRig) deliveryCount() int {
-	r.h.mu.Lock()
-	defer r.h.mu.Unlock()
-	return len(r.h.inboxLog)
-}
+func (r *instanceRig) deliveryCount() int { return r.h.deliveryCount() }
 
 // deliveredSince gives the groups named by the Follows and the Undo{Follow}s
 // delivered after mark, each in delivery order.
 func (r *instanceRig) deliveredSince(mark int) (follows, undos []string) {
-	r.h.t.Helper()
-	r.h.mu.Lock()
-	delivered := slices.Clone(r.h.inboxLog[mark:])
-	r.h.mu.Unlock()
-	for _, raw := range delivered {
-		activity, err := ap.ParseObject(raw)
-		require.NoError(r.h.t, err)
-		require.NotNil(r.h.t, activity.Object)
-		switch activity.Type {
-		case ap.TypeFollow:
-			follows = append(follows, activity.Object.ID)
-		case ap.TypeUndo:
-			require.NotNil(r.h.t, activity.Object.Object)
-			undos = append(undos, activity.Object.Object.ID)
-		default:
-			require.Failf(r.h.t, "unexpected delivery", "%s", raw)
-		}
-	}
-	return follows, undos
+	return r.h.deliveredSince(mark)
 }
 
 // listedPage is one page a host was asked for.

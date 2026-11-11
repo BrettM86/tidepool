@@ -120,8 +120,10 @@ func (d *Dispatcher) applyVoteWrite(ctx context.Context, tx *sql.Tx, did string,
 	// activity the peer never saw. Upsert bumps from the same base — 0 for a
 	// new row, +1 for a re-cast — so the two stay in step.
 	seq := 0
+	replacedActivityID := ""
 	if existing, err := d.votes.GetByATURI(ctx, voteATURI); err == nil {
 		seq = existing.ActivitySeq + 1
+		replacedActivityID = existing.CurrentActivityID
 	} else if !errors.IsNotFound(err) {
 		return fmt.Errorf("read vote state for %s: %w", voteATURI, err)
 	}
@@ -160,6 +162,19 @@ func (d *Dispatcher) applyVoteWrite(ctx context.Context, tx *sql.Tx, did string,
 	}
 	if err != nil {
 		return fmt.Errorf("write vote state for %s: %w", voteATURI, err)
+	}
+	// A re-cast replaces the vote: the replaced Like/Dislike, if still held (a
+	// community removal, a takedown pause), must not go out when the hold
+	// lifts, ahead of the replacement or after its later Undo. The vote's
+	// takedown-subject locks come first, as in a release, which holds them
+	// while it row-locks the held rows.
+	if replacedActivityID != "" && replacedActivityID != stored.CurrentActivityID {
+		if err := store.LockVoteSubjectsTx(ctx, tx, subject.CommunityAPID, subjectATURI); err != nil {
+			return err
+		}
+		if err := store.CancelHeldVoteTx(ctx, tx, replacedActivityID); err != nil {
+			return err
+		}
 	}
 
 	return d.enqueuer.EnqueueActivity(ctx, tx, did, did, subjectATURI, VoteIntent{
@@ -219,6 +234,15 @@ func (d *Dispatcher) applyVoteDelete(ctx context.Context, tx *sql.Tx, did string
 	retracting.RetractionActivityID = ActivityID(d.userOrigin, voteATURI, operationUndo, stored.ActivitySeq+1)
 	if _, err := d.votes.UpsertTx(ctx, tx, retracting); err != nil {
 		return fmt.Errorf("bump vote state for %s: %w", voteATURI, err)
+	}
+	// The Undo below is never held, so a Like/Dislike still held for this vote
+	// would re-cast it when its hold lifts. It is cancelled; the Undo still
+	// goes out, since another inbox may hold the vote, and a peer's refusal of
+	// an Undo for a vote it never saw is terminal at once (rejectVoteUndo).
+	// No takedown-subject lock is needed first: an Undo's enqueue takes none,
+	// so this tx waits on no lock a release holds after locking the held row.
+	if err := store.CancelHeldVoteTx(ctx, tx, stored.CurrentActivityID); err != nil {
+		return err
 	}
 
 	return d.enqueuer.EnqueueActivity(ctx, tx, did, did, stored.SubjectATURI, VoteIntent{

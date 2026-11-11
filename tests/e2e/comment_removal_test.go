@@ -130,9 +130,16 @@ func TestModeration_CommentRemoveAndRestoreWriteRemovalRecords(t *testing.T) {
 	}
 }
 
-// awaitLemmyPostID polls the community's post list until the post titled title
-// is there and returns its Lemmy id.
+// awaitLemmyPostID polls the community's post list on the first Lemmy until
+// the post titled title is there and returns its Lemmy id.
 func (h *harness) awaitLemmyPostID(t *testing.T, communityID int, title string) int {
+	t.Helper()
+	return h.admin.awaitPostID(t, communityID, title)
+}
+
+// awaitPostID polls the community's post list on the client's Lemmy until the
+// post titled title is there and returns its id on that instance.
+func (c *lemmyClient) awaitPostID(t *testing.T, communityID int, title string) int {
 	t.Helper()
 	deadline := time.Now().Add(eventTimeout)
 	for {
@@ -145,7 +152,7 @@ func (h *harness) awaitLemmyPostID(t *testing.T, communityID int, title string) 
 				} `json:"post"`
 			} `json:"posts"`
 		}
-		err := h.admin.do(http.MethodGet, "/api/v3/post/list?"+query.Encode(), nil, &out)
+		err := c.do(http.MethodGet, "/api/v3/post/list?"+query.Encode(), nil, &out)
 		if err == nil {
 			for _, p := range out.Posts {
 				if p.Post.Name == title {
@@ -154,20 +161,29 @@ func (h *harness) awaitLemmyPostID(t *testing.T, communityID int, title string) 
 			}
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("post %q never listed in Lemmy community %d within %s (last error: %v)",
-				title, communityID, eventTimeout, err)
+			t.Fatalf("post %q never listed in community %d on Lemmy %s within %s (last error: %v)",
+				title, communityID, c.base(), eventTimeout, err)
 		}
 		time.Sleep(time.Second)
 	}
 }
 
-// awaitLemmyCommentID polls a Lemmy post's comments until one whose content
-// contains body arrives and returns its Lemmy id.
+// awaitLemmyCommentID polls a post's comments on the first Lemmy until one
+// whose content contains body arrives and returns its Lemmy id.
 func (h *harness) awaitLemmyCommentID(t *testing.T, postID int, body string) int {
+	t.Helper()
+	return h.admin.awaitCommentID(t, postID, body)
+}
+
+// awaitCommentID polls a post's comments on the client's Lemmy until one whose
+// content contains body arrives and returns its id on that instance.
+func (c *lemmyClient) awaitCommentID(t *testing.T, postID int, body string) int {
 	t.Helper()
 	deadline := time.Now().Add(eventTimeout)
 	for {
-		query := url.Values{"post_id": {fmt.Sprint(postID)}, "sort": {"New"}, "limit": {"50"}}
+		// type_=All: without it Lemmy falls back to the user's default listing
+		// type (Local), which hides comments from other instances.
+		query := url.Values{"post_id": {fmt.Sprint(postID)}, "sort": {"New"}, "limit": {"50"}, "type_": {"All"}}
 		var out struct {
 			Comments []struct {
 				Comment struct {
@@ -176,7 +192,7 @@ func (h *harness) awaitLemmyCommentID(t *testing.T, postID int, body string) int
 				} `json:"comment"`
 			} `json:"comments"`
 		}
-		err := h.admin.do(http.MethodGet, "/api/v3/comment/list?"+query.Encode(), nil, &out)
+		err := c.do(http.MethodGet, "/api/v3/comment/list?"+query.Encode(), nil, &out)
 		if err == nil {
 			for _, c := range out.Comments {
 				if strings.Contains(c.Comment.Content, body) {
@@ -185,8 +201,8 @@ func (h *harness) awaitLemmyCommentID(t *testing.T, postID int, body string) int
 			}
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("comment %q never reached Lemmy post %d within %s (last error: %v)",
-				body, postID, eventTimeout, err)
+			t.Fatalf("comment %q never reached post %d on Lemmy %s within %s (last error: %v)",
+				body, postID, c.base(), eventTimeout, err)
 		}
 		time.Sleep(time.Second)
 	}

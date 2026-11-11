@@ -426,7 +426,8 @@ func writeAdminError(w http.ResponseWriter, err error) {
 // handleSubscribe resolves, bridges, and follows a community:
 // WebFinger → fetch Group → materialize community profile → signed Follow
 // from the service actor → follow_state pending (Accept arrives via the
-// inbox and flips it to accepted, which triggers backfill).
+// inbox and flips it to accepted, which triggers backfill). A community a
+// Coves moderator removed is refused with 409.
 func (a *Admin) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 	var req communityRequest
 	if err := decodeJSONBody(r, &req); err != nil || strings.TrimSpace(req.Community) == "" {
@@ -434,7 +435,7 @@ func (a *Admin) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	community, err := a.subscribe(r.Context(), req.Community)
+	community, err := a.subscribe(r.Context(), req.Community, store.FollowProvenanceManual)
 	if err != nil {
 		writeAdminError(w, err)
 		return
@@ -449,11 +450,26 @@ func (a *Admin) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 
 // subscribe is the transport-agnostic core of handleSubscribe, shared with
 // the follow-list reconciler. On success the returned community is either
-// already accepted (idempotent no-op) or freshly pending.
-func (a *Admin) subscribe(ctx context.Context, ref string) (*store.Community, error) {
+// already accepted (idempotent no-op) or freshly pending, with provenance
+// recorded as how it was followed. A removed community is refused with a 409
+// carrying a *communityRemovedError, before any fetch when Tidepool already
+// has it, and after the mint when the label arrived before the community.
+func (a *Admin) subscribe(ctx context.Context, ref string, provenance store.FollowProvenance) (*store.Community, error) {
 	groupIRI, err := a.resolveCommunity(ctx, ref)
 	if err != nil {
 		return nil, a.resolveError(ref, err)
+	}
+
+	known, err := a.communities.GetByAPGroupID(ctx, groupIRI)
+	switch {
+	case err == nil:
+		if err := a.refuseRemoved(ctx, known); err != nil {
+			return nil, err
+		}
+	case !errors.IsNotFound(err):
+		a.logger.Error("subscribe: look up community", "community", groupIRI, "error", err)
+		return nil, &adminError{status: http.StatusInternalServerError,
+			public: "internal error", err: err}
 	}
 
 	// Bridge the community first: DID minted, community.profile committed —
@@ -469,35 +485,34 @@ func (a *Admin) subscribe(ctx context.Context, ref string) (*store.Community, er
 		return nil, &adminError{status: http.StatusBadGateway,
 			public: "failed to bridge community", err: err}
 	}
+	if known == nil {
+		if err := a.refuseRemoved(ctx, community); err != nil {
+			return nil, err
+		}
+	}
 
 	if community.FollowState == store.FollowStateAccepted {
 		return community, nil
 	}
 
-	group, err := a.client.FetchActor(ctx, groupIRI)
-	if err != nil {
-		a.logger.Error("subscribe: fetch group", "community", groupIRI, "error", err)
-		return nil, &adminError{status: http.StatusBadGateway,
-			public: "failed to fetch community actor", err: err}
+	if err := a.deliverFollow(ctx, groupIRI); err != nil {
+		return nil, err
 	}
-	inbox := group.SharedInboxOrInbox()
-	if inbox == "" {
-		return nil, &adminError{status: http.StatusUnprocessableEntity,
-			public: "community actor advertises no inbox"}
-	}
-
-	follow, err := a.buildFollow(groupIRI)
-	if err != nil {
-		a.logger.Error("subscribe: build follow", "community", groupIRI, "error", err)
-		return nil, &adminError{status: http.StatusInternalServerError,
-			public: "failed to build Follow", err: err}
-	}
-	if err := a.client.SendActivity(ctx, inbox, follow); err != nil {
-		a.logger.Error("subscribe: deliver follow", "community", groupIRI, "error", err)
-		return nil, &adminError{status: http.StatusBadGateway,
-			public: "failed to deliver Follow", err: err}
-	}
-	if err := a.communities.SetFollowState(ctx, groupIRI, store.FollowStatePending); err != nil {
+	if err := a.markFollowPending(ctx, groupIRI, provenance); err != nil {
+		if stderrors.Is(err, store.ErrCommunityRemoved) {
+			// Removed between the check and the send: take the Follow back. A
+			// failed take-back is owed by the removal, so the follow retrier
+			// sends it.
+			if err := a.sendUndoFollow(ctx, groupIRI); err != nil {
+				a.logger.Warn("subscribe: removed community's Follow not taken back; the follow retrier sends the Undo{Follow}",
+					"community", groupIRI, "error", err)
+				if err := markUnfollowOwed(ctx, a.communities, community.DID); err != nil {
+					a.logger.Error("subscribe: removed community's Undo{Follow} not recorded as owed; Lemmy may list Tidepool as a follower",
+						"community", groupIRI, "error", err)
+				}
+			}
+			return nil, removedRefusal(groupIRI)
+		}
 		a.logger.Error("subscribe: record pending follow", "community", groupIRI, "error", err)
 		return nil, &adminError{status: http.StatusInternalServerError,
 			public: "failed to record follow state", err: err}
@@ -506,6 +521,107 @@ func (a *Admin) subscribe(ctx context.Context, ref string) (*store.Community, er
 
 	community.FollowState = store.FollowStatePending
 	return community, nil
+}
+
+// communityRemovedError names the removed community a follow was refused for.
+type communityRemovedError struct{ groupIRI string }
+
+func (e *communityRemovedError) Error() string {
+	return "community " + e.groupIRI + " is removed"
+}
+
+func (e *communityRemovedError) Unwrap() error { return store.ErrCommunityRemoved }
+
+// removedRefusal is the admin API's 409 for a follow of a removed community.
+func removedRefusal(groupIRI string) *adminError {
+	return &adminError{status: http.StatusConflict,
+		public: "community is removed by a Coves moderator",
+		err:    &communityRemovedError{groupIRI: groupIRI}}
+}
+
+// refuseRemoved answers removedRefusal when community is removed.
+func (a *Admin) refuseRemoved(ctx context.Context, community *store.Community) error {
+	removed, err := communityRemoved(ctx, a.communities, community.DID)
+	if err != nil {
+		a.logger.Error("read community removal", "community", community.APGroupID, "error", err)
+		return &adminError{status: http.StatusInternalServerError, public: "internal error", err: err}
+	}
+	if removed {
+		a.logger.Info("follow refused: community is removed", "community", community.APGroupID)
+		return removedRefusal(community.APGroupID)
+	}
+	return nil
+}
+
+// communityRemoved reports whether the community with did is removed. A
+// communities store without removals (a test double) removes nothing.
+func communityRemoved(ctx context.Context, communities store.Communities, did string) (bool, error) {
+	removals, ok := communities.(store.CommunityRemovals)
+	if !ok {
+		return false, nil
+	}
+	return removals.CommunityRemoved(ctx, did)
+}
+
+// markUnfollowOwedTimeout bounds recording an owed Undo{Follow}.
+const markUnfollowOwedTimeout = 10 * time.Second
+
+// markUnfollowOwed records that the active removal of the community with did
+// owes Lemmy an Undo{Follow}, for a Follow sent while the removal committed
+// whose take-back did not go out. A community with no active removal owes
+// nothing. A communities store without removals (a test double) records
+// nothing.
+func markUnfollowOwed(ctx context.Context, communities store.Communities, did string) error {
+	removals, ok := communities.(store.CommunityRemovals)
+	if !ok {
+		return nil
+	}
+	// The take-back usually failed because ctx ended, so the mark runs on a
+	// bounded context of its own.
+	markCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), markUnfollowOwedTimeout)
+	defer cancel()
+	if err := removals.MarkUnfollowOwed(markCtx, did); err != nil && !errors.IsNotFound(err) {
+		return err
+	}
+	return nil
+}
+
+// markFollowPending records the Follow just sent, with its provenance, unless
+// the community is removed (store.ErrCommunityRemoved).
+func (a *Admin) markFollowPending(ctx context.Context, groupIRI string, provenance store.FollowProvenance) error {
+	if removals, ok := a.communities.(store.CommunityRemovals); ok {
+		return removals.SetFollowPending(ctx, groupIRI, provenance)
+	}
+	return a.communities.SetFollowState(ctx, groupIRI, store.FollowStatePending)
+}
+
+// deliverFollow sends the service actor's Follow to the community's inbox:
+// the send path of subscribe.
+func (a *Admin) deliverFollow(ctx context.Context, groupIRI string) error {
+	group, err := a.client.FetchActor(ctx, groupIRI)
+	if err != nil {
+		a.logger.Error("subscribe: fetch group", "community", groupIRI, "error", err)
+		return &adminError{status: http.StatusBadGateway,
+			public: "failed to fetch community actor", err: err}
+	}
+	inbox := group.SharedInboxOrInbox()
+	if inbox == "" {
+		return &adminError{status: http.StatusUnprocessableEntity,
+			public: "community actor advertises no inbox"}
+	}
+
+	follow, err := a.buildFollow(groupIRI)
+	if err != nil {
+		a.logger.Error("subscribe: build follow", "community", groupIRI, "error", err)
+		return &adminError{status: http.StatusInternalServerError,
+			public: "failed to build Follow", err: err}
+	}
+	if err := a.client.SendActivity(ctx, inbox, follow); err != nil {
+		a.logger.Error("subscribe: deliver follow", "community", groupIRI, "error", err)
+		return &adminError{status: http.StatusBadGateway,
+			public: "failed to deliver Follow", err: err}
+	}
+	return nil
 }
 
 // handleUnsubscribe sends Undo{Follow} and clears the follow state. The
@@ -549,27 +665,12 @@ func (a *Admin) unsubscribeByGroupIRI(ctx context.Context, groupIRI string) (*st
 			public: "internal error", err: err}
 	}
 
-	// Best-effort remote notification.
-	if group, err := a.client.FetchActor(ctx, groupIRI); err == nil {
-		if inbox := group.SharedInboxOrInbox(); inbox != "" {
-			undo, err := a.buildUndoFollow(groupIRI)
-			if err != nil {
-				// A local crypto/rand failure: skip the notification rather
-				// than emitting a zero-entropy id, but still clear local state
-				// (unsubscribing must succeed even if the Undo can't be sent).
-				a.logger.Warn("unsubscribe: build undo failed (state cleared anyway)",
-					"community", groupIRI, "error", err)
-			} else if err := a.client.SendActivity(ctx, inbox, undo); err != nil {
-				a.logger.Warn("unsubscribe: deliver undo failed (state cleared anyway)",
-					"community", groupIRI, "error", err)
-			}
-		}
-	} else {
-		a.logger.Warn("unsubscribe: fetch group failed (state cleared anyway)",
+	if err := a.sendUndoFollow(ctx, groupIRI); err != nil {
+		a.logger.Warn("unsubscribe: Undo{Follow} not delivered (state cleared anyway)",
 			"community", groupIRI, "error", err)
 	}
 
-	if err := a.communities.SetFollowState(ctx, groupIRI, store.FollowStateNone); err != nil {
+	if err := a.unfollow(ctx, groupIRI); err != nil {
 		a.logger.Error("unsubscribe: clear follow state", "community", groupIRI, "error", err)
 		return nil, &adminError{status: http.StatusInternalServerError,
 			public: "failed to clear follow state", err: err}
@@ -577,6 +678,45 @@ func (a *Admin) unsubscribeByGroupIRI(ctx context.Context, groupIRI string) (*st
 	a.logger.Info("community unfollowed", "community", groupIRI)
 	community.FollowState = store.FollowStateNone
 	return community, nil
+}
+
+// unfollow clears the follow state; with removals it also keeps an active
+// removal's negation from following the community again.
+func (a *Admin) unfollow(ctx context.Context, groupIRI string) error {
+	if removals, ok := a.communities.(store.CommunityRemovals); ok {
+		return removals.Unfollow(ctx, groupIRI)
+	}
+	return a.communities.SetFollowState(ctx, groupIRI, store.FollowStateNone)
+}
+
+// sendUndoFollow notifies the community that the service actor no longer
+// follows it: the best-effort send path of unsubscribe and of a removal. The
+// caller logs a failure and clears the follow state either way.
+func (a *Admin) sendUndoFollow(ctx context.Context, groupIRI string) error {
+	return sendUndoFollowActivity(ctx, a.client, a.service, groupIRI)
+}
+
+// sendUndoFollowActivity delivers the service actor's Undo{Follow} to the
+// community's inbox, shared by the admin paths and the follow retrier.
+func sendUndoFollowActivity(ctx context.Context, client FollowClient, service *ap.ServiceActor, groupIRI string) error {
+	group, err := client.FetchActor(ctx, groupIRI)
+	if err != nil {
+		return fmt.Errorf("fetch group: %w", err)
+	}
+	inbox := group.SharedInboxOrInbox()
+	if inbox == "" {
+		return stderrors.New("community actor advertises no inbox")
+	}
+	// A crypto/rand failure skips the notification rather than emitting a
+	// zero-entropy id.
+	undo, err := buildUndoFollowActivity(service, groupIRI)
+	if err != nil {
+		return fmt.Errorf("build undo: %w", err)
+	}
+	if err := client.SendActivity(ctx, inbox, undo); err != nil {
+		return fmt.Errorf("deliver undo: %w", err)
+	}
+	return nil
 }
 
 // handleList reports every community in accepted or pending state.
@@ -598,6 +738,7 @@ func (a *Admin) handleList(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleBackfill triggers an on-demand backfill for a subscribed community.
+// A removed community is refused with 409.
 func (a *Admin) handleBackfill(w http.ResponseWriter, r *http.Request) {
 	if a.backfill == nil {
 		http.Error(w, "backfill is not configured", http.StatusNotImplemented)
@@ -622,6 +763,10 @@ func (a *Admin) handleBackfill(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		a.logger.Error("backfill: look up community", "community", groupIRI, "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if err := a.refuseRemoved(ctx, community); err != nil {
+		writeAdminError(w, err)
 		return
 	}
 	a.backfill.TriggerAsync(community, true)
@@ -777,15 +922,15 @@ func buildFollowActivity(service *ap.ServiceActor, groupIRI string) (*ap.Object,
 	}, nil
 }
 
-// buildUndoFollow constructs Undo{Follow}. Lemmy matches the undo by the
-// inner Follow's actor and object.
-func (a *Admin) buildUndoFollow(groupIRI string) (*ap.Object, error) {
-	inner, err := a.buildFollow(groupIRI)
+// buildUndoFollowActivity constructs Undo{Follow}. Lemmy matches the undo by
+// the inner Follow's actor and object.
+func buildUndoFollowActivity(service *ap.ServiceActor, groupIRI string) (*ap.Object, error) {
+	inner, err := buildFollowActivity(service, groupIRI)
 	if err != nil {
 		return nil, err
 	}
 	inner.Context = nil
-	id, err := a.activityID("undo")
+	id, err := mintActivityID(service, "undo")
 	if err != nil {
 		return nil, err
 	}
@@ -793,22 +938,18 @@ func (a *Admin) buildUndoFollow(groupIRI string) (*ap.Object, error) {
 		Context: json.RawMessage(`"https://www.w3.org/ns/activitystreams"`),
 		ID:      id,
 		Type:    ap.TypeUndo,
-		Actor:   &ap.Object{ID: a.service.ID},
+		Actor:   &ap.Object{ID: service.ID},
 		Object:  inner,
 		To:      ap.Audience{groupIRI},
 	}, nil
 }
 
-// activityID mints a unique bridge-side activity id. A crypto/rand failure
+// mintActivityID mints a unique bridge-side activity id. A crypto/rand failure
 // is propagated rather than swallowed: proceeding with the zero buffer would
 // emit a constant, remote-deduped id (…/kind/000…0), and Lemmy dedupes by
 // activity id — so the first such activity would land and every later
 // Follow/Undo{Follow} would be silently ignored while the admin API still
-// reports success. The buildFollow/buildUndoFollow callers map this to a 5xx.
-func (a *Admin) activityID(kind string) (string, error) {
-	return mintActivityID(a.service, kind)
-}
-
+// reports success. The buildFollow callers map this to a 5xx.
 func mintActivityID(service *ap.ServiceActor, kind string) (string, error) {
 	var buf [16]byte
 	if _, err := rand.Read(buf[:]); err != nil {

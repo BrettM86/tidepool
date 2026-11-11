@@ -717,15 +717,21 @@ func (h *Handler) handleAccept(ctx context.Context, accept *ap.Object, signer st
 		// fresh backfill.
 		return nil
 	case store.FollowStateNone:
-		// We unsubscribed (state cleared, Undo{Follow} sent) — Lemmy can retry
-		// an Accept for hours. A late Accept must not silently re-subscribe us
-		// nor trigger a backfill.
+		// We unsubscribed, or a Coves community removal unfollowed us (state
+		// cleared, Undo{Follow} sent or owed) — Lemmy can retry an Accept for
+		// hours. A late Accept must not silently re-subscribe us nor trigger a
+		// backfill.
 		return skip(accept.ID, "accept for a community we unfollowed: "+communityID)
 	}
 	// Only pending → accepted is a real transition (and the sole backfill
-	// trigger).
-	if err := h.communities.SetFollowState(ctx, communityID, store.FollowStateAccepted); err != nil {
+	// trigger). It is a compare-and-set: a removal (or unsubscribe) that
+	// committed after the read above leaves the community unfollowed.
+	accepted, err := h.acceptPendingFollow(ctx, communityID)
+	if err != nil {
 		return fmt.Errorf("ingest: mark follow accepted for %s: %w", communityID, err)
+	}
+	if !accepted {
+		return skip(accept.ID, "accept for a community no longer pending, or removed: "+communityID)
 	}
 	h.logger.Info("community follow accepted", "community", communityID)
 	if h.backfill != nil {
@@ -733,6 +739,16 @@ func (h *Handler) handleAccept(ctx context.Context, accept *ap.Object, signer st
 		h.backfill.TriggerAsync(community, false)
 	}
 	return nil
+}
+
+// acceptPendingFollow records the Accept of a pending community and reports
+// whether it did. A communities store without removals (a test double) sets
+// the state unconditionally.
+func (h *Handler) acceptPendingFollow(ctx context.Context, communityID string) (bool, error) {
+	if removals, ok := h.communities.(store.CommunityRemovals); ok {
+		return removals.AcceptPendingFollow(ctx, communityID)
+	}
+	return true, h.communities.SetFollowState(ctx, communityID, store.FollowStateAccepted)
 }
 
 // handleReject clears a community's Follow (the remote refused or revoked

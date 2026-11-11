@@ -1,0 +1,25 @@
+# Config for the second Lemmy instance of the Tidepool e2e harness (compose
+# service lemmy2). Same debug build and plain-HTTP shape as lemmy.hjson; its
+# users follow communities on lemmy, so content reaches it through the
+# community's Announce. Its own database and pictrs keep the two instances'
+# state apart.
+{
+  # The compose service name, baked into every AP id it emits
+  # (http://lemmy2/u/alice, ...).
+  hostname: "lemmy2"
+  bind: "0.0.0.0"
+  port: 80
+  tls_enabled: false
+  setup: {
+    admin_username: "admin"
+    admin_password: "lemmylemmy"
+    site_name: "tidepool-e2e-2"
+  }
+  database: {
+    uri: "postgres://lemmy:lemmy@lemmy2-postgres:5432/lemmy"
+  }
+  pictrs: {
+    url: "http://pictrs2:8080/"
+    api_key: "e2e-pictrs-key"
+  }
+}

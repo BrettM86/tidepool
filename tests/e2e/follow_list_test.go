@@ -61,7 +61,18 @@ func recreateTidepool(ctx context.Context, env []string, composeFiles ...string)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("recreate tidepool: %w\n%s", err, out)
 	}
-	return awaitTidepoolHealthy()
+	if err := awaitTidepoolHealthy(); err != nil {
+		return err
+	}
+	// coves-appview-forwarder joins tidepool's network namespace by container,
+	// so a recreated tidepool needs a recreated forwarder.
+	args = append(args[:len(args)-1], "coves-appview-forwarder")
+	cmd = exec.CommandContext(ctx, "docker", args...)
+	cmd.Env = append(os.Environ(), env...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("recreate coves-appview-forwarder: %w\n%s", err, out)
+	}
+	return nil
 }
 
 // followList is a scenario's handle on the mounted file.
@@ -200,6 +211,9 @@ type followListSweep struct {
 	Subscribed   []string `json:"subscribed"`
 	Unsubscribed []string `json:"unsubscribed"`
 	Failed       []string `json:"failed"`
+	// Suppressed are the community AP ids the sweep did not follow because
+	// they are removed.
+	Suppressed []string `json:"suppressed"`
 }
 
 // reconcileSweep runs one sweep through the admin API and returns its report.

@@ -64,14 +64,21 @@ func (r *HandleResolver) AccountStatus(ctx context.Context, did string) (bool, e
 	if err != nil {
 		return false, fmt.Errorf("confirm account status for %s: %w", did, err)
 	}
-	endpoint, err := pdsEndpoint(document)
+	endpoint, err := pdsEndpoint(document, false)
 	if err != nil {
 		// A document with no PDS is NOT read as "deleted", tempting as that is:
 		// the same shape appears while a document is mid-rewrite, and acting on
 		// it would erase a user whose hosting simply moved.
 		return false, fmt.Errorf("confirm account status for %s: %w", did, err)
 	}
-	return r.repoDeleted(ctx, endpoint, did)
+	status, err := r.readRepoStatus(ctx, endpoint, did)
+	if err != nil {
+		return false, err
+	}
+	// Both halves are required. `active` alone would read a suspension as a
+	// deletion, and `status` alone would believe a field the PDS may omit for a
+	// live repo.
+	return !status.Active && status.Status == repoStatusDeleted, nil
 }
 
 // didService is the sliver of a DID document's service list this reads.
@@ -89,7 +96,10 @@ type didService struct {
 // verdict is about. So it is validated to exhaustion BEFORE the first packet —
 // a guard that fires on the RESPONSE has already sent the bridge somewhere a
 // stranger chose, and has already leaked which DID it is about to act on.
-func pdsEndpoint(document *didDocument) (*url.URL, error) {
+//
+// allowInsecure admits an http endpoint; only RepoStatus passes it, and only
+// under the development allowance (see checkedPDSEndpoint).
+func pdsEndpoint(document *didDocument, allowInsecure bool) (*url.URL, error) {
 	for _, service := range document.Service {
 		// EXACT fragment match, not a suffix test: "#not_atproto_pds" ends with
 		// the same characters, and a document its own subject writes is where
@@ -99,30 +109,38 @@ func pdsEndpoint(document *didDocument) (*url.URL, error) {
 		if _, fragment, found := strings.Cut(service.ID, "#"); !found || fragment != atprotoPDSServiceID {
 			continue
 		}
-		return checkedPDSEndpoint(service.ServiceEndpoint)
+		return checkedPDSEndpoint(service.ServiceEndpoint, allowInsecure)
 	}
 	return nil, fmt.Errorf("DID document names no atproto PDS")
 }
 
-// checkedPDSEndpoint accepts only a plain, absolute HTTPS origin.
+// checkedPDSEndpoint accepts only a plain, absolute HTTPS origin (or HTTP under
+// allowInsecure).
 //
 // HTTPS IS NOT A PREFERENCE HERE. This response decides whether a user's content
 // is erased from every instance that holds it, and no peer un-deletes. Over
 // cleartext, anyone on the path can WRITE {"active":false,"status":"deleted"} —
 // the irreversible verdict, for free, with no credential and no compromise of
-// either endpoint. There is no allow-insecure option on purpose: a deployment
+// either endpoint. The deletion verdict has no allow-insecure option on purpose: a deployment
 // whose PDS is reachable only over http cannot confirm deletions, and it fails
 // CLOSED (a retryable error an operator can see) rather than acting on an answer
 // nobody can vouch for.
 //
+// The one exception is allowInsecure, which RepoStatus passes under
+// ResolverOptions.AllowInsecureStatusEndpoint (development only, where the local
+// PDS serves http). RepoStatus decides only reversible restrictions, and the
+// deletion verdict above never passes it.
+//
 // Userinfo is refused too: credentials in a URL a stranger wrote are not ours to
 // send, and Go would put them on the wire.
-func checkedPDSEndpoint(endpoint string) (*url.URL, error) {
+func checkedPDSEndpoint(endpoint string, allowInsecure bool) (*url.URL, error) {
 	parsed, err := url.Parse(endpoint)
 	switch {
 	case err != nil:
 		return nil, fmt.Errorf("DID document names an unparseable PDS endpoint")
-	case parsed.Scheme != "https":
+	case parsed.Scheme != "https" && (!allowInsecure || parsed.Scheme != "http"):
+		// http is admitted only under the development allowance, and the
+		// remaining checks below apply to it as to https.
 		return nil, fmt.Errorf(
 			"DID document names a PDS endpoint that is not https; a confirmation over a channel "+
 				"anyone can rewrite cannot decide an irreversible erasure (%q)", parsed.Scheme)
@@ -152,13 +170,13 @@ type repoStatus struct {
 // tier and this one.
 const repoStatusDeleted = "deleted"
 
-// repoDeleted asks the PDS what it holds for this repo.
+// readRepoStatus asks the PDS what it holds for this repo.
 //
 // ONLY an explicit, readable answer decides. A non-200 is unknown — a PDS that
 // 400s an unrecognised repo looks identical to one that is misconfigured, and
-// "the host said something we did not understand" is not evidence a user
-// deleted their account.
-func (r *HandleResolver) repoDeleted(ctx context.Context, endpoint *url.URL, did string) (bool, error) {
+// "the host said something we did not understand" is not evidence of any
+// status.
+func (r *HandleResolver) readRepoStatus(ctx context.Context, endpoint *url.URL, did string) (repoStatus, error) {
 	// BUILT FROM THE PARSED URL, never by concatenation: JoinPath escapes the
 	// segments and preserves a path prefix (https://host/pds), and setting the
 	// query as a value keeps the did from being pasted into a string that may
@@ -167,7 +185,7 @@ func (r *HandleResolver) repoDeleted(ctx context.Context, endpoint *url.URL, did
 	target.RawQuery = url.Values{"did": []string{did}}.Encode()
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
 	if err != nil {
-		return false, fmt.Errorf("build repo status request for %s: %w", did, err)
+		return repoStatus{}, fmt.Errorf("build repo status request for %s: %w", did, err)
 	}
 	request.Header.Set("Accept", "application/json")
 	if r.userAgent != "" {
@@ -186,29 +204,61 @@ func (r *HandleResolver) repoDeleted(ctx context.Context, endpoint *url.URL, did
 	// guard) while giving this call its own rules.
 	client := *r.httpClient
 	client.CheckRedirect = func(hop *http.Request, _ []*http.Request) error {
-		if hop.URL.Scheme != "https" || !strings.EqualFold(hop.URL.Host, request.URL.Host) {
+		// The scheme may not change: an https read never downgrades, and an
+		// http read exists only under the development allowance.
+		if hop.URL.Scheme != request.URL.Scheme || !strings.EqualFold(hop.URL.Host, request.URL.Host) {
 			return fmt.Errorf(
-				"refusing redirect to %s: a deletion verdict may come only from the PDS the DID "+
-					"document names, over https", hop.URL.Redacted())
+				"refusing redirect to %s: a status verdict may come only from the PDS the DID "+
+					"document names, over the same scheme", hop.URL.Redacted())
 		}
 		return nil
 	}
 
 	response, err := client.Do(request)
 	if err != nil {
-		return false, fmt.Errorf("fetch repo status for %s: %w", did, err)
+		return repoStatus{}, fmt.Errorf("fetch repo status for %s: %w", did, err)
 	}
 	defer func() { _ = response.Body.Close() }()
 
 	if response.StatusCode != http.StatusOK {
-		return false, fmt.Errorf("fetch repo status for %s: pds returned %d", did, response.StatusCode)
+		return repoStatus{}, fmt.Errorf("fetch repo status for %s: pds returned %d", did, response.StatusCode)
 	}
 	var status repoStatus
 	if err := json.NewDecoder(io.LimitReader(response.Body, maxRepoStatusBytes)).Decode(&status); err != nil {
-		return false, fmt.Errorf("decode repo status for %s: %w", did, err)
+		return repoStatus{}, fmt.Errorf("decode repo status for %s: %w", did, err)
 	}
-	// Both halves are required. `active` alone would read a suspension as a
-	// deletion, and `status` alone would believe a field the PDS may omit for a
-	// live repo.
-	return !status.Active && status.Status == repoStatusDeleted, nil
+	return status, nil
+}
+
+// RepoStatus is a repo's status as its PDS reports it.
+type RepoStatus struct {
+	Active bool
+	Status string
+}
+
+// RepoStatus reads the DID's repo status from the PDS its DID document names:
+// the same getRepoStatus read AccountStatus makes, returning the status itself
+// so the #account handler can confirm a takendown or suspended restriction and
+// its lift. Every failure (no document, no PDS, a non-200, an unreadable body)
+// is an error and the zero RepoStatus, never a guessed status.
+//
+// Under ResolverOptions.AllowInsecureStatusEndpoint an http endpoint is read;
+// AccountStatus stays https-only regardless.
+func (r *HandleResolver) RepoStatus(ctx context.Context, did string) (RepoStatus, error) {
+	if err := validatePLCDID(did); err != nil {
+		return RepoStatus{}, err
+	}
+	document, err := r.fetchDIDDocument(ctx, did)
+	if err != nil {
+		return RepoStatus{}, fmt.Errorf("read repo status for %s: %w", did, err)
+	}
+	endpoint, err := pdsEndpoint(document, r.allowInsecureStatusEndpoint)
+	if err != nil {
+		return RepoStatus{}, fmt.Errorf("read repo status for %s: %w", did, err)
+	}
+	status, err := r.readRepoStatus(ctx, endpoint, did)
+	if err != nil {
+		return RepoStatus{}, err
+	}
+	return RepoStatus(status), nil
 }

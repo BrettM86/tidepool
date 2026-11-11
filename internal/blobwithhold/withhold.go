@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/ipfs/go-cid"
+	"github.com/lib/pq"
 
 	"tidepool/internal/errors"
 )
@@ -31,6 +32,13 @@ const (
 	ReasonIllegalContent     = "illegal-content"
 	ReasonCSAM               = "csam"
 	ReasonOperatorDiscretion = "operator-discretion"
+	// ReasonLabelTakedown is a label row's code: a `!takedown` label.
+	ReasonLabelTakedown = "label-takedown"
+	// ReasonLabelTakedownAuthorDeleted is the code of a label row whose
+	// subject record its author deleted while the label stood: the bytes were
+	// kept, and a negation does not lift the row while the record is gone. The
+	// author's undelete clears the mark in the record's commit.
+	ReasonLabelTakedownAuthorDeleted = "label-takedown-author-deleted"
 )
 
 // Withhold is one withhold row. A nil LiftedAt means active.
@@ -380,8 +388,8 @@ func AddSubjectRemovalWithholds(ctx context.Context, q Execer, ownerDID, subject
 	return nil
 }
 
-// canonicalRemovalWithholds validates a community-removal write's inputs and
-// returns cids canonicalized.
+// canonicalRemovalWithholds validates a subject withhold write's inputs (a
+// community-removal or label row) and returns cids canonicalized.
 func canonicalRemovalWithholds(ownerDID, subjectURI, reasonCode string, cids []string) ([]string, error) {
 	if ownerDID == "" {
 		return nil, errors.NewValidationError("owner_did", "must not be empty")
@@ -419,6 +427,262 @@ func LiftSubjectRemovalWithholds(ctx context.Context, q Execer, subjectURI strin
 	return nil
 }
 
+// AddSubjectLabelWithholds inserts a label row of the subject for each CID
+// in cids that has none (idempotent under the one-active-row-per-(subject,
+// CID) index), and lifts nothing: like community-removal rows, label rows
+// only grow while the label stands. ownerDID is the subject record's repo
+// DID, the DID whose store and serve the rows refuse.
+func AddSubjectLabelWithholds(ctx context.Context, q Execer, ownerDID, subjectURI string, cids []string) error {
+	canonical, err := canonicalRemovalWithholds(ownerDID, subjectURI, ReasonLabelTakedown, cids)
+	if err != nil {
+		return err
+	}
+	for _, c := range canonical {
+		if _, err := q.ExecContext(ctx, `
+			INSERT INTO blob_withholds (cid, source, scope, owner_did, subject_uri, reason_code)
+			VALUES ($1, $2, $3, $4, $5, $6)
+			ON CONFLICT (subject_uri, cid) WHERE source = 'label' AND lifted_at IS NULL DO NOTHING`,
+			c, SourceLabel, ScopeSubject, ownerDID, subjectURI, ReasonLabelTakedown); err != nil {
+			return fmt.Errorf("blobwithhold: label withhold %s for %s: %w", c, subjectURI, err)
+		}
+	}
+	return nil
+}
+
+// LiftSubjectLabelWithholds lifts every active label withhold of the
+// subject. Other sources' rows and other subjects' rows stay.
+func LiftSubjectLabelWithholds(ctx context.Context, q Execer, subjectURI string) error {
+	if subjectURI == "" {
+		return errors.NewValidationError("subject_uri", "must not be empty")
+	}
+	if _, err := q.ExecContext(ctx, `
+		UPDATE blob_withholds SET lifted_at = now()
+		WHERE source = 'label' AND subject_uri = $1 AND lifted_at IS NULL`,
+		subjectURI); err != nil {
+		return fmt.Errorf("blobwithhold: lift label withholds of %s: %w", subjectURI, err)
+	}
+	return nil
+}
+
+// AddOwnerLabelWithhold places the account-scope label withhold of
+// ownerDID: one active owner-scope label row naming no CID, so it covers
+// every blob the DID owns, including blobs stored after it (an account
+// `!takedown`). Idempotent under the one-active-row-per-owner index.
+func AddOwnerLabelWithhold(ctx context.Context, q Execer, ownerDID string) error {
+	if ownerDID == "" {
+		return errors.NewValidationError("owner_did", "must not be empty")
+	}
+	if _, err := q.ExecContext(ctx, `
+		INSERT INTO blob_withholds (cid, source, scope, owner_did, reason_code)
+		VALUES (NULL, $1, $2, $3, $4)
+		ON CONFLICT (owner_did) WHERE source = 'label' AND scope = 'owner' AND cid IS NULL AND lifted_at IS NULL
+		DO NOTHING`,
+		SourceLabel, ScopeOwner, ownerDID, ReasonLabelTakedown); err != nil {
+		return fmt.Errorf("blobwithhold: account label withhold for %s: %w", ownerDID, err)
+	}
+	return nil
+}
+
+// LiftOwnerLabelWithhold lifts ownerDID's account-scope label withhold.
+// Every other row, of any source or scope, stays.
+func LiftOwnerLabelWithhold(ctx context.Context, q Execer, ownerDID string) error {
+	if ownerDID == "" {
+		return errors.NewValidationError("owner_did", "must not be empty")
+	}
+	if _, err := q.ExecContext(ctx, `
+		UPDATE blob_withholds SET lifted_at = now()
+		WHERE source = 'label' AND scope = 'owner' AND cid IS NULL
+		  AND owner_did = $1 AND lifted_at IS NULL`,
+		ownerDID); err != nil {
+		return fmt.Errorf("blobwithhold: lift account label withhold of %s: %w", ownerDID, err)
+	}
+	return nil
+}
+
+// AddCommunityLabelWithholds inserts a community-scope label row of
+// communityDID for ownerDID and each CID in cids that has none (idempotent
+// under the one-active-row-per-(community, owner, CID) index), and lifts
+// nothing: the rows only grow while the community's `!takedown` stands.
+// ownerDID is the repo DID of the record in the community that references the
+// CIDs, the DID whose store and serve the rows refuse.
+func AddCommunityLabelWithholds(ctx context.Context, q Execer, communityDID, ownerDID string, cids []string) error {
+	if communityDID == "" {
+		return errors.NewValidationError("community_did", "must not be empty")
+	}
+	if ownerDID == "" {
+		return errors.NewValidationError("owner_did", "must not be empty")
+	}
+	for _, c := range cids {
+		canonical, err := Canonicalize(c)
+		if err != nil {
+			return err
+		}
+		if _, err := q.ExecContext(ctx, `
+			INSERT INTO blob_withholds (cid, source, scope, owner_did, community_did, reason_code)
+			VALUES ($1, $2, $3, $4, $5, $6)
+			ON CONFLICT (community_did, owner_did, cid)
+			WHERE source = 'label' AND scope = 'community' AND lifted_at IS NULL
+			DO NOTHING`,
+			canonical, SourceLabel, ScopeCommunity, ownerDID, communityDID, ReasonLabelTakedown); err != nil {
+			return fmt.Errorf("blobwithhold: community label withhold %s of %s in %s: %w", canonical, ownerDID, communityDID, err)
+		}
+	}
+	return nil
+}
+
+// LiftCommunityLabelWithholds lifts every active community-scope label
+// withhold of communityDID except those marked author-deleted, which stay
+// active while their record is gone (see
+// MarkUnreferencedCommunityLabelWithholdsAuthorDeleted). Every other row, of any source
+// or scope (a record label's or an operator's on the same CID), stays.
+func LiftCommunityLabelWithholds(ctx context.Context, q Execer, communityDID string) error {
+	if communityDID == "" {
+		return errors.NewValidationError("community_did", "must not be empty")
+	}
+	if _, err := q.ExecContext(ctx, `
+		UPDATE blob_withholds SET lifted_at = now()
+		WHERE source = 'label' AND scope = 'community'
+		  AND community_did = $1 AND lifted_at IS NULL
+		  AND reason_code <> $2`,
+		communityDID, ReasonLabelTakedownAuthorDeleted); err != nil {
+		return fmt.Errorf("blobwithhold: lift community label withholds of %s: %w", communityDID, err)
+	}
+	return nil
+}
+
+// MarkUnreferencedCommunityLabelWithholdsAuthorDeleted gives the
+// author-deleted code to every active community-scope label withhold of
+// communityDID for ownerDID whose CID is not in referenced, in the transaction
+// of an author's delete while the community's `!takedown` stands. referenced
+// is every CID the owner's remaining records reference, read after the delete
+// under the commit lock, so a CID only an earlier version of the deleted
+// record referenced (an edit committed under the label dropped or replaced
+// it) is marked too. The delete kept the bytes, and the community's negation
+// keeps these rows, so the kept bytes stay refused until an operator's
+// delete-bytes or the record's undelete (see
+// ClearCommunityLabelWithholdsAuthorDeleted).
+func MarkUnreferencedCommunityLabelWithholdsAuthorDeleted(ctx context.Context, q Execer, communityDID, ownerDID string, referenced []string) error {
+	if communityDID == "" {
+		return errors.NewValidationError("community_did", "must not be empty")
+	}
+	if ownerDID == "" {
+		return errors.NewValidationError("owner_did", "must not be empty")
+	}
+	canonical := make([]string, 0, len(referenced))
+	for _, c := range referenced {
+		normalized, err := Canonicalize(c)
+		if err != nil {
+			return err
+		}
+		canonical = append(canonical, normalized)
+	}
+	if _, err := q.ExecContext(ctx, `
+		UPDATE blob_withholds SET reason_code = $3
+		WHERE source = 'label' AND scope = 'community' AND lifted_at IS NULL
+		  AND community_did = $1 AND owner_did = $2
+		  AND NOT (cid = ANY($4::text[]))`,
+		communityDID, ownerDID, ReasonLabelTakedownAuthorDeleted, pq.Array(canonical)); err != nil {
+		return fmt.Errorf("blobwithhold: author-deleted mark of unreferenced community label withholds of %s in %s: %w",
+			ownerDID, communityDID, err)
+	}
+	return nil
+}
+
+// ClearCommunityLabelWithholdsAuthorDeleted handles the author-deleted
+// community-scope label withholds of communityDID for ownerDID and each CID in
+// cids in the commit of a record of the owner in the community that
+// references them again (an undelete): while the community's `!takedown`
+// stands (standing) they get the label-takedown code again, so the negation
+// lifts them; otherwise they are lifted. Rows not marked author-deleted stay.
+func ClearCommunityLabelWithholdsAuthorDeleted(ctx context.Context, q Execer, communityDID, ownerDID string, cids []string, standing bool) error {
+	query := `UPDATE blob_withholds SET lifted_at = now()
+		WHERE source = 'label' AND scope = 'community' AND lifted_at IS NULL
+		  AND community_did = $1 AND owner_did = $2 AND cid = $3 AND reason_code = $4`
+	if standing {
+		query = `UPDATE blob_withholds SET reason_code = '` + ReasonLabelTakedown + `'
+		WHERE source = 'label' AND scope = 'community' AND lifted_at IS NULL
+		  AND community_did = $1 AND owner_did = $2 AND cid = $3 AND reason_code = $4`
+	}
+	return setCommunityLabelWithholdsAuthorDeleted(ctx, q, communityDID, ownerDID, cids, query)
+}
+
+// setCommunityLabelWithholdsAuthorDeleted runs query, with parameters
+// (communityDID, ownerDID, canonical CID, author-deleted code), once per CID.
+func setCommunityLabelWithholdsAuthorDeleted(ctx context.Context, q Execer, communityDID, ownerDID string, cids []string, query string) error {
+	if communityDID == "" {
+		return errors.NewValidationError("community_did", "must not be empty")
+	}
+	if ownerDID == "" {
+		return errors.NewValidationError("owner_did", "must not be empty")
+	}
+	for _, c := range cids {
+		canonical, err := Canonicalize(c)
+		if err != nil {
+			return err
+		}
+		if _, err := q.ExecContext(ctx, query, communityDID, ownerDID, canonical, ReasonLabelTakedownAuthorDeleted); err != nil {
+			return fmt.Errorf("blobwithhold: author-deleted mark of community label withhold %s of %s in %s: %w",
+				canonical, ownerDID, communityDID, err)
+		}
+	}
+	return nil
+}
+
+// MarkSubjectLabelWithholdsAuthorDeleted gives every active label withhold
+// of the subject the author-deleted code, in the transaction of the author's
+// delete of the subject record, so a later negation keeps those rows.
+func MarkSubjectLabelWithholdsAuthorDeleted(ctx context.Context, q Execer, subjectURI string) error {
+	if subjectURI == "" {
+		return errors.NewValidationError("subject_uri", "must not be empty")
+	}
+	if _, err := q.ExecContext(ctx, `
+		UPDATE blob_withholds SET reason_code = $2
+		WHERE source = 'label' AND subject_uri = $1 AND lifted_at IS NULL`,
+		subjectURI, ReasonLabelTakedownAuthorDeleted); err != nil {
+		return fmt.Errorf("blobwithhold: mark label withholds of %s author-deleted: %w", subjectURI, err)
+	}
+	return nil
+}
+
+// UnmarkSubjectLabelWithholdsAuthorDeleted gives every active label withhold
+// of the subject marked author-deleted the label-takedown code again, in the
+// commit of the subject record's undelete while its label stands, so a later
+// negation lifts those rows. Other sources' rows and other subjects' rows
+// stay.
+func UnmarkSubjectLabelWithholdsAuthorDeleted(ctx context.Context, q Execer, subjectURI string) error {
+	if subjectURI == "" {
+		return errors.NewValidationError("subject_uri", "must not be empty")
+	}
+	if _, err := q.ExecContext(ctx, `
+		UPDATE blob_withholds SET reason_code = $2
+		WHERE source = 'label' AND subject_uri = $1 AND lifted_at IS NULL
+		  AND reason_code = $3`,
+		subjectURI, ReasonLabelTakedown, ReasonLabelTakedownAuthorDeleted); err != nil {
+		return fmt.Errorf("blobwithhold: unmark label withholds of %s author-deleted: %w", subjectURI, err)
+	}
+	return nil
+}
+
+// LiftSubjectLabelWithholdsExceptAuthorDeleted lifts every active label
+// withhold of the subject except those marked author-deleted, which stay
+// active while the subject record is gone: until an operator's delete-bytes,
+// or until the author's undelete re-materializes the record, whose commit
+// lifts them (no label standing) or unmarks them (label standing). Other
+// sources' rows and other subjects' rows stay.
+func LiftSubjectLabelWithholdsExceptAuthorDeleted(ctx context.Context, q Execer, subjectURI string) error {
+	if subjectURI == "" {
+		return errors.NewValidationError("subject_uri", "must not be empty")
+	}
+	if _, err := q.ExecContext(ctx, `
+		UPDATE blob_withholds SET lifted_at = now()
+		WHERE source = 'label' AND subject_uri = $1 AND lifted_at IS NULL
+		  AND reason_code <> $2`,
+		subjectURI, ReasonLabelTakedownAuthorDeleted); err != nil {
+		return fmt.Errorf("blobwithhold: lift label withholds of %s: %w", subjectURI, err)
+	}
+	return nil
+}
+
 // ActiveSubjectRemovalCIDs lists the CIDs the subject's active
 // community-removal withholds cover, read in tx (the back-fill reads them
 // inside the commit that writes the missing ones).
@@ -448,9 +712,11 @@ func ActiveSubjectRemovalCIDs(ctx context.Context, tx *sql.Tx, subjectURI string
 // Covers reports whether any active withhold, of any source, refuses
 // (DID, CID): an every-owner row covers every DID; subject and owner rows
 // cover only their owner DID (a subject row therefore refuses the CID for
-// its owner even where another live record of that owner references it). Community-scope rows are not matched yet: no
-// blob-to-community link exists, and the source that writes them adds that
-// join here.
+// its owner even where another live record of that owner references it), and
+// an account-scope label row (owner scope, no CID) covers every CID of its
+// owner DID, stored or not. A community-scope row (a community label's)
+// covers its CID for its owner DID only, so the same bytes under an owner
+// outside the community are served.
 func (s *Store) Covers(ctx context.Context, did, cidStr string) (bool, error) {
 	return covers(ctx, s.db, did, cidStr)
 }
@@ -477,11 +743,39 @@ func covers(ctx context.Context, q rowQuerier, did, cidStr string) (bool, error)
 			SELECT 1 FROM blob_withholds
 			WHERE cid = $1 AND lifted_at IS NULL
 			  AND (scope = 'every-owner'
-			       OR (scope IN ('subject', 'owner') AND owner_did = $2))
+			       OR (scope IN ('subject', 'owner', 'community') AND owner_did = $2))
+		) OR EXISTS (
+			SELECT 1 FROM blob_withholds
+			WHERE cid IS NULL AND source = 'label' AND scope = 'owner'
+			  AND owner_did = $2 AND lifted_at IS NULL
 		)`, canonical, did).Scan(&covered); err != nil {
 		return false, fmt.Errorf("blobwithhold: covers %s for %s: %w", canonical, did, err)
 	}
 	return covered, nil
+}
+
+// KeepsOwnerBytesTx reports whether an active subject- or community-scope
+// row for ownerDID and cidStr, read in tx, still claims the bytes: a kept
+// label row of a record its author deleted under a `!takedown` (another
+// subject than the one being deleted), a community-removal row, or a
+// community label row. An author delete that finds no remaining reference to
+// the CID keeps the bytes while such a row stands, so deleting a second
+// record that shared the CID does not destroy the first record's evidence.
+func KeepsOwnerBytesTx(ctx context.Context, tx *sql.Tx, ownerDID, cidStr string) (bool, error) {
+	canonical, err := Canonicalize(cidStr)
+	if err != nil {
+		return false, err
+	}
+	var kept bool
+	if err := tx.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM blob_withholds
+			WHERE cid = $1 AND owner_did = $2 AND lifted_at IS NULL
+			  AND scope IN ('subject', 'community')
+		)`, canonical, ownerDID).Scan(&kept); err != nil {
+		return false, fmt.Errorf("blobwithhold: kept bytes of %s for %s: %w", canonical, ownerDID, err)
+	}
+	return kept, nil
 }
 
 // HasActiveOperator reports whether the CID has an active operator

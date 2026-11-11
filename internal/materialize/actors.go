@@ -332,6 +332,11 @@ func (m *Materializer) mintAndUpsert(ctx context.Context, doc *ap.Object, actorT
 			SigningKeyEncrypted: minted.SigningKeyEncrypted,
 			ConsentState:        store.ConsentStateOK,
 		}, func(ctx context.Context, tx *sql.Tx, stored *store.BridgedActor) error {
+			// A person minted under a standing account `!takedown` is
+			// withheld in its own mint, before the identity event.
+			if err := accountLabelWithholdTx(ctx, tx, stored.DID); err != nil {
+				return err
+			}
 			_, err := repo.AppendIdentityEventTx(ctx, tx, stored.DID, stored.Handle)
 			return err
 		})

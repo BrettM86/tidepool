@@ -60,7 +60,7 @@ make e2e-logs   # tail everything
 make e2e-down   # tear down (removes volumes)
 ```
 
-`make e2e-test` runs `go test -tags e2e,nodynamic -count=1 -v -timeout 20m
+`make e2e-test` runs `go test -tags e2e,nodynamic -count=1 -v -timeout 30m
 ./tests/e2e/...`.
 
 Host ports bind to loopback only:
@@ -70,6 +70,7 @@ Host ports bind to loopback only:
 | 127.0.0.1:8092 | Tidepool HTTP (admin API, XRPC, healthz) |
 | 127.0.0.1:5380 | Tidepool DNS, UDP and TCP (`TIDEPOOL_E2E_DNS_PORT` overrides) |
 | 127.0.0.1:8541 | Lemmy HTTP API |
+| 127.0.0.1:8542 | Second Lemmy (`lemmy2`) HTTP API (`LEMMY2_E2E_PORT` overrides; `LEMMY2_E2E_URL` overrides the whole URL in the suite) |
 | 127.0.0.1:2480 | Relay XRPC and admin API |
 | 127.0.0.1:3081 | Reference PDS (published on the `relay` service) |
 | 127.0.0.1:6028 | Jetstream WebSocket |
@@ -91,6 +92,19 @@ refuses plain HTTP, explicit ports, and private addresses. LemmyNet's own
 bridge runs with `BRIDGE_SCHEME=http` (dev-only) so its AP ids are plain HTTP
 too. The header comments in `docker-compose.e2e.yml` and
 `e2e/lemmy/Dockerfile` have the details.
+
+### The second Lemmy instance
+
+`lemmy2` (with `lemmy2-postgres` and `pictrs2`) runs the same image as
+`lemmy` (`tidepool-e2e-lemmy`, one Rust build), configured by
+`e2e/lemmy/lemmy2.hjson`: hostname `lemmy2`, plain HTTP, setup admin
+`admin` / `lemmylemmy`. Its users follow communities hosted on `lemmy`, so
+native content reaches it through the community's `Announce`; the native
+takedown test checks that the author's `Delete` and `Undo{Delete}` arrive
+there too. Compose DNS resolves `lemmy`, `lemmy2` and `coves-users` both
+ways on the stack network. The suite sets each instance's federation
+allowlist on first use: `lemmy` allows `tidepool`, `coves-users` and
+`lemmy2`; `lemmy2` allows `lemmy`, `tidepool` and `coves-users`.
 
 ## How the relay is wired
 
@@ -163,6 +177,70 @@ Like `pds`, it runs in the relay's network namespace. The PDS's DID documents
 name `http://localhost:3001`, and the proxy fetches blobs from that endpoint,
 so it has to reach the PDS there. Recreating `relay` drops the AppView's
 networking along with the PDS's; recreate both with it.
+
+### Instance admin and OAuth sign-in
+
+`pds-bootstrap` creates a second account on the reference PDS,
+`coves-admin.pds.test` (password `coves-admin-e2e-pass`), the AppView's
+instance admin. The PDS mints a new `did:plc` for it on every stack, so the
+DID is not in the compose file. `pds-bootstrap` reads it from the
+createSession answer and writes it to `/coves-admin/admin.did` on the
+`coves-admin` volume. `coves-appview` waits for `pds-bootstrap` to exit
+successfully, mounts that volume read-only, and its command exports the
+file's contents as `MODERATION_ADMINS` before it execs the server. It exits
+at once if the file is missing or empty. `TestComposeCovesAppView_ModerationAdminFromBootstrappedAccount`
+checks this wiring without Docker.
+
+Tests act as Coves users through the AppView's real OAuth web sign-in
+(`tests/e2e/coves_signin.go`, ported from Coves' `tests/testkit/signin.go`).
+It starts at `/oauth/login`, signs in and consents through the PDS's
+authorization-server UI API, hands the code to `/oauth/callback`, and returns
+the sealed `coves_session`, sent as `Authorization: Bearer` on XRPC calls.
+It follows no redirect on its own and scrubs every password, token, code,
+state and cookie value from its errors. The PDS's issuer is
+`http://localhost:3001`, true only in the relay's namespace; from the host it
+is `127.0.0.1:3081`. The helper's `DialOverrides` sends the connection there
+while URL, Host and Origin keep `localhost:3001`, which the authorization
+server checks requests against.
+
+For the sign-in, the AppView is built with `BUILD_TAGS=dev` (Coves' localhost
+OAuth resolvers live behind that tag) and runs with
+`APPVIEW_PUBLIC_URL=http://127.0.0.1:8093`. In dev mode `/oauth/login`
+redirects any other Host to that one, and the loopback OAuth client's
+`redirect_uri` is built from it. The login limiter allows 10 requests a
+minute per client IP; each sign-in spends two or three.
+
+### Labels
+
+The AppView publishes labels under `INSTANCE_DID=did:web:coves-appview.test`,
+a stack hostname, so nothing resolves the public `did:web:coves.social`.
+`LABEL_SIGNING_KEY` is a fixed test-only K-256 key, and
+`INSTANCE_ATPROTO_PUBLIC_KEY` is the public half of a second test key; Coves
+refuses to start when the two match. With the key set, the AppView serves
+`/.well-known/did.json` with `#atproto_label` and `#atproto_labeler`.
+
+Tidepool follows it with `COVES_LABELER_DID=did:web:coves-appview.test`.
+`handle-tls` has the network alias `coves-appview.test` and a site block
+(`tls internal`, `reverse_proxy relay:8081`), so Tidepool reads the DID
+document over HTTPS with the local CA it already trusts.
+
+Coves publishes `APPVIEW_PUBLIC_URL` as the `#atproto_labeler` endpoint, and
+that has to stay `http://127.0.0.1:8093` for the OAuth sign-in above. Inside
+Tidepool's container that address is nothing, so `coves-appview-forwarder`
+(Caddy, `network_mode: service:tidepool`) listens on
+`127.0.0.1:${COVES_APPVIEW_E2E_PORT:-8093}` in Tidepool's namespace and
+proxies to `relay:8081`, websockets included. Recreating or restarting
+`tidepool` drops the forwarder's networking; the test helpers that do either
+restart the forwarder after it. `TestComposeLabels_TidepoolReachesTheStackLabeler`
+checks this wiring without Docker.
+
+The forwarder also listens on `127.0.0.1:3001` and proxies to `relay:3001`.
+The stack's DID documents name the PDS as `http://localhost:3001`, which is
+the relay's namespace, and Tidepool confirms each `#account` status with
+`getRepoStatus` at that endpoint. The http read is allowed only because
+`ALLOW_PRIVATE_FETCH` is on (development); the terminal `deleted`
+confirmation stays https-only. The forwarder's healthcheck probes both
+forwards.
 
 ## Event ordering through the relay
 
@@ -241,6 +319,49 @@ The suite is `tests/e2e/`, build tag `e2e`. Shared helpers are in
   acceptance and writes a removal record, while the author's `postv2` stays.
 - `votes_hammer_test.go`: ten real voters vote, flip and clear in parallel
   bursts, and the final aggregates are exact.
+
+### Native account ban (`native_account_ban_test.go`)
+
+`native-alice`'s post and comment reach Lemmy, and the instance admin removes
+the comment with `removeContent`. The admin bans her with `banAccount`: both
+show deleted on Lemmy. She deactivates and reactivates her account on the
+stack PDS during the ban, and the test waits for Tidepool to apply each
+`#account` event; Lemmy still shows both deleted. In one run the admin
+unbans her with `unbanAccount` first: the post is restored and the comment
+stays deleted until `restoreContent`. In the other run the comment is
+restored first and stays deleted until the unban. Each run uses its own post
+and comment.
+
+### Native takedown (`native_takedown_test.go`)
+
+A `lemmy2` user follows the community, then `native-alice`'s post and two
+comments reach `lemmy` and, through the community's `Announce`, `lemmy2`. A
+Lemmy moderator removes the second comment. The instance admin removes the
+post and both comments with `removeContent`: `lemmy` shows all three
+deleted by their creator, `lemmy2` the post and first comment, and a fetch
+of the removed post's object id answers 410. The admin restores all three:
+the same items show undeleted, and the moderator's removal of the second
+comment on `lemmy` stays. `lemmy2` is read through the local copies saved when the content
+first arrived, so a refetch from Tidepool cannot stand in for the
+`Announce`.
+
+### Community removal (`community_removal_test.go`)
+
+Tidepool follows a bridged community through a whole-instance entry of the
+follow list, and one of its posts carries an image. The instance admin
+removes the community: the `!takedown` label on its bare DID is stored,
+Lemmy shows Tidepool no longer following it, a later sweep of the same
+instance entry does not follow it again, and Tidepool's `getBlob` refuses
+the image. The restore runs as cleanup only; the restore reconcile is
+covered by unit tests.
+
+### Labels (`labels_test.go`)
+
+The instance admin removes a bridged post with an image on the stack
+AppView. The `!takedown` label reaches Tidepool from the AppView's `did:web`
+labeler, and `getBlob` answers 404 `BlobNotFound` for the image. The restore
+negates the label and `getBlob` serves the same bytes again. Each run uses
+image bytes of its own, so a withhold left by a failed run cannot reach it.
 
 ### Follow list (`follow_list_test.go`)
 
@@ -327,6 +448,19 @@ uploads a PNG to the reference PDS and writes a `postv2` that embeds it, then
 expects `HEAD` and `GET` of the blob's proxy URL to return 200 with an
 `image/*` type. A second blob, embedded only in a post to a community the
 AppView never indexed, exists on the PDS but returns 404 from the proxy.
+
+### Coves moderation views (`coves_moderation_records_test.go`)
+
+The removal and ban records Tidepool writes for a Lemmy moderator reach
+Coves' served views through the relay and Jetstream. A Lemmy moderator
+removes a bridged comment: `getComments` shows it as a community-removed
+placeholder, and after the restore as live with its original text. The
+signed-in instance admin gets 200 from `social.coves.moderation.getSubjectState`
+for the comment, where `native-alice` gets 403. The moderator then bans
+`native-alice`'s persona from the community: `social.coves.community.get`
+shows her the ban, and `social.coves.community.post.create` refuses her with
+403 `Banned`. After the unban she can post again. Both users sign in through
+the OAuth helper above.
 
 ### Suite-end sweep (`zz_sweep_test.go`)
 

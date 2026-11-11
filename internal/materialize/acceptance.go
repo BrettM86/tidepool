@@ -87,16 +87,49 @@ func (m *Materializer) acceptPost(ctx context.Context, communityDID, postURI, po
 // the subject at rkey. Acceptance and removal share the digest key, so this is
 // a lookup rather than a search.
 func (m *Materializer) removalStands(ctx context.Context, communityDID, rkey string) (bool, error) {
-	_, _, err := m.repos.GetRecord(ctx, communityDID, CollectionRemoval, rkey)
+	cid, err := m.removalRecordCID(ctx, communityDID, rkey)
+	return cid != "", err
+}
+
+// removalRecordCID is the CID of communityDID's removal record at rkey, or ""
+// when none stands.
+func (m *Materializer) removalRecordCID(ctx context.Context, communityDID, rkey string) (string, error) {
+	_, cid, err := m.repos.GetRecord(ctx, communityDID, CollectionRemoval, rkey)
 	switch {
 	case err == nil:
-		return true, nil
+		return cid, nil
 	case errors.IsNotFound(err):
-		return false, nil
+		return "", nil
 	default:
-		return false, fmt.Errorf("materialize: read removal %s/%s/%s: %w",
+		return "", fmt.Errorf("materialize: read removal %s/%s/%s: %w",
 			communityDID, CollectionRemoval, rkey, err)
 	}
+}
+
+// RemovalStands reports whether the community the bridged post or comment of
+// mapping binds to has a removal record of it standing.
+func (m *Materializer) RemovalStands(ctx context.Context, mapping *store.APObjectMapping) (bool, error) {
+	cid, err := m.RemovalRecordCID(ctx, mapping)
+	return cid != "", err
+}
+
+// RemovalRecordCID is the CID of the removal record of the bridged post or
+// comment of mapping that its community has standing, or "" when none stands.
+// The community restore reconcile reads it before and after an origin fetch,
+// so the origin's answer is applied only to the removal state it was fetched
+// under.
+func (m *Materializer) RemovalRecordCID(ctx context.Context, mapping *store.APObjectMapping) (string, error) {
+	var communityDID string
+	var err error
+	if mapping != nil && mapping.Collection == CollectionComment {
+		communityDID, err = m.commentModerationTarget(ctx, mapping)
+	} else {
+		communityDID, _, _, err = m.moderationTarget(ctx, mapping)
+	}
+	if err != nil {
+		return "", err
+	}
+	return m.removalRecordCID(ctx, communityDID, SubjectRKey(mapping.ATURI))
 }
 
 // RemovalCodeModeratorDiscretion is the removal lexicon's catch-all: Lemmy

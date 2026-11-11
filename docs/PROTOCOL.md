@@ -253,6 +253,152 @@ bridged communities into ActivityPub and delivers it to the community's inbox
   switches and dry run are in
   [CONFIGURATION.md](CONFIGURATION.md#outbound-federation).
 
+### Coves instance takedowns
+
+A Coves instance admin's `removeContent` or account and community takedown
+reaches Tidepool as a signed `!takedown` label (see the label consumer in
+[CONFIGURATION.md](CONFIGURATION.md)). For native content the bridge
+delivered, Tidepool acts as the author:
+
+- Each native object has a set of takedown sources: its record label, its
+  author's account label or account status, and its community's label. The
+  object is removed while the set is non-empty.
+- When the set becomes non-empty and the object reached its community, the
+  bridge sends a `Delete` of the object from the author's persona, without
+  `summary`, so Lemmy treats it as the author's delete and not as a failed
+  moderator action. An object never delivered gets no `Delete`; one still
+  in flight gets it once its delivery settles.
+- When the set becomes empty again, the bridge sends `Undo{Delete}` whose
+  `object` is that episode's `Delete`, unless the author deleted the object
+  or the author's identity was withdrawn. A second removal is a new episode
+  with its own `Delete` and `Undo` ids.
+- Queued `Create` and `Update` deliveries of a removed object, and replies
+  under a removed parent, are held, not cancelled. They are released to the
+  tail of their community's queue behind the `Undo{Delete}`, in their
+  original order. The restore `Undo` waits while the author's delivery is
+  paused.
+- `GET` of a removed object's id answers 410 with an AS2 `Tombstone`
+  (`formerType` set). The restore brings the 200 back.
+- Lemmy announces the author's `Delete` and `Undo{Delete}` to the
+  community's followers, so other instances that copied the object follow
+  it. A Lemmy moderator's removal of the same object is separate state on
+  Lemmy and stays in force after the Coves restore.
+- A takedown is not an erasure: it never sends `Delete{Person}` and never
+  calls the purger.
+
+Account takedowns:
+
+- An account label names the bare DID. On a native persona it adds an
+  account-label source to the persona's pause and to every delivered object;
+  a negation removes both. A label's `exp` lapsing is applied like a
+  negation by a periodic check (every minute). A re-ban is a newer label
+  that replaces the expiry, so an older label's lapse never lifts it.
+- A `#account` frame applies its status pause at once, then confirms the
+  status with `com.atproto.sync.getRepoStatus` at the DID's PDS. A confirmed
+  `takendown` or `suspended` adds the account-status source to every
+  delivered object. A confirmed `active`, `deactivated` or `throttled`
+  removes it; any other answer changes nothing. A relay `active` lifts the
+  status pause only when the PDS confirms `active`. A failed read leaves the
+  object sources as they were and retries the frame. `deactivated` and
+  `throttled` alone pause and send no `Delete`.
+- The label and the status are separate pause sources: delivery resumes, and
+  an object restores, only when every source is gone. While a takedown
+  source (label, `takendown` or `suspended`) pauses the persona, its queued
+  deliveries are held and released on restore, and an edit to an accepted
+  post is kept and delivered after the `Undo{Delete}`. A pause from
+  `deactivated` or `throttled` alone cancels queued work as before.
+- On a bridged person (not a community), an account label withholds every
+  blob the DID owns, including blobs stored later, and holds native replies
+  beneath that account's bridged content, including replies already queued.
+  Negation or lapse lifts the withhold and releases the replies.
+- Labels stored before the subject existed apply when it becomes actionable:
+  at start for existing personas and bridged accounts, and in the mint
+  transaction for a persona or bridged person created later. A
+  purger-tombstoned persona gets no restore.
+
+Community takedowns:
+
+- A label on a bridged community's bare DID removes the community. Tidepool
+  records the removal with the community's follow state and follow
+  provenance and sets the follow state to `none`; once the label is committed
+  it sends `Undo{Follow}`. The removal records the `Undo{Follow}` as owed; a
+  failed send stays owed and the follow retrier resends it at its start and
+  every sweep. Records already bridged stay.
+- While the removal stands, nothing follows the community again: a follow
+  sweep skips it (listed under `suppressed`), the follow retrier does not
+  resend (and takes back with `Undo{Follow}` a resend the removal overtook),
+  `POST /admin/communities` and `POST /admin/communities/backfill` answer
+  409, queued backfill walks are dropped and a running walk stops before its
+  next item, and an `Accept` that arrives is ignored. A label that arrives
+  before Tidepool has the community refuses the follow the same way.
+  `DELETE /admin/communities` during the removal records the community as
+  not followed at the removal.
+- Every blob of the community's hosted bridged records is withheld,
+  including records committed later. The negation lifts only these rows,
+  except those an author delete kept (`label-takedown-author-deleted`: the
+  author deleted the record while the label stood, and its bytes stay
+  stored); those stay until an operator deletes the bytes or the record is
+  undeleted.
+- Native objects in the community get the community-label source: delivered
+  ones get a `Delete`, queued `Create`, `Update`, votes and replies under the
+  community's bridged posts are held. An edit of an accepted post is kept
+  and delivered after the `Undo{Delete}`; a new post is refused as not
+  followed.
+- The negation clears the removal, sends `Undo{Delete}` and releases held
+  work. It follows the community again only when the follow state at removal
+  was `accepted` or `pending` and the follow was manual or the follow list
+  still wants the community: it records the community `pending` with the
+  `Follow` owed, and the follow retrier's next sweep sends it. An `Accept`
+  before that send is ignored; the `Accept` of the sent `Follow` triggers a
+  backfill. An `Undo{Follow}` still owed is then dropped unsent; one already
+  in flight that lands after the community is followed again leaves it
+  `pending` with a fresh `Follow` owed.
+- A negation that clears a removal also marks the community's reconcile
+  pending, followed again or not. A reconcile pass runs once the community
+  is ready: not removed, its follow not `pending`, and an `accepted` follow's
+  backfill completed cleanly. The clean backfill walk starts the pass;
+  sweeps at start and every 10 minutes run pending passes too. A pass
+  fetches each kept object (a live bridged post or comment of the community)
+  from its origin with a pinned-authority signed GET:
+  - live (200 with the requested object: same id, a supported
+    `Page`/`Note`/`Article` type), with a removal record standing, and the
+    object on the community's own instance (same scheme and host as the
+    `Group`): the removal is restored as an `Undo{Delete}` would (removal
+    record deleted, its removal withholds lifted);
+  - live, otherwise: nothing. An object on another instance is fetched from
+    that instance, which answers for its own deletions but not for the
+    community's removals, so its removal record stays;
+  - 404, or Lemmy's 400 `couldnt_find_post` for a post or
+    `couldnt_find_comment` for a comment (its answer for a purged object),
+    which counts as 404: the record is deleted, on any instance;
+  - 410 or a `Tombstone` body: a `moderator-discretion` removal record is
+    written and the record kept, unless a removal record already stands, on
+    any instance;
+  - anything else (401/403, 429/5xx, any other 400, an off-authority
+    redirect, a transport error, a dead instance): nothing; a later pass
+    fetches it again. The pinned-authority GET does not report a gone host,
+    so a dead instance is retried like any other failure.
+  The first pass for a pending mark records when it started. The mark is
+  cleared, by compare-and-set on the value the pass read at its start (a
+  newer negation during the pass sets a newer value, which keeps the
+  reconcile pending for its own pass), when every kept object got one of
+  the final outcomes above and every write succeeded. Until 72 hours (the
+  backfill's dead-host window) have passed since the first pass, any fetch
+  failure keeps it; after that, a pass whose only non-final objects are
+  fetch failures counts them `unreachable`, logs one warning naming their
+  ap ids, changes nothing for them, and clears the mark. A failed write
+  keeps the mark however old it is, and a fetch failure never deletes or
+  removes anything. A new mark restarts the 72 hours. Each outcome is
+  idempotent, so processing is eventual, not exactly-once: objects handled
+  before a restart are fetched again. Operator and label withholds are not
+  touched. A pass stops when the community is removed again, checked before each
+  fetch and again before applying its answer, and never clears the marker of
+  a removed community. Counters
+  `tidepool_community_reconcile_{live,restored,deleted,removed,retry,
+  unreachable,passes_completed}`; one `community reconcile pass` log line
+  per pass.
+- Labels stored before start are applied at start.
+
 ## Coves user origin (the `coves.social` AP surface)
 
 Coves users get their own ActivityPub identities on `AP_USER_ORIGIN`. This is

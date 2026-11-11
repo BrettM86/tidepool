@@ -40,6 +40,8 @@ var knownOneShotServices = []string{
 // composeFile is the slice of a compose file this check reads.
 type composeFile struct {
 	Services map[string]composeService `yaml:"services"`
+	// Volumes are the top-level named volumes, checked only for presence.
+	Volumes map[string]yaml.Node `yaml:"volumes"`
 }
 
 type composeService struct {
@@ -52,6 +54,17 @@ type composeService struct {
 	DependsOn yaml.Node `yaml:"depends_on"`
 	// Environment is decoded in its map form, the only form the file uses.
 	Environment map[string]string `yaml:"environment"`
+	// Volumes is decoded in its short string form, the only form the file uses.
+	Volumes []string `yaml:"volumes"`
+	// Entrypoint and Command stay raw nodes because Compose accepts a string
+	// or a list for each.
+	Entrypoint yaml.Node `yaml:"entrypoint"`
+	Command    yaml.Node `yaml:"command"`
+	// NetworkMode is the raw network_mode, e.g. "service:relay".
+	NetworkMode string `yaml:"network_mode"`
+	// Networks stays a raw node because Compose accepts a list of network
+	// names or a map of network name to settings (aliases, addresses).
+	Networks yaml.Node `yaml:"networks"`
 }
 
 // composeDependency is one entry of the long depends_on form.

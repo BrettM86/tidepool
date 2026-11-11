@@ -31,7 +31,7 @@ func NewCommunities(db *sql.DB) Communities {
 const communityColumns = `
 	id, ap_group_id, did, preferred_username, instance,
 	follow_state, followed_at, last_backfill_at, created_at,
-	follow_requested_at, follow_attempts`
+	follow_requested_at, follow_attempts, follow_provenance`
 
 func (r *postgresCommunities) UpsertCommunity(ctx context.Context, community Community) (*Community, error) {
 	if err := validateCommunity(&community); err != nil {
@@ -111,6 +111,18 @@ func (r *postgresCommunities) GetByDID(ctx context.Context, did string) (*Commun
 }
 
 func (r *postgresCommunities) SetFollowState(ctx context.Context, apGroupID string, state FollowState) error {
+	return setFollowState(ctx, r.db, apGroupID, state)
+}
+
+// SetFollowStateTx is SetFollowState inside the caller's transaction.
+func SetFollowStateTx(ctx context.Context, tx *sql.Tx, apGroupID string, state FollowState) error {
+	if tx == nil {
+		return errors.NewValidationError("tx", "must not be nil")
+	}
+	return setFollowState(ctx, tx, apGroupID, state)
+}
+
+func setFollowState(ctx context.Context, db execer, apGroupID string, state FollowState) error {
 	if !state.Valid() {
 		return errors.NewValidationError("follow_state", fmt.Sprintf("unknown state %q", state))
 	}
@@ -145,7 +157,7 @@ func (r *postgresCommunities) SetFollowState(ctx context.Context, apGroupID stri
 		    follow_state = $2
 		WHERE ap_group_id = $1`
 
-	result, err := r.db.ExecContext(ctx, query, apGroupID, string(state))
+	result, err := db.ExecContext(ctx, query, apGroupID, string(state))
 	if err != nil {
 		return fmt.Errorf("set follow_state for %q: %w", apGroupID, err)
 	}
@@ -221,7 +233,8 @@ func (r *postgresCommunities) ClaimStalePendingFollows(ctx context.Context, requ
 	//     back to pending).
 	// NULL follow_requested_at (legacy rows from before migration 012) is
 	// treated as stale: a pending row with no recorded send time has, by
-	// definition, waited longer than any threshold.
+	// definition, waited longer than any threshold. A removed community is
+	// never claimed: no Follow goes to it while its removal stands.
 	query := `
 		UPDATE communities
 		SET follow_attempts = follow_attempts + 1,
@@ -229,6 +242,7 @@ func (r *postgresCommunities) ClaimStalePendingFollows(ctx context.Context, requ
 		WHERE follow_state = 'pending'
 		  AND follow_attempts < $2
 		  AND (follow_requested_at IS NULL OR follow_requested_at < $1)
+		  AND NOT ` + communityRemovedCondition("communities.did") + `
 		RETURNING` + communityColumns
 
 	rows, err := r.db.QueryContext(ctx, query, requestedBefore, maxAttempts)
@@ -276,16 +290,18 @@ func validateCommunity(community *Community) error {
 func scanCommunity(row rowScanner) (*Community, error) {
 	var community Community
 	var followState string
+	var provenance sql.NullString
 	err := row.Scan(
 		&community.ID, &community.APGroupID, &community.DID,
 		&community.PreferredUsername, &community.Instance,
 		&followState, &community.FollowedAt, &community.LastBackfillAt,
 		&community.CreatedAt,
-		&community.FollowRequestedAt, &community.FollowAttempts,
+		&community.FollowRequestedAt, &community.FollowAttempts, &provenance,
 	)
 	if err != nil {
 		return nil, err
 	}
 	community.FollowState = FollowState(followState)
+	community.FollowProvenance = FollowProvenance(provenance.String)
 	return &community, nil
 }

@@ -12,6 +12,7 @@ import (
 	"tidepool/internal/ap"
 	"tidepool/internal/blobwithhold"
 	"tidepool/internal/errors"
+	"tidepool/internal/labels"
 	"tidepool/internal/repo"
 	"tidepool/internal/store"
 )
@@ -113,11 +114,15 @@ func (m *Materializer) HandleDeleteRecord(ctx context.Context, apID string) erro
 // announced Delete). For a postv2 or a comment the record delete's own commit
 // also deletes the bytes of every blob the subject used that no other record
 // in the same repo still references (see deleteAuthorRecord). Decision
-// 2026-11-07: neither a moderator restore nor the author can bring the record
-// back, so nothing is kept for one. Decision 2026-11-08: while a community
-// removal of the subject stands, the delete keeps every byte and every
-// community-removal row, so an uploader cannot wipe a removed image before an
-// operator withholds it. Every other delete keeps the bytes.
+// 2026-11-07: no bytes are kept for a later restore; an author's undelete
+// re-materializes the record from the origin. Decision 2026-11-08: while a
+// community removal of the subject stands, the delete keeps every byte and
+// every community-removal row, so an uploader cannot wipe a removed image
+// before an operator withholds it. Absent a standing removal, a standing Coves
+// `!takedown` label keeps them the same way, and marks the subject's label
+// rows author-deleted so a later negation keeps them while the record is gone;
+// an undelete's commit clears the marks (see label_withholds.go).
+// Every other delete keeps the bytes.
 func (m *Materializer) HandleAuthorDeleteRecord(ctx context.Context, apID string) error {
 	if apID == "" {
 		return errors.NewValidationError("ap_id", "must not be empty")
@@ -140,21 +145,45 @@ func (m *Materializer) HandleAuthorDeleteRecord(ctx context.Context, apID string
 // deleteAuthorRecord deletes the subject's record and, as the side effect of
 // that same commit, the bytes of the blobs the subject used that no record
 // left in its repo references: every CID the deleted record referenced. A CID
-// another record references, or an operator withhold holds, keeps its bytes.
+// another record references, or an operator withhold holds, keeps its bytes,
+// and so does a CID an active subject- or community-scope row of the owner
+// still claims (blobwithhold.KeepsOwnerBytesTx): for example the kept label
+// row of another record of the author that shared the image and was deleted
+// under a `!takedown` first.
 //
-// A removed subject keeps everything (decision 2026-11-08): when its
-// community's removal record stands, read in the commit's transaction, the
-// commit deletes no bytes and lifts no community-removal row, so an uploader
-// cannot wipe the bridge's copy of a removed image before an operator
-// withholds it. The rows, written with the removal, keep the CIDs refused for
-// the owner, add-only as removal_withholds.go documents; the commit adds any
-// row the deleted record's CIDs lack (a removal written before removals
-// withheld blobs), since the back-fill cannot once the record is gone. A later moderator
-// restore finds no subject record to re-accept (the origin answers a
+// A removed or labeled subject keeps everything (decision 2026-11-08): when
+// its community's removal record stands, or a Coves `!takedown` label stands
+// for its at-uri, read in the commit's transaction, the commit deletes no
+// bytes and lifts no withhold row, so an uploader cannot wipe the bridge's
+// copy of a moderated image before an operator withholds it. Under a label
+// with no standing removal (a standing removal returns before the label is
+// read) the commit adds any label row the deleted record's CIDs lack and
+// gives every active label row of the subject the
+// label-takedown-author-deleted code; a later negation lifts every label row
+// of the absent subject except those, so they keep the bytes refused until an
+// operator's delete-bytes action removes them or the author's undelete
+// re-materializes the record, whose commit lifts the marked rows when no label
+// stands and gives them the label-takedown code while one stands (see
+// label_withholds.go). A
+// record with no blob left (an edit dropped its image while the label stood)
+// still has its earlier label rows marked. Under a removal the rows,
+// written with the removal,
+// keep the CIDs refused for the owner, add-only as removal_withholds.go
+// documents; the commit adds any row the deleted record's CIDs lack (a
+// removal written before removals withheld blobs), since the back-fill
+// cannot once the record is gone. A later moderator restore finds no subject record to re-accept (the origin answers a
 // tombstone), so the removal record and its rows stay and getBlob keeps
 // refusing; the bytes stay stored until an operator's delete-bytes action
 // removes them. A subject whose community cannot be determined (CommunityDIDOf
-// answers "") has no removal to find, and its bytes go.
+// answers "") has no removal to find, and its bytes go unless a label stands.
+// A standing `!takedown` on the record's community keeps the bytes too (see
+// keepCommunityLabelWithholdsOnAuthorDelete): its community rows of the owner
+// for the CIDs no remaining record of the owner references, including CIDs
+// only an earlier version of the record referenced, are marked author-deleted,
+// so the community's negation keeps them refused while the record is gone.
+// This runs first, whether or not a removal or a record label also stands:
+// those sources keep only the deleted version's CIDs, so without it the
+// negation would serve an earlier version's image.
 //
 // The references are read inside the commit, under the global commit lock,
 // against the tree after the delete, so a record committed to the repo before
@@ -166,9 +195,12 @@ func (m *Materializer) HandleAuthorDeleteRecord(ctx context.Context, apID string
 // landing in between fails the commit (retryable) rather than leaving the
 // edit's CIDs unconsidered.
 //
-// The removal check runs only when the record references a blob, and the repo
-// walk only when the subject is not removed, so a delete of a record with no
-// blobs does not read the author's tree.
+// The removal check runs only when the record references a blob, and the
+// repo walk only when the subject is neither removed nor labeled, or when its
+// community's label stands, so a delete of a record with no blobs reads the
+// author's tree only under a community label, and at most once per delete;
+// both label checks run on every delete, for the rows an earlier version of
+// the record left.
 //
 // Not closed: every store of a subject CID that finishes before this
 // commit loses its bytes, whether it inserted them or found them already
@@ -199,8 +231,13 @@ func (m *Materializer) deleteAuthorRecord(ctx context.Context, mapping *store.AP
 		RKey:          mapping.RKey,
 		ExpectPrevCID: &recordCID,
 	}}, func(ctx context.Context, tx *sql.Tx, _ *repo.CommitResult) error {
+		communityLabeled, err := m.keepCommunityLabelWithholdsOnAuthorDelete(ctx, tx, mapping.DID, communityDID, subjectCIDs)
+		if err != nil {
+			return err
+		}
 		if len(subjectCIDs) == 0 {
-			return nil
+			_, err := keepLabelWithholdsOnAuthorDelete(ctx, tx, mapping, nil)
+			return err
 		}
 		code, removed, err := m.standingRemovalCode(ctx, tx, mapping.Collection, mapping.ATURI, communityDID)
 		if err != nil {
@@ -214,13 +251,23 @@ func (m *Materializer) deleteAuthorRecord(ctx context.Context, mapping *store.AP
 			}
 			return nil
 		}
-		entries, err := m.repos.ListRecordsTx(ctx, tx, mapping.DID)
-		if err != nil && !errors.IsNotFound(err) {
-			return fmt.Errorf("materialize: list records of %s: %w", mapping.DID, err)
+		labeled, err := keepLabelWithholdsOnAuthorDelete(ctx, tx, mapping, subjectCIDs)
+		if err != nil || labeled || communityLabeled {
+			return err
 		}
-		references := blobReferencesOf(entries)
+		references, err := m.blobReferencesTx(ctx, tx, mapping.DID)
+		if err != nil {
+			return err
+		}
 		for _, blobCID := range subjectCIDs {
 			if len(references.byBlob[blobCID]) > 0 {
+				continue
+			}
+			kept, err := blobwithhold.KeepsOwnerBytesTx(ctx, tx, mapping.DID, blobCID)
+			if err != nil {
+				return fmt.Errorf("materialize: withholds of blob %s under %s on delete: %w", blobCID, mapping.DID, err)
+			}
+			if kept {
 				continue
 			}
 			if _, err := m.repos.DeleteBlobTx(ctx, tx, mapping.DID, blobCID); err != nil {
@@ -230,6 +277,78 @@ func (m *Materializer) deleteAuthorRecord(ctx context.Context, mapping *store.AP
 		return nil
 	})
 	return err
+}
+
+// keepLabelWithholdsOnAuthorDelete is the label half of deleteAuthorRecord's
+// commit: while a `!takedown` stands for the subject, read in tx, it adds a
+// label row for each of subjectCIDs that has none and gives every active
+// label row of the subject the author-deleted code, so a later negation keeps
+// them while the record is gone. labeled reports whether the label stands.
+func keepLabelWithholdsOnAuthorDelete(ctx context.Context, tx *sql.Tx, mapping *store.APObjectMapping, subjectCIDs []string) (labeled bool, err error) {
+	labeled, err = labels.StandingTx(ctx, tx, mapping.ATURI, LabelTakedown)
+	if err != nil {
+		return false, fmt.Errorf("materialize: label state of %s on delete: %w", mapping.ATURI, err)
+	}
+	if !labeled {
+		return false, nil
+	}
+	if err := blobwithhold.AddSubjectLabelWithholds(ctx, tx, mapping.DID, mapping.ATURI, subjectCIDs); err != nil {
+		return false, fmt.Errorf("materialize: withhold labeled %s on delete: %w", mapping.ATURI, err)
+	}
+	if err := blobwithhold.MarkSubjectLabelWithholdsAuthorDeleted(ctx, tx, mapping.ATURI); err != nil {
+		return false, fmt.Errorf("materialize: keep label withholds of %s on delete: %w", mapping.ATURI, err)
+	}
+	return true, nil
+}
+
+// keepCommunityLabelWithholdsOnAuthorDelete is the community label half of
+// deleteAuthorRecord's commit: while a `!takedown` stands for communityDID,
+// the community of the deleted record (empty for none), read in tx, the
+// delete keeps every byte of subjectCIDs (a community `!takedown` is a Coves
+// takedown). It adds the community row of each CID for ownerDID that has none
+// and marks author-deleted every active community row of the owner whose CID
+// no remaining record of the owner references (read in tx, after the delete),
+// whether or not the deleted record still referenced it: an edit committed
+// while the label stood can have dropped or replaced an image the label's
+// scan withheld, and its bytes stay stored. So the community's negation keeps
+// refusing the kept bytes while serving the CIDs a live record still uses.
+// labeled reports whether the community's label stands.
+func (m *Materializer) keepCommunityLabelWithholdsOnAuthorDelete(ctx context.Context, tx *sql.Tx, ownerDID, communityDID string, subjectCIDs []string) (labeled bool, err error) {
+	if communityDID == "" {
+		return false, nil
+	}
+	labeled, err = labels.StandingTx(ctx, tx, communityDID, LabelTakedown)
+	if err != nil {
+		return false, fmt.Errorf("materialize: label state of community %s on delete: %w", communityDID, err)
+	}
+	if !labeled {
+		return false, nil
+	}
+	if err := blobwithhold.AddCommunityLabelWithholds(ctx, tx, communityDID, ownerDID, subjectCIDs); err != nil {
+		return false, fmt.Errorf("materialize: withhold deleted record of %s in labeled community %s: %w", ownerDID, communityDID, err)
+	}
+	references, err := m.blobReferencesTx(ctx, tx, ownerDID)
+	if err != nil {
+		return false, err
+	}
+	referenced := make([]string, 0, len(references.byBlob))
+	for blobCID := range references.byBlob {
+		referenced = append(referenced, blobCID)
+	}
+	if err := blobwithhold.MarkUnreferencedCommunityLabelWithholdsAuthorDeleted(ctx, tx, communityDID, ownerDID, referenced); err != nil {
+		return false, fmt.Errorf("materialize: keep community label withholds of %s in %s on delete: %w", ownerDID, communityDID, err)
+	}
+	return true, nil
+}
+
+// blobReferencesTx walks did's current records, read in tx. A repo that does
+// not exist references nothing.
+func (m *Materializer) blobReferencesTx(ctx context.Context, tx *sql.Tx, did string) (*blobReferences, error) {
+	entries, err := m.repos.ListRecordsTx(ctx, tx, did)
+	if err != nil && !errors.IsNotFound(err) {
+		return nil, fmt.Errorf("materialize: list records of %s: %w", did, err)
+	}
+	return blobReferencesOf(entries), nil
 }
 
 // SuppressActor stops bridging an actor that opted out (#nobridge/#nobot)

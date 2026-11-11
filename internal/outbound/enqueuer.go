@@ -51,6 +51,7 @@ type Enqueuer struct {
 	activities store.OutboundActivities
 	deliveries store.OutboundDeliveries
 	apObjects  store.APObjects
+	takedowns  store.OutboundTakedowns
 	userOrigin string
 	originHost string
 	logger     *slog.Logger
@@ -84,6 +85,7 @@ func NewEnqueuer(opts EnqueuerOptions) (*Enqueuer, error) {
 		activities: activities,
 		deliveries: deliveries,
 		apObjects:  store.NewAPObjects(opts.DB),
+		takedowns:  store.NewOutboundTakedowns(opts.DB),
 		userOrigin: opts.UserOrigin,
 		originHost: originHost,
 		logger:     logger,
@@ -165,6 +167,168 @@ func (e *Enqueuer) EnqueueActivity(ctx context.Context, tx *sql.Tx, actorDID, or
 		OrderingKey: community,
 	}); err != nil {
 		return fmt.Errorf("enqueue delivery for %s: %w", intent.ActivityID(), err)
+	}
+	publishing := translated.Kind == "Create" || translated.Kind == "Update"
+	vote := translated.Kind == "Like" || translated.Kind == "Dislike"
+	if !publishing && !vote {
+		return nil
+	}
+	// The takedown reads below run under the subjects' takedown locks, so a
+	// restore committing concurrently either commits first (and is read) or
+	// runs after this tx and finds the held row. The parent's account is a
+	// subject too: a bridged account's label release takes it; so are the
+	// communities the work is bound to, which a community's release takes.
+	// So is the object's own account: an account-wide takedown holds it from
+	// its objects reread to its commit, so a new object of the actor commits
+	// either before that reread (and is taken down with the rest) or after
+	// the pause, which the worker then reads before delivering it.
+	communities, err := e.takedowns.CommunitySubjectsTx(ctx, tx, community, parentATURI)
+	if err != nil {
+		return err
+	}
+	objectATURI := publishedObjectATURI(intent)
+	subjects := append([]string{objectATURI, store.AccountSubjectOf(objectATURI), parentATURI,
+		store.AccountSubjectOf(parentATURI)}, communities...)
+	if err := store.LockTakedownSubjectsTx(ctx, tx, subjects...); err != nil {
+		return err
+	}
+	if publishing {
+		if err := e.holdIfTakenDown(ctx, tx, objectATURI, intent); err != nil {
+			return err
+		}
+		// Before the parent check: a row held on its parent would be released
+		// by the parent's restore ahead of the object's consent-held restore
+		// Undo.
+		if err := e.holdIfRestoreHeldOnConsent(ctx, tx, objectATURI, intent); err != nil {
+			return err
+		}
+		if err := e.holdIfParentTakenDown(ctx, tx, parentATURI, intent); err != nil {
+			return err
+		}
+	}
+	return e.holdIfCommunityRemoved(ctx, tx, communities, intent)
+}
+
+// holdIfCommunityRemoved holds a Create, Update or vote just enqueued into a
+// bridged community whose `!takedown` stands, on the community: the work of an
+// object created during the removal (which has no takedown source of its own)
+// and every vote wait for the negation, whose release takes the community's
+// subject lock. A row an earlier check already held stays on that blocker
+// (HoldActivityTx holds only pending rows); its release rechecks the parent.
+func (e *Enqueuer) holdIfCommunityRemoved(ctx context.Context, tx *sql.Tx, communities []string, intent consume.Intent) error {
+	removed, err := e.takedowns.RemovedCommunityTx(ctx, tx, communities)
+	if err != nil || removed == "" {
+		return err
+	}
+	if _, err := e.deliveries.HoldActivityTx(ctx, tx, intent.ActivityID(), store.HeldReasonCommunity, removed); err != nil {
+		return fmt.Errorf("hold %s for its community's removal: %w", intent.ActivityID(), err)
+	}
+	return nil
+}
+
+// holdIfRestoreHeldOnConsent holds a Create or Update just enqueued on consent
+// while its object's takedown restore is held on consent, so the edit is
+// released behind the restore Undo{Delete} and the older work held with it:
+// the restore delivers the latest state. A row already held on its object's
+// takedown stays on that blocker (HoldActivityTx holds only pending rows).
+// ReleaseConsentHeldTx rechecks the parent when it releases the row.
+func (e *Enqueuer) holdIfRestoreHeldOnConsent(ctx context.Context, tx *sql.Tx, atURI string, intent consume.Intent) error {
+	if atURI == "" {
+		return nil
+	}
+	held, err := e.deliveries.HasConsentHoldTx(ctx, tx, atURI)
+	if err != nil {
+		return fmt.Errorf("read consent hold of %s: %w", atURI, err)
+	}
+	if !held {
+		return nil
+	}
+	if _, err := e.deliveries.HoldActivityTx(ctx, tx, intent.ActivityID(), store.HeldReasonConsent, atURI); err != nil {
+		return fmt.Errorf("hold %s behind its consent-held restore: %w", intent.ActivityID(), err)
+	}
+	return nil
+}
+
+// holdIfParentTakenDown holds a reply's Create or Update just enqueued while
+// the parent it answers is taken down: a native parent with a non-empty
+// takedown set, or a bridged parent under a standing `!takedown` label. The
+// parent's restore releases it. A row the object's own takedown already held
+// is left on that blocker; its release rechecks the parent.
+func (e *Enqueuer) holdIfParentTakenDown(ctx context.Context, tx *sql.Tx, parentATURI string, intent consume.Intent) error {
+	if parentATURI == "" {
+		return nil
+	}
+	removed, err := e.takedowns.IsParentRemovedTx(ctx, tx, parentATURI)
+	if err != nil {
+		return fmt.Errorf("read takedown of parent %s: %w", parentATURI, err)
+	}
+	if !removed {
+		return nil
+	}
+	if _, err := e.deliveries.HoldActivityTx(ctx, tx, intent.ActivityID(), store.HeldReasonParent, parentATURI); err != nil {
+		return fmt.Errorf("hold %s for its parent's takedown: %w", intent.ActivityID(), err)
+	}
+	return nil
+}
+
+// holdIfTakenDown holds a Create or Update just enqueued for an object whose
+// takedown source set is non-empty, so it waits off the queue until the
+// object is restored. A label can stand before the object is first seen.
+func (e *Enqueuer) holdIfTakenDown(ctx context.Context, tx *sql.Tx, atURI string, intent consume.Intent) error {
+	if atURI == "" {
+		return nil
+	}
+	removed, err := e.takedowns.IsRemovedTx(ctx, tx, atURI)
+	if err != nil {
+		return fmt.Errorf("read takedown of %s: %w", atURI, err)
+	}
+	if !removed {
+		return nil
+	}
+	if _, err := e.deliveries.HoldForObjectTx(ctx, tx, atURI); err != nil {
+		return fmt.Errorf("hold %s for its takedown: %w", intent.ActivityID(), err)
+	}
+	return nil
+}
+
+// publishedObjectATURI is the at-uri of the post or comment intent publishes;
+// empty for any other intent.
+func publishedObjectATURI(intent consume.Intent) string {
+	switch typed := intent.(type) {
+	case consume.CommentIntent:
+		return typed.ATURI
+	case consume.PostIntent:
+		return typed.ATURI
+	default:
+		return ""
+	}
+}
+
+// enqueueTranslatedTx writes an already-translated activity by actorDID and
+// its delivery to community's inbox, on the community's ordering key, in tx.
+// It is the takedown path's enqueue: the activity is minted from stored state,
+// not from a consume.Intent.
+func (e *Enqueuer) enqueueTranslatedTx(ctx context.Context, tx *sql.Tx, actorDID, community string,
+	translated *TranslatedActivity) error {
+	if _, err := e.activities.InsertTx(ctx, tx, store.OutboundActivity{
+		ActivityID:  translated.ActivityID,
+		ActorDID:    actorDID,
+		Kind:        translated.Kind,
+		Payload:     translated.Payload,
+		ParentATURI: translated.ParentATURI,
+	}); err != nil {
+		return fmt.Errorf("insert outbound activity %s: %w", translated.ActivityID, err)
+	}
+	inbox, err := e.inboxes.ResolveInbox(ctx, community)
+	if err != nil {
+		return fmt.Errorf("resolve inbox for community %s: %w", community, err)
+	}
+	if _, err := e.deliveries.EnqueueTx(ctx, tx, store.OutboundDelivery{
+		ActivityID:  translated.ActivityID,
+		TargetInbox: inbox,
+		OrderingKey: community,
+	}); err != nil {
+		return fmt.Errorf("enqueue delivery for %s: %w", translated.ActivityID, err)
 	}
 	return nil
 }

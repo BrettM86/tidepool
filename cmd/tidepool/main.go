@@ -36,6 +36,7 @@ import (
 	"tidepool/internal/handlemigration"
 	"tidepool/internal/identity"
 	"tidepool/internal/ingest"
+	"tidepool/internal/labels"
 	"tidepool/internal/linkpreview"
 	"tidepool/internal/materialize"
 	"tidepool/internal/media"
@@ -608,6 +609,20 @@ func run(logger *slog.Logger) error {
 		seeder = lemmySeeder
 	}
 
+	// A restored community's kept objects are reconciled with their origins
+	// once its re-follow's backfill completes (OnComplete below), and by
+	// sweeps at start and on an interval (restart resume, retries).
+	communityReconciler, err := ingest.NewCommunityReconciler(ingest.CommunityReconcilerOptions{
+		DB:           database,
+		Fetcher:      apClient,
+		Materializer: materializer,
+		Logger:       logger,
+	})
+	if err != nil {
+		return err
+	}
+	go communityReconciler.Run(ctx)
+
 	backfill, err := ingest.NewBackfill(ingest.BackfillOptions{
 		Fetcher:      apClient,
 		Materializer: materializer,
@@ -622,6 +637,7 @@ func run(logger *slog.Logger) error {
 		// it, and an interrupted run leaves last_backfill_at unset (resumable).
 		BaseContext: ctx,
 		Logger:      logger,
+		OnComplete:  communityReconciler.TriggerAsync,
 	})
 	if err != nil {
 		return err
@@ -718,6 +734,7 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+
 	if _, err := startDelegation(ctx, cfg, actors, repoAcceptanceChecker{repos: repoManager}, admin, delegation.CloudflareAPIBaseURL, logger); err != nil {
 		return fmt.Errorf("delegation: %w", err)
 	}
@@ -814,6 +831,66 @@ func run(logger *slog.Logger) error {
 	}
 	admin.SetDivergenceReconciler(divergence)
 	go divergence.Run(ctx)
+
+	// The Coves label consumer: follows the configured labeler's
+	// subscribeLabels stream and applies `!takedown` labels on hosted bridged
+	// records as blob withholds, and on native records as takedowns (Delete
+	// on Lemmy, Undo{Delete} on restore). Account labels (the bare DID) pause a
+	// native persona and take down its delivered objects, or withhold a bridged
+	// person's blobs and hold native replies beneath its content; a label's exp
+	// lapses like a negation on the consumer's lapse ticker (default 1 minute).
+	// Community labels (a bridged community's bare DID) unfollow the
+	// community and refuse every follow path, withhold the blobs of its bridged
+	// records, and take down native work in it until the negation, which
+	// re-follows by provenance. The store is built after the Admin, whose
+	// community applier it runs, and started after the follow reconciler is
+	// set on it, which the negation reads to decide a re-follow. The three
+	// appliers run in the label's commit tx in this order and each activates
+	// stored labels on start.
+	// Off unless COVES_LABELER_DID is set.
+	// DID resolution and the websocket both go through the SSRF egress guard.
+	var labelsDone <-chan struct{}
+	if cfg.CovesLabelerDID != "" {
+		takedownEnqueuer, err := outbound.NewEnqueuer(outbound.EnqueuerOptions{
+			DB:         database,
+			Translator: outbound.NewTranslator(cfg.APUserOrigin, cfg.CovesMediaBaseURL),
+			Inboxes:    outbound.NewInboxResolver(apClient, outboundInboxTTL),
+			Actors:     store.NewAPActors(database),
+			UserOrigin: cfg.APUserOrigin,
+			Logger:     logger,
+		})
+		if err != nil {
+			return fmt.Errorf("takedown enqueuer: %w", err)
+		}
+		takedowns, err := outbound.NewTakedowns(outbound.TakedownsOptions{
+			DB: database, Enqueuer: takedownEnqueuer, Logger: logger,
+		})
+		if err != nil {
+			return fmt.Errorf("takedowns: %w", err)
+		}
+		labelConsumer, err := labels.NewConsumer(labels.ConsumerOptions{
+			LabelerDID: cfg.CovesLabelerDID,
+			Resolver: &labels.Resolver{
+				PLCDirectoryURL:       cfg.PLCDirectoryURL,
+				HTTPClient:            ap.NewGuardedHTTPClient(cfg.AllowPrivateAddresses, 30*time.Second),
+				AllowInsecureEndpoint: cfg.AllowPrivateAddresses,
+			},
+			Store: labels.NewPostgresStore(database,
+				materializer.LabelApplier(), takedowns.LabelApplier(), admin.CommunityLabelApplier()),
+			Logger:         logger,
+			NetDialContext: ap.NewGuardedDialContext(cfg.AllowPrivateAddresses),
+		})
+		if err != nil {
+			return fmt.Errorf("label consumer: %w", err)
+		}
+		labels.PublishMetrics(labelConsumer)
+		done := make(chan struct{})
+		labelsDone = done
+		go func() {
+			defer close(done)
+			labelConsumer.Run(ctx)
+		}()
+	}
 
 	// The vote-aggregate XRPC (the AppView's side-channel read).
 	votesXRPC, err := votes.NewXRPC(votes.XRPCOptions{DB: database, Logger: logger})
@@ -949,11 +1026,17 @@ func run(logger *slog.Logger) error {
 			// last_backfill_at unset, which is resumable). Wait bounded so a stuck
 			// run can't hold shutdown open past the deadline.
 			drained := make(chan struct{})
-			go func() { backfill.Wait(); admin.Wait(); renameAdmin.Wait(); close(drained) }()
+			go func() {
+				backfill.Wait()
+				admin.Wait()
+				renameAdmin.Wait()
+				communityReconciler.Wait()
+				close(drained)
+			}()
 			select {
 			case <-drained:
 			case <-shutdownCtx.Done():
-				logger.Warn("backfill/refresh-profile/handle-rename drain timed out; abandoning in-flight run (re-triggerable on restart)")
+				logger.Warn("backfill/refresh-profile/handle-rename/community-reconcile drain timed out; abandoning in-flight run (re-triggerable on restart)")
 			}
 			// Wait for the consumer's read loop to exit. Its shutdown path flushes
 			// the cursor on a fresh context, so cutting the process short here
@@ -964,6 +1047,17 @@ func run(logger *slog.Logger) error {
 				case <-consumerDone:
 				case <-shutdownCtx.Done():
 					logger.Warn("jetstream consumer did not stop in time; its cursor may replay on restart")
+				}
+			}
+			// The label consumer commits each label in one transaction on the
+			// cancelled signal context, so an in-flight commit rolls back and
+			// its label replays on restart; nothing is lost. Waiting lets that
+			// rollback and the lapse loop finish before shutdown continues.
+			if labelsDone != nil {
+				select {
+				case <-labelsDone:
+				case <-shutdownCtx.Done():
+					logger.Warn("label consumer did not stop in time; its last label replays on restart")
 				}
 			}
 			// ListenAndServe has returned by now (Shutdown guarantees it);
@@ -1046,6 +1140,10 @@ func startConsumer(
 		// self-hosted handle that publishes no well-known.
 		LookupTXT: consume.DefaultLookupTXT,
 		Logger:    logger,
+		// The #account confirmation read (getRepoStatus) may use an http PDS
+		// endpoint only where the egress guard is off too (development); the
+		// terminal deleted confirmation stays https-only regardless.
+		AllowInsecureStatusEndpoint: cfg.AllowPrivateAddresses,
 	})
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("consumer: handle resolver: %w", err)
@@ -1140,6 +1238,17 @@ func startConsumer(
 		return nil, nil, nil, fmt.Errorf("consumer: account terminator: %w", err)
 	}
 
+	// A confirmed #account takendown or suspended is an object takedown
+	// source on every delivered object of the persona (Delete on Lemmy,
+	// Undo{Delete} once a confirmed status lifts it). Built here, not with the
+	// label consumer, because it applies whether or not COVES_LABELER_DID is set.
+	accountTakedowns, err := outbound.NewTakedowns(outbound.TakedownsOptions{
+		DB: database, Enqueuer: enqueuer, Logger: logger,
+	})
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("consumer: account takedowns: %w", err)
+	}
+
 	dispatcher, err := consume.NewDispatcher(consume.Options{
 		DB:         database,
 		Actors:     minter,
@@ -1156,6 +1265,10 @@ func startConsumer(
 		Records:    repoManager,
 		UserOrigin: cfg.APUserOrigin,
 		Logger:     logger,
+		// A transient #account status is confirmed against the DID's PDS
+		// before it moves an object takedown source, in both directions.
+		AccountStatus:    resolver,
+		AccountTakedowns: accountTakedowns,
 	})
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("consumer: dispatcher: %w", err)

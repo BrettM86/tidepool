@@ -112,6 +112,7 @@ type Worker struct {
 	actors           store.APActors
 	prefs            store.FederationPrefs
 	votes            store.OutboundVotes
+	takedowns        store.OutboundTakedowns
 	signers          SignerProvider
 	inboxes          InboxResolver
 	sender           ActivitySender
@@ -124,6 +125,14 @@ type Worker struct {
 	// WorkerOptions.MediaBaseURL is empty.
 	mediaGate *MediaGate
 	logger    *slog.Logger
+	// beforeTakedownHold, when set, runs after holdIfTakenDown's autocommit
+	// pre-check finds a blocker and before the decision under the subject
+	// locks. Tests only: it commits a restore inside that window.
+	beforeTakedownHold func()
+	// beforeAcceptedStamp, when set, runs in stampAccepted after the first
+	// takedown check finds the object not taken down and before the plain
+	// accepted_at stamp. Tests only: it commits a takedown inside that window.
+	beforeAcceptedStamp func()
 }
 
 // NewWorker wires a Worker.
@@ -201,6 +210,7 @@ func NewWorker(opts WorkerOptions) (*Worker, error) {
 		actors:           opts.Actors,
 		prefs:            prefs,
 		votes:            votes,
+		takedowns:        store.NewOutboundTakedowns(opts.DB),
 		signers:          opts.Signers,
 		inboxes:          opts.Inboxes,
 		sender:           opts.Sender,
@@ -296,6 +306,14 @@ func (w *Worker) handle(ctx context.Context, delivery *store.OutboundDelivery) e
 		return w.park(ctx, delivery, "dry_run", "dry-run mode")
 	}
 
+	// Takedown holds: publishing work for an object that is taken down, or a
+	// reply to a parent that is, leaves the queue held instead of going out.
+	// The enqueue-time hold misses work queued before the takedown and rows
+	// in flight while it committed; this catches them before the wire.
+	if held, err := w.holdIfTakenDown(ctx, delivery, activity); held || err != nil {
+		return err
+	}
+
 	// Causal gate (decision 15): a reply must not be delivered before its
 	// bridge-origin parent is accepted. Checked POST-claim on the row (not a
 	// join in ClaimNext) so the loose-index-scan is untouched.
@@ -344,13 +362,47 @@ func (w *Worker) handle(ctx context.Context, delivery *store.OutboundDelivery) e
 	// Consent recheck (retraction asymmetry): a Delete/Undo always goes out —
 	// it is how an opted-out user takes down what is already federated. Outward
 	// kinds are cancelled when the actor is disabled, paused, or opted out —
-	// but ONLY this one claimed delivery, never the actor's pending retractions.
-	if !isRetraction(activity.Kind) {
+	// but ONLY this one claimed delivery, never the actor's pending retractions
+	// — except under a takedown pause, which holds the delivery instead.
+	//
+	// One retraction waits instead: the Undo{Delete} that restores a taken-down
+	// object republishes it, which a paused, disabled or opted-out persona has
+	// not consented to. It is held on consent, not cancelled, together with the
+	// object's queued Create/Update: off the community's queue, so it blocks no
+	// other work there, and released, Undo first, only when consent returns
+	// (store.ReleaseConsentHeldTx, from every pause clear and the opt-in).
+	if isRetraction(activity.Kind) {
+		restored, err := w.restoredObject(ctx, activity)
+		if err != nil {
+			return err
+		}
+		if restored != "" {
+			blocked, err := w.consentBlocked(ctx, activity.ActorDID)
+			if err != nil {
+				return err
+			}
+			if blocked {
+				if held, err := w.holdOnConsent(ctx, delivery, activity, restored); held || err != nil {
+					return err
+				}
+			}
+		}
+	} else {
 		blocked, err := w.consentBlocked(ctx, activity.ActorDID)
 		if err != nil {
 			return err
 		}
 		if blocked {
+			// A takedown pause (an account label, or a takendown or suspended
+			// status) is not the user withdrawing consent: the work waits for
+			// the pause to clear. Every other block cancels it.
+			held, consented, err := w.holdOnPause(ctx, delivery, activity)
+			if err != nil || held {
+				return err
+			}
+			if consented {
+				return w.deliverChecked(ctx, delivery, activity)
+			}
 			_, applied, err := w.deliveries.CancelClaimed(ctx, delivery.ActivityID, delivery.TargetInbox, *delivery.ClaimedUntil)
 			if err != nil {
 				return fmt.Errorf("cancel delivery %s: %w", delivery.ActivityID, err)
@@ -362,15 +414,66 @@ func (w *Worker) handle(ctx context.Context, delivery *store.OutboundDelivery) e
 		}
 	}
 
-	// Defense in depth: never sign a POST to an inbox that is not same-authority
-	// with the target community. The resolver already refuses a cross-authority
-	// inbox at enqueue time; this catches a tampered or legacy stored target.
+	return w.deliverChecked(ctx, delivery, activity)
+}
+
+// deliverChecked delivers after the last defense-in-depth check: never sign a
+// POST to an inbox that is not same-authority with the target community. The
+// resolver already refuses a cross-authority inbox at enqueue time; this
+// catches a tampered or legacy stored target.
+func (w *Worker) deliverChecked(ctx context.Context, delivery *store.OutboundDelivery,
+	activity *store.OutboundActivity) error {
 	if !ap.SameAuthority(delivery.OrderingKey, delivery.TargetInbox) {
 		return w.poison(ctx, delivery, store.PoisonClassCrossAuthority,
 			"target inbox is not same-authority with the community; refusing to deliver", 0)
 	}
-
 	return w.deliver(ctx, delivery, activity)
+}
+
+// holdOnPause holds a claimed outward delivery of a persona paused by a
+// takedown source (store.TakedownPausedTx) on HeldReasonPause, keyed by the
+// actor DID, until the pause set clears and store.ReleaseConsentHeldTx puts
+// it back at the tail. held reports the row was held here; consented reports
+// consent returned before the hold, so the delivery goes out now; neither
+// means the block is not a takedown pause and the caller cancels as before.
+//
+// Lock order is holdOnConsent's: the author's ap_actors row (shared) first,
+// then the delivery row. A pause clear updates that row before it reads the
+// held rows, so it either commits before the recheck here or finds this hold.
+func (w *Worker) holdOnPause(ctx context.Context, delivery *store.OutboundDelivery,
+	activity *store.OutboundActivity) (held, consented bool, err error) {
+	tx, err := w.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, false, fmt.Errorf("begin pause hold of %s: %w", delivery.ActivityID, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	blocked, err := store.LockActorConsentTx(ctx, tx, activity.ActorDID)
+	if err != nil {
+		return false, false, err
+	}
+	if !blocked {
+		return false, true, nil
+	}
+	takedownPaused, err := store.TakedownPausedTx(ctx, tx, activity.ActorDID)
+	if err != nil || !takedownPaused {
+		return false, false, err
+	}
+	_, applied, err := w.deliveries.HoldClaimedTx(ctx, tx, delivery.ActivityID, delivery.TargetInbox,
+		store.HeldReasonPause, activity.ActorDID, *delivery.ClaimedUntil)
+	if err != nil {
+		return false, false, fmt.Errorf("hold delivery %s: %w", delivery.ActivityID, err)
+	}
+	if !applied {
+		w.logger.Warn("pause hold did not apply: claim lost or row terminal",
+			"activity", delivery.ActivityID, "inbox", delivery.TargetInbox)
+		return true, false, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return false, false, fmt.Errorf("commit pause hold of %s: %w", delivery.ActivityID, err)
+	}
+	w.logger.Info("delivery held until the persona's takedown pause clears",
+		"activity", delivery.ActivityID, "kind", activity.Kind)
+	return true, false, nil
 }
 
 // awaitMedia runs the media gate: a Create/Update whose image URLs the Coves
@@ -632,7 +735,7 @@ func (w *Worker) rotateInbox(ctx context.Context, delivery *store.OutboundDelive
 // already accepted; poisoning it would make the disagreement permanent, which
 // is the whole bug.
 func (w *Worker) deliverSuccess(ctx context.Context, delivery *store.OutboundDelivery, activity *store.OutboundActivity, status int) error {
-	if err := w.stampAccepted(ctx, activity); err != nil {
+	if err := w.stampAccepted(ctx, delivery, activity); err != nil {
 		return w.settleLater(ctx, delivery, status,
 			fmt.Errorf("stamp accepted for %s: %w", delivery.ActivityID, err))
 	}
@@ -682,7 +785,16 @@ func (w *Worker) settleLater(ctx context.Context, delivery *store.OutboundDelive
 // community. A NotFound (no outbound_objects row — a comment we never persisted,
 // a vote) is not a failure and returns nil; a real store error is propagated so
 // deliverSuccess withholds the delivered mark until the stamp can commit.
-func (w *Worker) stampAccepted(ctx context.Context, activity *store.OutboundActivity) error {
+//
+// An object taken down before its Create settled is on the peer with no
+// takedown Delete, because the takedown found it unaccepted. Its stamp and
+// that owed Delete commit in one transaction, so a failure of either leaves
+// the delivery held for settlement with accepted_at unset, and the retry owes
+// both again. A takedown that commits after the first check but before the
+// plain stamp saw accepted_at unset, so the recheck enqueues its Delete; one
+// that commits after the stamp sees it set and enqueues its own, which the
+// recheck then finds recorded.
+func (w *Worker) stampAccepted(ctx context.Context, delivery *store.OutboundDelivery, activity *store.OutboundActivity) error {
 	if activity.Kind != "Create" && activity.Kind != "Update" {
 		return nil
 	}
@@ -690,13 +802,314 @@ func (w *Worker) stampAccepted(ctx context.Context, activity *store.OutboundActi
 	if atURI == "" {
 		return nil
 	}
+	settled, err := w.settleTakedownTx(ctx, delivery, activity, atURI, true)
+	if err != nil || settled {
+		return err
+	}
+	if w.beforeAcceptedStamp != nil {
+		w.beforeAcceptedStamp()
+	}
 	if err := w.objects.SetAccepted(ctx, atURI); err != nil {
 		if errors.IsNotFound(err) {
 			return nil
 		}
 		return err
 	}
+	_, err = w.settleTakedownTx(ctx, delivery, activity, atURI, false)
+	return err
+}
+
+// settleTakedownTx, when atURI is taken down, enqueues the takedown Delete
+// its episode still owes, in one transaction with the accepted_at stamp when
+// stamp is set. settled reports that the object is taken down and the
+// transaction committed; false means the object is not taken down (or has no
+// outbound row) and nothing was written.
+func (w *Worker) settleTakedownTx(ctx context.Context, delivery *store.OutboundDelivery,
+	activity *store.OutboundActivity, atURI string, stamp bool) (settled bool, err error) {
+	tx, err := w.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin takedown settlement of %s: %w", atURI, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	// The object row lock serializes this with a takedown's AddSourceTx, which
+	// takes it first and reads accepted_at under it.
+	object, err := w.objects.LockByATURITx(ctx, tx, atURI)
+	if errors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	removed, err := w.takedowns.IsRemovedTx(ctx, tx, atURI)
+	if err != nil || !removed {
+		return false, err
+	}
+	if stamp {
+		if err := w.objects.SetAcceptedTx(ctx, tx, atURI); err != nil {
+			return false, err
+		}
+	} else if !object.IsAccepted() {
+		return false, nil
+	}
+	if !object.IsTombstoned() {
+		if err := w.enqueueOwedDeleteTx(ctx, tx, delivery, activity, object); err != nil {
+			return false, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit takedown settlement of %s: %w", atURI, err)
+	}
+	return true, nil
+}
+
+// enqueueOwedDeleteTx enqueues object's takedown Delete, when its episode has
+// none yet, from the delivering persona to the inbox the Create just reached.
+// A persona the purger withdrew sends nothing: its identity is gone, not
+// taken down.
+func (w *Worker) enqueueOwedDeleteTx(ctx context.Context, tx *sql.Tx, delivery *store.OutboundDelivery,
+	activity *store.OutboundActivity, object *store.OutboundObject) error {
+	actor, err := w.actors.GetByDID(ctx, activity.ActorDID)
+	if errors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("load actor %s: %w", activity.ActorDID, err)
+	}
+	if actor.IsTombstoned() {
+		return nil
+	}
+	origin, ok := strings.CutSuffix(object.APObjectID, objectIDPath(object.ATURI))
+	if !ok || origin == "" {
+		return fmt.Errorf("object %s has AP id %q outside this bridge's object path", object.ATURI, object.APObjectID)
+	}
+	deleteID, err := enqueueOwedTakedownDeleteTx(ctx, tx, takedownDeleteWriter{
+		translator: NewTranslator(origin, ""),
+		takedowns:  w.takedowns,
+		activities: w.activities,
+		deliveries: w.deliveries,
+	}, actor, object, delivery.TargetInbox)
+	if err != nil {
+		return err
+	}
+	w.logger.Info("settled object was taken down; its Delete is queued",
+		"activity", delivery.ActivityID, "at_uri", object.ATURI, "delete", deleteID)
 	return nil
+}
+
+// objectIDPath is the path every served object URL of atURI ends in.
+func objectIDPath(atURI string) string {
+	return "/ap/object/" + strings.TrimPrefix(atURI, "at://")
+}
+
+// holdIfTakenDown moves a claimed Create or Update to held instead of
+// delivering it, when its own object is taken down, it replies to a parent
+// that is, or the bridged community it goes to (or its parent is bound to)
+// is removed; and a claimed vote (Like, Dislike) into a removed community.
+// held reports the delivery was not delivered here.
+//
+// An autocommit read first skips the common case (nothing taken down) without
+// a transaction. The decision itself is made under the subjects' takedown
+// locks: the blockers are reread and the row held in one tx, so a restore that
+// commits after the first read is seen and the row is delivered instead of
+// held on a subject whose release already ran.
+func (w *Worker) holdIfTakenDown(ctx context.Context, delivery *store.OutboundDelivery,
+	activity *store.OutboundActivity) (held bool, err error) {
+	var objectATURI, parentATURI string
+	switch activity.Kind {
+	case "Create", "Update":
+		objectATURI, parentATURI = objectATURIFromPayload(activity.Payload), activity.ParentATURI
+	case "Like", "Dislike":
+		// A vote waits on its community only: its subject's own takedown
+		// does not hold it.
+	default:
+		return false, nil
+	}
+	communities, err := w.takedowns.CommunitySubjects(ctx, delivery.OrderingKey, activity.ParentATURI)
+	if err != nil {
+		return true, err
+	}
+	reason, _, err := w.takedownBlocker(ctx, nil, objectATURI, parentATURI, communities)
+	if err != nil || reason == "" {
+		return err != nil, err
+	}
+	if w.beforeTakedownHold != nil {
+		w.beforeTakedownHold()
+	}
+
+	tx, err := w.db.BeginTx(ctx, nil)
+	if err != nil {
+		return true, fmt.Errorf("begin takedown hold of %s: %w", delivery.ActivityID, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	subjects := append([]string{objectATURI, parentATURI, store.AccountSubjectOf(parentATURI)}, communities...)
+	if err := store.LockTakedownSubjectsTx(ctx, tx, subjects...); err != nil {
+		return true, err
+	}
+	reason, subject, err := w.takedownBlocker(ctx, tx, objectATURI, parentATURI, communities)
+	if err != nil {
+		return true, err
+	}
+	if reason == "" {
+		return false, nil
+	}
+	_, applied, err := w.deliveries.HoldClaimedTx(ctx, tx, delivery.ActivityID, delivery.TargetInbox,
+		reason, subject, *delivery.ClaimedUntil)
+	if err != nil {
+		return true, fmt.Errorf("hold delivery %s: %w", delivery.ActivityID, err)
+	}
+	if !applied {
+		w.logger.Warn("takedown hold did not apply: claim lost or row terminal",
+			"activity", delivery.ActivityID, "inbox", delivery.TargetInbox)
+		return true, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return true, fmt.Errorf("commit takedown hold of %s: %w", delivery.ActivityID, err)
+	}
+	w.logger.Info("delivery held while taken down",
+		"activity", delivery.ActivityID, "reason", reason, "subject", subject)
+	return true, nil
+}
+
+// takedownBlocker is the blocker that holds work on objectATURI replying to
+// parentATURI (either may be empty) into communities: its own object's
+// takedown first, then its parent's, then a community's removal. reason is
+// empty when none stands. With tx nil it reads autocommit.
+func (w *Worker) takedownBlocker(ctx context.Context, tx *sql.Tx, objectATURI, parentATURI string,
+	communities []string) (reason, subject string, err error) {
+	if objectATURI != "" {
+		var removed bool
+		if tx == nil {
+			removed, err = w.takedowns.IsRemoved(ctx, objectATURI)
+		} else {
+			removed, err = w.takedowns.IsRemovedTx(ctx, tx, objectATURI)
+		}
+		if err != nil {
+			return "", "", fmt.Errorf("read takedown of %s: %w", objectATURI, err)
+		}
+		if removed {
+			return store.HeldReasonObject, objectATURI, nil
+		}
+	}
+	if parentATURI != "" {
+		var removed bool
+		if tx == nil {
+			removed, err = w.takedowns.IsParentRemoved(ctx, parentATURI)
+		} else {
+			removed, err = w.takedowns.IsParentRemovedTx(ctx, tx, parentATURI)
+		}
+		if err != nil {
+			return "", "", fmt.Errorf("read takedown of parent %s: %w", parentATURI, err)
+		}
+		if removed {
+			return store.HeldReasonParent, parentATURI, nil
+		}
+	}
+	var community string
+	if tx == nil {
+		community, err = w.takedowns.RemovedCommunity(ctx, communities)
+	} else {
+		community, err = w.takedowns.RemovedCommunityTx(ctx, tx, communities)
+	}
+	if err != nil || community == "" {
+		return "", "", err
+	}
+	return store.HeldReasonCommunity, community, nil
+}
+
+// holdOnConsent holds a claimed takedown restore of restoredATURI whose
+// author's consent is withdrawn, with the object's queued Create/Update, on
+// consent. held reports the delivery was not delivered here; false means
+// consent returned before the hold and the Undo goes out now.
+//
+// Lock order. This tx share-locks the author's ap_actors row first, then
+// takes the object's takedown-subject lock, then writes the claimed row and
+// the object's pending rows. The consent release (the consumer's unpause and
+// opt-in, the account label applier's lift, the #account handler) runs after
+// its tx's write of that ap_actors row, then takes the subject locks and the
+// held rows; an account-wide source change takes the row FOR NO KEY UPDATE
+// before its subject locks. Each takes the actor row before its subject
+// locks (store.LockTakedownSubjectsTx has the full order), so none holds a
+// subject lock while waiting on this tx's row lock. So a
+// release either commits before the recheck below, which then sees consent
+// back, or waits for this hold to commit and finds its rows.
+//
+// The consumer's federation opt-out (consume applyOptOut) also writes both
+// the actor row and the author's pending Create/Update rows, which this tx
+// updates last. It locks the actor row (FOR NO KEY UPDATE) before it cancels
+// those rows, and runs the destructive purge, which updates the actor row on
+// its own tx, before either, so it never holds a delivery row while waiting
+// on this tx's share lock.
+func (w *Worker) holdOnConsent(ctx context.Context, delivery *store.OutboundDelivery,
+	activity *store.OutboundActivity, restoredATURI string) (held bool, err error) {
+	tx, err := w.db.BeginTx(ctx, nil)
+	if err != nil {
+		return true, fmt.Errorf("begin consent hold of %s: %w", delivery.ActivityID, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	blocked, err := store.LockActorConsentTx(ctx, tx, activity.ActorDID)
+	if err != nil {
+		return true, err
+	}
+	if !blocked {
+		return false, nil
+	}
+	if err := store.LockTakedownSubjectsTx(ctx, tx, restoredATURI); err != nil {
+		return true, err
+	}
+	_, applied, err := w.deliveries.HoldClaimedTx(ctx, tx, delivery.ActivityID, delivery.TargetInbox,
+		store.HeldReasonConsent, restoredATURI, *delivery.ClaimedUntil)
+	if err != nil {
+		return true, fmt.Errorf("hold delivery %s: %w", delivery.ActivityID, err)
+	}
+	if !applied {
+		w.logger.Warn("consent hold did not apply: claim lost or row terminal",
+			"activity", delivery.ActivityID, "inbox", delivery.TargetInbox)
+		return true, nil
+	}
+	behind, err := w.deliveries.HoldObjectOnConsentTx(ctx, tx, restoredATURI)
+	if err != nil {
+		return true, err
+	}
+	if err := tx.Commit(); err != nil {
+		return true, fmt.Errorf("commit consent hold of %s: %w", delivery.ActivityID, err)
+	}
+	w.logger.Warn("takedown restore held until the persona's consent returns",
+		"activity", delivery.ActivityID, "at_uri", restoredATURI, "actor", activity.ActorDID,
+		"held_behind", behind)
+	return true, nil
+}
+
+// restoredObject is the at-uri of the object a retraction restores when it is
+// the Undo of a takedown Delete: an Undo{Delete} of an object that has had a
+// takedown episode. Empty otherwise. The kind alone does not say it;
+// RetractionKinds is shared with the vote Undo.
+func (w *Worker) restoredObject(ctx context.Context, activity *store.OutboundActivity) (string, error) {
+	if activity.Kind != "Undo" {
+		return "", nil
+	}
+	var undo struct {
+		Object struct {
+			Type   string `json:"type"`
+			Object string `json:"object"`
+		} `json:"object"`
+	}
+	if err := json.Unmarshal(activity.Payload, &undo); err != nil || undo.Object.Type != "Delete" {
+		return "", nil
+	}
+	const marker = "/ap/object/"
+	_, suffix, ok := strings.Cut(undo.Object.Object, marker)
+	if !ok || suffix == "" {
+		return "", nil
+	}
+	atURI := "at://" + suffix
+	restore, err := w.takedowns.WasEverRemoved(ctx, atURI)
+	if err != nil {
+		return "", fmt.Errorf("read takedown episodes for %s: %w", activity.ActivityID, err)
+	}
+	if !restore {
+		return "", nil
+	}
+	return atURI, nil
 }
 
 // voteCallback applies decision-16 delivery callbacks: a Like/Dislike success
@@ -948,9 +1361,10 @@ func (w *Worker) causalStatus(ctx context.Context, delivery *store.OutboundDeliv
 	return causalWait
 }
 
-// consentBlocked reports whether an outward delivery for actorDID must be
-// cancelled: the actor is disabled, delivery-paused, or has a federation
-// opt-out. A missing pref MEANS default-on (not blocked).
+// consentBlocked reports whether an outward delivery for actorDID may not go
+// out now: the actor is disabled, delivery-paused, or has a federation
+// opt-out. A missing pref MEANS default-on (not blocked). A takedown pause
+// holds the delivery (holdOnPause); every other block cancels it.
 func (w *Worker) consentBlocked(ctx context.Context, actorDID string) (bool, error) {
 	actor, err := w.actors.GetByDID(ctx, actorDID)
 	if err != nil {

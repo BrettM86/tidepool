@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bluesky-social/indigo/atproto/syntax"
 	miekgdns "github.com/miekg/dns"
 
 	"tidepool/internal/ingest"
@@ -81,6 +82,9 @@ type Config struct {
 	// the service actor; until then an empty value is handled gracefully
 	// (the bridge hostname simply does not resolve to a DID).
 	BridgeServiceDID string
+	// CovesLabelerDID is the Coves labeler whose subscribeLabels stream the
+	// label consumer follows (COVES_LABELER_DID); empty turns the consumer off.
+	CovesLabelerDID string
 	// UserAgent is sent on all outbound bridge traffic (signed fetches,
 	// service-actor deliveries, relay crawl requests etc.).
 	UserAgent string
@@ -499,6 +503,16 @@ func Load(logger *slog.Logger) (*Config, error) {
 	// Optional in every environment: an operator may pre-provision the
 	// bridge's service DID, otherwise identity bootstrap mints one.
 	cfg.BridgeServiceDID = os.Getenv("BRIDGE_SERVICE_DID")
+
+	// Optional: the Coves labeler DID whose labels Tidepool applies. Unset
+	// leaves the label consumer off; a value that is not a DID is a boot
+	// failure rather than a consumer that resolves nothing.
+	cfg.CovesLabelerDID = strings.TrimSpace(os.Getenv("COVES_LABELER_DID"))
+	if cfg.CovesLabelerDID != "" {
+		if _, err := syntax.ParseDID(cfg.CovesLabelerDID); err != nil {
+			return nil, fmt.Errorf("config: COVES_LABELER_DID must be a DID, got %q", cfg.CovesLabelerDID)
+		}
+	}
 
 	// Firehose retention has a real default in every environment — it is a
 	// tuning knob, not a deployment-specific value like hostnames or keys.

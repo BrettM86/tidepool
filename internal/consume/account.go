@@ -5,8 +5,10 @@ import (
 	"database/sql"
 	stderrors "errors"
 	"fmt"
-	"hash/fnv"
 	"log/slog"
+
+	"tidepool/internal/errors"
+	"tidepool/internal/store"
 )
 
 // The #account ordering guard (second-opinion C4). #account frames are UNGATED
@@ -29,29 +31,13 @@ import (
 // be days away) — or, on status="deleted", both reach the terminal, irreversible
 // seam and two Delete{Person} activities go out for one deletion.
 
-// accountClaimNamespace scopes this package's advisory locks. The two-argument
-// advisory lock functions take (namespace, key) as a pair of int32s and occupy a
-// lock space DISTINCT from the one-argument int64 form — which is what keeps
-// this from colliding with internal/repo's commit lock or testutil's
-// process-wide harness lock, both of which use the one-argument form.
-const accountClaimNamespace = 0x6163 // "ac"
-
-// accountClaimKey is the per-DID half of the advisory lock key.
-//
-// Hashed in GO rather than with postgres's hashtext(): that function is
-// undocumented and its algorithm has changed across major versions, and a lock
-// key is not something to inherit from an implementation detail. FNV-1a is
-// fixed here forever, which is all a lock key has to be.
-//
-// A COLLISION IS SAFE, not merely unlikely: two DIDs sharing a key serialize
-// against each other, which costs a little contention on the rarest event kind
-// the consumer handles and changes no outcome. Correctness needs only that one
-// DID always maps to one key.
-func accountClaimKey(did string) int32 {
-	hash := fnv.New32a()
-	_, _ = hash.Write([]byte(did)) // hash.Write never returns an error
-	return int32(hash.Sum32())     //nolint:gosec // wraparound is fine: this is a lock key, not a value
-}
+// The claim is store's per-DID account advisory lock (store.LockAccountTx,
+// namespace store.AccountLockNamespace "ac"). The two-argument advisory lock
+// functions take (namespace, key) as a pair of int32s and occupy a lock space
+// DISTINCT from the one-argument int64 form — which is what keeps this from
+// colliding with internal/repo's commit lock or testutil's process-wide
+// harness lock. The account label applier and persona minting take the same
+// lock, so a label, a status change and a mint of one DID serialize.
 
 // errAccountUnapplied is the sentinel an apply function returns to ABANDON its
 // claim without failing the event: the transition did not happen, so the seq
@@ -96,10 +82,21 @@ var errAccountUnapplied = stderrors.New("account event left unapplied")
 //
 // A claim LOSS returns nil: the event is a duplicate or a stale copy, fully
 // accounted for, and the cursor must advance past it.
-func (d *Dispatcher) applyAccountClaimed(ctx context.Context, did string, seq int64, apply func(tx *sql.Tx) error) error {
+//
+// advance false commits apply's writes WITHOUT advancing the seq: the
+// unconfirmed pause of a confirmed #account change (applyConfirmedAccountStatus)
+// is durable before the PDS is asked, while the event stays owed until the
+// confirmed half commits with the advance. It records seq as
+// pending_account_seq instead, and a frame with a lower seq is stale as one at
+// or below last_account_seq is: an older frame whose PDS read was in flight
+// must not clear or rewrite the pause of a newer frame still owed. applied
+// reports apply ran and committed; false is a claim loss, a vanished actor or
+// an unapplied event.
+func (d *Dispatcher) applyAccountClaimed(ctx context.Context, did string, seq int64, advance bool,
+	apply func(tx *sql.Tx) error) (applied bool, err error) {
 	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("begin account claim for %s: %w", did, err)
+		return false, fmt.Errorf("begin account claim for %s: %w", did, err)
 	}
 	defer func() {
 		if rollbackErr := tx.Rollback(); rollbackErr != nil && !stderrors.Is(rollbackErr, sql.ErrTxDone) {
@@ -112,29 +109,28 @@ func (d *Dispatcher) applyAccountClaimed(ctx context.Context, did string, seq in
 	// transition, the advance — happens with every other #account handler for
 	// this DID shut out, which is what makes the read-then-write below a claim
 	// rather than a guess.
-	if _, err := tx.ExecContext(ctx,
-		`SELECT pg_advisory_xact_lock($1, $2)`,
-		accountClaimNamespace, accountClaimKey(did)); err != nil {
-		return fmt.Errorf("claim account seq for %s: %w", did, err)
+	if err := store.LockAccountTx(ctx, tx, did); err != nil {
+		return false, fmt.Errorf("claim account seq for %s: %w", did, err)
 	}
 
-	var lastSeq int64
+	var lastSeq, pendingSeq int64
 	err = tx.QueryRowContext(ctx,
-		`SELECT last_account_seq FROM ap_actors WHERE did = $1`, did).Scan(&lastSeq)
+		`SELECT last_account_seq, pending_account_seq FROM ap_actors WHERE did = $1`, did).Scan(&lastSeq, &pendingSeq)
 	if stderrors.Is(err, sql.ErrNoRows) {
 		// The actor vanished between the existence check and the claim. Nothing
 		// to pause and nothing to withdraw; no seq is recorded, so a redelivery
 		// still applies if the actor is minted again.
 		d.logger.Debug("account claim found no actor", slog.String("did", did))
-		return nil
+		return false, nil
 	}
 	if err != nil {
-		return fmt.Errorf("read account seq for %s: %w", did, err)
+		return false, fmt.Errorf("read account seq for %s: %w", did, err)
 	}
-	if seq <= lastSeq {
+	if seq <= lastSeq || seq < pendingSeq {
 		d.logger.Debug("skipping stale or duplicate #account",
-			slog.String("did", did), slog.Int64("seq", seq), slog.Int64("last_seq", lastSeq))
-		return nil
+			slog.String("did", did), slog.Int64("seq", seq), slog.Int64("last_seq", lastSeq),
+			slog.Int64("pending_seq", pendingSeq))
+		return false, nil
 	}
 
 	if err := apply(tx); err != nil {
@@ -142,49 +138,77 @@ func (d *Dispatcher) applyAccountClaimed(ctx context.Context, did string, seq in
 			// Deliberately un-advanced: the deferred rollback releases the claim
 			// with the watermark where it was, so the event can still be applied
 			// by a build (or a moment) that can act on it.
-			return nil
+			return false, nil
 		}
-		return err // the deferred rollback releases the claim un-advanced
+		return false, err // the deferred rollback releases the claim un-advanced
 	}
 
 	// The advance is the LAST write, and it keeps its own monotonic WHERE. The
 	// claim already guarantees no concurrent advance; the predicate costs
 	// nothing and keeps the statement correct on its own terms.
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE ap_actors SET last_account_seq = $2, updated_at = now()
-		WHERE did = $1 AND last_account_seq < $2`, did, seq); err != nil {
-		return fmt.Errorf("advance account seq for %s: %w", did, err)
+	if advance {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE ap_actors SET last_account_seq = $2, updated_at = now()
+			WHERE did = $1 AND last_account_seq < $2`, did, seq); err != nil {
+			return false, fmt.Errorf("advance account seq for %s: %w", did, err)
+		}
+	} else {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE ap_actors SET pending_account_seq = $2, updated_at = now()
+			WHERE did = $1 AND pending_account_seq < $2`, did, seq); err != nil {
+			return false, fmt.Errorf("record pending account seq for %s: %w", did, err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit account claim for %s: %w", did, err)
+		return false, fmt.Errorf("commit account claim for %s: %w", did, err)
+	}
+	return true, nil
+}
+
+// pauseActorKeepingTakedownTx adds did's account-status pause source with a
+// status no PDS confirmed, on the claim's transaction: a confirmed takendown or
+// suspended status already stored is kept, so only a confirmed answer moves a
+// standing takedown. An unconfirmed takedown status is stored marked as such
+// (store.UnconfirmedTakedownStatus): it holds work like a confirmed one but is
+// not kept over a later unconfirmed write. A missing actor reports
+// errAccountUnapplied.
+func pauseActorKeepingTakedownTx(ctx context.Context, tx *sql.Tx, did string, status string) error {
+	if store.IsTakedownAccountStatus(status) {
+		status = store.UnconfirmedTakedownStatus(status)
+	}
+	src := store.PauseSource{Kind: store.PauseSourceAccountStatus, Key: did, Status: status}
+	err := store.AddPauseSourceKeepingTakedownTx(ctx, tx, did, src)
+	if errors.IsNotFound(err) {
+		return fmt.Errorf("%w: no actor for %s", errAccountUnapplied, did)
+	}
+	if err != nil {
+		return fmt.Errorf("set delivery paused for %s: %w", did, err)
 	}
 	return nil
 }
 
 // setActorPausedTx writes the transient #account state ON THE CLAIM's
-// transaction, so the pause and the seq advance land together or not at all.
-//
-// It is raw SQL here rather than a store.APActors method for the same reason
-// the seq itself is: this is the consume package's own gate surface, the
-// statement is the mirror of store's SetPaused (delivery_paused alone — pausing
-// delivery must never disable the actor), and the claim needs it on a
-// transaction the store's interface does not offer one for.
+// transaction, so the pause and the seq advance land together or not at all:
+// the persona's account-status pause source, carrying status, is added while
+// the account is inactive and removed when it is active. delivery_paused is
+// derived from the whole pause source set, so an account label's pause stays
+// through an `active` frame. Pausing delivery never disables the actor.
 //
 // A missing actor reports errAccountUnapplied: the row disappeared under us, so
 // nothing was applied and the seq must not move.
-func setActorPausedTx(ctx context.Context, tx *sql.Tx, did string, paused bool) error {
-	result, err := tx.ExecContext(ctx,
-		`UPDATE ap_actors SET delivery_paused = $2, updated_at = now() WHERE did = $1`,
-		did, paused)
+func setActorPausedTx(ctx context.Context, tx *sql.Tx, did string, paused bool, status string) error {
+	src := store.PauseSource{Kind: store.PauseSourceAccountStatus, Key: did, Status: status}
+	var err error
+	if paused {
+		err = store.AddPauseSourceTx(ctx, tx, did, src)
+	} else {
+		err = store.RemovePauseSourceTx(ctx, tx, did, src)
+	}
+	if errors.IsNotFound(err) {
+		return fmt.Errorf("%w: no actor for %s", errAccountUnapplied, did)
+	}
 	if err != nil {
 		return fmt.Errorf("set delivery paused for %s: %w", did, err)
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("set delivery paused for %s: rows affected: %w", did, err)
-	}
-	if affected == 0 {
-		return fmt.Errorf("%w: no actor for %s", errAccountUnapplied, did)
 	}
 	return nil
 }

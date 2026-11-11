@@ -573,6 +573,17 @@ func (m *Manager) WithCommitLock(ctx context.Context, did string, fn func(ctx co
 	return nil
 }
 
+// LockCommitsTx takes the global commit lock (commitAdvisoryLockKey) in the
+// caller's transaction, held until it ends. It is WithCommitLock for a
+// transaction the caller already owns: reads in tx after it (GetRecordTx)
+// see every earlier commit, and no commit lands until tx ends.
+func LockCommitsTx(ctx context.Context, tx *sql.Tx) error {
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, commitAdvisoryLockKey); err != nil {
+		return fmt.Errorf("repo: take commit advisory lock: %w", err)
+	}
+	return nil
+}
+
 // getRecordIn walks did's current tree to the record at path, reading in tx.
 func getRecordIn(ctx context.Context, tx *sql.Tx, did, path string) (map[string]any, string, error) {
 	state, err := readRepoState(ctx, tx, did, false)

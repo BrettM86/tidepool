@@ -25,7 +25,7 @@ import (
 // propagates any returned error and, critically, stops emitting the constant
 // zero-entropy id that Lemmy would dedupe) without contorting the design for
 // this essentially-never path. The propagation wiring through
-// buildFollow/buildUndoFollow into the 5xx handler paths is covered by the
+// buildFollow/buildUndoFollowActivity into the 5xx handler paths is covered by the
 // normal follow lifecycle tests below.
 
 // TestFollowLifecycle drives the full state machine: subscribe → pending →

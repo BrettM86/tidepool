@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	stderrors "errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -409,6 +410,12 @@ const notHeldForSettlement = `
 // It is ONE list shared with outbound.isRetraction so the queue and the worker
 // cannot drift into disagreeing about which activities a stopped user is still
 // owed.
+//
+// One Undo is not a retraction in effect: the Undo{Delete} that restores a
+// taken-down object republishes it. No cancellation takes it either, but the
+// worker does not send it while its author is paused, disabled or opted out:
+// it holds it on consent (HeldReasonConsent) with the object's queued work,
+// and ReleaseConsentHeldTx puts them back when consent returns.
 var RetractionKinds = []string{"Delete", "Undo"}
 
 // notARetraction excludes those kinds from a cancellation. It reads from the
@@ -460,14 +467,21 @@ func cancelForActor(ctx context.Context, ex execer, actorDID string) (int64, err
 //     the delivery insert returns the standing (cancelled) row by design, and
 //     the votes are already flipped, so the re-run enumerates nothing. Actor
 //     tombstoned, peers never told, "destructive opt-out applied" in the log.
+//
+// Work held on a takedown pause (HeldReasonPause) is outward work waiting on
+// the author's consent, so it is cancelled with the pending rows: otherwise an
+// opt-in and the takedown's lift would publish what the opt-out withdrew.
+// Rows held on consent (a takedown restore and its object's queued work) and
+// on an object or parent takedown are left to their own releases.
 func cancelOutwardForActor(ctx context.Context, ex execer, actorDID string) (int64, error) {
 	query := `
 		UPDATE outbound_deliveries d
-		SET state = 'cancelled', claimed_until = NULL, updated_at = now()
+		SET state = 'cancelled', claimed_until = NULL, held_reason = '', held_subject = '', updated_at = now()
 		FROM outbound_activities a
 		WHERE d.activity_id = a.activity_id
 		  AND a.actor_did = $1
-		  AND d.state = 'pending'` + notHeldForSettlement + `
+		  AND (d.state = 'pending' OR (d.state = 'held' AND d.held_reason = '` + HeldReasonPause + `'))` +
+		notHeldForSettlement + `
 		  AND a.kind <> ALL($2)`
 
 	result, err := ex.ExecContext(ctx, query, actorDID, pq.Array(RetractionKinds))
@@ -829,4 +843,723 @@ func scanOutboundDelivery(row rowScanner) (*OutboundDelivery, error) {
 		delivery.LastStatusCode = &code
 	}
 	return &delivery, nil
+}
+
+// Held-row reasons: the blocker a held delivery waits on.
+const (
+	// HeldReasonObject holds a delivery while its own object is taken down.
+	HeldReasonObject = "object"
+	// HeldReasonParent holds a reply while the parent it answers is taken down.
+	HeldReasonParent = "parent"
+	// HeldReasonConsent holds a takedown restore's Undo{Delete}, and the
+	// restored object's queued Create/Update, while the author is paused,
+	// disabled or opted out; the subject is the object's at-uri. Only
+	// ReleaseConsentHeldTx releases it, never a takedown release.
+	HeldReasonConsent = "consent"
+	// HeldReasonPause holds a claimed outward delivery (a Create, Update or
+	// vote) of a persona paused by a takedown source: an account label, or a
+	// takendown or suspended #account status. The subject is the actor DID.
+	// Like a consent hold it waits on the author, so only
+	// ReleaseConsentHeldTx releases it, once the pause set clears.
+	HeldReasonPause = "pause"
+	// HeldReasonCommunity holds native work into a bridged community whose
+	// `!takedown` stands (a vote, or a Create/Update with no takedown source of
+	// its own) until the label is negated; the subject is the community DID.
+	HeldReasonCommunity = "community"
+)
+
+// objectIDSuffix is the tail every served object URL of atURI ends in:
+// "/ap/object/<did>/<collection>/<rkey>". The store has no origin, so a
+// delivery is tied to its object by this suffix of the payload's object.id,
+// compared with right() rather than LIKE because a record key may contain '_'.
+func objectIDSuffix(atURI string) string {
+	return "/ap/object/" + strings.TrimPrefix(atURI, "at://")
+}
+
+func (r *postgresOutboundDeliveries) HoldForObjectTx(ctx context.Context, tx *sql.Tx, atURI string) (int64, error) {
+	return holdObjectRows(ctx, tx, atURI, HeldReasonObject)
+}
+
+func (r *postgresOutboundDeliveries) HoldObjectOnConsentTx(ctx context.Context, tx *sql.Tx, atURI string) (int64, error) {
+	return holdObjectRows(ctx, tx, atURI, HeldReasonConsent)
+}
+
+// holdObjectRows holds atURI's own pending, unclaimed Create/Update rows that
+// are not held for settlement, on reason with atURI as the subject.
+func holdObjectRows(ctx context.Context, tx *sql.Tx, atURI, reason string) (int64, error) {
+	if tx == nil {
+		return 0, errors.NewValidationError("tx", "must not be nil")
+	}
+	if atURI == "" {
+		return 0, errors.NewValidationError("at_uri", "must not be empty")
+	}
+	// Only the object's own publishing work (Create, Update) is held; its
+	// retractions go out regardless. A row in lease is in flight and a row held
+	// for settlement already reached the peer: both are left for the worker,
+	// which checks the takedown set before it delivers.
+	suffix := objectIDSuffix(atURI)
+	result, err := tx.ExecContext(ctx, `
+		UPDATE outbound_deliveries d
+		SET state = 'held', held_reason = $2, held_subject = $1,
+		    claimed_until = NULL, updated_at = now()
+		FROM outbound_activities a
+		WHERE d.activity_id = a.activity_id
+		  AND d.state = 'pending'
+		  AND (d.claimed_until IS NULL OR d.claimed_until <= CURRENT_TIMESTAMP)`+notHeldForSettlement+`
+		  AND a.kind IN ('Create', 'Update')
+		  AND right(a.payload -> 'object' ->> 'id', length($3)) = $3`,
+		atURI, reason, suffix)
+	if err != nil {
+		return 0, fmt.Errorf("hold outbound_deliveries of %q: %w", atURI, err)
+	}
+	held, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("hold outbound_deliveries of %q: rows affected: %w", atURI, err)
+	}
+	return held, nil
+}
+
+func (r *postgresOutboundDeliveries) HoldCommunityWorkTx(ctx context.Context, tx *sql.Tx, communityAPID, communityDID string) (int64, error) {
+	if tx == nil {
+		return 0, errors.NewValidationError("tx", "must not be nil")
+	}
+	if communityAPID == "" {
+		return 0, errors.NewValidationError("community_ap_id", "must not be empty")
+	}
+	if communityDID == "" {
+		return 0, errors.NewValidationError("community_did", "must not be empty")
+	}
+	// Publishing work and votes only: retractions (a takedown Delete, a vote
+	// Undo) go out regardless. Rows in lease or held for settlement are left
+	// alone. The worker checks the community only when it claims a row: a row
+	// whose POST is already in flight is delivered; one whose attempt fails
+	// returns to pending and is held at its next claim.
+	result, err := tx.ExecContext(ctx, `
+		UPDATE outbound_deliveries d
+		SET state = 'held', held_reason = $3, held_subject = $2,
+		    claimed_until = NULL, updated_at = now()
+		FROM outbound_activities a
+		WHERE d.activity_id = a.activity_id
+		  AND d.ordering_key = $1
+		  AND d.state = 'pending'
+		  AND (d.claimed_until IS NULL OR d.claimed_until <= CURRENT_TIMESTAMP)`+notHeldForSettlement+`
+		  AND a.kind IN ('Create', 'Update', 'Like', 'Dislike')`,
+		communityAPID, communityDID, HeldReasonCommunity)
+	if err != nil {
+		return 0, fmt.Errorf("hold outbound_deliveries into community %q: %w", communityAPID, err)
+	}
+	held, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("hold outbound_deliveries into community %q: rows affected: %w", communityAPID, err)
+	}
+	return held, nil
+}
+
+// heldRow is one held delivery a release examines, with its blockers' state.
+type heldRow struct {
+	activityID, targetInbox  string
+	objectATURI, parentATURI string
+	// restore: the row is a takedown restore's Undo{Delete} (held on consent).
+	restore       bool
+	objectRemoved bool
+	parentRemoved bool
+	// objectDeleted: the row publishes an object its author has since deleted
+	// (its outbound state is tombstoned).
+	objectDeleted bool
+	// voteWithdrawn: the row is a Like/Dislike its vote no longer names as
+	// live (WithdrawnVoteSQL).
+	voteWithdrawn bool
+	// vote: the row is a Like/Dislike. Its parent_at_uri is the voted
+	// subject, which never holds it, so a removed parent does not re-key it.
+	vote bool
+}
+
+// heldSubjectsReadHook, when set (tests only), runs after ReleaseHeldTx reads
+// its subjects and before it locks them.
+var heldSubjectsReadHook func()
+
+// ReleaseHeldTx locks the subject and the objects, parents and parents'
+// accounts (AccountSubjectOf: a bridged account's label removes its records)
+// of the rows held on it in ONE sorted LockTakedownSubjectsTx call before the
+// held rows are read. A row still blocked by its own object or its parent is
+// rekeyed onto that blocker (a reply held on its parent and then taken down
+// itself stays held on the parent, since a hold moves only pending rows), and
+// that blocker's restore (a record restore, or an account-wide one, which
+// takes the blocker's subject lock too) must not run between the read and the
+// rekey: the restore would find no row held on the blocker, then the rekey
+// would hold the row on a cleared blocker for good. A hold racing this
+// release takes the subject's lock, so it either commits before the locked
+// read (which finds its row) or rechecks after this tx commits (and sees the
+// blocker cleared).
+//
+// Invariant: a row is settled only when its object, its parent and the
+// parent's account are in the locked set. A hold that commits between the
+// subject read and the lock adds a row whose subjects may be unlocked; when
+// the locked read finds one, the attempt rolls back to a savepoint, which
+// drops its advisory and row locks, and reruns with the grown set, still one
+// sorted call per attempt.
+func (r *postgresOutboundDeliveries) ReleaseHeldTx(ctx context.Context, tx *sql.Tx, subjectATURI string) (int64, error) {
+	if tx == nil {
+		return 0, errors.NewValidationError("tx", "must not be nil")
+	}
+	if subjectATURI == "" {
+		return 0, errors.NewValidationError("subject_at_uri", "must not be empty")
+	}
+	if _, err := tx.ExecContext(ctx, `SAVEPOINT release_held`); err != nil {
+		return 0, fmt.Errorf("release held outbound_deliveries on %q: savepoint: %w", subjectATURI, err)
+	}
+	for attempt := 1; attempt <= releaseHeldAttempts; attempt++ {
+		held, covered, err := lockSubjectHeldRowsTx(ctx, tx, subjectATURI)
+		if err != nil {
+			return 0, err
+		}
+		if covered {
+			if _, err := tx.ExecContext(ctx, `RELEASE SAVEPOINT release_held`); err != nil {
+				return 0, fmt.Errorf("release held outbound_deliveries on %q: release savepoint: %w", subjectATURI, err)
+			}
+			return settleHeldRows(ctx, tx, held)
+		}
+		if _, err := tx.ExecContext(ctx, `ROLLBACK TO SAVEPOINT release_held`); err != nil {
+			return 0, fmt.Errorf("release held outbound_deliveries on %q: rollback to savepoint: %w", subjectATURI, err)
+		}
+	}
+	return 0, fmt.Errorf("release held outbound_deliveries on %q: held rows outgrew the locked subjects %d times",
+		subjectATURI, releaseHeldAttempts)
+}
+
+// subjectHeldWhere selects the rows ReleaseHeldTx settles: those held on the
+// subject ($1). Rows held on consent or on a pause wait on their author, not
+// on this subject: only ReleaseConsentHeldTx releases them.
+const subjectHeldWhere = `d.held_subject = $1 AND d.held_reason NOT IN ('` +
+	HeldReasonConsent + `', '` + HeldReasonPause + `')`
+
+// lockSubjectHeldRowsTx is one attempt of ReleaseHeldTx: it reads the objects,
+// parents and parents' accounts of the rows held on subjectATURI, locks them
+// with the subject in one sorted call, then reads the held rows locked.
+// covered is false when a read row has one of those outside the locked set;
+// its rows must not be settled.
+func lockSubjectHeldRowsTx(ctx context.Context, tx *sql.Tx, subjectATURI string) (held []heldRow, covered bool, err error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT DISTINCT s.subject
+		FROM outbound_deliveries d
+		JOIN outbound_activities a ON a.activity_id = d.activity_id
+		CROSS JOIN LATERAL (VALUES (`+heldObjectATURI+`), (a.parent_at_uri),
+		                           (`+accountSubjectSQL("a.parent_at_uri")+`)) AS s(subject)
+		WHERE d.state = 'held' AND `+subjectHeldWhere+` AND s.subject <> ''`, subjectATURI)
+	if err != nil {
+		return nil, false, fmt.Errorf("read held row subjects on %q: %w", subjectATURI, err)
+	}
+	subjects := []string{subjectATURI}
+	for rows.Next() {
+		var subject string
+		if err := rows.Scan(&subject); err != nil {
+			_ = rows.Close()
+			return nil, false, fmt.Errorf("scan held row subject on %q: %w", subjectATURI, err)
+		}
+		subjects = append(subjects, subject)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, false, fmt.Errorf("read held row subjects on %q: %w", subjectATURI, err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, false, fmt.Errorf("read held row subjects on %q: %w", subjectATURI, err)
+	}
+	if heldSubjectsReadHook != nil {
+		heldSubjectsReadHook()
+	}
+	if err := LockTakedownSubjectsTx(ctx, tx, subjects...); err != nil {
+		return nil, false, err
+	}
+	held, err = readHeldRows(ctx, tx, subjectHeldWhere, subjectATURI)
+	if err != nil {
+		return nil, false, fmt.Errorf("read held outbound_deliveries on %q: %w", subjectATURI, err)
+	}
+	for _, row := range held {
+		for _, subject := range []string{row.objectATURI, row.parentATURI, AccountSubjectOf(row.parentATURI)} {
+			if subject != "" && !slices.Contains(subjects, subject) {
+				return nil, false, nil
+			}
+		}
+	}
+	return held, true, nil
+}
+
+func (r *postgresOutboundDeliveries) ReleaseConsentHeldTx(ctx context.Context, tx *sql.Tx, actorDID string) (int64, error) {
+	if tx == nil {
+		return 0, errors.NewValidationError("tx", "must not be nil")
+	}
+	if actorDID == "" {
+		return 0, errors.NewValidationError("actor_did", "must not be empty")
+	}
+	blocked, err := LockActorConsentTx(ctx, tx, actorDID)
+	if err != nil {
+		return 0, err
+	}
+	if blocked {
+		return 0, cancelPauseHeldUnlessTakedownPausedTx(ctx, tx, actorDID)
+	}
+	// The actor's row lock (held by the caller's consent write, or taken
+	// above) shuts out a worker's consent or pause hold for the rest of this
+	// tx, so the subjects read here are every subject the actor's held rows
+	// are on. A reply still blocked by its parent is rekeyed onto it, and the
+	// parent's restore must not run between that read and the rekey.
+	subjects, err := ConsentHeldSubjectsTx(ctx, tx, actorDID)
+	if err != nil {
+		return 0, err
+	}
+	if len(subjects) == 0 {
+		return 0, nil
+	}
+	// Every blocker read below (each row's object and parent) is read under
+	// its subject lock, all taken here in one sorted call. A takedown of the
+	// object (Takedowns.AddSourceTx) and a restore of the object or the parent
+	// (ReleaseHeldTx) take the same lock, so each either commits before the
+	// read or waits for this tx.
+	if err := LockTakedownSubjectsTx(ctx, tx, subjects...); err != nil {
+		return 0, err
+	}
+	held, err := readHeldRows(ctx, tx, `d.held_reason IN ('`+HeldReasonConsent+`', '`+HeldReasonPause+
+		`') AND a.actor_did = $1`, actorDID)
+	if err != nil {
+		return 0, fmt.Errorf("read consent-held outbound_deliveries of %q: %w", actorDID, err)
+	}
+	return settleHeldRows(ctx, tx, held)
+}
+
+// cancelPauseHeldUnlessTakedownPausedTx cancels actorDID's rows held on a
+// pause (HeldReasonPause) once its consent is withdrawn for a reason that is
+// not a takedown: it is paused only by deactivated or throttled, disabled, or
+// opted out. Those rows waited for a takedown to lift; the withdrawn consent
+// cancels them as the worker cancels outward work claimed under such a block.
+// While a takedown source still pauses the persona they stay held. The caller
+// holds the actor's row lock (LockActorConsentTx), which orders this against
+// the worker's pause hold.
+func cancelPauseHeldUnlessTakedownPausedTx(ctx context.Context, tx *sql.Tx, actorDID string) error {
+	takedownPaused, err := TakedownPausedTx(ctx, tx, actorDID)
+	if err != nil || takedownPaused {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE outbound_deliveries d
+		SET state = 'cancelled', held_reason = '', held_subject = '', updated_at = now()
+		FROM outbound_activities a
+		WHERE d.activity_id = a.activity_id
+		  AND a.actor_did = $1
+		  AND d.state = 'held' AND d.held_reason = $2`, actorDID, HeldReasonPause); err != nil {
+		return fmt.Errorf("cancel pause-held outbound_deliveries of %q: %w", actorDID, err)
+	}
+	return nil
+}
+
+// ConsentHeldSubjectsTx reads, in tx, every takedown subject whose blocker
+// ReleaseConsentHeldTx reads for actorDID's rows held on consent or on a
+// pause: each row's object (a consent row's subject; a pause row is held on
+// the actor, so its object is read from its payload), its parent and the
+// parent's account. An account-wide change that runs the consent release in
+// its tx takes these with its own subjects in its one sorted
+// LockTakedownSubjectsTx call.
+func ConsentHeldSubjectsTx(ctx context.Context, tx *sql.Tx, actorDID string) ([]string, error) {
+	if tx == nil {
+		return nil, errors.NewValidationError("tx", "must not be nil")
+	}
+	rows, err := tx.QueryContext(ctx, `
+		SELECT DISTINCT s.subject
+		FROM outbound_deliveries d
+		JOIN outbound_activities a ON a.activity_id = d.activity_id
+		CROSS JOIN LATERAL (VALUES (`+heldObjectATURI+`), (a.parent_at_uri),
+		                           (`+accountSubjectSQL("a.parent_at_uri")+`)) AS s(subject)
+		WHERE d.state = 'held' AND d.held_reason IN ($2, $3) AND a.actor_did = $1 AND s.subject <> ''`,
+		actorDID, HeldReasonConsent, HeldReasonPause)
+	if err != nil {
+		return nil, fmt.Errorf("read consent-held subjects of %q: %w", actorDID, err)
+	}
+	var subjects []string
+	for rows.Next() {
+		var subject string
+		if err := rows.Scan(&subject); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("scan consent-held subject of %q: %w", actorDID, err)
+		}
+		subjects = append(subjects, subject)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, fmt.Errorf("read consent-held subjects of %q: %w", actorDID, err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("read consent-held subjects of %q: %w", actorDID, err)
+	}
+	return subjects, nil
+}
+
+// accountSubjectSQL is AccountSubjectOf in SQL: the bare DID authoring the
+// record at-uri in the given expression, the empty string for anything else.
+func accountSubjectSQL(uri string) string {
+	return `COALESCE(substring((` + uri + `)::text FROM '^at://(did:[^/]*)/'), '')`
+}
+
+// accountHeldSubjectsReadHook, when set (tests only), runs after
+// ReleaseAccountHeldTx reads its subjects and before it locks them.
+var accountHeldSubjectsReadHook func()
+
+// ReleaseAccountHeldTx releases, in tx, the replies held on a record of the
+// bridged account accountDID (rows held on their parent, the parent authored
+// by accountDID) once that account's `!takedown` no longer stands, deciding
+// each row by ReleaseHeldTx's rules: a reply whose parent is still removed
+// another way, or whose own object is removed, stays held on that blocker.
+// The caller has written the label's negation or lapse in tx.
+//
+// Every subject it reads a blocker of (the account, each held row's parent and
+// its account, and each held row's own object) is locked in ONE sorted
+// LockTakedownSubjectsTx call before the held rows are read, so it cannot
+// deadlock against a consent release or another multi-subject lock holder.
+// A worker's or an enqueuer's hold on a parent also takes the parent's
+// account subject, so once the account is locked neither commits a new hold
+// on a record of this account until this tx ends.
+//
+// Invariant: a row is settled only when every subject it reads a blocker of
+// is in the locked set. A hold that commits between the subject read and the
+// lock adds a row whose object may be unlocked; settling it would race that
+// object's restore (the restore finds no row held on the object, then the
+// settle rekeys the row onto the cleared object, held for good). So when the
+// locked read finds such a row, the attempt rolls back to a savepoint, which
+// drops its advisory and row locks, and reruns with the grown set, still one
+// sorted call per attempt. Returns how many rows were released.
+func ReleaseAccountHeldTx(ctx context.Context, tx *sql.Tx, accountDID string) (int64, error) {
+	if tx == nil {
+		return 0, errors.NewValidationError("tx", "must not be nil")
+	}
+	if accountDID == "" {
+		return 0, errors.NewValidationError("account_did", "must not be empty")
+	}
+	if _, err := tx.ExecContext(ctx, `SAVEPOINT release_account_held`); err != nil {
+		return 0, fmt.Errorf("release held replies of account %q: savepoint: %w", accountDID, err)
+	}
+	for attempt := 1; attempt <= releaseHeldAttempts; attempt++ {
+		held, covered, err := lockAccountHeldRowsTx(ctx, tx, accountDID)
+		if err != nil {
+			return 0, err
+		}
+		if covered {
+			if _, err := tx.ExecContext(ctx, `RELEASE SAVEPOINT release_account_held`); err != nil {
+				return 0, fmt.Errorf("release held replies of account %q: release savepoint: %w", accountDID, err)
+			}
+			return settleHeldRows(ctx, tx, held)
+		}
+		if _, err := tx.ExecContext(ctx, `ROLLBACK TO SAVEPOINT release_account_held`); err != nil {
+			return 0, fmt.Errorf("release held replies of account %q: rollback to savepoint: %w", accountDID, err)
+		}
+	}
+	return 0, fmt.Errorf("release held replies of account %q: held rows outgrew the locked subjects %d times",
+		accountDID, releaseHeldAttempts)
+}
+
+// releaseHeldAttempts bounds ReleaseHeldTx's and ReleaseAccountHeldTx's
+// relocks. Each needs a hold committed in the short window between its subject
+// read and its lock; past the bound the caller's tx fails and its caller
+// retries.
+const releaseHeldAttempts = 5
+
+// lockAccountHeldRowsTx is one attempt of ReleaseAccountHeldTx: it reads the
+// subjects of accountDID's parent-held rows, locks them in one sorted call,
+// then reads the held rows locked. covered is false when a read row has a
+// subject outside the locked set; its rows must not be settled.
+func lockAccountHeldRowsTx(ctx context.Context, tx *sql.Tx, accountDID string) (held []heldRow, covered bool, err error) {
+	prefix := "at://" + accountDID + "/"
+	rows, err := tx.QueryContext(ctx, `
+		SELECT DISTINCT s.subject
+		FROM outbound_deliveries d
+		JOIN outbound_activities a ON a.activity_id = d.activity_id
+		CROSS JOIN LATERAL (VALUES (d.held_subject), (a.parent_at_uri),
+		                           (`+accountSubjectSQL("a.parent_at_uri")+`),
+		                           (`+heldObjectATURI+`)) AS s(subject)
+		WHERE d.state = 'held' AND d.held_reason = $2 AND starts_with(d.held_subject, $1)
+		  AND s.subject <> ''`, prefix, HeldReasonParent)
+	if err != nil {
+		return nil, false, fmt.Errorf("read held reply subjects of account %q: %w", accountDID, err)
+	}
+	subjects := []string{accountDID}
+	for rows.Next() {
+		var subject string
+		if err := rows.Scan(&subject); err != nil {
+			_ = rows.Close()
+			return nil, false, fmt.Errorf("scan held reply subject of account %q: %w", accountDID, err)
+		}
+		subjects = append(subjects, subject)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, false, fmt.Errorf("read held reply subjects of account %q: %w", accountDID, err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, false, fmt.Errorf("read held reply subjects of account %q: %w", accountDID, err)
+	}
+	if accountHeldSubjectsReadHook != nil {
+		accountHeldSubjectsReadHook()
+	}
+	if err := LockTakedownSubjectsTx(ctx, tx, subjects...); err != nil {
+		return nil, false, err
+	}
+	held, err = readHeldRows(ctx, tx, `d.held_reason = '`+HeldReasonParent+`' AND starts_with(d.held_subject, $1)`, prefix)
+	if err != nil {
+		return nil, false, fmt.Errorf("read held replies of account %q: %w", accountDID, err)
+	}
+	for _, row := range held {
+		for _, subject := range []string{row.objectATURI, row.parentATURI, AccountSubjectOf(row.parentATURI)} {
+			if subject != "" && !slices.Contains(subjects, subject) {
+				return nil, false, nil
+			}
+		}
+	}
+	return held, true, nil
+}
+
+// LockActorConsentTx share-locks actorDID's ap_actors row in tx and reports
+// whether the actor's consent is withdrawn: it is disabled, delivery-paused,
+// or has a federation opt-out (a missing preference is default-on). A missing
+// actor is blocked: there is no persona to sign as. The share lock holds until
+// tx ends, so a consent write (an unpause or an opt-in updates the row) either
+// commits before this reads or waits for tx.
+func LockActorConsentTx(ctx context.Context, tx *sql.Tx, actorDID string) (blocked bool, err error) {
+	if tx == nil {
+		return false, errors.NewValidationError("tx", "must not be nil")
+	}
+	var consented bool
+	err = tx.QueryRowContext(ctx, `
+		SELECT a.enabled AND NOT a.delivery_paused
+		       AND COALESCE((SELECT p.enabled FROM federation_prefs p WHERE p.did = a.did), true)
+		FROM ap_actors a
+		WHERE a.did = $1
+		FOR SHARE OF a`, actorDID).Scan(&consented)
+	if stderrors.Is(err, sql.ErrNoRows) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read consent of %q: %w", actorDID, err)
+	}
+	return !consented, nil
+}
+
+// heldObjectATURI is the SQL expression for the at-uri of the object a held
+// delivery d (with its activity a) publishes or restores. A consent-held row's
+// object is its subject (a restore Undo's payload names the Delete, not the
+// object); any other row's is read from its payload's object id.
+const heldObjectATURI = `CASE WHEN d.held_reason = '` + HeldReasonConsent + `' THEN d.held_subject
+	ELSE COALESCE('at://' || substring(a.payload -> 'object' ->> 'id' FROM '/ap/object/(.+)$'), '') END`
+
+// HeldObjectATURISQL is heldObjectATURI for another package's query over a
+// held delivery d and its activity a: lockAccountObjectsTx locks each held
+// row's object before the releases it runs read the object's removal state.
+const HeldObjectATURISQL = heldObjectATURI
+
+// readHeldRows reads, in seq order and locked, the held rows matching where
+// (a condition on d, the delivery, and a, its activity, with its arguments)
+// with every blocker's state. Every blocker is rechecked, not only the one the
+// row was held on: a reply held on its parent may since have been taken down
+// itself. A consent-held row's object is its subject (a restore Undo's payload
+// names the Delete, not the object).
+func readHeldRows(ctx context.Context, tx *sql.Tx, where string, args ...any) ([]heldRow, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT d.activity_id, d.target_inbox, o.at_uri, a.parent_at_uri, a.kind = 'Undo',
+		       EXISTS (SELECT 1 FROM outbound_takedown_sources s WHERE s.at_uri = o.at_uri),
+		       a.parent_at_uri <> '' AND `+parentRemovedPredicate("a.parent_at_uri")+`,
+		       a.kind IN ('Create', 'Update', 'Undo') AND EXISTS (
+		           SELECT 1 FROM outbound_objects ob
+		           WHERE ob.at_uri = o.at_uri AND ob.tombstoned_at IS NOT NULL),
+		       `+withdrawnVoteSQL+`,
+		       a.kind IN ('Like', 'Dislike')
+		FROM outbound_deliveries d
+		JOIN outbound_activities a ON a.activity_id = d.activity_id
+		CROSS JOIN LATERAL (SELECT `+heldObjectATURI+` AS at_uri) o
+		WHERE d.state = 'held' AND `+where+`
+		ORDER BY d.seq
+		FOR UPDATE OF d`, args...)
+	if err != nil {
+		return nil, err
+	}
+	var held []heldRow
+	for rows.Next() {
+		var row heldRow
+		if err := rows.Scan(&row.activityID, &row.targetInbox, &row.objectATURI, &row.parentATURI, &row.restore,
+			&row.objectRemoved, &row.parentRemoved, &row.objectDeleted, &row.voteWithdrawn, &row.vote); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		held = append(held, row)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	return held, nil
+}
+
+// settleHeldRows decides each held row, returning how many were released.
+//
+// A held row of an object its author deleted during the hold is cancelled
+// whatever its blockers: a deleted object never comes back, and its Delete
+// already went out (retractions are never held). So is a held Like/Dislike
+// whose vote was deleted or re-cast during the hold: the deletion's Undo went
+// out, and releasing the vote behind it would re-cast what the user withdrew
+// (a re-cast's own activity is the one that stays). A row still blocked is
+// re-keyed to a blocker that stands, so the release of that blocker finds it;
+// a restore Undo whose object is removed again is cancelled instead, since
+// the next restore sends its own Undo for the new episode.
+//
+// In seq order, one row at a time: each released row draws the next seq,
+// which puts the released rows at the tail of their key, behind everything
+// enqueued during the hold and in the order they were first queued.
+func settleHeldRows(ctx context.Context, tx *sql.Tx, held []heldRow) (int64, error) {
+	var released int64
+	var err error
+	for _, row := range held {
+		switch {
+		case row.objectDeleted, row.voteWithdrawn, row.restore && row.objectRemoved:
+			_, err = tx.ExecContext(ctx, `
+				UPDATE outbound_deliveries
+				SET state = 'cancelled', held_reason = '', held_subject = '', updated_at = now()
+				WHERE activity_id = $1 AND target_inbox = $2 AND state = 'held'`,
+				row.activityID, row.targetInbox)
+		case row.objectRemoved:
+			err = rekeyHeld(ctx, tx, row, HeldReasonObject, row.objectATURI)
+		case row.parentRemoved && !row.restore && !row.vote:
+			err = rekeyHeld(ctx, tx, row, HeldReasonParent, row.parentATURI)
+		default:
+			_, err = tx.ExecContext(ctx, `
+				UPDATE outbound_deliveries
+				SET state = 'pending', held_reason = '', held_subject = '',
+				    seq = nextval(pg_get_serial_sequence('outbound_deliveries', 'seq')),
+				    updated_at = now()
+				WHERE activity_id = $1 AND target_inbox = $2 AND state = 'held'`,
+				row.activityID, row.targetInbox)
+			if err == nil {
+				released++
+			}
+		}
+		if err != nil {
+			return 0, fmt.Errorf("release held outbound_delivery %q -> %q: %w", row.activityID, row.targetInbox, err)
+		}
+	}
+	return released, nil
+}
+
+// withdrawnVoteSQL is true for a delivery's activity a that is a Like/Dislike
+// its vote no longer names as live: the outbound_votes row is gone (its Undo
+// landed), retracting (a delete queued its Undo), undone (a purge retracted
+// it), or names a newer activity (a re-cast replaced it).
+const withdrawnVoteSQL = `a.kind IN ('Like', 'Dislike') AND NOT EXISTS (
+		           SELECT 1 FROM outbound_votes v
+		           WHERE v.actor_did = a.actor_did AND v.current_activity_id = a.activity_id
+		             AND v.retraction_activity_id IS NULL
+		             AND v.delivered_state <> '` + string(DeliveredStateUndone) + `')`
+
+// CancelHeldVoteTx cancels, in tx, the held deliveries of the Like/Dislike
+// activityID, which the caller's vote write withdraws (its Undo) or replaces
+// (a re-cast). The caller writes the vote row and enqueues the Undo or the
+// replacement in the same tx, after this: a release that locked the rows
+// first commits before this statement proceeds, and the activity enqueued
+// after it then sits behind the released row on the ordering key. Rows not
+// held are left alone: a pending one goes out ahead of its Undo in order, and
+// one the worker holds later is cancelled at its release (withdrawnVoteSQL).
+func CancelHeldVoteTx(ctx context.Context, tx *sql.Tx, activityID string) error {
+	if tx == nil {
+		return errors.NewValidationError("tx", "must not be nil")
+	}
+	if activityID == "" {
+		return errors.NewValidationError("activity_id", "must not be empty")
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE outbound_deliveries
+		SET state = 'cancelled', held_reason = '', held_subject = '', updated_at = now()
+		WHERE activity_id = $1 AND state = 'held'`, activityID); err != nil {
+		return fmt.Errorf("cancel held outbound_deliveries of vote activity %q: %w", activityID, err)
+	}
+	return nil
+}
+
+// rekeyHeld keeps a held row held on the blocker that still stands.
+func rekeyHeld(ctx context.Context, tx *sql.Tx, row heldRow, reason, subject string) error {
+	_, err := tx.ExecContext(ctx, `
+		UPDATE outbound_deliveries
+		SET held_reason = $3, held_subject = $4, updated_at = now()
+		WHERE activity_id = $1 AND target_inbox = $2 AND state = 'held'
+		  AND (held_reason <> $3 OR held_subject <> $4)`,
+		row.activityID, row.targetInbox, reason, subject)
+	if err != nil {
+		return fmt.Errorf("re-key held outbound_delivery %q -> %q on %s %q: %w",
+			row.activityID, row.targetInbox, reason, subject, err)
+	}
+	return nil
+}
+
+func checkHeldReason(reason, subject string) error {
+	switch reason {
+	case HeldReasonObject, HeldReasonParent, HeldReasonConsent, HeldReasonPause, HeldReasonCommunity:
+	default:
+		return errors.NewValidationError("held_reason", "unknown held reason "+reason)
+	}
+	if subject == "" {
+		return errors.NewValidationError("held_subject", "must not be empty")
+	}
+	return nil
+}
+
+func (r *postgresOutboundDeliveries) HoldActivityTx(ctx context.Context, tx *sql.Tx, activityID, reason, subject string) (int64, error) {
+	if tx == nil {
+		return 0, errors.NewValidationError("tx", "must not be nil")
+	}
+	if err := checkHeldReason(reason, subject); err != nil {
+		return 0, err
+	}
+	result, err := tx.ExecContext(ctx, `
+		UPDATE outbound_deliveries
+		SET state = 'held', held_reason = $2, held_subject = $3,
+		    claimed_until = NULL, updated_at = now()
+		WHERE activity_id = $1
+		  AND state = 'pending'
+		  AND (claimed_until IS NULL OR claimed_until <= CURRENT_TIMESTAMP)`+notHeldForSettlement,
+		activityID, reason, subject)
+	if err != nil {
+		return 0, fmt.Errorf("hold outbound_deliveries of %q: %w", activityID, err)
+	}
+	held, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("hold outbound_deliveries of %q: rows affected: %w", activityID, err)
+	}
+	return held, nil
+}
+
+func (r *postgresOutboundDeliveries) HoldClaimedTx(ctx context.Context, tx *sql.Tx, activityID, targetInbox, reason, subject string, claimToken time.Time) (bool, bool, error) {
+	if tx == nil {
+		return false, false, errors.NewValidationError("tx", "must not be nil")
+	}
+	if err := checkHeldReason(reason, subject); err != nil {
+		return false, false, err
+	}
+	// Fenced like every mark: only the current claim holder may hold the row,
+	// and the claim's attempt is handed back as ReleaseParked does.
+	query := `
+		WITH updated AS (
+			UPDATE outbound_deliveries
+			SET state = 'held', held_reason = $3, held_subject = $4,
+			    claimed_until = NULL, attempts = GREATEST(attempts - 1, 0),
+			    updated_at = now()
+			WHERE activity_id = $1 AND target_inbox = $2
+			  AND state = 'pending'
+			  AND claimed_until = $5
+			RETURNING 1
+		)
+		SELECT
+			EXISTS (SELECT 1 FROM outbound_deliveries WHERE activity_id = $1 AND target_inbox = $2),
+			EXISTS (SELECT 1 FROM updated)`
+	var exists, applied bool
+	if err := tx.QueryRowContext(ctx, query, activityID, targetInbox, reason, subject, claimToken.UTC()).
+		Scan(&exists, &applied); err != nil {
+		return false, false, fmt.Errorf("hold outbound_delivery: %w", err)
+	}
+	return exists, applied, nil
 }

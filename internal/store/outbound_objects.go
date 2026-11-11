@@ -106,6 +106,21 @@ func (r *postgresOutboundObjects) GetByATURI(ctx context.Context, atURI string) 
 	return object, nil
 }
 
+func (r *postgresOutboundObjects) LockByATURITx(ctx context.Context, tx *sql.Tx, atURI string) (*OutboundObject, error) {
+	if tx == nil {
+		return nil, errors.NewValidationError("tx", "must not be nil")
+	}
+	query := `SELECT` + outboundObjectColumns + ` FROM outbound_objects WHERE at_uri = $1 FOR UPDATE`
+	object, err := scanOutboundObject(tx.QueryRowContext(ctx, query, atURI))
+	if err != nil {
+		if stderrors.Is(err, sql.ErrNoRows) {
+			return nil, errors.NewNotFoundError("outbound_object", atURI)
+		}
+		return nil, fmt.Errorf("lock outbound_object %q: %w", atURI, err)
+	}
+	return object, nil
+}
+
 func (r *postgresOutboundObjects) Tombstone(ctx context.Context, atURI string) (*OutboundObject, error) {
 	return r.tombstone(ctx, r.db, atURI)
 }
@@ -189,11 +204,22 @@ func (r *postgresOutboundObjects) UntombstoneTx(ctx context.Context, tx *sql.Tx,
 // it. A missing object is NotFound, not a no-op — accepting an object we hold no
 // state for is a bug, since there is nothing whose children we could unblock.
 func (r *postgresOutboundObjects) SetAccepted(ctx context.Context, atURI string) error {
+	return setAccepted(ctx, r.db, atURI)
+}
+
+func (r *postgresOutboundObjects) SetAcceptedTx(ctx context.Context, tx *sql.Tx, atURI string) error {
+	if tx == nil {
+		return errors.NewValidationError("tx", "must not be nil")
+	}
+	return setAccepted(ctx, tx, atURI)
+}
+
+func setAccepted(ctx context.Context, ex execer, atURI string) error {
 	query := `
 		UPDATE outbound_objects
 		SET accepted_at = COALESCE(accepted_at, now())
 		WHERE at_uri = $1`
-	result, err := r.db.ExecContext(ctx, query, atURI)
+	result, err := ex.ExecContext(ctx, query, atURI)
 	if err != nil {
 		return fmt.Errorf("set accepted_at for outbound_object %q: %w", atURI, err)
 	}

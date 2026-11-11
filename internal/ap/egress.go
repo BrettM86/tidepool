@@ -28,6 +28,16 @@ func NewGuardedHTTPClient(allowPrivate bool, timeout time.Duration) *http.Client
 	}
 }
 
+// NewGuardedDialContext returns a dial function that enforces the same SSRF
+// egress guard as NewGuardedHTTPClient (resolved-IP validation at dial
+// time). It is for outbound connections that are not made through an
+// *http.Client, such as a websocket dialer's NetDialContext. allowPrivate
+// follows the same rule as NewGuardedHTTPClient.
+func NewGuardedDialContext(allowPrivate bool) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	base := (&net.Dialer{Timeout: DefaultRequestTimeout, KeepAlive: 30 * time.Second}).DialContext
+	return newEgressGuard(allowPrivate).dialContext(base)
+}
+
 // NewPrivateOnlyHTTPClient returns an *http.Client whose transport enforces
 // the INVERSE of the SSRF guard at dial time: every destination must be
 // loopback, RFC1918/ULA private, or link-local — anything public is refused.

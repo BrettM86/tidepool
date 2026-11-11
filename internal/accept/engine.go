@@ -205,6 +205,7 @@ type Engine struct {
 	prefs           store.FederationPrefs
 	admissions      *Admissions
 	bans            store.CommunityBans
+	removals        store.CommunityRemovals
 	apActors        store.APActors
 	maxPerCommunity int
 	catalog         *lexicon.BaseCatalog
@@ -277,6 +278,10 @@ func NewEngine(opts Options) (*Engine, error) {
 		return nil, errors.NewValidationError("bans",
 			"must not be nil: pass a store.CommunityBans, or a Communities that provides one")
 	}
+	// The removal view keeps an accepted post's edit while its community is
+	// removed. A Communities without it (a test double) keeps today's gate: the
+	// edit of a post in an unfollowed community is a removal.
+	removals, _ := opts.Communities.(store.CommunityRemovals)
 	return &Engine{
 		repos:           opts.Repos,
 		enqueuer:        opts.Enqueuer,
@@ -287,6 +292,7 @@ func NewEngine(opts Options) (*Engine, error) {
 		prefs:           opts.Prefs,
 		admissions:      opts.Admissions,
 		bans:            bans,
+		removals:        removals,
 		apActors:        opts.APActors,
 		maxPerCommunity: opts.MaxPerAuthorPerCommunity,
 		catalog:         catalog,
@@ -341,7 +347,15 @@ func (e *Engine) AdmitPost(ctx context.Context, did string, commit *consume.Comm
 	// non-empty code is a rejection/removal cause, and because immutability is
 	// settled first, a non-empty code is always ABOUT the community this post is
 	// already bound to (or a post with no binding yet).
-	code, discard, err := e.decide(ctx, did, commit, communityDID, boundCommunity)
+	// Whether the post is LIVE right now: it federated once (the engine writes
+	// outbound_objects only on accept) and has not been withdrawn since. Read
+	// before any decision branch, because both the refusal branches below turn on
+	// it — a refusal that leaves a standing acceptance alone must not record the
+	// post as though nothing of it were live — and the paused check keeps a
+	// takedown-paused author's edit of a live post.
+	priorAccepted := priorBound && !prior.IsTombstoned()
+
+	code, discard, err := e.decide(ctx, did, commit, communityDID, boundCommunity, priorAccepted)
 	if err != nil {
 		return err
 	}
@@ -354,13 +368,6 @@ func (e *Engine) AdmitPost(ctx context.Context, did string, commit *consume.Comm
 			slog.String("bound_community", boundCommunity), slog.String("event_community", communityDID))
 		return e.annotateCommunityImmutable(ctx, postURI)
 	}
-
-	// Whether the post is LIVE right now: it federated once (the engine writes
-	// outbound_objects only on accept) and has not been withdrawn since. Read
-	// before any decision branch, because both the refusal branches below turn on
-	// it — a refusal that leaves a standing acceptance alone must not record the
-	// post as though nothing of it were live.
-	priorAccepted := priorBound && !prior.IsTombstoned()
 
 	if code != "" {
 		// A post that WAS accepted and now fails re-admission is REMOVED (it
@@ -489,7 +496,7 @@ const (
 // reaches a policy check, and a hijack (community move) is refused before the
 // author's own preferences are consulted.
 func (e *Engine) decide(ctx context.Context, did string, commit *consume.CommitEvent,
-	communityDID, boundCommunity string) (code string, discard bool, err error) {
+	communityDID, boundCommunity string, priorAccepted bool) (code string, discard bool, err error) {
 
 	// 1. Community immutability, FIRST. The lexicon marks `community` immutable:
 	// an UPDATE that names a different community than the post was bound to is a
@@ -532,7 +539,18 @@ func (e *Engine) decide(ctx context.Context, did string, commit *consume.CommitE
 		return "", false, fmt.Errorf("accept: resolve community %s: %w", communityDID, err)
 	}
 	if community.FollowState != store.FollowStateAccepted {
-		return DecisionCommunityNotFollowed, false, nil
+		// A removed community (a Coves community `!takedown`) is unfollowed by
+		// the removal, not by a judgement of the post: an edit of a post it had
+		// accepted is admitted as the object's latest state. Its Update waits
+		// behind the object's community takedown source and reaches Lemmy after
+		// the negation's Undo{Delete}. A post never accepted stays refused.
+		removed, err := e.communityRemoved(ctx, communityDID, priorAccepted)
+		if err != nil {
+			return "", false, err
+		}
+		if !removed {
+			return DecisionCommunityNotFollowed, false, nil
+		}
 	}
 
 	// 4. Community ban (task 17c-3): this community has excluded this author, so
@@ -562,12 +580,19 @@ func (e *Engine) decide(ctx context.Context, did string, commit *consume.CommitE
 	}
 
 	// 6. Paused (#account, decision 19): delivery is halted while the identity is
-	// deactivated/suspended/takendown/throttled, so a new post is not admitted.
+	// deactivated/suspended/takendown/throttled or under an account label, so a
+	// new post is not admitted. An edit of a live post by an author paused for a
+	// takedown (an account label, or a takendown/suspended status) is admitted
+	// instead: the takedown is not a judgement of the post, so the edit becomes
+	// the object's latest state, its Update waits behind the object's account
+	// takedown source and reaches Lemmy after the restore's Undo{Delete}. A
+	// deactivated/throttled pause alone keeps DecisionPaused.
 	if e.apActors != nil {
 		actor, err := e.apActors.GetByDID(ctx, did)
 		switch {
 		case err == nil:
-			if actor.DeliveryPaused {
+			keepsEdit := priorAccepted && actor.TakedownPaused
+			if actor.DeliveryPaused && !keepsEdit {
 				return DecisionPaused, false, nil
 			}
 		case errors.IsNotFound(err):
@@ -604,6 +629,20 @@ func (e *Engine) decide(ctx context.Context, did string, commit *consume.CommitE
 	}
 
 	return "", false, nil
+}
+
+// communityRemoved reports whether an accepted post's community is removed
+// (an active removal, or a standing community `!takedown`). It is false for a
+// post never accepted and for an engine without the removal view.
+func (e *Engine) communityRemoved(ctx context.Context, communityDID string, priorAccepted bool) (bool, error) {
+	if !priorAccepted || e.removals == nil {
+		return false, nil
+	}
+	removed, err := e.removals.CommunityRemoved(ctx, communityDID)
+	if err != nil {
+		return false, fmt.Errorf("accept: read removal of community %s: %w", communityDID, err)
+	}
+	return removed, nil
 }
 
 // accept writes the community-signed acceptance and enqueues the Create/Update
@@ -1251,7 +1290,10 @@ func (e *Engine) Readmit(ctx context.Context, postATURI string) (*ReadmitResult,
 	if err != nil {
 		return nil, err
 	}
-	code, discard, err := e.decide(ctx, did, commit, communityDID, boundCommunity)
+	// Whether the post is LIVE right now, read exactly as AdmitPost reads it: it
+	// federated once and has not been withdrawn since.
+	priorAccepted := priorBound && !prior.IsTombstoned()
+	code, discard, err := e.decide(ctx, did, commit, communityDID, boundCommunity, priorAccepted)
 	if err != nil {
 		return nil, err
 	}
@@ -1260,9 +1302,6 @@ func (e *Engine) Readmit(ctx context.Context, postATURI string) (*ReadmitResult,
 		// reported as still-failing with the immutability cause.
 		return &ReadmitResult{PostURI: postATURI, Status: adm.Status, DecisionCode: DecisionCommunityImmutable}, nil
 	}
-	// Whether the post is LIVE right now, read exactly as AdmitPost reads it: it
-	// federated once and has not been withdrawn since.
-	priorAccepted := priorBound && !prior.IsTombstoned()
 
 	if code != "" {
 		if priorAccepted && code == DecisionAuthorBanned {

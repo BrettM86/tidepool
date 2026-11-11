@@ -74,13 +74,13 @@ func (d *Dispatcher) handleFederation(ctx context.Context, tx *sql.Tx, did strin
 //
 //  1. the PREFERENCE. On the gate tx for the soft tier; on its own connection,
 //     committed immediately, for the destructive one (see below).
-//  2. the CANCELLATION of everything already queued — on the gate tx.
-//  3. the DESTRUCTIVE SEAM, if asked for. Outside any transaction of ours: it
+//  2. the DESTRUCTIVE SEAM, if asked for. Outside any transaction of ours: it
 //     opens its own.
-//  4. the ACTOR MIRROR — on the gate tx, and LAST, because the seam above
-//     updates that same row from its own transaction.
+//  3. the ACTOR ROW LOCK — on the gate tx, before any delivery row.
+//  4. the CANCELLATION of everything already queued — on the gate tx.
+//  5. the ACTOR MIRROR — on the gate tx.
 //
-// WHY STEP 1 SPLITS. The seam in step 3 reads and writes federation_prefs from
+// WHY STEP 1 SPLITS. The seam in step 2 reads and writes federation_prefs from
 // its own transaction: outbound.Purger marks this exact row purged there, and
 // purged_at is the only durable record that peers were really asked to delete.
 // Holding the row uncommitted on the gate tx across that call would do both
@@ -95,6 +95,25 @@ func (d *Dispatcher) handleFederation(ctx context.Context, tx *sql.Tx, did strin
 // upsert, the same deterministic activity ids, a delivery insert that returns
 // the standing row) and because the preference is the SAFE half to have
 // committed early — it says "stop", and a replay re-asserts it.
+//
+// WHY THE ACTOR ROW IS LOCKED BEFORE THE CANCELLATION. The worker's consent
+// hold (outbound.Worker.holdOnConsent) share-locks this actor row and then
+// updates the author's pending Create/Update rows; the cancellation updates
+// those same rows and the mirror then updates the actor row. Taken in that
+// order the two deadlock. So the gate tx takes the actor row first, in the
+// mode the mirror's UPDATE takes it (FOR NO KEY UPDATE conflicts with the
+// hold's FOR SHARE), and either the hold commits before the opt-out goes on
+// or the hold waits for the opt-out to commit.
+//
+// WHY THE SEAM RUNS BEFORE BOTH. The seam updates the actor row from its own
+// transaction (the purge's tombstone), so the gate tx cannot hold that row
+// across it. Nor can it hold the cancelled delivery rows across it: a hold
+// that share-locked the actor row would wait on those rows, the purge's
+// tombstone would wait on the hold, and this handler waits on the purge in Go,
+// a cycle Postgres cannot detect. With the seam first, the gate tx holds no row
+// the hold or the purge needs while the seam runs. Nothing goes out in the
+// meantime: the preference is already committed, and the worker's consent
+// recheck reads it at claim time.
 func (d *Dispatcher) applyOptOut(ctx context.Context, tx *sql.Tx, did string, deleteRemote bool) error {
 	// The preference is the AUTHORITY, not a mirror: it answers for every DID,
 	// including the ones with no actor to mirror onto.
@@ -104,25 +123,30 @@ func (d *Dispatcher) applyOptOut(ctx context.Context, tx *sql.Tx, did string, de
 		DeleteRemote: deleteRemote,
 		Source:       store.FederationPrefSourceRecord,
 	}
-	var err error
 	if deleteRemote {
-		_, err = d.prefs.Upsert(ctx, pref)
-	} else {
-		_, err = d.prefs.UpsertTx(ctx, tx, pref)
-	}
-	if err != nil {
+		if _, err := d.prefs.Upsert(ctx, pref); err != nil {
+			return fmt.Errorf("record federation opt-out for %s: %w", did, err)
+		}
+		if err := d.deleteRemoteContent(ctx, did); err != nil {
+			return err
+		}
+	} else if _, err := d.prefs.UpsertTx(ctx, tx, pref); err != nil {
 		return fmt.Errorf("record federation opt-out for %s: %w", did, err)
+	}
+
+	if err := lockActorRowTx(ctx, tx, did); err != nil {
+		return err
 	}
 
 	// STOP MEANS TWO FACTS AT ONCE: nothing new goes out, and nothing already
 	// queued goes out either. The cancellation answers the second — and it
 	// cancels only what PUBLISHES, never a retraction.
 	//
-	// That exemption is what makes this replay-safe. The destructive tier below
-	// enqueues its withdrawal (a Delete and some Undos) on its own transaction,
-	// which can commit while this one later rolls back; the record then replays
-	// and reaches this line again. A sweeping cancel here would cancel the
-	// erasure the previous attempt committed, and nothing would repair it — the
+	// That exemption is what makes this safe after the destructive tier above.
+	// The seam has already committed its withdrawal (a Delete and some Undos)
+	// on its own transaction, and a rollback here replays the record to this
+	// line again. A sweeping cancel would cancel that committed erasure, and
+	// nothing would repair it — the
 	// delivery insert returns the standing row rather than reviving it, and the
 	// votes are already retracted, so the re-run finds nothing to enumerate. The
 	// user would be tombstoned, the log would say the purge applied, and no peer
@@ -136,23 +160,27 @@ func (d *Dispatcher) applyOptOut(ctx context.Context, tx *sql.Tx, did string, de
 			slog.String("did", did), slog.Int64("cancelled", cancelled))
 	}
 
-	if deleteRemote {
-		if err := d.deleteRemoteContent(ctx, did); err != nil {
-			return err
-		}
-	}
-
 	// The mirror answers the first fact — the consumer, the admission gate and
-	// the delivery claim all read it — and it lands LAST, for a reason that is
-	// about locks rather than meaning: it UPDATEs the actor row, and the
-	// destructive tier updates that same row from its own transaction. Holding
-	// this one across that call deadlocks the two against each other, and the
-	// handler cannot release a lock it holds without committing.
+	// the delivery claim all read it. It UPDATEs the actor row, which the
+	// destructive tier also updates from its own transaction, so it comes after
+	// the seam (see the lock-order note above).
 	//
 	// It still rides the rev-gate transaction, so the cancellation and the flag
 	// commit together with the gate advance: nothing retries the missing half,
 	// because the record is applied ONCE under a gate that rejects the replay.
 	return d.mirrorActorEnabled(ctx, tx, did, false)
+}
+
+// lockActorRowTx locks did's ap_actors row on tx in the mode the mirror's
+// UPDATE takes it, so the opt-out holds the actor row before any delivery row
+// (see applyOptOut). A missing actor locks nothing and is not an error: the
+// mirror allows it too.
+func lockActorRowTx(ctx context.Context, tx *sql.Tx, did string) error {
+	if _, err := tx.ExecContext(ctx,
+		`SELECT 1 FROM ap_actors WHERE did = $1 FOR NO KEY UPDATE`, did); err != nil {
+		return fmt.Errorf("lock actor row for %s: %w", did, err)
+	}
+	return nil
 }
 
 // deleteRemoteContent runs the DESTRUCTIVE tier: peers are asked to delete what
@@ -216,6 +244,12 @@ func (d *Dispatcher) restoreDefaultFederation(ctx context.Context, tx *sql.Tx, d
 		return fmt.Errorf("clear federation preference for %s: %w", did, err)
 	}
 	if err := d.mirrorActorEnabled(ctx, tx, did, true); err != nil {
+		return err
+	}
+	// Consent is back unless a pause source stands: release the work held on
+	// it. After the ap_actors write, whose row lock orders it against the
+	// worker's holds.
+	if err := d.releasePauseHeldTx(ctx, tx, did); err != nil {
 		return err
 	}
 	if cleared {

@@ -129,3 +129,112 @@ func TestComposeCovesAppView_HandleWellKnownHostsCoverStackHandles(t *testing.T)
 		}
 	}
 }
+
+// TestComposeCovesAppView_ModerationAdminFromBootstrappedAccount checks how
+// the instance admin's DID reaches the AppView. The reference PDS mints a
+// fresh did:plc for the admin account on every stack, so the DID cannot be
+// written into the compose file: pds-bootstrap creates the account and writes
+// its DID to /coves-admin/admin.did on the shared coves-admin volume, and
+// coves-appview, started only once pds-bootstrap has exited successfully,
+// reads that file into MODERATION_ADMINS before it execs the server.
+func TestComposeCovesAppView_ModerationAdminFromBootstrappedAccount(t *testing.T) {
+	composePath := filepath.Join("..", "..", "docker-compose.e2e.yml")
+	raw, err := os.ReadFile(composePath)
+	if err != nil {
+		t.Fatalf("read %s: %v", composePath, err)
+	}
+	var compose composeFile
+	if err := yaml.Unmarshal(raw, &compose); err != nil {
+		t.Fatalf("parse %s: %v", composePath, err)
+	}
+	bootstrap, ok := compose.Services["pds-bootstrap"]
+	if !ok {
+		t.Fatalf("%s has no service %q", composePath, "pds-bootstrap")
+	}
+	appView, ok := compose.Services["coves-appview"]
+	if !ok {
+		t.Fatalf("%s has no service %q", composePath, "coves-appview")
+	}
+
+	dependency, ok := composeDependencies(t, "coves-appview", appView.DependsOn)["pds-bootstrap"]
+	if !ok {
+		t.Errorf("coves-appview does not depend on pds-bootstrap")
+	} else if dependency.Condition != "service_completed_successfully" {
+		t.Errorf("coves-appview depends on pds-bootstrap with condition %q, want %q",
+			dependency.Condition, "service_completed_successfully")
+	}
+
+	if _, ok := compose.Volumes["coves-admin"]; !ok {
+		t.Errorf("%s declares no top-level volume %q", composePath, "coves-admin")
+	}
+	if !slices.Contains(bootstrap.Volumes, "coves-admin:/coves-admin") {
+		t.Errorf("pds-bootstrap volumes %q lack the writable mount %q", bootstrap.Volumes, "coves-admin:/coves-admin")
+	}
+	if !slices.Contains(appView.Volumes, "coves-admin:/coves-admin:ro") {
+		t.Errorf("coves-appview volumes %q lack the read-only mount %q", appView.Volumes, "coves-admin:/coves-admin:ro")
+	}
+
+	bootstrapScript := composeCommandText(t, "pds-bootstrap", bootstrap.Command)
+	if !strings.Contains(bootstrapScript, "/coves-admin/admin.did") {
+		t.Errorf("pds-bootstrap's command never writes /coves-admin/admin.did:\n%s", bootstrapScript)
+	}
+
+	if got := composeCommandText(t, "coves-appview", appView.Entrypoint); got != "/bin/sh\n-ec" {
+		t.Errorf("coves-appview entrypoint = %q, want [\"/bin/sh\", \"-ec\"]", got)
+	}
+	appViewScript := composeCommandText(t, "coves-appview", appView.Command)
+	for _, want := range []string{
+		`admin_did="$(cat /coves-admin/admin.did)"`,
+		`[ -n "$admin_did" ] ||`,
+		"unreadable or blank",
+		`export MODERATION_ADMINS="$admin_did"`,
+		"exec /app/coves-server",
+	} {
+		if !strings.Contains(appViewScript, want) {
+			t.Errorf("coves-appview's command lacks %q:\n%s", want, appViewScript)
+		}
+	}
+	if value, set := appView.Environment["MODERATION_ADMINS"]; set {
+		t.Errorf("coves-appview's environment sets MODERATION_ADMINS to %q; it must come only from admin.did", value)
+	}
+}
+
+// composeCommandText returns an entrypoint or command as the container
+// receives it: list items joined by newlines, after Compose's interpolation
+// has turned each `$$` into `$`. A `$` that starts neither `$$` nor `${` is
+// one Compose itself would reject or expand, so it fails the test.
+func composeCommandText(t *testing.T, serviceName string, node yaml.Node) string {
+	t.Helper()
+	var parts []string
+	switch node.Kind {
+	case 0:
+		return ""
+	case yaml.ScalarNode:
+		parts = []string{node.Value}
+	case yaml.SequenceNode:
+		if err := node.Decode(&parts); err != nil {
+			t.Fatalf("service %q: decode list at line %d: %v", serviceName, node.Line, err)
+		}
+	default:
+		t.Fatalf("service %q: entrypoint/command at line %d is neither a string nor a list", serviceName, node.Line)
+	}
+	text := strings.Join(parts, "\n")
+	var out strings.Builder
+	for i := 0; i < len(text); i++ {
+		if text[i] != '$' {
+			out.WriteByte(text[i])
+			continue
+		}
+		if i+1 < len(text) && text[i+1] == '$' {
+			out.WriteByte('$')
+			i++
+			continue
+		}
+		if i+1 < len(text) && text[i+1] == '{' {
+			out.WriteByte('$')
+			continue
+		}
+		t.Fatalf("service %q: entrypoint/command has a bare $ that Compose interpolates (write $$ for the shell):\n%s", serviceName, text)
+	}
+	return out.String()
+}

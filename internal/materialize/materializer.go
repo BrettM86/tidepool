@@ -574,7 +574,16 @@ func (m *Materializer) commitRecord(ctx context.Context, did, collection, rkey s
 				return fmt.Errorf("materialize: withhold removed %s: %w", subjectURI, err)
 			}
 		}
-		return nil
+		// A standing `!takedown` label of the subject withholds the committed
+		// record's blobs the same way, add-only, in this commit; a record
+		// first materialized after its label arrived is withheld here too.
+		if err := labelWithholdOnCommit(ctx, tx, did, subjectURI, record); err != nil {
+			return err
+		}
+		// A standing `!takedown` on the community the record is bound to
+		// withholds its blobs for its owner, add-only, in this commit, so a
+		// record materialized or edited into a removed community is withheld.
+		return communityLabelWithholdOnCommit(ctx, tx, did, stored.CommunityDID, record)
 	}
 
 	if !carryForward {

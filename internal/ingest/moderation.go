@@ -134,11 +134,13 @@ const directBlockIgnoredReason = "a directly delivered Block other than a home s
 // way an in-force ban is published as a social.coves.moderation.ban record in
 // the community repo, and its Undo deletes that record under the stale-unban
 // rule. A native author's ban is also stored in community_bans (applyBan,
-// liftBan). A BRIDGED person's ban stores no row, and with removeData removes
-// their content published before the ban time (the Block's `published` when
-// earlier than receipt, else receivedAt) from this community (see
-// handleBridgedSubjectBlock); an unban of one restores no content. A subject
-// the bridge never minted is skipped and counted.
+// liftBan), and with removeData removes their posts and native comments in
+// that community; an unban restores none of it. A BRIDGED person's ban stores
+// no row, and with removeData removes their content published before the ban
+// time (the Block's `published` when earlier than receipt, else receivedAt)
+// from this community (see handleBridgedSubjectBlock); an unban of one
+// restores no content. A subject the bridge never minted is skipped and
+// counted.
 //
 // A BAN IS AN INTERSECTION: this author, in this community. Both halves are
 // recorded, because both readers need one each — the admission gate holds a
@@ -236,7 +238,8 @@ func (h *Handler) refuseBlockTarget(ctx context.Context, block *ap.Object, targe
 // applyBan records the exclusion and acts on everything it implies. A ban in
 // force is also published as the community's ban record, createdAt receivedAt;
 // a Block that lapsed before it arrived writes no record and leaves a standing
-// one as it is.
+// one as it is. With removeData, a ban still in force removes the author's
+// posts and native comments in this community.
 func (h *Handler) applyBan(ctx context.Context, block *ap.Object, announcer *store.Community, subjectDID string, receivedAt time.Time) error {
 	if h.bans == nil {
 		// Loud and retryable, never a skip: a ban we cannot store is one that
@@ -364,7 +367,17 @@ func (h *Handler) applyBan(ctx context.Context, block *ap.Object, announcer *sto
 			"ingest: no author-moderation surface is wired, so removeData for %s in %s cannot be applied",
 			subjectDID, announcer.APGroupID)
 	}
-	// Their content in THIS community, from the ledger that knows which posts
+	// Both comment surfaces are asked for before the post purge, so a gap
+	// retries the event before any terminal removal has run.
+	moderation, err := h.moderationState()
+	if err != nil {
+		return err
+	}
+	commentPublisher, err := h.commentRemovalPublisher()
+	if err != nil {
+		return err
+	}
+	// Their posts in THIS community, from the ledger that knows which posts
 	// this community admitted. Nothing is enqueued and nothing can be: the
 	// removal rides ApplyOps, which takes no side effect — and Lemmy has already
 	// removed this content, so an outbound Delete would be aimed at the
@@ -376,6 +389,99 @@ func (h *Handler) applyBan(ctx context.Context, block *ap.Object, announcer *sto
 	}
 	h.logger.Info("ban carried removeData; the author's posts in this community were removed",
 		"community", announcer.APGroupID, "subject_did", subjectDID, "removed", removed)
+	return h.removeBannedAuthorComments(ctx, moderation, commentPublisher, announcer, subjectDID, block.Summary)
+}
+
+// removeBannedAuthorComments removes each of the banned persona's live native
+// comments in this community, the same pair of writes moderateNativeComment
+// makes, under author-banned: a bridge-side removal, then the removal record in
+// the community repo. Both are idempotent, so a replayed Block commits nothing
+// new. A comment whose removal record already stands in the community repo is
+// left alone: the community already judged it, and relabelling it author-banned
+// would overwrite that judgement. The record, not object_moderation, decides,
+// so a removal whose record write failed is finished on retry. One comment's
+// failure does not abandon the rest; the first error is returned after the
+// sweep so the event retries.
+func (h *Handler) removeBannedAuthorComments(ctx context.Context, moderation store.ObjectModeration,
+	publisher CommentRemovalPublisher, announcer *store.Community, subjectDID, reason string) error {
+
+	mappings, err := h.objects.ListByActorDID(ctx, subjectDID)
+	if err != nil {
+		return fmt.Errorf("ingest: list %s's comments for removal from %s: %w", subjectDID, announcer.APGroupID, err)
+	}
+	var firstErr error
+	var undetermined []string
+	removed, alreadyRemoved, failed := 0, 0, 0
+	for _, mapping := range mappings {
+		if mapping.Origin != store.OriginBridge || mapping.Collection != materialize.CollectionComment ||
+			mapping.DID != subjectDID {
+			continue
+		}
+		communityDID, err := materialize.CommunityDIDOf(ctx, h.records, mapping)
+		if err != nil {
+			failed++
+			if firstErr == nil {
+				firstErr = fmt.Errorf("ingest: bind %s to a community: %w", mapping.ATURI, err)
+			}
+			continue
+		}
+		if communityDID == "" {
+			undetermined = append(undetermined, mapping.ATURI)
+			continue
+		}
+		if communityDID != announcer.DID {
+			continue
+		}
+		_, _, err = h.records.GetRecord(ctx, announcer.DID, materialize.CollectionRemoval,
+			materialize.SubjectRKey(mapping.ATURI))
+		if err == nil {
+			alreadyRemoved++
+			continue
+		}
+		if !errors.IsNotFound(err) {
+			failed++
+			if firstErr == nil {
+				firstErr = fmt.Errorf("ingest: read removal of %s from %s: %w", mapping.ATURI, announcer.APGroupID, err)
+			}
+			continue
+		}
+		removedAt, err := moderation.SetRemoval(ctx, store.ModeratedObject{
+			ATURI:        mapping.ATURI,
+			APID:         mapping.APID,
+			CommunityDID: announcer.DID,
+		}, materialize.RemovalCodeAuthorBanned, reason)
+		if err != nil {
+			failed++
+			if firstErr == nil {
+				firstErr = fmt.Errorf("ingest: record removal of %s: %w", mapping.ATURI, err)
+			}
+			continue
+		}
+		if _, err := publisher.WriteCommentRemoval(ctx, announcer.DID, mapping.ATURI, mapping.CID,
+			materialize.RemovalCodeAuthorBanned, reason, removedAt); err != nil {
+			failed++
+			if firstErr == nil {
+				firstErr = fmt.Errorf("ingest: publish removal of %s into %s: %w", mapping.ATURI, announcer.APGroupID, err)
+			}
+			continue
+		}
+		removed++
+	}
+	if len(undetermined) > 0 {
+		h.logger.Warn("community ban skipped native comments whose community cannot be determined",
+			"community", announcer.APGroupID, "subject_did", subjectDID,
+			"skipped", len(undetermined), "at_uris", undetermined)
+	}
+	if firstErr != nil {
+		h.logger.Warn("ban carried removeData; some of the author's native comments in this community "+
+			"were not removed and the event will retry",
+			"community", announcer.APGroupID, "subject_did", subjectDID, "removed", removed,
+			"already_removed", alreadyRemoved, "failed", failed, "error", firstErr)
+		return firstErr
+	}
+	h.logger.Info("ban carried removeData; the author's native comments in this community were removed",
+		"community", announcer.APGroupID, "subject_did", subjectDID, "removed", removed,
+		"already_removed", alreadyRemoved, "failed", failed)
 	return nil
 }
 

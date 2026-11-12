@@ -23,8 +23,8 @@ const (
 	// defaultBackfillMinInterval is how fresh last_backfill_at must be for
 	// an un-forced trigger (a re-delivered Accept) to be skipped.
 	defaultBackfillMinInterval = time.Hour
-	// DeadHostAfter is how long a host must keep failing as host-gone
-	// before backfill skips its items.
+	// DeadHostAfter is how long a restored community's reconcile keeps
+	// retrying objects whose origin fetch fails (community_reconcile.go).
 	DeadHostAfter = 72 * time.Hour
 	// maxRepliesPerPost bounds one post's replies-collection walk.
 	maxRepliesPerPost = 200
@@ -33,9 +33,7 @@ const (
 	// firstBackfillRetryDelay is the backoff after a community's first
 	// unfinished walk. It doubles with each further one.
 	firstBackfillRetryDelay = time.Hour
-	// maxBackfillRetryDelay caps the backoff. It must stay under
-	// store.HostGoneStreakGap (48h), or a gone host's streak would lapse
-	// between retries and never reach DeadHostAfter.
+	// maxBackfillRetryDelay caps the backoff.
 	maxBackfillRetryDelay = 24 * time.Hour
 )
 
@@ -71,17 +69,15 @@ type BackfillOptions struct {
 	Materializer Materializer
 	Communities  store.Communities
 	Tombstones   store.Tombstones
-	// Instances tracks per-host host-gone streaks: an item whose origin host
-	// is gone is skipped only once the host has kept failing for
-	// DeadHostAfter. Required.
-	Instances store.HostGoneStreaks
-	// Prober checks a failing host's nodeinfo before backfill treats it as
-	// dead (for every unreachable class but NXDOMAIN and a parked redirect),
-	// and before an object its host answers with an HTML page is skipped.
+	// Instances tracks per-host host-gone streaks: a host-gone failure is
+	// recorded into its host's streak, and a successful fetch clears it.
 	// Required.
+	Instances store.HostGoneStreaks
+	// Prober checks a host's nodeinfo before an object its host answers with
+	// an HTML page is skipped. Required.
 	Prober HostProber
-	// Deferred holds the items skipped because their host was dead, for
-	// RetryDeferred. Required.
+	// Deferred holds the items skipped because their host was unreachable,
+	// for RetryDeferred. Required.
 	Deferred store.DeferredBackfillItems
 	// Echo keeps the bridge's own federated content out of the walk. A
 	// bridged community's outbox holds OUR posts the moment a native user
@@ -494,20 +490,19 @@ func (b *Backfill) walk(ctx context.Context, community *store.Community) (stampe
 		// Classified once: recordHostGone records the failure into the
 		// host's streak, so it must run exactly once per failure.
 		hostGone := errors.IsHostGone(err)
-		deadHost := hostGone && b.recordHostGone(ctx, err)
+		deferrable := hostGone && b.recordHostGone(ctx, err)
 		switch {
 		case err == nil:
 			if ok {
 				posts++
 			}
-		case deadHost:
-			// A gone origin host may only be lapsed. Until it has stayed
-			// gone for DeadHostAfter the item falls through to an ordinary
-			// failure, retried on the walk backoff; after that backfill
-			// skips it, so one dead author host cannot keep the community
-			// from ever completing, and defers it for RetryDeferred. No live
-			// caller acts on host-gone. An item whose deferral cannot be
-			// written is a failure, so the walk does not stamp over it.
+		case deferrable:
+			// An unreachable origin host may only be lapsed, so backfill
+			// skips the item and defers it for RetryDeferred: one
+			// unreachable author host cannot keep the community from
+			// completing. No live caller acts on host-gone. An item whose
+			// deferral cannot be written is a failure, so the walk does not
+			// stamp over it.
 			if deferErr := b.deferDeadHostItem(ctx, outboxObject(item), community.APGroupID, community.DID, err); deferErr != nil {
 				failures++
 				b.logger.Warn("backfill item failed", "community", community.APGroupID, "item", item.ID, "error", deferErr)
@@ -559,7 +554,7 @@ func (b *Backfill) walk(ctx context.Context, community *store.Community) (stampe
 // materializeOutboxItem unwraps one outbox entry (Announce{Create{Page}},
 // Create{Page}, or a bare Page) and materializes the post plus its
 // advertised replies. ok reports whether a post actually landed;
-// replyHostGone counts the replies dropped because their host is dead.
+// replyHostGone counts the replies dropped because their host is gone.
 // communityIRI and communityDID identify the community being backfilled.
 func (b *Backfill) materializeOutboxItem(ctx context.Context, item *ap.Object, communityIRI, communityDID string) (ok bool, replyHostGone int, err error) {
 	obj := outboxObject(item)
@@ -605,7 +600,8 @@ func (b *Backfill) materializeOutboxItem(ctx context.Context, item *ap.Object, c
 	if err != nil {
 		return false, 0, err
 	}
-	return b.materializeResolved(ctx, obj, communityIRI, communityDID)
+	ok, replies, err := b.materializeResolved(ctx, obj, communityIRI, communityDID)
+	return ok, replies.hostGone, err
 }
 
 // outboxObject unwraps an outbox entry's Announce, Create and Update
@@ -621,8 +617,8 @@ func outboxObject(item *ap.Object) *ap.Object {
 // materializeResolved materializes an outbox object whose body is trusted
 // (embedded on the community's authority or fetched from its origin) and
 // that passed the echo and tombstone checks: a Page or Article as a post plus
-// its replies, a Note as a comment.
-func (b *Backfill) materializeResolved(ctx context.Context, obj *ap.Object, communityIRI, communityDID string) (ok bool, replyHostGone int, err error) {
+// its replies, a Note as a comment. replies is the post's reply pass outcome.
+func (b *Backfill) materializeResolved(ctx context.Context, obj *ap.Object, communityIRI, communityDID string) (ok bool, replies repliesOutcome, err error) {
 	switch obj.Type {
 	case ap.TypePage, ap.TypeArticle:
 		res, err := b.mat.MaterializePost(ctx, obj, communityIRI)
@@ -636,12 +632,12 @@ func (b *Backfill) materializeResolved(ctx context.Context, obj *ap.Object, comm
 					b.logger.Warn("backfill post removal failed", "post", obj.ID, "error", removeErr)
 				}
 			}
-			return false, 0, err
+			return false, repliesOutcome{}, err
 		}
 		if removed, err := b.removeIfDeletedDuringMaterialize(ctx, obj.ID, communityIRI); err != nil {
-			return false, 0, err
+			return false, repliesOutcome{}, err
 		} else if removed {
-			return false, 0, skip(obj.ID, "object was deleted upstream during the walk")
+			return false, repliesOutcome{}, skip(obj.ID, "object was deleted upstream during the walk")
 		}
 		// A community's host is trusted only for its own posts' counts.
 		// MaterializePost is bound to the walked community, so a post it
@@ -655,26 +651,26 @@ func (b *Backfill) materializeResolved(ctx context.Context, obj *ap.Object, comm
 			b.logger.Debug("backfill vote-count seeding skipped: stored community is not the walked one",
 				"post", obj.ID, "walked_community", communityDID, "stored_community", res.CommunityDID)
 		}
-		replyHostGone, err = b.backfillReplies(ctx, obj, communityIRI, communityDID)
+		replies, err = b.backfillReplies(ctx, obj, communityIRI, communityDID)
 		if err != nil {
 			// The post itself landed (and a retry's re-materialization is
 			// free), but an aborted reply pass fails the ITEM: that feeds the
 			// run's failures counter, which is what keeps last_backfill_at
 			// unset and the run resumable.
-			return false, replyHostGone, err
+			return false, replies, err
 		}
-		return true, replyHostGone, nil
+		return true, replies, nil
 	case ap.TypeNote:
 		removed, err := b.materializeComment(ctx, obj, communityIRI)
 		if err != nil {
-			return false, 0, err
+			return false, repliesOutcome{}, err
 		}
 		if removed {
-			return false, 0, skip(obj.ID, "object was deleted upstream during the walk")
+			return false, repliesOutcome{}, skip(obj.ID, "object was deleted upstream during the walk")
 		}
-		return true, 0, nil
+		return true, repliesOutcome{}, nil
 	default:
-		return false, 0, skip(obj.ID, "unsupported outbox object type "+obj.Type)
+		return false, repliesOutcome{}, skip(obj.ID, "unsupported outbox object type "+obj.Type)
 	}
 }
 
@@ -787,37 +783,39 @@ func (b *Backfill) seedCounts(ctx context.Context, postAPID, communityIRI string
 // An echo classification that cannot be MADE is the one exception: per
 // suppressEcho's contract the error propagates, aborting the reply pass so the
 // caller counts a failure the way an outbox-item failure is counted and the
-// run leaves last_backfill_at unset. A reply (or the replies collection)
-// whose origin host is gone but not yet for DeadHostAfter fails the pass the
+// run leaves last_backfill_at unset. A reply whose origin host is gone is a
+// skip, deferred for RetryDeferred under communityIRI and communityDID; one
+// whose failure cannot be recorded into its host's streak fails the pass the
 // same way, after the rest of the collection is walked, with ErrReplyHostGone,
-// so the run retries it; a skip there would be silent and permanent, since the
-// "clean" completion stamps the freshness window that blocks the re-walk.
-// Once the host is dead the reply is a skip, deferred for RetryDeferred under
-// communityIRI and communityDID; one whose deferral cannot be written fails
-// the pass. A replies collection on a dead host is a skip and is not deferred.
-// Any other reply failure is logged and does not fail the pass. communityIRI
-// is also the scope of the tombstone lookup below. hostGone counts the replies
-// (and a replies collection) dropped because their host is dead, for the
-// walk's host_gone total.
-func (b *Backfill) backfillReplies(ctx context.Context, post *ap.Object, communityIRI, communityDID string) (hostGone int, err error) {
+// so the run retries it, and so does one whose deferral cannot be written. A
+// reply on a host that already failed host-gone in this walk is deferred
+// without a fetch. A replies collection (or a later page) on a gone host
+// defers the post itself under that host, so a later sweep re-walks its
+// replies; when its failure cannot be recorded, or the deferral cannot be
+// written, the pass fails the same way. Any other reply failure is logged and
+// does not fail the pass. communityIRI is also the scope of the tombstone
+// lookup below.
+func (b *Backfill) backfillReplies(ctx context.Context, post *ap.Object, communityIRI, communityDID string) (outcome repliesOutcome, err error) {
 	if post.Replies == nil || post.Replies.ID == "" {
 		// Not advertised (or inline-only, which Lemmy never emits).
-		return 0, nil
+		return repliesOutcome{}, nil
 	}
+	hostGone := 0
 	repliesIRI := post.Replies.ID
 	count := 0
 	var classifyErr error
-	// youngHostGoneErr is the first reply whose origin host is gone but not
-	// yet for DeadHostAfter. The walk goes on (other replies still land), and
-	// the pass then fails the item so the run stays unstamped and retries.
-	var youngHostGoneErr error
-	noteYoungHostGone := func(replyID string, err error) {
+	// unrecordedHostGoneErr is the first reply whose origin host is gone and
+	// whose failure could not be recorded into the host's streak. The walk
+	// goes on (other replies still land), and the pass then fails the item so
+	// the run stays unstamped and retries.
+	var unrecordedHostGoneErr error
+	noteUnrecordedHostGone := func(replyID string, err error) {
 		b.logger.Warn("backfill reply failed", "post", post.ID, "reply", replyID, "error", err)
-		if youngHostGoneErr == nil {
-			// ErrReplyHostGone with the cause by %v, not %w: the failure is
-			// already recorded into the host's streak, so the item switch
-			// must not classify it as host-gone again.
-			youngHostGoneErr = fmt.Errorf("ingest: backfill reply %s of %s: %w: %v",
+		if unrecordedHostGoneErr == nil {
+			// ErrReplyHostGone with the cause by %v, not %w: the item switch
+			// must not classify the item as host-gone (a deferrable skip), since
+			// this failure could not be recorded into the host's streak.
+			unrecordedHostGoneErr = fmt.Errorf("ingest: backfill reply %s of %s: %w: %v",
 				replyID, post.ID, ErrReplyHostGone, err)
 		}
 	}
@@ -829,7 +827,8 @@ func (b *Backfill) backfillReplies(ctx context.Context, post *ap.Object, communi
 		}
 		b.logger.Warn("backfill reply skipped: origin host is gone", "post", post.ID, "reply", replyID, "error", err)
 	}
-	// deferErr is the first reply whose dead-host deferral failed.
+	// deferErr is the first reply (or the post, for its collection) whose
+	// host-gone deferral failed.
 	var deferErr error
 	deferReply := func(reply *ap.Object, err error) {
 		if failure := b.deferDeadHostItem(ctx, reply, communityIRI, communityDID, err); failure != nil {
@@ -860,16 +859,20 @@ func (b *Backfill) backfillReplies(ctx context.Context, post *ap.Object, communi
 		} else if ours {
 			return nil
 		}
+		if cause := knownGoneHost(ctx, &note, repliesIRI); cause != nil {
+			deferReply(&note, cause)
+			return nil
+		}
 		resolved, err := b.resolveEmbedded(ctx, &note, repliesIRI)
 		replyHostGone := errors.IsHostGone(err)
-		deadHost := replyHostGone && b.recordHostGone(ctx, err)
+		deferrable := replyHostGone && b.recordHostGone(ctx, err)
 		switch {
 		case err == nil:
-		case deadHost:
+		case deferrable:
 			deferReply(&note, err)
 			return nil
 		case replyHostGone:
-			noteYoungHostGone(note.ID, err)
+			noteUnrecordedHostGone(note.ID, err)
 			return nil
 		case materialize.IsSkip(err):
 			b.logger.Info("backfill reply skipped", "post", post.ID, "reply", note.ID, "reason", err.Error())
@@ -895,14 +898,14 @@ func (b *Backfill) backfillReplies(ctx context.Context, post *ap.Object, communi
 		}
 		removed, err := b.materializeComment(ctx, resolved, communityIRI)
 		replyHostGone = errors.IsHostGone(err)
-		deadHost = replyHostGone && b.recordHostGone(ctx, err)
+		deferrable = replyHostGone && b.recordHostGone(ctx, err)
 		switch {
-		case deadHost:
+		case deferrable:
 			deferReply(resolved, err)
 		case !replyHostGone && materialize.IsSkip(err):
 			b.logger.Info("backfill reply skipped", "post", post.ID, "reason", err.Error())
 		case replyHostGone:
-			noteYoungHostGone(resolved.ID, err)
+			noteUnrecordedHostGone(resolved.ID, err)
 		case err != nil:
 			b.logger.Warn("backfill reply failed", "post", post.ID, "reply", resolved.ID, "error", err)
 		case removed:
@@ -914,41 +917,55 @@ func (b *Backfill) backfillReplies(ctx context.Context, post *ap.Object, communi
 		// The classifier error came back out through FetchCollection; return
 		// the unwrapped cause so the run's failure names the check, not the
 		// walk.
-		return hostGone, classifyErr
+		return repliesOutcome{hostGone: hostGone}, classifyErr
 	}
+	var collectionGone error
 	if err != nil && !stderrors.Is(err, ap.ErrCollectionTruncated) {
 		b.logger.Warn("backfill replies walk failed", "post", post.ID, "error", err)
 		// A gone host on the collection itself (first fetch or a later page)
-		// hides replies the same way a gone reply host does: fail the item
-		// while the streak is young so the run stays unstamped and retries.
-		// ErrReplyHostGone with the cause by %v, not %w: the failure is
-		// recorded here, so the item switch must not record it again.
+		// is a skip once the failure is recorded into the host's streak: the
+		// post is deferred under that host so a later sweep re-walks its
+		// replies. An unrecorded failure fails the pass like a reply's.
 		if errors.IsHostGone(err) {
-			if !b.recordHostGone(ctx, err) {
-				return hostGone, fmt.Errorf("ingest: backfill replies %s of %s: %w: %v",
+			if b.recordHostGone(ctx, err) {
+				if failure := b.deferDeadHostItem(ctx, post, communityIRI, communityDID, err); failure != nil {
+					b.logger.Warn("backfill replies collection deferral failed", "post", post.ID, "error", failure)
+					if deferErr == nil {
+						deferErr = failure
+					}
+				} else {
+					noteDeadHost("", err)
+					collectionGone = err
+				}
+			} else if unrecordedHostGoneErr == nil {
+				unrecordedHostGoneErr = fmt.Errorf("ingest: backfill replies %s of %s: %w: %v",
 					repliesIRI, post.ID, ErrReplyHostGone, err)
 			}
-			noteDeadHost("", err)
 		}
 	}
-	return hostGone, stderrors.Join(youngHostGoneErr, deferErr)
+	return repliesOutcome{hostGone: hostGone, collectionGone: collectionGone}, stderrors.Join(unrecordedHostGoneErr, deferErr)
+}
+
+// repliesOutcome is what a post's reply pass left undone without failing.
+type repliesOutcome struct {
+	// hostGone counts the replies (and a replies collection) dropped because
+	// their host is gone, for the walk's host_gone total.
+	hostGone int
+	// collectionGone is the host-gone failure of the replies collection (or a
+	// later page) for which the post was deferred; nil when it was walked.
+	collectionGone error
 }
 
 // recordHostGone records the host-gone failure err against its host's streak
-// and reports whether the host has now been gone for at least DeadHostAfter
-// (dead), so the item is a skip. false means the item is an ordinary failure:
-// the streak is younger, err names no host, the streak could not be recorded
-// (logged), the host's nodeinfo probe answered, or the probe gave no answer
-// either way (cut short or refused on our side). Call it exactly once per
-// failure.
+// and reports whether the item can be deferred, so it is a skip. false means
+// the item is an ordinary failure: err names no host, or the streak could not
+// be recorded (logged). Call it exactly once per failure.
 //
-// Within a walk the verdict is kept per host: a cached-verdict error
-// (ap.ErrCachedHostVerdict) repeats an observation already made, so it
-// reuses that verdict, or is not dead when the walk holds none, and records
-// nothing. A dead verdict for an unreachable class other than NXDOMAIN or a
-// parked redirect needs the host's nodeinfo probe to fail too (probed once
-// per walk); a JSON answer ends the streak.
-func (b *Backfill) recordHostGone(ctx context.Context, err error) (dead bool) {
+// Within a walk the verdict is kept per host, for host-level reasons only
+// (hostLevelHostGone): a cached-verdict error (ap.ErrCachedHostVerdict)
+// repeats an observation already made, so it reuses that verdict, or is not
+// deferrable when the walk holds none, and records nothing.
+func (b *Backfill) recordHostGone(ctx context.Context, err error) (deferrable bool) {
 	host, ok := errors.HostGoneHost(err)
 	if !ok {
 		b.logger.Warn("backfill: host-gone error names no host", "error", err)
@@ -956,56 +973,55 @@ func (b *Backfill) recordHostGone(ctx context.Context, err error) (dead bool) {
 	}
 	hosts := walkHostsFrom(ctx)
 	if stderrors.Is(err, ap.ErrCachedHostVerdict) {
-		dead, _ := hosts.verdict(host)
-		return dead
+		deferrable, _ := hosts.verdict(host)
+		return deferrable
 	}
-	now := b.now()
-	goneSince, recordErr := b.instances.RecordHostGone(ctx, host, now)
+	hostLevel := hostLevelHostGone(err)
+	goneSince, recordErr := b.instances.RecordHostGone(ctx, host, b.now())
 	if recordErr != nil {
 		b.logger.Warn("backfill: record host-gone streak failed", "host", host, "error", recordErr)
-		hosts.setVerdict(host, false)
+		if hostLevel {
+			hosts.setVerdict(host, false)
+		}
 		return false
 	}
 	reason, _ := errors.HostGoneReason(err)
-	if now.Sub(goneSince) < DeadHostAfter {
-		b.logger.Info("backfill: origin host gone, retrying until the dead-host threshold",
-			"host", host, "reason", reason, "gone_since", goneSince, "skip_after", goneSince.Add(DeadHostAfter))
-		hosts.setVerdict(host, false)
-		return false
-	}
-	if probeBeforeDead(reason) {
-		switch b.hostAnswersProbe(ctx, host) {
-		case probeNotAnswered:
-			// The probe failed too: the host is dead, below.
-		case probeUnknown:
-			b.logger.Info("backfill: origin host unreachable and its nodeinfo probe gave no answer; not dead",
-				"host", host, "reason", reason)
-			return false
-		case probeAnswered:
-			if clearErr := b.instances.ClearHostGone(ctx, host); clearErr != nil {
-				b.logger.Warn("backfill: clear host-gone streak failed", "host", host, "error", clearErr)
-			}
-			b.logger.Info("backfill: origin host unreachable but answers its nodeinfo probe; not dead",
-				"host", host, "reason", reason)
-			hosts.setVerdict(host, false)
-			return false
-		}
-	}
-	b.logger.Info("backfill: origin host gone past the dead-host threshold",
+	b.logger.Info("backfill: origin host gone; deferring its items",
 		"host", host, "reason", reason, "gone_since", goneSince)
-	hosts.setVerdict(host, true)
+	if hostLevel {
+		hosts.setVerdict(host, true)
+	}
 	return true
 }
 
-// probeBeforeDead reports whether a host gone for reason needs a failed
-// nodeinfo probe before it is dead. NXDOMAIN and a parked redirect keep the
-// streak-only rule, as does an error carrying no reason.
-func probeBeforeDead(reason string) bool {
-	switch reason {
-	case "", errors.HostGoneReasonDNSNotFound, errors.HostGoneReasonParkedRedirect:
+// hostLevelHostGone reports whether a host-gone failure speaks for its whole
+// host: every reason but redirect_to_root, parked_redirect and
+// too_many_redirects, which concern the one URL fetched.
+func hostLevelHostGone(err error) bool {
+	switch reason, _ := errors.HostGoneReason(err); reason {
+	case errors.HostGoneReasonRedirectToRoot, errors.HostGoneReasonParkedRedirect, errors.HostGoneReasonTooManyRedirects:
 		return false
 	}
 	return true
+}
+
+// knownGoneHost returns a host-gone cause for a collection item that would be
+// fetched from its origin (resolveEmbedded) when its host already failed
+// host-gone in this walk or sweep, so the item is deferred without a fetch;
+// nil otherwise.
+func knownGoneHost(ctx context.Context, obj *ap.Object, sourceIRI string) error {
+	if embeddedTrusted(obj, sourceIRI) {
+		return nil
+	}
+	host, ok := ap.HostKey(obj.ID)
+	if !ok {
+		return nil
+	}
+	if gone, _ := walkHostsFrom(ctx).verdict(host); !gone {
+		return nil
+	}
+	return fmt.Errorf("ingest: %s: origin host already failed host-gone in this walk: %w",
+		obj.ID, errors.HostGoneError{Host: host})
 }
 
 // probeResult is what a host's nodeinfo probe says about the host.
@@ -1099,8 +1115,10 @@ func chainHolds(err, target error) bool {
 // walkHostsKey is the ctx key of a walk's walkHosts.
 type walkHostsKey struct{}
 
-// walkHosts holds one walk's per-host knowledge: the dead verdict of each
-// host recorded as gone, and each probed host's nodeinfo answer.
+// walkHosts holds one walk's or one RetryDeferred sweep's per-host
+// knowledge: the verdict of each host that failed host-gone for a host-level
+// reason (true when its items are deferred, or in a sweep rescheduled,
+// without a fetch), and each probed host's nodeinfo answer.
 type walkHosts struct {
 	mu       sync.Mutex
 	verdicts map[string]bool
@@ -1119,23 +1137,23 @@ func walkHostsFrom(ctx context.Context) *walkHosts {
 	return hosts
 }
 
-func (w *walkHosts) verdict(host string) (dead, known bool) {
+func (w *walkHosts) verdict(host string) (gone, known bool) {
 	if w == nil {
 		return false, false
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	dead, known = w.verdicts[host]
-	return dead, known
+	gone, known = w.verdicts[host]
+	return gone, known
 }
 
-func (w *walkHosts) setVerdict(host string, dead bool) {
+func (w *walkHosts) setVerdict(host string, gone bool) {
 	if w == nil {
 		return
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.verdicts[host] = dead
+	w.verdicts[host] = gone
 }
 
 func (w *walkHosts) probeAnswer(host string) (answered, known bool) {
@@ -1205,10 +1223,16 @@ func (b *Backfill) objectNotServed(ctx context.Context, iri string, err error) b
 // as-is, everything else is re-fetched from its origin (with the
 // self-asserted-id binding).
 func (b *Backfill) resolveEmbedded(ctx context.Context, obj *ap.Object, sourceIRI string) (*ap.Object, error) {
-	if obj.Type != "" && ap.SameAuthority(obj.ID, sourceIRI) {
+	if embeddedTrusted(obj, sourceIRI) {
 		return obj, nil
 	}
 	return b.fetchFromOrigin(ctx, obj)
+}
+
+// embeddedTrusted reports whether resolveEmbedded uses obj's embedded body
+// as-is: it is typed and lives on sourceIRI's authority.
+func embeddedTrusted(obj *ap.Object, sourceIRI string) bool {
+	return obj.Type != "" && ap.SameAuthority(obj.ID, sourceIRI)
 }
 
 // fetchFromOrigin fetches obj from its origin with the self-asserted-id
@@ -1228,8 +1252,8 @@ func (b *Backfill) fetchFromOrigin(ctx context.Context, obj *ap.Object) (*ap.Obj
 		return nil, skip(obj.ID, "the origin host is up but does not serve the object")
 	default:
 		// A host-gone error is returned as is (wrapped): the caller decides,
-		// once per failure, whether the host has been gone long enough to
-		// skip (recordHostGone).
+		// once per failure, whether it was recorded into the host's streak
+		// and the item can be deferred (recordHostGone).
 		return nil, fmt.Errorf("ingest: fetch %s: %w", obj.ID, err)
 	}
 	if fetched.ID == "" {
@@ -1244,11 +1268,11 @@ func (b *Backfill) fetchFromOrigin(ctx context.Context, obj *ap.Object) (*ap.Obj
 }
 
 // ErrReplyHostGone marks a reply pass failed because a reply's (or the
-// replies collection's) origin host is gone but not yet for DeadHostAfter.
-// It is not errors.ErrHostGone: the failure is already recorded into the
-// host's streak, so the item must not be classified host-gone again. A
-// deferred retry counts it as a host failure.
-var ErrReplyHostGone = stderrors.New("origin host gone, not yet skipped")
+// replies collection's) origin host is gone and the failure could not be
+// recorded into the host's streak. It is not errors.ErrHostGone: the item
+// must not be classified host-gone, a deferrable skip. The failure is local,
+// so a deferred retry leaves its row unchanged.
+var ErrReplyHostGone = stderrors.New("origin host gone, not skipped")
 
 // errOriginFailure marks a deferred item's origin fetch that failed on the
 // origin's side without being a skip or host-gone: an HTTP error status, a
@@ -1257,8 +1281,11 @@ var ErrReplyHostGone = stderrors.New("origin host gone, not yet skipped")
 var errOriginFailure = stderrors.New("origin fetch failed")
 
 // deferredRetrySteps are the retries of a deferred item, measured from its
-// first skip: 72h, 1 week, 2 weeks, 30 days and 90 days.
-var deferredRetrySteps = []time.Duration{72 * time.Hour, 168 * time.Hour, 336 * time.Hour, 720 * time.Hour, 2160 * time.Hour}
+// first skip: 1h, 6h, 24h, 72h, 1 week, 2 weeks, 30 days and 90 days.
+var deferredRetrySteps = []time.Duration{
+	time.Hour, 6 * time.Hour, 24 * time.Hour, 72 * time.Hour,
+	168 * time.Hour, 336 * time.Hour, 720 * time.Hour, 2160 * time.Hour,
+}
 
 // Reasons a deferred item is dropped without landing (the reason attr of
 // "backfill deferred item dropped").
@@ -1269,7 +1296,7 @@ const (
 )
 
 // deferDeadHostItem keeps obj, skipped in the community because the host
-// named by cause is dead, for RetryDeferred; its first retry is 72h out.
+// named by cause is gone, for RetryDeferred; its first retry is 1h out.
 func (b *Backfill) deferDeadHostItem(ctx context.Context, obj *ap.Object, communityIRI, communityDID string, cause error) error {
 	if obj == nil || obj.ID == "" {
 		return fmt.Errorf("ingest: defer dead-host item in %s: item has no object id", communityIRI)
@@ -1296,13 +1323,16 @@ func (b *Backfill) deferDeadHostItem(ctx context.Context, obj *ap.Object, commun
 }
 
 // RetryDeferred runs one sweep of the deferred items that are due, at most
-// limit of them, oldest due first. The sweep is one walk: it shares the
-// unreachable-host cache and host verdicts, so a host that fails at the
-// connection level costs one connection attempt per sweep (only
-// connection-level verdicts are cached; other host failures are fetched per
-// item), and its mints wait on the PLC budget. Each
-// item is fetched from its origin again and materialized like an outbox
-// item. A landed item, or one its origin no longer has, is deleted; a host
+// limit of them and at most store.MaxDueItemsPerHost per host, oldest due
+// first. The sweep is one walk: it shares the unreachable-host cache and host
+// verdicts, so a host that fails host-gone for a host-level reason (any but
+// redirect_to_root, parked_redirect and too_many_redirects, which concern
+// one URL) costs one
+// request per sweep: its later items in the sweep count an attempt and are
+// rescheduled unfetched, and replies on it are deferred unfetched. An item
+// with no retry step left is still fetched. Its mints wait on the PLC
+// budget. Each item is fetched from its origin again and materialized like an
+// outbox item. A landed item, or one its origin no longer has, is deleted; a host
 // failure counts an attempt and reschedules it, or drops it once the 90-day
 // retry has run; an item of a removed community, or of one the bridge no
 // longer follows (follow state none), is dropped unfetched. An item of a
@@ -1375,8 +1405,20 @@ func (b *Backfill) retryDeferredItem(ctx context.Context, item store.DeferredIte
 		return b.dropDeferredItem(ctx, item, deferredDropCommunityUnfollowed, nil)
 	}
 
+	hosts := walkHostsFrom(ctx)
+	// An item with no retry step left is fetched anyway: it is never dropped
+	// without a fetch of its own.
+	if gone, _ := hosts.verdict(item.Host); gone {
+		if _, ok := deferredRetryAt(item.CreatedAt, b.now()); ok {
+			return b.rescheduleDeferredItem(ctx, item,
+				fmt.Errorf("ingest: origin host %s already failed host-gone in this sweep", item.Host))
+		}
+	}
 	err = b.materializeDeferredItem(ctx, item, community)
 	hostGone := errors.IsHostGone(err)
+	if host, ok := errors.HostGoneHost(err); ok && hostGone && hostLevelHostGone(err) {
+		hosts.setVerdict(host, true)
+	}
 	switch {
 	case err == nil:
 		b.logger.Info("backfill deferred item landed",
@@ -1384,7 +1426,7 @@ func (b *Backfill) retryDeferredItem(ctx context.Context, item store.DeferredIte
 	case !hostGone && materialize.IsSkip(err):
 		b.logger.Info("backfill deferred item skipped",
 			"object", item.ObjectIRI, "community", item.CommunityAPID, "reason", err.Error())
-	case hostGone || stderrors.Is(err, ErrReplyHostGone) || isOriginFailure(err):
+	case hostGone || isOriginFailure(err):
 		return b.rescheduleDeferredItem(ctx, item, err)
 	default:
 		return err
@@ -1400,7 +1442,8 @@ func (b *Backfill) retryDeferredItem(ctx context.Context, item store.DeferredIte
 // item path, after the tombstone check and the echo check on the stored id
 // (a tombstoned item, or our own content, is a skip with no fetch). A fetch
 // failure the origin caused that is neither a skip nor host-gone is marked
-// errOriginFailure.
+// errOriginFailure. A post that lands while its replies collection fails
+// host-gone returns that failure, so its row is rescheduled, not deleted.
 func (b *Backfill) materializeDeferredItem(ctx context.Context, item store.DeferredItem, community *store.Community) error {
 	tombstoned, err := b.tombstones.ExistsFor(ctx, item.ObjectIRI, community.APGroupID)
 	if err != nil {
@@ -1427,7 +1470,12 @@ func (b *Backfill) materializeDeferredItem(ctx context.Context, item store.Defer
 	} else if ours {
 		return skip(obj.ID, "deferred item is our own federated content")
 	}
-	_, _, err = b.materializeResolved(ctx, obj, community.APGroupID, community.DID)
+	_, replies, err := b.materializeResolved(ctx, obj, community.APGroupID, community.DID)
+	if err == nil && replies.collectionGone != nil {
+		// The post landed, but its replies are still unwalked: the row is
+		// the post's, so the retry is rescheduled as a host-gone failure.
+		return replies.collectionGone
+	}
 	return err
 }
 

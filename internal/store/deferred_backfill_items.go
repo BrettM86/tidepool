@@ -7,8 +7,8 @@ import (
 	"time"
 )
 
-// DeferredItem is one backfill item skipped because its origin host was dead,
-// kept for a later retry.
+// DeferredItem is one backfill item skipped because its origin host was
+// unreachable, kept for a later retry.
 type DeferredItem struct {
 	ObjectIRI     string
 	CommunityAPID string
@@ -20,9 +20,16 @@ type DeferredItem struct {
 	CreatedAt     time.Time
 }
 
+// MaxDueItemsPerHost is the most due items ListDueItems returns for one
+// host, so one sweep attempts at most this many items per host: a recovered
+// host is not burst, and one large host does not fill the batch.
+const MaxDueItemsPerHost = 20
+
 // DeferredBackfillItems stores backfill items deferred for retry.
 type DeferredBackfillItems interface {
 	DeferItem(ctx context.Context, item DeferredItem) error
+	// ListDueItems returns at most limit items due at now, the earliest due
+	// first, and at most MaxDueItemsPerHost of them per host.
 	ListDueItems(ctx context.Context, now time.Time, limit int) ([]DeferredItem, error)
 	RescheduleItem(ctx context.Context, objectIRI, communityAPID string, attempts int, nextRetryAt time.Time) error
 	DeleteItem(ctx context.Context, objectIRI, communityAPID string) error
@@ -54,15 +61,21 @@ func (r *postgresDeferredBackfillItems) DeferItem(ctx context.Context, item Defe
 }
 
 // ListDueItems returns at most limit items whose next_retry_at is at or
-// before now, the earliest due first.
+// before now, the earliest due first, and at most MaxDueItemsPerHost of them
+// per host (each host's earliest due).
 func (r *postgresDeferredBackfillItems) ListDueItems(ctx context.Context, now time.Time, limit int) ([]DeferredItem, error) {
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT object_iri, community_ap_id, community_did, host, object_type,
 			attempts, next_retry_at, created_at
-		FROM backfill_deferred_items
-		WHERE next_retry_at <= $1
+		FROM (
+			SELECT *, row_number() OVER (
+				PARTITION BY host ORDER BY next_retry_at, object_iri, community_ap_id) AS host_rank
+			FROM backfill_deferred_items
+			WHERE next_retry_at <= $1
+		) due
+		WHERE host_rank <= $3
 		ORDER BY next_retry_at, object_iri, community_ap_id
-		LIMIT $2`, now, limit)
+		LIMIT $2`, now, limit, MaxDueItemsPerHost)
 	if err != nil {
 		return nil, fmt.Errorf("list due deferred backfill items: %w", err)
 	}

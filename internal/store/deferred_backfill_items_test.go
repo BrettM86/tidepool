@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -147,4 +148,60 @@ func TestInstances_ClearHostGoneMakesDeferredItemsDue(t *testing.T) {
 	since, err := rig.instances.RecordHostGone(ctx, "x.example", at(1, 4))
 	require.NoError(t, err)
 	assert.True(t, at(1, 4).Equal(since), "x.example's streak was cleared: goneSince = %v, want %v", since, at(1, 4))
+}
+
+// TestDeferredBackfillItems_ListDueItemsPerHostCap: with 25 due rows on
+// a.example across two communities and 3 on b.example, ListDueItems returns
+// a.example's earliest 20 by (next_retry_at, object_iri, community_ap_id) and
+// all of b.example's, merged in that same global order; a smaller limit still
+// cuts the merged list.
+func TestDeferredBackfillItems_ListDueItemsPerHostCap(t *testing.T) {
+	rig := deferredTestDB(t)
+	ctx := context.Background()
+	minute := func(m int) time.Time { return time.Date(2026, 11, 4, 0, m, 0, 0, time.UTC) }
+	// a is a.example's post/<object> in community, due at minute 12-object, so
+	// post/12 is due first; both communities' rows of one object share it.
+	a := func(object int, community, communityDID string) DeferredItem {
+		return DeferredItem{
+			ObjectIRI: fmt.Sprintf("https://a.example/post/%02d", object), CommunityAPID: community, CommunityDID: communityDID,
+			Host: "a.example", ObjectType: "Page", CreatedAt: minute(0), NextRetryAt: minute(12 - object),
+		}
+	}
+	technology := func(object int) DeferredItem { return a(object, deferredCommunity, deferredCommunityDID) }
+	gaming := func(object int) DeferredItem { return a(object, deferredSecondCommunity, deferredSecondDID) }
+	b := func(object, due int) DeferredItem {
+		return DeferredItem{
+			ObjectIRI: fmt.Sprintf("https://b.example/post/%02d", object), CommunityAPID: deferredCommunity, CommunityDID: deferredCommunityDID,
+			Host: "b.example", ObjectType: "Page", CreatedAt: minute(0), NextRetryAt: minute(due),
+		}
+	}
+	// a.example: post/00..post/12 in technology, post/00..post/11 in gaming.
+	for object := 0; object <= 12; object++ {
+		require.NoError(t, rig.items.DeferItem(ctx, technology(object)))
+		if object <= 11 {
+			require.NoError(t, rig.items.DeferItem(ctx, gaming(object)))
+		}
+	}
+	for _, item := range []DeferredItem{b(3, 30), b(2, 5), b(1, 0)} {
+		require.NoError(t, rig.items.DeferItem(ctx, item))
+	}
+
+	// "https://lemmy.world/c/gaming" sorts before ".../technology", and
+	// a.example's IRIs before b.example's at the same minute.
+	assert.Equal(t, []DeferredItem{
+		technology(12), b(1, 0),
+		gaming(11), technology(11),
+		gaming(10), technology(10),
+		gaming(9), technology(9),
+		gaming(8), technology(8),
+		gaming(7), technology(7), b(2, 5),
+		gaming(6), technology(6),
+		gaming(5), technology(5),
+		gaming(4), technology(4),
+		gaming(3), technology(3),
+		gaming(2),
+		b(3, 30),
+	}, rig.dueItems(t, minute(59), 100), "a.example's earliest 20 and b.example's 3, in due order")
+	assert.Equal(t, []DeferredItem{technology(12), b(1, 0), gaming(11), technology(11), gaming(10)},
+		rig.dueItems(t, minute(59), 5), "the limit cuts the merged list")
 }

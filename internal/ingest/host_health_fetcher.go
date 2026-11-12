@@ -10,8 +10,7 @@ import (
 )
 
 // hostHealthFetcher is a materialize.Fetcher that ends a host's host-gone
-// streak whenever an object or actor fetch from it succeeds, so a host that
-// came back is not later skipped by backfill on a stale streak. Clearing a
+// streak whenever an object or actor fetch from it succeeds. Clearing a
 // streak (Instances.ClearHostGone) also makes the host's deferred backfill
 // items due, so they run at the next RetryDeferred sweep; a fetch from a host
 // with no streak leaves their schedule alone.

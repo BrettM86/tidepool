@@ -137,9 +137,11 @@ func IsBlobWithheld(err error) bool { return errors.Is(err, ErrBlobWithheld) }
 // failing TLS, answering a CDN "origin down" status, or parking every URL
 // (HostGoneError.Reason names which). The condition may be temporary (a
 // lapsed domain can come back), so it is deliberately not ErrNotFound and
-// IsNotFound is false for it. Backfill treats the object as an ordinary
-// failure until its host has been gone for DeadHostAfter, then skips it and
-// defers it for RetryDeferred. No live caller acts on host-gone.
+// IsNotFound is false for it. Backfill skips the object and defers it for
+// RetryDeferred once the failure is recorded into the host's streak (an
+// unrecorded one is an ordinary failure); redirect_to_root, parked_redirect
+// and too_many_redirects concern only the URL fetched, not the whole host. No live
+// caller acts on host-gone.
 var ErrHostGone = errors.New("host gone")
 
 // IsHostGone reports whether err is, wraps, or unwraps to ErrHostGone.

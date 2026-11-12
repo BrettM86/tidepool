@@ -31,27 +31,34 @@ func seedHostGoneFailures(t *testing.T, h *harness, host string, agos ...time.Du
 	}
 }
 
-// TestBackfillDeadHostThreshold pins DeadHostAfter at the backfill level: a
-// host-gone item is skipped only once the host's streak is at least 72h old
-// at the backfill clock. A younger streak keeps the item a failure, so the
-// run errors and last_backfill_at stays unset.
-func TestBackfillDeadHostThreshold(t *testing.T) {
+// TestBackfillHostGoneDefersWhateverTheStreak: a host-gone outbox item is
+// deferred on the walk that meets it, whatever the age of its host's streak
+// (none, 48h, exactly DeadHostAfter): the run succeeds, stamps
+// last_backfill_at, writes one deferred row first due 1h out, and records the
+// failure into the host's streak.
+func TestBackfillHostGoneDefersWhateverTheStreak(t *testing.T) {
 	tests := []struct {
 		name string
 		// agos are the seeded failures before backfillNow, oldest first; each
 		// gap is under store.HostGoneStreakGap, so they form one streak.
-		agos     []time.Duration
-		wantSkip bool
+		agos []time.Duration
+		// wantSince is other.test's streak start after the walk.
+		wantSince time.Time
 	}{
 		{
-			name:     "48h-old streak is a failure",
-			agos:     []time.Duration{48 * time.Hour, 24 * time.Hour},
-			wantSkip: false,
+			name:      "no prior streak",
+			agos:      nil,
+			wantSince: time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC),
 		},
 		{
-			name:     "streak exactly 72h old is a skip",
-			agos:     []time.Duration{72 * time.Hour, 36 * time.Hour},
-			wantSkip: true,
+			name:      "48h-old streak",
+			agos:      []time.Duration{48 * time.Hour, 24 * time.Hour},
+			wantSince: time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC),
+		},
+		{
+			name:      "streak exactly 72h old",
+			agos:      []time.Duration{72 * time.Hour, 36 * time.Hour},
+			wantSince: time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC),
 		},
 	}
 	for _, tt := range tests {
@@ -60,7 +67,9 @@ func TestBackfillDeadHostThreshold(t *testing.T) {
 			h.subscribeTechnology()
 			serveOutboxFixtures(t, h)
 			serveBrokenItemOutbox(t, h)
-			seedHostGoneFailures(t, h, "other.test", tt.agos...)
+			if len(tt.agos) > 0 {
+				seedHostGoneFailures(t, h, "other.test", tt.agos...)
+			}
 			opts := h.backfillOptions(h.mat, 100)
 			opts.Fetcher = hostGoneFetcher{BackfillFetcher: h.client, goneIRI: "https://other.test/post/broken"}
 			b, err := NewBackfill(opts)
@@ -74,33 +83,34 @@ func TestBackfillDeadHostThreshold(t *testing.T) {
 
 			_, err = h.objects.GetByAPID(ctx, pageID)
 			require.NoError(t, err, "the healthy item still materializes")
-			if tt.wantSkip {
-				require.NoError(t, runErr, "a host gone for DeadHostAfter is a skip, not a run error")
-				require.NotNil(t, h.lastBackfillAt(groupID), "a walk whose only failure is a dead-host skip stamps last_backfill_at")
-				return
-			}
-			require.Error(t, runErr, "a host gone for less than DeadHostAfter is an item failure")
-			require.Nil(t, h.lastBackfillAt(groupID), "a host-gone failure inside DeadHostAfter must leave last_backfill_at unset")
+			assert.NoError(t, runErr, "a host-gone item is deferred, not a run error")
+			assert.NotNil(t, h.lastBackfillAt(groupID), "a walk whose only failure is a deferred host-gone item stamps last_backfill_at")
+			// The broken item's embedded object carries no type.
+			assert.Equal(t, walkDeferredRows(h, "other.test", [2]string{"https://other.test/post/broken", ""}),
+				deferredRows(t, h), "the host-gone item is deferred, first due 1h after the walk")
+			goneSince, err := h.materializerOptions.Instances.RecordHostGone(ctx, "other.test", backfillNow.Add(time.Hour))
+			require.NoError(t, err)
+			assert.True(t, tt.wantSince.Equal(goneSince), "other.test streak start = %v, want %v", goneSince, tt.wantSince)
 		})
 	}
 }
 
 // TestBackfillHostGoneReply: a reply in a post's replies collection whose
-// origin fetch fails host-gone is a failure while the host's streak is young
-// (the run errors and last_backfill_at stays unset, so the walk retries) and
-// a skip once the streak is dead (the walk stamps).
+// origin fetch fails host-gone is deferred on the walk that meets it, whatever
+// its host's streak: the run succeeds and stamps last_backfill_at, the reply
+// gets one deferred row, and the failure is recorded into the host's streak.
 func TestBackfillHostGoneReply(t *testing.T) {
 	const (
 		goneReply = "https://other.test/comment/77"
 		goneHost  = "other.test"
 	)
 	tests := []struct {
-		name     string
-		seedDead bool
-		wantSkip bool
+		name      string
+		seedDead  bool
+		wantSince time.Time
 	}{
-		{name: "no prior streak: the reply fails the item", seedDead: false, wantSkip: false},
-		{name: "dead streak: the reply is skipped", seedDead: true, wantSkip: true},
+		{name: "no prior streak", seedDead: false, wantSince: time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC)},
+		{name: "dead streak", seedDead: true, wantSince: time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -133,22 +143,13 @@ func TestBackfillHostGoneReply(t *testing.T) {
 			require.NoError(t, err, "the post carrying the replies collection still materializes")
 			_, err = h.objects.GetByAPID(ctx, goneReply)
 			assert.True(t, errors.IsNotFound(err), "the host-gone reply is not materialized")
-			// The reply fetch reached the gone host: the run recorded a failure
-			// into the host's streak (started by the run, or the seeded one).
-			wantSince := backfillNow
-			if tt.seedDead {
-				wantSince = backfillNow.Add(-96 * time.Hour)
-			}
 			goneSince, err := h.materializerOptions.Instances.RecordHostGone(ctx, goneHost, backfillNow.Add(time.Hour))
 			require.NoError(t, err)
-			assert.True(t, wantSince.Equal(goneSince), "%s streak start = %v, want %v", goneHost, goneSince, wantSince)
-			if tt.wantSkip {
-				require.NoError(t, runErr, "a reply on a dead host is a skip, not a run error")
-				require.NotNil(t, h.lastBackfillAt(groupID), "a walk whose only failure is a dead-host reply stamps last_backfill_at")
-				return
-			}
-			require.Error(t, runErr, "a reply on a host gone for less than DeadHostAfter fails the item")
-			require.Nil(t, h.lastBackfillAt(groupID), "a young host-gone reply must leave last_backfill_at unset")
+			assert.True(t, tt.wantSince.Equal(goneSince), "%s streak start = %v, want %v", goneHost, goneSince, tt.wantSince)
+			assert.NoError(t, runErr, "a host-gone reply is deferred, not a run error")
+			assert.NotNil(t, h.lastBackfillAt(groupID), "a walk whose only failure is a deferred reply stamps last_backfill_at")
+			assert.Equal(t, walkDeferredRows(h, goneHost, [2]string{goneReply, "Note"}), deferredRows(t, h),
+				"the host-gone reply is deferred, first due 1h after the walk")
 		})
 	}
 }
@@ -175,29 +176,40 @@ func (f repliesCollectionGoneFetcher) FetchCollection(ctx context.Context, iri s
 }
 
 // TestBackfillHostGoneRepliesCollection: a post's replies collection (or a
-// later page of it) whose fetch fails host-gone holds the walk open while the
-// host's streak is young (the run errors, last_backfill_at stays unset, and
-// the failure starts the host's streak) and is a skip once the streak is dead
-// (the walk stamps).
+// later page of it) whose fetch fails host-gone does not fail the walk,
+// whatever the host's streak: the run succeeds, stamps last_backfill_at,
+// records the failure into the host's streak, and defers the post itself
+// under the collection's host, so its replies are not lost. A sweep while the
+// collection still fails keeps the row, rescheduled like any host-gone retry;
+// a later sweep, with the collection served again, re-fetches the post, lands
+// its replies and removes the row.
 func TestBackfillHostGoneRepliesCollection(t *testing.T) {
-	const goneHost = "other.test"
+	const (
+		goneHost = "other.test"
+		replyID  = "https://lemmy.world/comment/3001"
+	)
 	repliesIRI := pageID + "/replies"
 	tests := []struct {
 		name           string
 		afterFirstPage bool
 		seedDead       bool
-		wantSkip       bool
+		wantSince      time.Time
 	}{
-		{name: "no prior streak: the collection fetch fails the item", seedDead: false, wantSkip: false},
-		{name: "no prior streak: a later page fails the item", afterFirstPage: true, seedDead: false, wantSkip: false},
-		{name: "dead streak: the collection fetch is skipped", seedDead: true, wantSkip: true},
-		{name: "dead streak: a later page is skipped", afterFirstPage: true, seedDead: true, wantSkip: true},
+		{name: "no prior streak: the collection fetch", wantSince: time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC)},
+		{name: "no prior streak: a later page", afterFirstPage: true, wantSince: time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC)},
+		{name: "dead streak: the collection fetch", seedDead: true, wantSince: time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)},
+		{name: "dead streak: a later page", afterFirstPage: true, seedDead: true, wantSince: time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			h := newHarness(t)
 			h.subscribeTechnology()
 			serveOutboxFixtures(t, h)
+			// The post's origin copy advertises the same replies collection,
+			// so the sweep's re-fetch of the post walks it.
+			page := loadFixture(t, "page_lemmy_world.json")
+			page["replies"] = repliesIRI
+			h.serveObject("/post/49131386", page)
 			if tt.seedDead {
 				seedDeadHostStreak(t, h, goneHost)
 			}
@@ -214,29 +226,41 @@ func TestBackfillHostGoneRepliesCollection(t *testing.T) {
 
 			_, err = h.objects.GetByAPID(ctx, pageID)
 			require.NoError(t, err, "the post carrying the replies collection still materializes")
-			// The collection fetch reached the gone host: the run recorded a
-			// failure into the host's streak (started by the run, or the seeded one).
-			wantSince := backfillNow
-			if tt.seedDead {
-				wantSince = backfillNow.Add(-96 * time.Hour)
-			}
 			goneSince, err := h.materializerOptions.Instances.RecordHostGone(ctx, goneHost, backfillNow.Add(time.Hour))
 			require.NoError(t, err)
-			assert.True(t, wantSince.Equal(goneSince), "%s streak start = %v, want %v", goneHost, goneSince, wantSince)
-			if tt.wantSkip {
-				require.NoError(t, runErr, "a replies collection on a dead host is a skip, not a run error")
-				require.NotNil(t, h.lastBackfillAt(groupID), "a walk whose only failure is a dead-host replies collection stamps last_backfill_at")
-				return
-			}
-			require.Error(t, runErr, "a replies collection on a host gone for less than DeadHostAfter fails the item")
-			require.Nil(t, h.lastBackfillAt(groupID), "a young host-gone replies collection must leave last_backfill_at unset")
+			assert.True(t, tt.wantSince.Equal(goneSince), "%s streak start = %v, want %v", goneHost, goneSince, tt.wantSince)
+			assert.NoError(t, runErr, "a host-gone replies collection is not a run error")
+			assert.NotNil(t, h.lastBackfillAt(groupID), "a walk whose only failure is a host-gone replies collection stamps last_backfill_at")
+			assert.Equal(t, walkDeferredRows(h, goneHost, [2]string{pageID, "Page"}), deferredRows(t, h),
+				"the post is deferred under the collection's host, first due 1h after the walk")
+
+			// A sweep while the collection still fails: the post lands again,
+			// but its row stays, rescheduled to its 6h retry with one attempt.
+			stillGone, err := NewBackfill(opts)
+			require.NoError(t, err)
+			stillGone.now = func() time.Time { return backfillNow.Add(61 * time.Minute) }
+			require.NoError(t, stillGone.RetryDeferred(ctx, 50))
+			assert.Equal(t, []store.DeferredItem{{
+				ObjectIRI: pageID, CommunityAPID: groupID, CommunityDID: h.communityDID(groupID),
+				Host: goneHost, ObjectType: "Page", Attempts: 1,
+				NextRetryAt: time.Date(2026, 11, 8, 18, 0, 0, 0, time.UTC),
+				CreatedAt:   time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC),
+			}}, deferredRows(t, h), "a sweep whose replies collection still fails keeps the post's row, at its 6h retry")
+
+			sweep := newBackfill(t, h, 100)
+			sweep.now = func() time.Time { return time.Date(2026, 11, 8, 18, 1, 0, 0, time.UTC) }
+			require.NoError(t, sweep.RetryDeferred(ctx, 50))
+
+			_, err = h.objects.GetByAPID(ctx, replyID)
+			assert.NoError(t, err, "the sweep lands the reply once the collection is served")
+			assert.Equal(t, []store.DeferredItem{}, deferredRows(t, h), "the post's row goes once its replies are walked")
 		})
 	}
 }
 
 // TestBackfillAuthorFetchClearsHostGoneStreak: with the materializer's
 // fetcher wrapped by NewHostHealthFetcher, a successful author fetch
-// (FetchActor) from a host with a young streak ends that streak.
+// (FetchActor) from a host with a streak ends that streak.
 func TestBackfillAuthorFetchClearsHostGoneStreak(t *testing.T) {
 	h := newHarness(t)
 	h.subscribeTechnology()
@@ -442,9 +466,9 @@ func TestHostHealthFetcher(t *testing.T) {
 }
 
 // TestBackfillHostGoneReplyAuthor: a reply whose body is served normally but
-// whose author's actor document fails host-gone fails the item while the
-// author host's streak is young (the run errors and last_backfill_at stays
-// unset) and is a skip once the streak is dead (the walk stamps).
+// whose author's actor document fails host-gone is deferred under the
+// author's host, whatever that host's streak: the run succeeds and stamps
+// last_backfill_at, and the reply gets its own deferred row.
 func TestBackfillHostGoneReplyAuthor(t *testing.T) {
 	const (
 		replyID     = "https://lemmy.world/comment/3001"
@@ -452,12 +476,12 @@ func TestBackfillHostGoneReplyAuthor(t *testing.T) {
 		goneHost    = "lemmy.world"
 	)
 	tests := []struct {
-		name     string
-		seedDead bool
-		wantSkip bool
+		name      string
+		seedDead  bool
+		wantSince time.Time
 	}{
-		{name: "no prior streak: the reply author fails the item", seedDead: false, wantSkip: false},
-		{name: "dead streak: the reply author is skipped", seedDead: true, wantSkip: true},
+		{name: "no prior streak", seedDead: false, wantSince: time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC)},
+		{name: "dead streak", seedDead: true, wantSince: time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -485,49 +509,91 @@ func TestBackfillHostGoneReplyAuthor(t *testing.T) {
 			require.NoError(t, err, "the post carrying the replies collection still materializes")
 			_, err = h.objects.GetByAPID(ctx, replyID)
 			assert.True(t, errors.IsNotFound(err), "the reply whose author's host is gone is not materialized")
-			wantSince := backfillNow
-			if tt.seedDead {
-				wantSince = backfillNow.Add(-96 * time.Hour)
-			}
 			goneSince, err := h.materializerOptions.Instances.RecordHostGone(ctx, goneHost, backfillNow.Add(time.Hour))
 			require.NoError(t, err)
-			assert.True(t, wantSince.Equal(goneSince), "%s streak start = %v, want %v", goneHost, goneSince, wantSince)
-			if tt.wantSkip {
-				require.NoError(t, runErr, "a reply author on a dead host is a skip, not a run error")
-				require.NotNil(t, h.lastBackfillAt(groupID), "a walk whose only failure is a dead-host reply author stamps last_backfill_at")
-				return
-			}
-			require.Error(t, runErr, "a reply author on a host gone for less than DeadHostAfter fails the item")
-			require.Nil(t, h.lastBackfillAt(groupID), "a young host-gone reply author must leave last_backfill_at unset")
+			assert.True(t, tt.wantSince.Equal(goneSince), "%s streak start = %v, want %v", goneHost, goneSince, tt.wantSince)
+			assert.NoError(t, runErr, "a reply whose author's host is gone is deferred, not a run error")
+			assert.NotNil(t, h.lastBackfillAt(groupID), "a walk whose only failure is a deferred reply stamps last_backfill_at")
+			assert.Equal(t, walkDeferredRows(h, goneHost, [2]string{replyID, "Note"}), deferredRows(t, h),
+				"the reply is deferred under its author's host, first due 1h after the walk")
 		})
 	}
 }
 
 // TestBackfillHostGoneRecordFailureIsAFailure: when the host-gone streak
-// cannot be recorded, the host-gone item is an ordinary failure, never a
-// skip: the run errors and last_backfill_at stays unset.
+// cannot be recorded, the host-gone outbox item, reply or replies collection
+// is an ordinary failure, never a skip: the run errors, last_backfill_at
+// stays unset and nothing is deferred.
 func TestBackfillHostGoneRecordFailureIsAFailure(t *testing.T) {
-	h := newHarness(t)
-	h.subscribeTechnology()
-	serveOutboxFixtures(t, h)
-	serveBrokenItemOutbox(t, h)
-	streaks := &fakeHostGoneStreaks{recordErr: stderrors.New("db down")}
-	opts := h.backfillOptions(h.mat, 100)
-	opts.Fetcher = hostGoneFetcher{BackfillFetcher: h.client, goneIRI: "https://other.test/post/broken"}
-	opts.Instances = streaks
-	b, err := NewBackfill(opts)
-	require.NoError(t, err)
-	b.now = func() time.Time { return backfillNow }
-	ctx := context.Background()
+	const goneReply = "https://other.test/comment/77"
+	repliesIRI := pageID + "/replies"
+	tests := []struct {
+		name    string
+		serve   func(t *testing.T, h *harness)
+		fetcher func(h *harness) BackfillFetcher
+	}{
+		{
+			name:  "an outbox item",
+			serve: serveBrokenItemOutbox,
+			fetcher: func(h *harness) BackfillFetcher {
+				return hostGoneFetcher{BackfillFetcher: h.client, goneIRI: "https://other.test/post/broken"}
+			},
+		},
+		{
+			name: "a reply",
+			serve: func(_ *testing.T, h *harness) {
+				h.serveObject("/post/49131386/replies", map[string]any{
+					"type":         "OrderedCollection",
+					"id":           repliesIRI,
+					"totalItems":   1,
+					"orderedItems": []any{note(goneReply, "https://other.test/u/ghost", pageID, "a reply from a gone host", "2026-07-07T05:00:00.000000Z")},
+				})
+			},
+			fetcher: func(h *harness) BackfillFetcher {
+				return hostGoneFetcher{BackfillFetcher: h.client, goneIRI: goneReply}
+			},
+		},
+		{
+			name: "a replies collection fetch",
+			fetcher: func(h *harness) BackfillFetcher {
+				return repliesCollectionGoneFetcher{BackfillFetcher: h.client, goneIRI: repliesIRI}
+			},
+		},
+		{
+			name: "a replies collection's later page",
+			fetcher: func(h *harness) BackfillFetcher {
+				return repliesCollectionGoneFetcher{BackfillFetcher: h.client, goneIRI: repliesIRI, afterFirstPage: true}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.subscribeTechnology()
+			serveOutboxFixtures(t, h)
+			if tt.serve != nil {
+				tt.serve(t, h)
+			}
+			streaks := &fakeHostGoneStreaks{recordErr: stderrors.New("db down")}
+			opts := h.backfillOptions(h.mat, 100)
+			opts.Fetcher = tt.fetcher(h)
+			opts.Instances = streaks
+			b, err := NewBackfill(opts)
+			require.NoError(t, err)
+			b.now = func() time.Time { return backfillNow }
+			ctx := context.Background()
 
-	community, err := h.communities.GetByAPGroupID(ctx, groupID)
-	require.NoError(t, err)
-	require.Error(t, b.Run(ctx, community, true), "a host-gone item whose streak cannot be recorded is an item failure")
+			community, err := h.communities.GetByAPGroupID(ctx, groupID)
+			require.NoError(t, err)
+			assert.Error(t, b.Run(ctx, community, true), "a host-gone failure whose streak cannot be recorded fails the walk")
 
-	_, err = h.objects.GetByAPID(ctx, pageID)
-	require.NoError(t, err, "the healthy item still materializes")
-	assert.Equal(t, []string{"other.test"}, streaks.recorded, "the run tried to record the host-gone failure once")
-	require.Nil(t, h.lastBackfillAt(groupID), "a host-gone item with a failed streak record must leave last_backfill_at unset")
+			_, err = h.objects.GetByAPID(ctx, pageID)
+			require.NoError(t, err, "the healthy post still materializes")
+			assert.Equal(t, []string{"other.test"}, streaks.recorded, "the run tried to record the host-gone failure once")
+			assert.Nil(t, h.lastBackfillAt(groupID), "a host-gone failure with a failed streak record must leave last_backfill_at unset")
+			assert.Equal(t, []store.DeferredItem{}, deferredRows(t, h), "nothing is deferred")
+		})
+	}
 }
 
 // TestBackfillCrossAuthorityFetchKeepsHostGoneStreak: an outbox item whose
@@ -583,14 +649,4 @@ func TestBackfillCrossAuthorityFetchKeepsHostGoneStreak(t *testing.T) {
 	want := backfillNow.Add(-96 * time.Hour)
 	assert.True(t, want.Equal(goneSince),
 		"a cross-authority response must not clear %s's streak: goneSince = %v, want %v", revivedHost, goneSince, want)
-}
-
-// TestHostGoneTimingInvariant pins the ordering the dead-host streak relies
-// on: a walk retried at the backoff cap records a failure before the streak
-// lapses, and a host must fail across several retries before it is dead.
-func TestHostGoneTimingInvariant(t *testing.T) {
-	assert.Less(t, maxBackfillRetryDelay, store.HostGoneStreakGap,
-		"maxBackfillRetryDelay must stay under store.HostGoneStreakGap")
-	assert.Less(t, store.HostGoneStreakGap, DeadHostAfter,
-		"store.HostGoneStreakGap must stay under DeadHostAfter")
 }

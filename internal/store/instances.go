@@ -11,10 +11,8 @@ import (
 )
 
 // HostGoneStreakGap is the longest quiet gap that keeps a host-gone streak
-// running. It is twice the backfill retry delay cap (24h), so a failing walk
-// retried at that cap records a new failure before the streak lapses, and
-// shorter than ingest.DeadHostAfter (72h), so a host must fail on several
-// retries spread over the threshold before backfill skips it.
+// running. The streak's start is only logged now (no wait rule reads it), and
+// clearing a streak makes the host's deferred backfill rows due.
 const HostGoneStreakGap = 48 * time.Hour
 
 // Instance is one remote instance's nodeinfo discovery state (migration

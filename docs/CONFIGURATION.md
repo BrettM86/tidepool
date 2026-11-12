@@ -91,8 +91,8 @@ the whole zone, counted from Cloudflare's `created_on`. A pass also stops at
 |---|---|---|
 | `INGEST_WORKERS` | `4` | Inbox queue worker count. |
 | `BACKFILL_MAX_POSTS` | `100` | Posts materialized per community backfill run. |
-| `BACKFILL_DEFERRED_RETRY_INTERVAL` | `1h` | How often backfill retries items it skipped because their host was dead. Each item is retried 72h, 1 week, 2 weeks, 30 days and 90 days after its skip, and dropped after the 90-day attempt. A successful fetch from its host that ends the host's host-gone streak makes it due, so it runs at the next sweep. The sweep also runs at startup. |
-| `BACKFILL_DEFERRED_RETRY_BATCH` | `50` | Most deferred items retried per sweep. The rest wait for the next one. |
+| `BACKFILL_DEFERRED_RETRY_INTERVAL` | `1h` | How often backfill retries items it skipped because their host was unreachable. Each item is retried 1h, 6h, 24h, 72h, 1 week, 2 weeks, 30 days and 90 days after its skip, and dropped after the 90-day attempt. A successful fetch from its host that ends the host's host-gone streak makes it due, so it runs at the next sweep. The sweep also runs at startup. |
+| `BACKFILL_DEFERRED_RETRY_BATCH` | `50` | Most deferred items retried per sweep, and at most 20 per host. The rest wait for the next one. |
 | `PLC_WRITES_PER_MINUTE` | `5` | PLC POSTs per minute, with a burst of 1, shared by DID mints and handle updates. Unseen authors in delivered content trigger mints, and PLC registrations are permanent. Any positive integer. See the note below. |
 | `SEED_COUNTS_FROM_API` | on | Seeds backfilled posts' vote counts from the community's host through Lemmy's public API. Uses `/api/v3/post` for posts on that host and anonymous `/api/v3/resolve_object` for posts from other instances. Never queries the post's own host. Set `0` to turn off. |
 | `MAX_BLOB_BYTES` | `5242880` (5 MiB) | Largest remote media file (avatar, banner, post image) the materializer downloads. Larger files are dropped, never truncated. Lexicon slots set tighter limits of their own, for example 1 MB for avatars. |

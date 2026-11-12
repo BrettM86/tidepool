@@ -382,11 +382,11 @@ Community takedowns:
   cleared, by compare-and-set on the value the pass read at its start (a
   newer negation during the pass sets a newer value, which keeps the
   reconcile pending for its own pass), when every kept object got one of
-  the final outcomes above and every write succeeded. Until 72 hours (the
-  backfill's dead-host window) have passed since the first pass, any fetch
-  failure keeps it; after that, a pass whose only non-final objects are
-  fetch failures counts them `unreachable`, logs one warning naming their
-  ap ids, changes nothing for them, and clears the mark. A failed write
+  the final outcomes above and every write succeeded. Until 72 hours
+  (DeadHostAfter, used only by the reconcile) have passed since the first
+  pass, any fetch failure keeps it; after that, a pass whose only non-final
+  objects are fetch failures counts them `unreachable`, logs one warning
+  naming their ap ids, changes nothing for them, and clears the mark. A failed write
   keeps the mark however old it is, and a fetch failure never deletes or
   removes anything. A new mark restarts the 72 hours. Each outcome is
   idempotent, so processing is eventual, not exactly-once: objects handled

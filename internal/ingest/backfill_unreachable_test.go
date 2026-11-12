@@ -288,93 +288,96 @@ func requireNotMaterialized(t *testing.T, h *harness, ids ...string) {
 	}
 }
 
-// TestBackfillUnreachableDeadHostCached is the acceptance check: a host that
-// refuses connections and has been gone past DeadHostAfter, and whose nodeinfo
-// probe answers a parked page, costs the walk one connection attempt, one
-// probe and one streak record. Every item that needs it (three posts on it and
-// a comment whose parent is on it) is skipped, and the walk completes.
-func TestBackfillUnreachableDeadHostCached(t *testing.T) {
-	h := newHarness(t)
-	h.subscribeTechnology()
-	serveUnreachableOutbox(h, 3, true)
-	seedDeadHostStreak(t, h, unreachableHost)
-	rig := newUnreachableRig(t, h,
-		map[string]error{unreachableHost: connectionRefused()},
-		map[string]probeAnswer{unreachableHost: probeHTML})
+// firstDeferredRetry is when an item deferred by a walk at backfillNow is
+// first due: one hour after its first skip.
+var firstDeferredRetry = time.Date(2026, 11, 8, 13, 0, 0, 0, time.UTC)
 
-	assert.NoError(t, rig.run(t), "every item on a dead, refusing host is a skip")
-
-	assert.NotNil(t, h.lastBackfillAt(groupID), "a walk whose only failures are dead-host skips stamps last_backfill_at")
-	requireNotMaterialized(t, h, unreachablePageIRI(1), unreachablePageIRI(2), unreachablePageIRI(3), ancestorItemID)
-	assert.Equal(t, []string{"WARN"}, logLevels(h.logs.String(), "backfill complete", "host_gone=4"),
-		"the walk completes with all four items counted host_gone")
-	assert.Equal(t, 1, rig.transport.attemptsTo(unreachableHost), "x.example is dialed once per walk")
-	assert.Equal(t, 1, rig.probes.requestsTo(unreachableHost), "x.example is probed once per walk")
-	assert.Equal(t, []string{unreachableHost}, rig.streaks.recordedHosts(), "the walk records x.example's failure once")
-	since := hostGoneSince(t, h, unreachableHost)
-	require.True(t, since.Valid, "x.example's streak survives the walk")
-	assert.True(t, backfillNow.Add(-96*time.Hour).Equal(since.Time),
-		"x.example's streak keeps its seeded start: host_gone_since = %v", since.Time)
+// walkDeferredRows is the backfill_deferred_items rows a walk at backfillNow
+// writes for items, each (object IRI, object type) under the technology
+// community and host, ordered as deferredRows reads them.
+func walkDeferredRows(h *harness, host string, items ...[2]string) []store.DeferredItem {
+	communityDID := h.communityDID(groupID)
+	rows := []store.DeferredItem{}
+	for _, item := range items {
+		rows = append(rows, store.DeferredItem{
+			ObjectIRI:     item[0],
+			CommunityAPID: groupID,
+			CommunityDID:  communityDID,
+			Host:          host,
+			ObjectType:    item[1],
+			Attempts:      0,
+			NextRetryAt:   firstDeferredRetry,
+			CreatedAt:     backfillNow,
+		})
+	}
+	return rows
 }
 
-// TestBackfillUnreachableYoungHostCached: the same refusing host with no prior
-// streak fails every item that needs it, so the walk stays unstamped, but the
-// host is still dialed once and recorded once, and never probed (a young
-// streak cannot be dead whatever the probe says).
-func TestBackfillUnreachableYoungHostCached(t *testing.T) {
-	h := newHarness(t)
-	h.subscribeTechnology()
-	serveUnreachableOutbox(h, 3, true)
-	rig := newUnreachableRig(t, h,
-		map[string]error{unreachableHost: connectionRefused()},
-		map[string]probeAnswer{unreachableHost: probeHTML})
+// TestBackfillUnreachableHostDefersOnFirstWalk is the acceptance check: a
+// walk over items on an unreachable host (three posts on it and a comment
+// whose parent is on it) defers every one of them at once, whatever the
+// host's streak and its reason, so the walk completes and stamps
+// last_backfill_at. Each item gets one row, first due one hour after the
+// walk. The host costs the walk one connection attempt and one streak record,
+// and is never probed: a probe, were one sent, would answer JSON.
+func TestBackfillUnreachableHostDefersOnFirstWalk(t *testing.T) {
+	tests := []struct {
+		name       string
+		failure    error
+		deadStreak bool
+		// wantSince is x.example's host_gone_since after the walk.
+		wantSince time.Time
+	}{
+		{
+			name:      "a refusing host with no streak",
+			failure:   connectionRefused(),
+			wantSince: time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC),
+		},
+		{
+			name:       "a refusing host gone past DeadHostAfter",
+			failure:    connectionRefused(),
+			deadStreak: true,
+			wantSince:  time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC),
+		},
+		{
+			name:      "an NXDOMAIN host with no streak",
+			failure:   noSuchHost(unreachableHost),
+			wantSince: time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.subscribeTechnology()
+			serveUnreachableOutbox(h, 3, true)
+			if tt.deadStreak {
+				seedDeadHostStreak(t, h, unreachableHost)
+			}
+			rig := newUnreachableRig(t, h,
+				map[string]error{unreachableHost: tt.failure},
+				map[string]probeAnswer{unreachableHost: probeJSON})
 
-	assert.Error(t, rig.run(t), "items on a host gone for less than DeadHostAfter are failures")
+			assert.NoError(t, rig.run(t), "every item on an unreachable host is deferred, not a failure")
 
-	assert.Nil(t, h.lastBackfillAt(groupID), "a young unreachable host leaves last_backfill_at unset")
-	requireNotMaterialized(t, h, unreachablePageIRI(1), unreachablePageIRI(2), unreachablePageIRI(3), ancestorItemID)
-	assert.Equal(t, 1, rig.transport.attemptsTo(unreachableHost), "x.example is dialed once per walk")
-	assert.Equal(t, []string{unreachableHost}, rig.streaks.recordedHosts(), "the walk records x.example's failure once")
-	assert.Equal(t, 0, rig.probes.requestsTo(unreachableHost), "a young streak is never probed")
-}
-
-// TestBackfillUnreachableProbeClears: a refusing host past DeadHostAfter whose
-// nodeinfo probe answers JSON is alive: its streak is cleared and the item is
-// an ordinary failure, retried on the walk backoff.
-func TestBackfillUnreachableProbeClears(t *testing.T) {
-	h := newHarness(t)
-	h.subscribeTechnology()
-	serveUnreachableOutbox(h, 1, false)
-	seedDeadHostStreak(t, h, unreachableHost)
-	rig := newUnreachableRig(t, h,
-		map[string]error{unreachableHost: connectionRefused()},
-		map[string]probeAnswer{unreachableHost: probeJSON})
-
-	require.Error(t, rig.run(t), "an item on a host whose probe answers is a failure, not a skip")
-
-	require.Nil(t, h.lastBackfillAt(groupID), "the failed item leaves last_backfill_at unset")
-	assert.Equal(t, 1, rig.probes.requestsTo(unreachableHost), "the dead-streak host is probed before it is skipped")
-	assert.False(t, hostGoneSince(t, h, unreachableHost).Valid, "a probe answering JSON clears x.example's streak")
-}
-
-// TestBackfillUnreachableNXDOMAINNotProbed: NXDOMAIN keeps its old rule: a
-// host gone past DeadHostAfter is skipped on the streak alone, never probed.
-func TestBackfillUnreachableNXDOMAINNotProbed(t *testing.T) {
-	h := newHarness(t)
-	h.subscribeTechnology()
-	serveUnreachableOutbox(h, 3, true)
-	seedDeadHostStreak(t, h, unreachableHost)
-	rig := newUnreachableRig(t, h,
-		map[string]error{unreachableHost: noSuchHost(unreachableHost)},
-		// A probe, were one sent, would answer JSON and turn the skips into
-		// failures.
-		map[string]probeAnswer{unreachableHost: probeJSON})
-
-	require.NoError(t, rig.run(t), "items on a dead NXDOMAIN host are skips")
-
-	require.NotNil(t, h.lastBackfillAt(groupID), "a walk whose only failures are dead-host skips stamps last_backfill_at")
-	requireNotMaterialized(t, h, unreachablePageIRI(1), unreachablePageIRI(2), unreachablePageIRI(3), ancestorItemID)
-	assert.Equal(t, 0, rig.probes.requestsTo(unreachableHost), "an NXDOMAIN host is never probed")
+			assert.NotNil(t, h.lastBackfillAt(groupID), "a walk whose only failures are deferred stamps last_backfill_at")
+			assert.Equal(t, walkDeferredRows(h, unreachableHost,
+				[2]string{ancestorItemID, "Note"},
+				[2]string{"https://x.example/post/1", "Page"},
+				[2]string{"https://x.example/post/2", "Page"},
+				[2]string{"https://x.example/post/3", "Page"},
+			), deferredRows(t, h), "one deferred row per item, first due 1h after the walk")
+			requireNotMaterialized(t, h, unreachablePageIRI(1), unreachablePageIRI(2), unreachablePageIRI(3), ancestorItemID)
+			assert.Equal(t, []string{"WARN"}, logLevels(h.logs.String(), "backfill complete", "host_gone=4"),
+				"the walk completes with all four items counted host_gone")
+			assert.Equal(t, 0, rig.probes.requestsTo(unreachableHost), "the walk never probes x.example before deferring")
+			assert.Equal(t, 1, rig.transport.attemptsTo(unreachableHost), "x.example is dialed once per walk")
+			assert.Equal(t, []string{unreachableHost}, rig.streaks.recordedHosts(), "the walk records x.example's failure once")
+			since := hostGoneSince(t, h, unreachableHost)
+			require.True(t, since.Valid, "x.example has a streak after the walk")
+			assert.True(t, tt.wantSince.Equal(since.Time),
+				"x.example's host_gone_since = %v, want %v", since.Time, tt.wantSince)
+		})
+	}
 }
 
 // TestBackfillObjectNotServed: a cross-authority item whose origin answers
@@ -593,126 +596,83 @@ func (failingDeferItems) DeferItem(context.Context, store.DeferredItem) error {
 	return stderrors.New("deferred store unavailable")
 }
 
-// TestBackfillDeadHostDefersSkippedItems is the acceptance check for deferred
-// retries: every item a walk skips because its host is dead is kept for a
-// later retry, one row per skipped object under the walked community, first
-// due 72h after the walk. A young host's failures are not deferred (the walk
-// stays unstamped and retries them), a reply skipped on a dead host is
-// deferred like an outbox item, and an item whose deferral cannot be written
-// is a failure, so the walk does not stamp over it.
-func TestBackfillDeadHostDefersSkippedItems(t *testing.T) {
-	const deadReplyIRI = "https://x.example/comment/1"
-	// createdAt is backfillNow; firstRetry is 72h after it.
-	createdAt := time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC)
-	firstRetry := time.Date(2026, 11, 11, 12, 0, 0, 0, time.UTC)
+// TestBackfillDefersUnreachableItems: an item or reply whose host is
+// unreachable is deferred on the walk that first meets it, with no prior
+// streak. A reply on such a host is deferred like an outbox item and its post
+// lands. Any other failure in the same walk (an origin answering 502) still
+// leaves it unstamped, with the unreachable item deferred all the same. An
+// item or reply whose deferral cannot be written is a failure, so the walk
+// does not stamp over it.
+func TestBackfillDefersUnreachableItems(t *testing.T) {
+	const (
+		unreachableReplyIRI = "https://x.example/comment/1"
+		badGatewayIRI       = "https://y.example/post/bad-gateway"
+	)
+	serveUnreachableReply := func(t *testing.T, h *harness) {
+		serveOutboxFixtures(t, h)
+		h.serveObject("/post/49131386/replies", map[string]any{
+			"type":         "OrderedCollection",
+			"id":           pageID + "/replies",
+			"totalItems":   1,
+			"orderedItems": []any{note(unreachableReplyIRI, "https://x.example/u/gone", pageID, "a reply on an unreachable host", "2026-07-07T05:00:00.000000Z")},
+		})
+	}
 	tests := []struct {
-		name       string
-		serve      func(t *testing.T, h *harness)
-		deadStreak bool
-		failDefer  bool
-		// probeError, when set, is what every nodeinfo probe returns.
-		probeError error
-		// probe, when set, answers every nodeinfo probe.
-		probe proberFunc
-		// wantRows lists the expected rows as (object IRI, object type).
+		name      string
+		serve     func(t *testing.T, h *harness)
+		failDefer bool
+		// wantRows lists the expected rows as (object IRI, object type), all
+		// on x.example.
 		wantRows     [][2]string
 		wantStamped  bool
 		materialized []string
 	}{
 		{
-			name:       "items skipped on a dead host are each deferred",
-			serve:      func(_ *testing.T, h *harness) { serveUnreachableOutbox(h, 3, true) },
-			deadStreak: true,
-			wantRows: [][2]string{
-				{ancestorItemID, "Note"},
-				{"https://x.example/post/1", "Page"},
-				{"https://x.example/post/2", "Page"},
-				{"https://x.example/post/3", "Page"},
+			name: "an unreachable item beside a 502 item is deferred and the walk stays unstamped",
+			serve: func(_ *testing.T, h *harness) {
+				h.mux.HandleFunc("GET /post/bad-gateway", func(w http.ResponseWriter, _ *http.Request) {
+					http.Error(w, "bad gateway", http.StatusBadGateway)
+				})
+				h.serveObject("/c/technology/outbox", map[string]any{
+					"type":       "OrderedCollection",
+					"id":         groupID + "/outbox",
+					"totalItems": 2,
+					"orderedItems": []any{
+						map[string]any{
+							"id":           unreachablePageIRI(1),
+							"type":         "Page",
+							"attributedTo": "https://x.example/u/gone",
+							"audience":     groupID,
+							"to":           []any{groupID, ap.PublicAudience},
+							"name":         "a post from an unreachable host",
+							"content":      "<p>unreachable</p>",
+							"published":    "2026-11-07T09:00:00.000000Z",
+						},
+						map[string]any{"id": badGatewayIRI, "type": "Page"},
+					},
+				})
 			},
-			wantStamped: true,
-		},
-		{
-			name:        "failures on a young host are not deferred",
-			serve:       func(_ *testing.T, h *harness) { serveUnreachableOutbox(h, 3, true) },
-			wantRows:    [][2]string{},
+			wantRows:    [][2]string{{"https://x.example/post/1", "Page"}},
 			wantStamped: false,
 		},
 		{
 			name:        "an item whose deferral fails is a failure",
 			serve:       func(_ *testing.T, h *harness) { serveUnreachableOutbox(h, 1, false) },
-			deadStreak:  true,
 			failDefer:   true,
 			wantRows:    [][2]string{},
 			wantStamped: false,
 		},
 		{
-			name: "a reply skipped on a dead host is deferred and its post lands",
-			serve: func(t *testing.T, h *harness) {
-				serveOutboxFixtures(t, h)
-				h.serveObject("/post/49131386/replies", map[string]any{
-					"type":         "OrderedCollection",
-					"id":           pageID + "/replies",
-					"totalItems":   1,
-					"orderedItems": []any{note(deadReplyIRI, "https://x.example/u/gone", pageID, "a reply on a dead host", "2026-07-07T05:00:00.000000Z")},
-				})
-			},
-			deadStreak:   true,
-			wantRows:     [][2]string{{deadReplyIRI, "Note"}},
+			name:         "a reply on an unreachable host is deferred and its post lands",
+			serve:        serveUnreachableReply,
+			wantRows:     [][2]string{{unreachableReplyIRI, "Note"}},
 			wantStamped:  true,
 			materialized: []string{pageID},
 		},
 		{
-			name: "a reply whose deferral fails fails its post's item",
-			serve: func(t *testing.T, h *harness) {
-				serveOutboxFixtures(t, h)
-				h.serveObject("/post/49131386/replies", map[string]any{
-					"type":         "OrderedCollection",
-					"id":           pageID + "/replies",
-					"totalItems":   1,
-					"orderedItems": []any{note(deadReplyIRI, "https://x.example/u/gone", pageID, "a reply on a dead host", "2026-07-07T05:00:00.000000Z")},
-				})
-			},
-			deadStreak:  true,
+			name:        "a reply whose deferral fails fails its post's item",
+			serve:       serveUnreachableReply,
 			failDefer:   true,
-			wantRows:    [][2]string{},
-			wantStamped: false,
-		},
-		{
-			name:        "a probe cut short by its own deadline gives no dead verdict",
-			serve:       func(_ *testing.T, h *harness) { serveUnreachableOutbox(h, 1, false) },
-			deadStreak:  true,
-			probeError:  fmt.Errorf("ap: probe nodeinfo of %s: %w", unreachableHost, context.DeadlineExceeded),
-			wantRows:    [][2]string{},
-			wantStamped: false,
-		},
-		{
-			name:        "a probe refused on our side gives no dead verdict",
-			serve:       func(_ *testing.T, h *harness) { serveUnreachableOutbox(h, 1, false) },
-			deadStreak:  true,
-			probeError:  errors.NewValidationError("url", "egress guard refused the address"),
-			wantRows:    [][2]string{},
-			wantStamped: false,
-		},
-		{
-			// The limiter is recognised by its error, not by text the remote
-			// host can put in a response body.
-			name:       "a probe answered 400 with a body naming the limiter is a dead verdict",
-			serve:      func(_ *testing.T, h *harness) { serveUnreachableOutbox(h, 1, false) },
-			deadStreak: true,
-			probeError: fmt.Errorf("ap: probe nodeinfo of %s: %w", unreachableHost, ap.HTTPError{
-				URL:        "https://x.example/.well-known/nodeinfo",
-				StatusCode: http.StatusBadRequest,
-				Method:     http.MethodGet,
-				Body:       "ap: rate limit wait for x.example: rate: Wait(n=1) would exceed context deadline",
-			}),
-			wantRows:    [][2]string{{"https://x.example/post/1", "Page"}},
-			wantStamped: true,
-		},
-		{
-			name:        "a probe refused by our own rate limiter gives no dead verdict",
-			serve:       func(_ *testing.T, h *harness) { serveUnreachableOutbox(h, 1, false) },
-			deadStreak:  true,
-			probe:       rateLimitedProbe,
 			wantRows:    [][2]string{},
 			wantStamped: false,
 		},
@@ -722,18 +682,9 @@ func TestBackfillDeadHostDefersSkippedItems(t *testing.T) {
 			h := newHarness(t)
 			h.subscribeTechnology()
 			tt.serve(t, h)
-			if tt.deadStreak {
-				seedDeadHostStreak(t, h, unreachableHost)
-			}
 			adjust := func(opts *BackfillOptions) {
 				if tt.failDefer {
 					opts.Deferred = failingDeferItems{DeferredBackfillItems: opts.Deferred}
-				}
-				if tt.probeError != nil {
-					opts.Prober = proberFunc(func(context.Context, string) error { return tt.probeError })
-				}
-				if tt.probe != nil {
-					opts.Prober = tt.probe
 				}
 			}
 			rig := newUnreachableRigWith(t, h,
@@ -742,24 +693,10 @@ func TestBackfillDeadHostDefersSkippedItems(t *testing.T) {
 
 			runErr := rig.run(t)
 
-			communityDID := h.communityDID(groupID)
-			want := []store.DeferredItem{}
-			for _, row := range tt.wantRows {
-				want = append(want, store.DeferredItem{
-					ObjectIRI:     row[0],
-					CommunityAPID: groupID,
-					CommunityDID:  communityDID,
-					Host:          unreachableHost,
-					ObjectType:    row[1],
-					Attempts:      0,
-					NextRetryAt:   firstRetry,
-					CreatedAt:     createdAt,
-				})
-			}
-			assert.Equal(t, want, deferredRows(t, h), "deferred rows after the walk")
+			assert.Equal(t, walkDeferredRows(h, unreachableHost, tt.wantRows...), deferredRows(t, h), "deferred rows after the walk")
 			if tt.wantStamped {
-				assert.NoError(t, runErr, "a walk whose only non-successes are dead-host skips succeeds")
-				assert.NotNil(t, h.lastBackfillAt(groupID), "a walk whose only non-successes are dead-host skips stamps last_backfill_at")
+				assert.NoError(t, runErr, "a walk whose only non-successes are deferred items succeeds")
+				assert.NotNil(t, h.lastBackfillAt(groupID), "a walk whose only non-successes are deferred items stamps last_backfill_at")
 			} else {
 				assert.Error(t, runErr, "the walk has a failed item")
 				assert.Nil(t, h.lastBackfillAt(groupID), "a walk with a failed item leaves last_backfill_at unset")
@@ -770,36 +707,6 @@ func TestBackfillDeadHostDefersSkippedItems(t *testing.T) {
 			}
 		})
 	}
-}
-
-// proberFunc is a HostProber answering with its function.
-type proberFunc func(ctx context.Context, host string) error
-
-func (f proberFunc) ProbeNodeInfo(ctx context.Context, host string) error { return f(ctx, host) }
-
-// refusingRoundTripper fails every request at the transport, refused.
-type refusingRoundTripper struct{}
-
-func (refusingRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
-	return nil, connectionRefused()
-}
-
-// rateLimitedProbe returns a real refusal of ap's per-host rate limiter: on a
-// client allowing one request per 10000 seconds, a first probe spends the
-// only token and a second, under a one-minute deadline, cannot wait for the
-// next one.
-func rateLimitedProbe(ctx context.Context, host string) error {
-	limited := ap.NewClient(ap.ClientOptions{
-		HTTPClient:            &http.Client{Transport: refusingRoundTripper{}},
-		AllowPrivateAddresses: true,
-		PerHostRPS:            0.0001,
-		PerHostBurst:          1,
-		MaxAttempts:           1,
-	})
-	_ = limited.ProbeNodeInfo(ctx, host)
-	short, cancel := context.WithTimeout(ctx, time.Minute)
-	defer cancel()
-	return limited.ProbeNodeInfo(short, host)
 }
 
 // TestBackfillCachedHitWithoutVerdictRecordsNothing: a cached unreachable-host
@@ -822,31 +729,6 @@ func TestBackfillCachedHitWithoutVerdictRecordsNothing(t *testing.T) {
 	rig.backfill.recordHostGone(ctx, cachedErr)
 
 	assert.Empty(t, rig.streaks.recordedHosts(), "a cache hit with no walk verdict records no streak")
-}
-
-// TestBackfillProbeCutShortByWalkIsNotDead: a nodeinfo probe that ends
-// because the walk's own ctx ended says nothing about the host, so a host
-// past the dead-host threshold is not judged dead on it.
-func TestBackfillProbeCutShortByWalkIsNotDead(t *testing.T) {
-	h := newHarness(t)
-	h.subscribeTechnology()
-	seedDeadHostStreak(t, h, unreachableHost)
-	ctx, cancel := context.WithCancel(withWalkHosts(ap.WithUnreachableHostCache(context.Background())))
-	defer cancel()
-	rig := newUnreachableRigWith(t, h,
-		map[string]error{unreachableHost: connectionRefused()}, nil,
-		func(opts *BackfillOptions) {
-			opts.Prober = proberFunc(func(probeCtx context.Context, _ string) error {
-				cancel()
-				return fmt.Errorf("ap: probe nodeinfo of %s: %w", unreachableHost, probeCtx.Err())
-			})
-		})
-	_, fetchErr := rig.backfill.fetcher.FetchObject(ctx, unreachablePageIRI(1))
-	require.True(t, errors.IsHostGone(fetchErr), "precondition: x.example is unreachable: %v", fetchErr)
-
-	dead := rig.backfill.recordHostGone(ctx, fetchErr)
-
-	assert.False(t, dead, "a probe cut short by the walk ending is no dead verdict")
 }
 
 // TestBackfillDeferNamesNoHost: a dead-host deferral whose cause names no

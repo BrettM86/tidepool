@@ -664,10 +664,10 @@ func hostGoneErr(iri, host string) error {
 // backfillNow is the backfill clock in the host-gone tests.
 var backfillNow = time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC)
 
-// seedDeadHostStreak gives host a host-gone streak that began 96h before
-// backfillNow (older than DeadHostAfter) and whose last failure was 24h
-// before it, so a failure at backfillNow continues it. The failures are 36h
-// apart: inside store.HostGoneStreakGap, so they form one streak.
+// seedDeadHostStreak gives host a long host-gone streak that began 96h
+// before backfillNow and whose last failure was 24h before it, so a failure
+// at backfillNow continues it. The failures are 36h apart: inside
+// store.HostGoneStreakGap, so they form one streak.
 func seedDeadHostStreak(t *testing.T, h *harness, host string) {
 	t.Helper()
 	ctx := context.Background()
@@ -677,36 +677,6 @@ func seedDeadHostStreak(t *testing.T, h *harness, host string) {
 		require.True(t, backfillNow.Add(-96*time.Hour).Equal(goneSince),
 			"seeded streak for %s starts 96h before the backfill clock, got %v", host, goneSince)
 	}
-}
-
-// TestBackfillSkipsHostGoneItem: an item whose origin host has been gone
-// (NXDOMAIN, or an off-host redirect to a parked page) for longer than
-// DeadHostAfter is skipped by backfill, so the walk completes and stamps
-// last_backfill_at instead of retrying forever.
-func TestBackfillSkipsHostGoneItem(t *testing.T) {
-	h := newHarness(t)
-	h.subscribeTechnology()
-	serveOutboxFixtures(t, h)
-	serveBrokenItemOutbox(t, h)
-	seedDeadHostStreak(t, h, "other.test")
-	opts := h.backfillOptions(h.mat, 100)
-	opts.Fetcher = hostGoneFetcher{BackfillFetcher: h.client, goneIRI: "https://other.test/post/broken"}
-	b, err := NewBackfill(opts)
-	require.NoError(t, err)
-	b.now = func() time.Time { return backfillNow }
-	ctx := context.Background()
-
-	community, err := h.communities.GetByAPGroupID(ctx, groupID)
-	require.NoError(t, err)
-	require.NoError(t, b.Run(ctx, community, true), "a host-gone item is a skip, not a run error")
-
-	_, err = h.objects.GetByAPID(ctx, pageID)
-	require.NoError(t, err, "the healthy item still materializes")
-
-	community, err = h.communities.GetByAPGroupID(ctx, groupID)
-	require.NoError(t, err)
-	require.NotNil(t, community.LastBackfillAt,
-		"a walk whose only failure is a host-gone skip must stamp last_backfill_at")
 }
 
 // actorHostGoneFetcher is the harness client except that FetchActor of
@@ -726,9 +696,9 @@ func (f actorHostGoneFetcher) FetchActor(ctx context.Context, iri string) (*ap.O
 }
 
 // TestBackfillSkipsHostGoneAuthor: an item whose post is reachable but whose
-// author's actor document lives on a host gone for longer than DeadHostAfter
-// is skipped by backfill, the same as a host-gone item, so the walk completes
-// and stamps last_backfill_at.
+// author's actor document lives on a host-gone host, with no prior streak, is
+// deferred under the author's host on the walk that meets it, the same as a
+// host-gone item, so the walk completes and stamps last_backfill_at.
 func TestBackfillSkipsHostGoneAuthor(t *testing.T) {
 	h := newHarness(t)
 	h.subscribeTechnology()
@@ -742,55 +712,24 @@ func TestBackfillSkipsHostGoneAuthor(t *testing.T) {
 	materializerOptions.Fetcher = actorHostGoneFetcher{Fetcher: h.client, goneActorIRI: goneAuthor}
 	materializer, err := materialize.New(materializerOptions)
 	require.NoError(t, err)
-	seedDeadHostStreak(t, h, "lemmy.world")
 	b := newBackfillOver(t, h, materializer, 100)
 	b.now = func() time.Time { return backfillNow }
 
 	community, err := h.communities.GetByAPGroupID(ctx, groupID)
 	require.NoError(t, err)
-	require.NoError(t, b.Run(ctx, community, true), "a host-gone author is a skip, not a run error")
+	require.NoError(t, b.Run(ctx, community, true), "a host-gone author is deferred, not a run error")
 
 	_, err = h.objects.GetByAPID(ctx, pageID)
 	require.NoError(t, err, "the healthy item still materializes")
 	_, err = h.objects.GetByAPID(ctx, secondPageID)
 	assert.True(t, errors.IsNotFound(err), "the post whose author's host is gone is not materialized")
+	assert.Equal(t, walkDeferredRows(h, "lemmy.world", [2]string{secondPageID, "Page"}), deferredRows(t, h),
+		"the post is deferred under its author's host, first due 1h after the walk")
 
 	community, err = h.communities.GetByAPGroupID(ctx, groupID)
 	require.NoError(t, err)
 	require.NotNil(t, community.LastBackfillAt,
-		"a walk whose only failure is a host-gone author must stamp last_backfill_at")
-}
-
-// TestBackfillHostGoneWithoutStreakIsAFailure: the first host-gone failure of
-// a host with no streak is an ordinary item failure, not a skip: the run
-// returns an error, last_backfill_at stays unset so the walk retries on the
-// backoff, and the host's streak starts at the backfill clock.
-func TestBackfillHostGoneWithoutStreakIsAFailure(t *testing.T) {
-	h := newHarness(t)
-	h.subscribeTechnology()
-	serveOutboxFixtures(t, h)
-	serveBrokenItemOutbox(t, h)
-	opts := h.backfillOptions(h.mat, 100)
-	opts.Fetcher = hostGoneFetcher{BackfillFetcher: h.client, goneIRI: "https://other.test/post/broken"}
-	b, err := NewBackfill(opts)
-	require.NoError(t, err)
-	b.now = func() time.Time { return backfillNow }
-	ctx := context.Background()
-
-	community, err := h.communities.GetByAPGroupID(ctx, groupID)
-	require.NoError(t, err)
-	require.Error(t, b.Run(ctx, community, true),
-		"a host that has not kept failing for DeadHostAfter is an item failure")
-
-	_, err = h.objects.GetByAPID(ctx, pageID)
-	require.NoError(t, err, "the healthy item still materializes")
-	require.Nil(t, h.lastBackfillAt(groupID),
-		"a host-gone failure inside DeadHostAfter must leave last_backfill_at unset")
-
-	goneSince, err := h.materializerOptions.Instances.RecordHostGone(ctx, "other.test", backfillNow.Add(time.Hour))
-	require.NoError(t, err)
-	assert.True(t, backfillNow.Equal(goneSince),
-		"the run started other.test's streak at the backfill clock: goneSince = %v, want %v", goneSince, backfillNow)
+		"a walk whose only failure is a deferred host-gone author must stamp last_backfill_at")
 }
 
 // TestBackfillFetchClearsHostGoneStreak: a successful fetch of an outbox item

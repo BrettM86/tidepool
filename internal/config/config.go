@@ -198,12 +198,13 @@ type Config struct {
 	// materializes (BACKFILL_MAX_POSTS, default 100).
 	BackfillMaxPosts int
 	// BackfillDeferredRetryInterval is how often the sweep retries backfill
-	// items skipped because their host was dead (BACKFILL_DEFERRED_RETRY_INTERVAL,
+	// items skipped because their host was unreachable (BACKFILL_DEFERRED_RETRY_INTERVAL,
 	// a Go duration, default 1h, must be positive). It runs once at startup
 	// too.
 	BackfillDeferredRetryInterval time.Duration
 	// BackfillDeferredRetryBatch bounds how many due deferred items one sweep
-	// retries (BACKFILL_DEFERRED_RETRY_BATCH, default 50, must be positive).
+	// retries (BACKFILL_DEFERRED_RETRY_BATCH, default 50, must be positive),
+	// at most store.MaxDueItemsPerHost of them per host.
 	BackfillDeferredRetryBatch int
 	// PLCWritesPerMinute is the pace of every PLC POST, mints and handle
 	// updates together (PLC_WRITES_PER_MINUTE, default 5, burst 1). Inbound

@@ -495,7 +495,8 @@ func run(logger *slog.Logger) error {
 
 	materializer, err := materialize.New(materialize.Options{
 		// Successful author and ancestor fetches (live or backfill) end the
-		// host's host-gone streak, so backfill never skips a revived host.
+		// host's host-gone streak, which makes its deferred backfill items due
+		// at the next sweep.
 		Fetcher:     ingest.NewHostHealthFetcher(apClient, instances, logger),
 		Objects:     objects,
 		Actors:      actors,

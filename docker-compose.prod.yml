@@ -121,6 +121,13 @@ services:
       # "Runbook: rotating BRIDGE_KEK".
       BRIDGE_KEK_PREVIOUS: ${BRIDGE_KEK_PREVIOUS:-}
       ADMIN_TOKEN: ${ADMIN_TOKEN}
+      # Coves instance labeler whose com.atproto.label.subscribeLabels stream
+      # the bridge follows (docs/CONFIGURATION.md). Its #atproto_label key and
+      # #atproto_labeler endpoint come from https://coves.social/.well-known/did.json;
+      # until that document lists them and the Coves AppView serves the stream,
+      # the consumer retries with backoff (capped at 5 minutes) and takes in
+      # no labels.
+      COVES_LABELER_DID: did:web:coves.social
       # PLC writes a minute, shared by mints and the rename job. Empty means
       # the built-in default of 5. Lower it to slow down during an incident.
       # The minimum is 1; 0 fails boot.

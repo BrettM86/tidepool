@@ -132,6 +132,10 @@ services:
       # the built-in default of 5. Lower it to slow down during an incident.
       # The minimum is 1; 0 fails boot.
       PLC_WRITES_PER_MINUTE: ${PLC_WRITES_PER_MINUTE:-}
+      # Deferred backfill items retried per hourly sweep (at most 20 per
+      # host). The default of 50 fell behind a 2.6k-row queue; a dead host
+      # still costs one request per sweep, whatever the batch.
+      BACKFILL_DEFERRED_RETRY_BATCH: "500"
       # Announced for WIDER-NETWORK visibility only (and quota-limited
       # there — see the relay service below). The app path into Coves is
       # the self-hosted relay + jetstream services in this file. The

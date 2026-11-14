@@ -590,12 +590,12 @@ func TestQueueOrdinaryFailuresStillPoisonAtTheCap(t *testing.T) {
 			qh.enqueue(t, "doomed-1", "community-a")
 			driveQueueUntil(t, q, qh.finished("doomed-1"))
 
-			assert.Equal(t, []int{1, 2, 3, 4, 5}, processor.attempts)
+			assert.Equal(t, []int{1, 2, 3}, processor.attempts)
 			stored, err := qh.events.GetEvent(context.Background(), "doomed-1")
 			require.NoError(t, err)
 			assert.NotNil(t, stored.FailedAt, "the event is poisoned at the cap")
 			assert.Nil(t, stored.ProcessedAt)
-			assert.Equal(t, 5, stored.Attempts)
+			assert.Equal(t, 3, stored.Attempts)
 		})
 	}
 }
@@ -634,7 +634,7 @@ func TestQueueParkDelayIsFixedWithJitter(t *testing.T) {
 		attempts int
 	}{
 		{name: "first attempt", attempts: 1},
-		{name: "at the attempt cap", attempts: 5},
+		{name: "at the attempt cap", attempts: 3},
 	}
 
 	for _, test := range tests {
@@ -668,24 +668,24 @@ func TestQueueParkDelayIsFixedWithJitter(t *testing.T) {
 	}
 }
 
-// TestQueueThrottleAtTheCapParksInsteadOfPoisoning: four real failures followed
-// by a refusal on the fifth claim, the one that would hit the attempt cap. The
+// TestQueueThrottleAtTheCapParksInsteadOfPoisoning: two real failures followed
+// by a refusal on the third claim, the one that would hit the attempt cap. The
 // refusal parks, so the throttled case must sit before the cap.
 func TestQueueThrottleAtTheCapParksInsteadOfPoisoning(t *testing.T) {
 	qh := newQueueHarness(t)
 	ctx := context.Background()
 	failure := stderrors.New("remote 503")
 	refusal := fmt.Errorf("mint actor: %w", ErrMintRateExceeded)
-	processor := &claimScriptedProcessor{results: []error{failure, failure, failure, failure, refusal}}
+	processor := &claimScriptedProcessor{results: []error{failure, failure, refusal}}
 	q := qh.newParkingQueue(t, processor, time.Millisecond)
 
 	qh.enqueue(t, "capped-1", "community-a")
-	driveQueueUntil(t, q, func() bool { return len(processor.attempts) == 5 })
-	require.Equal(t, []int{1, 2, 3, 4, 5}, processor.attempts, "the refusal lands on the fifth claim")
+	driveQueueUntil(t, q, func() bool { return len(processor.attempts) == 3 })
+	require.Equal(t, []int{1, 2, 3}, processor.attempts, "the refusal lands on the third claim")
 
 	stored, err := qh.events.GetEvent(ctx, "capped-1")
 	require.NoError(t, err)
-	assert.Equal(t, 4, stored.Attempts, "the park hands back the fifth claim")
+	assert.Equal(t, 2, stored.Attempts, "the park hands back the third claim")
 	assert.Nil(t, stored.FailedAt, "a refusal at the cap must not poison")
 
 	driveQueueUntil(t, q, qh.finished("capped-1"))

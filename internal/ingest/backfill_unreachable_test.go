@@ -41,13 +41,22 @@ type unreachableHostsTransport struct {
 
 func (rt *unreachableHostsTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	host := req.URL.Hostname()
-	if failure, ok := rt.failures[host]; ok && req.URL.Path != nodeInfoPath {
-		rt.mu.Lock()
+	rt.mu.Lock()
+	failure, ok := rt.failures[host]
+	if ok && req.URL.Path != nodeInfoPath {
 		rt.attempts[host]++
 		rt.mu.Unlock()
 		return nil, failure
 	}
+	rt.mu.Unlock()
 	return rewriteTransport{target: rt.target}.RoundTrip(req)
+}
+
+// heal makes host reachable again: its requests go to the fixture server.
+func (rt *unreachableHostsTransport) heal(host string) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	delete(rt.failures, host)
 }
 
 func (rt *unreachableHostsTransport) attemptsTo(host string) int {
@@ -133,9 +142,13 @@ func (s *countingHostGoneStreaks) recordedHosts() []string {
 type unreachableRig struct {
 	h         *harness
 	transport *unreachableHostsTransport
-	probes    *nodeInfoProbes
-	streaks   *countingHostGoneStreaks
-	backfill  *Backfill
+	// client and materializer are the rig's AP client over transport and the
+	// materializer over it, for a rig that also wires the dispatcher.
+	client       *ap.Client
+	materializer *materialize.Materializer
+	probes       *nodeInfoProbes
+	streaks      *countingHostGoneStreaks
+	backfill     *Backfill
 }
 
 func newUnreachableRig(t *testing.T, h *harness, failures map[string]error, answers map[string]probeAnswer) *unreachableRig {
@@ -147,6 +160,9 @@ func newUnreachableRig(t *testing.T, h *harness, failures map[string]error, answ
 // to the Backfill options last (to swap one dependency for a decorator).
 func newUnreachableRigWith(t *testing.T, h *harness, failures map[string]error, answers map[string]probeAnswer, adjust func(*BackfillOptions)) *unreachableRig {
 	t.Helper()
+	if failures == nil {
+		failures = map[string]error{}
+	}
 	transport := &unreachableHostsTransport{
 		target:   h.fixtures.Listener.Addr().String(),
 		failures: failures,
@@ -163,6 +179,7 @@ func newUnreachableRigWith(t *testing.T, h *harness, failures map[string]error, 
 	logger := slog.New(slog.NewTextHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	materializerOptions := h.materializerOptions
 	materializerOptions.Fetcher = NewHostHealthFetcher(client, h.materializerOptions.Instances, logger)
+	materializerOptions.NodeInfoClient = &http.Client{Transport: transport}
 	materializer, err := materialize.New(materializerOptions)
 	require.NoError(t, err)
 
@@ -179,11 +196,13 @@ func newUnreachableRigWith(t *testing.T, h *harness, failures map[string]error, 
 	require.NoError(t, err)
 	b.now = func() time.Time { return backfillNow }
 	return &unreachableRig{
-		h:         h,
-		transport: transport,
-		probes:    serveNodeInfoProbes(h, answers),
-		streaks:   streaks,
-		backfill:  b,
+		h:            h,
+		transport:    transport,
+		client:       client,
+		materializer: materializer,
+		probes:       serveNodeInfoProbes(h, answers),
+		streaks:      streaks,
+		backfill:     b,
 	}
 }
 

@@ -555,8 +555,9 @@ func guardedTransport(base http.RoundTripper, guard *egressGuard) http.RoundTrip
 //   - any other 2xx non-JSON page → NonJSONResponseError;
 //   - the IsHostGone cases apply to FetchObject, FetchActor and
 //     FetchCollection (its pages go through FetchObject) only, not to
-//     pinned-authority fetches or WebFinger. They are not IsNotFound. No live
-//     caller acts on them; backfill decides whether a gone host is a skip.
+//     pinned-authority fetches or WebFinger. They are not IsNotFound. Backfill
+//     decides whether a gone host is a skip, and the inbox queue defers the
+//     event's content;
 //     With WithUnreachableHostCache in ctx, connection-level verdicts are
 //     reused for the rest of the walk;
 //   - other non-2xx → HTTPError.

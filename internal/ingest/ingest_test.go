@@ -488,10 +488,18 @@ func (h *harness) useConcreteLinkPreviews() {
 		&http.Client{Transport: rewriteTransport{target: h.fixtures.Listener.Addr().String()}}, "tidepool-test/1.0")
 	materializer, err := materialize.New(h.materializerOptions)
 	require.NoError(h.t, err)
+	h.rebuildDispatch(materializer, h.client, QueueOptions{MaxAttempts: 3})
+}
+
+// rebuildDispatch rebuilds the dispatcher over materializer and fetcher, and
+// the queue drain() pumps over it with queueOptions (Events, Processor,
+// Workers, Lease and Logger are filled in). Call it before any delivery.
+func (h *harness) rebuildDispatch(materializer *materialize.Materializer, fetcher Fetcher, queueOptions QueueOptions) {
+	h.t.Helper()
 	h.mat = materializer
 	handler, err := NewHandler(HandlerOptions{
 		Materializer:   h.mat,
-		Fetcher:        h.client,
+		Fetcher:        fetcher,
 		Objects:        h.objects,
 		Actors:         h.actors,
 		Communities:    h.communities,
@@ -505,14 +513,12 @@ func (h *harness) useConcreteLinkPreviews() {
 	})
 	require.NoError(h.t, err)
 	h.handler = handler
-	queue, err := NewQueue(QueueOptions{
-		Events:      h.events,
-		Processor:   handler,
-		Workers:     1,
-		MaxAttempts: 3,
-		Lease:       time.Minute,
-		Logger:      slog.New(slog.NewTextHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
-	})
+	queueOptions.Events = h.events
+	queueOptions.Processor = handler
+	queueOptions.Workers = 1
+	queueOptions.Lease = time.Minute
+	queueOptions.Logger = slog.New(slog.NewTextHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	queue, err := NewQueue(queueOptions)
 	require.NoError(h.t, err)
 	h.queue = queue
 }

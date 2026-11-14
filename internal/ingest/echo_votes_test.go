@@ -47,8 +47,8 @@ const (
 )
 
 // withRealAggregator puts the production vote aggregator behind the harness's
-// recorder, wired with the same voter probe production uses.
-func withRealAggregator(t *testing.T, h *harness) {
+// recorder, wired with the same voter probe production uses, and returns it.
+func withRealAggregator(t *testing.T, h *harness) *votes.Aggregator {
 	t.Helper()
 	probe, err := echo.New(echo.Options{
 		Objects:         h.objects,
@@ -63,6 +63,7 @@ func withRealAggregator(t *testing.T, h *harness) {
 	h.votes.mu.Lock()
 	h.votes.delegate = aggregator
 	h.votes.mu.Unlock()
+	return aggregator
 }
 
 // mintPersona creates the native persona's ap_actors row and serves an actor

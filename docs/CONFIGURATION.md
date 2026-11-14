@@ -91,7 +91,7 @@ the whole zone, counted from Cloudflare's `created_on`. A pass also stops at
 |---|---|---|
 | `INGEST_WORKERS` | `4` | Inbox queue worker count. |
 | `BACKFILL_MAX_POSTS` | `100` | Posts materialized per community backfill run. |
-| `BACKFILL_DEFERRED_RETRY_INTERVAL` | `1h` | How often backfill retries items it skipped because their host was unreachable. Each item is retried 1h, 6h, 24h, 72h, 1 week, 2 weeks, 30 days and 90 days after its skip, and dropped after the 90-day attempt. A successful fetch from its host that ends the host's host-gone streak makes it due, so it runs at the next sweep. The sweep also runs at startup. |
+| `BACKFILL_DEFERRED_RETRY_INTERVAL` | `1h` | How often backfill retries items it skipped because their host was unreachable, and inbox posts and comments deferred out of the queue. Each item is retried 1h, 6h, 24h, 72h, 1 week, 2 weeks, 30 days and 90 days after its skip, and dropped after the 90-day attempt. A successful fetch from its host that ends the host's host-gone streak makes it due, so it runs at the next sweep. The sweep also runs at startup. |
 | `BACKFILL_DEFERRED_RETRY_BATCH` | `50` | Most deferred items retried per sweep, and at most 20 per host. The rest wait for the next one. |
 | `PLC_WRITES_PER_MINUTE` | `5` | PLC POSTs per minute, with a burst of 1, shared by DID mints and handle updates. Unseen authors in delivered content trigger mints, and PLC registrations are permanent. Any positive integer. See the note below. |
 | `SEED_COUNTS_FROM_API` | on | Seeds backfilled posts' vote counts from the community's host through Lemmy's public API. Uses `/api/v3/post` for posts on that host and anonymous `/api/v3/resolve_object` for posts from other instances. Never queries the post's own host. Set `0` to turn off. |
@@ -112,8 +112,12 @@ the whole zone, counted from Cloudflare's `created_on`. A pass also stops at
 included, shares one budget. Any PLC 429 pauses all writes for `Retry-After`,
 or for 1 hour if it is missing or invalid. The pause is not persisted across
 restarts. An inbox event refused a mint, or stopped by a PLC 429, waits about 2
-minutes and retries without using a retry attempt. Other failures still poison
-the event after 5 attempts. See [HANDLE_SCHEME.md](../HANDLE_SCHEME.md).
+minutes and retries without using a retry attempt. Every other failing event
+is retried and, after 3 attempts (down from 5), poisoned, except a community's
+Announce of a post or comment: that content is deferred to the backfill retry
+system, on its first failure when its host looks gone, else after its third. An
+announced post or comment whose host is up but answers its URL with a web page
+instead of ActivityPub is skipped. See [HANDLE_SCHEME.md](../HANDLE_SCHEME.md).
 
 ## Outbound federation
 

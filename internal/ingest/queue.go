@@ -17,7 +17,7 @@ import (
 // Queue defaults, overridable through QueueOptions.
 const (
 	defaultWorkers        = 4
-	defaultMaxAttempts    = 5
+	defaultMaxAttempts    = 3
 	defaultRetryBaseDelay = 30 * time.Second
 	defaultMaxRetryDelay  = time.Hour
 	defaultLease          = 2 * time.Minute
@@ -27,13 +27,22 @@ const (
 	// context detached from the worker's (see processNext) so a completed
 	// event is durably acked even as the pool is shutting down.
 	bookkeepingTimeout = 10 * time.Second
+	// defaultProbeTimeout bounds the deferrer's ObjectNotServed probe, which
+	// runs on its own context so a slow host cannot spend the bookkeeping
+	// context the outcome is then written on.
+	defaultProbeTimeout = 10 * time.Second
 )
 
 // Processor consumes one claimed inbox event. *Handler implements it.
 // Return contract: nil or IsSkip → processed; IsValidation → poisoned;
 // ErrMintRateExceeded or *identity.PLCRateLimitedError → parked for a fixed
-// delay and retried at no attempt cost, for as long as the throttling lasts;
-// anything else → retried with backoff until the attempt cap, then poisoned.
+// delay and retried at no attempt cost, for as long as the throttling lasts.
+// With a Deferrer, anything else that is host-gone is deferred out of the
+// queue on that attempt (processed), and an object its live host does not
+// serve is a skip. The rest is retried with backoff until the attempt cap,
+// then deferred when the deferrer takes it, else poisoned. A host-gone event
+// the deferrer refuses is retried like any other failure; one whose deferral
+// the deferrer fails to write is retried with backoff, even at the cap.
 type Processor interface {
 	Process(ctx context.Context, event *store.InboxEvent) error
 }
@@ -46,8 +55,8 @@ type QueueOptions struct {
 	// size: ClaimNext never hands out an event whose ordering key has an
 	// older pending sibling.
 	Workers int
-	// MaxAttempts poisons an event after this many failed claims
-	// (default 5).
+	// MaxAttempts defers or poisons an event after this many failed claims
+	// (default 3).
 	MaxAttempts int
 	// RetryBaseDelay is the first backoff step, doubling per attempt up to
 	// an hour (default 30s).
@@ -64,11 +73,33 @@ type QueueOptions struct {
 	// retries and missed nudges.
 	PollInterval time.Duration
 	Logger       *slog.Logger
+	// Deferrer moves a failing event out of the queue (nil = no deferral:
+	// failures retry until the cap, then poison).
+	Deferrer EventDeferrer
+}
+
+// EventDeferrer moves a failing inbox event out of its community's queue so
+// one dead or broken origin does not stall the events behind it. *Backfill
+// implements it. Only announced content is deferrable: a vote, delete or undo
+// that depends on deferred content is not, and can be poisoned at the
+// attempt cap while that content waits for its retry (accepted in
+// docs/PRD_INBOX_DEFER.md).
+type EventDeferrer interface {
+	// DeferEvent keeps event's content for a later retry outside the queue.
+	// deferred is false when the event is not deferrable; it is true also
+	// when the content already had a deferred row, which the deferral
+	// refreshes. An error means the deferral was not written.
+	DeferEvent(ctx context.Context, event *store.InboxEvent, cause error) (deferred bool, err error)
+	// ObjectNotServed reports whether cause is a fetch of event's own
+	// content that its host, still up, does not serve as ActivityPub. It
+	// probes the host over the network, bounded by ctx.
+	ObjectNotServed(ctx context.Context, event *store.InboxEvent, cause error) bool
 }
 
 // Queue is the durable ingestion work loop: a worker pool draining
 // inbox_events (the postgres-backed queue — no external broker), with
-// per-community serial ordering, retry with backoff, and poison handling.
+// per-community serial ordering, retry with backoff, deferral of failing
+// content out of the queue (with a Deferrer), and poison handling.
 type Queue struct {
 	events         store.InboxEvents
 	processor      Processor
@@ -79,6 +110,10 @@ type Queue struct {
 	parkDelay      time.Duration
 	pollInterval   time.Duration
 	logger         *slog.Logger
+	deferrer       EventDeferrer
+	// probeTimeout bounds ObjectNotServed's probe (default 10s); a test
+	// seam.
+	probeTimeout time.Duration
 
 	nudge chan struct{}
 	// now is a test seam for retry and park scheduling.
@@ -107,6 +142,8 @@ func NewQueue(opts QueueOptions) (*Queue, error) {
 		parkDelay:      opts.ParkDelay,
 		pollInterval:   opts.PollInterval,
 		logger:         logger,
+		deferrer:       opts.Deferrer,
+		probeTimeout:   defaultProbeTimeout,
 		nudge:          make(chan struct{}, 1),
 		now:            time.Now,
 	}
@@ -221,23 +258,24 @@ func (q *Queue) processNext(ctx context.Context) bool {
 
 	// Record the outcome on a context detached from the worker's, so an
 	// event that just completed is durably acked even though shutdown has
-	// cancelled ctx. Bounded so a stuck DB cannot hang shutdown forever.
-	bookCtx, bookCancel := context.WithTimeout(context.WithoutCancel(ctx), bookkeepingTimeout)
-	defer bookCancel()
+	// cancelled ctx. Each write gets its own bounded context (bookkeeping), so
+	// a stuck DB cannot hang shutdown forever and a slow step before a write
+	// cannot spend that write's time.
+	detached := context.WithoutCancel(ctx)
 
 	switch {
 	case err == nil:
-		q.finish(bookCtx, event, token)
+		q.finish(detached, event, token)
 	case materialize.IsSkip(err):
 		// Deliberate drops: log the reason, mark processed, never retry.
 		q.logger.Info("inbox event skipped",
 			"activity_id", event.ActivityID, "type", event.Type, "reason", err.Error())
-		q.finish(bookCtx, event, token)
+		q.finish(detached, event, token)
 	case errors.IsValidation(err):
 		// Malformed payloads never get better; poison immediately.
 		q.logger.Warn("inbox event poisoned (invalid payload)",
 			"activity_id", event.ActivityID, "type", event.Type, "error", err)
-		q.poison(bookCtx, event, token, err.Error())
+		q.poison(detached, event, token, err.Error())
 	case isThrottled(err):
 		// Throttling says nothing about the event, so it waits without
 		// spending an attempt. This case sits above the attempt cap so a
@@ -247,33 +285,125 @@ func (q *Queue) processNext(ctx context.Context) bool {
 		q.logger.Info("inbox event throttled; parking",
 			"activity_id", event.ActivityID, "type", event.Type,
 			"attempt", event.Attempts, "retry_in", delay, "error", err)
+		bookCtx, bookCancel := bookkeeping(detached)
 		applied, rerr := q.events.ReleaseParked(bookCtx, event.ActivityID, err.Error(), q.now().Add(delay), token)
+		bookCancel()
 		if rerr != nil {
 			q.logger.Error("park inbox event", "activity_id", event.ActivityID, "error", rerr)
 		} else if !applied {
 			q.logger.Warn("stale claim; park discarded", "activity_id", event.ActivityID)
 		}
-	case event.Attempts >= q.maxAttempts:
-		q.logger.Error("inbox event poisoned (attempt cap reached)",
-			"activity_id", event.ActivityID, "type", event.Type,
-			"attempts", event.Attempts, "error", err)
-		q.poison(bookCtx, event, token, err.Error())
 	default:
-		delay := q.backoff(event.Attempts)
-		q.logger.Warn("inbox event failed; scheduling retry",
-			"activity_id", event.ActivityID, "type", event.Type,
-			"attempt", event.Attempts, "retry_in", delay, "error", err)
-		applied, rerr := q.events.Release(bookCtx, event.ActivityID, err.Error(), q.now().Add(delay), token)
-		if rerr != nil {
-			q.logger.Error("release inbox event", "activity_id", event.ActivityID, "error", rerr)
-		} else if !applied {
-			q.logger.Warn("stale claim; retry release discarded", "activity_id", event.ActivityID)
-		}
+		q.handleFailure(detached, event, token, err)
 	}
 	return true
 }
 
-func (q *Queue) finish(ctx context.Context, event *store.InboxEvent, token time.Time) {
+// handleFailure records the outcome of a failed attempt that is not a skip,
+// invalid or throttled. With a deferrer, a host-gone failure is deferred on
+// this attempt, and a fetch of the event's content its live host does not
+// serve is a skip. Otherwise the event is retried with backoff until the
+// attempt cap, where it is deferred when the deferrer takes it, else
+// poisoned. A refused host-gone deferral falls through to the cases below:
+// retry, or poison at the cap. A deferral the deferrer accepted but could
+// not write is retried with backoff even at the cap, so deferrable content
+// is not poisoned for a failed write.
+func (q *Queue) handleFailure(detached context.Context, event *store.InboxEvent, token time.Time, err error) {
+	deferralTried, deferralWriteFailed := false, false
+	if q.deferrer != nil {
+		if errors.IsHostGone(err) {
+			// A dead origin will not answer within the backoff, so the event
+			// leaves the queue on its first failure instead of blocking its
+			// community's later events.
+			deferralTried = true
+			deferred, writeErr := q.deferEvent(detached, event, err)
+			if deferred {
+				q.finish(detached, event, token)
+				return
+			}
+			deferralWriteFailed = writeErr != nil
+		}
+		if q.objectNotServed(detached, event, err) {
+			q.logger.Info("inbox event skipped",
+				"activity_id", event.ActivityID, "type", event.Type, "reason", "object_not_served", "error", err)
+			q.finish(detached, event, token)
+			return
+		}
+	}
+	if event.Attempts >= q.maxAttempts {
+		if !deferralTried {
+			deferred, writeErr := q.deferEvent(detached, event, err)
+			if deferred {
+				q.finish(detached, event, token)
+				return
+			}
+			deferralWriteFailed = writeErr != nil
+		}
+		if !deferralWriteFailed {
+			q.logger.Error("inbox event poisoned (attempt cap reached)",
+				"activity_id", event.ActivityID, "type", event.Type,
+				"attempts", event.Attempts, "error", err)
+			q.poison(detached, event, token, err.Error())
+			return
+		}
+	}
+	delay := q.backoff(event.Attempts)
+	q.logger.Warn("inbox event failed; scheduling retry",
+		"activity_id", event.ActivityID, "type", event.Type,
+		"attempt", event.Attempts, "retry_in", delay, "error", err)
+	bookCtx, bookCancel := bookkeeping(detached)
+	defer bookCancel()
+	applied, rerr := q.events.Release(bookCtx, event.ActivityID, err.Error(), q.now().Add(delay), token)
+	if rerr != nil {
+		q.logger.Error("release inbox event", "activity_id", event.ActivityID, "error", rerr)
+	} else if !applied {
+		q.logger.Warn("stale claim; retry release discarded", "activity_id", event.ActivityID)
+	}
+}
+
+// bookkeeping is the bounded context one outcome write runs on, derived from
+// the detached worker context.
+func bookkeeping(detached context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(detached, bookkeepingTimeout)
+}
+
+// objectNotServed asks the deferrer whether err is a fetch of event's
+// content its live host does not serve, on a context bounded by the probe
+// timeout.
+func (q *Queue) objectNotServed(detached context.Context, event *store.InboxEvent, err error) bool {
+	probeCtx, cancel := context.WithTimeout(detached, q.probeTimeout)
+	defer cancel()
+	return q.deferrer.ObjectNotServed(probeCtx, event, err)
+}
+
+// deferEvent hands a failing event to the deferrer. deferred reports that
+// the deferral was written (and so the event can be marked processed);
+// (false, nil) is a refusal: the event is not deferrable. An error is a
+// deferral the deferrer could not write, logged here; the caller keeps the
+// event in the queue.
+func (q *Queue) deferEvent(detached context.Context, event *store.InboxEvent, cause error) (deferred bool, err error) {
+	if q.deferrer == nil {
+		return false, nil
+	}
+	ctx, cancel := bookkeeping(detached)
+	defer cancel()
+	deferred, err = q.deferrer.DeferEvent(ctx, event, cause)
+	if err != nil {
+		q.logger.Error("defer inbox event",
+			"activity_id", event.ActivityID, "type", event.Type, "cause", cause, "error", err)
+		return false, err
+	}
+	if deferred {
+		q.logger.Warn("inbox event deferred",
+			"activity_id", event.ActivityID, "type", event.Type,
+			"attempt", event.Attempts, "error", cause)
+	}
+	return deferred, nil
+}
+
+func (q *Queue) finish(detached context.Context, event *store.InboxEvent, token time.Time) {
+	ctx, cancel := bookkeeping(detached)
+	defer cancel()
 	applied, err := q.events.MarkProcessed(ctx, event.ActivityID, token)
 	if err != nil {
 		q.logger.Error("mark inbox event processed", "activity_id", event.ActivityID, "error", err)
@@ -284,7 +414,9 @@ func (q *Queue) finish(ctx context.Context, event *store.InboxEvent, token time.
 	}
 }
 
-func (q *Queue) poison(ctx context.Context, event *store.InboxEvent, token time.Time, message string) {
+func (q *Queue) poison(detached context.Context, event *store.InboxEvent, token time.Time, message string) {
+	ctx, cancel := bookkeeping(detached)
+	defer cancel()
 	applied, err := q.events.MarkPoisoned(ctx, event.ActivityID, message, token)
 	if err != nil {
 		q.logger.Error("poison inbox event", "activity_id", event.ActivityID, "error", err)

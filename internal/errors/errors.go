@@ -140,8 +140,10 @@ func IsBlobWithheld(err error) bool { return errors.Is(err, ErrBlobWithheld) }
 // IsNotFound is false for it. Backfill skips the object and defers it for
 // RetryDeferred once the failure is recorded into the host's streak (an
 // unrecorded one is an ordinary failure); redirect_to_root, parked_redirect
-// and too_many_redirects concern only the URL fetched, not the whole host. No live
-// caller acts on host-gone.
+// and too_many_redirects concern only the URL fetched, not the whole host. The
+// inbox queue differs: it defers a host-gone inbox event's announced content
+// on its first failure, for any host-gone reason, without recording the
+// failure into the host's streak.
 var ErrHostGone = errors.New("host gone")
 
 // IsHostGone reports whether err is, wraps, or unwraps to ErrHostGone.

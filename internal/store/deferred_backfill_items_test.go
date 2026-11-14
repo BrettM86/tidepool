@@ -90,14 +90,14 @@ func TestDeferredBackfillItems(t *testing.T) {
 		"the same object in another community is its own row")
 	assert.Empty(t, rig.dueItems(t, at(1, 9), 10), "nothing is due before the earliest next_retry_at")
 
-	require.NoError(t, rig.items.RescheduleItem(ctx, first.ObjectIRI, deferredCommunity, 1, at(8, 0)))
+	require.NoError(t, rig.items.RescheduleItem(ctx, first, 1, at(8, 0)))
 	rescheduled := first
 	rescheduled.Attempts = 1
 	rescheduled.NextRetryAt = at(8, 0)
 	assert.Equal(t, []DeferredItem{earlier, otherCommunity, rescheduled}, rig.dueItems(t, at(30, 0), 10),
 		"RescheduleItem updates attempts and next_retry_at of that row only")
 
-	require.NoError(t, rig.items.DeleteItem(ctx, first.ObjectIRI, deferredCommunity))
+	require.NoError(t, rig.items.DeleteItem(ctx, first))
 	assert.Equal(t, []DeferredItem{earlier, otherCommunity}, rig.dueItems(t, at(30, 0), 10),
 		"DeleteItem removes that row only")
 }
@@ -204,4 +204,77 @@ func TestDeferredBackfillItems_ListDueItemsPerHostCap(t *testing.T) {
 	}, rig.dueItems(t, minute(59), 100), "a.example's earliest 20 and b.example's 3, in due order")
 	assert.Equal(t, []DeferredItem{technology(12), b(1, 0), gaming(11), technology(11), gaming(10)},
 		rig.dueItems(t, minute(59), 5), "the limit cuts the merged list")
+}
+
+// sweepMutations is the store's sweep-side mutations keyed by the swept item
+// itself, so each is conditioned on the created_at the sweep read: a refresh
+// (DeferInboxItem) gives the row a new created_at, its generation.
+type sweepMutations interface {
+	RescheduleItem(ctx context.Context, item DeferredItem, attempts int, nextRetryAt time.Time) error
+	DeleteItem(ctx context.Context, item DeferredItem) error
+	DeleteLandedItem(ctx context.Context, item DeferredItem, contentIRI string) error
+}
+
+// TestDeferredBackfillItems_StaleSweepMutationKeepsRefreshedRow (G1): a
+// sweep lists a due row, an inbox deferral refreshes it (new created_at,
+// attempts 0), and the sweep then applies its mutation with the item it
+// read. The stale mutation succeeds without touching the refreshed row: it
+// keeps the refresh's created_at, attempts 0 and next_retry_at.
+func TestDeferredBackfillItems_StaleSweepMutationKeepsRefreshedRow(t *testing.T) {
+	at := func(day, hour int) time.Time { return time.Date(2026, 11, day, hour, 0, 0, 0, time.UTC) }
+	original := DeferredItem{
+		ObjectIRI: "https://x.example/post/90", CommunityAPID: deferredCommunity, CommunityDID: deferredCommunityDID,
+		Host: "x.example", ObjectType: "Page", Attempts: 3, CreatedAt: at(1, 0), NextRetryAt: at(4, 0),
+	}
+	refresh := original
+	refresh.Attempts = 0
+	refresh.CreatedAt = at(4, 1)
+	refresh.NextRetryAt = at(4, 2)
+	// The refresh keeps the earlier of the two schedules: the row's 11-04 00:00.
+	wantRefreshed := DeferredItem{
+		ObjectIRI: "https://x.example/post/90", CommunityAPID: deferredCommunity, CommunityDID: deferredCommunityDID,
+		Host: "x.example", ObjectType: "Page", Attempts: 0, CreatedAt: at(4, 1), NextRetryAt: at(4, 0),
+	}
+	tests := []struct {
+		name  string
+		apply func(ctx context.Context, items sweepMutations, stale DeferredItem) error
+	}{
+		{
+			name: "a stale DeleteItem",
+			apply: func(ctx context.Context, items sweepMutations, stale DeferredItem) error {
+				return items.DeleteItem(ctx, stale)
+			},
+		},
+		{
+			name: "a stale DeleteLandedItem",
+			apply: func(ctx context.Context, items sweepMutations, stale DeferredItem) error {
+				return items.DeleteLandedItem(ctx, stale, stale.ObjectIRI)
+			},
+		},
+		{
+			name: "a stale RescheduleItem",
+			apply: func(ctx context.Context, items sweepMutations, stale DeferredItem) error {
+				return items.RescheduleItem(ctx, stale, 4, at(5, 0))
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rig := deferredTestDB(t)
+			ctx := context.Background()
+			require.NoError(t, rig.items.DeferItem(ctx, original))
+			swept := rig.dueItems(t, at(4, 0), 10)
+			require.Equal(t, []DeferredItem{original}, swept, "precondition: the sweep reads the original row")
+			require.NoError(t, rig.items.DeferInboxItem(ctx, refresh))
+			require.Equal(t, []DeferredItem{wantRefreshed}, rig.dueItems(t, at(30, 0), 10),
+				"precondition: the inbox deferral refreshed the row")
+
+			items, ok := any(rig.items).(sweepMutations)
+			require.True(t, ok, "the sweep mutations take the swept item, so they can be conditioned on its created_at")
+			assert.NoError(t, tt.apply(ctx, items, swept[0]), "a stale sweep mutation is not an error")
+
+			assert.Equal(t, []DeferredItem{wantRefreshed}, rig.dueItems(t, at(30, 0), 10),
+				"the refreshed row keeps its new created_at, attempts 0 and next_retry_at")
+		})
+	}
 }

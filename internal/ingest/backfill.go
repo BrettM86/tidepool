@@ -637,7 +637,7 @@ func (b *Backfill) materializeResolved(ctx context.Context, obj *ap.Object, comm
 		if removed, err := b.removeIfDeletedDuringMaterialize(ctx, obj.ID, communityIRI); err != nil {
 			return false, repliesOutcome{}, err
 		} else if removed {
-			return false, repliesOutcome{}, skip(obj.ID, "object was deleted upstream during the walk")
+			return false, repliesOutcome{}, deletedSkip(obj.ID, "object was deleted upstream during the walk")
 		}
 		// A community's host is trusted only for its own posts' counts.
 		// MaterializePost is bound to the walked community, so a post it
@@ -666,7 +666,7 @@ func (b *Backfill) materializeResolved(ctx context.Context, obj *ap.Object, comm
 			return false, repliesOutcome{}, err
 		}
 		if removed {
-			return false, repliesOutcome{}, skip(obj.ID, "object was deleted upstream during the walk")
+			return false, repliesOutcome{}, deletedSkip(obj.ID, "object was deleted upstream during the walk")
 		}
 		return true, repliesOutcome{}, nil
 	default:
@@ -1243,7 +1243,7 @@ func (b *Backfill) fetchFromOrigin(ctx context.Context, obj *ap.Object) (*ap.Obj
 	switch {
 	case err == nil:
 	case errors.IsTombstoned(err):
-		return nil, skip(obj.ID, "object is tombstoned upstream")
+		return nil, deletedSkip(obj.ID, "object is tombstoned upstream")
 	case errors.IsNotFound(err):
 		return nil, skip(obj.ID, "object is unavailable upstream")
 	case isLemmyNotFoundFor(obj.Type, err):
@@ -1280,6 +1280,16 @@ var ErrReplyHostGone = stderrors.New("origin host gone, not skipped")
 // redirect, a DNS failure other than NXDOMAIN, a read reset.
 var errOriginFailure = stderrors.New("origin fetch failed")
 
+// errDeletedUpstream is the cause of a skip of an object deleted upstream: a
+// local tombstone, an upstream Tombstone, or a delete that landed while the
+// object materialized.
+var errDeletedUpstream = stderrors.New("object deleted upstream")
+
+// deletedSkip is a skip of apID, deleted upstream.
+func deletedSkip(apID, reason string) error {
+	return &materialize.SkipError{APID: apID, Reason: reason, Cause: errDeletedUpstream}
+}
+
 // deferredRetrySteps are the retries of a deferred item, measured from its
 // first skip: 1h, 6h, 24h, 72h, 1 week, 2 weeks, 30 days and 90 days.
 var deferredRetrySteps = []time.Duration{
@@ -1305,9 +1315,24 @@ func (b *Backfill) deferDeadHostItem(ctx context.Context, obj *ap.Object, commun
 	if !ok {
 		return fmt.Errorf("ingest: defer %s in %s: its dead-host cause names no host: %w", obj.ID, communityIRI, cause)
 	}
+	if err := b.deferItem(ctx, obj, communityIRI, communityDID, host); err != nil {
+		return fmt.Errorf("ingest: defer %s skipped on dead host %s: %w", obj.ID, host, err)
+	}
+	return nil
+}
+
+// deferItem writes obj's deferred row in the community, on host, with its
+// first retry 1h out.
+func (b *Backfill) deferItem(ctx context.Context, obj *ap.Object, communityIRI, communityDID, host string) error {
+	return b.deferred.DeferItem(ctx, b.newDeferredItem(obj, communityIRI, communityDID, host))
+}
+
+// newDeferredItem is obj's deferred row in the community, on host, created
+// now with its first retry 1h out.
+func (b *Backfill) newDeferredItem(obj *ap.Object, communityIRI, communityDID, host string) store.DeferredItem {
 	createdAt := b.now()
 	nextRetryAt, _ := deferredRetryAt(createdAt, createdAt)
-	err := b.deferred.DeferItem(ctx, store.DeferredItem{
+	return store.DeferredItem{
 		ObjectIRI:     obj.ID,
 		CommunityAPID: communityIRI,
 		CommunityDID:  communityDID,
@@ -1315,11 +1340,105 @@ func (b *Backfill) deferDeadHostItem(ctx context.Context, obj *ap.Object, commun
 		ObjectType:    obj.Type,
 		NextRetryAt:   nextRetryAt,
 		CreatedAt:     createdAt,
-	})
-	if err != nil {
-		return fmt.Errorf("ingest: defer %s skipped on dead host %s: %w", obj.ID, host, err)
 	}
-	return nil
+}
+
+// DeferEvent keeps a failing inbox event's content as a deferred item for
+// RetryDeferred, in the community that signed the event (event.ActorID, the
+// community the handler materializes into). The host is the dead host cause
+// names (an ancestor's, when an ancestor failed), else the content IRI's.
+// Only an Announce of content is deferrable: of a Create or Update of a Page,
+// Article or Note (typed or a bare IRI), of the content itself, or of a bare
+// IRI (which may name an activity; RetryDeferred unwraps a Create or Update).
+// Votes, deletes, undos and other activities, an unparseable payload, and an
+// event from a community the bridge does not have or has not minted, are not
+// deferrable: (false, nil). A deferral of content that already has a row in
+// the community refreshes that row (store DeferInboxItem) and reports true.
+// An error means the row was not written.
+func (b *Backfill) DeferEvent(ctx context.Context, event *store.InboxEvent, cause error) (bool, error) {
+	activity, err := ap.ParseObject(event.Payload)
+	if err != nil {
+		b.logger.Info("inbox event not deferred",
+			"activity_id", event.ActivityID, "type", event.Type, "reason", "unparseable", "error", err)
+		return false, nil
+	}
+	content := announcedContent(activity)
+	if content == nil {
+		return false, nil
+	}
+	refuse := func(reason string) (bool, error) {
+		b.logger.Info("inbox event not deferred",
+			"activity_id", event.ActivityID, "object", content.ID, "community", event.ActorID, "reason", reason)
+		return false, nil
+	}
+	community, err := b.communities.GetByAPGroupID(ctx, event.ActorID)
+	switch {
+	case errors.IsNotFound(err):
+		return refuse("community_unknown")
+	case err != nil:
+		return false, fmt.Errorf("ingest: read community %s: %w", event.ActorID, err)
+	}
+	if community.DID == "" {
+		return refuse("community_unminted")
+	}
+	host, ok := errors.HostGoneHost(cause)
+	if !ok {
+		if host, ok = ap.HostKey(content.ID); !ok {
+			return refuse("no_host")
+		}
+	}
+	item := b.newDeferredItem(content, community.APGroupID, community.DID, host)
+	if err := b.deferred.DeferInboxItem(ctx, item); err != nil {
+		return false, fmt.Errorf("ingest: defer inbox event %s content %s: %w", event.ActivityID, content.ID, err)
+	}
+	return true, nil
+}
+
+// announcedContent is the content an Announce carries, as DeferEvent defers
+// it: the object of an announced Create or Update of content, the announced
+// content, or the announced bare IRI. nil when activity carries none.
+func announcedContent(activity *ap.Object) *ap.Object {
+	if activity.Type != ap.TypeAnnounce || activity.Object == nil {
+		return nil
+	}
+	content := activity.Object
+	if content.Type == ap.TypeCreate || content.Type == ap.TypeUpdate {
+		content = content.Object
+		if content == nil {
+			return nil
+		}
+	}
+	switch content.Type {
+	case "", ap.TypePage, ap.TypeArticle, ap.TypeNote:
+	default:
+		return nil
+	}
+	if content.ID == "" {
+		return nil
+	}
+	return content
+}
+
+// ObjectNotServed reports whether cause is a fetch of event's own content
+// whose host answered the content URL with a non-JSON page while still
+// answering its nodeinfo probe (objectNotServed). Only an event DeferEvent
+// would take (an Announce of content) qualifies, and only when the page
+// answered the content IRI itself, not its author, community or an ancestor:
+// a vote, delete or undo whose verification fetch got a page is not skipped.
+func (b *Backfill) ObjectNotServed(ctx context.Context, event *store.InboxEvent, cause error) bool {
+	var nonJSON ap.NonJSONResponseError
+	if !stderrors.As(cause, &nonJSON) {
+		return false
+	}
+	activity, err := ap.ParseObject(event.Payload)
+	if err != nil {
+		return false
+	}
+	content := announcedContent(activity)
+	if content == nil || nonJSON.URL != content.ID {
+		return false
+	}
+	return b.objectNotServed(ctx, nonJSON.URL, cause)
 }
 
 // RetryDeferred runs one sweep of the deferred items that are due, at most
@@ -1332,7 +1451,9 @@ func (b *Backfill) deferDeadHostItem(ctx context.Context, obj *ap.Object, commun
 // rescheduled unfetched, and replies on it are deferred unfetched. An item
 // with no retry step left is still fetched. Its mints wait on the PLC
 // budget. Each item is fetched from its origin again and materialized like an
-// outbox item. A landed item, or one its origin no longer has, is deleted; a host
+// outbox item; a fetched Create or Update stands for the content it carries,
+// fetched from its own URL. A landed item, or one its origin no longer has,
+// is deleted (an inbox row's landed content is marked community-announced); a host
 // failure counts an attempt and reschedules it, or drops it once the 90-day
 // retry has run; an item of a removed community, or of one the bridge no
 // longer follows (follow state none), is dropped unfetched. An item of a
@@ -1371,7 +1492,7 @@ func (b *Backfill) RetryDeferred(ctx context.Context, limit int) error {
 			// have cleared that host's streak, which pulls this row's
 			// schedule to its created_at. The failure was not the host's, so the row
 			// keeps the schedule it had (still due for the next sweep).
-			if err := b.deferred.RescheduleItem(ctx, item.ObjectIRI, item.CommunityAPID, item.Attempts, item.NextRetryAt); err != nil {
+			if err := b.deferred.RescheduleItem(ctx, item, item.Attempts, item.NextRetryAt); err != nil {
 				b.logger.Warn("backfill deferred item schedule restore failed",
 					"object", item.ObjectIRI, "community", item.CommunityAPID, "error", err)
 			}
@@ -1414,15 +1535,29 @@ func (b *Backfill) retryDeferredItem(ctx context.Context, item store.DeferredIte
 				fmt.Errorf("ingest: origin host %s already failed host-gone in this sweep", item.Host))
 		}
 	}
-	err = b.materializeDeferredItem(ctx, item, community)
+	landed, err := b.materializeDeferredItem(ctx, item, community)
+	if err != nil && landed != "" {
+		// The content landed but its replies did not: an inbox row's
+		// content is announced now, though the row stays for the replies.
+		if markErr := b.deferred.MarkInboxContentAnnounced(ctx, item, landed); markErr != nil {
+			return fmt.Errorf("ingest: mark landed deferred inbox content announced: %w", markErr)
+		}
+	}
 	hostGone := errors.IsHostGone(err)
 	if host, ok := errors.HostGoneHost(err); ok && hostGone && hostLevelHostGone(err) {
 		hosts.setVerdict(host, true)
 	}
 	switch {
 	case err == nil:
+		if err := b.deferred.DeleteLandedItem(ctx, item, landed); err != nil {
+			return fmt.Errorf("ingest: delete landed deferred item: %w", err)
+		}
 		b.logger.Info("backfill deferred item landed",
-			"object", item.ObjectIRI, "community", item.CommunityAPID, "attempts", item.Attempts+1)
+			"object", item.ObjectIRI, "content", landed, "community", item.CommunityAPID, "attempts", item.Attempts+1)
+		return nil
+	case !hostGone && stderrors.Is(err, errDeletedUpstream):
+		b.logger.Warn("backfill deferred item skipped: deleted upstream",
+			"object", item.ObjectIRI, "community", item.CommunityAPID, "reason", err.Error())
 	case !hostGone && materialize.IsSkip(err):
 		b.logger.Info("backfill deferred item skipped",
 			"object", item.ObjectIRI, "community", item.CommunityAPID, "reason", err.Error())
@@ -1431,7 +1566,7 @@ func (b *Backfill) retryDeferredItem(ctx context.Context, item store.DeferredIte
 	default:
 		return err
 	}
-	if err := b.deferred.DeleteItem(ctx, item.ObjectIRI, item.CommunityAPID); err != nil {
+	if err := b.deferred.DeleteItem(ctx, item); err != nil {
 		return fmt.Errorf("ingest: delete deferred item: %w", err)
 	}
 	return nil
@@ -1442,39 +1577,92 @@ func (b *Backfill) retryDeferredItem(ctx context.Context, item store.DeferredIte
 // item path, after the tombstone check and the echo check on the stored id
 // (a tombstoned item, or our own content, is a skip with no fetch). A fetch
 // failure the origin caused that is neither a skip nor host-gone is marked
-// errOriginFailure. A post that lands while its replies collection fails
-// host-gone returns that failure, so its row is rescheduled, not deleted.
-func (b *Backfill) materializeDeferredItem(ctx context.Context, item store.DeferredItem, community *store.Community) error {
+// errOriginFailure. A fetched Create or Update activity (a deferred bare-IRI
+// Announce of one) stands for the content it carries; any other activity is
+// a skip. landed is the IRI of the content that landed. A post that lands
+// while its replies collection fails host-gone returns its IRI with that
+// failure, so its row is rescheduled, not deleted.
+func (b *Backfill) materializeDeferredItem(ctx context.Context, item store.DeferredItem, community *store.Community) (landed string, err error) {
 	tombstoned, err := b.tombstones.ExistsFor(ctx, item.ObjectIRI, community.APGroupID)
 	if err != nil {
-		return fmt.Errorf("ingest: tombstone check for %s: %w", item.ObjectIRI, err)
+		return "", fmt.Errorf("ingest: tombstone check for %s: %w", item.ObjectIRI, err)
 	}
 	if tombstoned {
-		return skip(item.ObjectIRI, "object was deleted upstream")
+		return "", deletedSkip(item.ObjectIRI, "object was deleted upstream")
 	}
 	stored := &ap.Object{ID: item.ObjectIRI, Type: item.ObjectType}
 	if ours, err := b.suppressEcho(ctx, stored); err != nil {
-		return err
+		return "", err
 	} else if ours {
-		return skip(item.ObjectIRI, "deferred item is our own federated content")
+		return "", skip(item.ObjectIRI, "deferred item is our own federated content")
 	}
 	obj, err := b.fetchFromOrigin(ctx, stored)
 	if err != nil {
-		if !errors.IsHostGone(err) && !materialize.IsSkip(err) && !isLocalFetchError(ctx, err) {
-			return fmt.Errorf("%w: %w", errOriginFailure, err)
-		}
-		return err
+		return "", markOriginFailure(ctx, err)
 	}
 	if ours, err := b.suppressEcho(ctx, obj); err != nil {
-		return err
+		return "", err
 	} else if ours {
-		return skip(obj.ID, "deferred item is our own federated content")
+		return "", skip(obj.ID, "deferred item is our own federated content")
+	}
+	switch {
+	case obj.Type == ap.TypeCreate || obj.Type == ap.TypeUpdate:
+		// A deferred bare-IRI Announce may name the activity: its content is
+		// the object it carries, fetched and checked like an outbox item's.
+		if obj, err = b.resolveDeferredActivity(ctx, obj, community.APGroupID); err != nil {
+			return "", err
+		}
+	case obj.Actor != nil:
+		b.logger.Error("backfill deferred item is an activity that carries no content",
+			"object", obj.ID, "type", obj.Type, "community", community.APGroupID,
+			"reason", "deferred_activity_not_content")
+		return "", skip(obj.ID, "deferred activity "+obj.Type+" is not content")
 	}
 	_, replies, err := b.materializeResolved(ctx, obj, community.APGroupID, community.DID)
 	if err == nil && replies.collectionGone != nil {
 		// The post landed, but its replies are still unwalked: the row is
 		// the post's, so the retry is rescheduled as a host-gone failure.
-		return replies.collectionGone
+		return obj.ID, replies.collectionGone
+	}
+	if err != nil {
+		return "", err
+	}
+	return obj.ID, nil
+}
+
+// resolveDeferredActivity resolves the content a fetched Create or Update
+// activity carries: its tombstone check, a fetch of the content's current
+// state from its own URL (never the snapshot the activity embeds; an object
+// the origin no longer has is a skip), and the echo check.
+func (b *Backfill) resolveDeferredActivity(ctx context.Context, activity *ap.Object, communityIRI string) (*ap.Object, error) {
+	inner := activity.Object
+	if inner == nil || inner.ID == "" {
+		return nil, skip(activity.ID, "deferred activity carries no object")
+	}
+	tombstoned, err := b.tombstones.ExistsFor(ctx, inner.ID, communityIRI)
+	if err != nil {
+		return nil, fmt.Errorf("ingest: tombstone check for %s: %w", inner.ID, err)
+	}
+	if tombstoned {
+		return nil, deletedSkip(inner.ID, "object was deleted upstream")
+	}
+	obj, err := b.fetchFromOrigin(ctx, inner)
+	if err != nil {
+		return nil, markOriginFailure(ctx, err)
+	}
+	if ours, err := b.suppressEcho(ctx, obj); err != nil {
+		return nil, fmt.Errorf("ingest: echo check for %s: %w", obj.ID, err)
+	} else if ours {
+		return nil, skip(obj.ID, "deferred item is our own federated content")
+	}
+	return obj, nil
+}
+
+// markOriginFailure marks a deferred item's origin fetch failure that is
+// neither host-gone, a skip, nor local as errOriginFailure.
+func markOriginFailure(ctx context.Context, err error) error {
+	if !errors.IsHostGone(err) && !materialize.IsSkip(err) && !isLocalFetchError(ctx, err) {
+		return fmt.Errorf("%w: %w", errOriginFailure, err)
 	}
 	return err
 }
@@ -1497,7 +1685,7 @@ func (b *Backfill) rescheduleDeferredItem(ctx context.Context, item store.Deferr
 		return b.dropDeferredItem(ctx, item, deferredDropRetriesExhausted, cause)
 	}
 	attempts := item.Attempts + 1
-	if err := b.deferred.RescheduleItem(ctx, item.ObjectIRI, item.CommunityAPID, attempts, nextRetryAt); err != nil {
+	if err := b.deferred.RescheduleItem(ctx, item, attempts, nextRetryAt); err != nil {
 		return fmt.Errorf("ingest: reschedule deferred item: %w", err)
 	}
 	b.logger.Info("backfill deferred item rescheduled",
@@ -1517,7 +1705,7 @@ func (b *Backfill) deferPendingCommunityItem(ctx context.Context, item store.Def
 	if !ok {
 		return b.dropDeferredItem(ctx, item, deferredDropRetriesExhausted, nil)
 	}
-	if err := b.deferred.RescheduleItem(ctx, item.ObjectIRI, item.CommunityAPID, item.Attempts, nextRetryAt); err != nil {
+	if err := b.deferred.RescheduleItem(ctx, item, item.Attempts, nextRetryAt); err != nil {
 		return fmt.Errorf("ingest: reschedule deferred item of pending community: %w", err)
 	}
 	b.logger.Info("backfill deferred item kept for a pending follow",
@@ -1530,7 +1718,7 @@ func (b *Backfill) deferPendingCommunityItem(ctx context.Context, item store.Def
 // final cause (nil when the item was dropped unfetched). The logged host is
 // the one cause names, or the row's when it names none.
 func (b *Backfill) dropDeferredItem(ctx context.Context, item store.DeferredItem, reason string, cause error) error {
-	if err := b.deferred.DeleteItem(ctx, item.ObjectIRI, item.CommunityAPID); err != nil {
+	if err := b.deferred.DeleteItem(ctx, item); err != nil {
 		return fmt.Errorf("ingest: delete deferred item: %w", err)
 	}
 	host := item.Host

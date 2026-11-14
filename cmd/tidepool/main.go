@@ -681,6 +681,9 @@ func run(logger *slog.Logger) error {
 		Processor: handler,
 		Workers:   cfg.IngestWorkers,
 		Logger:    logger,
+		// A failing event whose content is on a dead or broken origin moves
+		// to the backfill's deferred items instead of stalling its community.
+		Deferrer: backfill,
 	})
 	if err != nil {
 		return err

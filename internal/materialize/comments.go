@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"tidepool/internal/ap"
+	"tidepool/internal/apobject"
 	"tidepool/internal/echo"
 	"tidepool/internal/errors"
 	"tidepool/internal/store"
@@ -415,7 +416,8 @@ func (m *Materializer) commitCommentLeaf(ctx context.Context, note *ap.Object, d
 // comment. parent comes straight from the mapping; root is the parent
 // itself when the parent is a post, otherwise the parent comment's own
 // stored reply.root (every materialized comment carries it, so one record
-// read resolves the thread root without walking AP again).
+// read resolves the thread root without walking AP again). A native parent
+// comment has no record here; nativeCommentRoot resolves its root instead.
 //
 // It also returns the community the thread belongs to, taken from the
 // PARENT's mapping. A comment record has nowhere to state its community, so
@@ -456,6 +458,15 @@ func (m *Materializer) resolveReplyRefs(ctx context.Context, note *ap.Object) (m
 		return reply, communityDID, nil
 	}
 
+	if parentMapping.Origin == store.OriginBridge {
+		root, err := m.nativeCommentRoot(ctx, note, parentMapping)
+		if err != nil {
+			return nil, "", err
+		}
+		reply["root"] = root
+		return reply, communityDID, nil
+	}
+
 	// Parent is a comment: reuse its stored reply.root.
 	parentRecord, _, err := m.repos.GetRecord(ctx, parentMapping.DID, parentMapping.Collection, parentMapping.RKey)
 	if err != nil {
@@ -467,6 +478,66 @@ func (m *Materializer) resolveReplyRefs(ctx context.Context, note *ap.Object) (m
 	}
 	reply["root"] = root
 	return reply, communityDID, nil
+}
+
+// nativeCommentRoot is the thread root for a reply to a NATIVE comment. Its
+// record lives in the author's PDS, not in a repo this bridge hosts, so the
+// root comes from the bridge's own outbound snapshot of it — the rootAtUri
+// the consumer resolved from bridge state — rather than from the author-
+// supplied reply.root on the native record. The root's CID is the one its
+// ap_objects mapping names.
+//
+// A bridge-origin mapping and its outbound row are written in one transaction
+// and the row is never deleted, so a missing row is a broken invariant and an
+// error. Everything else that leaves no usable root is a skip, because no
+// retry can change it: a snapshot with no rootAtUri (the consumer records ""
+// when the thread walk dead-ends), a root that is not a post (pre-026 threads
+// recorded a comment as their top), or a root deleted since — for a native
+// post that is its tombstoned outbound row, as its mapping stays live. A
+// native root with no outbound row is read as not deleted.
+func (m *Materializer) nativeCommentRoot(ctx context.Context, note *ap.Object, parentMapping *store.APObjectMapping) (map[string]any, error) {
+	if m.outbound == nil {
+		return nil, fmt.Errorf("materialize: reply to native comment %s needs outbound state, which is not wired", parentMapping.ATURI)
+	}
+	state, err := m.outbound.GetByATURI(ctx, parentMapping.ATURI)
+	if err != nil {
+		return nil, fmt.Errorf("materialize: read outbound state for %s: %w", parentMapping.ATURI, err)
+	}
+	if state.IsTombstoned() {
+		return nil, skip(note.ID, fmt.Sprintf("parent %s is tombstoned", parentMapping.ATURI))
+	}
+	snapshot, err := apobject.ParseSnapshot(state.TranslatedSnapshot)
+	if err != nil {
+		return nil, fmt.Errorf("materialize: parse outbound snapshot for %s: %w", parentMapping.ATURI, err)
+	}
+	rootURI, _ := snapshot["rootAtUri"].(string)
+	if rootURI == "" {
+		return nil, skip(note.ID, fmt.Sprintf("native parent comment %s has no recorded thread root", parentMapping.ATURI))
+	}
+	root, err := m.objects.GetByATURI(ctx, rootURI)
+	switch {
+	case err == nil:
+	case errors.IsNotFound(err):
+		return nil, skip(note.ID, fmt.Sprintf("thread root %s is not materialized", rootURI))
+	default:
+		return nil, fmt.Errorf("materialize: load thread root mapping %s: %w", rootURI, err)
+	}
+	if root.Collection != CollectionPost && root.Collection != CollectionPostV2 {
+		return nil, skip(note.ID, fmt.Sprintf("thread root %s is not a post", rootURI))
+	}
+	if root.IsDeleted() {
+		return nil, skip(note.ID, fmt.Sprintf("thread root %s is tombstoned", rootURI))
+	}
+	if root.Origin == store.OriginBridge {
+		rootState, err := m.outbound.GetByATURI(ctx, rootURI)
+		if err != nil && !errors.IsNotFound(err) {
+			return nil, fmt.Errorf("materialize: read outbound state for thread root %s: %w", rootURI, err)
+		}
+		if rootState != nil && rootState.IsTombstoned() {
+			return nil, skip(note.ID, fmt.Sprintf("thread root %s is tombstoned", rootURI))
+		}
+	}
+	return strongRef(root.ATURI, root.CID), nil
 }
 
 // extractStrongRef digs a {uri, cid} pair out of a decoded record.

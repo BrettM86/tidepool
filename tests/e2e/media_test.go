@@ -4,7 +4,9 @@ package e2e
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"image"
 	"image/color"
 	"image/png"
@@ -193,5 +195,43 @@ func TestImagePost_EmbedImagesAndNSFWLabel(t *testing.T) {
 		// re-encode; the dimension + size + mime assertions above are the
 		// load-bearing ones.
 		t.Logf("stored blob bytes differ from the upload (%d vs %d bytes) — pictrs transformed the image", len(data), len(pngBytes))
+	}
+}
+
+// TestImagePost_BlobBytesInObjectStore pins the s3 byte store
+// (docker-compose.e2e.yml sets BLOB_STORE=s3): the bridged image's blobs row
+// exists and holds NULL bytes, so the bytes went to the bucket. getBlob alone
+// cannot tell, because a row holding its bytes is served from Postgres.
+func TestImagePost_BlobBytesInObjectStore(t *testing.T) {
+	h := newHarness(t)
+	community, _ := setupSubscribedCommunity(t, h, "imgs3")
+	user := h.registerUser(t, h.uniqueName(t, "oscar"))
+	imageURL := user.uploadImage(t, "e2e.png", makeTestPNG(t))
+
+	listener := h.newListener(t, cursorNow(), colPostV2)
+	title := "Object store image post " + h.suffix
+	user.createImagePost(t, community.ID, title, imageURL, "e2e object store gradient", false)
+	event := listener.await("image post create", func(e *jsEvent) bool {
+		got, _ := fieldOf(e.Commit.Record, "title")
+		return e.Commit.Collection == colPostV2 &&
+			e.Commit.Operation == opCreate && got == title
+	})
+	blobCID := stringAt(t, decodeRecord(t, event.Commit.Record), "embed", "images", "0", "image", "ref", "$link")
+	if blobCID == "" {
+		t.Fatal("embed image blob ref.$link is empty")
+	}
+
+	database := openTidepoolDB(t)
+	var bytesAreNull bool
+	err := database.QueryRowContext(t.Context(),
+		`SELECT bytes IS NULL FROM blobs WHERE did = $1 AND cid = $2`, event.Did, blobCID).Scan(&bytesAreNull)
+	if errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("no blobs row for (%s, %s)", event.Did, blobCID)
+	}
+	if err != nil {
+		t.Fatalf("query blobs row: %v", err)
+	}
+	if !bytesAreNull {
+		t.Errorf("blobs row (%s, %s) holds its bytes in Postgres, want NULL bytes with BLOB_STORE=s3", event.Did, blobCID)
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"tidepool/internal/blobstore"
 	"tidepool/internal/blobwithhold"
 	"tidepool/internal/materialize"
 	"tidepool/internal/repo"
@@ -159,7 +160,7 @@ func TestTheRemovalWithholdBackfillWithholdsEveryHostedRemovedSubjectOnce(t *tes
 	assert.Zero(t, dryRun.AlreadyWithheld)
 	assert.Equal(t, 1, dryRun.SkippedUnhosted, "the native subject is skipped and counted")
 	for _, c := range allCIDs {
-		state, err := blobwithhold.NewStore(h.db).Inspect(ctx, c)
+		state, err := blobwithhold.NewStore(h.db, blobstore.NewPostgres(h.db)).Inspect(ctx, c)
 		require.NoError(t, err)
 		assert.Empty(t, state.Withholds, "a dry run writes no withhold row for %s", c)
 		assertBlobServed(t, h, ubUserDID, c, "a dry run withholds nothing")

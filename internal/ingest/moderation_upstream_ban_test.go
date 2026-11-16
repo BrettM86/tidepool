@@ -83,7 +83,12 @@ type upstreamBanWorld struct {
 
 func newUpstreamBanWorld(t *testing.T) *upstreamBanWorld {
 	t.Helper()
-	h := newHarness(t)
+	return newUpstreamBanWorldOn(t, newHarness(t))
+}
+
+// newUpstreamBanWorldOn is newUpstreamBanWorld over the harness h.
+func newUpstreamBanWorldOn(t *testing.T, h *harness) *upstreamBanWorld {
+	t.Helper()
 	world := &upstreamBanWorld{h: h}
 	world.communityC = h.subscribeTechnology()
 	world.communityD = h.subscribeCommunityURL(ubCommunityDGroupID, ubCommunityDName)

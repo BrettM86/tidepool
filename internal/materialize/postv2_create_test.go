@@ -32,22 +32,17 @@ const (
 // bytes → same CID → same row). These bytes appear in exactly one blob.
 var embedImageBytes = []byte("postv2-flip-embed-image-bytes-not-a-real-png")
 
-// blobHolders returns every repo DID holding a blob with exactly these bytes.
-// Deliberately a direct read of the blobs table rather than a walk of the
+// blobHolders returns every repo DID holding a blob with exactly these bytes,
+// in the Postgres column or (bucket non-nil) in the bucket's object.
+// Deliberately a direct read of the stored bytes rather than a walk of the
 // record: WHERE the blob was stored is the behavior under test, and it must be
 // observable independently of where the record ended up.
-func blobHolders(t *testing.T, data []byte) []string {
+func blobHolders(t *testing.T, bucket *testutil.S3Bucket, data []byte) []string {
 	t.Helper()
-	rows, err := testutil.DB(t).Query(`SELECT did FROM blobs WHERE bytes = $1 ORDER BY did`, data)
-	require.NoError(t, err)
-	defer func() { _ = rows.Close() }()
 	var dids []string
-	for rows.Next() {
-		var did string
-		require.NoError(t, rows.Scan(&did))
-		dids = append(dids, did)
+	for _, stored := range testutil.BlobsHoldingBytes(t, testutil.DB(t), bucket, data) {
+		dids = append(dids, stored.DID)
 	}
-	require.NoError(t, rows.Err())
 	return dids
 }
 
@@ -60,36 +55,41 @@ func blobHolders(t *testing.T, data []byte) []string {
 // while the community pays to host them. The fetch DID therefore has to
 // follow the record's repo rather than the community the post names.
 func TestPostV2EmbedBlobsLandInAuthorRepo(t *testing.T) {
-	h := newHarness(t)
-	h.serveLemmyWorldFixtures()
-	h.mux.HandleFunc("GET /media/postv2-embed.png", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "image/png")
-		_, _ = w.Write(embedImageBytes)
-	})
-	ctx := context.Background()
+	for _, mode := range blobModes() {
+		t.Run(mode.name, func(t *testing.T) {
+			repoOptions, bucket, _ := mode.setUp(t)
+			h := newHarnessWithRepoOptions(t, repoOptions)
+			h.serveLemmyWorldFixtures()
+			h.mux.HandleFunc("GET /media/postv2-embed.png", func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "image/png")
+				_, _ = w.Write(embedImageBytes)
+			})
+			ctx := context.Background()
 
-	imagePost := page(imagePageID, personID, groupID, "an image post", "2026-07-08T10:00:00.000000Z")
-	imagePost["attachment"] = []any{map[string]any{
-		"type":      "Image",
-		"href":      embedImageURL,
-		"mediaType": "image/png",
-		"name":      "a picture",
-	}}
+			imagePost := page(imagePageID, personID, groupID, "an image post", "2026-07-08T10:00:00.000000Z")
+			imagePost["attachment"] = []any{map[string]any{
+				"type":      "Image",
+				"href":      embedImageURL,
+				"mediaType": "image/png",
+				"name":      "a picture",
+			}}
 
-	_, err := h.m.MaterializePost(ctx, mustObject(t, imagePost), groupID)
-	require.NoError(t, err)
+			_, err := h.m.MaterializePost(ctx, mustObject(t, imagePost), groupID)
+			require.NoError(t, err)
 
-	communityDID := testDIDFor("technology", "lemmy.world")
-	authorDID := testDIDFor("LeftLeaningFreedomFighters", "lemmy.world")
+			communityDID := testDIDFor("technology", "lemmy.world")
+			authorDID := testDIDFor("LeftLeaningFreedomFighters", "lemmy.world")
 
-	holders := blobHolders(t, embedImageBytes)
-	require.NotEmpty(t, holders, "the embed image must have been fetched and stored as a blob")
-	assert.Contains(t, holders, authorDID,
-		"the embed blob must be stored under the AUTHOR's DID — a blob ref resolves against the "+
-			"repo its record lives in, and postv2 lives in the author's repo")
-	assert.NotContains(t, holders, communityDID,
-		"the community must NOT hold bytes for a record it does not carry")
-	assert.Len(t, holders, 1, "the embed image is stored exactly once, got holders %v", holders)
+			holders := blobHolders(t, bucket, embedImageBytes)
+			require.NotEmpty(t, holders, "the embed image must have been fetched and stored as a blob")
+			assert.Contains(t, holders, authorDID,
+				"the embed blob must be stored under the AUTHOR's DID — a blob ref resolves against the "+
+					"repo its record lives in, and postv2 lives in the author's repo")
+			assert.NotContains(t, holders, communityDID,
+				"the community must NOT hold bytes for a record it does not carry")
+			assert.Len(t, holders, 1, "the embed image is stored exactly once, got holders %v", holders)
+		})
+	}
 }
 
 // pageAttributedToInline builds a Page whose attributedTo is an INLINE actor

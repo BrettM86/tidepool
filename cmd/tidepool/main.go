@@ -26,6 +26,7 @@ import (
 	"tidepool/internal/accept"
 	"tidepool/internal/acceptrec"
 	"tidepool/internal/ap"
+	"tidepool/internal/blobstore"
 	"tidepool/internal/blobwithhold"
 	"tidepool/internal/config"
 	"tidepool/internal/consume"
@@ -107,8 +108,16 @@ func dispatch(logger *slog.Logger, args []string) error {
 		return runMigrations(logger)
 	case len(args) == 1 && args[0] == "rotate-kek":
 		return runRotateKEK(logger)
+	case args[0] == "migrate-blobs":
+		concurrency, err := parseMigrateBlobsArgs(args[1:])
+		if err != nil {
+			return err
+		}
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return runMigrateBlobs(ctx, logger, concurrency, nil)
 	default:
-		return fmt.Errorf("usage: tidepool [migrate|rotate-kek]")
+		return fmt.Errorf("usage: tidepool [migrate|rotate-kek|migrate-blobs [--concurrency N]]")
 	}
 }
 
@@ -283,6 +292,30 @@ func run(logger *slog.Logger) error {
 		}
 	}
 
+	// A database that holds bytes in the object store, or bucket deletes
+	// still queued, cannot run in postgres mode: stop before anything binds.
+	if cfg.BlobStore == "postgres" {
+		if err := blobstore.CheckPostgresMode(ctx, database); err != nil {
+			var modeErr *blobstore.ModeError
+			if errors.As(err, &modeErr) {
+				logger.Error("blob store mode refused", "code", modeErr.Code, "count", modeErr.Count)
+			}
+			return err
+		}
+	}
+
+	// One byte store serves the repo Manager and the blob withhold store. In
+	// s3 mode opening it checks the bucket; the error names the endpoint
+	// host and bucket, never the raw endpoint or the secret access key.
+	blobStore, s3Store, err := openBlobStore(ctx, database, cfg, logger, nil)
+	if err != nil {
+		logger.Error("blob store unavailable at startup", "error", err)
+		return err
+	}
+	if s3Store != nil {
+		go s3Store.Run(ctx)
+	}
+
 	router := chi.NewRouter()
 	router.Use(middleware.RequestID)
 	router.Use(middleware.Recoverer)
@@ -338,7 +371,7 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 	repoManager, err := repo.NewManager(database, identity.NewActorKeys(actors, custodian), logger,
-		repo.WithTreeCacheSize(cfg.MSTCacheSize))
+		repo.WithTreeCacheSize(cfg.MSTCacheSize), repo.WithBlobStore(blobStore))
 	if err != nil {
 		return err
 	}
@@ -775,7 +808,7 @@ func run(logger *slog.Logger) error {
 	// Blob withholds are served whether or not the consumer runs: the
 	// operator must be able to withhold and delete bytes at any time.
 	blobAdmin, err := blobwithhold.NewAdmin(blobwithhold.AdminOptions{
-		Token: cfg.AdminToken, Store: blobwithhold.NewStore(database), Logger: logger,
+		Token: cfg.AdminToken, Store: blobwithhold.NewStore(database, blobStore), Logger: logger,
 	})
 	if err != nil {
 		return err

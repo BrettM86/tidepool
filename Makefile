@@ -1,7 +1,7 @@
 GOLANGCI_LINT_VERSION := v2.15.0
 GOLANGCI_LINT := go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 
-.PHONY: help build run test test-db-up test-db-down db-migrate db-migrate-down dev-up dev-down plc-up plc-down jetstream-up jetstream-down lint fmt fmt-check clean e2e e2e-up e2e-test e2e-logs e2e-down check-lexicons
+.PHONY: help build run test test-db-up test-db-down test-s3-up test-s3-down db-migrate db-migrate-down dev-up dev-down plc-up plc-down jetstream-up jetstream-down lint fmt fmt-check clean e2e e2e-up e2e-test e2e-logs e2e-down check-lexicons
 
 .DEFAULT_GOAL := help
 
@@ -16,6 +16,15 @@ E2E_COMPOSE := docker compose -f docker-compose.e2e.yml
 
 DEV_DATABASE_URL ?= postgres://tidepool:tidepool@localhost:5442/tidepool_dev?sslmode=disable
 TEST_DATABASE_URL ?= postgres://tidepool_test:tidepool_test@localhost:5443/tidepool_test?sslmode=disable
+
+# Test MinIO (docker-compose.dev.yml minio-test). The fixed project name makes
+# every checkout, main or a worktree, start and stop the same container.
+TEST_S3_COMPOSE := docker compose -p tidepool-test-s3 -f docker-compose.dev.yml --profile test-s3
+TEST_S3_ENDPOINT := http://127.0.0.1:9010
+TEST_S3_ENV := TIDEPOOL_TEST_S3_ENDPOINT="$(TEST_S3_ENDPOINT)" \
+	TIDEPOOL_TEST_S3_ACCESS_KEY_ID=tidepool_test \
+	TIDEPOOL_TEST_S3_SECRET_ACCESS_KEY=tidepool_test_secret \
+	TIDEPOOL_TEST_S3_REGION=us-east-1
 
 ##@ General
 
@@ -91,9 +100,26 @@ test-db-down: ## Stop the test database
 	@$(COMPOSE) --profile test stop postgres-test
 	@echo "$(GREEN)✓ Test database stopped$(RESET)"
 
-test: test-db-up ## Run the test suite against real postgres (migrations run in-process)
+test-s3-up: ## Start the test MinIO (S3 API on 127.0.0.1:9010)
+	@echo "$(GREEN)Starting test MinIO...$(RESET)"
+	@$(TEST_S3_COMPOSE) up -d minio-test
+	@for i in $$(seq 1 30); do \
+		if curl -fs -o /dev/null "$(TEST_S3_ENDPOINT)/minio/health/live"; then \
+			echo "$(GREEN)✓ MinIO (test) on $(TEST_S3_ENDPOINT)$(RESET)"; exit 0; \
+		fi; \
+		sleep 1; \
+	done; \
+	echo "$(RED)✗ test MinIO did not answer on $(TEST_S3_ENDPOINT) within 30s$(RESET)" >&2; \
+	$(TEST_S3_COMPOSE) logs --tail=50 minio-test >&2 || true; \
+	exit 1
+
+test-s3-down: ## Stop the test MinIO
+	@$(TEST_S3_COMPOSE) down
+	@echo "$(GREEN)✓ Test MinIO stopped$(RESET)"
+
+test: test-db-up test-s3-up ## Run the test suite against real postgres and MinIO (migrations run in-process)
 	@echo "$(GREEN)Running tests (store tests migrate the test database themselves)...$(RESET)"
-	@TIDEPOOL_TEST_DATABASE_URL="$(TEST_DATABASE_URL)" go test -tags nodynamic ./...
+	@TIDEPOOL_TEST_DATABASE_URL="$(TEST_DATABASE_URL)" $(TEST_S3_ENV) go test -tags nodynamic ./...
 	@echo "$(GREEN)✓ Tests complete$(RESET)"
 
 ##@ End-to-end (real Lemmy + PLC + Jetstream)

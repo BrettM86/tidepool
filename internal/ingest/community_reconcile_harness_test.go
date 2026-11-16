@@ -13,6 +13,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"tidepool/internal/blobstore"
 	"tidepool/internal/blobwithhold"
 	"tidepool/internal/materialize"
 	"tidepool/internal/store"
@@ -213,7 +214,7 @@ func (w *reconcileWorld) backdateFirstAttempt(age time.Duration) {
 // withholdRowCount counts every blob_withholds row of cidStr, lifted or not.
 func withholdRowCount(t *testing.T, h *harness, cidStr string) int {
 	t.Helper()
-	state, err := blobwithhold.NewStore(h.db).Inspect(context.Background(), cidStr)
+	state, err := blobwithhold.NewStore(h.db, blobstore.NewPostgres(h.db)).Inspect(context.Background(), cidStr)
 	require.NoError(t, err)
 	return len(state.Withholds)
 }

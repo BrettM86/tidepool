@@ -16,6 +16,7 @@ require (
 	github.com/ipld/go-car v0.6.3
 	github.com/lib/pq v1.12.3
 	github.com/miekg/dns v1.1.73
+	github.com/minio/minio-go/v7 v7.4.1
 	github.com/multiformats/go-multihash v0.2.3
 	github.com/pressly/goose/v3 v3.29.0
 	github.com/rivo/uniseg v0.4.7
@@ -34,6 +35,7 @@ require (
 	github.com/RussellLuo/slidingwindow v0.0.0-20200528002341-535bb99d338b // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	github.com/dustin/go-humanize v1.1.0 // indirect
 	github.com/earthboundkid/versioninfo/v2 v2.24.1 // indirect
 	github.com/ebitengine/purego v0.10.1 // indirect
 	github.com/gammazero/chanqueue v1.1.2 // indirect
@@ -60,9 +62,13 @@ require (
 	github.com/ipld/go-ipld-prime v0.24.0 // indirect
 	github.com/jinzhu/inflection v1.0.0 // indirect
 	github.com/jinzhu/now v1.1.5 // indirect
+	github.com/klauspost/compress v1.20.1 // indirect
 	github.com/klauspost/cpuid/v2 v2.4.0 // indirect
+	github.com/klauspost/crc32 v1.3.0 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/mfridman/interpolate v0.0.2 // indirect
+	github.com/minio/crc64nvme v1.1.1 // indirect
+	github.com/minio/md5-simd v1.1.2 // indirect
 	github.com/minio/sha256-simd v1.0.1 // indirect
 	github.com/mr-tron/base58 v1.3.0 // indirect
 	github.com/multiformats/go-base32 v0.1.0 // indirect
@@ -72,15 +78,19 @@ require (
 	github.com/multiformats/go-varint v0.1.0 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/opentracing/opentracing-go v1.2.0 // indirect
+	github.com/philhofer/fwd v1.2.0 // indirect
 	github.com/polydawn/refmt v0.90.0 // indirect
 	github.com/prometheus/client_golang v1.23.2 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.67.5 // indirect
 	github.com/prometheus/procfs v0.22.0 // indirect
+	github.com/rs/xid v1.6.0 // indirect
 	github.com/sethvargo/go-retry v0.5.0 // indirect
 	github.com/spaolacci/murmur3 v1.1.0 // indirect
 	github.com/tetratelabs/wazero v1.12.0 // indirect
+	github.com/tinylib/msgp v1.6.4 // indirect
 	github.com/whyrusleeping/cbor-gen v0.3.1 // indirect
+	github.com/zeebo/xxh3 v1.1.0 // indirect
 	gitlab.com/yawning/secp256k1-voi v0.0.0-20230925100816-f2616030848b // indirect
 	gitlab.com/yawning/tuplehash v0.0.0-20230713102510-df83abbf9a02 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
@@ -97,6 +107,7 @@ require (
 	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/xerrors v0.0.0-20240903120638-7835f813f4da // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
+	gopkg.in/ini.v1 v1.67.3 // indirect
 	gorm.io/gorm v1.31.2 // indirect
 	lukechampine.com/blake3 v1.4.1 // indirect
 )

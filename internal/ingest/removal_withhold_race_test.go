@@ -106,11 +106,9 @@ func commitInOrder(t *testing.T, h *harness, first, second func(context.Context)
 // bytes.
 func storedCIDOfSeed(t *testing.T, h *harness, seed string) string {
 	t.Helper()
-	var found string
-	require.NoError(t, h.db.QueryRowContext(context.Background(),
-		`SELECT cid FROM blobs WHERE did = $1 AND bytes = $2`, ubUserDID, rwImageBytes(seed)).Scan(&found),
-		"%s's bytes are stored under U", seed)
-	return found
+	cids := storedCIDsOfBytes(t, h, ubUserDID, rwImageBytes(seed))
+	require.NotEmpty(t, cids, "%s's bytes are stored under U", seed)
+	return cids[0]
 }
 
 // editedPageObject serves postID's edit carrying one image per seed and returns
@@ -156,31 +154,35 @@ func activeRemovalRowsOf(t *testing.T, h *harness, subjectURI string) []blobwith
 // state before the removal landed, commits second THEN B is refused under the
 // removal's code and A stays withheld for the post (only a restore lifts).
 func TestAnEditCommittedAfterARemovalItRacedWithholdsItsNewImage(t *testing.T) {
-	world := newUpstreamBanWorld(t)
-	h := world.h
-	const slug = "rw-race-a"
-	postID := world.imagePost(world.communityC, slug, "race-a-image-a")
-	subject := atURIOf(t, h, postID)
-	imageA := storedCIDOfSeed(t, h, "race-a-image-a")
-	mapping, err := h.objects.GetByAPID(context.Background(), postID)
-	require.NoError(t, err)
-	edit := world.editedPageObject(slug, "2026-08-21T12:00:00Z", "race-a-image-b")
+	for _, mode := range blobModes() {
+		t.Run(mode.name, func(t *testing.T) {
+			world := newUpstreamBanWorldOn(t, newHarnessInMode(t, mode))
+			h := world.h
+			const slug = "rw-race-a"
+			postID := world.imagePost(world.communityC, slug, "race-a-image-a")
+			subject := atURIOf(t, h, postID)
+			imageA := storedCIDOfSeed(t, h, "race-a-image-a")
+			mapping, err := h.objects.GetByAPID(context.Background(), postID)
+			require.NoError(t, err)
+			edit := world.editedPageObject(slug, "2026-08-21T12:00:00Z", "race-a-image-b")
 
-	commitInOrder(t, h,
-		func(ctx context.Context) error { return h.mat.RemovePost(ctx, mapping, rwSummary) },
-		func(ctx context.Context) error {
-			_, err := h.mat.HandleUpdate(ctx, edit, world.communityC.id)
-			return err
+			commitInOrder(t, h,
+				func(ctx context.Context) error { return h.mat.RemovePost(ctx, mapping, rwSummary) },
+				func(ctx context.Context) error {
+					_, err := h.mat.HandleUpdate(ctx, edit, world.communityC.id)
+					return err
+				})
+
+			imageB := storedCIDOfSeed(t, h, "race-a-image-b")
+			require.Equal(t, []string{imageB}, recordBlobCIDs(t, h, postID), "precondition: the edit committed image B")
+			require.Equal(t, materialize.RemovalCodeModeratorDiscretion, removalCode(t, h, ubCommunityCDID, postID),
+				"precondition: the removal stands")
+			assertBlobRefused(t, h, ubUserDID, imageB, "the new image of a post removed before the edit committed")
+			assertOneRemovalWithhold(t, h, imageB, subject, ubUserDID)
+			assertOneRemovalWithhold(t, h, imageA, subject, ubUserDID)
+			assertBlobRefused(t, h, ubUserDID, imageA, "the image a still-removed post dropped")
 		})
-
-	imageB := storedCIDOfSeed(t, h, "race-a-image-b")
-	require.Equal(t, []string{imageB}, recordBlobCIDs(t, h, postID), "precondition: the edit committed image B")
-	require.Equal(t, materialize.RemovalCodeModeratorDiscretion, removalCode(t, h, ubCommunityCDID, postID),
-		"precondition: the removal stands")
-	assertBlobRefused(t, h, ubUserDID, imageB, "the new image of a post removed before the edit committed")
-	assertOneRemovalWithhold(t, h, imageB, subject, ubUserDID)
-	assertOneRemovalWithhold(t, h, imageA, subject, ubUserDID)
-	assertBlobRefused(t, h, ubUserDID, imageA, "the image a still-removed post dropped")
+	}
 }
 
 // TestABackfillRacingAnEditOfARemovedPostAddsOnlyWhatTheEditLeftMissing (race
@@ -192,36 +194,40 @@ func TestAnEditCommittedAfterARemovalItRacedWithholdsItsNewImage(t *testing.T) {
 // one row the removal wrote (the back-fill adds no second one), and the
 // back-fill reports the post already withheld.
 func TestABackfillRacingAnEditOfARemovedPostAddsOnlyWhatTheEditLeftMissing(t *testing.T) {
-	world := newUpstreamBanWorld(t)
-	h := world.h
-	const slug = "rw-race-a-backfill"
-	postID := world.imagePost(world.communityC, slug, "race-ab-image-a")
-	subject := atURIOf(t, h, postID)
-	imageA := storedCIDOfSeed(t, h, "race-ab-image-a")
-	world.removeFromC(slug, postID)
-	assertOneRemovalWithhold(t, h, imageA, subject, ubUserDID)
-	edit := world.editedPageObject(slug, "2026-08-21T12:00:00Z", "race-ab-image-b")
+	for _, mode := range blobModes() {
+		t.Run(mode.name, func(t *testing.T) {
+			world := newUpstreamBanWorldOn(t, newHarnessInMode(t, mode))
+			h := world.h
+			const slug = "rw-race-a-backfill"
+			postID := world.imagePost(world.communityC, slug, "race-ab-image-a")
+			subject := atURIOf(t, h, postID)
+			imageA := storedCIDOfSeed(t, h, "race-ab-image-a")
+			world.removeFromC(slug, postID)
+			assertOneRemovalWithhold(t, h, imageA, subject, ubUserDID)
+			edit := world.editedPageObject(slug, "2026-08-21T12:00:00Z", "race-ab-image-b")
 
-	var report *materialize.RemovalWithholdBackfillReport
-	commitInOrder(t, h,
-		func(ctx context.Context) error {
-			_, err := h.mat.HandleUpdate(ctx, edit, world.communityC.id)
-			return err
-		},
-		func(ctx context.Context) error {
-			var err error
-			report, err = h.mat.BackfillRemovalWithholds(ctx, []string{ubCommunityCDID}, false)
-			return err
+			var report *materialize.RemovalWithholdBackfillReport
+			commitInOrder(t, h,
+				func(ctx context.Context) error {
+					_, err := h.mat.HandleUpdate(ctx, edit, world.communityC.id)
+					return err
+				},
+				func(ctx context.Context) error {
+					var err error
+					report, err = h.mat.BackfillRemovalWithholds(ctx, []string{ubCommunityCDID}, false)
+					return err
+				})
+
+			imageB := storedCIDOfSeed(t, h, "race-ab-image-b")
+			require.Equal(t, []string{imageB}, recordBlobCIDs(t, h, postID), "precondition: the edit committed image B")
+			assertBlobRefused(t, h, ubUserDID, imageB, "the edit's image of a removed post, after a racing back-fill")
+			assertOneRemovalWithhold(t, h, imageB, subject, ubUserDID)
+			assertOneRemovalWithhold(t, h, imageA, subject, ubUserDID)
+			assertBlobRefused(t, h, ubUserDID, imageA, "the image a still-removed post dropped")
+			assert.Empty(t, report.Added, "the edit already withheld everything the post references")
+			assert.Equal(t, 1, report.AlreadyWithheld)
 		})
-
-	imageB := storedCIDOfSeed(t, h, "race-ab-image-b")
-	require.Equal(t, []string{imageB}, recordBlobCIDs(t, h, postID), "precondition: the edit committed image B")
-	assertBlobRefused(t, h, ubUserDID, imageB, "the edit's image of a removed post, after a racing back-fill")
-	assertOneRemovalWithhold(t, h, imageB, subject, ubUserDID)
-	assertOneRemovalWithhold(t, h, imageA, subject, ubUserDID)
-	assertBlobRefused(t, h, ubUserDID, imageA, "the image a still-removed post dropped")
-	assert.Empty(t, report.Added, "the edit already withheld everything the post references")
-	assert.Equal(t, 1, report.AlreadyWithheld)
+	}
 }
 
 // TestABackfillRacingARestoreOfARemovedPostWithholdsNothing (race B,
@@ -238,44 +244,48 @@ func TestABackfillRacingAnEditOfARemovedPostAddsOnlyWhatTheEditLeftMissing(t *te
 // off C until the restore returned, so it would list C after the restore and
 // never take the stale-listing path this test pins.
 func TestABackfillRacingARestoreOfARemovedPostWithholdsNothing(t *testing.T) {
-	for _, dryRun := range []bool{true, false} {
-		name := "real run"
-		if dryRun {
-			name = "dry run"
-		}
-		t.Run(name, func(t *testing.T) {
-			world := newUpstreamBanWorld(t)
-			h := world.h
-			const slug = "rw-race-b-backfill"
-			postID := world.imagePost(world.communityC, slug, "race-bb-image-a")
-			subject := atURIOf(t, h, postID)
-			imageA := storedCIDOfSeed(t, h, "race-bb-image-a")
-			world.removeFromC(slug, postID)
-			assertOneRemovalWithhold(t, h, imageA, subject, ubUserDID)
-			mapping, err := h.objects.GetByAPID(context.Background(), postID)
-			require.NoError(t, err)
+	for _, mode := range blobModes() {
+		t.Run(mode.name, func(t *testing.T) {
+			for _, dryRun := range []bool{true, false} {
+				name := "real run"
+				if dryRun {
+					name = "dry run"
+				}
+				t.Run(name, func(t *testing.T) {
+					world := newUpstreamBanWorldOn(t, newHarnessInMode(t, mode))
+					h := world.h
+					const slug = "rw-race-b-backfill"
+					postID := world.imagePost(world.communityC, slug, "race-bb-image-a")
+					subject := atURIOf(t, h, postID)
+					imageA := storedCIDOfSeed(t, h, "race-bb-image-a")
+					world.removeFromC(slug, postID)
+					assertOneRemovalWithhold(t, h, imageA, subject, ubUserDID)
+					mapping, err := h.objects.GetByAPID(context.Background(), postID)
+					require.NoError(t, err)
 
-			secondManager, err := repo.NewManager(h.db, identity.NewActorKeys(h.actors, h.custodian), nil)
-			require.NoError(t, err)
-			secondOptions := h.materializerOptions
-			secondOptions.Repos = secondManager
-			secondMaterializer, err := materialize.New(secondOptions)
-			require.NoError(t, err)
+					secondManager, err := repo.NewManager(h.db, identity.NewActorKeys(h.actors, h.custodian), nil, h.repoOptions...)
+					require.NoError(t, err)
+					secondOptions := h.materializerOptions
+					secondOptions.Repos = secondManager
+					secondMaterializer, err := materialize.New(secondOptions)
+					require.NoError(t, err)
 
-			var report *materialize.RemovalWithholdBackfillReport
-			commitInOrder(t, h,
-				func(ctx context.Context) error { return h.mat.RestorePost(ctx, mapping) },
-				func(ctx context.Context) error {
-					var err error
-					report, err = secondMaterializer.BackfillRemovalWithholds(ctx, []string{ubCommunityCDID}, dryRun)
-					return err
+					var report *materialize.RemovalWithholdBackfillReport
+					commitInOrder(t, h,
+						func(ctx context.Context) error { return h.mat.RestorePost(ctx, mapping) },
+						func(ctx context.Context) error {
+							var err error
+							report, err = secondMaterializer.BackfillRemovalWithholds(ctx, []string{ubCommunityCDID}, dryRun)
+							return err
+						})
+
+					require.Empty(t, removalCode(t, h, ubCommunityCDID, postID), "precondition: the restore deleted the removal")
+					assert.Empty(t, report.Added, "the back-fill must not withhold a subject restored after its walk listed the removal")
+					assert.Zero(t, report.Failed)
+					assert.Empty(t, activeRemovalRowsOf(t, h, subject), "a restored post keeps no community-removal row")
+					assertBlobServed(t, h, ubUserDID, imageA, "the image of a post restored before the back-fill committed")
 				})
-
-			require.Empty(t, removalCode(t, h, ubCommunityCDID, postID), "precondition: the restore deleted the removal")
-			assert.Empty(t, report.Added, "the back-fill must not withhold a subject restored after its walk listed the removal")
-			assert.Zero(t, report.Failed)
-			assert.Empty(t, activeRemovalRowsOf(t, h, subject), "a restored post keeps no community-removal row")
-			assertBlobServed(t, h, ubUserDID, imageA, "the image of a post restored before the back-fill committed")
+			}
 		})
 	}
 }
@@ -287,31 +297,35 @@ func TestABackfillRacingARestoreOfARemovedPostWithholdsNothing(t *testing.T) {
 // before the restore landed, commits second THEN neither image has an active
 // community-removal row and both are served.
 func TestAnEditCommittedAfterARestoreItRacedLeavesThePostUnwithheld(t *testing.T) {
-	world := newUpstreamBanWorld(t)
-	h := world.h
-	const slug = "rw-race-b"
-	postID := world.imagePost(world.communityC, slug, "race-b-image-a")
-	subject := atURIOf(t, h, postID)
-	imageA := storedCIDOfSeed(t, h, "race-b-image-a")
-	world.removeFromC(slug, postID)
-	assertOneRemovalWithhold(t, h, imageA, subject, ubUserDID)
-	mapping, err := h.objects.GetByAPID(context.Background(), postID)
-	require.NoError(t, err)
-	edit := world.editedPageObject(slug, "2026-08-21T12:00:00Z", "race-b-image-b")
+	for _, mode := range blobModes() {
+		t.Run(mode.name, func(t *testing.T) {
+			world := newUpstreamBanWorldOn(t, newHarnessInMode(t, mode))
+			h := world.h
+			const slug = "rw-race-b"
+			postID := world.imagePost(world.communityC, slug, "race-b-image-a")
+			subject := atURIOf(t, h, postID)
+			imageA := storedCIDOfSeed(t, h, "race-b-image-a")
+			world.removeFromC(slug, postID)
+			assertOneRemovalWithhold(t, h, imageA, subject, ubUserDID)
+			mapping, err := h.objects.GetByAPID(context.Background(), postID)
+			require.NoError(t, err)
+			edit := world.editedPageObject(slug, "2026-08-21T12:00:00Z", "race-b-image-b")
 
-	commitInOrder(t, h,
-		func(ctx context.Context) error { return h.mat.RestorePost(ctx, mapping) },
-		func(ctx context.Context) error {
-			_, err := h.mat.HandleUpdate(ctx, edit, world.communityC.id)
-			return err
+			commitInOrder(t, h,
+				func(ctx context.Context) error { return h.mat.RestorePost(ctx, mapping) },
+				func(ctx context.Context) error {
+					_, err := h.mat.HandleUpdate(ctx, edit, world.communityC.id)
+					return err
+				})
+
+			imageB := storedCIDOfSeed(t, h, "race-b-image-b")
+			require.Equal(t, []string{imageB}, recordBlobCIDs(t, h, postID), "precondition: the edit committed image B")
+			require.Empty(t, removalCode(t, h, ubCommunityCDID, postID), "precondition: the restore deleted the removal")
+			assert.Empty(t, activeRemovalRowsOf(t, h, subject), "a restored post keeps no community-removal row")
+			assertBlobServed(t, h, ubUserDID, imageB, "the image of a restored post")
+			assertBlobServed(t, h, ubUserDID, imageA, "the image of a restored post's earlier version")
 		})
-
-	imageB := storedCIDOfSeed(t, h, "race-b-image-b")
-	require.Equal(t, []string{imageB}, recordBlobCIDs(t, h, postID), "precondition: the edit committed image B")
-	require.Empty(t, removalCode(t, h, ubCommunityCDID, postID), "precondition: the restore deleted the removal")
-	assert.Empty(t, activeRemovalRowsOf(t, h, subject), "a restored post keeps no community-removal row")
-	assertBlobServed(t, h, ubUserDID, imageB, "the image of a restored post")
-	assertBlobServed(t, h, ubUserDID, imageA, "the image of a restored post's earlier version")
+	}
 }
 
 // TestTheBackfillWithholdsUnderTheRemovalRecordsCode.
@@ -319,33 +333,37 @@ func TestAnEditCommittedAfterARestoreItRacedLeavesThePostUnwithheld(t *testing.T
 // GIVEN a removal of U's image post written before withholds existed, with the
 // code spam; WHEN the back-fill runs THEN the post's row carries spam.
 func TestTheBackfillWithholdsUnderTheRemovalRecordsCode(t *testing.T) {
-	world := newUpstreamBanWorld(t)
-	h := world.h
-	ctx := context.Background()
-	postID := world.imagePost(world.communityC, "rw-code-backfill", "code-backfill-image")
-	postURI := atURIOf(t, h, postID)
-	imageCID := storedCIDOfSeed(t, h, "code-backfill-image")
-	_, postRecordCID, err := h.manager.GetRecord(ctx, ubUserDID, materialize.CollectionPostV2, mustMappingRKey(t, h, postID))
-	require.NoError(t, err)
-	rkey := testDigestRKey(postURI)
-	_, err = h.manager.ApplyOps(ctx, ubCommunityCDID, []repo.RecordOp{
-		{Action: repo.OpActionDelete, Collection: materialize.CollectionAcceptance, RKey: rkey},
-		{Action: repo.OpActionUpdate, Collection: materialize.CollectionRemoval, RKey: rkey, Record: map[string]any{
-			"$type":     materialize.CollectionRemoval,
-			"subject":   map[string]any{"uri": postURI, "cid": postRecordCID},
-			"code":      "spam",
-			"createdAt": "2026-08-25T12:00:00.000Z",
-		}},
-	})
-	require.NoError(t, err)
-	require.Empty(t, activeRemovalWithholds(t, h, imageCID), "precondition: the prior removal wrote no withhold")
+	for _, mode := range blobModes() {
+		t.Run(mode.name, func(t *testing.T) {
+			world := newUpstreamBanWorldOn(t, newHarnessInMode(t, mode))
+			h := world.h
+			ctx := context.Background()
+			postID := world.imagePost(world.communityC, "rw-code-backfill", "code-backfill-image")
+			postURI := atURIOf(t, h, postID)
+			imageCID := storedCIDOfSeed(t, h, "code-backfill-image")
+			_, postRecordCID, err := h.manager.GetRecord(ctx, ubUserDID, materialize.CollectionPostV2, mustMappingRKey(t, h, postID))
+			require.NoError(t, err)
+			rkey := testDigestRKey(postURI)
+			_, err = h.manager.ApplyOps(ctx, ubCommunityCDID, []repo.RecordOp{
+				{Action: repo.OpActionDelete, Collection: materialize.CollectionAcceptance, RKey: rkey},
+				{Action: repo.OpActionUpdate, Collection: materialize.CollectionRemoval, RKey: rkey, Record: map[string]any{
+					"$type":     materialize.CollectionRemoval,
+					"subject":   map[string]any{"uri": postURI, "cid": postRecordCID},
+					"code":      "spam",
+					"createdAt": "2026-08-25T12:00:00.000Z",
+				}},
+			})
+			require.NoError(t, err)
+			require.Empty(t, activeRemovalWithholds(t, h, imageCID), "precondition: the prior removal wrote no withhold")
 
-	report := runBackfill(t, h, map[string]any{"dry_run": false})
-	require.Len(t, report.Added, 1, "the back-fill adds the post's row")
+			report := runBackfill(t, h, map[string]any{"dry_run": false})
+			require.Len(t, report.Added, 1, "the back-fill adds the post's row")
 
-	rows := activeRemovalWithholds(t, h, imageCID)
-	if assert.Len(t, rows, 1) {
-		assert.Equal(t, "spam", rows[0].ReasonCode, "the row carries the removal record's code")
+			rows := activeRemovalWithholds(t, h, imageCID)
+			if assert.Len(t, rows, 1) {
+				assert.Equal(t, "spam", rows[0].ReasonCode, "the row carries the removal record's code")
+			}
+		})
 	}
 }
 
@@ -356,37 +374,41 @@ func TestTheBackfillWithholdsUnderTheRemovalRecordsCode(t *testing.T) {
 // to a new image THEN the new row keeps moderator-discretion; WHEN C then bans
 // U with removeData THEN every row of the ban fixture carries author-banned.
 func TestAModeratorRemovalAndACommunityBanWithholdUnderTheirOwnCodes(t *testing.T) {
-	world := newUpstreamBanWorld(t)
-	h := world.h
-	const slug = "rw-code-moderator"
-	postID := world.imagePost(world.communityC, slug, "code-moderator-image")
-	fixture := world.seedCommunityBanFixture("rw-code-ban")
+	for _, mode := range blobModes() {
+		t.Run(mode.name, func(t *testing.T) {
+			world := newUpstreamBanWorldOn(t, newHarnessInMode(t, mode))
+			h := world.h
+			const slug = "rw-code-moderator"
+			postID := world.imagePost(world.communityC, slug, "code-moderator-image")
+			fixture := world.seedCommunityBanFixture("rw-code-ban")
 
-	world.removeFromC(slug, postID)
-	rows := activeRemovalWithholds(t, h, storedCIDOfSeed(t, h, "code-moderator-image"))
-	if assert.Len(t, rows, 1) {
-		assert.Equal(t, materialize.RemovalCodeModeratorDiscretion, rows[0].ReasonCode, "a moderator removal's row")
-	}
+			world.removeFromC(slug, postID)
+			rows := activeRemovalWithholds(t, h, storedCIDOfSeed(t, h, "code-moderator-image"))
+			if assert.Len(t, rows, 1) {
+				assert.Equal(t, materialize.RemovalCodeModeratorDiscretion, rows[0].ReasonCode, "a moderator removal's row")
+			}
 
-	edit := world.editedPageObject(slug, "2026-08-22T12:00:00Z", "code-moderator-image-edited")
-	_, err := h.mat.HandleUpdate(context.Background(), edit, world.communityC.id)
-	require.NoError(t, err)
-	rows = activeRemovalWithholds(t, h, storedCIDOfSeed(t, h, "code-moderator-image-edited"))
-	if assert.Len(t, rows, 1) {
-		assert.Equal(t, materialize.RemovalCodeModeratorDiscretion, rows[0].ReasonCode,
-			"an edit of a removed post keeps the removal's code")
-	}
+			edit := world.editedPageObject(slug, "2026-08-22T12:00:00Z", "code-moderator-image-edited")
+			_, err := h.mat.HandleUpdate(context.Background(), edit, world.communityC.id)
+			require.NoError(t, err)
+			rows = activeRemovalWithholds(t, h, storedCIDOfSeed(t, h, "code-moderator-image-edited"))
+			if assert.Len(t, rows, 1) {
+				assert.Equal(t, materialize.RemovalCodeModeratorDiscretion, rows[0].ReasonCode,
+					"an edit of a removed post keeps the removal's code")
+			}
 
-	const banID = "https://lemmy.world/activities/announce/block/rw-code-ban"
-	world.announceCommunityBlock(world.communityC, banID, ubUserID, nil, ubBanTime)
-	assertProcessed(t, h, banID)
-	banned := append(append([]string{}, fixture.postCIDs...),
-		fixture.commentCID[fixture.comments[0]], fixture.commentCID[fixture.comments[1]])
-	for _, c := range banned {
-		rows := activeRemovalWithholds(t, h, c)
-		if assert.Len(t, rows, 1, "%s: one row for the banned content", c) {
-			assert.Equal(t, materialize.RemovalCodeAuthorBanned, rows[0].ReasonCode, "%s: a community ban's row", c)
-		}
+			const banID = "https://lemmy.world/activities/announce/block/rw-code-ban"
+			world.announceCommunityBlock(world.communityC, banID, ubUserID, nil, ubBanTime)
+			assertProcessed(t, h, banID)
+			banned := append(append([]string{}, fixture.postCIDs...),
+				fixture.commentCID[fixture.comments[0]], fixture.commentCID[fixture.comments[1]])
+			for _, c := range banned {
+				rows := activeRemovalWithholds(t, h, c)
+				if assert.Len(t, rows, 1, "%s: one row for the banned content", c) {
+					assert.Equal(t, materialize.RemovalCodeAuthorBanned, rows[0].ReasonCode, "%s: a community ban's row", c)
+				}
+			}
+		})
 	}
 }
 
@@ -405,33 +427,37 @@ func TestAModeratorRemovalAndACommunityBanWithholdUnderTheirOwnCodes(t *testing.
 // let the restore commit before the record delete; the commit lock gives no
 // way to order the restore between the two.
 func TestARestoreRacingADeleteOfARemovedPostLeavesItsImageRefused(t *testing.T) {
-	world := newUpstreamBanWorld(t)
-	h := world.h
-	const slug = "rw-race-c-post"
-	postID := world.imagePost(world.communityC, slug, "race-c-post-image")
-	subject := atURIOf(t, h, postID)
-	imageA := storedCIDOfSeed(t, h, "race-c-post-image")
-	world.removeFromC(slug, postID)
-	assertOneRemovalWithhold(t, h, imageA, subject, ubUserDID)
-	mapping, err := h.objects.GetByAPID(context.Background(), postID)
-	require.NoError(t, err)
+	for _, mode := range blobModes() {
+		t.Run(mode.name, func(t *testing.T) {
+			world := newUpstreamBanWorldOn(t, newHarnessInMode(t, mode))
+			h := world.h
+			const slug = "rw-race-c-post"
+			postID := world.imagePost(world.communityC, slug, "race-c-post-image")
+			subject := atURIOf(t, h, postID)
+			imageA := storedCIDOfSeed(t, h, "race-c-post-image")
+			world.removeFromC(slug, postID)
+			assertOneRemovalWithhold(t, h, imageA, subject, ubUserDID)
+			mapping, err := h.objects.GetByAPID(context.Background(), postID)
+			require.NoError(t, err)
 
-	commitInOrder(t, h,
-		func(ctx context.Context) error {
-			_, err := h.manager.DeleteRecord(ctx, ubUserDID, materialize.CollectionPostV2, mapping.RKey)
-			return err
-		},
-		func(ctx context.Context) error { return h.mat.RestorePost(ctx, mapping) })
+			commitInOrder(t, h,
+				func(ctx context.Context) error {
+					_, err := h.manager.DeleteRecord(ctx, ubUserDID, materialize.CollectionPostV2, mapping.RKey)
+					return err
+				},
+				func(ctx context.Context) error { return h.mat.RestorePost(ctx, mapping) })
 
-	_, _, err = h.manager.GetRecord(context.Background(), ubUserDID, materialize.CollectionPostV2, mapping.RKey)
-	require.True(t, errors.IsNotFound(err), "precondition: the delete committed: %v", err)
-	assert.False(t, acceptanceExists(t, h, ubCommunityCDID, postID),
-		"a restore must not accept a post deleted before its commit")
-	assert.Equal(t, materialize.RemovalCodeModeratorDiscretion, removalCode(t, h, ubCommunityCDID, postID),
-		"a restore whose subject is gone leaves the removal standing")
-	assertBlobStored(t, h, ubUserDID, imageA, "the bytes stay until an operator acts")
-	assertRemovalWithholdStands(t, h, imageA, subject, "a restore whose subject is gone lifts no row")
-	assertBlobRefused(t, h, ubUserDID, imageA, "the removed, deleted post's image")
+			_, _, err = h.manager.GetRecord(context.Background(), ubUserDID, materialize.CollectionPostV2, mapping.RKey)
+			require.True(t, errors.IsNotFound(err), "precondition: the delete committed: %v", err)
+			assert.False(t, acceptanceExists(t, h, ubCommunityCDID, postID),
+				"a restore must not accept a post deleted before its commit")
+			assert.Equal(t, materialize.RemovalCodeModeratorDiscretion, removalCode(t, h, ubCommunityCDID, postID),
+				"a restore whose subject is gone leaves the removal standing")
+			assertBlobStored(t, h, ubUserDID, imageA, "the bytes stay until an operator acts")
+			assertRemovalWithholdStands(t, h, imageA, subject, "a restore whose subject is gone lifts no row")
+			assertBlobRefused(t, h, ubUserDID, imageA, "the removed, deleted post's image")
+		})
+	}
 }
 
 // TestARestoreRacingAnAuthorDeleteOfARemovedCommentLeavesItsImageRefused (race
@@ -485,43 +511,47 @@ func TestARestoreRacingAnAuthorDeleteOfARemovedCommentLeavesItsImageRefused(t *t
 // WHEN the restore is retried THEN it accepts the edited version and B is
 // served.
 func TestARestoreRacingAnEditOfARemovedPostFailsAndItsRetryPinsTheEdit(t *testing.T) {
-	world := newUpstreamBanWorld(t)
-	h := world.h
-	const slug = "rw-race-c-edit"
-	postID := world.imagePost(world.communityC, slug, "race-c-edit-image-a")
-	imageA := storedCIDOfSeed(t, h, "race-c-edit-image-a")
-	world.removeFromC(slug, postID)
-	mapping, err := h.objects.GetByAPID(context.Background(), postID)
-	require.NoError(t, err)
-	edit := world.editedPageObject(slug, "2026-08-21T12:00:00Z", "race-c-edit-image-b")
+	for _, mode := range blobModes() {
+		t.Run(mode.name, func(t *testing.T) {
+			world := newUpstreamBanWorldOn(t, newHarnessInMode(t, mode))
+			h := world.h
+			const slug = "rw-race-c-edit"
+			postID := world.imagePost(world.communityC, slug, "race-c-edit-image-a")
+			imageA := storedCIDOfSeed(t, h, "race-c-edit-image-a")
+			world.removeFromC(slug, postID)
+			mapping, err := h.objects.GetByAPID(context.Background(), postID)
+			require.NoError(t, err)
+			edit := world.editedPageObject(slug, "2026-08-21T12:00:00Z", "race-c-edit-image-b")
 
-	var restoreErr error
-	commitInOrder(t, h,
-		func(ctx context.Context) error {
-			_, err := h.mat.HandleUpdate(ctx, edit, world.communityC.id)
-			return err
-		},
-		func(ctx context.Context) error {
-			restoreErr = h.mat.RestorePost(ctx, mapping)
-			return nil
+			var restoreErr error
+			commitInOrder(t, h,
+				func(ctx context.Context) error {
+					_, err := h.mat.HandleUpdate(ctx, edit, world.communityC.id)
+					return err
+				},
+				func(ctx context.Context) error {
+					restoreErr = h.mat.RestorePost(ctx, mapping)
+					return nil
+				})
+
+			imageB := storedCIDOfSeed(t, h, "race-c-edit-image-b")
+			require.Equal(t, []string{imageB}, recordBlobCIDs(t, h, postID), "precondition: the edit committed image B")
+			require.Error(t, restoreErr, "a restore pinning a version edited before its commit fails")
+			assert.False(t, acceptanceExists(t, h, ubCommunityCDID, postID), "the failed restore accepts nothing")
+			assert.Equal(t, materialize.RemovalCodeModeratorDiscretion, removalCode(t, h, ubCommunityCDID, postID),
+				"the failed restore leaves the removal standing")
+			assertBlobRefused(t, h, ubUserDID, imageB, "the edited image while the removal stands")
+			assertBlobRefused(t, h, ubUserDID, imageA, "the dropped image while the removal stands")
+
+			require.NoError(t, h.mat.RestorePost(context.Background(), mapping), "the retry")
+			_, editedCID, err := h.manager.GetRecord(context.Background(), ubUserDID, materialize.CollectionPostV2, mapping.RKey)
+			require.NoError(t, err)
+			acceptance, _, err := h.manager.GetRecord(context.Background(), ubCommunityCDID, materialize.CollectionAcceptance,
+				testDigestRKey(mapping.ATURI))
+			require.NoError(t, err, "the retry accepts the post")
+			assert.Equal(t, editedCID, acceptance["subject"].(map[string]any)["cid"], "the retry pins the edited version")
+			assert.Empty(t, removalCode(t, h, ubCommunityCDID, postID), "the retry deletes the removal")
+			assertBlobServed(t, h, ubUserDID, imageB, "the restored post's image")
 		})
-
-	imageB := storedCIDOfSeed(t, h, "race-c-edit-image-b")
-	require.Equal(t, []string{imageB}, recordBlobCIDs(t, h, postID), "precondition: the edit committed image B")
-	require.Error(t, restoreErr, "a restore pinning a version edited before its commit fails")
-	assert.False(t, acceptanceExists(t, h, ubCommunityCDID, postID), "the failed restore accepts nothing")
-	assert.Equal(t, materialize.RemovalCodeModeratorDiscretion, removalCode(t, h, ubCommunityCDID, postID),
-		"the failed restore leaves the removal standing")
-	assertBlobRefused(t, h, ubUserDID, imageB, "the edited image while the removal stands")
-	assertBlobRefused(t, h, ubUserDID, imageA, "the dropped image while the removal stands")
-
-	require.NoError(t, h.mat.RestorePost(context.Background(), mapping), "the retry")
-	_, editedCID, err := h.manager.GetRecord(context.Background(), ubUserDID, materialize.CollectionPostV2, mapping.RKey)
-	require.NoError(t, err)
-	acceptance, _, err := h.manager.GetRecord(context.Background(), ubCommunityCDID, materialize.CollectionAcceptance,
-		testDigestRKey(mapping.ATURI))
-	require.NoError(t, err, "the retry accepts the post")
-	assert.Equal(t, editedCID, acceptance["subject"].(map[string]any)["cid"], "the retry pins the edited version")
-	assert.Empty(t, removalCode(t, h, ubCommunityCDID, postID), "the retry deletes the removal")
-	assertBlobServed(t, h, ubUserDID, imageB, "the restored post's image")
+	}
 }

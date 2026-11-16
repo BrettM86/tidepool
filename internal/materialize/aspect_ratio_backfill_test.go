@@ -11,7 +11,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"tidepool/internal/ap"
+	"tidepool/internal/blobstore"
 	"tidepool/internal/blobwithhold"
+	"tidepool/internal/repo"
 	"tidepool/internal/store"
 	"tidepool/internal/testutil"
 )
@@ -170,7 +173,7 @@ func TestBackfillImageAspectRatios(t *testing.T) {
 	legacy := seedLegacyImagePost(t, h, pngFixture(t, 120, 30))
 
 	withheldCID := blobCIDOf(t, embedImages(t, h.recordFor(t, withheldID))[0])
-	operatorWithhold(t, blobwithhold.NewStore(testutil.DB(t)), withheldCID)
+	operatorWithhold(t, blobwithhold.NewStore(testutil.DB(t), blobstore.NewPostgres(testutil.DB(t))), withheldCID)
 	deletedMapping, err := h.objects.GetByAPID(ctx, deletedID)
 	require.NoError(t, err)
 	require.NoError(t, h.m.HandleDeleteRecord(ctx, deletedID))
@@ -261,11 +264,18 @@ func TestBackfillImageAspectRatios(t *testing.T) {
 // mapping. The community and author repos must already exist.
 func seedLegacyImagePost(t *testing.T, h *harness, imageBytes []byte) *store.APObjectMapping {
 	t.Helper()
+	blob, err := h.manager.PutBlob(context.Background(), testDIDFor("technology", "lemmy.world"), "image/png", imageBytes)
+	require.NoError(t, err)
+	return seedLegacyImagePostWithBlob(t, h, *blob)
+}
+
+// seedLegacyImagePostWithBlob is seedLegacyImagePost over a blob ref the
+// caller has already stored (or seeded) under the community DID.
+func seedLegacyImagePostWithBlob(t *testing.T, h *harness, blob atdata.Blob) *store.APObjectMapping {
+	t.Helper()
 	ctx := context.Background()
 	communityDID := testDIDFor("technology", "lemmy.world")
 	authorDID := testDIDFor("LeftLeaningFreedomFighters", "lemmy.world")
-	blob, err := h.manager.PutBlob(ctx, communityDID, "image/png", imageBytes)
-	require.NoError(t, err)
 	const rkey = "3kjzl5kcb2s3a"
 	published := time.Date(2026, 6, 1, 9, 0, 0, 0, time.UTC)
 	commit, err := h.manager.PutRecord(ctx, communityDID, CollectionPost, rkey, map[string]any{
@@ -276,7 +286,7 @@ func seedLegacyImagePost(t *testing.T, h *harness, imageBytes []byte) *store.APO
 		"title":     "a pre-flip image post",
 		"embed": map[string]any{
 			"$type":  "social.coves.embed.images",
-			"images": []any{map[string]any{"image": *blob}},
+			"images": []any{map[string]any{"image": blob}},
 		},
 	})
 	require.NoError(t, err)
@@ -296,3 +306,53 @@ func seedLegacyImagePost(t *testing.T, h *harness, imageBytes []byte) *store.APO
 	require.NoError(t, err)
 	return mapping
 }
+
+// TestBackfillImageAspectRatiosByteStoreOutage (B10): in s3 mode with the
+// store cut off, an image without an aspectRatio whose blobs row has NULL
+// bytes (they live in the bucket) cannot be read. That is a failed post, not
+// an unreadable image: the next run must try it again.
+func TestBackfillImageAspectRatiosByteStoreOutage(t *testing.T) {
+	const (
+		imageCID  = "bafkreihyaummzibbppbsqyvto7hn4rj6h55kuioaziat7o5qsdfhijk47y"
+		imageSize = 11
+	)
+	byteStore, err := blobstore.NewS3(testutil.DB(t), blobstore.S3Config{
+		Endpoint:              closedLoopbackEndpoint(t),
+		Region:                "us-east-1",
+		Bucket:                "tidepool-cut-off",
+		AccessKeyID:           "cut-off-access-key",
+		SecretAccessKey:       "cut-off-secret-key",
+		AllowPrivateAddresses: true,
+	})
+	require.NoError(t, err)
+	// Setup stores the fixture avatar, which a cut-off store refuses (task
+	// 02's D4), so it runs on a working store; the cut-off store serves the
+	// backfill only.
+	store := &switchableBlobStore{Store: blobstore.NewPostgres(testutil.DB(t))}
+	h := newHarnessWithRepoOptions(t, []repo.Option{repo.WithBlobStore(store)})
+	h.serveLemmyWorldFixtures()
+	ctx := context.Background()
+	_, err = h.m.EnsureCommunity(ctx, &ap.Object{ID: groupID})
+	require.NoError(t, err)
+	_, err = h.m.EnsureActor(ctx, &ap.Object{ID: personID})
+	require.NoError(t, err)
+
+	communityDID := testDIDFor("technology", "lemmy.world")
+	_, err = testutil.DB(t).ExecContext(ctx,
+		`INSERT INTO blobs (did, cid, mime_type, size, bytes) VALUES ($1, $2, 'image/png', $3, NULL)`,
+		communityDID, imageCID, imageSize)
+	require.NoError(t, err)
+	ref, err := cid.Decode(imageCID)
+	require.NoError(t, err)
+	seedLegacyImagePostWithBlob(t, h, atdata.Blob{Ref: atdata.CIDLink(ref), MimeType: "image/png", Size: imageSize})
+
+	store.Store = byteStore
+	report, err := h.m.BackfillImageAspectRatios(ctx, false)
+	require.NoError(t, err)
+	assert.Equal(t, AspectRatioBackfillReport{Failed: 1}, *report,
+		"a byte store outage fails the post; it is not an unreadable image")
+}
+
+// switchableBlobStore delegates to Store, which a test may replace between
+// setup and the step under test.
+type switchableBlobStore struct{ blobstore.Store }

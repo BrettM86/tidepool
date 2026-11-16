@@ -37,7 +37,8 @@ import (
 //	                                community's bridge state (404 if it was
 //	                                never bridged or the handle does not
 //	                                resolve, 502 if resolution or the refresh
-//	                                fetch fails, 422 if it refuses bridging).
+//	                                fetch fails, 503 if the blob store is
+//	                                unavailable, 422 if it refuses bridging).
 //	{"all":true}                    every bridged community, ASYNCHRONOUS,
 //	                                202 with the count. The walk re-fetches
 //	                                one Group actor per community from its
@@ -130,6 +131,13 @@ func (a *Admin) refreshCommunityProfile(ctx context.Context, groupIRI string) (*
 			a.logger.Warn("refresh-profile refused", "community", groupIRI, "reason", err.Error())
 			return nil, &adminError{status: http.StatusUnprocessableEntity,
 				public: "community cannot be bridged: " + err.Error(), err: err}
+		}
+		if errors.IsBlobStoreUnavailable(err) {
+			// The repo layer logged the store failure; nothing was committed,
+			// so the existing profile stays and the refresh can be re-run.
+			a.logger.Warn("refresh-profile: blob store unavailable", "community", groupIRI, "error", err)
+			return nil, &adminError{status: http.StatusServiceUnavailable,
+				public: "blob store unavailable", err: err}
 		}
 		a.logger.Error("refresh-profile: materialize community", "community", groupIRI, "error", err)
 		return nil, &adminError{status: http.StatusBadGateway,

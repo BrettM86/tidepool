@@ -91,7 +91,8 @@ func TestDispatchRejectsUnknownCommands(t *testing.T) {
 	// answers to but never advertises is a subcommand nobody runs — and the
 	// one that has to be run is the one that lets BRIDGE_KEK_PREVIOUS be
 	// retired, so a rotation left half-finished is the cost of omitting it.
-	assert.Contains(t, err.Error(), "usage: tidepool [migrate|rotate-kek]")
+	// UPDATED for migrate-blobs: the usage line lists the one-time blob copy.
+	assert.Contains(t, err.Error(), "usage: tidepool [migrate|rotate-kek|migrate-blobs [--concurrency N]]")
 }
 
 func TestRunMigrationsRequiresDatabaseURL(t *testing.T) {

@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"tidepool/internal/ap"
+	"tidepool/internal/blobstore"
 	"tidepool/internal/blobwithhold"
 	"tidepool/internal/errors"
 	"tidepool/internal/testutil"
@@ -290,7 +291,7 @@ func TestWithheldBlobRefusedButRefKept(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t)
-			tc.run(t, h, blobwithhold.NewStore(testutil.DB(t)))
+			tc.run(t, h, blobwithhold.NewStore(testutil.DB(t), blobstore.NewPostgres(testutil.DB(t))))
 		})
 	}
 }

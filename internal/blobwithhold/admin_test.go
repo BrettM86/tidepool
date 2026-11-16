@@ -18,6 +18,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"tidepool/internal/blobstore"
 	"tidepool/internal/blobwithhold"
 	"tidepool/internal/errors"
 	"tidepool/internal/repo"
@@ -64,13 +65,28 @@ type adminWorld struct {
 	store   *blobwithhold.Store
 	manager *repo.Manager
 	router  chi.Router
+	// bucket, byteStore and gate are set in s3 mode only.
+	bucket    *testutil.S3Bucket
+	byteStore *blobstore.S3
+	gate      *objectDeleteGate
 }
 
-// newAdminWorld mounts a fresh Admin and removes the withhold rows and blobs
-// rows of cids when the test ends. A nil logger discards.
+// newAdminWorld is newAdminWorldInMode in postgres mode.
 func newAdminWorld(t *testing.T, logger *slog.Logger, cids ...string) *adminWorld {
 	t.Helper()
+	return newAdminWorldInMode(t, adminModes()[0], logger, cids...)
+}
+
+// newAdminWorldInMode mounts a fresh Admin over mode's byte store and
+// removes the withhold rows and blobs rows of cids when the test ends;
+// blob_object_deletes is empty before and after the test. In s3 mode the
+// repo manager and the withhold store share one blobstore.S3 over a fresh
+// test bucket, reached through an objectDeleteGate. A nil logger discards.
+func newAdminWorldInMode(t *testing.T, mode adminMode, logger *slog.Logger, cids ...string) *adminWorld {
+	t.Helper()
 	db := testutil.DB(t)
+	testutil.Truncate(t, db, "blob_object_deletes")
+	t.Cleanup(func() { testutil.Truncate(t, db, "blob_object_deletes") })
 	t.Cleanup(func() {
 		for _, c := range cids {
 			if _, err := db.Exec(`DELETE FROM blob_withholds WHERE cid = $1`, c); err != nil {
@@ -84,17 +100,39 @@ func newAdminWorld(t *testing.T, logger *slog.Logger, cids ...string) *adminWorl
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	store := blobwithhold.NewStore(db)
-	admin, err := blobwithhold.NewAdmin(blobwithhold.AdminOptions{Token: adminToken, Store: store, Logger: logger})
+	world := &adminWorld{db: db}
+	var byteStore blobstore.Store = blobstore.NewPostgres(db)
+	var repoOptions []repo.Option
+	if mode.s3 {
+		world.bucket = testutil.NewS3Bucket(t)
+		require.NotNil(t, world.bucket.Client, "testutil.NewS3Bucket must return a bucket with a client")
+		world.gate = newObjectDeleteGate(t, world.bucket)
+		s3Store, err := blobstore.NewS3(db, blobstore.S3Config{
+			Endpoint:              world.gate.URL,
+			Region:                world.bucket.Region,
+			Bucket:                world.bucket.Name,
+			AccessKeyID:           world.bucket.AccessKeyID,
+			SecretAccessKey:       world.bucket.SecretAccessKey,
+			AllowPrivateAddresses: true,
+			Logger:                slog.New(slog.NewTextHandler(io.Discard, nil)),
+			Transport:             testutil.LocalS3Transport(),
+		})
+		require.NoError(t, err)
+		world.byteStore = s3Store
+		byteStore = s3Store
+		repoOptions = append(repoOptions, repo.WithBlobStore(s3Store))
+	}
+	world.store = blobwithhold.NewStore(db, byteStore)
+	admin, err := blobwithhold.NewAdmin(blobwithhold.AdminOptions{Token: adminToken, Store: world.store, Logger: logger})
 	require.NoError(t, err)
-	router := chi.NewRouter()
-	admin.Routes(router)
+	world.router = chi.NewRouter()
+	admin.Routes(world.router)
 
 	key, err := atcrypto.GeneratePrivateKeyK256()
 	require.NoError(t, err)
-	manager, err := repo.NewManager(db, staticKeys{key: key}, nil)
+	world.manager, err = repo.NewManager(db, staticKeys{key: key}, nil, repoOptions...)
 	require.NoError(t, err)
-	return &adminWorld{db: db, store: store, manager: manager, router: router}
+	return world
 }
 
 // adminRequest issues one request. An empty token omits Authorization.
@@ -306,35 +344,39 @@ func TestAdminLiftWithoutActiveOperatorWithholdIsRefused(t *testing.T) {
 // keeps the row (lifted_at, lifted_by set), drops it from the listing, and
 // GetBlob serves the stored bytes again.
 func TestAdminLiftRestoresServingAndKeepsTheRow(t *testing.T) {
-	const (
-		liftCID      = "bafkreiaz2lisg6vpz3iybieeglnhp2aovezfddnkxgjjijtwgid2moutwa"
-		communityCID = "bafkreiefbgibbc37dfu46j2kh5s43fpzixzavbg7hxixv3swtxucpe76ai"
-	)
-	payload := testBytes("B5 lift")
-	w := newAdminWorld(t, nil, liftCID, communityCID)
-	w.putBlob(t, ownerA, payload, liftCID)
-	w.operatorWithhold(t, liftCID, "b5-operator")
-	w.communityRemoval(t, communityCID)
+	for _, mode := range adminModes() {
+		t.Run(mode.name, func(t *testing.T) {
+			const (
+				liftCID      = "bafkreiaz2lisg6vpz3iybieeglnhp2aovezfddnkxgjjijtwgid2moutwa"
+				communityCID = "bafkreiefbgibbc37dfu46j2kh5s43fpzixzavbg7hxixv3swtxucpe76ai"
+			)
+			payload := testBytes("B5 lift")
+			w := newAdminWorldInMode(t, mode, nil, liftCID, communityCID)
+			w.putBlob(t, ownerA, payload, liftCID)
+			w.operatorWithhold(t, liftCID, "b5-operator")
+			w.communityRemoval(t, communityCID)
 
-	listed := w.listedCIDs(t)
-	assert.Contains(t, listed, liftCID, "the active operator withhold is listed")
-	assert.NotContains(t, listed, communityCID, "a community-removal row is not an operator withhold")
+			listed := w.listedCIDs(t)
+			assert.Contains(t, listed, liftCID, "the active operator withhold is listed")
+			assert.NotContains(t, listed, communityCID, "a community-removal row is not an operator withhold")
 
-	lifted := state(t, w.call(t, http.MethodPost, liftPath, `{"cid":"`+liftCID+`","actor":"b5-lifter"}`))
-	row := operatorRow(t, lifted)
-	assert.NotNil(t, row.LiftedAt, "lifted_at is set")
-	assert.Equal(t, "b5-lifter", row.LiftedBy)
-	assert.Equal(t, "b5-operator", row.CreatedBy)
+			lifted := state(t, w.call(t, http.MethodPost, liftPath, `{"cid":"`+liftCID+`","actor":"b5-lifter"}`))
+			row := operatorRow(t, lifted)
+			assert.NotNil(t, row.LiftedAt, "lifted_at is set")
+			assert.Equal(t, "b5-lifter", row.LiftedBy)
+			assert.Equal(t, "b5-operator", row.CreatedBy)
 
-	kept := operatorRow(t, w.inspect(t, liftCID))
-	assert.NotNil(t, kept.LiftedAt, "the row is kept, inactive")
+			kept := operatorRow(t, w.inspect(t, liftCID))
+			assert.NotNil(t, kept.LiftedAt, "the row is kept, inactive")
 
-	assert.NotContains(t, w.listedCIDs(t), liftCID, "a lifted withhold is not listed")
+			assert.NotContains(t, w.listedCIDs(t), liftCID, "a lifted withhold is not listed")
 
-	data, mimeType, err := w.manager.GetBlob(context.Background(), ownerA, liftCID)
-	require.NoError(t, err, "a lifted blob is served again")
-	assert.Equal(t, payload, data)
-	assert.Equal(t, blobMimeType, mimeType)
+			data, mimeType, err := w.manager.GetBlob(context.Background(), ownerA, liftCID)
+			require.NoError(t, err, "a lifted blob is served again")
+			assert.Equal(t, payload, data)
+			assert.Equal(t, blobMimeType, mimeType)
+		})
+	}
 }
 
 // TestOperatorLiftLeavesCommunityRemovalWithholdInForce (B6): with an
@@ -343,61 +385,69 @@ func TestAdminLiftRestoresServingAndKeepsTheRow(t *testing.T) {
 // DID stores nothing and returns the ref with IsBlobWithheld; GetBlob is
 // not-found.
 func TestOperatorLiftLeavesCommunityRemovalWithholdInForce(t *testing.T) {
-	const blobCID = "bafkreiebhemxmkdmfeuuctqkbgmdb37rldvpfhbwflf7dy7novkzm22a3e"
-	payload := testBytes("B6 two-source")
-	w := newAdminWorld(t, nil, blobCID)
-	ctx := context.Background()
-	w.putBlob(t, ownerA, payload, blobCID)
-	w.operatorWithhold(t, blobCID, "b6-operator")
-	w.communityRemoval(t, blobCID)
-	_, err := w.store.Lift(ctx, blobCID, "b6-lifter")
-	require.NoError(t, err, "setup: operator lift")
+	for _, mode := range adminModes() {
+		t.Run(mode.name, func(t *testing.T) {
+			const blobCID = "bafkreiebhemxmkdmfeuuctqkbgmdb37rldvpfhbwflf7dy7novkzm22a3e"
+			payload := testBytes("B6 two-source")
+			w := newAdminWorldInMode(t, mode, nil, blobCID)
+			ctx := context.Background()
+			w.putBlob(t, ownerA, payload, blobCID)
+			w.operatorWithhold(t, blobCID, "b6-operator")
+			w.communityRemoval(t, blobCID)
+			_, err := w.store.Lift(ctx, blobCID, "b6-lifter")
+			require.NoError(t, err, "setup: operator lift")
 
-	blob, err := w.manager.PutBlob(ctx, ownerNew, blobMimeType, payload)
-	require.Error(t, err, "the community-removal row still refuses the store")
-	assert.True(t, errors.IsBlobWithheld(err), "want IsBlobWithheld, got %v", err)
-	if assert.NotNil(t, blob, "a refused store still returns the ref") {
-		assert.Equal(t, blobCID, cid.Cid(blob.Ref).String())
-		assert.Equal(t, blobMimeType, blob.MimeType)
-		assert.Equal(t, int64(47), blob.Size)
+			blob, err := w.manager.PutBlob(ctx, ownerNew, blobMimeType, payload)
+			require.Error(t, err, "the community-removal row still refuses the store")
+			assert.True(t, errors.IsBlobWithheld(err), "want IsBlobWithheld, got %v", err)
+			if assert.NotNil(t, blob, "a refused store still returns the ref") {
+				assert.Equal(t, blobCID, cid.Cid(blob.Ref).String())
+				assert.Equal(t, blobMimeType, blob.MimeType)
+				assert.Equal(t, int64(47), blob.Size)
+			}
+			assert.Equal(t, []string{ownerA}, w.storedOwners(t, blobCID), "nothing stored for the new DID")
+
+			_, _, err = w.manager.GetBlob(ctx, ownerA, blobCID)
+			assert.True(t, errors.IsNotFound(err), "still withheld, want not-found, got %v", err)
+		})
 	}
-	assert.Equal(t, []string{ownerA}, w.storedOwners(t, blobCID), "nothing stored for the new DID")
-
-	_, _, err = w.manager.GetBlob(ctx, ownerA, blobCID)
-	assert.True(t, errors.IsNotFound(err), "still withheld, want not-found, got %v", err)
 }
 
 // TestSubjectScopeWithholdCoversOnlyItsOwner (B6 revision): a static
 // subject-scope row for owner A covers (A, CID) and not (B, CID).
 func TestSubjectScopeWithholdCoversOnlyItsOwner(t *testing.T) {
-	const blobCID = "bafkreigjeautfi3rmnztid7lujymwmlq4gpnalmu2yasmv2fi6lbjbuexu"
-	payload := testBytes("B6 subject-scope")
-	w := newAdminWorld(t, nil, blobCID)
-	ctx := context.Background()
-	_, err := w.store.Insert(ctx, blobwithhold.Withhold{
-		CID:          blobCID,
-		Source:       blobwithhold.SourceCommunityRemoval,
-		Scope:        blobwithhold.ScopeSubject,
-		OwnerDID:     ownerA,
-		SubjectURI:   "at://" + ownerA + "/social.coves.community.post/b6subject",
-		CommunityDID: communityDID,
-		ReasonCode:   "moderator-discretion",
-	})
-	require.NoError(t, err, "setup: subject-scope row")
+	for _, mode := range adminModes() {
+		t.Run(mode.name, func(t *testing.T) {
+			const blobCID = "bafkreigjeautfi3rmnztid7lujymwmlq4gpnalmu2yasmv2fi6lbjbuexu"
+			payload := testBytes("B6 subject-scope")
+			w := newAdminWorldInMode(t, mode, nil, blobCID)
+			ctx := context.Background()
+			_, err := w.store.Insert(ctx, blobwithhold.Withhold{
+				CID:          blobCID,
+				Source:       blobwithhold.SourceCommunityRemoval,
+				Scope:        blobwithhold.ScopeSubject,
+				OwnerDID:     ownerA,
+				SubjectURI:   "at://" + ownerA + "/social.coves.community.post/b6subject",
+				CommunityDID: communityDID,
+				ReasonCode:   "moderator-discretion",
+			})
+			require.NoError(t, err, "setup: subject-scope row")
 
-	coveredA, err := w.store.Covers(ctx, ownerA, blobCID)
-	require.NoError(t, err)
-	assert.True(t, coveredA, "the subject row covers its owner")
-	coveredB, err := w.store.Covers(ctx, ownerB, blobCID)
-	require.NoError(t, err)
-	assert.False(t, coveredB, "the subject row does not cover another owner")
+			coveredA, err := w.store.Covers(ctx, ownerA, blobCID)
+			require.NoError(t, err)
+			assert.True(t, coveredA, "the subject row covers its owner")
+			coveredB, err := w.store.Covers(ctx, ownerB, blobCID)
+			require.NoError(t, err)
+			assert.False(t, coveredB, "the subject row does not cover another owner")
 
-	blob, err := w.manager.PutBlob(ctx, ownerB, blobMimeType, payload)
-	require.NoError(t, err, "another owner may store the bytes")
-	assert.Equal(t, blobCID, cid.Cid(blob.Ref).String())
-	_, err = w.manager.PutBlob(ctx, ownerA, blobMimeType, payload)
-	assert.True(t, errors.IsBlobWithheld(err), "the subject's owner is refused, got %v", err)
-	assert.Equal(t, []string{ownerB}, w.storedOwners(t, blobCID))
+			blob, err := w.manager.PutBlob(ctx, ownerB, blobMimeType, payload)
+			require.NoError(t, err, "another owner may store the bytes")
+			assert.Equal(t, blobCID, cid.Cid(blob.Ref).String())
+			_, err = w.manager.PutBlob(ctx, ownerA, blobMimeType, payload)
+			assert.True(t, errors.IsBlobWithheld(err), "the subject's owner is refused, got %v", err)
+			assert.Equal(t, []string{ownerB}, w.storedOwners(t, blobCID))
+		})
+	}
 }
 
 // TestAdminDeleteBytesRefusedWithoutActiveOperatorWithholdOrConfirm (B7):
@@ -405,72 +455,137 @@ func TestSubjectScopeWithholdCoversOnlyItsOwner(t *testing.T) {
 // active operator withhold (none, community-removal only, lifted only), or
 // when the withhold is active but confirm is absent or false.
 func TestAdminDeleteBytesRefusedWithoutActiveOperatorWithholdOrConfirm(t *testing.T) {
-	withhold := func(t *testing.T, w *adminWorld, cidStr string) { w.operatorWithhold(t, cidStr, "b7-operator") }
-	cases := []struct {
-		name    string
-		cid     string
-		setup   func(t *testing.T, w *adminWorld, cidStr string)
-		confirm string // the JSON fragment after actor, empty for absent
-	}{
-		{"no withhold", "bafkreidst6aedhasadobqfj3oldwhzlpsfbenj73qdixmaslk5vetc7odi",
-			func(*testing.T, *adminWorld, string) {}, `,"confirm":true`},
-		{"confirm absent", "bafkreih7563nnmjylu4kyxtrfe52q2bhwfij53f2ptckvivsqeji3ezn3m",
-			withhold, ``},
-		{"confirm false", "bafkreifppx2oaqexhdeaxj7ljiwkwynaswl2tgraalbrozu5hibuwtfjom",
-			withhold, `,"confirm":false`},
-		{"community-removal only", "bafkreiaeer7f6mvfif2thx56vjt3erf3chauwz7cvf5zz2qwjlima74paa",
-			func(t *testing.T, w *adminWorld, cidStr string) { w.communityRemoval(t, cidStr) }, `,"confirm":true`},
-		{"lifted only", "bafkreigmupgxp2mrz7ziz3vhbwknzecjvncljasotu7bjbftfawnap5nca",
-			func(t *testing.T, w *adminWorld, cidStr string) {
-				w.operatorWithhold(t, cidStr, "b7-operator")
-				_, err := w.store.Lift(context.Background(), cidStr, "b7-lifter")
-				require.NoError(t, err, "setup: lift")
-			}, `,"confirm":true`},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			payload := testBytes("B7 " + strings.ReplaceAll(tc.name, " ", "-"))
-			w := newAdminWorld(t, nil, tc.cid)
-			w.putBlob(t, ownerA, payload, tc.cid)
-			w.putBlob(t, ownerB, payload, tc.cid)
-			tc.setup(t, w, tc.cid)
+	for _, mode := range adminModes() {
+		t.Run(mode.name, func(t *testing.T) {
+			withhold := func(t *testing.T, w *adminWorld, cidStr string) { w.operatorWithhold(t, cidStr, "b7-operator") }
+			cases := []struct {
+				name    string
+				cid     string
+				setup   func(t *testing.T, w *adminWorld, cidStr string)
+				confirm string // the JSON fragment after actor, empty for absent
+			}{
+				{"no withhold", "bafkreidst6aedhasadobqfj3oldwhzlpsfbenj73qdixmaslk5vetc7odi",
+					func(*testing.T, *adminWorld, string) {}, `,"confirm":true`},
+				{"confirm absent", "bafkreih7563nnmjylu4kyxtrfe52q2bhwfij53f2ptckvivsqeji3ezn3m",
+					withhold, ``},
+				{"confirm false", "bafkreifppx2oaqexhdeaxj7ljiwkwynaswl2tgraalbrozu5hibuwtfjom",
+					withhold, `,"confirm":false`},
+				{"community-removal only", "bafkreiaeer7f6mvfif2thx56vjt3erf3chauwz7cvf5zz2qwjlima74paa",
+					func(t *testing.T, w *adminWorld, cidStr string) { w.communityRemoval(t, cidStr) }, `,"confirm":true`},
+				{"lifted only", "bafkreigmupgxp2mrz7ziz3vhbwknzecjvncljasotu7bjbftfawnap5nca",
+					func(t *testing.T, w *adminWorld, cidStr string) {
+						w.operatorWithhold(t, cidStr, "b7-operator")
+						_, err := w.store.Lift(context.Background(), cidStr, "b7-lifter")
+						require.NoError(t, err, "setup: lift")
+					}, `,"confirm":true`},
+			}
+			for _, tc := range cases {
+				t.Run(tc.name, func(t *testing.T) {
+					payload := testBytes("B7 " + strings.ReplaceAll(tc.name, " ", "-"))
+					w := newAdminWorldInMode(t, mode, nil, tc.cid)
+					w.putBlob(t, ownerA, payload, tc.cid)
+					w.putBlob(t, ownerB, payload, tc.cid)
+					tc.setup(t, w, tc.cid)
 
-			rec := w.call(t, http.MethodPost, deletePath, `{"cid":"`+tc.cid+`","actor":"b7-deleter"`+tc.confirm+`}`)
-			assert4xx(t, rec, "refused delete-bytes")
-			assert.Equal(t, []string{ownerA, ownerB}, w.storedOwners(t, tc.cid), "every owner keeps the bytes")
+					rec := w.call(t, http.MethodPost, deletePath, `{"cid":"`+tc.cid+`","actor":"b7-deleter"`+tc.confirm+`}`)
+					assert4xx(t, rec, "refused delete-bytes")
+					assert.Equal(t, []string{ownerA, ownerB}, w.storedOwners(t, tc.cid), "every owner keeps the bytes")
 
-			after := w.inspect(t, tc.cid)
-			assert.False(t, after.BytesDeleted)
-			assert.Equal(t, 2, after.StoredOwners)
+					after := w.inspect(t, tc.cid)
+					assert.False(t, after.BytesDeleted)
+					assert.Equal(t, 2, after.StoredOwners)
+				})
+			}
 		})
 	}
 }
 
-// TestAdminDeleteBytesRemovesEveryOwnersBytes (B8): with an active operator
-// withhold and confirm, delete-bytes removes the blobs rows for every owner,
-// sets deleted_at, keeps the withhold active and reports bytes_deleted with
-// no stored owners.
+// TestAdminDeleteBytesRemovesEveryOwnersBytes (B8; task 04 B6): with an
+// active operator withhold and confirm, delete-bytes removes the blobs rows
+// for every owner, sets deleted_at, keeps the withhold active and reports
+// bytes_deleted with no stored owners. One CID is stored under three DIDs
+// and, in s3 mode, an orphan object under a fourth DID has its queued delete
+// and no blobs row (what an s3 PutBlob that failed after the upload leaves).
+// In s3 mode every object of the CID is gone and no delete stays queued;
+// with the bucket refusing object deletes the call still succeeds, every
+// delete stays queued and the answer counts them. The answer always carries
+// pending_object_deletes, also when it is 0.
 func TestAdminDeleteBytesRemovesEveryOwnersBytes(t *testing.T) {
-	const blobCID = "bafkreia6g7ry3yisovaid4hc7whljhcnhqrop2rwfrmawyleqfkczmbhqm"
-	payload := testBytes("B8 delete-bytes")
+	const (
+		blobCID = "bafkreia6g7ry3yisovaid4hc7whljhcnhqrop2rwfrmawyleqfkczmbhqm"
+		ownerC  = "did:plc:bwadminownerc"
+		orphan  = "did:plc:bwadminownerorphan"
+	)
+	cases := []struct {
+		name           string
+		mode           adminMode
+		refuseDeletes  bool
+		wantPending    string
+		wantQueuedDIDs []string
+	}{
+		{name: "postgres", mode: adminModes()[0], wantPending: "0"},
+		{name: "s3", mode: adminModes()[1], wantPending: "0"},
+		{name: "s3 object deletes refused", mode: adminModes()[1], refuseDeletes: true, wantPending: "4",
+			wantQueuedDIDs: []string{ownerA, ownerB, ownerC, orphan}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := testBytes("B8 delete-bytes")
+			w := newAdminWorldInMode(t, tc.mode, nil, blobCID)
+			w.putBlob(t, ownerA, payload, blobCID)
+			w.putBlob(t, ownerB, payload, blobCID)
+			w.putBlob(t, ownerC, payload, blobCID)
+			w.operatorWithhold(t, blobCID, "b8-operator")
+			if tc.mode.s3 {
+				w.drainQueue(t)
+				w.putOrphanObject(t, orphan, blobCID, payload)
+				w.gate.RefuseDeletes.Store(tc.refuseDeletes)
+			}
+
+			rec := w.call(t, http.MethodPost, deletePath,
+				`{"cid":"`+blobCID+`","actor":"b8-deleter","confirm":true}`)
+			deleted := state(t, rec)
+			assert.True(t, deleted.BytesDeleted)
+			assert.Equal(t, 0, deleted.StoredOwners)
+			row := operatorRow(t, deleted)
+			assert.Nil(t, row.LiftedAt, "the withhold stays active")
+			assert.NotNil(t, row.DeletedAt, "deleted_at is set")
+			assert.Equal(t, "b8-deleter", row.BytesDeletedBy)
+			assert.Equal(t, tc.wantPending, rawPendingObjectDeletes(t, rec),
+				"the answer counts the CID's queued object deletes")
+
+			assert.Empty(t, w.storedOwners(t, blobCID), "no owner keeps the bytes")
+			assert.Equal(t, tc.wantQueuedDIDs, w.queuedDIDs(t, blobCID), "the CID's queued object deletes")
+			if tc.mode.s3 && !tc.refuseDeletes {
+				assert.Empty(t, bucketKeys(t, w.bucket), "every object of the CID is gone")
+			}
+			if !tc.mode.s3 {
+				assert.Empty(t, w.queuedDIDs(t, ""), "postgres mode queues no object delete")
+			}
+			inspected := w.inspect(t, blobCID)
+			assert.True(t, inspected.BytesDeleted)
+			assert.Equal(t, 0, inspected.StoredOwners)
+		})
+	}
+}
+
+// TestAdminInspectReportsPendingObjectDeletes (task 04 B6): inspecting a CID
+// (the raw sha-256 CIDv1 of "tidepool blobwithhold admin B6 pending bytes")
+// with one queued object delete reports pending_object_deletes 1; a queued
+// delete of another CID is not counted.
+func TestAdminInspectReportsPendingObjectDeletes(t *testing.T) {
+	const (
+		blobCID  = "bafkreicishhajkvkizuqc4x6htitllmzxtf2pua2nlboehpf6serkv3jvu"
+		otherCID = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku"
+	)
 	w := newAdminWorld(t, nil, blobCID)
-	w.putBlob(t, ownerA, payload, blobCID)
-	w.putBlob(t, ownerB, payload, blobCID)
-	w.operatorWithhold(t, blobCID, "b8-operator")
+	for _, queued := range []string{blobCID, otherCID} {
+		_, err := w.db.Exec(`INSERT INTO blob_object_deletes (did, cid) VALUES ($1, $2)`, ownerA, queued)
+		require.NoError(t, err, "setup: queue an object delete")
+	}
 
-	deleted := state(t, w.call(t, http.MethodPost, deletePath,
-		`{"cid":"`+blobCID+`","actor":"b8-deleter","confirm":true}`))
-	assert.True(t, deleted.BytesDeleted)
-	assert.Equal(t, 0, deleted.StoredOwners)
-	row := operatorRow(t, deleted)
-	assert.Nil(t, row.LiftedAt, "the withhold stays active")
-	assert.NotNil(t, row.DeletedAt, "deleted_at is set")
-	assert.Equal(t, "b8-deleter", row.BytesDeletedBy)
-
-	assert.Empty(t, w.storedOwners(t, blobCID), "no owner keeps the bytes")
-	inspected := w.inspect(t, blobCID)
-	assert.True(t, inspected.BytesDeleted)
-	assert.Equal(t, 0, inspected.StoredOwners)
+	rec := w.call(t, http.MethodGet, statePath+blobCID, "")
+	assert.Equal(t, "1", rawPendingObjectDeletes(t, rec))
 }
 
 // TestAdminAuditTrailKeepsEachActorsLabel (B9): Alice withholds, Bob
@@ -478,46 +593,50 @@ func TestAdminDeleteBytesRemovesEveryOwnersBytes(t *testing.T) {
 // label and timestamp survives the later actions, in order, and the
 // moderation_action_id and csam_case_id persist.
 func TestAdminAuditTrailKeepsEachActorsLabel(t *testing.T) {
-	const blobCID = "bafkreif6o4cnnvgr5znbh2ylmswxydchbdzwhzccpvcnssalumxjc7j4ha"
-	w := newAdminWorld(t, nil, blobCID)
-	w.putBlob(t, ownerA, testBytes("B9 audit-trail"), blobCID)
+	for _, mode := range adminModes() {
+		t.Run(mode.name, func(t *testing.T) {
+			const blobCID = "bafkreif6o4cnnvgr5znbh2ylmswxydchbdzwhzccpvcnssalumxjc7j4ha"
+			w := newAdminWorldInMode(t, mode, nil, blobCID)
+			w.putBlob(t, ownerA, testBytes("B9 audit-trail"), blobCID)
 
-	withheld := operatorRow(t, state(t, w.call(t, http.MethodPost, withholdPath,
-		`{"cid":"`+blobCID+`","reason_code":"csam","actor":"alice",`+
-			`"moderation_action_id":"b9-modaction-17","csam_case_id":"b9-case-42"}`)))
-	assert.Equal(t, "alice", withheld.CreatedBy)
-	assert.Equal(t, blobwithhold.ReasonCSAM, withheld.ReasonCode)
-	require.False(t, withheld.CreatedAt.IsZero(), "created_at is set")
+			withheld := operatorRow(t, state(t, w.call(t, http.MethodPost, withholdPath,
+				`{"cid":"`+blobCID+`","reason_code":"csam","actor":"alice",`+
+					`"moderation_action_id":"b9-modaction-17","csam_case_id":"b9-case-42"}`)))
+			assert.Equal(t, "alice", withheld.CreatedBy)
+			assert.Equal(t, blobwithhold.ReasonCSAM, withheld.ReasonCode)
+			require.False(t, withheld.CreatedAt.IsZero(), "created_at is set")
 
-	deleted := operatorRow(t, state(t, w.call(t, http.MethodPost, deletePath,
-		`{"cid":"`+blobCID+`","actor":"bob","confirm":true}`)))
-	assert.Equal(t, "alice", deleted.CreatedBy)
-	assert.Equal(t, "bob", deleted.BytesDeletedBy)
-	require.NotNil(t, deleted.DeletedAt, "deleted_at is set")
-	bobDeletedAt := *deleted.DeletedAt
+			deleted := operatorRow(t, state(t, w.call(t, http.MethodPost, deletePath,
+				`{"cid":"`+blobCID+`","actor":"bob","confirm":true}`)))
+			assert.Equal(t, "alice", deleted.CreatedBy)
+			assert.Equal(t, "bob", deleted.BytesDeletedBy)
+			require.NotNil(t, deleted.DeletedAt, "deleted_at is set")
+			bobDeletedAt := *deleted.DeletedAt
 
-	w.call(t, http.MethodPost, deletePath, `{"cid":"`+blobCID+`","actor":"dave","confirm":true}`)
-	afterDave := operatorRow(t, w.inspect(t, blobCID))
-	assert.Equal(t, "bob", afterDave.BytesDeletedBy, "a second delete does not replace Bob")
-	if assert.NotNil(t, afterDave.DeletedAt) {
-		assert.True(t, bobDeletedAt.Equal(*afterDave.DeletedAt), "a second delete does not move deleted_at")
+			w.call(t, http.MethodPost, deletePath, `{"cid":"`+blobCID+`","actor":"dave","confirm":true}`)
+			afterDave := operatorRow(t, w.inspect(t, blobCID))
+			assert.Equal(t, "bob", afterDave.BytesDeletedBy, "a second delete does not replace Bob")
+			if assert.NotNil(t, afterDave.DeletedAt) {
+				assert.True(t, bobDeletedAt.Equal(*afterDave.DeletedAt), "a second delete does not move deleted_at")
+			}
+
+			lifted := operatorRow(t, state(t, w.call(t, http.MethodPost, liftPath, `{"cid":"`+blobCID+`","actor":"carol"}`)))
+			assert.Equal(t, "carol", lifted.LiftedBy)
+
+			final := operatorRow(t, w.inspect(t, blobCID))
+			assert.Equal(t, "alice", final.CreatedBy)
+			assert.True(t, withheld.CreatedAt.Equal(final.CreatedAt), "created_at unchanged")
+			assert.Equal(t, "bob", final.BytesDeletedBy)
+			assert.Equal(t, "carol", final.LiftedBy)
+			assert.Equal(t, "b9-modaction-17", final.ModerationActionID)
+			assert.Equal(t, "b9-case-42", final.CSAMCaseID)
+			require.NotNil(t, final.DeletedAt)
+			require.NotNil(t, final.LiftedAt)
+			assert.True(t, bobDeletedAt.Equal(*final.DeletedAt), "deleted_at unchanged by the lift")
+			assert.False(t, final.DeletedAt.Before(final.CreatedAt), "created_at <= deleted_at")
+			assert.False(t, final.LiftedAt.Before(*final.DeletedAt), "deleted_at <= lifted_at")
+		})
 	}
-
-	lifted := operatorRow(t, state(t, w.call(t, http.MethodPost, liftPath, `{"cid":"`+blobCID+`","actor":"carol"}`)))
-	assert.Equal(t, "carol", lifted.LiftedBy)
-
-	final := operatorRow(t, w.inspect(t, blobCID))
-	assert.Equal(t, "alice", final.CreatedBy)
-	assert.True(t, withheld.CreatedAt.Equal(final.CreatedAt), "created_at unchanged")
-	assert.Equal(t, "bob", final.BytesDeletedBy)
-	assert.Equal(t, "carol", final.LiftedBy)
-	assert.Equal(t, "b9-modaction-17", final.ModerationActionID)
-	assert.Equal(t, "b9-case-42", final.CSAMCaseID)
-	require.NotNil(t, final.DeletedAt)
-	require.NotNil(t, final.LiftedAt)
-	assert.True(t, bobDeletedAt.Equal(*final.DeletedAt), "deleted_at unchanged by the lift")
-	assert.False(t, final.DeletedAt.Before(final.CreatedAt), "created_at <= deleted_at")
-	assert.False(t, final.LiftedAt.Before(*final.DeletedAt), "deleted_at <= lifted_at")
 }
 
 // TestAdminRoutesRequireBearer (B13): every admin route answers 401 with no
@@ -547,34 +666,38 @@ func TestAdminRoutesRequireBearer(t *testing.T) {
 // base58btc) and carry neither the bearer token nor the request's actor,
 // moderation_action_id or csam_case_id text.
 func TestAdminMutationLogsCarryCanonicalCIDButNoSecrets(t *testing.T) {
-	const (
-		cidBase32    = "bafkreihk4wdmwn4ulohba54nm6sm562gfazmtfzopq2go27borlfdirnti"
-		cidBase58BTC = "zb2rhnTDb7X3JBYZiY7cEqCoBE4fAWcFd2pxEK43GXNtXPgjj"
-		actor        = "b15-actor-label-qx7"
-		moderationID = "b15-modaction-qx7"
-		caseID       = "b15-case-qx7"
-	)
-	var logs bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	w := newAdminWorld(t, logger, cidBase32)
-	w.putBlob(t, ownerA, testBytes("B15 logging"), cidBase32)
+	for _, mode := range adminModes() {
+		t.Run(mode.name, func(t *testing.T) {
+			const (
+				cidBase32    = "bafkreihk4wdmwn4ulohba54nm6sm562gfazmtfzopq2go27borlfdirnti"
+				cidBase58BTC = "zb2rhnTDb7X3JBYZiY7cEqCoBE4fAWcFd2pxEK43GXNtXPgjj"
+				actor        = "b15-actor-label-qx7"
+				moderationID = "b15-modaction-qx7"
+				caseID       = "b15-case-qx7"
+			)
+			var logs bytes.Buffer
+			logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+			w := newAdminWorldInMode(t, mode, logger, cidBase32)
+			w.putBlob(t, ownerA, testBytes("B15 logging"), cidBase32)
 
-	recs := map[string]*httptest.ResponseRecorder{
-		"withhold": w.call(t, http.MethodPost, withholdPath,
-			`{"cid":"`+cidBase58BTC+`","reason_code":"csam","actor":"`+actor+`",`+
-				`"moderation_action_id":"`+moderationID+`","csam_case_id":"`+caseID+`"}`),
-	}
-	recs["delete-bytes"] = w.call(t, http.MethodPost, deletePath,
-		`{"cid":"`+cidBase58BTC+`","actor":"`+actor+`","confirm":true}`)
-	recs["lift"] = w.call(t, http.MethodPost, liftPath, `{"cid":"`+cidBase58BTC+`","actor":"`+actor+`"}`)
+			recs := map[string]*httptest.ResponseRecorder{
+				"withhold": w.call(t, http.MethodPost, withholdPath,
+					`{"cid":"`+cidBase58BTC+`","reason_code":"csam","actor":"`+actor+`",`+
+						`"moderation_action_id":"`+moderationID+`","csam_case_id":"`+caseID+`"}`),
+			}
+			recs["delete-bytes"] = w.call(t, http.MethodPost, deletePath,
+				`{"cid":"`+cidBase58BTC+`","actor":"`+actor+`","confirm":true}`)
+			recs["lift"] = w.call(t, http.MethodPost, liftPath, `{"cid":"`+cidBase58BTC+`","actor":"`+actor+`"}`)
 
-	logged := logs.String()
-	assert.Contains(t, logged, cidBase32, "mutation logs name the canonical cid")
-	assert.NotContains(t, logged, adminToken, "logs must not carry the bearer token")
-	assert.NotContains(t, logged, actor, "logs must not carry the actor label")
-	assert.NotContains(t, logged, moderationID, "logs must not carry the moderation_action_id")
-	assert.NotContains(t, logged, caseID, "logs must not carry the csam_case_id")
-	for name, rec := range recs {
-		assert.Equal(t, http.StatusOK, rec.Code, "%s: body %s", name, rec.Body.String())
+			logged := logs.String()
+			assert.Contains(t, logged, cidBase32, "mutation logs name the canonical cid")
+			assert.NotContains(t, logged, adminToken, "logs must not carry the bearer token")
+			assert.NotContains(t, logged, actor, "logs must not carry the actor label")
+			assert.NotContains(t, logged, moderationID, "logs must not carry the moderation_action_id")
+			assert.NotContains(t, logged, caseID, "logs must not carry the csam_case_id")
+			for name, rec := range recs {
+				assert.Equal(t, http.StatusOK, rec.Code, "%s: body %s", name, rec.Body.String())
+			}
+		})
 	}
 }

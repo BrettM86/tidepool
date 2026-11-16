@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"tidepool/internal/blobstore"
 	"tidepool/internal/blobwithhold"
 	"tidepool/internal/errors"
 	"tidepool/internal/labels"
@@ -54,7 +55,7 @@ func newCommunityWithholdWorld(t *testing.T) *communityWithholdWorld {
 	w := &communityWithholdWorld{
 		h:         h,
 		rig:       newLabelRig(t, h),
-		withholds: blobwithhold.NewStore(testutil.DB(t)),
+		withholds: blobwithhold.NewStore(testutil.DB(t), blobstore.NewPostgres(testutil.DB(t))),
 		community: testDIDFor("technology", "lemmy.world"),
 		p1:        testDIDFor("LeftLeaningFreedomFighters", "lemmy.world"),
 		p2:        testDIDFor("communityremovalsecond", "lemmy.world"),

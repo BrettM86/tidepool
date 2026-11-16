@@ -172,11 +172,17 @@ audit trail; each action records its own and never overwrites another's.
 | `GET /admin/blobs?cid=` | Inspects one CID. | **200** state; **400** unparseable cid. |
 | `GET /admin/blobs/withholds` | Lists the active operator withholds. | **200** `{"withholds":[…]}`. |
 
-The state is `{cid, withholds, bytes_deleted, stored_owners}`. `withholds`
+The state is `{cid, withholds, bytes_deleted, stored_owners,
+pending_object_deletes}`. `withholds`
 holds every row for the CID, active and lifted, each with `source`, `scope`,
 `reason_code`, the actor labels and `created_at`, `lifted_at`, `deleted_at`.
 A row without `lifted_at` is active. `stored_owners` counts the DIDs still
-holding the bytes.
+holding the bytes. `pending_object_deletes` counts the CID's rows in the
+bucket object delete queue (always 0 in postgres mode). A recent upload leaves
+a row until the next sweep, so a non-zero count on inspect can be normal;
+`delete-bytes` processes every row for the CID before answering, so a non-zero
+count in its answer means a bucket delete failed and the sweeper retries it
+every minute.
 
 Automatic deletes (site bans, `Delete{Actor}`, nobridge scrubs) keep the
 bytes of a CID under an active operator withhold, so `delete-bytes` is the

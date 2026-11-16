@@ -15,6 +15,7 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/lib/pq"
 
+	"tidepool/internal/blobstore"
 	"tidepool/internal/errors"
 )
 
@@ -67,6 +68,12 @@ type State struct {
 	Withholds    []Withhold `json:"withholds"`
 	BytesDeleted bool       `json:"bytes_deleted"`
 	StoredOwners int        `json:"stored_owners"`
+	// PendingObjectDeletes counts the CID's rows in the bucket object delete
+	// queue (always 0 in postgres mode). A recent upload leaves a row until
+	// the next sweep, so a non-zero count on inspect, withhold or lift can be
+	// normal; DeleteBytes processes every row for the CID before answering,
+	// so a non-zero count in its answer means a bucket delete failed.
+	PendingObjectDeletes int `json:"pending_object_deletes"`
 }
 
 // OperatorRequest is an operator withhold.
@@ -112,10 +119,15 @@ func errNoActiveOperatorWithhold(cidStr string) error {
 }
 
 // Store is the withhold store.
-type Store struct{ db *sql.DB }
+type Store struct {
+	db        *sql.DB
+	byteStore blobstore.Store
+}
 
-// NewStore builds a Store.
-func NewStore(db *sql.DB) *Store { return &Store{db: db} }
+// NewStore builds a Store whose DeleteBytes deletes through byteStore.
+func NewStore(db *sql.DB, byteStore blobstore.Store) *Store {
+	return &Store{db: db, byteStore: byteStore}
+}
 
 // withholdColumns is the SELECT list scanWithhold reads.
 const withholdColumns = `id, cid, source, scope,
@@ -214,7 +226,10 @@ func (s *Store) Lift(ctx context.Context, cidStr, actor string) (State, error) {
 // DeleteBytes deletes the CID's bytes for every owner under an active
 // operator withhold. deleted_at and bytes_deleted_by are set by the first
 // delete only. With no active operator withhold it deletes nothing and
-// returns an error satisfying errors.IsNotFound.
+// returns an error satisfying errors.IsNotFound. The rows are deleted
+// through the byte store, which in s3 mode queues their objects' deletes;
+// after commit every queued object delete for the CID is processed, and the
+// returned state counts the ones still pending.
 func (s *Store) DeleteBytes(ctx context.Context, cidStr, actor string) (State, error) {
 	canonical, err := Canonicalize(cidStr)
 	if err != nil {
@@ -228,6 +243,11 @@ func (s *Store) DeleteBytes(ctx context.Context, cidStr, actor string) (State, e
 		return State{}, fmt.Errorf("blobwithhold: delete bytes %s: begin: %w", canonical, err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	// The exclusive CID lock waits for every PutBlob of this CID in flight,
+	// under any owner, so none inserts bytes after this delete.
+	if err := blobstore.LockCID(ctx, tx, canonical, false); err != nil {
+		return State{}, fmt.Errorf("blobwithhold: delete bytes %s: %w", canonical, err)
+	}
 	var id int64
 	err = tx.QueryRowContext(ctx, `
 		SELECT id FROM blob_withholds
@@ -239,7 +259,7 @@ func (s *Store) DeleteBytes(ctx context.Context, cidStr, actor string) (State, e
 	if err != nil {
 		return State{}, fmt.Errorf("blobwithhold: delete bytes %s: find withhold: %w", canonical, err)
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM blobs WHERE cid = $1`, canonical); err != nil {
+	if _, err := s.byteStore.DeleteCID(ctx, tx, canonical); err != nil {
 		return State{}, fmt.Errorf("blobwithhold: delete bytes %s: %w", canonical, err)
 	}
 	if _, err := tx.ExecContext(ctx, `
@@ -247,14 +267,14 @@ func (s *Store) DeleteBytes(ctx context.Context, cidStr, actor string) (State, e
 		WHERE id = $1 AND deleted_at IS NULL`, id, actor); err != nil {
 		return State{}, fmt.Errorf("blobwithhold: delete bytes %s: record: %w", canonical, err)
 	}
-	state, err := s.inspect(ctx, tx, canonical)
-	if err != nil {
-		return State{}, err
-	}
 	if err := tx.Commit(); err != nil {
 		return State{}, fmt.Errorf("blobwithhold: delete bytes %s: commit: %w", canonical, err)
 	}
-	return state, nil
+	// Every queue row for the CID, including an orphan object a failed
+	// PutBlob left without a blobs row; failures stay for the sweeper and
+	// show in PendingObjectDeletes.
+	s.byteStore.ProcessObjectDeletes(ctx, "", canonical)
+	return s.inspect(ctx, s.db, canonical)
 }
 
 // Inspect returns the CID's state: every withhold row (active and lifted),
@@ -292,6 +312,10 @@ func (s *Store) inspect(ctx context.Context, q queryer, canonical string) (State
 	if err := q.QueryRowContext(ctx,
 		`SELECT count(*) FROM blobs WHERE cid = $1`, canonical).Scan(&state.StoredOwners); err != nil {
 		return State{}, fmt.Errorf("blobwithhold: inspect %s: stored owners: %w", canonical, err)
+	}
+	if err := q.QueryRowContext(ctx,
+		`SELECT count(*) FROM blob_object_deletes WHERE cid = $1`, canonical).Scan(&state.PendingObjectDeletes); err != nil {
+		return State{}, fmt.Errorf("blobwithhold: inspect %s: pending object deletes: %w", canonical, err)
 	}
 	return state, nil
 }

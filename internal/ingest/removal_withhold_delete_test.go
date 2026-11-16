@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"tidepool/internal/blobstore"
 	"tidepool/internal/blobwithhold"
 	"tidepool/internal/materialize"
 )
@@ -234,7 +235,7 @@ func TestAnAuthorDeleteKeepsTheBytesOfAnOperatorWithheldImage(t *testing.T) {
 			t.Errorf("cleanup blob_withholds: %v", err)
 		}
 	})
-	_, err := blobwithhold.NewStore(h.db).Withhold(context.Background(), blobwithhold.OperatorRequest{
+	_, err := blobwithhold.NewStore(h.db, blobstore.NewPostgres(h.db)).Withhold(context.Background(), blobwithhold.OperatorRequest{
 		CID:        imageCID,
 		ReasonCode: blobwithhold.ReasonIllegalContent,
 		Actor:      "rw-delete-operator",

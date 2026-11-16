@@ -233,18 +233,26 @@ func (r *recordingScrubber) calls() []string {
 // configure adjusts the materializer options before New.
 func newHarness(t *testing.T, configure ...func(*Options)) *harness {
 	t.Helper()
+	return newHarnessWithRepoOptions(t, nil, configure...)
+}
+
+// newHarnessWithRepoOptions is newHarness with repoOptions passed to the
+// repo manager both h.manager and h.m use.
+func newHarnessWithRepoOptions(t *testing.T, repoOptions []repo.Option, configure ...func(*Options)) *harness {
+	t.Helper()
 	database := testutil.DB(t)
 	testutil.Truncate(t, database,
 		"ap_objects", "bridged_actors", "communities",
-		"blocks", "repo_state", "firehose_events", "blobs", "blob_withholds", "instances",
+		"blocks", "repo_state", "firehose_events", "blobs", "blob_withholds", "blob_object_deletes", "instances",
 		"coves_labels", "coves_label_cursor")
+	t.Cleanup(func() { testutil.Truncate(t, database, "blob_object_deletes") })
 
 	custodian, err := identity.NewCustodian(testKEK)
 	require.NoError(t, err)
 	actors := store.NewBridgedActors(database)
 	objects := store.NewAPObjects(database)
 	communities := store.NewCommunities(database)
-	manager, err := repo.NewManager(database, identity.NewActorKeys(actors, custodian), nil)
+	manager, err := repo.NewManager(database, identity.NewActorKeys(actors, custodian), nil, repoOptions...)
 	require.NoError(t, err)
 
 	mux := http.NewServeMux()

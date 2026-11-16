@@ -2,7 +2,8 @@
 #
 # Usage:
 #   make dev-up     # start the dev database (port 5442)
-#   make test       # starts postgres-test (port 5443) and runs the suite
+#   make test       # starts postgres-test (port 5443) and minio-test
+#                   # (127.0.0.1:9010) and runs the suite
 #   make dev-down   # stop everything
 #
 # Ports 5442/5443 are chosen to stay clear of the Coves stack
@@ -56,6 +57,28 @@ services:
       retries: 15
     profiles:
       - test
+
+  # Test object store (S3 API on 127.0.0.1:9010) — used by `make test` for the
+  # s3-mode blob tests. Started by `make test-s3-up` under the fixed Compose
+  # project tidepool-test-s3, so every checkout (main or a worktree) shares
+  # this one container. Data lives in memory; each test creates and removes
+  # its own bucket. The credentials are fixed, non-secret test values.
+  # The image is pgsty/minio, the Pigsty community build of the same server
+  # (the official minio/minio image could not be pulled on 2026-11-15),
+  # pinned by digest; keep it the same as .github/workflows/ci.yml.
+  minio-test:
+    image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z@sha256:b6bfe7239bfc83fb90d31612d9704d86039dd714f7904b3f1ad68f211e602372
+    container_name: tidepool-test-minio
+    command: ["server", "/data"]
+    ports:
+      - "127.0.0.1:9010:9000"
+    environment:
+      MINIO_ROOT_USER: tidepool_test
+      MINIO_ROOT_PASSWORD: tidepool_test_secret
+    tmpfs:
+      - /data:size=1g
+    profiles:
+      - test-s3
 
   # PLC directory postgres — backing store for the local did:plc directory.
   # Port 5444 stays clear of both the Tidepool (5442/5443) and Coves

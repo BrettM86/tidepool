@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"tidepool/internal/ap"
+	"tidepool/internal/blobstore"
 	"tidepool/internal/blobwithhold"
 	"tidepool/internal/materialize"
 	"tidepool/internal/store"
@@ -126,7 +127,7 @@ func TestCommunityReconcile_LiveCommentRestoreLeavesOtherWithholds(t *testing.T)
 	world := newReconcileWorld(t)
 	h := world.h
 	ctx := context.Background()
-	withholds := blobwithhold.NewStore(h.db)
+	withholds := blobwithhold.NewStore(h.db, blobstore.NewPostgres(h.db))
 
 	labelledID := world.postBy(ubUserID, world.communityC, "rc-b2-labelled", ubBeforeBan, true)
 	labelledImage := postBlobCID(t, h, labelledID)

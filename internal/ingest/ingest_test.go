@@ -233,6 +233,12 @@ type harness struct {
 
 	// materializerOptions built mat, for a rig that swaps one dependency.
 	materializerOptions materialize.Options
+	// repoOptions built manager; a second manager over the same byte store
+	// passes them too.
+	repoOptions []repo.Option
+	// blobBucket is the test bucket of an s3-mode harness (nil in postgres
+	// mode), as testutil.BlobsHoldingBytes takes it.
+	blobBucket *testutil.S3Bucket
 
 	mux      *http.ServeMux
 	fixtures *httptest.Server
@@ -271,6 +277,13 @@ func testServiceActor(t *testing.T) *ap.ServiceActor {
 }
 
 func newHarness(t *testing.T) *harness {
+	t.Helper()
+	return newHarnessWithRepoOptions(t, nil)
+}
+
+// newHarnessWithRepoOptions is newHarness with repoOptions passed to the
+// harness's repo manager (kept in h.repoOptions for a second manager).
+func newHarnessWithRepoOptions(t *testing.T, repoOptions []repo.Option) *harness {
 	t.Helper()
 	database := testutil.DB(t)
 	testutil.Truncate(t, database,
@@ -327,11 +340,12 @@ func newHarness(t *testing.T) *harness {
 	communities := store.NewCommunities(database)
 	tombstones := store.NewTombstones(database)
 	events := store.NewInboxEvents(database)
-	manager, err := repo.NewManager(database, identity.NewActorKeys(actors, custodian), nil)
+	manager, err := repo.NewManager(database, identity.NewActorKeys(actors, custodian), nil, repoOptions...)
 	require.NoError(t, err)
 
 	h := &harness{
 		t:           t,
+		repoOptions: repoOptions,
 		db:          database,
 		custodian:   custodian,
 		objects:     objects,

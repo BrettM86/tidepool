@@ -48,7 +48,7 @@ func TestCanonicalize(t *testing.T) {
 // database, so these must be rejected before any DB access.
 func TestAdminRejectsMalformedInput(t *testing.T) {
 	const token = "b1-admin-token"
-	admin, err := NewAdmin(AdminOptions{Token: token, Store: NewStore(nil)})
+	admin, err := NewAdmin(AdminOptions{Token: token, Store: NewStore(nil, nil)})
 	require.NoError(t, err)
 	router := chi.NewRouter()
 	admin.Routes(router)

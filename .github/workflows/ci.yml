@@ -1,7 +1,7 @@
 # Tidepool CI.
 #
 # unit: always — build, vet, lexicon-manifest check, full unit/integration
-#   suite against a real postgres service (Coves convention: tests hit real
+#   suite against a real postgres service and a local MinIO (Coves convention: tests hit real
 #   infrastructure; PLC-dependent identity tests self-skip when no local PLC
 #   directory is reachable, and NOTHING ever touches the public
 #   plc.directory).
@@ -56,9 +56,29 @@ jobs:
         run: git clone --depth 1 https://github.com/BrettM86/coves /tmp/coves
       - name: Lexicon manifest and upstream drift check
         run: ./scripts/check-lexicons.sh /tmp/coves
+      # The s3-mode blob tests need a local MinIO. A step rather than a
+      # service container: a service cannot be given `server /data`. The
+      # image is pgsty/minio, the Pigsty community build of MinIO (the
+      # official minio/minio image could not be pulled on 2026-11-15), pinned
+      # by digest; keep it the same as docker-compose.dev.yml.
+      - name: Start test MinIO
+        run: |
+          docker run -d --name tidepool-test-minio -p 127.0.0.1:9010:9000 \
+            -e MINIO_ROOT_USER=tidepool_test -e MINIO_ROOT_PASSWORD=tidepool_test_secret \
+            pgsty/minio:RELEASE.2026-08-04T00-00-00Z@sha256:b6bfe7239bfc83fb90d31612d9704d86039dd714f7904b3f1ad68f211e602372 server /data
+          for i in $(seq 1 30); do
+            curl -fs -o /dev/null http://127.0.0.1:9010/minio/health/live && exit 0
+            sleep 1
+          done
+          docker logs tidepool-test-minio
+          exit 1
       - name: Unit & integration tests
         env:
           TIDEPOOL_TEST_DATABASE_URL: postgres://tidepool_test:tidepool_test@localhost:5443/tidepool_test?sslmode=disable
+          TIDEPOOL_TEST_S3_ENDPOINT: http://127.0.0.1:9010
+          TIDEPOOL_TEST_S3_ACCESS_KEY_ID: tidepool_test
+          TIDEPOOL_TEST_S3_SECRET_ACCESS_KEY: tidepool_test_secret
+          TIDEPOOL_TEST_S3_REGION: us-east-1
         run: go test -tags nodynamic ./...
 
   e2e:

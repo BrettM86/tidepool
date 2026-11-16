@@ -35,8 +35,9 @@ const (
 
 // Processor consumes one claimed inbox event. *Handler implements it.
 // Return contract: nil or IsSkip → processed; IsValidation → poisoned;
-// ErrMintRateExceeded or *identity.PLCRateLimitedError → parked for a fixed
-// delay and retried at no attempt cost, for as long as the throttling lasts.
+// ErrMintRateExceeded, *identity.PLCRateLimitedError or a byte-store failure
+// (errors.IsBlobStoreUnavailable) → parked for a fixed delay and retried at
+// no attempt cost, for as long as the throttling or outage lasts.
 // With a Deferrer, anything else that is host-gone is deferred out of the
 // queue on that attempt (processed), and an object its live host does not
 // serve is a skip. The rest is retried with backoff until the attempt cap,
@@ -438,13 +439,15 @@ func claimToken(event *store.InboxEvent) time.Time {
 	return *event.ClaimedUntil
 }
 
-// isThrottled reports whether err is a refusal by the PLC write budget or a
-// PLC 429. It matches *identity.PLCRateLimitedError and not the wider
+// isThrottled reports whether err is a refusal by the PLC write budget, a
+// PLC 429, or a byte-store failure (errors.IsBlobStoreUnavailable): none of
+// them says anything about the work, which waits for as long as they last.
+// It matches *identity.PLCRateLimitedError and not the wider
 // identity.ErrPLCTransient that type unwraps to: other transient PLC failures
 // still spend attempts.
 func isThrottled(err error) bool {
 	var rateLimited *identity.PLCRateLimitedError
-	return stderrors.Is(err, ErrMintRateExceeded) || stderrors.As(err, &rateLimited)
+	return stderrors.Is(err, ErrMintRateExceeded) || stderrors.As(err, &rateLimited) || errors.IsBlobStoreUnavailable(err)
 }
 
 // parkWait is the park delay plus jitter uniform in [0, delay/4), so events

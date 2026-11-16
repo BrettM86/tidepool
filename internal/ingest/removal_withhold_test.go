@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"tidepool/internal/ap"
+	"tidepool/internal/blobstore"
 	"tidepool/internal/blobwithhold"
 	"tidepool/internal/errors"
 	"tidepool/internal/materialize"
@@ -228,7 +229,7 @@ func assertBlobStored(t *testing.T, h *harness, did, cidStr, why string) {
 // activeRemovalWithholds returns cidStr's active community-removal rows.
 func activeRemovalWithholds(t *testing.T, h *harness, cidStr string) []blobwithhold.Withhold {
 	t.Helper()
-	state, err := blobwithhold.NewStore(h.db).Inspect(context.Background(), cidStr)
+	state, err := blobwithhold.NewStore(h.db, blobstore.NewPostgres(h.db)).Inspect(context.Background(), cidStr)
 	require.NoError(t, err)
 	var active []blobwithhold.Withhold
 	for _, row := range state.Withholds {
@@ -242,7 +243,7 @@ func activeRemovalWithholds(t *testing.T, h *harness, cidStr string) []blobwithh
 // activeOperatorWithholds returns cidStr's active operator rows.
 func activeOperatorWithholds(t *testing.T, h *harness, cidStr string) []blobwithhold.Withhold {
 	t.Helper()
-	state, err := blobwithhold.NewStore(h.db).Inspect(context.Background(), cidStr)
+	state, err := blobwithhold.NewStore(h.db, blobstore.NewPostgres(h.db)).Inspect(context.Background(), cidStr)
 	require.NoError(t, err)
 	var active []blobwithhold.Withhold
 	for _, row := range state.Withholds {
@@ -325,68 +326,64 @@ func TestACommunityRemovalWithholdsEveryBlobOfTheRemovedPosts(t *testing.T) {
 // one keeps its community-removal row for A and stays refused (its bytes are
 // still stored, and only a restore lifts).
 func TestAnEditOfARemovedPostWithholdsItsNewImageAndKeepsTheDroppedOne(t *testing.T) {
-	world := newUpstreamBanWorld(t)
-	h := world.h
-	ctx := context.Background()
+	for _, mode := range blobModes() {
+		t.Run(mode.name, func(t *testing.T) {
+			world := newUpstreamBanWorldOn(t, newHarnessInMode(t, mode))
+			h := world.h
 
-	const slug = "rw-b2"
-	postID := world.imagePost(world.communityC, slug, "b2-image-one", "b2-image-two")
-	before := recordBlobCIDs(t, h, postID)
-	world.removeFromC(slug, postID)
-	subject := atURIOf(t, h, postID)
-	for _, c := range before {
-		assertBlobStored(t, h, ubUserDID, c, "a removal keeps the bytes")
+			const slug = "rw-b2"
+			postID := world.imagePost(world.communityC, slug, "b2-image-one", "b2-image-two")
+			before := recordBlobCIDs(t, h, postID)
+			world.removeFromC(slug, postID)
+			subject := atURIOf(t, h, postID)
+			for _, c := range before {
+				assertBlobStored(t, h, ubUserDID, c, "a removal keeps the bytes")
+			}
+
+			// Identify image one's and image two's CIDs from the stored blobs rows'
+			// bytes (the fixture's own bytes), not from any code under test.
+			cidOfSeed := func(seed string) string {
+				t.Helper()
+				found := storedCIDsOfBytes(t, h, ubUserDID, rwImageBytes(seed))
+				require.NotEmpty(t, found, "precondition: %s's bytes are stored under U", seed)
+				return found[len(found)-1]
+			}
+			imageOne := cidOfSeed("b2-image-one")
+			imageTwo := cidOfSeed("b2-image-two")
+			require.ElementsMatch(t, before, []string{imageOne, imageTwo}, "precondition: A references images one and two")
+
+			edited := world.rwPage(world.communityC, slug, "2026-08-20T12:00:00Z",
+				world.rwImageAttachments(slug+"-edit", "b2-image-three", "b2-image-two"))
+			h.serveObject("/post/"+slug, edited)
+			require.Equal(t, http.StatusAccepted, h.deliver(world.communityC, map[string]any{
+				"id":       world.communityC.id + "/activities/announce/update/" + slug,
+				"type":     "Announce",
+				"actor":    world.communityC.id,
+				"audience": world.communityC.id,
+				"object": map[string]any{
+					"id":       originOf(ubUserID) + "/activities/update/" + slug,
+					"type":     "Update",
+					"actor":    ubUserID,
+					"audience": world.communityC.id,
+					"object":   edited,
+				},
+			}))
+			h.drain()
+
+			imageThree := cidOfSeed("b2-image-three")
+			require.ElementsMatch(t, []string{imageThree, imageTwo}, recordBlobCIDs(t, h, postID),
+				"precondition: the edit re-materialized A with images three and two")
+			require.Equal(t, materialize.RemovalCodeModeratorDiscretion, removalCode(t, h, ubCommunityCDID, postID),
+				"precondition: the removal still stands after the edit")
+
+			assertBlobStored(t, h, ubUserDID, imageThree, "the edit's new image is stored")
+			assertBlobRefused(t, h, ubUserDID, imageThree, "the new image of a post that is still removed")
+			assertOneRemovalWithhold(t, h, imageThree, subject, ubUserDID)
+			assertBlobRefused(t, h, ubUserDID, imageTwo, "an image the removed post still references")
+			assertOneRemovalWithhold(t, h, imageOne, subject, ubUserDID)
+			assertBlobRefused(t, h, ubUserDID, imageOne, "the image a still-removed post dropped")
+		})
 	}
-
-	// Identify image one's and image two's CIDs from the stored blobs rows'
-	// bytes (the fixture's own bytes), not from any code under test.
-	cidOfSeed := func(seed string) string {
-		t.Helper()
-		var found string
-		rows, err := h.db.QueryContext(ctx, `SELECT cid FROM blobs WHERE did = $1 AND bytes = $2`, ubUserDID, rwImageBytes(seed))
-		require.NoError(t, err)
-		defer func() { _ = rows.Close() }()
-		for rows.Next() {
-			require.NoError(t, rows.Scan(&found))
-		}
-		require.NoError(t, rows.Err())
-		require.NotEmpty(t, found, "precondition: %s's bytes are stored under U", seed)
-		return found
-	}
-	imageOne := cidOfSeed("b2-image-one")
-	imageTwo := cidOfSeed("b2-image-two")
-	require.ElementsMatch(t, before, []string{imageOne, imageTwo}, "precondition: A references images one and two")
-
-	edited := world.rwPage(world.communityC, slug, "2026-08-20T12:00:00Z",
-		world.rwImageAttachments(slug+"-edit", "b2-image-three", "b2-image-two"))
-	h.serveObject("/post/"+slug, edited)
-	require.Equal(t, http.StatusAccepted, h.deliver(world.communityC, map[string]any{
-		"id":       world.communityC.id + "/activities/announce/update/" + slug,
-		"type":     "Announce",
-		"actor":    world.communityC.id,
-		"audience": world.communityC.id,
-		"object": map[string]any{
-			"id":       originOf(ubUserID) + "/activities/update/" + slug,
-			"type":     "Update",
-			"actor":    ubUserID,
-			"audience": world.communityC.id,
-			"object":   edited,
-		},
-	}))
-	h.drain()
-
-	imageThree := cidOfSeed("b2-image-three")
-	require.ElementsMatch(t, []string{imageThree, imageTwo}, recordBlobCIDs(t, h, postID),
-		"precondition: the edit re-materialized A with images three and two")
-	require.Equal(t, materialize.RemovalCodeModeratorDiscretion, removalCode(t, h, ubCommunityCDID, postID),
-		"precondition: the removal still stands after the edit")
-
-	assertBlobStored(t, h, ubUserDID, imageThree, "the edit's new image is stored")
-	assertBlobRefused(t, h, ubUserDID, imageThree, "the new image of a post that is still removed")
-	assertOneRemovalWithhold(t, h, imageThree, subject, ubUserDID)
-	assertBlobRefused(t, h, ubUserDID, imageTwo, "an image the removed post still references")
-	assertOneRemovalWithhold(t, h, imageOne, subject, ubUserDID)
-	assertBlobRefused(t, h, ubUserDID, imageOne, "the image a still-removed post dropped")
 }
 
 // TestARemovalWithholdsAnImageAnotherLivePostOfTheAuthorStillUses (B3).
@@ -549,7 +546,7 @@ func TestAnOperatorWithholdOutlivesACommunityRemovalAndItsRestore(t *testing.T) 
 			name: "operator lift leaves the removal withhold",
 			slug: "rw-b5b",
 			act: func(t *testing.T, world *upstreamBanWorld, postID, imageOne string) (string, bool) {
-				_, err := blobwithhold.NewStore(world.h.db).Lift(context.Background(), imageOne, "b5b-operator")
+				_, err := blobwithhold.NewStore(world.h.db, blobstore.NewPostgres(world.h.db)).Lift(context.Background(), imageOne, "b5b-operator")
 				require.NoError(t, err)
 				require.Empty(t, activeOperatorWithholds(t, world.h, imageOne), "precondition: the operator row is lifted")
 				assertOneRemovalWithhold(t, world.h, imageOne, atURIOf(t, world.h, postID), ubUserDID)
@@ -565,7 +562,7 @@ func TestAnOperatorWithholdOutlivesACommunityRemovalAndItsRestore(t *testing.T) 
 			postID := world.imagePost(world.communityC, tc.slug, tc.slug+"-image-one", tc.slug+"-image-two")
 			cids := recordBlobCIDs(t, h, postID)
 			imageOne, imageTwo := cids[0], cids[1]
-			_, err := blobwithhold.NewStore(h.db).Withhold(ctx, blobwithhold.OperatorRequest{
+			_, err := blobwithhold.NewStore(h.db, blobstore.NewPostgres(h.db)).Withhold(ctx, blobwithhold.OperatorRequest{
 				CID:        imageOne,
 				ReasonCode: "operator-discretion",
 				Actor:      tc.slug + "-operator",

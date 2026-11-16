@@ -153,6 +153,16 @@ func (m *Materializer) MaterializePost(ctx context.Context, page *ap.Object, com
 		}
 		record = m.buildPostV2Record(ctx, page, community.DID, author, authorDoc, did)
 	}
+	// Embed media is fetched into the record's repo. A byte-store failure
+	// fails the post before anything is committed for it, so it is retried
+	// with its images rather than bridged without them.
+	embed, err := m.buildPostEmbed(ctx, page, did)
+	if err != nil {
+		return nil, err
+	}
+	if embed != nil {
+		record["embed"] = embed
+	}
 	res, err := m.commitRecord(ctx, did, collection, rkey, record, page, authorDID, community.DID)
 	if err != nil {
 		return nil, err
@@ -179,17 +189,17 @@ func (m *Materializer) MaterializePost(ctx context.Context, page *ap.Object, com
 }
 
 // buildPostV2Record translates the Page per the community.postv2 lexicon:
-// the shared post fields, plus the provenance a bridged record owes its
+// the shared text fields (MaterializePost adds the embed), plus the provenance a bridged record owes its
 // readers. There is deliberately no `author` — the record's repo is the
 // authorship claim, and a field restating it would invite a consumer to
 // trust the field over the repo.
-func (m *Materializer) buildPostV2Record(ctx context.Context, page *ap.Object, communityDID string, author *store.BridgedActor, authorDoc *ap.Object, repoDID string) map[string]any {
+func (m *Materializer) buildPostV2Record(_ context.Context, page *ap.Object, communityDID string, author *store.BridgedActor, authorDoc *ap.Object, _ string) map[string]any {
 	record := map[string]any{
 		"$type":     CollectionPostV2,
 		"community": communityDID,
 		"createdAt": recordDatetime(page.Published.Time),
 	}
-	m.fillPostContent(ctx, record, page, repoDID, apobject.MaximumPostContentGraphemes, apobject.MaximumPostContentBytes)
+	m.fillPostContent(page, record, apobject.MaximumPostContentGraphemes, apobject.MaximumPostContentBytes)
 	record["originalAuthor"] = originalAuthorOf(author, authorDoc)
 	record["federatedFrom"] = federatedFromOf(page)
 	return record
@@ -292,9 +302,9 @@ func isPublicCollection(iri string) bool {
 }
 
 // buildPostRecord translates the Page fields per the DEPRECATED
-// community.post lexicon. Reached only for a post already materialized under
+// community.post lexicon, all but the embed, which MaterializePost adds. Reached only for a post already materialized under
 // that collection, which keeps being updated where it lies.
-func (m *Materializer) buildPostRecord(ctx context.Context, page *ap.Object, communityDID, authorDID, repoDID string) map[string]any {
+func (m *Materializer) buildPostRecord(_ context.Context, page *ap.Object, communityDID, authorDID, _ string) map[string]any {
 	record := map[string]any{
 		"$type":     CollectionPost,
 		"community": communityDID,
@@ -303,16 +313,14 @@ func (m *Materializer) buildPostRecord(ctx context.Context, page *ap.Object, com
 	}
 	// The deprecated community.post lexicon keeps the 10000-grapheme /
 	// 100000-byte body limit postv2 has outgrown.
-	m.fillPostContent(ctx, record, page, repoDID, 10000, 100000)
+	m.fillPostContent(page, record, 10000, 100000)
 	return record
 }
 
-// fillPostContent adds the fields both post eras share — title, body and
-// facets, langs, self-labels, embed. The body is truncated to the era's
-// lexicon limits. Embed media is fetched into repoDID's blob store (the repo
-// holding the record); media failures degrade to a post without the affected
-// embed.
-func (m *Materializer) fillPostContent(ctx context.Context, record map[string]any, page *ap.Object, repoDID string, maximumContentGraphemes, maximumContentBytes int) {
+// fillPostContent adds the text fields both post eras share — title, body
+// and facets, langs, self-labels. The body is truncated to the era's lexicon
+// limits. The embed is added by MaterializePost, which can fail on it.
+func (m *Materializer) fillPostContent(page *ap.Object, record map[string]any, maximumContentGraphemes, maximumContentBytes int) {
 	if page.Name != "" {
 		record["title"] = truncateText(page.Name, 300, 3000)
 	}
@@ -333,20 +341,21 @@ func (m *Materializer) fillPostContent(ctx context.Context, record map[string]an
 	if page.Sensitive != nil && *page.Sensitive {
 		record["labels"] = selfLabels("nsfw")
 	}
-	if embed := m.buildPostEmbed(ctx, page, repoDID); embed != nil {
-		record["embed"] = embed
-	}
 }
 
 // fetchEmbedImage stores one embed image in repoDID and returns its
 // social.coves.embed.images#image entry with the aspect ratio of the stored
 // bytes, so clients can size the frame before the image loads. It returns
-// nil when the image is omitted.
-func (m *Materializer) fetchEmbedImage(ctx context.Context, repoDID, url string) map[string]any {
-	// A fetch failure is logged in fetchMedia; post images are optional.
-	blob, data, _ := m.fetchMedia(ctx, repoDID, url, slotEmbedImage)
+// nil when the image is omitted, and an error only for a byte-store failure.
+func (m *Materializer) fetchEmbedImage(ctx context.Context, repoDID, url string) (map[string]any, error) {
+	// A fetch failure is logged in fetchMedia; post images are optional, but
+	// a byte-store failure fails the post so it is retried with its image.
+	blob, data, err := m.fetchMedia(ctx, repoDID, url, slotEmbedImage)
+	if errors.IsBlobStoreUnavailable(err) {
+		return nil, err
+	}
 	if blob == nil {
-		return nil
+		return nil, nil
 	}
 	image := map[string]any{"image": *blob}
 	if aspectRatio := imageAspectRatio(blob.MimeType, data); aspectRatio != nil {
@@ -355,7 +364,7 @@ func (m *Materializer) fetchEmbedImage(ctx context.Context, repoDID, url string)
 		m.logger.Debug("embed image dimensions unreadable; omitting aspectRatio",
 			"url", url, "mime_type", blob.MimeType)
 	}
-	return image
+	return image, nil
 }
 
 // buildPostEmbed maps the Page's attachments onto the post embed union:
@@ -363,8 +372,9 @@ func (m *Materializer) fetchEmbedImage(ctx context.Context, repoDID, url string)
 // that will hold the record); a link attachment (or `url`) →
 // social.coves.embed.external with the Lemmy-provided thumbnail as thumb,
 // falling back to the link's unfurled thumbnail (YouTube oEmbed or og:image)
-// when the Page has none or it fails to fetch.
-func (m *Materializer) buildPostEmbed(ctx context.Context, page *ap.Object, repoDID string) map[string]any {
+// when the Page has none or it fails to fetch. A byte-store failure for any
+// of that media is returned as an error.
+func (m *Materializer) buildPostEmbed(ctx context.Context, page *ap.Object, repoDID string) (map[string]any, error) {
 	var images []any
 	var externalLink *ap.Link
 	for i := range page.Attach {
@@ -380,7 +390,10 @@ func (m *Materializer) buildPostEmbed(ctx context.Context, page *ap.Object, repo
 			if len(images) >= 8 {
 				continue // lexicon maxLength
 			}
-			image := m.fetchEmbedImage(ctx, repoDID, href)
+			image, err := m.fetchEmbedImage(ctx, repoDID, href)
+			if err != nil {
+				return nil, err
+			}
 			if image == nil {
 				continue
 			}
@@ -398,7 +411,7 @@ func (m *Materializer) buildPostEmbed(ctx context.Context, page *ap.Object, repo
 		return map[string]any{
 			"$type":  "social.coves.embed.images",
 			"images": images,
-		}
+		}, nil
 	}
 
 	uri := ""
@@ -414,14 +427,18 @@ func (m *Materializer) buildPostEmbed(ctx context.Context, page *ap.Object, repo
 		// No link, no images. A Lemmy thumbnail alone (image posts sometimes
 		// deliver the pictrs file in `image`) still makes an images embed.
 		if thumbURL := imageURL(page.Image); thumbURL != "" {
-			if image := m.fetchEmbedImage(ctx, repoDID, thumbURL); image != nil {
+			image, err := m.fetchEmbedImage(ctx, repoDID, thumbURL)
+			if err != nil {
+				return nil, err
+			}
+			if image != nil {
 				return map[string]any{
 					"$type":  "social.coves.embed.images",
 					"images": []any{image},
-				}
+				}, nil
 			}
 		}
-		return nil
+		return nil, nil
 	}
 
 	external := map[string]any{"uri": uri}
@@ -429,29 +446,40 @@ func (m *Materializer) buildPostEmbed(ctx context.Context, page *ap.Object, repo
 		external["title"] = truncateGraphemes(title, 500)
 	}
 	if thumbURL := imageURL(page.Image); thumbURL != "" {
-		if blob := m.fetchBlob(ctx, repoDID, thumbURL, slotExternalThumb); blob != nil {
+		blob, err := m.fetchBlob(ctx, repoDID, thumbURL, slotExternalThumb)
+		if err != nil {
+			return nil, err
+		}
+		if blob != nil {
 			external["thumb"] = *blob
 		}
 	}
 	if _, ok := external["thumb"]; !ok && m.linkPreviews != nil {
-		if blob := m.unfurlThumb(ctx, repoDID, uri); blob != nil {
+		blob, err := m.unfurlThumb(ctx, repoDID, uri)
+		if err != nil {
+			return nil, err
+		}
+		if blob != nil {
 			external["thumb"] = *blob
 		}
 	}
 	return map[string]any{
 		"$type":    "social.coves.embed.external",
 		"external": external,
-	}
+	}, nil
 }
 
 // unfurlThumb resolves uri's thumbnail through the link previewer and
-// fetches it as an external thumb. Every failure is logged (fetchBlob logs
-// its own) and leaves the embed without a thumb.
-func (m *Materializer) unfurlThumb(ctx context.Context, repoDID, uri string) *atdata.Blob {
+// fetches it as an external thumb. linkPreviewTimeout bounds the resolve and
+// the origin download only; the store runs under ctx, so the unfurl deadline
+// never cuts it. Every failure is logged (fetchAndStoreMedia logs its own)
+// and leaves the embed without a thumb, except a byte-store failure, which
+// is returned so the materialization is retried with its thumb.
+func (m *Materializer) unfurlThumb(ctx context.Context, repoDID, uri string) (*atdata.Blob, error) {
 	if err := ctx.Err(); err != nil {
 		m.logger.Warn("link thumbnail unfurl skipped",
 			"uri", uri, "did", repoDID, "reason", "context ended", "error", err)
-		return nil
+		return nil, nil
 	}
 	// One deadline covers the resolve and the thumbnail download, so a slow
 	// resolver cannot buy the download a fresh budget.
@@ -464,15 +492,21 @@ func (m *Materializer) unfurlThumb(ctx context.Context, repoDID, uri string) *at
 		if ctx.Err() != nil && (stderrors.Is(err, context.Canceled) || stderrors.Is(err, context.DeadlineExceeded)) {
 			m.logger.Warn("link thumbnail unfurl skipped",
 				"uri", uri, "did", repoDID, "reason", "context ended", "error", err)
-			return nil
+			return nil, nil
 		}
 		m.logger.Warn("link thumbnail unfurl failed", "uri", uri, "did", repoDID, "error", err)
-		return nil
+		return nil, nil
 	}
 	if thumbURL == "" {
-		return nil
+		return nil, nil
 	}
-	return m.fetchBlob(unfurlCtx, repoDID, thumbURL, slotExternalThumb)
+	blob, _, err := m.fetchAndStoreMedia(unfurlCtx, ctx, repoDID, thumbURL, slotExternalThumb)
+	if errors.IsBlobStoreUnavailable(err) {
+		return nil, err
+	}
+	// Any other error is the origin's (fetchAndStoreMedia logged it): the
+	// embed goes without a thumb, as fetchBlob does.
+	return blob, nil
 }
 
 // isSafeLinkScheme restricts bridge-authored clickable URIs (external

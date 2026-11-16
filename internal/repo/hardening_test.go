@@ -178,35 +178,40 @@ func TestPutRecordTxSideEffectAtomicity(t *testing.T) {
 	assert.Equal(t, 1, eventCount, "a NoOp re-put emits no new event")
 }
 
+// TestDeleteBlobAndDeleteBlobsForDID runs in both byte-store modes.
 func TestDeleteBlobAndDeleteBlobsForDID(t *testing.T) {
-	manager, _, _ := testManager(t)
-	ctx := t.Context()
+	for _, mode := range blobManagerModes() {
+		t.Run(mode.name, func(t *testing.T) {
+			manager, _ := mode.manager(t)
+			ctx := t.Context()
 
-	blob1, err := manager.PutBlob(ctx, testDID, "image/png", []byte("png-bytes-1"))
-	require.NoError(t, err)
-	blob2, err := manager.PutBlob(ctx, testDID, "image/png", []byte("png-bytes-2"))
-	require.NoError(t, err)
-	const otherDID = "did:plc:yk4dd2qkboz2yv6tpubpc6co"
-	other, err := manager.PutBlob(ctx, otherDID, "image/png", []byte("png-bytes-3"))
-	require.NoError(t, err)
+			blob1, err := manager.PutBlob(ctx, testDID, "image/png", []byte("png-bytes-1"))
+			require.NoError(t, err)
+			blob2, err := manager.PutBlob(ctx, testDID, "image/png", []byte("png-bytes-2"))
+			require.NoError(t, err)
+			const otherDID = "did:plc:yk4dd2qkboz2yv6tpubpc6co"
+			other, err := manager.PutBlob(ctx, otherDID, "image/png", []byte("png-bytes-3"))
+			require.NoError(t, err)
 
-	cid1 := blob1.Ref.String()
-	require.NoError(t, manager.DeleteBlob(ctx, testDID, cid1))
-	_, _, err = manager.GetBlob(ctx, testDID, cid1)
-	assert.True(t, errors.IsNotFound(err))
-	// Idempotent: deleting again is a no-op success.
-	require.NoError(t, manager.DeleteBlob(ctx, testDID, cid1))
+			cid1 := blob1.Ref.String()
+			require.NoError(t, manager.DeleteBlob(ctx, testDID, cid1))
+			_, _, err = manager.GetBlob(ctx, testDID, cid1)
+			assert.True(t, errors.IsNotFound(err))
+			// Idempotent: deleting again is a no-op success.
+			require.NoError(t, manager.DeleteBlob(ctx, testDID, cid1))
 
-	n, err := manager.DeleteBlobsForDID(ctx, testDID)
-	require.NoError(t, err)
-	assert.Equal(t, int64(1), n, "only the remaining blob under the DID")
-	_, _, err = manager.GetBlob(ctx, testDID, blob2.Ref.String())
-	assert.True(t, errors.IsNotFound(err))
+			n, err := manager.DeleteBlobsForDID(ctx, testDID)
+			require.NoError(t, err)
+			assert.Equal(t, int64(1), n, "only the remaining blob under the DID")
+			_, _, err = manager.GetBlob(ctx, testDID, blob2.Ref.String())
+			assert.True(t, errors.IsNotFound(err))
 
-	// The other DID's blob is untouched.
-	data, _, err := manager.GetBlob(ctx, otherDID, other.Ref.String())
-	require.NoError(t, err)
-	assert.Equal(t, []byte("png-bytes-3"), data)
+			// The other DID's blob is untouched.
+			data, _, err := manager.GetBlob(ctx, otherDID, other.Ref.String())
+			require.NoError(t, err)
+			assert.Equal(t, []byte("png-bytes-3"), data)
+		})
+	}
 }
 
 // TestPruneEventsBatched drives PruneEvents across multiple DELETE batches

@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"tidepool/internal/blobstore"
 	"tidepool/internal/blobwithhold"
 	"tidepool/internal/errors"
 	"tidepool/internal/labels"
@@ -97,7 +98,7 @@ func TestAccountTakedown_BridgedPersonsBlobsAreWithheldUntilTheLabelLifts(t *tes
 			h := newHarness(t)
 			h.serveLemmyWorldFixtures()
 			rig := newLabelRig(t, h)
-			withholds := blobwithhold.NewStore(testutil.DB(t))
+			withholds := blobwithhold.NewStore(testutil.DB(t), blobstore.NewPostgres(testutil.DB(t)))
 			const firstPostID = "https://lemmy.world/post/b8-account-label-first"
 			const laterPostID = "https://lemmy.world/post/b8-account-label-later"
 			const operatorPostID = "https://lemmy.world/post/b8-account-label-operator"
@@ -138,7 +139,7 @@ func TestAccountTakedown_BridgedPersonsBlobsAreWithheldUntilTheLabelLifts(t *tes
 		h := newHarness(t)
 		h.serveLemmyWorldFixtures()
 		rig := newLabelRig(t, h)
-		withholds := blobwithhold.NewStore(testutil.DB(t))
+		withholds := blobwithhold.NewStore(testutil.DB(t), blobstore.NewPostgres(testutil.DB(t)))
 		ctx := context.Background()
 		const postID = "https://lemmy.world/post/b8-account-label-group"
 
@@ -168,7 +169,7 @@ func TestAccountTakedown_StoredLabelCoversABridgedPersonOnceActionable(t *testin
 		h := newHarness(t)
 		h.serveLemmyWorldFixtures()
 		rig := newLabelRig(t, h)
-		withholds := blobwithhold.NewStore(testutil.DB(t))
+		withholds := blobwithhold.NewStore(testutil.DB(t), blobstore.NewPostgres(testutil.DB(t)))
 		const postID = "https://lemmy.world/post/b15-account-label-before-mint"
 
 		_, err := h.actors.GetByDID(context.Background(), authorDID)
@@ -186,7 +187,7 @@ func TestAccountTakedown_StoredLabelCoversABridgedPersonOnceActionable(t *testin
 		h := newHarness(t)
 		h.serveLemmyWorldFixtures()
 		rig := newLabelRig(t, h)
-		withholds := blobwithhold.NewStore(testutil.DB(t))
+		withholds := blobwithhold.NewStore(testutil.DB(t), blobstore.NewPostgres(testutil.DB(t)))
 		const postID = "https://lemmy.world/post/b15-account-label-activation"
 
 		materializeImagePost(t, h, postID, "/media/b15-activation.png", []byte("b15-account-label-activation-image"))

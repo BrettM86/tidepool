@@ -26,6 +26,7 @@ import (
 	blockformat "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
 
+	"tidepool/internal/blobstore"
 	"tidepool/internal/blobwithhold"
 	"tidepool/internal/errors"
 )
@@ -119,6 +120,10 @@ type Manager struct {
 	// withholds answers "may (DID, CID) be stored or served" for the blob
 	// paths, over the same database.
 	withholds *blobwithhold.Store
+
+	// blobStore holds blob bytes; blobstore.NewPostgres(db) unless
+	// WithBlobStore set another.
+	blobStore blobstore.Store
 }
 
 // Option customizes a Manager at construction. Options are additive; the
@@ -132,6 +137,12 @@ type Option func(*Manager)
 // DefaultTreeCacheSize — there is no in-band "default" value.
 func WithTreeCacheSize(n int) Option {
 	return func(m *Manager) { m.treeCache = newTreeCache(n) }
+}
+
+// WithBlobStore sets the byte store blob bytes go through, in place of the
+// default blobstore.NewPostgres over the Manager's database.
+func WithBlobStore(store blobstore.Store) Option {
+	return func(m *Manager) { m.blobStore = store }
 }
 
 // NewManager builds the repo manager. db and keys must be non-nil; a nil
@@ -153,11 +164,12 @@ func NewManager(db *sql.DB, keys SigningKeys, logger *slog.Logger, opts ...Optio
 		logger:    logger,
 		locks:     make(map[string]*sync.Mutex),
 		treeCache: newTreeCache(DefaultTreeCacheSize),
-		withholds: blobwithhold.NewStore(db),
+		blobStore: blobstore.NewPostgres(db),
 	}
 	for _, opt := range opts {
 		opt(m)
 	}
+	m.withholds = blobwithhold.NewStore(db, m.blobStore)
 	return m, nil
 }
 

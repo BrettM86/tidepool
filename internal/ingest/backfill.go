@@ -684,6 +684,12 @@ func (b *Backfill) materializeComment(ctx context.Context, note *ap.Object, comm
 	removeErr := b.removeDeletedAncestors(ctx, res, communityIRI)
 	if err != nil {
 		if removeErr != nil {
+			// A byte-store outage stays visible so the reply pass fails the
+			// walk; any other cause (a skip among them) is only formatted, so
+			// the failed removal still fails the item.
+			if errors.IsBlobStoreUnavailable(err) {
+				return false, stderrors.Join(removeErr, fmt.Errorf("materializing %s: %w", note.ID, err))
+			}
 			return false, fmt.Errorf("%w (materializing %s: %v)", removeErr, note.ID, err)
 		}
 		return false, err
@@ -789,7 +795,10 @@ func (b *Backfill) seedCounts(ctx context.Context, postAPID, communityIRI string
 // same way, after the rest of the collection is walked, with ErrReplyHostGone,
 // so the run retries it, and so does one whose deferral cannot be written. A
 // reply on a host that already failed host-gone in this walk is deferred
-// without a fetch. A replies collection (or a later page) on a gone host
+// without a fetch. A reply that fails on a byte-store outage
+// (errors.IsBlobStoreUnavailable) also fails the pass after the walk, so the
+// run stays unstamped and the reply is not lost to the outage. A replies
+// collection (or a later page) on a gone host
 // defers the post itself under that host, so a later sweep re-walks its
 // replies; when its failure cannot be recorded, or the deferral cannot be
 // written, the pass fails the same way. Any other reply failure is logged and
@@ -830,6 +839,8 @@ func (b *Backfill) backfillReplies(ctx context.Context, post *ap.Object, communi
 	// deferErr is the first reply (or the post, for its collection) whose
 	// host-gone deferral failed.
 	var deferErr error
+	// storeErr is the first reply that failed on a byte-store outage.
+	var storeErr error
 	deferReply := func(reply *ap.Object, err error) {
 		if failure := b.deferDeadHostItem(ctx, reply, communityIRI, communityDID, err); failure != nil {
 			b.logger.Warn("backfill reply failed", "post", post.ID, "reply", reply.ID, "error", failure)
@@ -906,6 +917,11 @@ func (b *Backfill) backfillReplies(ctx context.Context, post *ap.Object, communi
 			b.logger.Info("backfill reply skipped", "post", post.ID, "reason", err.Error())
 		case replyHostGone:
 			noteUnrecordedHostGone(resolved.ID, err)
+		case errors.IsBlobStoreUnavailable(err):
+			b.logger.Warn("backfill reply failed", "post", post.ID, "reply", resolved.ID, "error", err)
+			if storeErr == nil {
+				storeErr = fmt.Errorf("ingest: backfill reply %s of %s: %w", resolved.ID, post.ID, err)
+			}
 		case err != nil:
 			b.logger.Warn("backfill reply failed", "post", post.ID, "reply", resolved.ID, "error", err)
 		case removed:
@@ -943,7 +959,7 @@ func (b *Backfill) backfillReplies(ctx context.Context, post *ap.Object, communi
 			}
 		}
 	}
-	return repliesOutcome{hostGone: hostGone, collectionGone: collectionGone}, stderrors.Join(unrecordedHostGoneErr, deferErr)
+	return repliesOutcome{hostGone: hostGone, collectionGone: collectionGone}, stderrors.Join(unrecordedHostGoneErr, deferErr, storeErr)
 }
 
 // repliesOutcome is what a post's reply pass left undone without failing.
@@ -1461,7 +1477,8 @@ func (b *Backfill) ObjectNotServed(ctx context.Context, event *store.InboxEvent,
 // unchanged and moved to its next retry step (deferredRetryAt), so it does
 // not stay due and crowd the batch; past its 90-day retry it is dropped. A
 // local failure leaves the item as it was for the next sweep, or drops it
-// once its 90-day retry has run. The error is
+// once its 90-day retry has run; a byte-store outage
+// (errors.IsBlobStoreUnavailable) is never dropped. The error is
 // the listing's or the ctx's, which ends the sweep.
 func (b *Backfill) RetryDeferred(ctx context.Context, limit int) error {
 	ctx = withBudgetWait(withWalkHosts(ap.WithUnreachableHostCache(ctx)))
@@ -1477,7 +1494,9 @@ func (b *Backfill) RetryDeferred(ctx context.Context, limit int) error {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return ctxErr
 			}
-			if _, ok := deferredRetryAt(item.CreatedAt, b.now()); !ok {
+			// A byte-store outage says nothing about the item: it is kept as
+			// it was (still due) even past its 90-day retry.
+			if _, ok := deferredRetryAt(item.CreatedAt, b.now()); !ok && !errors.IsBlobStoreUnavailable(err) {
 				// The 90-day retry has run: a local failure on it ends the
 				// item like a host failure would.
 				if dropErr := b.dropDeferredItem(ctx, item, deferredDropRetriesExhausted, err); dropErr != nil {

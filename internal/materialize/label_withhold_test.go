@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"tidepool/internal/blobstore"
 	"tidepool/internal/blobwithhold"
 	"tidepool/internal/errors"
 	"tidepool/internal/labels"
@@ -165,7 +166,7 @@ func TestLabelTakedown_WithholdsTheSubjectsBlobsUntilTheNegation(t *testing.T) {
 	h := newHarness(t)
 	h.serveLemmyWorldFixtures()
 	rig := newLabelRig(t, h)
-	withholds := blobwithhold.NewStore(testutil.DB(t))
+	withholds := blobwithhold.NewStore(testutil.DB(t), blobstore.NewPostgres(testutil.DB(t)))
 	ctx := context.Background()
 	authorDID := testDIDFor("LeftLeaningFreedomFighters", "lemmy.world")
 	communityDID := testDIDFor("technology", "lemmy.world")
@@ -226,7 +227,7 @@ func TestLabelTakedown_MaterializedAfterTheLabelIsWithheldInItsOwnCommit(t *test
 		h := newHarness(t)
 		h.serveLemmyWorldFixtures()
 		rig := newLabelRig(t, h)
-		withholds := blobwithhold.NewStore(testutil.DB(t))
+		withholds := blobwithhold.NewStore(testutil.DB(t), blobstore.NewPostgres(testutil.DB(t)))
 		const postID = "https://lemmy.world/post/b8-label-before-record"
 		subject := futurePostURI(t, authorDID, postID)
 
@@ -376,7 +377,7 @@ func TestLabelTakedown_SeqOrdersCtsNever(t *testing.T) {
 	h := newHarness(t)
 	h.serveLemmyWorldFixtures()
 	rig := newLabelRig(t, h)
-	withholds := blobwithhold.NewStore(testutil.DB(t))
+	withholds := blobwithhold.NewStore(testutil.DB(t), blobstore.NewPostgres(testutil.DB(t)))
 	authorDID := testDIDFor("LeftLeaningFreedomFighters", "lemmy.world")
 	const negatedPostID = "https://lemmy.world/post/b16-negated-by-seq"
 	const standingPostID = "https://lemmy.world/post/b16-still-standing"
@@ -509,7 +510,7 @@ func TestLabelConsumer_FutureCursorResetKeepsEarlierEpochLabels(t *testing.T) {
 	h := newHarness(t)
 	h.serveLemmyWorldFixtures()
 	rig := newLabelRig(t, h)
-	withholds := blobwithhold.NewStore(testutil.DB(t))
+	withholds := blobwithhold.NewStore(testutil.DB(t), blobstore.NewPostgres(testutil.DB(t)))
 	ctx := context.Background()
 	authorDID := testDIDFor("LeftLeaningFreedomFighters", "lemmy.world")
 	const firstPostID = "https://lemmy.world/post/b11-reset-first"
@@ -719,7 +720,7 @@ func TestLabelTakedown_RacesAnEditOfTheSubject(t *testing.T) {
 	h := newHarness(t)
 	h.serveLemmyWorldFixtures()
 	rig := newLabelRig(t, h)
-	withholds := blobwithhold.NewStore(testutil.DB(t))
+	withholds := blobwithhold.NewStore(testutil.DB(t), blobstore.NewPostgres(testutil.DB(t)))
 	authorDID := testDIDFor("LeftLeaningFreedomFighters", "lemmy.world")
 	var seq int64
 
@@ -838,7 +839,7 @@ func TestLabelTakedown_AuthorDeleteUnderAStandingTakedownKeepsTheBytes(t *testin
 	h := newHarness(t)
 	h.serveLemmyWorldFixtures()
 	rig := newLabelRig(t, h)
-	withholds := blobwithhold.NewStore(testutil.DB(t))
+	withholds := blobwithhold.NewStore(testutil.DB(t), blobstore.NewPostgres(testutil.DB(t)))
 	ctx := context.Background()
 	authorDID := testDIDFor("LeftLeaningFreedomFighters", "lemmy.world")
 	const postID = "https://lemmy.world/post/label-author-delete-keeps-bytes"

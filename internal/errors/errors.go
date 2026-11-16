@@ -218,3 +218,12 @@ func HostGoneReason(err error) (reason string, ok bool) {
 	}
 	return hostGone.Reason, true
 }
+
+// ErrBlobStoreUnavailable marks a blob store that failed for a reason other
+// than validation or a withhold: the database or byte store could not take
+// the write. The blob was not stored; a retry later may succeed.
+var ErrBlobStoreUnavailable = errors.New("blob store unavailable")
+
+// IsBlobStoreUnavailable reports a blob store that failed because the byte
+// store or its database was unavailable.
+func IsBlobStoreUnavailable(err error) bool { return errors.Is(err, ErrBlobStoreUnavailable) }

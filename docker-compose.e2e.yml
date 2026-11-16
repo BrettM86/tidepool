@@ -136,6 +136,27 @@ services:
         condition: service_healthy
     restart: "no"
 
+  # The bridge's blob byte store (BLOB_STORE=s3). The e2e bucket is created
+  # as a directory before the server starts, so no one-shot container is
+  # needed (a one-shot needs a service_completed_successfully dependent, or
+  # `up --wait` fails when it exits). Data lives in memory. The credentials
+  # are fixed, non-secret test values. Same pinned image as the test MinIO
+  # in docker-compose.dev.yml.
+  minio:
+    image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z@sha256:b6bfe7239bfc83fb90d31612d9704d86039dd714f7904b3f1ad68f211e602372
+    entrypoint: ["sh", "-c", "mkdir -p /data/tidepool-e2e && exec minio server /data"]
+    environment:
+      MINIO_ROOT_USER: tidepool_e2e
+      MINIO_ROOT_PASSWORD: tidepool_e2e_secret
+    tmpfs:
+      - /data:size=1g
+    networks: [tidepool-e2e]
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "-o", "/dev/null", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
   tidepool:
     build: .
     environment:
@@ -154,6 +175,14 @@ services:
       # The compose network is private address space; the SSRF guard must let
       # the bridge fetch lemmy/plc (dev-only, refused in production).
       ALLOW_PRIVATE_FETCH: "1"
+      # Blob bytes go to the in-stack MinIO bucket; startup checks the bucket
+      # once. A minio endpoint is allowed in development.
+      BLOB_STORE: s3
+      BLOB_S3_ENDPOINT: http://minio:9000
+      BLOB_S3_REGION: us-east-1
+      BLOB_S3_BUCKET: tidepool-e2e
+      BLOB_S3_ACCESS_KEY_ID: tidepool_e2e
+      BLOB_S3_SECRET_ACCESS_KEY: tidepool_e2e_secret
       # Through the fixture, so tests can answer tidepool's PLC POSTs 429.
       PLC_DIRECTORY_URL: http://plc-fixture:3000
       ADMIN_TOKEN: e2e-admin-token
@@ -247,6 +276,8 @@ services:
     depends_on:
       tidepool-migrate:
         condition: service_completed_successfully
+      minio:
+        condition: service_healthy
       dns:
         condition: service_started
       jetstream:

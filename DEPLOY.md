@@ -1008,6 +1008,11 @@ Remaining limits: dumps live on the host they protect (`./backups` is not
 replicated offsite; copying it with the same routine as `.env` is the next
 step), and there is no WAL archiving or point-in-time recovery.
 
+With `BLOB_STORE=s3` the dumps hold blob metadata but no blob bytes. The
+bucket is the only copy, and a restore needs the extra steps in
+[Blob object storage](#blob-object-storage-built), "Restoring a dump in s3
+mode".
+
 What is at risk, most irreplaceable first:
 
 1. **`BRIDGE_KEK`**: lives in `/opt/tidepool/.env`, not in Postgres, and no
@@ -1021,6 +1026,217 @@ What is at risk, most irreplaceable first:
    re-bridging, which mints new DIDs; the old at-uris do not come back.
 4. **`outbound_*`, `admissions`**: in-flight federation state. Losing it
    double-sends or drops deliveries.
+
+### Blob object storage (BUILT)
+
+`BLOB_STORE` picks where blob bytes (avatars, banners, post images, link
+thumbs) live. `postgres`, the default, keeps them in `blobs.bytes`. `s3`
+writes new bytes to an S3 bucket and keeps one `blobs` row per blob with
+`bytes` NULL. Rows that still hold bytes are served from Postgres until
+`tidepool migrate-blobs` copies them. The design is
+`docs/PRD_BLOB_OBJECT_STORAGE.md`, the variables are in
+`docs/CONFIGURATION.md`.
+
+⚠️ **There is no rollback to postgres mode after the first s3-mode write.**
+Postgres mode refuses to start while any row has NULL `bytes`
+(`blob_bytes_in_object_store`) or `blob_object_deletes` has rows
+(`blob_object_deletes_pending`), and nothing copies bytes back from the
+bucket.
+
+⚠️ **A restart during a bucket outage keeps the whole bridge down.** s3-mode
+startup sends one HEAD for the bucket and exits if the bucket is unreachable
+or the credentials are wrong. While the process runs, a bucket outage parks
+inbox events and fails backfill items and profile refreshes for retry, so no
+post or profile is bridged without its images. Avoid restarting or
+recreating `tidepool` while OVH object storage is down.
+
+#### Prerequisites
+
+1. A new bucket in the OVH US account, region `us-west-or` (endpoint
+   `https://s3.us-west-or.io.cloud.ovh.us`). Not the Coves PDS bucket, and
+   not the backups bucket, which expires objects.
+2. Versioning **disabled** and **no Object Lock**. With versioning on, a
+   delete only adds a delete marker and the bytes stay, so operator
+   `delete-bytes` would not remove them. Check in the OVH control panel, or
+   with the OVHcloud CLI:
+
+   ```sh
+   ovhcloud cloud storage object bucket get <REGION>_<BUCKET> --cloud-project <PROJECT_ID>
+   # expect: versioning DISABLED and objectLock DISABLED
+   ```
+
+3. A dedicated S3 user in the project for Tidepool. OVH's built-in roles
+   cover the whole project, which also holds the Coves PDS bucket, so give it
+   a policy limited to this bucket, with no policy or ACL rights:
+
+   ```json
+   {
+     "Statement": [
+       {
+         "Sid": "TidepoolBlobObjects",
+         "Effect": "Allow",
+         "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+         "Resource": ["arn:aws:s3:::<BUCKET>/blobs/*"]
+       },
+       {
+         "Sid": "TidepoolBlobBucket",
+         "Effect": "Allow",
+         "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
+         "Resource": ["arn:aws:s3:::<BUCKET>"]
+       }
+     ]
+   }
+   ```
+
+   Objects are keyed `blobs/<did>/<cid>`. The startup check needs
+   `s3:ListBucket`; reads, writes and deletes need only the `blobs/*` grant.
+4. The bucket refuses anonymous requests. Both virtual-host URLs must
+   answer 403:
+
+   ```sh
+   curl -s -o /dev/null -w '%{http_code}\n' https://<BUCKET>.s3.us-west-or.io.cloud.ovh.us/
+   curl -s -o /dev/null -w '%{http_code}\n' https://<BUCKET>.s3.us-west-or.io.cloud.ovh.us/blobs/<DID>/<CID>
+   ```
+
+   Path-style anonymous requests answer 400 InvalidRequest on OVH; that is
+   not a pass. Repeat the second one, in the same virtual-host form, against
+   a real object key after the switch and expect 403.
+
+Keep the access key and secret only in `/opt/tidepool/.env` and its offsite
+copy. Never commit them; this repo is mirrored publicly.
+
+#### Switching to s3 mode
+
+Run from `/opt/tidepool`. The bridge keeps serving traffic throughout,
+except for the short `VACUUM FULL` in step 7.
+
+1. **Deploy the release in postgres mode first**, with the usual
+   [deploy command](#deploy-command) and no `BLOB_*` lines in `.env`. Migration
+   068 makes `blobs.bytes` nullable and creates `blob_object_deletes`; nothing
+   else changes. The startup log shows `msg="blob store" mode=postgres`.
+2. **Add the variables** to `/opt/tidepool/.env` (the block in
+   `.env.prod.example`), then take the offsite `.env` copy and
+   `touch backups/.env-backed-up`:
+
+   ```sh
+   BLOB_STORE=s3
+   BLOB_S3_ENDPOINT=https://s3.us-west-or.io.cloud.ovh.us
+   BLOB_S3_REGION=us-west-or
+   BLOB_S3_BUCKET=<BUCKET>
+   BLOB_S3_ACCESS_KEY_ID=<ACCESS_KEY_ID>
+   BLOB_S3_SECRET_ACCESS_KEY=<SECRET_ACCESS_KEY>
+   ```
+
+   A partial set fails startup naming every missing variable.
+3. **Recreate only the `tidepool` service.** From here there is no rollback
+   to postgres mode.
+
+   ```sh
+   docker compose -f docker-compose.prod.yml up -d tidepool
+   ```
+
+4. **Verify:**
+   - The startup log has
+     `msg="blob store" mode=s3 endpoint=s3.us-west-or.io.cloud.ovh.us bucket=<BUCKET>`
+     and no `blob store: s3 bucket check` error:
+
+     ```sh
+     docker logs tidepool-prod 2>&1 | grep 'msg="blob store'
+     ```
+
+   - A blob stored after the switch, from a new image post, has NULL bytes:
+
+     ```sh
+     docker exec -i tidepool-prod-postgres psql -U tidepool -d tidepool -c "
+       SELECT did, cid, size, bytes IS NULL AS in_bucket, created_at
+         FROM blobs ORDER BY created_at DESC LIMIT 10;"
+     ```
+
+   - getBlob serves that row (expect `200` and its image type):
+
+     ```sh
+     curl -s -o /dev/null -w '%{http_code} %{content_type}\n' \
+       "https://tdpl.io/xrpc/com.atproto.sync.getBlob?did=<DID>&cid=<CID>"
+     ```
+
+   - The object delete queue drains. Every s3-mode PutBlob writes a queue row
+     ahead of its upload, and the one-minute sweeper drops it once the blob
+     row exists, so rows come and go. None should be older than a few
+     minutes, `attempts` should stay 0, and the log should have no
+     `code=blob_object_delete_failed` or `code=blob_object_put_failed`:
+
+     ```sh
+     docker exec -i tidepool-prod-postgres psql -U tidepool -d tidepool -c "
+       SELECT count(*), min(queued_at), max(attempts), max(last_error)
+         FROM blob_object_deletes;"
+     ```
+
+     A row older than an hour logs `code=blob_object_delete_stuck` at every
+     sweep.
+5. **Copy the old bytes to the bucket.** `docker compose run` inherits the
+   `tidepool` service's environment, so the command sees the same
+   `DATABASE_URL` and `BLOB_*` values. It refuses to run unless
+   `BLOB_STORE=s3` and does the same bucket check as startup. Compose first
+   runs the `tidepool-migrate` one-shot, as on every deploy.
+
+   ```sh
+   docker compose -f docker-compose.prod.yml run --rm tidepool migrate-blobs
+   ```
+
+   `--concurrency N` sets the parallel uploads (default 4). The run ends with
+   `msg="blob migration summary" copied=… skipped=… mismatched=… failed=…`
+   and exits non-zero when any row failed. It is safe to stop and re-run, so
+   re-run it until it reports `failed=0`. About 30k rows at 4 uploads should
+   take well under an hour.
+6. **Handle the mismatched rows.** A row whose bytes do not hash to its CID
+   is not copied, is counted as `mismatched`, and is logged as
+   `code=blob_cid_mismatch did=… cid=…`. Its bytes are already corrupt in
+   Postgres. Check that the rows still holding bytes are exactly those:
+
+   ```sh
+   docker exec -i tidepool-prod-postgres psql -U tidepool -d tidepool -c "
+     SELECT count(*) FROM blobs WHERE bytes IS NOT NULL;"
+   ```
+
+   The count must equal the last run's `mismatched`. Delete each listed row
+   by hand. It has no bucket object, so no queue row is needed; getBlob then
+   answers 404 for it until the record is re-materialized.
+
+   ```sh
+   docker exec -i tidepool-prod-postgres psql -U tidepool -d tidepool -c "
+     DELETE FROM blobs WHERE did = '<DID>' AND cid = '<CID>' AND bytes IS NOT NULL;"
+   ```
+
+   Spot-check getBlob, with the `curl` from step 4, on a sample of old
+   (migrated) and new CIDs. The next nightly dump no longer carries the
+   bytes.
+7. **Return the space to the OS:**
+
+   ```sh
+   docker exec -i tidepool-prod-postgres psql -U tidepool -d tidepool -c "VACUUM FULL blobs;"
+   ```
+
+   `VACUUM FULL` rewrites the table under an exclusive lock. The table is
+   small by then, so it takes seconds, but while it runs every getBlob,
+   PutBlob and blob delete waits on it, so image serving and ingest stall.
+
+#### Restoring a dump in s3 mode
+
+The bucket is the only copy of the bytes. A restore brings back rows, not
+objects, and the bucket keeps no deleted versions.
+
+- **Rows for blobs deleted after the dump point at missing objects.** getBlob
+  answers 500 for them and logs `code=blob_object_missing`. Re-materializing
+  the record (a profile refresh, or a community backfill for posts)
+  re-uploads the object and repairs the row.
+- **Re-apply every operator withhold and `delete-bytes` recorded since the
+  dump before the bridge serves traffic.** They are not in the restored
+  database, and the bytes of anything withheld but not deleted at the dump
+  are servable again until withheld. Find them in the admin API log lines
+  since the dump time. The admin API answers on the host-local
+  `localhost:8091` without going through Caddy (see `docs/ADMIN_API.md`,
+  "Blob withholds"), so they can be re-applied before `tdpl.io` traffic
+  reaches the restored bridge.
 
 ### A divergence off switch
 

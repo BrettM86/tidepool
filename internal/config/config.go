@@ -36,6 +36,11 @@ type Config struct {
 	Environment string
 	// DatabaseURL is the postgres connection string for bridge state.
 	DatabaseURL string
+	// BlobStore selects where blob bytes live (BLOB_STORE): "postgres" (the
+	// blobs table, the default) or "s3" (an S3 bucket, BlobS3).
+	BlobStore string
+	// BlobS3 holds the BLOB_S3_* settings; zero unless BlobStore is "s3".
+	BlobS3 S3Settings
 	// ListenAddr is the address the HTTP server binds, e.g. ":8091".
 	ListenAddr string
 	// BridgeHostname is the public domain the bridge is served from,
@@ -371,6 +376,12 @@ func Load(logger *slog.Logger) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	blobStore, err := LoadBlobStore()
+	if err != nil {
+		return nil, err
+	}
+	cfg.BlobStore = blobStore.Mode
+	cfg.BlobS3 = blobStore.S3
 	cfg.ListenAddr, err = stringVar(logger, isDevelopment, "LISTEN_ADDR", ":8091")
 	if err != nil {
 		return nil, err

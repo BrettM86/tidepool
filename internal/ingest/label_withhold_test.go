@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"tidepool/internal/blobstore"
 	"tidepool/internal/blobwithhold"
 	"tidepool/internal/labels"
 	"tidepool/internal/labels/labelstest"
@@ -140,7 +141,7 @@ func TestALabelNegatedWhileTheRecordIsDeletedServesTheOwnersOtherRecord(t *testi
 // activeLabelWithholds returns the active label rows of subject on cidStr.
 func activeLabelWithholds(t *testing.T, h *harness, cidStr, subject string) []blobwithhold.Withhold {
 	t.Helper()
-	state, err := blobwithhold.NewStore(h.db).Inspect(context.Background(), cidStr)
+	state, err := blobwithhold.NewStore(h.db, blobstore.NewPostgres(h.db)).Inspect(context.Background(), cidStr)
 	require.NoError(t, err)
 	var active []blobwithhold.Withhold
 	for _, row := range state.Withholds {

@@ -3,6 +3,7 @@ package materialize
 import (
 	"context"
 	"errors"
+	"fmt"
 	"mime"
 	"net/http"
 	"strings"
@@ -38,24 +39,30 @@ var (
 // fetchBlob downloads remote media through the SSRF-guarded AP client and
 // stores it as a blob in the DID's repo, returning the blob ref for the
 // record. AVIF is transcoded to JPEG, or PNG when it has transparency,
-// because no lexicon slot accepts it. Media is always optional: every
-// failure (unreachable, oversize, wrong content type, failed transcode) logs
-// a reason and returns nil so the caller omits the image rather than
-// dropping the record.
-func (m *Materializer) fetchBlob(ctx context.Context, did, url string, slot blobSlot) *atdata.Blob {
-	blob, _ := m.fetchBlobClassified(ctx, did, url, slot)
-	return blob
+// because no lexicon slot accepts it. Problems with the media itself
+// (unreachable at origin, oversize, wrong content type, failed transcode)
+// log a reason and return (nil, nil) so the caller omits the image rather
+// than dropping the record. A byte-store failure is not about the media: it
+// returns an error satisfying errors.IsBlobStoreUnavailable, and the caller
+// fails the materialization so the work is retried with its image.
+func (m *Materializer) fetchBlob(ctx context.Context, did, url string, slot blobSlot) (*atdata.Blob, error) {
+	blob, err := m.fetchBlobClassified(ctx, did, url, slot)
+	if tperrors.IsBlobStoreUnavailable(err) {
+		return nil, err
+	}
+	return blob, nil
 }
 
 // fetchBlobClassified is fetchBlob that also reports the ORIGIN fetch error,
 // so carry-forward callers can distinguish a permanent removal (IsNotFound
 // for 404/401/403, IsTombstoned for 410 — the image is gone at the source)
 // from a transient failure (timeout/5xx/dial — the image is probably still
-// there). Only the download error is surfaced; unusable-media outcomes
-// (wrong content type, oversize, failed AVIF transcode — including a busy
-// decoder — or blob-store failure) return (nil, nil), meaning no removal
-// signal: a post image is omitted this pass, and profile media carries the
-// stored blob forward. A store refused by a blob withhold returns the
+// there). Unusable-media outcomes (wrong content type, oversize, failed AVIF
+// transcode — including a busy decoder) return (nil, nil), meaning no
+// removal signal: a post image is omitted this pass, and profile media
+// carries the stored blob forward. A byte-store failure returns an error
+// satisfying errors.IsBlobStoreUnavailable, which callers check before any
+// origin classification. A store refused by a blob withhold returns the
 // computed ref with a nil error: the record keeps the ref, no bytes stored.
 func (m *Materializer) fetchBlobClassified(ctx context.Context, did, url string, slot blobSlot) (*atdata.Blob, error) {
 	blob, _, err := m.fetchMedia(ctx, did, url, slot)
@@ -67,6 +74,14 @@ func (m *Materializer) fetchBlobClassified(ctx context.Context, did, url string,
 // The bytes are non-nil exactly when the blob is, including a withheld blob
 // whose bytes were not stored.
 func (m *Materializer) fetchMedia(ctx context.Context, did, url string, slot blobSlot) (*atdata.Blob, []byte, error) {
+	return m.fetchAndStoreMedia(ctx, ctx, did, url, slot)
+}
+
+// fetchAndStoreMedia is fetchMedia with the origin download bounded by
+// fetchCtx and the transcode and byte-store write by storeCtx, so a caller's
+// download deadline never cuts the store and turns a store outage into a
+// missing image.
+func (m *Materializer) fetchAndStoreMedia(fetchCtx, storeCtx context.Context, did, url string, slot blobSlot) (*atdata.Blob, []byte, error) {
 	if url == "" {
 		return nil, nil, nil
 	}
@@ -74,7 +89,7 @@ func (m *Materializer) fetchMedia(ctx context.Context, did, url string, slot blo
 	if m.maxBlob < budget {
 		budget = m.maxBlob
 	}
-	data, contentType, err := m.fetcher.FetchMedia(ctx, url, budget)
+	data, contentType, err := m.fetcher.FetchMedia(fetchCtx, url, budget)
 	if err != nil {
 		m.logger.Warn("media fetch failed; omitting image",
 			"slot", slot.name, "url", url, "error", err)
@@ -84,7 +99,7 @@ func (m *Materializer) fetchMedia(ctx context.Context, did, url string, slot blo
 	// No slot accepts AVIF, and servers mislabel it, so it is detected from
 	// the header or the bytes and transcoded under the same budget.
 	if mimeType == "image/avif" || media.IsAVIF(data) {
-		data, mimeType, err = media.TranscodeAVIF(ctx, data, budget)
+		data, mimeType, err = media.TranscodeAVIF(storeCtx, data, budget)
 		if err != nil {
 			// A busy decoder or a cancelled ingest says nothing about the
 			// media, so it is logged apart from bad media.
@@ -103,7 +118,7 @@ func (m *Materializer) fetchMedia(ctx context.Context, did, url string, slot blo
 			"slot", slot.name, "url", url, "content_type", mimeType)
 		return nil, nil, nil
 	}
-	blob, err := m.repos.PutBlob(ctx, did, mimeType, data)
+	blob, err := m.repos.PutBlob(storeCtx, did, mimeType, data)
 	if tperrors.IsBlobWithheld(err) && blob != nil {
 		// A withhold refused the bytes, not the reference: the record keeps
 		// the ref so lifting the withhold serves the image again without a
@@ -112,8 +127,13 @@ func (m *Materializer) fetchMedia(ctx context.Context, did, url string, slot blo
 			"slot", slot.name, "did", did, "cid", cid.Cid(blob.Ref).String())
 		return blob, data, nil
 	}
+	if tperrors.IsBlobStoreUnavailable(err) {
+		// The byte store failing says nothing about the media; PutBlob has
+		// logged it. The caller fails the materialization so it is retried.
+		return nil, nil, fmt.Errorf("materialize: store %s from %s: %w", slot.name, url, err)
+	}
 	if err != nil {
-		m.logger.Warn("blob store failed; omitting image",
+		m.logger.Warn("blob store refused media; omitting image",
 			"slot", slot.name, "url", url, "did", did, "error", err)
 		return nil, nil, nil
 	}

@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"tidepool/internal/blobstore"
 	"tidepool/internal/blobwithhold"
 )
 
@@ -35,7 +36,7 @@ func TestASiteBanKeepsTheBytesOfAnOperatorWithheldImage(t *testing.T) {
 			t.Errorf("cleanup blob_withholds: %v", err)
 		}
 	})
-	_, err := blobwithhold.NewStore(h.db).Withhold(ctx, blobwithhold.OperatorRequest{
+	_, err := blobwithhold.NewStore(h.db, blobstore.NewPostgres(h.db)).Withhold(ctx, blobwithhold.OperatorRequest{
 		CID:        heldCID,
 		ReasonCode: blobwithhold.ReasonIllegalContent,
 		Actor:      "b10a-operator",

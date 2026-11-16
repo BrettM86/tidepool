@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"tidepool/internal/blobstore"
 	"tidepool/internal/blobwithhold"
 	"tidepool/internal/errors"
 	"tidepool/internal/testutil"
@@ -100,7 +101,7 @@ func TestActorScrubKeepsOperatorWithheldBlobs(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t)
 			h.serveLemmyWorldFixtures()
-			withholds := blobwithhold.NewStore(testutil.DB(t))
+			withholds := blobwithhold.NewStore(testutil.DB(t), blobstore.NewPostgres(testutil.DB(t)))
 			ctx := context.Background()
 
 			heldPostID := "https://lemmy.world/post/" + tc.seed + "-held"

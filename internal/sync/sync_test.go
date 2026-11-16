@@ -69,12 +69,19 @@ func newHarness(t *testing.T) *harness {
 // admission-control tests shrink limits with them).
 func newHarnessWithPoll(t *testing.T, pollInterval time.Duration, mutate ...func(*Options)) *harness {
 	t.Helper()
+	return newHarnessWithRepoOptions(t, pollInterval, nil, mutate...)
+}
+
+// newHarnessWithRepoOptions is newHarnessWithPoll with repoOptions passed to
+// the repo manager.
+func newHarnessWithRepoOptions(t *testing.T, pollInterval time.Duration, repoOptions []repo.Option, mutate ...func(*Options)) *harness {
+	t.Helper()
 	database := testutil.DB(t)
-	testutil.Truncate(t, database, "blocks", "repo_state", "firehose_events", "bridged_actors", "blobs")
+	testutil.Truncate(t, database, "blocks", "repo_state", "firehose_events", "bridged_actors", "blobs", "blob_object_deletes")
 
 	key, err := atcrypto.GeneratePrivateKeyK256()
 	require.NoError(t, err)
-	manager, err := repo.NewManager(database, &staticKeys{key: key}, nil)
+	manager, err := repo.NewManager(database, &staticKeys{key: key}, nil, repoOptions...)
 	require.NoError(t, err)
 
 	broadcaster, err := NewBroadcaster(os.Getenv("TIDEPOOL_TEST_DATABASE_URL"), pollInterval, nil)
@@ -962,48 +969,52 @@ func TestGetRepo_VanishedRepoIs404(t *testing.T) {
 // stored blob round-trips with its content type, misses 404, and
 // deactivated repos refuse to serve.
 func TestGetBlob(t *testing.T) {
-	h := newHarness(t)
-	putRecord(t, h, "b01", "repo exists")
+	for _, mode := range blobModes() {
+		t.Run(mode.name, func(t *testing.T) {
+			h := newHarnessInMode(t, mode)
+			putRecord(t, h, "b01", "repo exists")
 
-	payload := []byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3}
-	blob, err := h.manager.PutBlob(context.Background(), testDID, "image/png", payload)
-	require.NoError(t, err)
+			payload := []byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3}
+			blob, err := h.manager.PutBlob(context.Background(), testDID, "image/png", payload)
+			require.NoError(t, err)
 
-	// Idempotent re-put of the same bytes yields the same CID.
-	again, err := h.manager.PutBlob(context.Background(), testDID, "image/png", payload)
-	require.NoError(t, err)
-	assert.Equal(t, blob.Ref.String(), again.Ref.String())
+			// Idempotent re-put of the same bytes yields the same CID.
+			again, err := h.manager.PutBlob(context.Background(), testDID, "image/png", payload)
+			require.NoError(t, err)
+			assert.Equal(t, blob.Ref.String(), again.Ref.String())
 
-	url := h.http.URL + "/xrpc/com.atproto.sync.getBlob?did=" + testDID + "&cid=" + blob.Ref.String()
-	resp, err := http.Get(url)
-	require.NoError(t, err)
-	body, err := io.ReadAll(resp.Body)
-	require.NoError(t, err)
-	_ = resp.Body.Close()
-	assert.Equal(t, http.StatusOK, resp.StatusCode)
-	assert.Equal(t, "image/png", resp.Header.Get("Content-Type"))
-	assert.Equal(t, "nosniff", resp.Header.Get("X-Content-Type-Options"))
-	assert.Equal(t, payload, body)
+			url := h.http.URL + "/xrpc/com.atproto.sync.getBlob?did=" + testDID + "&cid=" + blob.Ref.String()
+			resp, err := http.Get(url)
+			require.NoError(t, err)
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			_ = resp.Body.Close()
+			assert.Equal(t, http.StatusOK, resp.StatusCode)
+			assert.Equal(t, "image/png", resp.Header.Get("Content-Type"))
+			assert.Equal(t, "nosniff", resp.Header.Get("X-Content-Type-Options"))
+			assert.Equal(t, payload, body)
 
-	// Unknown CID → BlobNotFound.
-	var errBody map[string]string
-	resp = getJSON(t, h.http.URL+"/xrpc/com.atproto.sync.getBlob?did="+testDID+
-		"&cid=bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku", &errBody)
-	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
-	assert.Equal(t, "BlobNotFound", errBody["error"])
+			// Unknown CID → BlobNotFound.
+			var errBody map[string]string
+			resp = getJSON(t, h.http.URL+"/xrpc/com.atproto.sync.getBlob?did="+testDID+
+				"&cid=bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku", &errBody)
+			assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+			assert.Equal(t, "BlobNotFound", errBody["error"])
 
-	// Deactivated repo refuses blobs like every other content endpoint.
-	actors := store.NewBridgedActors(testutil.DB(t))
-	_, err = actors.UpsertActor(context.Background(), store.BridgedActor{
-		APActorID:    "https://lemmy.example/u/blobowner",
-		ActorType:    store.ActorTypePerson,
-		DID:          testDID,
-		ConsentState: store.ConsentStateDeleted,
-	})
-	require.NoError(t, err)
-	resp = getJSON(t, url, &errBody)
-	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
-	assert.Equal(t, "RepoDeactivated", errBody["error"])
+			// Deactivated repo refuses blobs like every other content endpoint.
+			actors := store.NewBridgedActors(testutil.DB(t))
+			_, err = actors.UpsertActor(context.Background(), store.BridgedActor{
+				APActorID:    "https://lemmy.example/u/blobowner",
+				ActorType:    store.ActorTypePerson,
+				DID:          testDID,
+				ConsentState: store.ConsentStateDeleted,
+			})
+			require.NoError(t, err)
+			resp = getJSON(t, url, &errBody)
+			assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+			assert.Equal(t, "RepoDeactivated", errBody["error"])
+		})
+	}
 }
 
 func TestListReposPagination(t *testing.T) {

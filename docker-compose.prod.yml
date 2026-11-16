@@ -258,6 +258,20 @@ services:
       CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
       CLOUDFLARE_ZONE_ID: ${CLOUDFLARE_ZONE_ID:-}
       DELEGATION_MAX_NS_RECORDS: ${DELEGATION_MAX_NS_RECORDS:-}
+
+      # Blob byte store (docs/PRD_BLOB_OBJECT_STORAGE.md). Unset keeps bytes in
+      # the Postgres blobs table. BLOB_STORE=s3 needs all five BLOB_S3_* values
+      # (a partial set fails boot) and one bucket HEAD at startup, so a restart
+      # during a bucket outage keeps the bridge down. After the first s3-mode
+      # write there is no way back to postgres. `docker compose run tidepool
+      # migrate-blobs` inherits this environment. See DEPLOY.md §6, "Blob
+      # object storage".
+      BLOB_STORE: ${BLOB_STORE:-postgres}
+      BLOB_S3_ENDPOINT: ${BLOB_S3_ENDPOINT:-}
+      BLOB_S3_REGION: ${BLOB_S3_REGION:-}
+      BLOB_S3_BUCKET: ${BLOB_S3_BUCKET:-}
+      BLOB_S3_ACCESS_KEY_ID: ${BLOB_S3_ACCESS_KEY_ID:-}
+      BLOB_S3_SECRET_ACCESS_KEY: ${BLOB_S3_SECRET_ACCESS_KEY:-}
     volumes:
       - ./:/repo:ro
     networks:

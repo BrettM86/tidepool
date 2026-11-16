@@ -373,15 +373,22 @@ func (m *Materializer) mintAndUpsert(ctx context.Context, doc *ap.Object, actorT
 // blob instead of dropping it — a transient 5xx or timeout at the origin
 // must not strip profiles bare until the next refresh. An actor that
 // REMOVED its image (no icon/image in the doc) still loses the blob, as it
-// should.
+// should. A byte-store failure is not carried forward: the refresh fails
+// before committing and the existing profile record stays as it is.
 func (m *Materializer) rematerializeProfile(ctx context.Context, stored *store.BridgedActor, doc *ap.Object) (*store.BridgedActor, error) {
 	collection := CollectionActorProfile
 	if stored.ActorType == store.ActorTypeGroup {
 		collection = CollectionCommunityProfile
 	}
 
-	avatar := m.fetchBlobWithCarryForward(ctx, stored.DID, collection, imageURL(doc.Icon), slotAvatar, "avatar")
-	banner := m.fetchBlobWithCarryForward(ctx, stored.DID, collection, imageURL(doc.Image), slotBanner, "banner")
+	avatar, err := m.fetchBlobWithCarryForward(ctx, stored.DID, collection, imageURL(doc.Icon), slotAvatar, "avatar")
+	if err != nil {
+		return nil, err
+	}
+	banner, err := m.fetchBlobWithCarryForward(ctx, stored.DID, collection, imageURL(doc.Image), slotBanner, "banner")
+	if err != nil {
+		return nil, err
+	}
 
 	var record map[string]any
 	switch stored.ActorType {
@@ -471,21 +478,25 @@ func isProfileCollection(collection string) bool {
 // its URL lingers in a stale doc) is NOT carried forward — the blob is
 // dropped, because serving media the origin removed forever is wrong. A
 // first-ever materialization has no existing record, so the fallback is
-// naturally empty there.
-func (m *Materializer) fetchBlobWithCarryForward(ctx context.Context, did, collection, url string, slot blobSlot, field string) *atdata.Blob {
+// naturally empty there. A byte-store failure (errors.IsBlobStoreUnavailable)
+// is returned, never carried forward: the profile write fails and is retried.
+func (m *Materializer) fetchBlobWithCarryForward(ctx context.Context, did, collection, url string, slot blobSlot, field string) (*atdata.Blob, error) {
 	if url == "" {
-		return nil
+		return nil, nil
 	}
 	blob, fetchErr := m.fetchBlobClassified(ctx, did, url, slot)
+	if errors.IsBlobStoreUnavailable(fetchErr) {
+		return nil, fetchErr
+	}
 	if blob != nil {
-		return blob
+		return blob, nil
 	}
 	if errors.IsNotFound(fetchErr) || errors.IsTombstoned(fetchErr) {
 		// Image gone at origin: drop it rather than carrying the stale blob
 		// forward forever.
 		m.logger.Info("media removed at origin; dropping previously stored blob",
 			"did", did, "field", field, "url", url)
-		return nil
+		return nil, nil
 	}
 	existing, _, err := m.repos.GetRecord(ctx, did, collection, ProfileRKey)
 	if err != nil {
@@ -493,15 +504,15 @@ func (m *Materializer) fetchBlobWithCarryForward(ctx context.Context, did, colle
 			m.logger.Warn("media carry-forward: read existing profile failed",
 				"did", did, "field", field, "error", err)
 		}
-		return nil
+		return nil, nil
 	}
 	prev, ok := existing[field].(atdata.Blob)
 	if !ok {
-		return nil
+		return nil, nil
 	}
 	m.logger.Info("media fetch failed; carrying forward previously stored blob",
 		"did", did, "field", field, "url", url, "cid", cid.Cid(prev.Ref).String())
-	return &prev
+	return &prev, nil
 }
 
 // EnsureCommunity makes sure the AP group behind groupRef is bridged:

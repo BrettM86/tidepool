@@ -71,7 +71,8 @@ func GalleryImages(record map[string]any, media MediaSource) []GalleryImage {
 }
 
 // galleryMediaType returns the blob mimeType of the record's gallery entry at
-// position.
+// position. This is the uploaded type, not necessarily the type the proxy
+// serves; see imageAttachment.
 func galleryMediaType(record map[string]any, position int) string {
 	entry, _ := galleryEntries(record)[position].(map[string]any)
 	blob, _ := entry["image"].(map[string]any)

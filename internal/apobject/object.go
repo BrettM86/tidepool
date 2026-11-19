@@ -227,14 +227,20 @@ func linkAttachment(embed map[string]any) []any {
 }
 
 // imageAttachment renders the gallery image at position as an AS2 Image.
-// name is always present, "" for an empty alt.
+// name is always present, "" for an empty alt. mediaType is set only for a
+// GIF: the proxy's content_full render serves a GIF as-is but re-encodes every
+// other type (WebP, or PNG/JPEG past WebP's size limit), so the blob type
+// would mislabel the served bytes and the served type is not known up front.
 func imageAttachment(record map[string]any, gallery []GalleryImage, position int) map[string]any {
-	return map[string]any{
-		"type":      "Image",
-		"mediaType": galleryMediaType(record, position),
-		"url":       gallery[position].URL,
-		"name":      gallery[position].Alt,
+	attachment := map[string]any{
+		"type": "Image",
+		"url":  gallery[position].URL,
+		"name": gallery[position].Alt,
 	}
+	if mimeType := galleryMediaType(record, position); mimeType == "image/gif" {
+		attachment["mediaType"] = mimeType
+	}
+	return attachment
 }
 
 func galleryImagesAt(gallery []GalleryImage, positions []int) []GalleryImage {

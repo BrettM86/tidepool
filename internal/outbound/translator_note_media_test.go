@@ -161,9 +161,9 @@ func TestTranslator_ImageOnlyCommentCreatesNoteWithAttachments(t *testing.T) {
 		"content": "<p></p>\n",
 		"source": {"content": "", "mediaType": "text/markdown"},
 		"attachment": [
-			{"type": "Image", "mediaType": "image/png", "name": "a photo",
+			{"type": "Image", "name": "a photo",
 			 "url": "https://img.example/img/content_full/plain/did:plc:abc/bafkreihak3l6grklnl53pnqjtrwfph7wyojvrsaazb7nmptucuhobephqy"},
-			{"type": "Image", "mediaType": "image/jpeg", "name": "",
+			{"type": "Image", "name": "",
 			 "url": "https://img.example/img/content_full/plain/did:plc:abc/bafkreihh33brlfst3dssji2k4fllfvevfp6q6c2zrqfm2soybkt2pq3lui"}
 		]
 	}`, string(object))

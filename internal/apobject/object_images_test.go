@@ -78,7 +78,7 @@ func TestBuildPage_UnplacedGalleryImages(t *testing.T) {
 		`<p><img src="` + testImageURL1 + `" alt="two"></p>` + "\n"
 	secondAppended := "hello\n\n![two](" + testImageURL1 + ")"
 	secondAppendedHTML := "<p>hello</p>\n" + `<p><img src="` + testImageURL1 + `" alt="two"></p>` + "\n"
-	firstImage := `[{"type":"Image","mediaType":"image/png","url":"` + testImageURL0 + `","name":"one"}]`
+	firstImage := `[{"type":"Image","url":"` + testImageURL0 + `","name":"one"}]`
 
 	tests := []struct {
 		name               string
@@ -93,7 +93,7 @@ func TestBuildPage_UnplacedGalleryImages(t *testing.T) {
 			name:               "single image with alt",
 			content:            "hello",
 			embed:              imagesEmbed(galleryEntry(testImageCID0, "image/png", "a photo")),
-			expectedAttachment: `[{"type":"Image","mediaType":"image/png","url":"` + testImageURL0 + `","name":"a photo"}]`,
+			expectedAttachment: `[{"type":"Image","url":"` + testImageURL0 + `","name":"a photo"}]`,
 			expectedMarkdown:   "hello",
 			expectedHTML:       "<p>hello</p>\n",
 		},
@@ -101,7 +101,25 @@ func TestBuildPage_UnplacedGalleryImages(t *testing.T) {
 			name:               "single image with empty alt",
 			content:            "hello",
 			embed:              imagesEmbed(galleryEntry(testImageCID1, "image/jpeg", "")),
-			expectedAttachment: `[{"type":"Image","mediaType":"image/jpeg","url":"` + testImageURL1 + `","name":""}]`,
+			expectedAttachment: `[{"type":"Image","url":"` + testImageURL1 + `","name":""}]`,
+			expectedMarkdown:   "hello",
+			expectedHTML:       "<p>hello</p>\n",
+		},
+		{
+			// The proxy re-encodes every non-GIF render, so its blob type
+			// would mislabel the served bytes.
+			name:               "webp image has no mediaType",
+			content:            "hello",
+			embed:              imagesEmbed(galleryEntry(testImageCID2, "image/webp", "a webp")),
+			expectedAttachment: `[{"type":"Image","url":"` + testImageURL2 + `","name":"a webp"}]`,
+			expectedMarkdown:   "hello",
+			expectedHTML:       "<p>hello</p>\n",
+		},
+		{
+			name:               "gif image keeps image/gif mediaType",
+			content:            "hello",
+			embed:              imagesEmbed(galleryEntry(testImageCID2, "image/gif", "a gif")),
+			expectedAttachment: `[{"type":"Image","mediaType":"image/gif","url":"` + testImageURL2 + `","name":"a gif"}]`,
 			expectedMarkdown:   "hello",
 			expectedHTML:       "<p>hello</p>\n",
 		},
@@ -118,7 +136,7 @@ func TestBuildPage_UnplacedGalleryImages(t *testing.T) {
 				galleryEntry(testImageCID6, "image/png", "img 6"),
 				galleryEntry(testImageCID7, "image/jpeg", "img 7"),
 			),
-			expectedAttachment: `[{"type":"Image","mediaType":"image/png","url":"` + testImageURL0 + `","name":"img 0"}]`,
+			expectedAttachment: `[{"type":"Image","url":"` + testImageURL0 + `","name":"img 0"}]`,
 			expectedMarkdown: "gallery" +
 				"\n\n![img 1](" + testImageURL1 + ")" +
 				"\n\n![img 2](" + testImageURL2 + ")" +
@@ -251,7 +269,7 @@ func TestBuildPage_UnplacedGalleryImages(t *testing.T) {
 				galleryEntry(testImageCID1, "image/jpeg", "two"),
 				galleryEntry(testImageCID2, "image/png", "three"),
 			),
-			expectedAttachment: `[{"type":"Image","mediaType":"image/jpeg","url":"` + testImageURL1 + `","name":"two"}]`,
+			expectedAttachment: `[{"type":"Image","url":"` + testImageURL1 + `","name":"two"}]`,
 			expectedMarkdown:   "see ![three](" + testImageURL2 + ") now",
 			expectedHTML:       `<p>see <img src="` + testImageURL2 + `" alt="three"> now</p>` + "\n",
 		},
@@ -320,8 +338,8 @@ func TestBuildNote_UnplacedGalleryImagesAreAttachments(t *testing.T) {
 			content: "hello",
 			embed:   twoImages,
 			expectedAttachment: `[` +
-				`{"type":"Image","mediaType":"image/png","url":"` + testImageURL0 + `","name":"one"},` +
-				`{"type":"Image","mediaType":"image/jpeg","url":"` + testImageURL1 + `","name":"two"}]`,
+				`{"type":"Image","url":"` + testImageURL0 + `","name":"one"},` +
+				`{"type":"Image","url":"` + testImageURL1 + `","name":"two"}]`,
 			expectedMarkdown: "hello",
 			expectedHTML:     "<p>hello</p>\n",
 		},
@@ -329,7 +347,7 @@ func TestBuildNote_UnplacedGalleryImagesAreAttachments(t *testing.T) {
 			name:               "image-only comment",
 			content:            "",
 			embed:              imagesEmbed(galleryEntry(testImageCID1, "image/jpeg", "")),
-			expectedAttachment: `[{"type":"Image","mediaType":"image/jpeg","url":"` + testImageURL1 + `","name":""}]`,
+			expectedAttachment: `[{"type":"Image","url":"` + testImageURL1 + `","name":""}]`,
 			expectedMarkdown:   "",
 			expectedHTML:       "<p></p>\n",
 		},
@@ -338,7 +356,31 @@ func TestBuildNote_UnplacedGalleryImagesAreAttachments(t *testing.T) {
 			content:            "see pic now",
 			facets:             []any{testFacet(4, 7, imageFeature(float64(0)))},
 			embed:              twoImages,
-			expectedAttachment: `[{"type":"Image","mediaType":"image/jpeg","url":"` + testImageURL1 + `","name":"two"}]`,
+			expectedAttachment: `[{"type":"Image","url":"` + testImageURL1 + `","name":"two"}]`,
+			expectedMarkdown:   "see ![one](" + testImageURL0 + ") now",
+			expectedHTML:       `<p>see <img src="` + testImageURL0 + `" alt="one"> now</p>` + "\n",
+		},
+		{
+			name:    "unplaced gif after a placed png keeps its own image/gif mediaType",
+			content: "see pic now",
+			facets:  []any{testFacet(4, 7, imageFeature(float64(0)))},
+			embed: imagesEmbed(
+				galleryEntry(testImageCID0, "image/png", "one"),
+				galleryEntry(testImageCID1, "image/gif", "two"),
+			),
+			expectedAttachment: `[{"type":"Image","mediaType":"image/gif","url":"` + testImageURL1 + `","name":"two"}]`,
+			expectedMarkdown:   "see ![one](" + testImageURL0 + ") now",
+			expectedHTML:       `<p>see <img src="` + testImageURL0 + `" alt="one"> now</p>` + "\n",
+		},
+		{
+			name:    "unplaced png after a placed gif has no mediaType",
+			content: "see pic now",
+			facets:  []any{testFacet(4, 7, imageFeature(float64(0)))},
+			embed: imagesEmbed(
+				galleryEntry(testImageCID0, "image/gif", "one"),
+				galleryEntry(testImageCID1, "image/png", "two"),
+			),
+			expectedAttachment: `[{"type":"Image","url":"` + testImageURL1 + `","name":"two"}]`,
 			expectedMarkdown:   "see ![one](" + testImageURL0 + ") now",
 			expectedHTML:       `<p>see <img src="` + testImageURL0 + `" alt="one"> now</p>` + "\n",
 		},

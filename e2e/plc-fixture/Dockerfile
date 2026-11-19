@@ -2,7 +2,7 @@
 # as the root Dockerfile: a static binary on alpine, which keeps busybox wget
 # for the compose healthcheck.
 
-FROM golang:1.27.3-alpine3.24 AS build
+FROM golang:1.27.4-alpine3.24 AS build
 
 WORKDIR /src
 

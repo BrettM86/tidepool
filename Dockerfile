@@ -7,7 +7,7 @@
 # lets it bind :80 (the e2e harness serves the bridge portless at
 # http://tidepool/ so AP object ids stay clean hostnames).
 
-FROM golang:1.27.3-alpine3.24 AS build
+FROM golang:1.27.4-alpine3.24 AS build
 
 WORKDIR /src
 

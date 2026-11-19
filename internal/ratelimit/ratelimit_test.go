@@ -2,6 +2,9 @@ package ratelimit
 
 import (
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/netip"
 	"testing"
 	"time"
 
@@ -95,4 +98,99 @@ func TestLimiterRefillFollowsClock(t *testing.T) {
 
 	clock.advance(1500 * time.Millisecond)
 	assert.True(t, limiter.Allow("192.0.2.1"), "one token refills after a second")
+}
+
+func TestClientIPResolver(t *testing.T) {
+	trusted := []netip.Prefix{netip.MustParsePrefix("172.18.0.0/16")}
+
+	tests := []struct {
+		name       string
+		resolver   *ClientIPResolver
+		remoteAddr string
+		header     http.Header
+		want       string
+	}{
+		// B1: a trusted proxy's X-Real-IP names the client.
+		{
+			name:       "trusted proxy IPv4 X-Real-IP",
+			resolver:   NewClientIPResolver(trusted),
+			remoteAddr: "172.18.0.5:41000",
+			header:     http.Header{"X-Real-Ip": {"203.0.113.5"}},
+			want:       "203.0.113.5",
+		},
+		{
+			name:       "trusted proxy IPv6 X-Real-IP",
+			resolver:   NewClientIPResolver(trusted),
+			remoteAddr: "172.18.0.5:41000",
+			header:     http.Header{"X-Real-Ip": {"2001:db8::7"}},
+			want:       "2001:db8::7",
+		},
+		// B2: the header is ignored unless the peer is a trusted proxy.
+		{
+			name:       "untrusted peer cannot spoof X-Real-IP",
+			resolver:   NewClientIPResolver(trusted),
+			remoteAddr: "198.51.100.9:5000",
+			header:     http.Header{"X-Real-Ip": {"203.0.113.5"}},
+			want:       "198.51.100.9",
+		},
+		{
+			name:       "nil resolver trusts nobody",
+			resolver:   nil,
+			remoteAddr: "172.18.0.5:41000",
+			header:     http.Header{"X-Real-Ip": {"203.0.113.5"}},
+			want:       "172.18.0.5",
+		},
+		{
+			name:       "empty trusted set trusts nobody",
+			resolver:   NewClientIPResolver(nil),
+			remoteAddr: "172.18.0.5:41000",
+			header:     http.Header{"X-Real-Ip": {"203.0.113.5"}},
+			want:       "172.18.0.5",
+		},
+		{
+			name:       "trusted peer with only X-Forwarded-For",
+			resolver:   NewClientIPResolver(trusted),
+			remoteAddr: "172.18.0.5:41000",
+			header:     http.Header{"X-Forwarded-For": {"203.0.113.5"}},
+			want:       "172.18.0.5",
+		},
+		// B3: a malformed header from a trusted proxy falls back to the peer.
+		{
+			name:       "trusted peer malformed X-Real-IP",
+			resolver:   NewClientIPResolver(trusted),
+			remoteAddr: "172.18.0.5:41000",
+			header:     http.Header{"X-Real-Ip": {"not-an-ip"}},
+			want:       "172.18.0.5",
+		},
+		{
+			name:       "trusted peer list-valued X-Real-IP",
+			resolver:   NewClientIPResolver(trusted),
+			remoteAddr: "172.18.0.5:41000",
+			header:     http.Header{"X-Real-Ip": {"203.0.113.5, 10.0.0.1"}},
+			want:       "172.18.0.5",
+		},
+		{
+			name:       "trusted peer empty X-Real-IP",
+			resolver:   NewClientIPResolver(trusted),
+			remoteAddr: "172.18.0.5:41000",
+			header:     http.Header{"X-Real-Ip": {""}},
+			want:       "172.18.0.5",
+		},
+		{
+			name:       "trusted peer two X-Real-IP fields",
+			resolver:   NewClientIPResolver(trusted),
+			remoteAddr: "172.18.0.5:41000",
+			header:     http.Header{"X-Real-Ip": {"203.0.113.5", "203.0.113.6"}},
+			want:       "172.18.0.5",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/", nil)
+			r.RemoteAddr = tt.remoteAddr
+			r.Header = tt.header
+			assert.Equal(t, tt.want, tt.resolver.ClientIP(r))
+		})
+	}
 }

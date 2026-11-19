@@ -319,10 +319,13 @@ The sweep reports divergence and never repairs it.
 - The e2e harness runs in development mode (migrations on start, HTTP and
   private fetching, strict lexicon validation). `ENVIRONMENT=production` is
   exercised only by the production deployment.
-- All in-process IP rate limiters use `RemoteAddr` and ignore
-  `X-Forwarded-For`. Behind a proxy every client shares the proxy's bucket, so
-  rate-limit at the edge. A future opt-in `TRUSTED_PROXY` setting could trust
-  forwarded addresses from listed hops.
+- Production does not set `TRUSTED_PROXY_CIDRS` yet, so every client behind
+  Caddy still shares Caddy's per-IP bucket. The tidepool `environment:` map in
+  `docker-compose.prod.yml` must pass the variable through, and
+  `/opt/tidepool/.env` must set it to the Docker network Caddy sits on (see
+  [docs/CONFIGURATION.md](docs/CONFIGURATION.md)). `DEPLOY.md` (around lines
+  1293-1296) still says the limiters key on `RemoteAddr` and needs the same
+  update. All three are production files left for a human.
 
 ## Materializer and storage
 

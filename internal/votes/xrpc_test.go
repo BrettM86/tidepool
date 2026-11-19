@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"strings"
 	"testing"
@@ -14,6 +15,8 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"tidepool/internal/ratelimit"
 )
 
 // xrpcResponse mirrors the getVoteAggregates output schema.
@@ -261,4 +264,37 @@ func TestGetVoteAggregatesRateLimited(t *testing.T) {
 	var xrpcErr map[string]string
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &xrpcErr))
 	assert.Equal(t, "RateLimitExceeded", xrpcErr["error"])
+}
+
+// TestGetVoteAggregatesRateLimitKeysOnTrustedProxyHeader: behind a trusted
+// reverse proxy the per-IP bucket keys on the proxy's X-Real-IP, so two
+// clients relayed through the same proxy address get separate buckets.
+func TestGetVoteAggregatesRateLimitKeysOnTrustedProxyHeader(t *testing.T) {
+	database := testDB(t)
+	xrpc, err := NewXRPC(XRPCOptions{
+		DB:            database,
+		RatePerSecond: 0.001,
+		RateBurst:     1,
+		ClientIPs:     ratelimit.NewClientIPResolver([]netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}),
+	})
+	require.NoError(t, err)
+	router := chi.NewRouter()
+	xrpc.Routes(router)
+	query := "uris=" + url.QueryEscape(testATURI("3jzfcijpj2z2a"))
+
+	viaProxy := func(realIP string) int {
+		req := httptest.NewRequest(http.MethodGet,
+			"https://bridge.test/xrpc/"+NSIDGetVoteAggregates+"?"+query, nil)
+		req.RemoteAddr = "192.0.2.1:1234"
+		req.Header.Set("X-Real-IP", realIP)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	require.Equal(t, http.StatusOK, viaProxy("203.0.113.5"))
+	require.Equal(t, http.StatusTooManyRequests, viaProxy("203.0.113.5"),
+		"the same client's burst is spent")
+	assert.Equal(t, http.StatusOK, viaProxy("203.0.113.6"),
+		"a second client behind the same proxy gets its own bucket")
 }

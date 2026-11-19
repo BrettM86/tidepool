@@ -245,6 +245,11 @@ type Config struct {
 	// live tree, so memory scales with the cached repos' sizes; operators
 	// bridging many very large communities tune this down.
 	MSTCacheSize int
+	// TrustedProxyCIDRs (TRUSTED_PROXY_CIDRS): TCP peers whose X-Real-IP
+	// header names the client for per-IP rate limiting. Comma-separated;
+	// unset or empty trusts nobody. Must cover only the reverse proxy's
+	// network, never one a direct client can connect from.
+	TrustedProxyCIDRs []netip.Prefix
 	// Inbox admission control (task 11): per-client-IP and per-verified-
 	// signer token buckets on POST /inbox, plus the dedicated tighter cap
 	// on the tombstoned-self-delete confirmation branch. All are generous
@@ -746,6 +751,20 @@ func Load(logger *slog.Logger) (*Config, error) {
 	cfg.MSTCacheSize, err = intVar(logger, "MST_CACHE_SIZE", 512)
 	if err != nil {
 		return nil, err
+	}
+
+	// Trusted reverse-proxy peers for per-IP rate limiting. Unset trusts
+	// nobody (limits key on the TCP peer).
+	for _, entry := range strings.Split(os.Getenv("TRUSTED_PROXY_CIDRS"), ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		prefix, err := netip.ParsePrefix(entry)
+		if err != nil {
+			return nil, fmt.Errorf("config: TRUSTED_PROXY_CIDRS entry %q is not a CIDR prefix: %w", entry, err)
+		}
+		cfg.TrustedProxyCIDRs = append(cfg.TrustedProxyCIDRs, prefix)
 	}
 
 	// Admission-control knobs (task 11): tuning knobs with real defaults in

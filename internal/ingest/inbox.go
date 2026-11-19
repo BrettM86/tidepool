@@ -109,6 +109,10 @@ type InboxOptions struct {
 	SignerRateBurst               int
 	TombstoneConfirmRatePerSecond float64
 	TombstoneConfirmBurst         int
+
+	// ClientIPs resolves the client IP the per-IP buckets key on; a
+	// nil trusts nobody (keys on the TCP peer).
+	ClientIPs *ratelimit.ClientIPResolver
 }
 
 // Inbox is the HTTP face of ingestion: POST /inbox (+ the actor inbox
@@ -121,6 +125,7 @@ type Inbox struct {
 	fetcher  ActorFetcher
 	logger   *slog.Logger
 
+	clientIPs        *ratelimit.ClientIPResolver
 	ipLimiter        *ratelimit.Limiter
 	signerLimiter    *ratelimit.Limiter
 	tombstoneLimiter *ratelimit.Limiter
@@ -158,12 +163,13 @@ func NewInbox(opts InboxOptions) (*Inbox, error) {
 		return ratelimit.New(rate, burst)
 	}
 	return &Inbox{
-		verifier: opts.Verifier,
-		events:   opts.Events,
-		queue:    opts.Queue,
-		service:  opts.Service,
-		fetcher:  opts.Fetcher,
-		logger:   logger,
+		verifier:  opts.Verifier,
+		events:    opts.Events,
+		queue:     opts.Queue,
+		service:   opts.Service,
+		fetcher:   opts.Fetcher,
+		logger:    logger,
+		clientIPs: opts.ClientIPs,
 		ipLimiter: limiterOf(opts.IPRatePerSecond, defaultInboxIPRatePerSecond,
 			opts.IPRateBurst, defaultInboxIPRateBurst),
 		signerLimiter: limiterOf(opts.SignerRatePerSecond, defaultInboxSignerRatePerSecond,
@@ -212,7 +218,7 @@ func (ib *Inbox) handleInbox(w http.ResponseWriter, r *http.Request) {
 	// signs with. Refusals are 503, NOT 429: Lemmy's federation crate
 	// treats server errors as retryable but drops 4xx permanently, and a
 	// legitimate burst must be delayed, never lost.
-	clientIP := ratelimit.ClientIP(r)
+	clientIP := ib.clientIPs.ClientIP(r)
 	if !ib.ipLimiter.Allow(clientIP) {
 		InboxRateLimited.Add(1)
 		if ib.refusalLog.Allow(time.Now()) {

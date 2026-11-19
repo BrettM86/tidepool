@@ -1,10 +1,14 @@
 package ingest
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,6 +22,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"tidepool/internal/ap"
+	"tidepool/internal/ratelimit"
 	"tidepool/internal/store"
 )
 
@@ -69,6 +74,70 @@ func TestInboxPerIPRateLimit(t *testing.T) {
 	assert.Error(t, err, "rate-limited deliveries must not be enqueued")
 	assert.Greater(t, InboxRateLimited.Value(), before,
 		"a refusal must increment the tidepool_inbox_ratelimited counter")
+}
+
+// deliverViaProxy signs and posts an activity to /inbox as if relayed by a
+// reverse proxy: the TCP peer is remoteAddr and the proxy's X-Real-IP
+// header names realIP.
+func (h *harness) deliverViaProxy(actor *remoteActor, activity map[string]any, remoteAddr, realIP string) int {
+	h.t.Helper()
+	body, err := json.Marshal(activity)
+	require.NoError(h.t, err)
+	req := httptest.NewRequest(http.MethodPost, "https://"+bridgeHost+"/inbox", bytes.NewReader(body))
+	req.RemoteAddr = remoteAddr
+	req.Header.Set("Content-Type", ap.ContentTypeActivityJSON)
+	req.Header.Set("X-Real-IP", realIP)
+	require.NoError(h.t, actor.signer().SignRequest(req, body))
+	rec := httptest.NewRecorder()
+	h.router.ServeHTTP(rec, req)
+	return rec.Code
+}
+
+// TestInboxPerIPRateLimitKeysOnTrustedProxyHeader: behind a trusted reverse
+// proxy every delivery arrives from the proxy's address, so the per-IP
+// bucket must key on the proxy's X-Real-IP; with no trusted proxies the
+// header is ignored and every client shares the peer's bucket (a direct
+// client cannot spoof its key).
+func TestInboxPerIPRateLimitKeysOnTrustedProxyHeader(t *testing.T) {
+	const proxyAddr = "192.0.2.1:1234"
+	tests := []struct {
+		name       string
+		trusted    []netip.Prefix
+		wantSecond int // the second client's first delivery
+	}{
+		{
+			name:       "trusted proxy gives each client its own bucket",
+			trusted:    []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")},
+			wantSecond: http.StatusAccepted,
+		},
+		{
+			name:       "no trusted proxies shares the peer bucket",
+			trusted:    nil,
+			wantSecond: http.StatusServiceUnavailable,
+		},
+	}
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.limitedInbox(func(o *InboxOptions) {
+				o.IPRatePerSecond = 0.001
+				o.IPRateBurst = 1
+				o.ClientIPs = ratelimit.NewClientIPResolver(tt.trusted)
+			})
+			actorID := fmt.Sprintf("https://lemmy.world/u/proxyip%d", i)
+			alice := h.newRemoteActor(actorID, person(actorID, fmt.Sprintf("proxyip%d", i), nil))
+			activity := func(n int) map[string]any {
+				return likeActivity(fmt.Sprintf("https://lemmy.world/activities/like/proxy-%d-%d", i, n), alice.id)
+			}
+
+			require.Equal(t, http.StatusAccepted, h.deliverViaProxy(alice, activity(1), proxyAddr, "203.0.113.5"),
+				"the first client's first delivery fits its burst")
+			require.Equal(t, http.StatusServiceUnavailable, h.deliverViaProxy(alice, activity(2), proxyAddr, "203.0.113.5"),
+				"the first client's burst is spent")
+			assert.Equal(t, tt.wantSecond, h.deliverViaProxy(alice, activity(3), proxyAddr, "203.0.113.6"),
+				"the second client's first delivery")
+		})
+	}
 }
 
 // TestAdminMetricsScoped: /admin/metrics exposes tidepool's own counters and

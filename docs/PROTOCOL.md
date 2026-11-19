@@ -142,13 +142,12 @@ Tombstoned repos report `RepoDeactivated` / `active: false` with status
   cap. Inbox refusals return 503, because federation queues drop 4xx
   responses permanently and retry on server errors.
 
-Every per-IP limiter keys on the connection's `RemoteAddr` and ignores
-`X-Forwarded-For`, which can be spoofed without a trusted-proxy allowlist.
-[FOLLOWUPS.md](../FOLLOWUPS.md) describes a possible `TRUSTED_PROXY` setting.
-If TLS termination or a load balancer sits in front of the bridge, you must
-rate-limit `POST /inbox` and `com.atproto.sync.*` at the edge. Otherwise all
-clients share the proxy's single IP bucket, and the self-delete confirmation
-cap becomes one global cap.
+Every per-IP limiter keys on the client address from `X-Real-IP` when the
+TCP peer is inside a prefix listed in `TRUSTED_PROXY_CIDRS`, and on the
+connection's `RemoteAddr` otherwise. `X-Forwarded-For` is never read. With
+`TRUSTED_PROXY_CIDRS` unset, a proxy in front of the bridge puts every client
+in the proxy's single IP bucket, and the self-delete confirmation cap becomes
+one global cap. [CONFIGURATION.md](CONFIGURATION.md) describes the setting.
 
 ## Vote aggregates
 
@@ -177,8 +176,8 @@ GET /xrpc/social.coves.bridge.getVoteAggregates?uris=at://…&uris=at://…
   request order. Unknown or never-voted uris are left out, which is not an
   error.
 - Public, `Cache-Control: public, max-age=30`, rate limited per client IP.
-  Behind a proxy, rate-limit the real client at the edge, because the bridge
-  ignores `X-Forwarded-For`.
+  The client IP is `X-Real-IP` from a peer in `TRUSTED_PROXY_CIDRS`, otherwise
+  `RemoteAddr`; see [CONFIGURATION.md](CONFIGURATION.md).
 
 The contract is the lexicon at
 [`lexicons/social/coves/bridge/getVoteAggregates.json`](../lexicons/social/coves/bridge/getVoteAggregates.json).

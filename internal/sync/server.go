@@ -96,6 +96,7 @@ type Server struct {
 	// surface (HTTP reads and WebSocket dials alike); subscribers counts
 	// live subscribeRepos connections against maxSubscribers.
 	limiter        *ratelimit.Limiter
+	clientIPs      *ratelimit.ClientIPResolver
 	maxSubscribers int64
 	subscribers    atomic.Int64
 	// refusalLog samples the (otherwise noisy) rate-limit refusal Warn logs.
@@ -139,6 +140,10 @@ type Options struct {
 	RatePerSecond  float64
 	RateBurst      int
 	MaxSubscribers int
+
+	// ClientIPs resolves the client IP the per-IP bucket keys on; a
+	// nil trusts nobody (keys on the TCP peer).
+	ClientIPs *ratelimit.ClientIPResolver
 }
 
 // NewServer validates options and builds the server.
@@ -189,6 +194,7 @@ func NewServer(opts Options) (*Server, error) {
 		burst = defaultSyncRateBurst
 	}
 	s.limiter = ratelimit.New(perSecond, burst)
+	s.clientIPs = opts.ClientIPs
 	s.refusalLog = ratelimit.NewSampler(time.Second)
 	s.exportCAR = s.repo.ExportCARTo
 	s.maxSubscribers = int64(opts.MaxSubscribers)
@@ -222,7 +228,7 @@ func (s *Server) Routes(r chi.Router) {
 // reconnecting WebSocket clients, both of which handle 429 by backing off).
 func (s *Server) limited(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !s.limiter.Allow(ratelimit.ClientIP(r)) {
+		if !s.limiter.Allow(s.clientIPs.ClientIP(r)) {
 			SyncRateLimited.Add(1)
 			if s.refusalLog.Allow(time.Now()) {
 				s.logger.Warn("sync request rate-limited (sampled)", "remote", r.RemoteAddr, "path", r.URL.Path)

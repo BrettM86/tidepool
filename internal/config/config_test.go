@@ -42,6 +42,7 @@ func clearConfigEnv(t *testing.T) {
 		"BRIDGED_VOTE_VERIFY_BATCH",
 		"BLOB_STORE", "BLOB_S3_ENDPOINT", "BLOB_S3_REGION", "BLOB_S3_BUCKET",
 		"BLOB_S3_ACCESS_KEY_ID", "BLOB_S3_SECRET_ACCESS_KEY",
+		"TRUSTED_PROXY_CIDRS",
 	} {
 		t.Setenv(name, "")
 	}
@@ -1261,6 +1262,54 @@ func TestLoad_CovesLabelerDID(t *testing.T) {
 			}
 			require.NoError(t, err)
 			assert.Equal(t, tc.want, cfg.CovesLabelerDID)
+		})
+	}
+}
+
+func TestLoad_TrustedProxyCIDRs(t *testing.T) {
+	tests := []struct {
+		name    string
+		unset   bool
+		value   string
+		want    []netip.Prefix
+		wantErr bool
+	}{
+		{name: "unset", unset: true, want: nil},
+		{name: "empty", value: "", want: nil},
+		{
+			name:  "IPv4 and IPv6 with whitespace",
+			value: "172.18.0.0/16, fd00::/8",
+			want: []netip.Prefix{
+				netip.MustParsePrefix("172.18.0.0/16"),
+				netip.MustParsePrefix("fd00::/8"),
+			},
+		},
+		{name: "prefix length out of range", value: "172.18.0.0/33", wantErr: true},
+		{name: "garbage", value: "garbage", wantErr: true},
+		{name: "valid then garbage", value: "172.18.0.0/16,garbage", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clearConfigEnv(t)
+			if tt.unset {
+				require.NoError(t, os.Unsetenv("TRUSTED_PROXY_CIDRS"))
+			} else {
+				t.Setenv("TRUSTED_PROXY_CIDRS", tt.value)
+			}
+
+			cfg, err := Load(discardLogger())
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "TRUSTED_PROXY_CIDRS")
+				return
+			}
+			require.NoError(t, err)
+			if tt.want == nil {
+				assert.Empty(t, cfg.TrustedProxyCIDRs)
+				return
+			}
+			assert.Equal(t, tt.want, cfg.TrustedProxyCIDRs)
 		})
 	}
 }

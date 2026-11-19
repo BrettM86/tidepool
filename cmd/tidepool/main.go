@@ -45,6 +45,7 @@ import (
 	"tidepool/internal/outbound"
 	"tidepool/internal/personas"
 	"tidepool/internal/prune"
+	"tidepool/internal/ratelimit"
 	"tidepool/internal/repo"
 	"tidepool/internal/store"
 	tidepoolsync "tidepool/internal/sync"
@@ -381,6 +382,11 @@ func run(logger *slog.Logger) error {
 	}
 	defer func() { _ = broadcaster.Close() }()
 	go broadcaster.Run(ctx)
+	// One client-IP resolver for every per-IP limiter (sync, inbox, votes
+	// XRPC): X-Real-IP is trusted only from TRUSTED_PROXY_CIDRS peers.
+	clientIPs := ratelimit.NewClientIPResolver(cfg.TrustedProxyCIDRs)
+	logger.Info("per-IP rate limits: trusted proxy prefixes",
+		"count", len(cfg.TrustedProxyCIDRs), "prefixes", cfg.TrustedProxyCIDRs)
 	syncServer, err := tidepoolsync.NewServer(tidepoolsync.Options{
 		Repo:           repoManager,
 		Broadcaster:    broadcaster,
@@ -391,6 +397,7 @@ func run(logger *slog.Logger) error {
 		RatePerSecond:  float64(cfg.SyncRatePerSecond),
 		RateBurst:      cfg.SyncRateBurst,
 		MaxSubscribers: cfg.SyncMaxSubscribers,
+		ClientIPs:      clientIPs,
 	})
 	if err != nil {
 		return err
@@ -736,6 +743,7 @@ func run(logger *slog.Logger) error {
 		SignerRateBurst:               cfg.InboxSignerRateBurst,
 		TombstoneConfirmRatePerSecond: float64(cfg.InboxTombstoneConfirmsPerMinute) / 60,
 		TombstoneConfirmBurst:         cfg.InboxTombstoneConfirmBurst,
+		ClientIPs:                     clientIPs,
 	})
 	if err != nil {
 		return err
@@ -941,7 +949,7 @@ func run(logger *slog.Logger) error {
 	}
 
 	// The vote-aggregate XRPC (the AppView's side-channel read).
-	votesXRPC, err := votes.NewXRPC(votes.XRPCOptions{DB: database, Logger: logger})
+	votesXRPC, err := votes.NewXRPC(votes.XRPCOptions{DB: database, Logger: logger, ClientIPs: clientIPs})
 	if err != nil {
 		return err
 	}

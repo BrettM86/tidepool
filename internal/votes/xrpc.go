@@ -46,15 +46,19 @@ type XRPCOptions struct {
 	// take the defaults. Tests shrink them.
 	RatePerSecond float64
 	RateBurst     int
+	// ClientIPs resolves the client IP the per-IP bucket keys on; a
+	// nil trusts nobody (keys on the TCP peer).
+	ClientIPs *ratelimit.ClientIPResolver
 }
 
 // XRPC serves the vote-aggregate side channel: the one sanctioned read the
 // AppView uses to display scores for bridged content (PLAN.md decision 7).
 // Public, cacheable, rate limited by client IP.
 type XRPC struct {
-	db      *sql.DB
-	limiter *ratelimit.Limiter
-	logger  *slog.Logger
+	db        *sql.DB
+	limiter   *ratelimit.Limiter
+	clientIPs *ratelimit.ClientIPResolver
+	logger    *slog.Logger
 }
 
 // NewXRPC validates options and builds the handler.
@@ -75,9 +79,10 @@ func NewXRPC(opts XRPCOptions) (*XRPC, error) {
 		burst = defaultRateBurst
 	}
 	return &XRPC{
-		db:      opts.DB,
-		limiter: ratelimit.New(perSecond, burst),
-		logger:  logger,
+		db:        opts.DB,
+		limiter:   ratelimit.New(perSecond, burst),
+		clientIPs: opts.ClientIPs,
+		logger:    logger,
 	}, nil
 }
 
@@ -101,7 +106,7 @@ type aggregateView struct {
 // error — the AppView batches optimistically over content that may predate
 // vote ingestion. Malformed at-uris are InvalidRequest.
 func (x *XRPC) handleGetVoteAggregates(w http.ResponseWriter, r *http.Request) {
-	if !x.limiter.Allow(ratelimit.ClientIP(r)) {
+	if !x.limiter.Allow(x.clientIPs.ClientIP(r)) {
 		x.writeXRPCError(w, http.StatusTooManyRequests, "RateLimitExceeded", "rate limit exceeded")
 		return
 	}

@@ -21,6 +21,8 @@ package ratelimit
 import (
 	"net"
 	"net/http"
+	"net/netip"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -150,14 +152,56 @@ func (l *Limiter) Size() int {
 	return len(l.buckets)
 }
 
-// ClientIP extracts the connection's remote IP from a request. Deliberately
-// not X-Forwarded-For: the bridge cannot know which proxies to trust, and a
-// spoofable header would let one client exhaust every bucket. Deployments
-// behind a load balancer rate-limit the real client at the edge.
-func ClientIP(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
+// ClientIPResolver resolves the client IP a per-IP bucket keys on. By
+// default it is the TCP peer address. X-Real-IP is honoured only when the
+// peer falls inside a configured trusted proxy prefix (the reverse proxy's
+// network, e.g. Caddy's Docker network), and must then carry exactly one
+// parseable address; otherwise the peer address is used. X-Forwarded-For is
+// never read: it is client-appendable, and a spoofable key would let one
+// client spread itself across buckets or exhaust everyone else's. A nil
+// resolver, or one with no prefixes, trusts nobody.
+type ClientIPResolver struct {
+	trusted []netip.Prefix
+}
+
+// NewClientIPResolver builds a resolver trusting the given proxy prefixes.
+func NewClientIPResolver(trusted []netip.Prefix) *ClientIPResolver {
+	masked := make([]netip.Prefix, 0, len(trusted))
+	for _, p := range trusted {
+		masked = append(masked, p.Masked())
 	}
-	return host
+	return &ClientIPResolver{trusted: masked}
+}
+
+// ClientIP returns the request's client IP.
+func (c *ClientIPResolver) ClientIP(r *http.Request) string {
+	peer, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		peer = r.RemoteAddr
+	}
+	if c == nil || len(c.trusted) == 0 {
+		return peer
+	}
+	peerAddr, err := netip.ParseAddr(peer)
+	if err != nil || !c.trusts(peerAddr.Unmap()) {
+		return peer
+	}
+	values := r.Header.Values("X-Real-IP")
+	if len(values) != 1 {
+		return peer
+	}
+	client, err := netip.ParseAddr(strings.TrimSpace(values[0]))
+	if err != nil || client.Zone() != "" {
+		return peer
+	}
+	return client.Unmap().String()
+}
+
+func (c *ClientIPResolver) trusts(addr netip.Addr) bool {
+	for _, p := range c.trusted {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }

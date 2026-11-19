@@ -5,13 +5,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
+	"net/netip"
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"tidepool/internal/ratelimit"
 	"tidepool/internal/repo"
 )
 
@@ -128,4 +132,34 @@ func TestSyncSurface_PerIPRateLimit(t *testing.T) {
 		status(h.http.URL+fmt.Sprintf("/xrpc/com.atproto.repo.getRecord?repo=%s&collection=%s&rkey=x", testDID, testCollection)))
 	// …except the healthcheck probe.
 	assert.Equal(t, http.StatusOK, status(h.http.URL+"/xrpc/_health"))
+}
+
+// TestSyncSurface_PerIPRateLimitKeysOnTrustedProxyHeader: behind a trusted
+// reverse proxy the per-IP bucket keys on the proxy's X-Real-IP, so two
+// clients relayed through the same proxy address get separate buckets.
+// Requests go straight to the router so the TCP peer is an explicit
+// RemoteAddr, not httptest.NewServer's loopback.
+func TestSyncSurface_PerIPRateLimitKeysOnTrustedProxyHeader(t *testing.T) {
+	h := newHarnessWithPoll(t, 500*time.Millisecond, func(o *Options) {
+		o.RatePerSecond = 0.001 // effectively no refill inside the test
+		o.RateBurst = 1
+		o.ClientIPs = ratelimit.NewClientIPResolver([]netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")})
+	})
+	router := chi.NewRouter()
+	h.server.Routes(router)
+
+	viaProxy := func(realIP string) int {
+		req := httptest.NewRequest(http.MethodGet, "http://"+testHostname+"/xrpc/com.atproto.sync.listRepos", nil)
+		req.RemoteAddr = "192.0.2.1:1234"
+		req.Header.Set("X-Real-IP", realIP)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	require.Equal(t, http.StatusOK, viaProxy("203.0.113.5"))
+	require.Equal(t, http.StatusTooManyRequests, viaProxy("203.0.113.5"),
+		"the same client's burst is spent")
+	assert.Equal(t, http.StatusOK, viaProxy("203.0.113.6"),
+		"a second client behind the same proxy gets its own bucket")
 }

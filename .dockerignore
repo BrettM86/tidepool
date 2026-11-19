@@ -17,3 +17,9 @@ backups/
 
 # CI checks Coves out here as the e2e AppView build context (ci.yml).
 coves-src/
+
+# Environment files hold production secrets (BRIDGE_KEK, the admin token) in
+# the checkout production builds from. The build needs none of them, and a
+# copied .env would persist in the build stage layer and the build cache.
+.env
+.env.*

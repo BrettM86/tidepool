@@ -22,6 +22,10 @@
               "maximum": 5,
               "default": 3,
               "description": "Content visibility level (1=only best content, 5=all content)"
+            },
+            "favorite": {
+              "type": "boolean",
+              "description": "Whether to pin this community as a favorite. When omitted, an existing subscription keeps its setting and a new one is not a favorite."
             }
           }
         }
@@ -30,7 +34,7 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["uri", "cid"],
+          "required": ["uri", "cid", "favorite", "contentVisibility"],
           "properties": {
             "uri": {
               "type": "string",
@@ -45,6 +49,16 @@
             "existing": {
               "type": "boolean",
               "description": "True when the viewer already had a subscription record for the community (whether or not it was rewritten)"
+            },
+            "favorite": {
+              "type": "boolean",
+              "description": "Whether the subscription is a favorite after this call"
+            },
+            "contentVisibility": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 5,
+              "description": "The subscription's content visibility level after this call (1=only best content, 5=all content)"
             }
           }
         }
@@ -61,6 +75,10 @@
         {
           "name": "CommunityRemoved",
           "description": "The community is removed by the instance and takes no new subscriptions"
+        },
+        {
+          "name": "SubscriptionConflict",
+          "description": "The existing subscription record kept changing while this call rewrote it, or was deleted or replaced by a different record concurrently; nothing was written and the call may be retried"
         }
       ]
     }

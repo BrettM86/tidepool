@@ -31,6 +31,11 @@
             "maximum": 5,
             "default": 3,
             "description": "Content visibility level (1=only best content, 5=all content)"
+          },
+          "favorite": {
+            "type": "boolean",
+            "default": false,
+            "description": "Whether the subscriber has pinned this community as a favorite"
           }
         }
       }

@@ -94,6 +94,10 @@
               "maximum": 5,
               "description": "The viewer's contentVisibility setting for this community (1=only best content, 5=all content). Present only when subscribed."
             },
+            "favorite": {
+              "type": "boolean",
+              "description": "Whether the viewer has pinned this community as a favorite. Present only when subscribed."
+            },
             "member": {
               "type": "boolean",
               "description": "Whether the viewer has membership status"
@@ -302,6 +306,10 @@
           "minimum": 1,
           "maximum": 5,
           "description": "The viewer's contentVisibility setting for this community (1=only best content, 5=all content). Present only when subscribed."
+        },
+        "favorite": {
+          "type": "boolean",
+          "description": "Whether the viewer has pinned this community as a favorite. Present only when subscribed."
         },
         "subscriptionUri": {
           "type": "string",

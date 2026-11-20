@@ -67,9 +67,9 @@ func NewPrivateOnlyHTTPClient(timeout time.Duration) *http.Client {
 // pivot through: loopback, RFC1918 private, link-local, unique-local,
 // multicast, unspecified, the cloud-metadata endpoint, and the reserved
 // ranges in reservedPrefixes (this network, shared address space, IETF
-// protocol assignments, benchmarking, class E, NAT64, 6to4). It rejects
-// non-http(s) schemes and URL userinfo, validates any IP literal in a URL,
-// and — crucially — validates the actually-resolved IP at dial time so a
+// protocol assignments, benchmarking, class E, IPv4-compatible IPv6, NAT64,
+// 6to4). It rejects non-http(s) schemes and URL userinfo, validates any IP
+// literal in a URL, and — crucially — validates the actually-resolved IP at dial time so a
 // hostname that resolves to a blocked address (or rebinds between the DNS
 // answer and the connect) is refused. This mirrors bridgy-fed's
 // are_urls_safe egress check.
@@ -164,14 +164,16 @@ func isLocalIP(ip net.IP) bool {
 	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
 }
 
-// reservedPrefixes are non-public ranges the net.IP predicates miss. NAT64
-// and 6to4 are blocked whole because they embed arbitrary IPv4 addresses.
+// reservedPrefixes are non-public ranges the net.IP predicates miss. NAT64,
+// 6to4 and the deprecated IPv4-compatible range ::/96 (RFC 4291 §2.5.5.1) are
+// blocked whole because they embed arbitrary IPv4 addresses.
 var reservedPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("0.0.0.0/8"),
 	netip.MustParsePrefix("100.64.0.0/10"),
 	netip.MustParsePrefix("192.0.0.0/24"),
 	netip.MustParsePrefix("198.18.0.0/15"),
 	netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("::/96"),
 	netip.MustParsePrefix("64:ff9b::/96"),
 	netip.MustParsePrefix("64:ff9b:1::/48"),
 	netip.MustParsePrefix("2002::/16"),

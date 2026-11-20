@@ -307,6 +307,80 @@ func TestDialGuard_IPLiteralAddr(t *testing.T) {
 	require.Error(t, err, "a blocked IP literal must be refused at dial time")
 }
 
+// TestIsBlockedIP_IPv4CompatibleIPv6: the deprecated IPv4-compatible IPv6
+// range ::/96 (RFC 4291 section 2.5.5.1) is non-public and blocked as a
+// whole, like 64:ff9b::/96, whatever IPv4 address it embeds. Neighbouring
+// public IPv6 addresses stay dialable, and IPv4-mapped (::ffff:0:0/96)
+// handling is unaffected.
+func TestIsBlockedIP_IPv4CompatibleIPv6(t *testing.T) {
+	cases := []struct {
+		addr    string
+		blocked bool
+	}{
+		// ::/96 IPv4-compatible IPv6
+		{"::7f00:1", true},    // embeds 127.0.0.1
+		{"::a9fe:a9fe", true}, // embeds 169.254.169.254
+		{"::a00:1", true},     // embeds 10.0.0.1
+		{"::808:808", true},   // embeds public 8.8.8.8; whole prefix blocked
+		{"::", true},          // unspecified
+		{"::1", true},         // loopback
+		// IPv4-mapped IPv6 handling unchanged
+		{"::ffff:127.0.0.1", true},
+		{"::ffff:8.8.8.8", false},
+		// public neighbours
+		{"1::7f00:1", false},
+		{"2001:4860:4860::8888", false},
+		{"2606:4700::1111", false},
+		{"2003::1", false}, // just outside 2002::/16 6to4
+	}
+	for _, tc := range cases {
+		t.Run(tc.addr, func(t *testing.T) {
+			ip := net.ParseIP(tc.addr)
+			require.NotNil(t, ip, tc.addr)
+			if tc.blocked {
+				assert.True(t, isBlockedIP(ip), "%s must be blocked", tc.addr)
+			} else {
+				assert.False(t, isBlockedIP(ip), "%s must be allowed", tc.addr)
+			}
+		})
+	}
+}
+
+// TestDialGuard_IPv4CompatibleIPv6Literal: an IPv4-compatible IPv6 literal
+// embedding loopback is refused at dial time without calling the base
+// dialer; with allowPrivate the guard passes it through unchanged.
+func TestDialGuard_IPv4CompatibleIPv6Literal(t *testing.T) {
+	t.Run("guard on refuses", func(t *testing.T) {
+		g := newEgressGuard(false)
+		g.lookupIPAddr = func(_ context.Context, host string) ([]net.IPAddr, error) {
+			t.Fatalf("an IP literal must not be resolved, got lookup for %q", host)
+			return nil, nil
+		}
+		dialed := false
+		base := func(_ context.Context, _, _ string) (net.Conn, error) {
+			dialed = true
+			return stubConn{}, nil
+		}
+		_, err := g.dialContext(base)(context.Background(), "tcp", "[::7f00:1]:443")
+		require.Error(t, err, "[::7f00:1]:443 must be refused at dial time")
+		assert.False(t, dialed, "the guard must not dial ::7f00:1")
+		assert.True(t, errors.IsValidation(err), "refusal must be the guard's validation error, got %v", err)
+		assert.Contains(t, err.Error(), "not an allowed egress target")
+	})
+	t.Run("allowPrivate passes through", func(t *testing.T) {
+		g := newEgressGuard(true)
+		var dialedAddr string
+		base := func(_ context.Context, _, addr string) (net.Conn, error) {
+			dialedAddr = addr
+			return stubConn{}, nil
+		}
+		conn, err := g.dialContext(base)(context.Background(), "tcp", "[::7f00:1]:443")
+		require.NoError(t, err)
+		assert.Equal(t, stubConn{}, conn)
+		assert.Equal(t, "[::7f00:1]:443", dialedAddr)
+	})
+}
+
 // TestPrivateOnlyHTTPClient_RefusesPublicDestinations: the dev-only client
 // (ALLOW_DEV_REQUEST_CRAWL's crawl path) is the INVERSE of the SSRF guard —
 // it must refuse anything public at dial time, so a misconfigured

@@ -42,6 +42,85 @@ func TestIsBlockedIP(t *testing.T) {
 	}
 }
 
+// TestIsBlockedIP_ReservedRanges covers special-purpose ranges the stdlib
+// net.IP predicates do not flag: CGNAT/Tailscale, benchmarking, the reserved
+// 240.0.0.0/4 block (including limited broadcast), "this network" 0.0.0.0/8,
+// IETF protocol assignments, and the IPv6 transition prefixes (NAT64 and
+// 6to4) that can translate to an internal IPv4 address. Addresses just
+// outside each range must stay dialable.
+func TestIsBlockedIP_ReservedRanges(t *testing.T) {
+	cases := []struct {
+		addr    string
+		blocked bool
+	}{
+		// 100.64.0.0/10 shared address space (CGNAT, Tailscale)
+		{"100.64.0.1", true},
+		{"100.127.255.254", true},
+		{"100.63.255.255", false},
+		{"100.128.0.1", false},
+		// 198.18.0.0/15 benchmarking
+		{"198.18.0.1", true},
+		{"198.19.255.255", true},
+		{"198.17.255.255", false},
+		{"198.20.0.1", false},
+		// 240.0.0.0/4 reserved, including limited broadcast
+		{"240.0.0.1", true},
+		{"255.255.255.255", true},
+		{"223.255.255.254", false},
+		// 0.0.0.0/8 "this network"
+		{"0.1.2.3", true},
+		{"1.0.0.1", false},
+		// 192.0.0.0/24 IETF protocol assignments
+		{"192.0.0.8", true},
+		{"192.0.1.1", false},
+		// 64:ff9b::/96 NAT64; the whole prefix is blocked, even when it
+		// embeds a public IPv4 address
+		{"64:ff9b::a00:1", true},
+		{"64:ff9b::101:101", true},
+		// 64:ff9b:1::/48 local-use NAT64
+		{"64:ff9b:1::a00:1", true},
+		// 2002::/16 6to4
+		{"2002:a00:1::", true},
+		// IPv4-mapped IPv6 forms of reserved IPv4 addresses
+		{"::ffff:100.64.0.1", true},
+		{"::ffff:198.18.0.1", true},
+		// public addresses
+		{"1.1.1.1", false},
+		{"2606:4700::1111", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.addr, func(t *testing.T) {
+			ip := net.ParseIP(tc.addr)
+			require.NotNil(t, ip, tc.addr)
+			if tc.blocked {
+				assert.True(t, isBlockedIP(ip), "%s must be blocked", tc.addr)
+			} else {
+				assert.False(t, isBlockedIP(ip), "%s must be allowed", tc.addr)
+			}
+		})
+	}
+}
+
+// TestDialGuard_BlocksResolvedSharedAddressSpace: a hostname resolving to a
+// CGNAT/Tailscale address (100.64.0.0/10) is refused at dial time with the
+// guard's validation error, and the base dialer is never called.
+func TestDialGuard_BlocksResolvedSharedAddressSpace(t *testing.T) {
+	g := newEgressGuard(false)
+	g.lookupIPAddr = func(_ context.Context, _ string) ([]net.IPAddr, error) {
+		return []net.IPAddr{{IP: net.IPv4(100, 64, 0, 1)}}, nil
+	}
+	dialed := false
+	base := func(_ context.Context, _, _ string) (net.Conn, error) {
+		dialed = true
+		return stubConn{}, nil
+	}
+	_, err := g.dialContext(base)(context.Background(), "tcp", "tailnet.attacker.test:443")
+	require.Error(t, err, "a hostname resolving to 100.64.0.1 must be refused at dial time")
+	assert.False(t, dialed, "the guard must not dial a blocked resolved address")
+	assert.True(t, errors.IsValidation(err), "refusal must be the guard's validation error, got %v", err)
+	assert.Contains(t, err.Error(), "not an allowed egress target")
+}
+
 func TestCheckURL_SchemeAndUserinfo(t *testing.T) {
 	g := newEgressGuard(false)
 	cases := []string{

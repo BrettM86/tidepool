@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"time"
@@ -64,7 +65,9 @@ func NewPrivateOnlyHTTPClient(timeout time.Duration) *http.Client {
 
 // egressGuard blocks outbound requests to addresses an SSRF attacker would
 // pivot through: loopback, RFC1918 private, link-local, unique-local,
-// multicast, unspecified, and the cloud-metadata endpoint. It rejects
+// multicast, unspecified, the cloud-metadata endpoint, and the reserved
+// ranges in reservedPrefixes (this network, shared address space, IETF
+// protocol assignments, benchmarking, class E, NAT64, 6to4). It rejects
 // non-http(s) schemes and URL userinfo, validates any IP literal in a URL,
 // and — crucially — validates the actually-resolved IP at dial time so a
 // hostname that resolves to a blocked address (or rebinds between the DNS
@@ -161,9 +164,32 @@ func isLocalIP(ip net.IP) bool {
 	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
 }
 
+// reservedPrefixes are non-public ranges the net.IP predicates miss. NAT64
+// and 6to4 are blocked whole because they embed arbitrary IPv4 addresses.
+var reservedPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("64:ff9b::/96"),
+	netip.MustParsePrefix("64:ff9b:1::/48"),
+	netip.MustParsePrefix("2002::/16"),
+}
+
 func isBlockedIP(ip net.IP) bool {
 	if ip == nil {
 		return true
+	}
+	address, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return true
+	}
+	address = address.Unmap()
+	for _, prefix := range reservedPrefixes {
+		if prefix.Contains(address) {
+			return true
+		}
 	}
 	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
 		ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() ||

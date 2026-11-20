@@ -420,6 +420,13 @@ func digestMatches(header, expectedB64 string) bool {
 	return false
 }
 
+// SignatureKeyID returns the keyId named by the request's Signature header,
+// or "" when there is none. It is unverified: use it only to attribute a
+// rejection in logs.
+func SignatureKeyID(req *http.Request) string {
+	return parseSignatureHeader(req.Header.Get("Signature"))["keyid"]
+}
+
 // parseSignatureHeader parses the comma-separated key="value" pairs of a
 // draft-cavage Signature header. Keys are lower-cased. Values may contain
 // commas (base64 never does, but headers lists don't either — split on

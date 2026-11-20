@@ -9,12 +9,14 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	stderrors "errors"
 	"expvar"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 
@@ -254,6 +256,30 @@ func (ib *Inbox) handleInbox(w http.ResponseWriter, r *http.Request) {
 			// (tombstonedSelfDelete already logged the fetch error.)
 			http.Error(w, "tombstone confirmation unavailable", http.StatusServiceUnavailable)
 			return
+		case stderrors.Is(err, ap.ErrPayloadShape):
+			// The signer's actor (key) document exceeds the parser's shape
+			// budget (nesting depth, element count): definitive, since
+			// re-fetching yields the same document. Checked before
+			// IsValidation, which ErrPayloadShape also satisfies, so it is
+			// not reported as a bad signature. The body is never logged.
+			// The keyId is unverified and header-sized (up to 1 MiB), and
+			// err's text embeds it, so log a truncated keyId and host (an
+			// IPv6 zone identifier survives Hostname()) and a fixed reason
+			// naming the cap.
+			keyID := ap.SignatureKeyID(r)
+			host, _ := ap.HostKey(ap.ActorIDFromKeyID(keyID))
+			reason := ap.ErrPayloadShape.Error()
+			switch {
+			case stderrors.Is(err, ap.ErrPayloadTooDeep):
+				reason = ap.ErrPayloadTooDeep.Error()
+			case stderrors.Is(err, ap.ErrPayloadTooManyElements):
+				reason = ap.ErrPayloadTooManyElements.Error()
+			}
+			ib.logger.Warn("inbox delivery rejected: signer key document payload shape",
+				"key_id", truncateUTF8(keyID, maxLoggedKeyIDBytes),
+				"host", truncateUTF8(host, maxLoggedKeyIDBytes), "reason", reason)
+			http.Error(w, "signature key document rejected", http.StatusUnauthorized)
+			return
 		case errors.IsValidation(err):
 			// Bad/expired/missing signature: a definitive rejection.
 			ib.logger.Warn("inbox delivery rejected: signature", "error", err)
@@ -270,8 +296,9 @@ func (ib *Inbox) handleInbox(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "signing actor is gone", http.StatusUnauthorized)
 			return
 		default:
-			// Key resolution failed (network, remote down): tell the sender
-			// to retry rather than swallowing the delivery.
+			// Key resolution failed transiently (network, remote down): tell
+			// the sender to retry rather than swallowing the delivery. A
+			// shape-rejected key document is definitive and handled above.
 			ib.logger.Warn("inbox delivery deferred: key resolution", "error", err)
 			http.Error(w, "signature key unavailable", http.StatusServiceUnavailable)
 			return
@@ -296,6 +323,11 @@ func (ib *Inbox) handleInbox(w http.ResponseWriter, r *http.Request) {
 	if activity == nil {
 		activity, err = ap.ParseObject(body)
 		if err != nil {
+			if stderrors.Is(err, ap.ErrPayloadShape) {
+				host, _ := ap.HostKey(actorID)
+				ib.logger.Warn("inbox delivery rejected: payload shape",
+					"signer", actorID, "host", host, "reason", err.Error())
+			}
 			http.Error(w, "payload is not an AP activity", http.StatusBadRequest)
 			return
 		}
@@ -581,4 +613,19 @@ func decodeJSONBody(r *http.Request, dst any) error {
 		return fmt.Errorf("decode request body: %w", err)
 	}
 	return nil
+}
+
+// maxLoggedKeyIDBytes caps an unverified keyId written to logs.
+const maxLoggedKeyIDBytes = 256
+
+// truncateUTF8 returns s cut to at most n bytes without splitting a UTF-8
+// sequence.
+func truncateUTF8(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }

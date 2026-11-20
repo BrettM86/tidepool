@@ -16,6 +16,8 @@ import (
 	"net/url"
 	"reflect"
 	"time"
+
+	"tidepool/internal/errors"
 )
 
 // AS2 media types. Lemmy serves and accepts application/activity+json;
@@ -704,6 +706,19 @@ const MaxObjectNestingDepth = 32
 // about 2,500, so 30000 leaves more than 10x headroom.
 const MaxObjectElements = 30000
 
+// ErrPayloadShape marks a payload ParseObject rejects for its shape (nesting
+// depth or element count over the caps). Shape rejections are deterministic,
+// so it wraps errors.ErrInvalidInput: fetch consumers classify them as
+// validation (terminal, never retried).
+var ErrPayloadShape = fmt.Errorf("ap: payload shape rejected: %w", errors.ErrInvalidInput)
+
+// ErrPayloadTooDeep and ErrPayloadTooManyElements name which shape cap a
+// payload exceeded. Both wrap ErrPayloadShape.
+var (
+	ErrPayloadTooDeep         = fmt.Errorf("ap: payload exceeds maximum nesting depth of %d: %w", MaxObjectNestingDepth, ErrPayloadShape)
+	ErrPayloadTooManyElements = fmt.Errorf("ap: payload exceeds maximum of %d JSON elements: %w", MaxObjectElements, ErrPayloadShape)
+)
+
 // ParseObject decodes an AP object from JSON, requiring that the payload is
 // a JSON object (not a bare string/array) nested no deeper than
 // MaxObjectNestingDepth and containing at most MaxObjectElements elements.
@@ -748,7 +763,7 @@ func checkPayloadShape(data []byte) error {
 		case '{', '[':
 			depth++
 			if depth > MaxObjectNestingDepth {
-				return fmt.Errorf("ap: payload exceeds maximum nesting depth of %d", MaxObjectNestingDepth)
+				return ErrPayloadTooDeep
 			}
 			elements++
 		case ',':
@@ -757,7 +772,7 @@ func checkPayloadShape(data []byte) error {
 			depth--
 		}
 		if elements > MaxObjectElements {
-			return fmt.Errorf("ap: payload exceeds maximum of %d JSON elements", MaxObjectElements)
+			return ErrPayloadTooManyElements
 		}
 	}
 	return nil

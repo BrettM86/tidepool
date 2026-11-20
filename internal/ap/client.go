@@ -553,6 +553,8 @@ func guardedTransport(base http.RoundTripper, guard *egressGuard) http.RoundTrip
 //   - a redirect off the IRI's host ending at a non-JSON 2xx page (a dead
 //     instance parking every URL) → errors.IsHostGone (parked_redirect);
 //   - any other 2xx non-JSON page → NonJSONResponseError;
+//   - a body over ParseObject's shape caps → ErrPayloadShape, which
+//     errors.IsValidation (deterministic, so terminal: never re-fetch);
 //   - the IsHostGone cases apply to FetchObject, FetchActor and
 //     FetchCollection (its pages go through FetchObject) only, not to
 //     pinned-authority fetches or WebFinger. They are not IsNotFound. Backfill

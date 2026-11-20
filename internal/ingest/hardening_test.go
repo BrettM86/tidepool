@@ -407,3 +407,41 @@ func TestFollowRetrierExhaustionLogsLoudly(t *testing.T) {
 	assert.Equal(t, 2, community.FollowAttempts)
 	assert.Equal(t, store.FollowStatePending, community.FollowState)
 }
+
+// TestInboxTombstonePathRejectsDeepNestingWithoutConfirmation: an
+// unverifiable self-Delete from a tombstoned actor that carries a
+// 9,990-deep nest (under the 1 MiB body cap) in another field is rejected
+// by the parse's depth cap — cheaply, and before the tombstone
+// confirmation fetch the branch could otherwise be farmed for.
+func TestInboxTombstonePathRejectsDeepNestingWithoutConfirmation(t *testing.T) {
+	h := newHarness(t)
+	const ghost = "https://lemmy.world/u/ghost-deep"
+	var ghostHits atomic.Int64
+	h.mux.HandleFunc("GET "+urlPath(h.t, ghost), func(w http.ResponseWriter, _ *http.Request) {
+		ghostHits.Add(1)
+		w.WriteHeader(http.StatusGone)
+	})
+	key, err := ap.GenerateRSAKey()
+	require.NoError(t, err)
+	deleted := &remoteActor{id: ghost, key: key}
+
+	const activityID = "https://lemmy.world/activities/delete/deep-1"
+	activity := selfDelete(activityID, ghost)
+	// Outermost activity is depth 1; the target nest adds 9,989 more.
+	const targetDepth = 9989
+	pad := strings.Repeat("a", 900_000)
+	activity["target"] = json.RawMessage(strings.Repeat(`{"object":`, targetDepth) +
+		`"` + pad + `"` + strings.Repeat(`}`, targetDepth))
+
+	start := time.Now()
+	status := h.deliver(deleted, activity)
+	elapsed := time.Since(start)
+
+	assert.Equal(t, http.StatusUnauthorized, status,
+		"an unparseable tombstone-path payload is a definitive rejection (not 413: the body is under the cap)")
+	assert.Equal(t, int64(1), ghostHits.Load(),
+		"only key resolution may fetch the actor; the confirmation fetch must never go out")
+	_, err = h.events.GetEvent(context.Background(), activityID)
+	assert.Error(t, err, "a rejected delivery must not be enqueued")
+	assert.Less(t, elapsed, time.Second, "the delivery must be handled in bounded time")
+}

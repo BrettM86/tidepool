@@ -685,16 +685,60 @@ func (o *Object) SharedInboxOrInbox() string {
 	return o.Inbox
 }
 
+// MaxObjectNestingDepth caps how deeply objects and arrays may nest in a
+// payload handed to ParseObject. Each nested *Object field re-scans its own
+// sub-slice through UnmarshalJSON, so decode cost grows quadratically with
+// depth. Real Lemmy, Mastodon, PieFed and Mbin payloads nest under 10 levels
+// (the deepest repo fixture is 7), so 32 leaves ample headroom.
+const MaxObjectNestingDepth = 32
+
 // ParseObject decodes an AP object from JSON, requiring that the payload is
-// a JSON object (not a bare string/array).
+// a JSON object (not a bare string/array) nested no deeper than
+// MaxObjectNestingDepth.
 func ParseObject(data []byte) (*Object, error) {
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) == 0 || trimmed[0] != '{' {
 		return nil, fmt.Errorf("ap: payload is not a JSON object")
+	}
+	if err := checkNestingDepth(trimmed); err != nil {
+		return nil, err
 	}
 	var obj Object
 	if err := json.Unmarshal(trimmed, &obj); err != nil {
 		return nil, fmt.Errorf("ap: parse object: %w", err)
 	}
 	return &obj, nil
+}
+
+// checkNestingDepth makes one linear pass over data, counting '{' and '['
+// outside JSON strings (the outermost object is depth 1), and fails at the
+// first point the depth exceeds MaxObjectNestingDepth. Malformed JSON is
+// left for json.Unmarshal to report.
+func checkNestingDepth(data []byte) error {
+	depth := 0
+	inString := false
+	for i := 0; i < len(data); i++ {
+		c := data[i]
+		if inString {
+			switch c {
+			case '\\':
+				i++ // skip the escaped byte
+			case '"':
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = true
+		case '{', '[':
+			depth++
+			if depth > MaxObjectNestingDepth {
+				return fmt.Errorf("ap: payload exceeds maximum nesting depth of %d", MaxObjectNestingDepth)
+			}
+		case '}', ']':
+			depth--
+		}
+	}
+	return nil
 }

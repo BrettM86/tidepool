@@ -692,15 +692,27 @@ func (o *Object) SharedInboxOrInbox() string {
 // (the deepest repo fixture is 7), so 32 leaves ample headroom.
 const MaxObjectNestingDepth = 32
 
+// MaxObjectElements caps how many JSON elements a payload handed to
+// ParseObject may contain, where an element is each '{', '[' or ',' outside
+// JSON strings. The cap bounds per-element decode allocation: each element
+// costs at most about 1.7-1.8 KiB, roughly 50 MiB at the cap. It is not an
+// overall ceiling: total allocation also scales with body bytes (large
+// strings, invalid UTF-8, RawMessage re-copies) and nesting depth, which only
+// the caller's body limit bounds (maxInboxBodyBytes, 1 MiB, for the inbox;
+// DefaultMaxResponseBytes, 5 MiB, for fetches). The largest repo fixture
+// (outbox_lemmy_world.json) has 101 elements and a 50-item Lemmy outbox page
+// about 2,500, so 30000 leaves more than 10x headroom.
+const MaxObjectElements = 30000
+
 // ParseObject decodes an AP object from JSON, requiring that the payload is
 // a JSON object (not a bare string/array) nested no deeper than
-// MaxObjectNestingDepth.
+// MaxObjectNestingDepth and containing at most MaxObjectElements elements.
 func ParseObject(data []byte) (*Object, error) {
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) == 0 || trimmed[0] != '{' {
 		return nil, fmt.Errorf("ap: payload is not a JSON object")
 	}
-	if err := checkNestingDepth(trimmed); err != nil {
+	if err := checkPayloadShape(trimmed); err != nil {
 		return nil, err
 	}
 	var obj Object
@@ -710,12 +722,14 @@ func ParseObject(data []byte) (*Object, error) {
 	return &obj, nil
 }
 
-// checkNestingDepth makes one linear pass over data, counting '{' and '['
-// outside JSON strings (the outermost object is depth 1), and fails at the
-// first point the depth exceeds MaxObjectNestingDepth. Malformed JSON is
-// left for json.Unmarshal to report.
-func checkNestingDepth(data []byte) error {
+// checkPayloadShape makes one linear pass over data outside JSON strings,
+// tracking nesting depth from '{' and '[' (the outermost object is depth 1)
+// and counting elements ('{', '[' and ','). It fails at the first point the
+// depth exceeds MaxObjectNestingDepth or the element count exceeds
+// MaxObjectElements. Malformed JSON is left for json.Unmarshal to report.
+func checkPayloadShape(data []byte) error {
 	depth := 0
+	elements := 0
 	inString := false
 	for i := 0; i < len(data); i++ {
 		c := data[i]
@@ -736,8 +750,14 @@ func checkNestingDepth(data []byte) error {
 			if depth > MaxObjectNestingDepth {
 				return fmt.Errorf("ap: payload exceeds maximum nesting depth of %d", MaxObjectNestingDepth)
 			}
+			elements++
+		case ',':
+			elements++
 		case '}', ']':
 			depth--
+		}
+		if elements > MaxObjectElements {
+			return fmt.Errorf("ap: payload exceeds maximum of %d JSON elements", MaxObjectElements)
 		}
 	}
 	return nil

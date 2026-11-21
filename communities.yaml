@@ -96,3 +96,27 @@ instances:
     exclude:
       - "!boysjerking@sh.itjust.works"
       - "!combatvideos@sh.itjust.works"
+  # added 2026-11-21 on request: fourth whole instance, the largest Lemmy
+  # (about 13.7k local communities; the public listing reaches 10k).
+  # skip_nsfw leaves out its NSFW-flagged communities (743 in the 2026-11-21
+  # listing), including ones created or switched to NSFW later. The excludes
+  # are explicit or graphic communities that carry no NSFW flag.
+  - host: "lemmy.world"
+    skip_nsfw: true
+    exclude:
+      - "!pornvids@lemmy.world"
+      - "!pornhub@lemmy.world"
+      - "!celebritypornnsfw@lemmy.world"
+      - "!anal@lemmy.world"
+      - "!floppycocks@lemmy.world"
+      - "!dicksisters@lemmy.world"
+      - "!normalnudes@lemmy.world"
+      - "!rule34dle@lemmy.world"
+      - "!camgirls@lemmy.world"
+      - "!slimthick@lemmy.world"
+      - "!girlsgonewild@lemmy.world"
+      - "!NaturalBeautyGW@lemmy.world"
+      - "!NaturalgirlsGW@lemmy.world"
+      - "!PetiteGW@lemmy.world"
+      - "!MixedBeautiesGW@lemmy.world"
+      - "!MediGore@lemmy.world"

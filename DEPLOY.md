@@ -1290,10 +1290,11 @@ does other work.
 
 These limit what the runbook above can promise:
 
-- **Per-IP rate limits act as global limits behind Caddy.** Every in-process
-  limiter keys on `RemoteAddr` and ignores `X-Forwarded-For`, so behind the
-  proxy every request has Caddy's container IP. Rate limiting at the edge is
-  the fix; tracked in `FOLLOWUPS.md`.
+- **Per-IP rate limits need `TRUSTED_PROXY_CIDRS` behind Caddy.** Unset, every
+  in-process limiter keys on `RemoteAddr`, so behind the proxy every request
+  has Caddy's container IP and the per-IP limits act as global limits. Set it
+  in `.env` to the coves-prod-network subnet so the limiters key on Caddy's
+  `X-Real-IP`; the startup log line reports `count=1`.
 - **The e2e harness never runs with `ENVIRONMENT=production`.** It runs in
   development mode (migrations on start, HTTP, private fetch, strict lexicon
   validation; `docker-compose.e2e.yml`). The production-only refusals

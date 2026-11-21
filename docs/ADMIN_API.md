@@ -21,7 +21,7 @@ errors.
 | `POST /admin/communities/backfill` | Queues an outbox backfill in the background. At most 4 run at once. A community already queued or walking is not queued again. | `{"community":…}`. **202**; **404** not bridged; **409** the community is removed by a Coves community `!takedown` (nothing is queued). |
 | `POST /admin/communities/refresh-profile` | Re-materializes `community.profile` without waiting for `PROFILE_REFRESH_TTL`. Use it to add new record fields to communities that are not posting. | `{"community":…}` runs now: **200**, **404** not bridged, **422**, **502**. `{"all":true}` walks every bridged community in the background: **202** `{"communities":N}`, **409** while a community walk runs. Sending both keys is **400**. |
 | `POST /admin/users/refresh-profile` | Re-materializes `actor.profile` for every bridged person. Use it to add new record fields such as `origin`, `originUsername`, `originUrl`. | Body must be exactly `{"all":true}`; anything else, including unknown keys or trailing data, is **400**. **202** `{"users":N}`; **409** while a user walk runs. |
-| `POST /admin/communities/reconcile` | Runs one follow-list sweep now and answers when it ends. A sweep can take minutes (see [Pacing](#pacing)), so the response's write deadline is 10 minutes, and that includes any wait behind a running sweep. A client that drops does not cancel the sweep. A sweep that outlasts the deadline still finishes, and the client gets no result. | **200** `{"subscribed":[…],"unsubscribed":[…],"failed":[…],"suppressed":[…]}`. `suppressed` holds the actor ids of removed communities the sweep did not follow. `subscribed` and `failed` hold follow-list entries, and actor ids for listed communities. `unsubscribed` and a failed unfollow in `failed` hold group ids. A listed community left for a later sweep appears nowhere in the response. **500** `reconcile failed: …`. A parse failure or a failed read of the subscription table makes no subscription changes, but the outbound sets may already be applied. A sweep ended by shutdown keeps the changes it made. A failed community listing is not a 500. **501** `FOLLOW_LIST_PATH` is unset. |
+| `POST /admin/communities/reconcile` | Runs one follow-list sweep now and answers when it ends. A sweep can take minutes (see [Pacing](#pacing)), so the response's write deadline is 10 minutes, and that includes any wait behind a running sweep. A client that drops does not cancel the sweep. A sweep that outlasts the deadline still finishes, and the client gets no result. | **200** `{"subscribed":[…],"unsubscribed":[…],"failed":[…],"suppressed":[…],"nsfw_skipped":{…}}`. `suppressed` holds the actor ids of removed communities the sweep did not follow. `nsfw_skipped` maps each `skip_nsfw` host to the number of its communities the sweep left out or refused as NSFW, and is `{}` when there are none. `subscribed` and `failed` hold follow-list entries, and actor ids for listed communities. `unsubscribed` and a failed unfollow in `failed` hold group ids. A listed community left for a later sweep appears nowhere in the response. **500** `reconcile failed: …`. A parse failure or a failed read of the subscription table makes no subscription changes, but the outbound sets may already be applied. A sweep ended by shutdown keeps the changes it made. A failed community listing is not a 500. **501** `FOLLOW_LIST_PATH` is unset. |
 
 Both refresh walks go one item at a time with a pause between them. The
 community walk and the user walk can run at the same time. Progress and a final
@@ -397,7 +397,8 @@ giving its reason.
 ### Instance entries
 
 An `instances` entry follows every local community of one Lemmy instance,
-including NSFW communities and communities created later:
+including communities created later, and NSFW communities unless the entry sets
+`skip_nsfw: true`:
 
 ```yaml
 communities:
@@ -408,6 +409,7 @@ instances:
       - "!news@lemmy.world"
       - "https://lemmy.world/c/pics"
   - host: "lemmy.ml"
+    skip_nsfw: true              # optional, default false
 ```
 
 - `communities` is still required. A file with only instance entries writes
@@ -423,6 +425,26 @@ instances:
   `instances: []`.
 - `exclude:` with nothing under it is an error. Remove the key or write
   `exclude: []`.
+- `skip_nsfw` takes `true` or `false`, and a missing key is `false`. Any other
+  value, including a null, `"yes"` or `1`, is an error naming the host.
+- With `skip_nsfw: true`, a community whose `community.nsfw` is set in the
+  listing or in a post walk is not tried: it gets no Group fetch and no batch
+  slot. Each sweep counts it once in `nsfw_skipped` for its host.
+- With `skip_nsfw: true`, every listed or post-discovered add first fetches the
+  Group, and refuses one with `sensitive: true` before a DID is minted. The
+  refusal logs `subscribe refused` with the community id and the reason
+  `community is NSFW-flagged`, counts in `nsfw_skipped`, not `failed`, takes a
+  batch slot, and is not tried again for 24 hours.
+- An NSFW community named in `communities` is followed: explicit entries win
+  over `skip_nsfw`. A manual `POST /admin/communities` of an NSFW community on
+  a `skip_nsfw` host is followed, but the next sweep unfollows it; only a
+  `communities` entry keeps it.
+
+On a `skip_nsfw` host, a followed community that turns NSFW (an `Update{Group}`
+or the profile TTL refresh sets `sensitive: true`) and is wanted only by that
+instance entry is unfollowed at the next sweep (`Undo{Follow}`), logged with
+its community id. Its bridged records are kept. If it switches back, a later
+sweep adds it again. A community named under `communities` stays followed.
 
 Each sweep reads each host at `/api/v3/community/list` with `type_=Local`. The
 scheme is `BRIDGE_SCHEME`, and the URL has no port, so the host must serve Lemmy's
@@ -468,13 +490,16 @@ A sweep works in this order:
 
 1. Unfollows.
 2. Entries in `communities` that are not tracked, with no add limit.
-3. Listed and post-discovered communities that are not tracked, not excluded
-   and not skipped, at most 20 a sweep. Post-discovered communities come first,
-   then the rest, each lowest actor id first across all hosts.
+3. Listed and post-discovered communities that are not tracked, not excluded,
+   not skipped and, on a `skip_nsfw` host, not flagged NSFW (see
+   [Instance entries](#instance-entries)), at most 20 a sweep. Post-discovered
+   communities come first, then the rest, each lowest actor id first across all
+   hosts.
    Candidates are this sweep's listing results plus every community a post walk
    has found. A post-discovered community stays a candidate across sweeps until
-   it is added, tracked by other means, named in `communities`, excluded, or its
-   host is removed from `instances`. A community tried and refused or failed
+   it is added, tracked by other means, named in `communities`, excluded, its
+   host is removed from `instances`, or, on a `skip_nsfw` host, it is flagged
+   NSFW. A community tried and refused or failed
    uses a slot, as an added one does.
 
 Adds wait for the rate, `PLC_WRITES_PER_MINUTE`. At the default of 5 a minute, 20

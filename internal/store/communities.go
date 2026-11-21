@@ -31,7 +31,7 @@ func NewCommunities(db *sql.DB) Communities {
 const communityColumns = `
 	id, ap_group_id, did, preferred_username, instance,
 	follow_state, followed_at, last_backfill_at, created_at,
-	follow_requested_at, follow_attempts, follow_provenance`
+	follow_requested_at, follow_attempts, follow_provenance, sensitive`
 
 func (r *postgresCommunities) UpsertCommunity(ctx context.Context, community Community) (*Community, error) {
 	if err := validateCommunity(&community); err != nil {
@@ -39,14 +39,16 @@ func (r *postgresCommunities) UpsertCommunity(ctx context.Context, community Com
 	}
 
 	// On conflict only preferred_username updates (display renames happen
-	// upstream); did, instance, follow state, and timestamps are preserved.
+	// upstream); did, instance, follow state, sensitive, and timestamps are
+	// preserved. Sensitive is written on insert only: SetSensitive updates it
+	// when a Group document is in hand.
 	// The DO UPDATE's WHERE refuses identity drift (a changed DID or
 	// instance for a known ap_group_id): the excluded row surfaces as "no
 	// row returned" and is reported as a conflict below.
 	query := `
 		INSERT INTO communities (
-			ap_group_id, did, preferred_username, instance, follow_state
-		) VALUES ($1, $2, $3, $4, $5)
+			ap_group_id, did, preferred_username, instance, follow_state, sensitive
+		) VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (ap_group_id) DO UPDATE SET
 			preferred_username = EXCLUDED.preferred_username
 		WHERE communities.did = EXCLUDED.did
@@ -60,7 +62,7 @@ func (r *postgresCommunities) UpsertCommunity(ctx context.Context, community Com
 
 	row := r.db.QueryRowContext(ctx, query,
 		community.APGroupID, community.DID, community.PreferredUsername,
-		community.Instance, string(followState),
+		community.Instance, string(followState), community.Sensitive,
 	)
 	stored, err := scanCommunity(row)
 	if stderrors.Is(err, sql.ErrNoRows) {
@@ -84,6 +86,22 @@ func (r *postgresCommunities) UpsertCommunity(ctx context.Context, community Com
 		return nil, fmt.Errorf("upsert community %q: %w", community.APGroupID, err)
 	}
 	return stored, nil
+}
+
+func (r *postgresCommunities) SetSensitive(ctx context.Context, apGroupID string, sensitive bool) error {
+	result, err := r.db.ExecContext(ctx,
+		`UPDATE communities SET sensitive = $2 WHERE ap_group_id = $1`, apGroupID, sensitive)
+	if err != nil {
+		return fmt.Errorf("set sensitive for %q: %w", apGroupID, err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("set sensitive for %q: rows affected: %w", apGroupID, err)
+	}
+	if affected == 0 {
+		return errors.NewNotFoundError("community", apGroupID)
+	}
+	return nil
 }
 
 func (r *postgresCommunities) GetByAPGroupID(ctx context.Context, apGroupID string) (*Community, error) {
@@ -297,6 +315,7 @@ func scanCommunity(row rowScanner) (*Community, error) {
 		&followState, &community.FollowedAt, &community.LastBackfillAt,
 		&community.CreatedAt,
 		&community.FollowRequestedAt, &community.FollowAttempts, &provenance,
+		&community.Sensitive,
 	)
 	if err != nil {
 		return nil, err

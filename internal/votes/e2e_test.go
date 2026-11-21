@@ -96,6 +96,11 @@ func (s *stubMaterializer) EnsureCommunity(context.Context, *ap.Object) (*store.
 	return nil, nil
 }
 
+func (s *stubMaterializer) EnsureCommunityWithDocument(context.Context, string, *ap.Object) (*store.Community, error) {
+	s.t.Fatal("votes must never reach EnsureCommunityWithDocument")
+	return nil, nil
+}
+
 func (s *stubMaterializer) RemovePost(context.Context, *store.APObjectMapping, string) error {
 	s.t.Fatal("votes must never reach RemovePost")
 	return nil

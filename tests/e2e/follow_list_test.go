@@ -87,6 +87,8 @@ type followList struct {
 type followListInstance struct {
 	host    string
 	exclude []string
+	// skipNSFW writes `skip_nsfw: true`; false leaves the key out.
+	skipNSFW bool
 }
 
 // installFollowList recreates the bridge reading a follow list that names every
@@ -161,6 +163,9 @@ func (l *followList) writeSwitches(disabledHosts, disabledCommunities []string) 
 		doc.WriteString("instances:\n")
 		for _, instance := range l.instances {
 			fmt.Fprintf(&doc, "  - host: %q\n", instance.host)
+			if instance.skipNSFW {
+				doc.WriteString("    skip_nsfw: true\n")
+			}
 			if len(instance.exclude) > 0 {
 				doc.WriteString("    exclude:\n")
 				for _, entry := range instance.exclude {
@@ -605,4 +610,220 @@ func TestFollowList_InstanceEntryFollowsEveryLocalCommunity(t *testing.T) {
 	})
 	awaitAccepted(returnedName)
 	assertLeftOut()
+}
+
+// requireCommunityNotBridged fails the test if apID has a communities row or a
+// bridged_actors row: either means a DID was minted for it.
+func requireCommunityNotBridged(t *testing.T, db *sql.DB, apID string) {
+	t.Helper()
+	var communities, actors int
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		`SELECT count(*) FROM communities WHERE ap_group_id = $1`, apID).Scan(&communities))
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		`SELECT count(*) FROM bridged_actors WHERE ap_actor_id = $1`, apID).Scan(&actors))
+	require.Zero(t, communities, "communities rows for %s", apID)
+	require.Zero(t, actors, "bridged_actors rows for %s", apID)
+}
+
+// TestFollowList_SkipNSFWLeavesNSFWCommunitiesOut: an `instances` entry for the
+// real Lemmy with skip_nsfw follows its eligible communities and leaves its NSFW
+// ones unfollowed with no DID, ones created after the first sweeps included,
+// while an NSFW community named under communities is followed. Each NSFW
+// community is created before an eligible one, so once the eligible one is
+// tracked the listing has passed it. The interval is an hour, so only this
+// test's sweeps run after the startup sweep.
+func TestFollowList_SkipNSFWLeavesNSFWCommunitiesOut(t *testing.T) {
+	h := newHarness(t)
+	lemmyHost := lemmyHostname(t)
+	db := openTidepoolDB(t)
+
+	owner := h.registerUser(t, h.uniqueName(t, "sn_own"))
+	list := h.installFollowList(t, time.Hour)
+	base := slices.Clone(list.communities)
+
+	// Registered after installFollowList, so it runs before that cleanup and
+	// while this list is still the running one: later scenarios must not inherit
+	// a follow of every Lemmy community, nor of the named NSFW one.
+	t.Cleanup(func() {
+		list.instances = nil
+		list.communities = base
+		list.writeSwitches(nil, nil)
+		if result := h.reconcileSweep(t); len(result.Failed) > 0 {
+			t.Errorf("removing the instances entry failed on %v", result.Failed)
+		}
+		for community := range h.trackedCommunities(t) {
+			if !slices.Contains(base, community) {
+				t.Errorf("%s is still tracked after the instances entry was removed", community)
+			}
+		}
+	})
+
+	firstNSFWName := h.uniqueName(t, "sn_nsfw1")
+	firstNSFW := owner.createCommunityWith(t, firstNSFWName, "skip nsfw "+firstNSFWName, lemmyCommunityOptions{NSFW: true})
+	firstEligibleName := h.uniqueName(t, "sn_elig1")
+	firstEligible := owner.createCommunity(t, firstEligibleName, "skip nsfw "+firstEligibleName)
+	namedNSFWName := h.uniqueName(t, "sn_named")
+	namedNSFW := owner.createCommunityWith(t, namedNSFWName, "skip nsfw "+namedNSFWName, lemmyCommunityOptions{NSFW: true})
+
+	list.communities = append(list.communities, namedNSFW.APID)
+	list.instances = []followListInstance{{host: lemmyHost, skipNSFW: true}}
+	list.writeSwitches(nil, nil)
+
+	// Tracked means the sweep's add took; the suite's own subscribe then closes
+	// Lemmy's first-contact Accept race and waits for accepted.
+	awaitAccepted := func(names ...string) {
+		t.Helper()
+		for _, name := range names {
+			h.subscribeCommunity(t, "!"+name+"@"+lemmyHost)
+		}
+	}
+
+	sweeps := &instanceSweeps{t: t, h: h, failed: map[string]bool{}}
+	sweeps.until("the eligible and the named NSFW communities followed", func(tracked map[string]bool) bool {
+		return tracksAll(tracked, firstEligible, namedNSFW)
+	})
+	awaitAccepted(firstEligibleName, namedNSFWName)
+	if h.trackedCommunities(t)[firstNSFW.APID] {
+		t.Errorf("NSFW community %s is tracked", firstNSFW.APID)
+	}
+	requireCommunityNotBridged(t, db, firstNSFW.APID)
+
+	secondNSFWName := h.uniqueName(t, "sn_nsfw2")
+	secondNSFW := owner.createCommunityWith(t, secondNSFWName, "skip nsfw "+secondNSFWName, lemmyCommunityOptions{NSFW: true})
+	secondEligibleName := h.uniqueName(t, "sn_elig2")
+	secondEligible := owner.createCommunity(t, secondEligibleName, "skip nsfw "+secondEligibleName)
+	sweeps.until("an eligible community created after the first sweeps followed", func(tracked map[string]bool) bool {
+		return tracksAll(tracked, secondEligible)
+	})
+	awaitAccepted(secondEligibleName)
+	tracked := h.trackedCommunities(t)
+	if tracked[secondNSFW.APID] {
+		t.Errorf("NSFW community %s created after the first sweeps is tracked", secondNSFW.APID)
+	}
+	if tracked[firstNSFW.APID] {
+		t.Errorf("NSFW community %s is tracked after the later sweeps", firstNSFW.APID)
+	}
+	requireCommunityNotBridged(t, db, secondNSFW.APID)
+	requireCommunityNotBridged(t, db, firstNSFW.APID)
+}
+
+// awaitCommunitySensitive polls Tidepool's communities row for apID until its
+// stored sensitive flag is want. A query error fails at once: the row exists
+// once the community is followed.
+func awaitCommunitySensitive(t *testing.T, db *sql.DB, apID string, want bool) {
+	t.Helper()
+	deadline := time.Now().Add(eventTimeout)
+	for {
+		var sensitive bool
+		if err := db.QueryRowContext(t.Context(),
+			`SELECT sensitive FROM communities WHERE ap_group_id = $1`, apID).Scan(&sensitive); err != nil {
+			t.Fatalf("read communities.sensitive for %s: %v", apID, err)
+		}
+		if sensitive == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("communities.sensitive for %s is still %v after %s, want %v", apID, sensitive, eventTimeout, want)
+		}
+		select {
+		case <-t.Context().Done():
+			t.Fatalf("await communities.sensitive for %s: %v", apID, t.Context().Err())
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+// awaitFollowAccepted polls GET /admin/communities until apID is accepted,
+// sending no Follow of its own: whatever follow is in flight has to be the one
+// that lands.
+func (h *harness) awaitFollowAccepted(t *testing.T, apID, when string) {
+	t.Helper()
+	deadline := time.Now().Add(eventTimeout)
+	for {
+		state, ok := h.findCommunity(t, apID, apID)
+		if ok && state.FollowState == "accepted" {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s %s: not accepted within %s (tracked %v, state %q)", apID, when, eventTimeout, ok, state.FollowState)
+		}
+		select {
+		case <-t.Context().Done():
+			t.Fatalf("await %s accepted %s: %v", apID, when, t.Context().Err())
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+// TestFollowList_SkipNSFWUnfollowsACommunitySwitchedToNSFW: a community the
+// real Lemmy's skip_nsfw instance entry follows is edited to NSFW on Lemmy. Once
+// its Update{Group} has stored the flag, a sweep unfollows it and Lemmy drops
+// Tidepool as a follower. Edited back, later sweeps follow it again through the
+// listing alone, and a sweep after that keeps it. The interval is an hour, so
+// only this test's sweeps run after the startup sweep.
+func TestFollowList_SkipNSFWUnfollowsACommunitySwitchedToNSFW(t *testing.T) {
+	h := newHarness(t)
+	lemmyHost := lemmyHostname(t)
+	db := openTidepoolDB(t)
+
+	owner := h.registerUser(t, h.uniqueName(t, "sw_own"))
+	list := h.installFollowList(t, time.Hour)
+
+	// Registered after installFollowList, so it runs before that cleanup and
+	// while this list is still the running one: later scenarios must not inherit
+	// a follow of every Lemmy community.
+	t.Cleanup(func() {
+		list.instances = nil
+		list.writeSwitches(nil, nil)
+		if result := h.reconcileSweep(t); len(result.Failed) > 0 {
+			t.Errorf("removing the instances entry failed on %v", result.Failed)
+		}
+	})
+
+	name := h.uniqueName(t, "sw_comm")
+	community := owner.createCommunity(t, name, "switch to nsfw "+name)
+	list.instances = []followListInstance{{host: lemmyHost, skipNSFW: true}}
+	list.writeSwitches(nil, nil)
+
+	sweeps := &instanceSweeps{t: t, h: h, failed: map[string]bool{}}
+	sweeps.until("the community followed through the skip_nsfw instance entry", func(tracked map[string]bool) bool {
+		return tracksAll(tracked, community)
+	})
+	// The suite's subscribe closes Lemmy's first-contact Accept race and waits
+	// for accepted; the follow stays the instance entry's.
+	h.subscribeCommunity(t, "!"+name+"@"+lemmyHost)
+	owner.awaitRemoteFollowers(t, community.ID, 1, "after the instance entry's follow is accepted")
+
+	// ── Edited to NSFW: the next sweep unfollows it ──────────────────────
+	nsfw := true
+	owner.editCommunity(t, community.ID, lemmyCommunityEdit{NSFW: &nsfw})
+	awaitCommunitySensitive(t, db, community.APID, true)
+
+	// instanceSweeps.sweep refuses any unfollow, so this one is driven directly.
+	result := h.reconcileSweep(t)
+	if !slices.Contains(result.Unsubscribed, community.APID) {
+		t.Fatalf("the sweep after the NSFW edit unsubscribed %v, want it to include %s", result.Unsubscribed, community.APID)
+	}
+	if state, ok := h.findCommunity(t, community.APID, community.APID); ok {
+		t.Errorf("%s is still tracked as %q after the sweep unfollowed it", community.APID, state.FollowState)
+	}
+	owner.awaitRemoteFollowers(t, community.ID, 0, "after the sweep unfollowed it")
+
+	// ── Edited back: later sweeps follow it again through the listing ────
+	notNSFW := false
+	owner.editCommunity(t, community.ID, lemmyCommunityEdit{NSFW: &notNSFW})
+	sweeps.until("the community followed again once it is no longer NSFW", func(tracked map[string]bool) bool {
+		return tracksAll(tracked, community)
+	})
+	h.awaitFollowAccepted(t, community.APID, "after the listing followed it again")
+	owner.awaitRemoteFollowers(t, community.ID, 1, "after the listing followed it again")
+
+	// ── One more sweep keeps it ──────────────────────────────────────────
+	result = h.reconcileSweep(t)
+	if len(result.Unsubscribed) > 0 {
+		t.Errorf("the sweep after the re-follow unsubscribed %v", result.Unsubscribed)
+	}
+	if state, ok := h.findCommunity(t, community.APID, community.APID); !ok || state.FollowState != "accepted" {
+		t.Errorf("%s after the last sweep: tracked %v, state %q, want accepted", community.APID, ok, state.FollowState)
+	}
 }

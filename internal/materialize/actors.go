@@ -76,50 +76,58 @@ func (m *Materializer) ensureActor(ctx context.Context, actorRef *ap.Object, for
 // every OK-path MarkProfileSynced following a profile commit: a call site that
 // stamps an OK row without one would reopen stranded rows.
 func (m *Materializer) ensureKnownActor(ctx context.Context, stored *store.BridgedActor, actorRef *ap.Object, force bool) (*store.BridgedActor, error) {
+	actor, _, err := m.ensureKnownActorDoc(ctx, stored, actorRef, force, force)
+	return actor, err
+}
+
+// ensureKnownActorDoc is ensureKnownActor that also returns the document the
+// profile was rematerialized from, nil when none was read (a fresh profile).
+// allowEmbedded says actorRef may stand in for that document.
+func (m *Materializer) ensureKnownActorDoc(ctx context.Context, stored *store.BridgedActor, actorRef *ap.Object, force, allowEmbedded bool) (*store.BridgedActor, *ap.Object, error) {
 	if stored.ProfileSyncedAt == nil || stored.ConsentState != store.ConsentStateOK {
 		if existing, err := m.objects.GetByAPID(ctx, stored.APActorID); err == nil {
 			if !isProfileCollection(existing.Collection) {
-				return nil, m.healStrandedActorRow(ctx, stored, existing.Collection)
+				return nil, nil, m.healStrandedActorRow(ctx, stored, existing.Collection)
 			}
 		} else if !errors.IsNotFound(err) {
-			return nil, fmt.Errorf("materialize: check mapping for actor %s: %w", stored.APActorID, err)
+			return nil, nil, fmt.Errorf("materialize: check mapping for actor %s: %w", stored.APActorID, err)
 		}
 	}
 	switch stored.ConsentState {
 	case store.ConsentStateDeleted:
 		// Terminal: the repo is tombstoned, nothing is ever materialized.
-		return nil, skip(stored.APActorID, "actor is deleted (tombstoned repo)")
+		return nil, nil, skip(stored.APActorID, "actor is deleted (tombstoned repo)")
 	case store.ConsentStateNoBridge:
 		// Re-check on the profile TTL: removing the marker upstream restores
 		// bridging, so nobridge is sticky only until the next stale check.
 		if !force && m.profileFresh(stored) {
-			return nil, skip(stored.APActorID, "actor opted out (#nobridge/#nobot)")
+			return nil, nil, skip(stored.APActorID, "actor opted out (#nobridge/#nobot)")
 		}
-		doc, err := m.knownActorDoc(ctx, stored, actorRef, force)
+		doc, err := m.knownActorDoc(ctx, stored, actorRef, allowEmbedded)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if hasNobridgeMarker(doc) {
 			// Stamps without a profile commit; ensureKnownActor still checks
 			// this non-OK row for a stranded id.
 			if err := m.actors.MarkProfileSynced(ctx, stored.APActorID, m.now(), storablePreferredUsername(doc)); err != nil {
-				return nil, fmt.Errorf("materialize: mark nobridge re-check for %s: %w", stored.APActorID, err)
+				return nil, nil, fmt.Errorf("materialize: mark nobridge re-check for %s: %w", stored.APActorID, err)
 			}
-			return nil, skip(stored.APActorID, "actor opted out (#nobridge/#nobot)")
+			return nil, nil, skip(stored.APActorID, "actor opted out (#nobridge/#nobot)")
 		}
 		if err := m.actors.SetConsentState(ctx, stored.APActorID, store.ConsentStateOK); err != nil {
-			return nil, fmt.Errorf("materialize: restore consent for %s: %w", stored.APActorID, err)
+			return nil, nil, fmt.Errorf("materialize: restore consent for %s: %w", stored.APActorID, err)
 		}
 		m.logger.Info("actor removed nobridge marker; bridging restored", "ap_actor_id", stored.APActorID)
 		stored.ConsentState = store.ConsentStateOK
-		return m.rematerializeProfile(ctx, stored, doc)
+		return m.rematerializeProfileDoc(ctx, stored, doc)
 	case store.ConsentStateOK:
 		if !force && m.profileFresh(stored) {
-			return stored, nil
+			return stored, nil, nil
 		}
-		doc, err := m.knownActorDoc(ctx, stored, actorRef, force)
+		doc, err := m.knownActorDoc(ctx, stored, actorRef, allowEmbedded)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if hasNobridgeMarker(doc) {
 			// A previously-bridged actor opted out: scrub the content already
@@ -129,25 +137,25 @@ func (m *Materializer) ensureKnownActor(ctx context.Context, stored *store.Bridg
 			// as DeleteActor and SuppressActor, but reversible (NoBridge, not
 			// the terminal Deleted).
 			if _, err := m.scrubActorRecords(ctx, stored.DID); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			if err := m.scrubActorVotes(ctx, stored.APActorID); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			if err := m.actors.SetConsentState(ctx, stored.APActorID, store.ConsentStateNoBridge); err != nil {
-				return nil, fmt.Errorf("materialize: record nobridge for %s: %w", stored.APActorID, err)
+				return nil, nil, fmt.Errorf("materialize: record nobridge for %s: %w", stored.APActorID, err)
 			}
 			// Again after the flip: a vote may have become a record meanwhile.
 			if err := m.scrubActorVotes(ctx, stored.APActorID); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			m.logger.Info("actor added nobridge marker; existing content scrubbed and new materialization stopped",
 				"ap_actor_id", stored.APActorID)
-			return nil, skip(stored.APActorID, "actor opted out (#nobridge/#nobot)")
+			return nil, nil, skip(stored.APActorID, "actor opted out (#nobridge/#nobot)")
 		}
-		return m.rematerializeProfile(ctx, stored, doc)
+		return m.rematerializeProfileDoc(ctx, stored, doc)
 	default:
-		return nil, fmt.Errorf("materialize: actor %s has invalid consent state %q",
+		return nil, nil, fmt.Errorf("materialize: actor %s has invalid consent state %q",
 			stored.APActorID, stored.ConsentState)
 	}
 }
@@ -408,12 +416,52 @@ func (m *Materializer) rematerializeProfile(ctx context.Context, stored *store.B
 	if _, err := m.commitRecord(ctx, stored.DID, collection, ProfileRKey, record, doc, stored.DID, ""); err != nil {
 		return nil, err
 	}
+	// Before the stamp, so a failed flag write leaves the profile stale and
+	// the next touch refreshes again.
+	if stored.ActorType == store.ActorTypeGroup {
+		if err := m.syncCommunitySensitive(ctx, stored.APActorID, doc); err != nil {
+			return nil, err
+		}
+	}
 	// Stamped only after the commit: ensureKnownActor skips the stranded-row
 	// check for a synced OK row on that basis.
 	if err := m.actors.MarkProfileSynced(ctx, stored.APActorID, m.now(), storablePreferredUsername(doc)); err != nil {
 		return nil, fmt.Errorf("materialize: mark profile synced for %s: %w", stored.APActorID, err)
 	}
 	return stored, nil
+}
+
+// syncCommunitySensitive stores doc's sensitive flag on the Group's
+// communities row, when one exists and its flag differs. Every refresh of a
+// Group runs it, the author path (EnsureActor) included: that refresh makes
+// the profile fresh, so the next ensureCommunity reads no document and would
+// keep the old flag. A Group known only as an author has no row and gains
+// none.
+func (m *Materializer) syncCommunitySensitive(ctx context.Context, apGroupID string, doc *ap.Object) error {
+	community, err := m.communities.GetByAPGroupID(ctx, apGroupID)
+	if errors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("materialize: look up community %s for sensitive flag: %w", apGroupID, err)
+	}
+	sensitive := doc.Sensitive != nil && *doc.Sensitive
+	if community.Sensitive == sensitive {
+		return nil
+	}
+	if err := m.communities.SetSensitive(ctx, apGroupID, sensitive); err != nil {
+		return fmt.Errorf("materialize: store sensitive flag for community %s: %w", apGroupID, err)
+	}
+	return nil
+}
+
+// rematerializeProfileDoc is rematerializeProfile that also returns doc.
+func (m *Materializer) rematerializeProfileDoc(ctx context.Context, stored *store.BridgedActor, doc *ap.Object) (*store.BridgedActor, *ap.Object, error) {
+	actor, err := m.rematerializeProfile(ctx, stored, doc)
+	if err != nil {
+		return nil, nil, err
+	}
+	return actor, doc, nil
 }
 
 // storablePreferredUsername is the name MarkProfileSynced records: the
@@ -520,20 +568,48 @@ func (m *Materializer) fetchBlobWithCarryForward(ctx context.Context, did, colle
 // repo layer needs) and communities row upserted, community.profile record
 // committed. Returns the communities row.
 func (m *Materializer) EnsureCommunity(ctx context.Context, groupRef *ap.Object) (*store.Community, error) {
-	return m.ensureCommunity(ctx, groupRef, false)
+	return m.ensureCommunity(ctx, groupRef, false, nil)
 }
 
 // RefreshCommunity re-materializes the community profile regardless of TTL
 // — the Update{Group} path.
 func (m *Materializer) RefreshCommunity(ctx context.Context, groupRef *ap.Object) (*store.Community, error) {
-	return m.ensureCommunity(ctx, groupRef, true)
+	return m.ensureCommunity(ctx, groupRef, true, nil)
 }
 
-func (m *Materializer) ensureCommunity(ctx context.Context, groupRef *ap.Object, force bool) (*store.Community, error) {
+// EnsureCommunityWithDocument is EnsureCommunity with a Group document the
+// caller fetched itself by groupIRI. The document stands in for
+// EnsureCommunity's own fetch on a new or stale profile; on a fresh profile
+// only its sensitive flag is stored. A document naming another id is refused
+// as a SkipError before anything is written.
+func (m *Materializer) EnsureCommunityWithDocument(ctx context.Context, groupIRI string, group *ap.Object) (*store.Community, error) {
+	if groupIRI == "" {
+		return nil, errors.NewValidationError("group", "must carry an AP group id")
+	}
+	if group == nil {
+		return nil, errors.NewValidationError("group", "must carry a Group document")
+	}
+	if group.ID != groupIRI {
+		return nil, skip(groupIRI, fmt.Sprintf(
+			"group document names a different id %s; refusing to bridge an alias", group.ID))
+	}
+	if group.Type != ap.TypeGroup {
+		return nil, errors.NewValidationError("group",
+			fmt.Sprintf("object %s has type %q, want Group", groupIRI, group.Type))
+	}
+	return m.ensureCommunity(ctx, group, false, group)
+}
+
+// ensureCommunity materializes groupRef's community. supplied, when set, is a
+// Group document for groupRef's id that the caller fetched itself; it is used
+// in place of a fetch.
+func (m *Materializer) ensureCommunity(ctx context.Context, groupRef *ap.Object, force bool, supplied *ap.Object) (*store.Community, error) {
 	if groupRef == nil || groupRef.ID == "" {
 		return nil, errors.NewValidationError("group", "must carry an AP group id")
 	}
 	apID := groupRef.ID
+	// doc is the Group document in hand, if any; its sensitive flag is stored.
+	var doc *ap.Object
 
 	// The bridged_actors row is the source of truth for consent, keys, and
 	// profile freshness — the communities row adds follow/backfill state.
@@ -548,13 +624,29 @@ func (m *Materializer) ensureCommunity(ctx context.Context, groupRef *ap.Object,
 			return nil, skip(apID,
 				fmt.Sprintf("actor is bridged as %s, not a community Group", actor.ActorType))
 		}
-		if _, err := m.ensureKnownActor(ctx, actor, groupRef, force); err != nil {
+		// A Group bridged only as an author has no communities row yet. The
+		// row about to be inserted takes its sensitive flag from a document,
+		// so a fresh profile is refreshed rather than inserting false.
+		refresh := force
+		if !refresh && supplied == nil {
+			if _, err := m.communities.GetByAPGroupID(ctx, apID); errors.IsNotFound(err) {
+				refresh = true
+			} else if err != nil {
+				return nil, fmt.Errorf("materialize: look up community %s: %w", apID, err)
+			}
+		}
+		if _, doc, err = m.ensureKnownActorDoc(ctx, actor, groupRef, refresh, force || supplied != nil); err != nil {
 			return nil, err
 		}
+		if doc == nil {
+			doc = supplied
+		}
 	case errors.IsNotFound(err):
-		doc, err := m.actorDoc(ctx, groupRef, force)
-		if err != nil {
-			return nil, err
+		doc = supplied
+		if doc == nil {
+			if doc, err = m.actorDoc(ctx, groupRef, force); err != nil {
+				return nil, err
+			}
 		}
 		if doc.Type != ap.TypeGroup {
 			return nil, errors.NewValidationError("group",
@@ -575,14 +667,25 @@ func (m *Materializer) ensureCommunity(ctx context.Context, groupRef *ap.Object,
 		return nil, fmt.Errorf("materialize: look up community actor %s: %w", apID, err)
 	}
 
+	sensitive := doc != nil && doc.Sensitive != nil && *doc.Sensitive
 	community, err := m.communities.UpsertCommunity(ctx, store.Community{
 		APGroupID:         apID,
 		DID:               actor.DID,
 		PreferredUsername: preferredUsernameFor(groupRef, actor),
 		Instance:          groupRef.Host(),
+		Sensitive:         sensitive,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("materialize: upsert community %s: %w", apID, err)
+	}
+	// The upsert writes the flag on insert only, so a known row whose stored
+	// flag differs from the document in hand is updated here. With no
+	// document (a fresh profile) the stored flag stands.
+	if doc != nil && community.Sensitive != sensitive {
+		if err := m.communities.SetSensitive(ctx, apID, sensitive); err != nil {
+			return nil, fmt.Errorf("materialize: store sensitive flag for community %s: %w", apID, err)
+		}
+		community.Sensitive = sensitive
 	}
 	return community, nil
 }

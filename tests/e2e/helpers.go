@@ -827,14 +827,44 @@ func (c *lemmyClient) deleteAccount(t *testing.T) {
 	}
 }
 
-// editCommunity renames/re-describes a community (caller must be a mod —
-// the harness admin created every suite community). Federates as
-// Announce{Update{Group}} to the community's followers.
-func (c *lemmyClient) editCommunity(t *testing.T, communityID int, title, description string) {
+// lemmyCommunityEdit is the fields of Lemmy's EditCommunity request. An empty
+// string or a nil NSFW leaves that field out.
+type lemmyCommunityEdit struct {
+	Title       string
+	Description string
+	NSFW        *bool
+}
+
+// editCommunity edits a community (caller must be a mod — the harness admin
+// created every suite community, and a registered user mods its own). Federates
+// as Announce{Update{Group}} to the community's followers. A set NSFW that Lemmy
+// did not store would make the scenario pass on an unchanged community, so the
+// response is checked.
+func (c *lemmyClient) editCommunity(t *testing.T, communityID int, edit lemmyCommunityEdit) {
 	t.Helper()
-	if err := c.do(http.MethodPut, "/api/v3/community",
-		map[string]any{"community_id": communityID, "title": title, "description": description}, nil); err != nil {
+	body := map[string]any{"community_id": communityID}
+	if edit.Title != "" {
+		body["title"] = edit.Title
+	}
+	if edit.Description != "" {
+		body["description"] = edit.Description
+	}
+	if edit.NSFW != nil {
+		body["nsfw"] = *edit.NSFW
+	}
+	var out struct {
+		CommunityView struct {
+			Community struct {
+				NSFW bool `json:"nsfw"`
+			} `json:"community"`
+		} `json:"community_view"`
+	}
+	if err := c.do(http.MethodPut, "/api/v3/community", body, &out); err != nil {
 		t.Fatalf("edit community %d: %v", communityID, err)
+	}
+	if edit.NSFW != nil && out.CommunityView.Community.NSFW != *edit.NSFW {
+		t.Fatalf("edit community %d: lemmy stored nsfw = %v, want %v",
+			communityID, out.CommunityView.Community.NSFW, *edit.NSFW)
 	}
 }
 

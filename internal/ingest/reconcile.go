@@ -68,11 +68,12 @@ type followListDoc struct {
 	Instances []*instanceEntryDoc `yaml:"instances"`
 }
 
-// instanceEntryDoc is one `instances` item. Exclude is a node because only the
-// node tells a present-but-null key from a missing one.
+// instanceEntryDoc is one `instances` item. Exclude and SkipNSFW are nodes
+// because only the node tells a present-but-null key from a missing one.
 type instanceEntryDoc struct {
-	Host    string    `yaml:"host"`
-	Exclude yaml.Node `yaml:"exclude"`
+	Host     string    `yaml:"host"`
+	Exclude  yaml.Node `yaml:"exclude"`
+	SkipNSFW yaml.Node `yaml:"skip_nsfw"`
 }
 
 // bareHostname matches a lowercased hostname with no scheme, port or path. One
@@ -89,18 +90,21 @@ type FollowList struct {
 }
 
 // InstanceEntry names a whole instance: every community local to Host except
-// those Exclude names.
+// those Exclude names. With SkipNSFW, the host's NSFW-flagged communities are
+// left out too, unless Communities names them.
 type InstanceEntry struct {
-	Host    string
-	Exclude []string
+	Host     string
+	Exclude  []string
+	SkipNSFW bool
 }
 
 // Desires reports whether the list wants the community: an entry in Communities
-// names it, or its instance is listed and no Exclude entry names it. It is
+// names it, or its instance is listed, no Exclude entry names it, and it is not
+// sensitive (its stored NSFW flag) on a SkipNSFW entry. It is
 // offline, like entryMatchesCommunity, and that is why a failed or short listing
 // can never unfollow anything. A listing result has no row yet, so it passes an
 // empty preferredUsername.
-func (l *FollowList) Desires(groupID, instance, preferredUsername string) bool {
+func (l *FollowList) Desires(groupID, instance, preferredUsername string, sensitive bool) bool {
 	matches := func(entry string) bool {
 		return entryMatchesCommunity(entry, groupID, instance, preferredUsername)
 	}
@@ -109,7 +113,7 @@ func (l *FollowList) Desires(groupID, instance, preferredUsername string) bool {
 	}
 	for _, listed := range l.Instances {
 		if strings.EqualFold(listed.Host, instance) {
-			return !slices.ContainsFunc(listed.Exclude, matches)
+			return !slices.ContainsFunc(listed.Exclude, matches) && (!listed.SkipNSFW || !sensitive)
 		}
 	}
 	return false
@@ -245,9 +249,31 @@ func parseInstanceEntries(docs []*instanceEntryDoc) ([]InstanceEntry, error) {
 		if err != nil {
 			return nil, fmt.Errorf("instances entry %d: %w", i+1, err)
 		}
-		entries = append(entries, InstanceEntry{Host: doc.Host, Exclude: exclude})
+		skipNSFW, err := parseInstanceSkipNSFW(doc)
+		if err != nil {
+			return nil, fmt.Errorf("instances entry %d: host %q: %w", i+1, doc.Host, err)
+		}
+		entries = append(entries, InstanceEntry{Host: doc.Host, Exclude: exclude, SkipNSFW: skipNSFW})
 	}
 	return entries, nil
+}
+
+// parseInstanceSkipNSFW reads the skip_nsfw switch of one instance entry. A
+// missing key is false. Anything but a YAML boolean is an error: a null or a
+// "yes" read as false would follow the NSFW communities the operator meant to
+// skip.
+func parseInstanceSkipNSFW(doc *instanceEntryDoc) (bool, error) {
+	if doc.SkipNSFW.Kind == 0 {
+		return false, nil
+	}
+	if doc.SkipNSFW.Kind != yaml.ScalarNode || doc.SkipNSFW.ShortTag() != "!!bool" {
+		return false, fmt.Errorf("skip_nsfw must be true or false")
+	}
+	var skipNSFW bool
+	if err := doc.SkipNSFW.Decode(&skipNSFW); err != nil {
+		return false, fmt.Errorf("skip_nsfw: %w", err)
+	}
+	return skipNSFW, nil
 }
 
 // parseInstanceExclude validates the exclude entries of one instance entry.
@@ -465,7 +491,14 @@ type FollowReconciler struct {
 	// discovered holds the actor ids post walks returned, each with its host,
 	// until they are added, tracked, named in Communities or no longer desired.
 	// A leftover stays a candidate without being seen in a post again.
-	discovered map[string]string
+	discovered map[string]discoveredCommunity
+}
+
+// discoveredCommunity is one post-discovered community: its host and whether a
+// post walk saw it NSFW-flagged.
+type discoveredCommunity struct {
+	host string
+	nsfw bool
 }
 
 // NewFollowReconciler validates options and builds the reconciler.
@@ -515,7 +548,7 @@ func NewFollowReconciler(opts FollowReconcilerOptions) (*FollowReconciler, error
 		positions:  make(map[string]ListingPosition),
 		skips:      make(map[string]time.Time),
 		postMarks:  make(map[string]PostMark),
-		discovered: make(map[string]string),
+		discovered: make(map[string]discoveredCommunity),
 	}, nil
 }
 
@@ -524,13 +557,16 @@ func NewFollowReconciler(opts FollowReconcilerOptions) (*FollowReconciler, error
 // Unsubscribed carries canonical AP group ids (the file no longer names those
 // communities, so their entries are gone by definition). Suppressed carries
 // the AP group ids of the communities the pass did not follow because a Coves
-// moderator removed them; they are never in Failed. A listed community the
-// budget or a limit stopped is left for a later sweep and appears nowhere.
+// moderator removed them; they are never in Failed. NSFWSkipped counts, per
+// skip_nsfw host, the communities left out as NSFW-flagged or refused as
+// sensitive; they are never in Failed. A listed community the budget or a limit
+// stopped is left for a later sweep and appears nowhere.
 type SweepResult struct {
-	Subscribed   []string `json:"subscribed"`
-	Unsubscribed []string `json:"unsubscribed"`
-	Failed       []string `json:"failed"`
-	Suppressed   []string `json:"suppressed"`
+	Subscribed   []string       `json:"subscribed"`
+	Unsubscribed []string       `json:"unsubscribed"`
+	Failed       []string       `json:"failed"`
+	Suppressed   []string       `json:"suppressed"`
+	NSFWSkipped  map[string]int `json:"nsfw_skipped"`
 }
 
 // Run converges once immediately, then on every interval tick until ctx is
@@ -590,7 +626,7 @@ func (r *FollowReconciler) parseAndSwap() error {
 // unfollows nothing. Every host is listed and walked even when no add is
 // possible.
 func (r *FollowReconciler) Sweep(ctx context.Context) (SweepResult, error) {
-	result := SweepResult{Subscribed: []string{}, Unsubscribed: []string{}, Failed: []string{}}
+	result := SweepResult{Subscribed: []string{}, Unsubscribed: []string{}, Failed: []string{}, NSFWSkipped: map[string]int{}}
 
 	if err := r.parseAndSwap(); err != nil {
 		return result, err
@@ -619,7 +655,7 @@ func (r *FollowReconciler) Sweep(ctx context.Context) (SweepResult, error) {
 	}
 	diff := diffFollowList(list, current)
 
-	if err := r.unfollowExtras(ctx, diff.extras, &result); err != nil {
+	if err := r.unfollowExtras(ctx, list, diff.extras, &result); err != nil {
 		return result, err
 	}
 
@@ -639,7 +675,8 @@ func (r *FollowReconciler) Sweep(ctx context.Context) (SweepResult, error) {
 	if err := r.walkPosts(ctx, list.Instances); err != nil {
 		return result, err
 	}
-	candidates := r.listedCandidates(list, listings, tracked)
+	candidates, nsfwSkipped := r.listedCandidates(list, listings, tracked)
+	maps.Copy(result.NSFWSkipped, nsfwSkipped)
 	leftovers := candidates
 	if !budgetStopped {
 		leftovers = r.addListed(ctx, candidates, &result)
@@ -649,7 +686,7 @@ func (r *FollowReconciler) Sweep(ctx context.Context) (SweepResult, error) {
 	}
 	r.movePositions(listings, leftovers)
 
-	if len(result.Subscribed) > 0 || len(result.Unsubscribed) > 0 || len(result.Failed) > 0 || len(result.Suppressed) > 0 || len(leftovers) > 0 {
+	if len(result.Subscribed) > 0 || len(result.Unsubscribed) > 0 || len(result.Failed) > 0 || len(result.Suppressed) > 0 || len(result.NSFWSkipped) > 0 || len(leftovers) > 0 {
 		r.logger.Info("follow reconciler: sweep complete",
 			"desired", len(list.Communities),
 			"instances", len(list.Instances),
@@ -657,6 +694,7 @@ func (r *FollowReconciler) Sweep(ctx context.Context) (SweepResult, error) {
 			"unsubscribed", len(result.Unsubscribed),
 			"failed", len(result.Failed),
 			"suppressed", len(result.Suppressed),
+			"nsfw_skipped", result.NSFWSkipped,
 			"leftover", len(leftovers))
 	}
 
@@ -702,7 +740,7 @@ func diffFollowList(list *FollowList, current []*store.Community) followListDiff
 				matched[i] = true
 			}
 		}
-		if !list.Desires(c.APGroupID, c.Instance, c.PreferredUsername) {
+		if !list.Desires(c.APGroupID, c.Instance, c.PreferredUsername, c.Sensitive) {
 			diff.extras = append(diff.extras, c)
 		} else if c.FollowState == store.FollowStateAccepted && c.LastBackfillAt == nil {
 			diff.unfinished = append(diff.unfinished, c)
@@ -716,8 +754,9 @@ func diffFollowList(list *FollowList, current []*store.Community) followListDiff
 	return diff
 }
 
-// unfollowExtras undoes each extra. It returns an error only when ctx ends.
-func (r *FollowReconciler) unfollowExtras(ctx context.Context, extras []*store.Community, result *SweepResult) error {
+// unfollowExtras undoes each extra, logging each that list would want but for
+// its stored NSFW flag. It returns an error only when ctx ends.
+func (r *FollowReconciler) unfollowExtras(ctx context.Context, list *FollowList, extras []*store.Community, result *SweepResult) error {
 	for _, c := range extras {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -726,6 +765,9 @@ func (r *FollowReconciler) unfollowExtras(ctx context.Context, extras []*store.C
 			// unsubscribeByGroupIRI already logged the details.
 			result.Failed = append(result.Failed, c.APGroupID)
 			continue
+		}
+		if c.Sensitive && list.Desires(c.APGroupID, c.Instance, c.PreferredUsername, false) {
+			r.logger.Info("follow reconciler: unfollowed NSFW-flagged community", "community", c.APGroupID)
 		}
 		result.Unsubscribed = append(result.Unsubscribed, c.APGroupID)
 	}
@@ -747,7 +789,7 @@ func (r *FollowReconciler) addExplicitEntries(ctx context.Context, entries []str
 			result.Failed = append(result.Failed, entry)
 			continue
 		}
-		community, err := r.admin.subscribe(ctx, entry, store.FollowProvenanceFollowList)
+		community, err := r.admin.subscribe(ctx, entry, store.FollowProvenanceFollowList, false)
 		if groupIRI, removed := removedCommunity(err); removed {
 			result.Suppressed = append(result.Suppressed, groupIRI)
 			continue
@@ -795,7 +837,7 @@ func (r *FollowReconciler) listInstances(ctx context.Context, instances []Instan
 }
 
 // walkPosts walks each host's recent posts from its mark and records every
-// community returned in discovered. A successful walk moves the host's mark to
+// community returned in discovered, with the walk's NSFW flag. A successful walk moves the host's mark to
 // its newest post; a failed one keeps the old mark, so the next walk reads the
 // same posts again. A host no longer listed loses its mark, so re-adding it
 // starts with a first walk. It returns an error only when ctx ends.
@@ -814,7 +856,7 @@ func (r *FollowReconciler) walkPosts(ctx context.Context, instances []InstanceEn
 		}
 		walk := r.posts.RecentPostCommunities(ctx, instance.Host, r.postMarks[instance.Host])
 		for _, actorID := range walk.ActorIDs {
-			r.discovered[actorID] = instance.Host
+			r.discovered[actorID] = discoveredCommunity{host: instance.Host, nsfw: walk.NSFW[actorID]}
 		}
 		if walk.Err == nil && walk.Newest != (PostMark{}) {
 			r.postMarks[instance.Host] = walk.Newest
@@ -825,11 +867,12 @@ func (r *FollowReconciler) walkPosts(ctx context.Context, instances []InstanceEn
 
 // listedCandidate is one listing or post-discovered result that may be added.
 // discovered is set for any community a post walk found, even when a listing
-// also returned it.
+// also returned it. skipNSFW is its host's skip_nsfw switch.
 type listedCandidate struct {
 	actorID    string
 	host       string
 	discovered bool
+	skipNSFW   bool
 }
 
 // listedCandidates merges the listings and the discovered communities into the
@@ -837,11 +880,36 @@ type listedCandidate struct {
 // communities first, then listing-only ones, each by actor id. It leaves
 // out what is tracked, excluded or skipped, and anything the file names in
 // Communities: those belong to the explicit adds, which never use the skip map or
-// a batch slot. A discovered community left out for any reason but a skip is
-// deleted from discovered; a skipped one is tried again when its skip ends.
-func (r *FollowReconciler) listedCandidates(list *FollowList, listings map[string]CommunityListing, tracked map[string]struct{}) []listedCandidate {
+// a batch slot. On a skip_nsfw host it also leaves out what the listing or a
+// post walk flags NSFW, and counts each such community once in the returned
+// host → count map. A discovered community left out for any reason but a skip
+// is deleted from discovered; a skipped one is tried again when its skip ends.
+func (r *FollowReconciler) listedCandidates(list *FollowList, listings map[string]CommunityListing, tracked map[string]struct{}) ([]listedCandidate, map[string]int) {
 	now := r.now()
 	maps.DeleteFunc(r.skips, func(_ string, expiry time.Time) bool { return !expiry.After(now) })
+
+	skipNSFW := make(map[string]bool, len(list.Instances))
+	for _, instance := range list.Instances {
+		skipNSFW[instance.Host] = instance.SkipNSFW
+	}
+	nsfwSkipped := make(map[string]int)
+	counted := make(map[string]struct{})
+	// leaveOutNSFW reports a wanted community a skip_nsfw host flags NSFW, and
+	// counts it the first time this sweep meets it.
+	leaveOutNSFW := func(actorID, host string, listingFlag bool) bool {
+		if !skipNSFW[host] {
+			return false
+		}
+		if _, done := counted[actorID]; done {
+			return true
+		}
+		if !listingFlag && !r.discovered[actorID].nsfw {
+			return false
+		}
+		counted[actorID] = struct{}{}
+		nsfwSkipped[host]++
+		return true
+	}
 
 	// wanted reports whether the community belongs to the listed adds at all,
 	// leaving the skip map aside.
@@ -850,26 +918,32 @@ func (r *FollowReconciler) listedCandidates(list *FollowList, listings map[strin
 		explicit := slices.ContainsFunc(list.Communities, func(entry string) bool {
 			return entryMatchesCommunity(entry, actorID, host, "")
 		})
-		return !isTracked && !explicit && list.Desires(actorID, host, "")
+		return !isTracked && !explicit && list.Desires(actorID, host, "", false)
 	}
 	var candidates []listedCandidate
 	for host, listing := range listings {
 		for _, actorID := range listing.ActorIDs {
-			if _, skipped := r.skips[actorID]; skipped || !wanted(actorID, host) {
+			if _, skipped := r.skips[actorID]; skipped || !wanted(actorID, host) || leaveOutNSFW(actorID, host, listing.NSFW[actorID]) {
 				continue
 			}
 			_, discovered := r.discovered[actorID]
-			candidates = append(candidates, listedCandidate{actorID: actorID, host: host, discovered: discovered})
+			candidates = append(candidates, listedCandidate{actorID: actorID, host: host, discovered: discovered, skipNSFW: skipNSFW[host]})
 		}
 	}
-	for actorID, host := range r.discovered {
+	for actorID, entry := range r.discovered {
+		host := entry.host
 		if !wanted(actorID, host) {
 			delete(r.discovered, actorID)
 			continue
 		}
-		if _, skipped := r.skips[actorID]; !skipped {
-			candidates = append(candidates, listedCandidate{actorID: actorID, host: host, discovered: true})
+		if _, skipped := r.skips[actorID]; skipped {
+			continue
 		}
+		if leaveOutNSFW(actorID, host, false) {
+			delete(r.discovered, actorID)
+			continue
+		}
+		candidates = append(candidates, listedCandidate{actorID: actorID, host: host, discovered: true, skipNSFW: skipNSFW[host]})
 	}
 	slices.SortFunc(candidates, func(a, b listedCandidate) int {
 		if a.discovered != b.discovered {
@@ -880,14 +954,15 @@ func (r *FollowReconciler) listedCandidates(list *FollowList, listings map[strin
 		}
 		return strings.Compare(a.actorID, b.actorID)
 	})
-	return slices.CompactFunc(candidates, func(a, b listedCandidate) bool { return a.actorID == b.actorID })
+	return slices.CompactFunc(candidates, func(a, b listedCandidate) bool { return a.actorID == b.actorID }), nsfwSkipped
 }
 
 // addListed subscribes candidates in order, up to maxListedAddsPerSweep tries,
 // and returns the ones it did not get to. A leftover the host's listing returned
 // keeps that host's position (see movePositions). A tried candidate uses a slot
-// whether it was added, refused or failed. One the budget stopped, or that ctx
-// ended, was not really tried: it is a leftover, and reported nowhere.
+// whether it was added, refused or failed. An NSFW refusal is counted in
+// NSFWSkipped, not Failed. One the budget stopped, or that ctx ended, was not
+// really tried: it is a leftover, and reported nowhere.
 func (r *FollowReconciler) addListed(ctx context.Context, candidates []listedCandidate, result *SweepResult) []listedCandidate {
 	tried := 0
 	for index, candidate := range candidates {
@@ -898,7 +973,7 @@ func (r *FollowReconciler) addListed(ctx context.Context, candidates []listedCan
 		if candidate.discovered {
 			provenance = store.FollowProvenancePostWalk
 		}
-		_, err := r.admin.subscribe(ctx, candidate.actorID, provenance)
+		_, err := r.admin.subscribe(ctx, candidate.actorID, provenance, candidate.skipNSFW)
 		if groupIRI, removed := removedCommunity(err); removed {
 			// Refused before any fetch, so it uses no slot and no skip: each
 			// sweep reports it again while the removal stands.
@@ -910,6 +985,9 @@ func (r *FollowReconciler) addListed(ctx context.Context, candidates []listedCan
 			result.Subscribed = append(result.Subscribed, candidate.actorID)
 		case isThrottled(err), ctx.Err() != nil:
 			return candidates[index:]
+		case stderrors.Is(err, errCommunityNSFW):
+			r.skips[candidate.actorID] = r.now().Add(refusalSkip)
+			result.NSFWSkipped[candidate.host]++
 		case materialize.IsSkip(err):
 			r.skips[candidate.actorID] = r.now().Add(refusalSkip)
 			result.Failed = append(result.Failed, candidate.actorID)

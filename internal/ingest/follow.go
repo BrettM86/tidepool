@@ -435,7 +435,7 @@ func (a *Admin) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	community, err := a.subscribe(r.Context(), req.Community, store.FollowProvenanceManual)
+	community, err := a.subscribe(r.Context(), req.Community, store.FollowProvenanceManual, false)
 	if err != nil {
 		writeAdminError(w, err)
 		return
@@ -453,8 +453,10 @@ func (a *Admin) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 // already accepted (idempotent no-op) or freshly pending, with provenance
 // recorded as how it was followed. A removed community is refused with a 409
 // carrying a *communityRemovedError, before any fetch when Tidepool already
-// has it, and after the mint when the label arrived before the community.
-func (a *Admin) subscribe(ctx context.Context, ref string, provenance store.FollowProvenance) (*store.Community, error) {
+// has it, and after the mint when the label arrived before the community. With
+// refuseNSFW, an instance or post-walk add fetches the Group before the mint and
+// refuses a sensitive one with a 422 that errors.Is errCommunityNSFW.
+func (a *Admin) subscribe(ctx context.Context, ref string, provenance store.FollowProvenance, refuseNSFW bool) (*store.Community, error) {
 	groupIRI, err := a.resolveCommunity(ctx, ref)
 	if err != nil {
 		return nil, a.resolveError(ref, err)
@@ -472,9 +474,25 @@ func (a *Admin) subscribe(ctx context.Context, ref string, provenance store.Foll
 			public: "internal error", err: err}
 	}
 
+	// group is the Group document the NSFW check fetched, when it ran.
+	var group *ap.Object
+	if refuseNSFW && (provenance == store.FollowProvenanceInstance || provenance == store.FollowProvenancePostWalk) {
+		if group, err = a.refuseNSFWGroup(ctx, groupIRI); err != nil {
+			return nil, err
+		}
+	}
+
 	// Bridge the community first: DID minted, community.profile committed —
-	// content referencing it can land the moment announces start.
-	community, err := a.mat.EnsureCommunity(ctx, &ap.Object{ID: groupIRI})
+	// content referencing it can land the moment announces start. A document
+	// the NSFW check fetched is handed over, so its sensitive flag is stored
+	// even on a fresh profile (a community that switched back is not
+	// unfollowed again by the next sweep).
+	var community *store.Community
+	if group != nil {
+		community, err = a.mat.EnsureCommunityWithDocument(ctx, groupIRI, group)
+	} else {
+		community, err = a.mat.EnsureCommunity(ctx, &ap.Object{ID: groupIRI})
+	}
 	if err != nil {
 		if materialize.IsSkip(err) {
 			a.logger.Warn("subscribe refused", "community", groupIRI, "reason", err.Error())
@@ -521,6 +539,40 @@ func (a *Admin) subscribe(ctx context.Context, ref string, provenance store.Foll
 
 	community.FollowState = store.FollowStatePending
 	return community, nil
+}
+
+// errCommunityNSFW is the cause of a skip_nsfw host's refusal of a community
+// whose Group is sensitive.
+var errCommunityNSFW = stderrors.New("community is NSFW-flagged")
+
+// refuseNSFWGroup fetches the Group and refuses it when it is sensitive, before
+// anything is minted or stored. It returns the Group it fetched otherwise. A tombstoned or missing Group is refused as the
+// mint's own fetch refuses it (materialize's actorDoc), since this fetch now
+// comes first.
+func (a *Admin) refuseNSFWGroup(ctx context.Context, groupIRI string) (*ap.Object, error) {
+	group, err := a.client.FetchActor(ctx, groupIRI)
+	if err != nil {
+		if errors.IsTombstoned(err) {
+			return nil, a.refuseGroup(&materialize.SkipError{APID: groupIRI, Reason: "actor is tombstoned upstream"})
+		}
+		if errors.IsNotFound(err) {
+			return nil, a.refuseGroup(&materialize.SkipError{APID: groupIRI, Reason: "actor document is unavailable upstream"})
+		}
+		a.logger.Error("subscribe: fetch group", "community", groupIRI, "error", err)
+		return nil, &adminError{status: http.StatusBadGateway,
+			public: "failed to fetch community actor", err: err}
+	}
+	if group.Sensitive == nil || !*group.Sensitive {
+		return group, nil
+	}
+	return nil, a.refuseGroup(&materialize.SkipError{APID: groupIRI, Reason: errCommunityNSFW.Error(), Cause: errCommunityNSFW})
+}
+
+// refuseGroup logs refusal and answers it as the admin API's 422.
+func (a *Admin) refuseGroup(refusal *materialize.SkipError) error {
+	a.logger.Warn("subscribe refused", "community", refusal.APID, "reason", refusal.Reason)
+	return &adminError{status: http.StatusUnprocessableEntity,
+		public: "community cannot be bridged: " + refusal.Error(), err: refusal}
 }
 
 // communityRemovedError names the removed community a follow was refused for.

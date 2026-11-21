@@ -19,6 +19,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"tidepool/internal/ap"
+	"tidepool/internal/errors"
 	"tidepool/internal/identity"
 	"tidepool/internal/materialize"
 	"tidepool/internal/store"
@@ -1177,4 +1179,483 @@ func TestSweep_AcceptDuringTheBatchStopsTheNextAdd(t *testing.T) {
 	assert.Equal(t, []string{firstAddedID}, follows)
 	assert.Equal(t, store.FollowStateAccepted, rig.followState(firstAddedID))
 	assert.Zero(t, h.hitCount(urlPath(t, nextID)), "the next add must not be tried")
+}
+
+// TestSweep_SkipNSFWLeavesFlaggedListedCommunitiesOut: on a skip_nsfw host, a
+// community its listing flags NSFW sorts ahead of 20 eligible ones. It is left
+// out before any Group fetch, so it takes no slot and all 20 are subscribed in
+// the one sweep, and it is counted for its host. Named under communities, the
+// same community is the explicit add's: followed, and not counted.
+func TestSweep_SkipNSFWLeavesFlaggedListedCommunitiesOut(t *testing.T) {
+	const flaggedID = "https://lemmy.world/c/aa-flagged"
+	eligible := numberedIDs("https://lemmy.world/c/eligible-", 20)
+	for _, tc := range []struct {
+		name         string
+		followList   string
+		wantFollowed []string
+		wantSkipped  map[string]int
+		// wantNoFetch: the flagged Group is never fetched. The explicit add
+		// fetches it as any subscribe does, which is not this test's subject.
+		wantNoFetch bool
+	}{
+		{
+			name:         "listed only",
+			followList:   "communities: []\ninstances:\n  - host: lemmy.world\n    skip_nsfw: true\n",
+			wantFollowed: eligible,
+			wantSkipped:  map[string]int{"lemmy.world": 1},
+			wantNoFetch:  true,
+		},
+		{
+			name: "also named under communities",
+			followList: "communities:\n  - \"https://lemmy.world/c/aa-flagged\"\n" +
+				"instances:\n  - host: lemmy.world\n    skip_nsfw: true\n",
+			wantFollowed: append([]string{flaggedID}, eligible...),
+			wantSkipped:  map[string]int{},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			rig := newInstanceRig(t, h, tc.followList, instanceRigOptions{})
+			// The Group itself is plain: only the listing's flag can keep it out.
+			rig.fixture.add(lemmyFixtureHost, lemmyCommunity{name: "aa-flagged", nsfw: true})
+			rig.serveGroup(flaggedID, nil)
+			for _, name := range numberedIDs("eligible-", 20) {
+				rig.addCommunity(lemmyFixtureHost, name)
+			}
+
+			result := rig.sweep()
+
+			assert.Equal(t, tc.wantFollowed, result.Subscribed)
+			assert.Empty(t, result.Failed)
+			assert.Equal(t, tc.wantSkipped, result.NSFWSkipped)
+			if tc.wantNoFetch {
+				assert.Equal(t, []int{0}, rig.fetchCounts(flaggedID), "Group fetches of the flagged community")
+			}
+			follows, undos := rig.deliveredSince(0)
+			assert.Equal(t, tc.wantFollowed, follows)
+			assert.Empty(t, undos)
+		})
+	}
+}
+
+// skipNSFWLemmyWorld is a follow list whose one entry is lemmy.world with
+// skip_nsfw.
+const skipNSFWLemmyWorld = "communities: []\ninstances:\n  - host: lemmy.world\n    skip_nsfw: true\n"
+
+// sensitiveGroup is the extra field of a Group its host flags NSFW.
+var sensitiveGroup = map[string]any{"sensitive": true}
+
+// mintCount is how many DIDs the harness minter has minted.
+func (r *instanceRig) mintCount() int {
+	r.h.minter.mu.Lock()
+	defer r.h.minter.mu.Unlock()
+	return r.h.minter.mints
+}
+
+// assertNotBridged asserts id has neither a communities row nor a
+// bridged_actors row.
+func (r *instanceRig) assertNotBridged(t *testing.T, id string) {
+	t.Helper()
+	_, err := r.h.communities.GetByAPGroupID(context.Background(), id)
+	assert.True(t, errors.IsNotFound(err), "no communities row may exist for %s, got %v", id, err)
+	_, err = r.h.actors.GetByAPActorID(context.Background(), id)
+	assert.True(t, errors.IsNotFound(err), "no bridged_actors row may exist for %s, got %v", id, err)
+}
+
+// nsfwRefusalLogged reports whether a line of the harness log names id with the
+// reason "community is NSFW-flagged".
+func (r *instanceRig) nsfwRefusalLogged(id string) bool {
+	for line := range strings.Lines(r.h.logs.String()) {
+		if strings.Contains(line, id) && strings.Contains(line, "community is NSFW-flagged") {
+			return true
+		}
+	}
+	return false
+}
+
+// captureReconcilerLogs sends the reconciler's log to a JSON buffer, read with
+// listingLogRecords.
+func (r *instanceRig) captureReconcilerLogs() *syncBuffer {
+	logs := &syncBuffer{}
+	r.reconciler.logger = slog.New(slog.NewJSONHandler(logs, nil))
+	return logs
+}
+
+// TestSweep_SkipNSFWCountsAreReportedPerHost: two skip_nsfw hosts list only
+// flagged communities. Nothing else changes, yet the sweep reports each host's
+// count in its result and in the sweep-complete log.
+func TestSweep_SkipNSFWCountsAreReportedPerHost(t *testing.T) {
+	h := newHarness(t)
+	rig := newInstanceRig(t, h, `communities: []
+instances:
+  - host: lemmy.world
+    skip_nsfw: true
+  - host: lemmy.ml
+    skip_nsfw: true
+`, instanceRigOptions{})
+	logs := rig.captureReconcilerLogs()
+	// The Groups are plain: only the listing's flags can keep them out.
+	for _, community := range []struct{ host, name string }{
+		{lemmyFixtureHost, "nsfw-a1"}, {lemmyFixtureHost, "nsfw-a2"}, {lemmyMLHost, "nsfw-b1"},
+	} {
+		rig.fixture.add(community.host, lemmyCommunity{name: community.name, nsfw: true})
+		rig.serveGroup("https://"+community.host+"/c/"+community.name, nil)
+	}
+
+	result := rig.sweep()
+
+	assert.Equal(t, map[string]int{"lemmy.world": 2, "lemmy.ml": 1}, result.NSFWSkipped)
+	assert.Empty(t, result.Subscribed)
+	assert.Empty(t, result.Failed)
+	complete := slices.DeleteFunc(listingLogRecords(t, logs, "INFO"), func(record map[string]any) bool {
+		return record["msg"] != "follow reconciler: sweep complete"
+	})
+	require.Len(t, complete, 1, "one sweep-complete record")
+	assert.Equal(t, map[string]any{"lemmy.world": float64(2), "lemmy.ml": float64(1)}, complete[0]["nsfw_skipped"])
+}
+
+// TestSweep_SkipNSFWRefusesASensitiveGroupBeforeTheMint: the listing or the post
+// walk returns a community unflagged, and its Group says sensitive. On a
+// skip_nsfw host the add refuses it before the mint: no DID, no rows, no
+// Follow, counted for its host and not Failed, logged with its id. A refusal
+// is skipped like any other, so the next sweep does not fetch it again. A
+// manual subscribe of the same Group is not an instance entry's, so it is
+// minted and followed.
+func TestSweep_SkipNSFWRefusesASensitiveGroupBeforeTheMint(t *testing.T) {
+	const sensitiveID = "https://lemmy.world/c/sensitive"
+	for _, tc := range []struct {
+		name    string
+		arrange func(rig *instanceRig)
+	}{
+		{
+			name: "listed",
+			arrange: func(rig *instanceRig) {
+				rig.fixture.add(lemmyFixtureHost, lemmyCommunity{name: "sensitive"})
+				rig.serveGroup(sensitiveID, sensitiveGroup)
+			},
+		},
+		{
+			name: "found by the post walk",
+			arrange: func(rig *instanceRig) {
+				rig.serveGroup(sensitiveID, sensitiveGroup)
+				rig.post(lemmyFixtureHost, sensitiveID)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			rig := newInstanceRig(t, h, skipNSFWLemmyWorld, instanceRigOptions{})
+			tc.arrange(rig)
+
+			result := rig.sweep()
+
+			assert.Empty(t, result.Subscribed)
+			assert.Empty(t, result.Failed, "an NSFW refusal is counted, not Failed")
+			assert.Equal(t, map[string]int{"lemmy.world": 1}, result.NSFWSkipped)
+			assert.Zero(t, rig.mintCount(), "no DID may be minted")
+			rig.assertNotBridged(t, sensitiveID)
+			follows, _ := rig.deliveredSince(0)
+			assert.Empty(t, follows)
+			assert.True(t, rig.nsfwRefusalLogged(sensitiveID), "the refusal is logged with the community id and reason")
+
+			rig.clock.Advance(time.Hour)
+			result = rig.sweep()
+
+			assert.Empty(t, result.Subscribed)
+			assert.Empty(t, result.Failed)
+			assert.Equal(t, map[string]int{}, result.NSFWSkipped, "a skipped refusal is not counted again")
+			assert.Equal(t, []int{1}, rig.fetchCounts(sensitiveID), "the refusal is not fetched again inside its skip")
+
+			mark := rig.deliveryCount()
+			rec := h.adminRequest(http.MethodPost, "/admin/communities", map[string]any{"community": sensitiveID})
+
+			require.Equal(t, http.StatusAccepted, rec.Code, rec.Body.String())
+			assert.Equal(t, store.FollowStatePending, rig.followState(sensitiveID))
+			assert.Equal(t, 1, rig.mintCount(), "a manual subscribe mints")
+			follows, _ = rig.deliveredSince(mark)
+			assert.Equal(t, []string{sensitiveID}, follows)
+		})
+	}
+}
+
+// TestSweep_SkipNSFWDeadGroupIsSkippedForADay: on a skip_nsfw host the NSFW
+// check's fetch is the add's first, so a listed community whose Group answers
+// 410 or 404 is refused there as the mint's fetch would refuse it: Failed, not
+// counted as NSFW, nothing minted or stored, logged as a refusal at Warn, and
+// skipped for 24 hours rather than the hour a failed add gets.
+func TestSweep_SkipNSFWDeadGroupIsSkippedForADay(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		reason string
+	}{
+		{name: "tombstoned", status: http.StatusGone, reason: "actor is tombstoned upstream"},
+		{name: "not found", status: http.StatusNotFound, reason: "actor document is unavailable upstream"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const deadID = "https://lemmy.world/c/dead"
+			h := newHarness(t)
+			rig := newInstanceRig(t, h, skipNSFWLemmyWorld, instanceRigOptions{})
+			rig.fixture.add(lemmyFixtureHost, lemmyCommunity{name: "dead"})
+			h.serveStatus(urlPath(t, deadID), tc.status)
+
+			result := rig.sweep()
+
+			assert.Empty(t, result.Subscribed)
+			assert.Equal(t, []string{deadID}, result.Failed)
+			assert.Empty(t, result.NSFWSkipped, "a dead Group is not an NSFW refusal")
+			assert.Zero(t, rig.mintCount(), "no DID may be minted")
+			rig.assertNotBridged(t, deadID)
+			follows, _ := rig.deliveredSince(0)
+			assert.Empty(t, follows)
+			assert.Equal(t, []int{1}, rig.fetchCounts(deadID))
+			logs := h.logs.String()
+			assert.Contains(t, logs, `level=WARN msg="subscribe refused" community=`+deadID)
+			assert.Contains(t, logs, tc.reason)
+			assert.NotContains(t, logs, "subscribe: fetch group")
+
+			rig.clock.Advance(23 * time.Hour)
+			result = rig.sweep()
+
+			assert.Empty(t, result.Failed)
+			assert.Equal(t, []int{1}, rig.fetchCounts(deadID), "a refusal is not fetched again inside its 24 hour skip")
+
+			rig.clock.Advance(time.Hour + time.Minute)
+			result = rig.sweep()
+
+			assert.Equal(t, []string{deadID}, result.Failed)
+			assert.Equal(t, []int{2}, rig.fetchCounts(deadID), "the refusal is tried again once its skip ends")
+		})
+	}
+}
+
+// TestSweep_SkipNSFWFailedGroupFetchDoesNotFailOpen: on a skip_nsfw host the
+// NSFW check's fetch answers 503, and the Group is sensitive on every fetch
+// after. The add fails there; it does not go on to the mint's own fetch, so the
+// sensitive community gets no DID, no rows and no Follow.
+func TestSweep_SkipNSFWFailedGroupFetchDoesNotFailOpen(t *testing.T) {
+	const sensitiveID = "https://lemmy.world/c/flaky-sensitive"
+	h := newHarness(t)
+	rig := newInstanceRig(t, h, skipNSFWLemmyWorld, instanceRigOptions{})
+	rig.fixture.add(lemmyFixtureHost, lemmyCommunity{name: "flaky-sensitive"})
+	rig.serveGroup(sensitiveID, sensitiveGroup)
+	path := urlPath(t, sensitiveID)
+	h.serveStatus(path, http.StatusServiceUnavailable)
+	h.onFetch[path] = func() { h.serveStatus(path, 0) }
+
+	result := rig.sweep()
+
+	assert.Empty(t, result.Subscribed)
+	assert.Equal(t, []string{sensitiveID}, result.Failed)
+	assert.Empty(t, result.NSFWSkipped)
+	assert.Zero(t, rig.mintCount(), "no DID may be minted")
+	rig.assertNotBridged(t, sensitiveID)
+	follows, _ := rig.deliveredSince(0)
+	assert.Empty(t, follows)
+	assert.Equal(t, []int{1}, rig.fetchCounts(sensitiveID), "the add stops at the failed fetch")
+}
+
+// TestSweep_SkipNSFWRefusalUsesASlot: an NSFW refusal is tried, so it takes
+// one of the 20 slots. Sorted ahead of 20 eligible communities, it leaves 19
+// subscribed in sweep 1 and the last one for sweep 2, which does not fetch the
+// refusal again.
+func TestSweep_SkipNSFWRefusalUsesASlot(t *testing.T) {
+	const refusedID = "https://lemmy.world/c/aa-sensitive"
+	h := newHarness(t)
+	rig := newInstanceRig(t, h, skipNSFWLemmyWorld, instanceRigOptions{})
+	rig.fixture.add(lemmyFixtureHost, lemmyCommunity{name: "aa-sensitive"})
+	rig.serveGroup(refusedID, sensitiveGroup)
+	eligible := numberedIDs("https://lemmy.world/c/eligible-", 20)
+	for _, name := range numberedIDs("eligible-", 20) {
+		rig.addCommunity(lemmyFixtureHost, name)
+	}
+
+	result := rig.sweep()
+
+	require.Equal(t, eligible[:19], result.Subscribed)
+	require.Empty(t, result.Failed)
+	require.Equal(t, map[string]int{"lemmy.world": 1}, result.NSFWSkipped)
+
+	rig.clock.Advance(15 * time.Minute)
+	result = rig.sweep()
+
+	assert.Equal(t, eligible[19:], result.Subscribed)
+	assert.Empty(t, result.Failed)
+	assert.Equal(t, []int{1}, rig.fetchCounts(refusedID))
+	follows, undos := rig.deliveredSince(0)
+	assert.Equal(t, eligible, follows)
+	assert.Empty(t, undos)
+	rig.assertNotBridged(t, refusedID)
+}
+
+// TestSweep_SkipNSFWRefusesOnlyOnItsOwnHost: in one sweep, lemmy.world has
+// skip_nsfw and lemmy.ml does not, and each lists one unflagged community whose
+// Group is sensitive. Only lemmy.world's is refused and counted; lemmy.ml's is
+// minted and followed.
+func TestSweep_SkipNSFWRefusesOnlyOnItsOwnHost(t *testing.T) {
+	const (
+		refusedID  = "https://lemmy.world/c/sensitive-a"
+		followedID = "https://lemmy.ml/c/sensitive-b"
+	)
+	h := newHarness(t)
+	rig := newInstanceRig(t, h, `communities: []
+instances:
+  - host: lemmy.world
+    skip_nsfw: true
+  - host: lemmy.ml
+`, instanceRigOptions{})
+	rig.fixture.add(lemmyFixtureHost, lemmyCommunity{name: "sensitive-a"})
+	rig.serveGroup(refusedID, sensitiveGroup)
+	rig.fixture.add(lemmyMLHost, lemmyCommunity{name: "sensitive-b"})
+	rig.serveGroup(followedID, sensitiveGroup)
+
+	result := rig.sweep()
+
+	assert.Equal(t, []string{followedID}, result.Subscribed)
+	assert.Empty(t, result.Failed)
+	assert.Equal(t, map[string]int{"lemmy.world": 1}, result.NSFWSkipped)
+	rig.assertNotBridged(t, refusedID)
+	assert.Equal(t, store.FollowStatePending, rig.followState(followedID))
+	assert.Equal(t, 1, rig.mintCount(), "only lemmy.ml's community is minted")
+	follows, _ := rig.deliveredSince(0)
+	assert.Equal(t, []string{followedID}, follows)
+}
+
+// storeSensitive sets the stored NSFW flag of id's communities row, the value
+// a Group document that turned sensitive leaves there.
+func (r *instanceRig) storeSensitive(id string, sensitive bool) {
+	r.h.t.Helper()
+	_, err := r.h.db.ExecContext(context.Background(),
+		`UPDATE communities SET sensitive = $2 WHERE ap_group_id = $1`, id, sensitive)
+	require.NoError(r.h.t, err)
+}
+
+// storedSensitive reads the communities.sensitive column of id's row.
+func (r *instanceRig) storedSensitive(id string) bool {
+	r.h.t.Helper()
+	var sensitive bool
+	require.NoError(r.h.t, r.h.db.QueryRowContext(context.Background(),
+		`SELECT sensitive FROM communities WHERE ap_group_id = $1`, id).Scan(&sensitive))
+	return sensitive
+}
+
+// TestSweep_SkipNSFWUnfollowsACommunityThatTurnedNSFW: an accepted community
+// on a skip_nsfw host whose stored flag is now set is an extra unless an
+// explicit entry names it. The unfollow sends Undo{Follow}, is reported and
+// logged with the community id, and keeps the community's bridged records. A
+// flagged community unfollowed for another reason gets no NSFW-unfollow log.
+func TestSweep_SkipNSFWUnfollowsACommunityThatTurnedNSFW(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		followList       string
+		wantUnsubscribed []string
+		wantUndos        []string
+		wantState        store.FollowState
+		wantLogged       bool
+	}{
+		{
+			name:             "wanted only by the skip_nsfw instance entry",
+			followList:       skipNSFWLemmyWorld,
+			wantUnsubscribed: []string{groupID},
+			wantUndos:        []string{groupID},
+			wantState:        store.FollowStateNone,
+			wantLogged:       true,
+		},
+		{
+			name: "also named under communities",
+			followList: "communities:\n  - \"!technology@lemmy.world\"\n" +
+				"instances:\n  - host: lemmy.world\n    skip_nsfw: true\n",
+			wantState: store.FollowStateAccepted,
+		},
+		{
+			name: "excluded from the skip_nsfw instance entry",
+			followList: "communities: []\ninstances:\n  - host: lemmy.world\n    skip_nsfw: true\n" +
+				"    exclude:\n      - \"!technology@lemmy.world\"\n",
+			wantUnsubscribed: []string{groupID},
+			wantUndos:        []string{groupID},
+			wantState:        store.FollowStateNone,
+		},
+		{
+			name:             "its host's instance entry removed",
+			followList:       "communities: []\ninstances: []\n",
+			wantUnsubscribed: []string{groupID},
+			wantUndos:        []string{groupID},
+			wantState:        store.FollowStateNone,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			ctx := context.Background()
+			h.serveLemmyWorldContent()
+			group := h.subscribeTechnology()
+			postID := h.bridgePost(group, "50520001")
+			rig := newInstanceRig(t, h, tc.followList, instanceRigOptions{})
+			logs := rig.captureReconcilerLogs()
+			// Lemmy now lists the community flagged.
+			rig.fixture.add(lemmyFixtureHost, lemmyCommunity{name: "technology", nsfw: true})
+			rig.storeSensitive(groupID, true)
+			mark := rig.deliveryCount()
+
+			result := rig.sweep()
+
+			assert.ElementsMatch(t, tc.wantUnsubscribed, result.Unsubscribed)
+			assert.Empty(t, result.Failed)
+			follows, undos := rig.deliveredSince(mark)
+			assert.ElementsMatch(t, tc.wantUndos, undos, "Undo{Follow}s delivered")
+			assert.Empty(t, follows)
+			assert.Equal(t, tc.wantState, rig.followState(groupID))
+			logged := slices.ContainsFunc(listingLogRecords(t, logs, ""), func(record map[string]any) bool {
+				return record["msg"] == "follow reconciler: unfollowed NSFW-flagged community" && record["community"] == groupID
+			})
+			assert.Equal(t, tc.wantLogged, logged, "the NSFW-unfollow record for community=%s", groupID)
+
+			post, err := h.objects.GetByAPID(ctx, postID)
+			require.NoError(t, err, "the bridged post's mapping remains")
+			assert.False(t, post.IsDeleted(), "the bridged post's mapping is live")
+			_, _, err = h.manager.GetRecord(ctx, post.DID, post.Collection, post.RKey)
+			assert.NoError(t, err, "the bridged post's record is still readable")
+			profile, err := h.objects.GetByAPID(ctx, groupID)
+			require.NoError(t, err, "the community profile mapping remains")
+			assert.False(t, profile.IsDeleted(), "the community profile mapping is live")
+			_, _, err = h.manager.GetRecord(ctx, profile.DID, profile.Collection, profile.RKey)
+			assert.NoError(t, err, "the community profile record is still readable")
+		})
+	}
+}
+
+// TestSweep_SkipNSFWReaddsACommunityThatTurnedBack: a community whose stored
+// flag is still set from its NSFW time, on a fresh profile, is listed unflagged
+// again and its Group now says sensitive false. The sweep's listed add
+// re-subscribes it with the document its NSFW check fetched, so the stored flag
+// clears and the next sweep keeps the subscription.
+func TestSweep_SkipNSFWReaddsACommunityThatTurnedBack(t *testing.T) {
+	const backID = "https://lemmy.world/c/turned-back"
+	h := newHarness(t)
+	ctx := context.Background()
+	rig := newInstanceRig(t, h, skipNSFWLemmyWorld, instanceRigOptions{})
+	rig.fixture.add(lemmyFixtureHost, lemmyCommunity{name: "turned-back"})
+	rig.serveGroup(backID, map[string]any{"sensitive": false})
+	// Bridged earlier and not followed now, its profile within the TTL.
+	_, err := h.mat.EnsureCommunity(ctx, &ap.Object{ID: backID})
+	require.NoError(t, err)
+	rig.storeSensitive(backID, true)
+	require.Equal(t, store.FollowStateNone, rig.followState(backID))
+
+	result := rig.sweep()
+
+	assert.Equal(t, []string{backID}, result.Subscribed)
+	assert.Empty(t, result.Failed)
+	assert.Empty(t, result.Unsubscribed)
+	assert.Equal(t, store.FollowStatePending, rig.followState(backID))
+	assert.False(t, rig.storedSensitive(backID), "the re-subscribe stores the fetched Group's flag")
+
+	mark := rig.deliveryCount()
+	rig.clock.Advance(time.Hour)
+	result = rig.sweep()
+
+	assert.Empty(t, result.Unsubscribed)
+	assert.Empty(t, result.Failed)
+	_, undos := rig.deliveredSince(mark)
+	assert.Empty(t, undos, "the next sweep sends no Undo{Follow}")
+	assert.Equal(t, store.FollowStatePending, rig.followState(backID))
 }

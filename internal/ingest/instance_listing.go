@@ -48,9 +48,11 @@ type ListingPosition struct {
 var firstListingPosition = ListingPosition{Sort: listingSortOld, Page: 1}
 
 // CommunityListing is the result of one read. A non-nil Err means the read
-// failed; a read stopped by the page cap has not failed.
+// failed; a read stopped by the page cap has not failed. NSFW holds true for
+// each actor id whose community.nsfw is set.
 type CommunityListing struct {
 	ActorIDs []string
+	NSFW     map[string]bool
 	Next     ListingPosition
 	Err      error
 	// ReachedLimit reports a full sort=New page 100 that did not meet the sort=Old
@@ -149,7 +151,7 @@ func (l *LemmyLister) ListCommunities(ctx context.Context, host string, start Li
 				"sort", position.Sort, "page", position.Page, "error", err)
 			return listing
 		}
-		listing.ActorIDs = append(listing.ActorIDs, l.keepHostActorIDs(host, page)...)
+		l.keepHostCommunities(host, page, &listing)
 		next, readEnded, reachedLimit := nextPosition(position, page)
 		listing.Next = next
 		listing.ReachedLimit = reachedLimit
@@ -168,6 +170,7 @@ type lemmyCommunityView struct {
 	Community struct {
 		ActorID   string    `json:"actor_id"`
 		Published time.Time `json:"published"`
+		NSFW      bool      `json:"nsfw"`
 	} `json:"community"`
 }
 
@@ -233,16 +236,21 @@ func (l *LemmyLister) fetchBody(ctx context.Context, host, path string, query ur
 	return body, nil
 }
 
-// keepHostActorIDs gives the page's actor ids that belong to host, and logs the
-// rest.
-func (l *LemmyLister) keepHostActorIDs(host string, page []lemmyCommunityView) []string {
-	actorIDs := make([]string, 0, len(page))
+// keepHostCommunities adds the page's actor ids that belong to host, with their
+// NSFW flags, to listing, and logs the rest.
+func (l *LemmyLister) keepHostCommunities(host string, page []lemmyCommunityView, listing *CommunityListing) {
 	for _, view := range page {
-		if l.onHost(host, view.Community.ActorID, "community listing dropped a result from another host") {
-			actorIDs = append(actorIDs, view.Community.ActorID)
+		if !l.onHost(host, view.Community.ActorID, "community listing dropped a result from another host") {
+			continue
+		}
+		listing.ActorIDs = append(listing.ActorIDs, view.Community.ActorID)
+		if view.Community.NSFW {
+			if listing.NSFW == nil {
+				listing.NSFW = make(map[string]bool)
+			}
+			listing.NSFW[view.Community.ActorID] = true
 		}
 	}
-	return actorIDs
 }
 
 // onHost reports whether actorID belongs to host, and logs dropMessage with

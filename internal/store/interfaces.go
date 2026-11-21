@@ -449,11 +449,16 @@ type CommunityBans interface {
 // backfill progress.
 type Communities interface {
 	// UpsertCommunity idempotently upserts a community keyed on APGroupID
-	// and returns the stored row. On conflict it updates PreferredUsername
-	// only; follow state and timestamps are preserved, and DID and Instance
-	// are immutable: an upsert whose DID or Instance diverges from the
-	// stored row returns an error satisfying errors.IsAlreadyExists.
+	// and returns the stored row. Sensitive is written on insert only. On
+	// conflict it updates PreferredUsername only; follow state, Sensitive and
+	// timestamps are preserved, and DID and Instance are immutable: an
+	// upsert whose DID or Instance diverges from the stored row returns an
+	// error satisfying errors.IsAlreadyExists.
 	UpsertCommunity(ctx context.Context, community Community) (*Community, error)
+
+	// SetSensitive records the Group's sensitive (NSFW) flag as last seen in
+	// its document. A missing row returns errors.IsNotFound.
+	SetSensitive(ctx context.Context, apGroupID string, sensitive bool) error
 
 	// GetByAPGroupID returns the community for an AP group id.
 	GetByAPGroupID(ctx context.Context, apGroupID string) (*Community, error)

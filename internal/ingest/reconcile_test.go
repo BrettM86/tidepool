@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -749,9 +751,9 @@ func TestParseFollowList_RepoFile(t *testing.T) {
 		{Host: "programming.dev"},
 		{Host: "sh.itjust.works", Exclude: []string{"!boysjerking@sh.itjust.works", "!combatvideos@sh.itjust.works"}},
 	}, list.Instances)
-	assert.False(t, list.Desires("https://sh.itjust.works/c/boysjerking", "sh.itjust.works", ""))
-	assert.False(t, list.Desires("https://sh.itjust.works/c/combatvideos", "sh.itjust.works", ""))
-	assert.True(t, list.Desires("https://sh.itjust.works/c/opensim", "sh.itjust.works", ""))
+	assert.False(t, list.Desires("https://sh.itjust.works/c/boysjerking", "sh.itjust.works", "", false))
+	assert.False(t, list.Desires("https://sh.itjust.works/c/combatvideos", "sh.itjust.works", "", false))
+	assert.True(t, list.Desires("https://sh.itjust.works/c/opensim", "sh.itjust.works", "", false))
 	assert.Empty(t, list.OutboundDisabledHosts)
 	assert.Empty(t, list.OutboundDisabledCommunities)
 }
@@ -839,6 +841,195 @@ func TestParseFollowList_Guard(t *testing.T) {
 			path := writeFollowList(t, tc.content)
 			list, err := ParseFollowList(path)
 			assertFollowListRejected(t, path, list, err, tc.want)
+		})
+	}
+}
+
+// scriptedLister answers each host's listing from listings; an unscripted host
+// lists nothing.
+type scriptedLister struct{ listings map[string]CommunityListing }
+
+func (s scriptedLister) ListCommunities(_ context.Context, host string, _ ListingPosition) CommunityListing {
+	return s.listings[host]
+}
+
+// scriptedPostReader answers each host's post walk from walks; an unscripted
+// host walks nothing.
+type scriptedPostReader struct{ walks map[string]PostWalk }
+
+func (s scriptedPostReader) RecentPostCommunities(_ context.Context, host string, _ PostMark) PostWalk {
+	return s.walks[host]
+}
+
+// TestListedCandidates_SkipNSFW: on a host whose entry sets skip_nsfw, a
+// community the listing or a post walk flags NSFW is no candidate, is counted
+// once for its host, and leaves discovered. An explicit communities entry is
+// the explicit add's, never a candidate and never counted. A host without the
+// switch keeps its flagged communities as candidates.
+func TestListedCandidates_SkipNSFW(t *testing.T) {
+	const (
+		host     = "lemmy.world"
+		flagged  = "https://lemmy.world/c/flagged"
+		plain    = "https://lemmy.world/c/plain"
+		otherID  = "https://lemmy.ml/c/other-flagged"
+		ml       = "lemmy.ml"
+		explicit = "https://lemmy.world/c/flagged"
+	)
+	skipping := []InstanceEntry{{Host: host, SkipNSFW: true}}
+	for _, tc := range []struct {
+		name          string
+		list          *FollowList
+		listings      map[string]CommunityListing
+		walks         map[string]PostWalk
+		want          []listedCandidate
+		wantCounts    map[string]int
+		wantDiscovers []string
+	}{
+		{
+			name: "flagged only in the listing",
+			list: &FollowList{Instances: skipping},
+			listings: map[string]CommunityListing{
+				host: {ActorIDs: []string{flagged, plain}, NSFW: map[string]bool{flagged: true}},
+			},
+			want:       []listedCandidate{{actorID: plain, host: host, skipNSFW: true}},
+			wantCounts: map[string]int{host: 1},
+		},
+		{
+			name:     "flagged only in the post walk",
+			list:     &FollowList{Instances: skipping},
+			listings: map[string]CommunityListing{host: {ActorIDs: []string{plain}}},
+			walks: map[string]PostWalk{
+				host: {ActorIDs: []string{flagged}, NSFW: map[string]bool{flagged: true}},
+			},
+			want:       []listedCandidate{{actorID: plain, host: host, skipNSFW: true}},
+			wantCounts: map[string]int{host: 1},
+		},
+		{
+			name: "flagged in both counts once",
+			list: &FollowList{Instances: skipping},
+			listings: map[string]CommunityListing{
+				host: {ActorIDs: []string{flagged, plain}, NSFW: map[string]bool{flagged: true}},
+			},
+			walks: map[string]PostWalk{
+				host: {ActorIDs: []string{flagged}, NSFW: map[string]bool{flagged: true}},
+			},
+			want:       []listedCandidate{{actorID: plain, host: host, skipNSFW: true}},
+			wantCounts: map[string]int{host: 1},
+		},
+		{
+			name: "listing says plain but the walk says flagged",
+			list: &FollowList{Instances: skipping},
+			listings: map[string]CommunityListing{
+				host: {ActorIDs: []string{flagged, plain}, NSFW: map[string]bool{flagged: false}},
+			},
+			walks: map[string]PostWalk{
+				host: {ActorIDs: []string{flagged}, NSFW: map[string]bool{flagged: true}},
+			},
+			want:       []listedCandidate{{actorID: plain, host: host, skipNSFW: true}},
+			wantCounts: map[string]int{host: 1},
+		},
+		{
+			name: "named under communities is neither a candidate nor counted",
+			list: &FollowList{Communities: []string{explicit}, Instances: skipping},
+			listings: map[string]CommunityListing{
+				host: {ActorIDs: []string{flagged, plain}, NSFW: map[string]bool{flagged: true}},
+			},
+			walks: map[string]PostWalk{
+				host: {ActorIDs: []string{flagged}, NSFW: map[string]bool{flagged: true}},
+			},
+			want:       []listedCandidate{{actorID: plain, host: host, skipNSFW: true}},
+			wantCounts: map[string]int{},
+		},
+		{
+			name: "host without skip_nsfw keeps the flagged community",
+			list: &FollowList{Instances: []InstanceEntry{{Host: host}}},
+			listings: map[string]CommunityListing{
+				host: {ActorIDs: []string{flagged, plain}, NSFW: map[string]bool{flagged: true}},
+			},
+			walks: map[string]PostWalk{
+				host: {ActorIDs: []string{flagged}, NSFW: map[string]bool{flagged: true}},
+			},
+			want: []listedCandidate{
+				{actorID: flagged, host: host, discovered: true},
+				{actorID: plain, host: host},
+			},
+			wantCounts:    map[string]int{},
+			wantDiscovers: []string{flagged},
+		},
+		{
+			name: "only the host with the switch skips",
+			list: &FollowList{Instances: []InstanceEntry{{Host: host, SkipNSFW: true}, {Host: ml}}},
+			listings: map[string]CommunityListing{
+				host: {ActorIDs: []string{flagged, plain}, NSFW: map[string]bool{flagged: true}},
+				ml:   {ActorIDs: []string{otherID}, NSFW: map[string]bool{otherID: true}},
+			},
+			walks: map[string]PostWalk{
+				ml: {ActorIDs: []string{otherID}, NSFW: map[string]bool{otherID: true}},
+			},
+			want: []listedCandidate{
+				{actorID: otherID, host: ml, discovered: true},
+				{actorID: plain, host: host, skipNSFW: true},
+			},
+			wantCounts:    map[string]int{host: 1},
+			wantDiscovers: []string{otherID},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reconciler, err := NewFollowReconciler(FollowReconcilerOptions{
+				Admin: &Admin{}, Path: "communities.yaml", Backfill: &recordingBackfill{},
+				Lister: scriptedLister{tc.listings}, Posts: scriptedPostReader{tc.walks}, Budget: unlimitedBudget(t),
+			})
+			require.NoError(t, err)
+			ctx := context.Background()
+			listings, err := reconciler.listInstances(ctx, tc.list.Instances)
+			require.NoError(t, err)
+			require.NoError(t, reconciler.walkPosts(ctx, tc.list.Instances))
+
+			candidates, counts := reconciler.listedCandidates(tc.list, listings, map[string]struct{}{})
+
+			assert.Equal(t, tc.want, candidates, "candidates")
+			for countedHost, want := range tc.wantCounts {
+				assert.Equal(t, want, counts[countedHost], "NSFW-skipped count of %s", countedHost)
+			}
+			for _, listed := range tc.list.Instances {
+				if _, counted := tc.wantCounts[listed.Host]; !counted {
+					assert.Zero(t, counts[listed.Host], "no NSFW-skipped count for %s", listed.Host)
+				}
+			}
+			discovered := slices.Collect(maps.Keys(reconciler.discovered))
+			assert.ElementsMatch(t, tc.wantDiscovers, discovered, "what stays in discovered")
+		})
+	}
+}
+
+// TestSweepResult_NSFWSkippedJSON: the admin reconcile response always carries
+// nsfw_skipped as an object, {} when nothing was skipped, never null or absent.
+// The empty row is the result a sweep starts from: one that stops at a broken
+// file returns it untouched, with no database behind the reconciler.
+func TestSweepResult_NSFWSkippedJSON(t *testing.T) {
+	reconciler, err := NewFollowReconciler(FollowReconcilerOptions{
+		Admin: &Admin{}, Path: writeFollowList(t, "communities: [\n"), Backfill: &recordingBackfill{},
+		Lister: noCommunitiesLister{}, Posts: noPostsReader{}, Budget: unlimitedBudget(t),
+	})
+	require.NoError(t, err)
+	started, err := reconciler.Sweep(context.Background())
+	require.Error(t, err, "the broken file stops the sweep before any store read")
+
+	for _, tc := range []struct {
+		name   string
+		result SweepResult
+		want   string
+	}{
+		{"populated", SweepResult{NSFWSkipped: map[string]int{"a.example": 2}}, `{"a.example":2}`},
+		{"empty", started, `{}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			encoded, err := json.Marshal(tc.result)
+			require.NoError(t, err)
+			var fields map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(encoded, &fields))
+			require.Contains(t, fields, "nsfw_skipped", "in %s", encoded)
+			assert.JSONEq(t, tc.want, string(fields["nsfw_skipped"]))
 		})
 	}
 }

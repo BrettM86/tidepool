@@ -512,3 +512,20 @@ func TestLemmyLister_WalksBothEndsOfTheList(t *testing.T) {
 		})
 	}
 }
+
+// TestLemmyLister_FlagsNSFWCommunities: the listing keeps each community's
+// community.nsfw, keyed by actor id, so a host with skip_nsfw can leave the
+// flagged ones out before any Group fetch.
+func TestLemmyLister_FlagsNSFWCommunities(t *testing.T) {
+	fixture := newLemmyFixture(t)
+	fixture.add(lemmyFixtureHost, lemmyCommunity{name: "plain"})
+	fixture.add(lemmyFixtureHost, lemmyCommunity{name: "flagged", nsfw: true})
+	lister, _ := newFixtureLister(t, fixture, 0)
+
+	listing := lister.ListCommunities(context.Background(), lemmyFixtureHost, oldPosition(1))
+
+	require.NoError(t, listing.Err)
+	assert.ElementsMatch(t, []string{"https://lemmy.world/c/plain", "https://lemmy.world/c/flagged"}, listing.ActorIDs)
+	assert.True(t, listing.NSFW["https://lemmy.world/c/flagged"], "the nsfw:true community is flagged")
+	assert.False(t, listing.NSFW["https://lemmy.world/c/plain"], "the nsfw:false community is not flagged")
+}

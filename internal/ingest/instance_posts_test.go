@@ -359,3 +359,26 @@ func TestRecentPostCommunities_ZeroOptionsTakeTheDefaults(t *testing.T) {
 		assert.True(t, postLogHas(t, logs, "INFO", lemmyFixtureHost), "the cap is logged at info with the host")
 	})
 }
+
+// TestRecentPostCommunities_FlagsNSFWCommunities: the walk flags a community by
+// the post view's community.nsfw, not by post.nsfw. A plain post in a flagged
+// community flags it; a flagged post in a plain community does not.
+func TestRecentPostCommunities_FlagsNSFWCommunities(t *testing.T) {
+	fixture := newLemmyFixture(t)
+	fixture.addPosts(lemmyFixtureHost,
+		lemmyPost{id: 1, published: postMinute(1), community: "https://lemmy.world/c/flagged-community", nsfw: true},
+		lemmyPost{id: 2, published: postMinute(2), community: "https://lemmy.world/c/flagged-post", postNSFW: true},
+		lemmyPost{id: 3, published: postMinute(3), community: "https://lemmy.world/c/plain"},
+	)
+	lister, _ := newFixtureLister(t, fixture, 0)
+
+	walk := lister.RecentPostCommunities(context.Background(), lemmyFixtureHost, PostMark{})
+
+	require.NoError(t, walk.Err)
+	assert.ElementsMatch(t, []string{
+		"https://lemmy.world/c/flagged-community", "https://lemmy.world/c/flagged-post", "https://lemmy.world/c/plain",
+	}, walk.ActorIDs)
+	assert.True(t, walk.NSFW["https://lemmy.world/c/flagged-community"], "a plain post in a flagged community flags the community")
+	assert.False(t, walk.NSFW["https://lemmy.world/c/flagged-post"], "a flagged post in a plain community does not flag it")
+	assert.False(t, walk.NSFW["https://lemmy.world/c/plain"], "a plain post in a plain community does not flag it")
+}

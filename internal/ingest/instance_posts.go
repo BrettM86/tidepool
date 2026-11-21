@@ -34,9 +34,11 @@ func (m PostMark) after(other PostMark) bool {
 }
 
 // PostWalk is the result of one walk of a host's recent local posts. A non-nil
-// Err means the walk failed.
+// Err means the walk failed. NSFW holds true for each actor id whose post view's
+// community.nsfw is set; post.nsfw does not flag the community.
 type PostWalk struct {
 	ActorIDs []string
+	NSFW     map[string]bool
 	Newest   PostMark
 	Err      error
 }
@@ -71,6 +73,12 @@ func (l *LemmyLister) RecentPostCommunities(ctx context.Context, host string, si
 				seen[actorID] = struct{}{}
 				if l.onHost(host, actorID, "post walk dropped a community from another host") {
 					walk.ActorIDs = append(walk.ActorIDs, actorID)
+					if view.Community.NSFW {
+						if walk.NSFW == nil {
+							walk.NSFW = make(map[string]bool)
+						}
+						walk.NSFW[actorID] = true
+					}
 				}
 			}
 			if view.Post.FeaturedLocal {
@@ -102,6 +110,7 @@ type lemmyListedPost struct {
 	} `json:"post"`
 	Community struct {
 		ActorID string `json:"actor_id"`
+		NSFW    bool   `json:"nsfw"`
 	} `json:"community"`
 }
 

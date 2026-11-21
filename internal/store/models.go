@@ -185,6 +185,9 @@ type Community struct {
 	// unknown (rows followed before it was recorded), which counts as
 	// configured.
 	FollowProvenance FollowProvenance
+	// Sensitive is the Group's AP sensitive (NSFW) flag as last seen in its
+	// document.
+	Sensitive bool
 }
 
 // CommunityBan is one community's exclusion of one native author.

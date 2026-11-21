@@ -208,5 +208,5 @@ func (c communityLabelApplier) stillWanted(community *store.Community, provenanc
 			"community", community.APGroupID, "error", err)
 		return false
 	}
-	return list.Desires(community.APGroupID, community.Instance, community.PreferredUsername)
+	return list.Desires(community.APGroupID, community.Instance, community.PreferredUsername, community.Sensitive)
 }

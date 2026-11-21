@@ -53,6 +53,9 @@ type Materializer interface {
 	RefreshActor(ctx context.Context, actorRef *ap.Object) (*store.BridgedActor, error)
 	RefreshCommunity(ctx context.Context, groupRef *ap.Object) (*store.Community, error)
 	EnsureCommunity(ctx context.Context, groupRef *ap.Object) (*store.Community, error)
+	// EnsureCommunityWithDocument is EnsureCommunity with a Group document the
+	// caller fetched itself by groupIRI.
+	EnsureCommunityWithDocument(ctx context.Context, groupIRI string, group *ap.Object) (*store.Community, error)
 }
 
 // Fetcher is the slice of *ap.Client the dispatcher uses to re-fetch

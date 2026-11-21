@@ -85,6 +85,8 @@ type lemmyCommunity struct {
 	name      string
 	actorID   string
 	published time.Time
+	// nsfw is the community's own NSFW flag, community.nsfw in the listing.
+	nsfw bool
 }
 
 // lemmyPost is one local post a host holds, in a community that is local, not
@@ -96,8 +98,12 @@ type lemmyPost struct {
 	featuredLocal bool
 	// community is the actor_id of the post's community.
 	community string
-	// nsfw marks the post's community NSFW: it is listed only with show_nsfw=true.
+	// nsfw marks the post's community NSFW (community.nsfw in the post view): it
+	// is listed only with show_nsfw=true.
 	nsfw bool
+	// postNSFW marks the post itself NSFW (post.nsfw) and not its community: it
+	// too is listed only with show_nsfw=true.
+	postNSFW bool
 }
 
 // lemmyPostKey names the post list request of one host that carries cursor as
@@ -456,7 +462,7 @@ func (f *lemmyFixture) page(communities []lemmyCommunity, sort string, page, lim
 		ordered = append(ordered, lemmyCommunityViewDocument{
 			Community: lemmyCommunityDocument{
 				ID: index + 1, Name: community.name, ActorID: community.actorID,
-				Published: community.published.UTC().Format(lemmyPublishedFormat),
+				Published: community.published.UTC().Format(lemmyPublishedFormat), NSFW: community.nsfw,
 			},
 			Subscribed: "NotSubscribed",
 		})
@@ -641,7 +647,7 @@ func (f *lemmyFixture) postPage(host string, posts []lemmyPost, after *lemmyPost
 		if after != nil && lemmyPostOrder(post, *after) <= 0 {
 			continue
 		}
-		if post.nsfw && !showNSFW {
+		if (post.nsfw || post.postNSFW) && !showNSFW {
 			continue
 		}
 		published := post.published.UTC().Format(lemmyPublishedFormat)
@@ -649,7 +655,7 @@ func (f *lemmyFixture) postPage(host string, posts []lemmyPost, after *lemmyPost
 			Post: lemmyPostDocument{
 				ID: post.id, Name: fmt.Sprintf("post %d", post.id),
 				APID:      fmt.Sprintf("https://%s/post/%d", host, post.id),
-				Published: published, Local: true, NSFW: post.nsfw, FeaturedLocal: post.featuredLocal,
+				Published: published, Local: true, NSFW: post.postNSFW, FeaturedLocal: post.featuredLocal,
 			},
 			Community: lemmyPostCommunityDocument{
 				ID: communityIDs[post.community], Name: post.community[strings.LastIndexByte(post.community, '/')+1:],

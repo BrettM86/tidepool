@@ -83,6 +83,27 @@ instances:
 			name:    "empty list",
 			content: "communities: []\ninstances: []\n",
 		},
+		{
+			name:    "skip_nsfw true",
+			content: "communities: []\ninstances:\n  - host: lemmy.world\n    skip_nsfw: true\n",
+			want:    []InstanceEntry{{Host: "lemmy.world", SkipNSFW: true}},
+		},
+		{
+			name:    "skip_nsfw false",
+			content: "communities: []\ninstances:\n  - host: lemmy.world\n    skip_nsfw: false\n",
+			want:    []InstanceEntry{{Host: "lemmy.world", SkipNSFW: false}},
+		},
+		{
+			name: "skip_nsfw on one host of two",
+			content: `
+communities: []
+instances:
+  - host: lemmy.world
+  - host: lemmy.ml
+    skip_nsfw: true
+`,
+			want: []InstanceEntry{{Host: "lemmy.world", SkipNSFW: false}, {Host: "lemmy.ml", SkipNSFW: true}},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			list, err := ParseFollowList(writeFollowList(t, tc.content))
@@ -92,6 +113,7 @@ instances:
 			for index, want := range tc.want {
 				assert.Equal(t, want.Host, list.Instances[index].Host)
 				assert.ElementsMatch(t, want.Exclude, list.Instances[index].Exclude)
+				assert.Equal(t, want.SkipNSFW, list.Instances[index].SkipNSFW, "skip_nsfw of %s", want.Host)
 			}
 		})
 	}
@@ -176,6 +198,13 @@ func TestParseFollowList_RejectedInstances(t *testing.T) {
 			"communities: []\ninstances:\n  - host: lemmy.world\n    excludes: []\n",
 			"excludes",
 		},
+		// Only a YAML boolean turns the switch on or off: anything else is a typo
+		// that would otherwise follow NSFW communities the operator meant to skip.
+		{"skip_nsfw that is a string", "communities: []\ninstances:\n  - host: nsfw.example\n    skip_nsfw: \"yes\"\n", "nsfw.example"},
+		{"skip_nsfw that is bare yes", "communities: []\ninstances:\n  - host: nsfw.example\n    skip_nsfw: yes\n", "nsfw.example"},
+		{"skip_nsfw that is an integer", "communities: []\ninstances:\n  - host: nsfw.example\n    skip_nsfw: 1\n", "nsfw.example"},
+		{"skip_nsfw that is null", "communities: []\ninstances:\n  - host: nsfw.example\n    skip_nsfw:\n", "nsfw.example"},
+		{"skip_nsfw that is tilde", "communities: []\ninstances:\n  - host: nsfw.example\n    skip_nsfw: ~\n", "nsfw.example"},
 		// A string is not an entry. yaml cuts the value in its message, so the line
 		// is what locates it.
 		{"string item", "communities: []\ninstances:\n  - \"lemmy.world\"\n", "line 3"},
@@ -212,6 +241,7 @@ func TestFollowListDesires(t *testing.T) {
 		groupID           string
 		instance          string
 		preferredUsername string
+		sensitive         bool
 		want              bool
 	}{
 		// Explicit handle entries compare the id's last path segment.
@@ -381,10 +411,45 @@ func TestFollowListDesires(t *testing.T) {
 			name:    "nothing listed",
 			groupID: technologyID, instance: world, preferredUsername: "c-technology", want: false,
 		},
+
+		// The stored NSFW flag matters only to an instance-only match on a
+		// skip_nsfw host.
+		{
+			name:      "flagged community on a skip_nsfw host",
+			instances: []InstanceEntry{{Host: world, SkipNSFW: true}},
+			groupID:   technologyID, instance: world, preferredUsername: "c-technology", sensitive: true, want: false,
+		},
+		{
+			name:      "unflagged community on a skip_nsfw host",
+			instances: []InstanceEntry{{Host: world, SkipNSFW: true}},
+			groupID:   technologyID, instance: world, preferredUsername: "c-technology", sensitive: false, want: true,
+		},
+		{
+			name:        "flagged community on a skip_nsfw host, also in communities",
+			communities: []string{"!technology@lemmy.world"},
+			instances:   []InstanceEntry{{Host: world, SkipNSFW: true}},
+			groupID:     technologyID, instance: world, preferredUsername: "c-technology", sensitive: true, want: true,
+		},
+		{
+			name:        "unflagged community on a skip_nsfw host, also in communities",
+			communities: []string{"!technology@lemmy.world"},
+			instances:   []InstanceEntry{{Host: world, SkipNSFW: true}},
+			groupID:     technologyID, instance: world, preferredUsername: "c-technology", sensitive: false, want: true,
+		},
+		{
+			name:      "flagged community on a host without skip_nsfw",
+			instances: listed(),
+			groupID:   technologyID, instance: world, preferredUsername: "c-technology", sensitive: true, want: true,
+		},
+		{
+			name:      "unflagged community on a host without skip_nsfw",
+			instances: listed(),
+			groupID:   technologyID, instance: world, preferredUsername: "c-technology", sensitive: false, want: true,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			list := &FollowList{Communities: tc.communities, Instances: tc.instances}
-			assert.Equal(t, tc.want, list.Desires(tc.groupID, tc.instance, tc.preferredUsername))
+			assert.Equal(t, tc.want, list.Desires(tc.groupID, tc.instance, tc.preferredUsername, tc.sensitive))
 		})
 	}
 }

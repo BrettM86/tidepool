@@ -488,7 +488,7 @@ func TestCommunityUpdate_ProfileUpdateEvent(t *testing.T) {
 
 	newTitle := "Renamed " + h.suffix
 	newDesc := "fresh sidebar " + h.suffix
-	h.admin.editCommunity(t, community.ID, newTitle, newDesc)
+	h.admin.editCommunity(t, community.ID, lemmyCommunityEdit{Title: newTitle, Description: newDesc})
 
 	updateEv := l.await("community.profile update", func(e *jsEvent) bool {
 		got, _ := fieldOf(e.Commit.Record, "displayName")

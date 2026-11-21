@@ -112,7 +112,7 @@ func TestCommunityRemoval_SubscribeWhoseTakeBackFailsOwesTheUndoFollow(t *testin
 	h.mu.Unlock()
 	mark := h.deliveryCount()
 
-	_, err = failing.subscribe(ctx, removedGroupID, store.FollowProvenanceManual)
+	_, err = failing.subscribe(ctx, removedGroupID, store.FollowProvenanceManual, false)
 
 	require.NoError(t, removalErr)
 	var removed *communityRemovedError

@@ -582,7 +582,7 @@ func TestReconcile_AnswersPastTheWriteTimeout(t *testing.T) {
 
 	require.NoError(t, request.result(t), "the client must get the result")
 	assert.Equal(t, http.StatusOK, *status)
-	assert.Equal(t, SweepResult{Subscribed: []string{heldCommunityID}, Unsubscribed: []string{}, Failed: []string{}}, *result)
+	assert.Equal(t, SweepResult{Subscribed: []string{heldCommunityID}, Unsubscribed: []string{}, Failed: []string{}, NSFWSkipped: map[string]int{}}, *result)
 }
 
 // TestReconcile_ClientDropDoesNotCancelTheSweep: the hold outlasts the moment the

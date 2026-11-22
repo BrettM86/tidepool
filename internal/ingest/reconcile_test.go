@@ -750,10 +750,25 @@ func TestParseFollowList_RepoFile(t *testing.T) {
 		{Host: "lemmy.zip"},
 		{Host: "programming.dev"},
 		{Host: "sh.itjust.works", Exclude: []string{"!boysjerking@sh.itjust.works", "!combatvideos@sh.itjust.works"}},
+		{Host: "lemmy.world", SkipNSFW: true, Exclude: []string{
+			"!pornvids@lemmy.world", "!pornhub@lemmy.world", "!celebritypornnsfw@lemmy.world",
+			"!anal@lemmy.world", "!floppycocks@lemmy.world", "!dicksisters@lemmy.world",
+			"!normalnudes@lemmy.world", "!rule34dle@lemmy.world", "!camgirls@lemmy.world",
+			"!slimthick@lemmy.world", "!girlsgonewild@lemmy.world", "!NaturalBeautyGW@lemmy.world",
+			"!NaturalgirlsGW@lemmy.world", "!PetiteGW@lemmy.world", "!MixedBeautiesGW@lemmy.world",
+			"!MediGore@lemmy.world",
+		}},
 	}, list.Instances)
 	assert.False(t, list.Desires("https://sh.itjust.works/c/boysjerking", "sh.itjust.works", "", false))
 	assert.False(t, list.Desires("https://sh.itjust.works/c/combatvideos", "sh.itjust.works", "", false))
 	assert.True(t, list.Desires("https://sh.itjust.works/c/opensim", "sh.itjust.works", "", false))
+	// lemmy.world: an excluded community and a sensitive one stay out, an
+	// ordinary one is followed, and a community named under `communities` is
+	// followed even when the host flags it sensitive.
+	assert.False(t, list.Desires("https://lemmy.world/c/pornvids", "lemmy.world", "", false))
+	assert.False(t, list.Desires("https://lemmy.world/c/somensfw", "lemmy.world", "", true))
+	assert.True(t, list.Desires("https://lemmy.world/c/technology", "lemmy.world", "", false))
+	assert.True(t, list.Desires("https://lemmy.world/c/selfhosted", "lemmy.world", "", true))
 	assert.Empty(t, list.OutboundDisabledHosts)
 	assert.Empty(t, list.OutboundDisabledCommunities)
 }

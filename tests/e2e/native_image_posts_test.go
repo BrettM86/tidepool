@@ -144,6 +144,7 @@ func (h *harness) awaitLemmyCommentContaining(t *testing.T, communityID int, mar
 // alt text and metadata, gallery images in the post body, an image beside a
 // link, and comment images Lemmy appends to the comment.
 func TestNativeImage_UnplacedImagesFederate(t *testing.T) {
+	parallel(t)
 	h := newHarness(t)
 
 	owner := h.registerUser(t, h.uniqueName(t, "imgu_own"))

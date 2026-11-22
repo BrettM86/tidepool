@@ -147,6 +147,7 @@ func (h *harness) fetchImage(method, imageURL string) (imageResponse, error) {
 // post's image blob through its proxy, and refuses a blob that exists on the
 // PDS but no indexed record references.
 func TestCovesAppView_ServesIndexedImageBlob(t *testing.T) {
+	parallel(t)
 	h := newHarness(t)
 
 	owner := h.registerUser(t, h.uniqueName(t, "img_own"))

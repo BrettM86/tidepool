@@ -43,6 +43,7 @@ import (
 //     post never bridges, and the repo stays ACTIVE (reversible posture —
 //     nobridge is not the terminal Deleted).
 func TestConsent_NobridgeLifecycle(t *testing.T) {
+	parallel(t)
 	h := newHarness(t)
 	community, sub := setupSubscribedCommunity(t, h, "cns")
 
@@ -187,6 +188,7 @@ func TestConsent_NobridgeLifecycle(t *testing.T) {
 // on the bridge's own subscribeRepos AND its relay-side consequence — bigsky
 // consumes it, marks the repo tombstoned, and stops listing it.
 func TestDeleteActor_ScrubsAndTombstones(t *testing.T) {
+	parallel(t)
 	h := newHarness(t)
 	community, sub := setupSubscribedCommunity(t, h, "del")
 
@@ -268,21 +270,44 @@ func TestDeleteActor_ScrubsAndTombstones(t *testing.T) {
 		t.Errorf("#account frame status = %v, want \"deleted\"", account.Status)
 	}
 
-	// Over-scrub guard: the scrub must delete EXACTLY the three records
+	// Over-scrub guard: the scrub must delete EXACTLY the four records
 	// awaited above. A bounded drain asserts no OTHER delete op appears on
 	// either affected repo — above all the community.profile rkey `self`
 	// (the community must survive its member's deletion), but also any
-	// double-delete replay of the three. Without this window an over-scrub
+	// double-delete replay of the four. Without this window an over-scrub
 	// would pass unnoticed: the awaits only prove the expected deletes
 	// happened, not that nothing else died.
+	//
+	// One re-create/delete pair per re-pin is not extra: a vote-stats re-pin
+	// racing the scrub can re-create the post's acceptance after the scrub
+	// deleted it, and the re-pin's orphan guard then deletes it again. The
+	// drain includes the acceptance's original create, ahead of any re-create,
+	// because no await consumed it, so each further create of that acceptance
+	// allows one more delete, each is logged, and the record must end up gone.
+	acceptanceRKey := subjectRKey(postEv.atURI())
+	acceptanceCreates, acceptanceDeletes := 0, 0
 	for _, ev := range l.drain(negativeWindow) {
-		if ev.Kind != kindCommit || ev.Commit == nil || ev.Commit.Operation != opDelete {
+		if ev.Kind != kindCommit || ev.Commit == nil {
+			continue
+		}
+		isAcceptance := ev.Did == sub.DID && ev.Commit.Collection == colAcceptance && ev.Commit.RKey == acceptanceRKey
+		if isAcceptance && ev.Commit.Operation == opCreate {
+			acceptanceCreates++
+			continue
+		}
+		if ev.Commit.Operation != opDelete {
+			continue
+		}
+		if isAcceptance && acceptanceDeletes < acceptanceCreates-1 {
+			acceptanceDeletes++
+			t.Logf("tolerated re-pin re-create and orphan-guard delete of the post's acceptance: %s", ev)
 			continue
 		}
 		if ev.Did == sub.DID || ev.Did == authorDID {
 			t.Errorf("over-scrub: unexpected extra delete after Delete(Actor): %s", ev)
 		}
 	}
+	h.awaitRecordGone(t, sub.DID, colAcceptance, acceptanceRKey, "the post's acceptance after Delete(Actor)")
 
 	// Terminal tombstone on the bridge's sync surface. The consent flip is
 	// written right after the scrub whose commits we just observed — poll
@@ -475,6 +500,7 @@ func TestUnsubscribe_StopsBridging(t *testing.T) {
 // re-materializes community.profile as an UPDATE on rkey `self` with the
 // new displayName/description.
 func TestCommunityUpdate_ProfileUpdateEvent(t *testing.T) {
+	parallel(t)
 	h := newHarness(t)
 
 	cursor := cursorNow()

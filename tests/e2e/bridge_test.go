@@ -22,6 +22,23 @@ func setupSubscribedCommunity(t *testing.T, h *harness, prefix string) (lemmyCom
 	if sub.DID == "" {
 		t.Fatalf("subscribed community %s has no DID", name)
 	}
+	// The first backfill runs after the Accept. A post the scenario writes
+	// before that backfill finishes can be materialized from the outbox walk
+	// instead of its live Create; under parallel load that broke scenarios
+	// that check the live path, so wait for it.
+	deadline := time.Now().Add(eventTimeout)
+	for sub.LastBackfillAt == "" {
+		if time.Now().After(deadline) {
+			t.Fatalf("subscribed community %s: first backfill did not complete within %s; a failed first walk "+
+				"retries only an hour later, so look for its error in the tidepool logs", name, eventTimeout)
+		}
+		time.Sleep(250 * time.Millisecond)
+		state, ok := h.findCommunity(t, "!"+name+"@lemmy", sub.Community)
+		if !ok {
+			t.Fatalf("subscribed community %s is no longer listed while waiting for its first backfill", name)
+		}
+		sub = state
+	}
 	return community, sub
 }
 
@@ -29,6 +46,7 @@ func setupSubscribedCommunity(t *testing.T, h *harness, prefix string) (lemmyCom
 // firehose and validates against the Coves lexicon (as every create/update
 // consumed by the suite does, via the listener's centralized vetting).
 func TestSubscribe_CommunityProfileOnFirehose(t *testing.T) {
+	parallel(t)
 	h := newHarness(t)
 
 	cursor := cursorNow()
@@ -72,6 +90,7 @@ func TestSubscribe_CommunityProfileOnFirehose(t *testing.T) {
 // infrastructure too, cannot rely on profile-before-post either
 // (FOLLOWUPS.md "Relay pipeline").
 func TestPost_ActorProfileThenPost(t *testing.T) {
+	parallel(t)
 	h := newHarness(t)
 	community, sub := setupSubscribedCommunity(t, h, "post")
 
@@ -168,6 +187,7 @@ func TestPost_ActorProfileThenPost(t *testing.T) {
 // reply.root/reply.parent strongRefs resolve to the exact uri+cid of the
 // earlier firehose events.
 func TestComments_StrongRefsResolve(t *testing.T) {
+	parallel(t)
 	h := newHarness(t)
 	community, sub := setupSubscribedCommunity(t, h, "cmt")
 
@@ -250,6 +270,7 @@ func TestComments_StrongRefsResolve(t *testing.T) {
 // Scenario 4: edit post → update event on the same rkey; delete comment →
 // delete op on the firehose.
 func TestUpdateAndDelete(t *testing.T) {
+	parallel(t)
 	h := newHarness(t)
 	community, sub := setupSubscribedCommunity(t, h, "upd")
 
@@ -279,13 +300,13 @@ func TestUpdateAndDelete(t *testing.T) {
 	})
 
 	user.editPost(t, post.ID, "edited body")
+	// Matched on the edited content: the vote-stats refresher also updates the
+	// post, and under load its update can land first.
 	updateEv := l.await("post update", func(e *jsEvent) bool {
+		content, _ := fieldOf(e.Commit.Record, "content")
 		return e.Commit.Collection == colPostV2 && e.Commit.Operation == opUpdate &&
-			e.Did == postEv.Did && e.Commit.RKey == postEv.Commit.RKey
+			e.Did == postEv.Did && e.Commit.RKey == postEv.Commit.RKey && content == "edited body"
 	})
-	if got := recordField(t, updateEv.Commit.Record, "content"); got != "edited body" {
-		t.Errorf("updated post content = %q, want %q", got, "edited body")
-	}
 	if updateEv.Commit.CID == postEv.Commit.CID {
 		t.Error("update event carries the same cid as the create — no new commit?")
 	}
@@ -323,6 +344,7 @@ func TestUpdateAndDelete(t *testing.T) {
 // announced Dislike, Announce{Dislike}, with no Undo), retract (an Undo carrying a reconstructed inner vote), and a
 // comment vote (task 07's reply.root community-binding path).
 func TestVotes_SideChannelOnly(t *testing.T) {
+	parallel(t)
 	h := newHarness(t)
 	community, sub := setupSubscribedCommunity(t, h, "vote")
 
@@ -438,6 +460,7 @@ func awaitAggregates(t *testing.T, h *harness, uri string, up, down int64) {
 // post stays aggregate and IS counted (PLAN.md decision 21; the stack runs
 // BRIDGED_VOTE_RECORDS=both).
 func TestVotes_RepoVoterBecomesRecord(t *testing.T) {
+	parallel(t)
 	h := newHarness(t)
 	community, _ := setupSubscribedCommunity(t, h, "vrec")
 
@@ -507,6 +530,7 @@ func TestVotes_RepoVoterBecomesRecord(t *testing.T) {
 // post itself; pre-existing vote counts are seeded from Lemmy's API
 // (SEED_COUNTS_FROM_API, on in the e2e compose).
 func TestBackfill_PreexistingPosts(t *testing.T) {
+	parallel(t)
 	h := newHarness(t)
 
 	name := h.uniqueName(t, "bf")
@@ -755,6 +779,7 @@ func TestRestart_ReplayIsIdempotent(t *testing.T) {
 // record exactly once, counting every commit per (did, collection/rkey)
 // regardless of operation.
 func TestBurst_ConcurrentIngestionExactlyOnce(t *testing.T) {
+	parallel(t)
 	h := newHarness(t)
 
 	commA, _ := setupSubscribedCommunity(t, h, "ba")

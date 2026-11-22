@@ -11,8 +11,8 @@ import (
 // The store tests run against a real postgres database (Coves convention:
 // real infrastructure, no mocks). They skip cleanly when
 // TIDEPOOL_TEST_DATABASE_URL is unset; `make test` starts the postgres-test
-// container and sets it. testutil.DB holds the cross-package advisory lock
-// that serializes the packages sharing this database.
+// container and sets it. testutil.DB gives this package its own database and
+// holds an advisory lock in it, so two runs of this package take turns.
 
 // testDB returns a migrated connection to the test database, truncating all
 // tables this package touches so each test starts clean.

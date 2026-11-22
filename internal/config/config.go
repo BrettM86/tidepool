@@ -219,6 +219,11 @@ type Config struct {
 	// IngestWorkers is the inbox queue worker-pool size (INGEST_WORKERS,
 	// default 4).
 	IngestWorkers int
+	// IngestParkDelay is how long a throttled inbox event (mint rate, PLC
+	// 429, byte-store outage) waits before its next claim (INGEST_PARK_DELAY,
+	// a Go duration, default 2m, must be positive); up to a quarter more is
+	// added as jitter. The e2e stack shortens it.
+	IngestParkDelay time.Duration
 	// SeedCountsFromAPI enables seeding backfilled posts' vote aggregates
 	// from the community host's public API (Lemmy's `counts` field) —
 	// history whose individual Like activities AP never delivers
@@ -659,6 +664,10 @@ func Load(logger *slog.Logger) (*Config, error) {
 		return nil, err
 	}
 	cfg.IngestWorkers, err = intVar(logger, "INGEST_WORKERS", 4)
+	if err != nil {
+		return nil, err
+	}
+	cfg.IngestParkDelay, err = durationVar(logger, "INGEST_PARK_DELAY", 2*time.Minute)
 	if err != nil {
 		return nil, err
 	}

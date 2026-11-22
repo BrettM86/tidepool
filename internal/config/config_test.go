@@ -29,7 +29,7 @@ func clearConfigEnv(t *testing.T) {
 		"PLC_DIRECTORY_URL", "BRIDGE_SERVICE_DID", "USER_AGENT", "BRIDGE_KEK",
 		"BRIDGE_KEK_PREVIOUS",
 		"ADMIN_TOKEN", "BACKFILL_MAX_POSTS", "MINT_RATE_PER_MINUTE",
-		"MINT_BURST", "PLC_WRITES_PER_MINUTE", "INGEST_WORKERS", "BRIDGE_SCHEME",
+		"MINT_BURST", "PLC_WRITES_PER_MINUTE", "INGEST_WORKERS", "INGEST_PARK_DELAY", "BRIDGE_SCHEME",
 		"ALLOW_PRIVATE_FETCH", "ALLOW_DEV_REQUEST_CRAWL", "RELAY_HOSTS",
 		"AP_USER_ORIGIN", "AP_HOST_FALLTHROUGH_DEV",
 		"CONSUMER_ENABLED", "JETSTREAM_URL", "COVES_MEDIA_BASE_URL",
@@ -428,6 +428,25 @@ func TestLoad_ProductionWithAllValues(t *testing.T) {
 	assert.Equal(t, "prod-admin-token", cfg.AdminToken)
 	assert.Equal(t, 100, cfg.BackfillMaxPosts, "tuning knobs default in every environment")
 	assert.Equal(t, 4, cfg.IngestWorkers)
+}
+
+func TestLoad_IngestParkDelay(t *testing.T) {
+	setProductionEnv(t)
+	cfg, err := Load(discardLogger())
+	require.NoError(t, err)
+	assert.Equal(t, 2*time.Minute, cfg.IngestParkDelay, "unset keeps the queue's two-minute park")
+
+	t.Setenv("INGEST_PARK_DELAY", "10s")
+	cfg, err = Load(discardLogger())
+	require.NoError(t, err)
+	assert.Equal(t, 10*time.Second, cfg.IngestParkDelay)
+
+	for _, bad := range []string{"0s", "-1m", "soon"} {
+		t.Setenv("INGEST_PARK_DELAY", bad)
+		_, err = Load(discardLogger())
+		require.Error(t, err, "INGEST_PARK_DELAY=%q must fail boot", bad)
+		assert.Contains(t, err.Error(), "INGEST_PARK_DELAY")
+	}
 }
 
 func TestLoad_ProductionRequiresAdminToken(t *testing.T) {

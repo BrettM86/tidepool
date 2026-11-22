@@ -189,6 +189,10 @@ services:
       # The budget's burst is 1, so a low rate refuses concurrent authors'
       # mints and stalls the suite.
       PLC_WRITES_PER_MINUTE: "600000"
+      # Throttled inbox events (mint refusals during a PLC pause) retry after
+      # 10s instead of 2m, so TestPLCBudget's held post lands soon after the
+      # pause ends.
+      INGEST_PARK_DELAY: 10s
       SEED_COUNTS_FROM_API: "1"
       # Short stats-refresh interval (default 30s) so the vote scenarios
       # actually exercise the bridged-vote-stats refresher: within ~2s of a
@@ -927,6 +931,10 @@ services:
   coves-appview-forwarder:
     image: caddy:2.11-alpine
     network_mode: "service:tidepool"
+    # Caddy's graceful stop waits on the label stream it proxies, so every
+    # tidepool restart or recreate in the suite paid Docker's full 10s stop
+    # timeout here. Nothing it holds needs draining.
+    stop_grace_period: 1s
     entrypoint: ["/bin/sh", "-ec"]
     command:
       - |

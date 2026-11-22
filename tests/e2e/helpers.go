@@ -255,6 +255,48 @@ var (
 	nameMu          sync.Mutex
 )
 
+// parallelScenarios counts the scenarios marked with parallel that have not
+// finished, so the suite-end sweep can wait for them.
+var parallelScenarios sync.WaitGroup
+
+// parallel runs a scenario beside the other parallel ones, after every serial
+// scenario has finished. A scenario stays serial when it changes state the
+// rest of the stack shares: it restarts or recreates tidepool, stops Lemmy,
+// pauses the AppView, arms the PLC fixture, starts a handle migration run,
+// bans or deactivates the shared native-alice account, or hammers Lemmy with
+// concurrent requests (Lemmy answered the vote hammer 408 beside the other
+// scenarios), or reads a Lemmy-wide listing that other scenarios' posts would
+// push its own out of, or proves an absence with a fixed window whose control
+// event does not share the suppressed event's queue (TestUnsubscribe: under
+// parallel load a late emission could land after the window). Every parallel
+// scenario works on its own communities,
+// users and posts, and its negative windows only look at those. It may post
+// as native-alice or act as the instance admin, but only on its own
+// community or post: anything account-wide stays serial.
+func parallel(t *testing.T) {
+	t.Helper()
+	parallelScenarios.Add(1)
+	t.Cleanup(parallelScenarios.Done)
+	t.Parallel()
+}
+
+// usedSuffixes holds every harness suffix this process has handed out.
+var usedSuffixes = map[int64]bool{}
+
+// newSuffix returns a short time-derived suffix no other harness in this
+// process has, so scenarios whose harnesses start in the same instant still
+// title their records apart.
+func newSuffix() string {
+	nameMu.Lock()
+	defer nameMu.Unlock()
+	value := time.Now().UnixNano() % 0xffffff
+	for usedSuffixes[value] {
+		value = (value + 1) % 0xffffff
+	}
+	usedSuffixes[value] = true
+	return fmt.Sprintf("%x", value)
+}
+
 // newHarness waits for the stack once per process, logs in the Lemmy admin,
 // and (once) applies the site settings the suite needs: open registration,
 // no captcha, federation on, and the tidepool host allowlisted.
@@ -268,7 +310,7 @@ func newHarness(t *testing.T) *harness {
 
 	h := &harness{
 		http:   &http.Client{Timeout: 30 * time.Second},
-		suffix: strings.ToLower(fmt.Sprintf("%x", time.Now().UnixNano()%0xffffff)),
+		suffix: newSuffix(),
 	}
 
 	setupOnce.Do(func() { setupErr = h.setupLemmySite() })

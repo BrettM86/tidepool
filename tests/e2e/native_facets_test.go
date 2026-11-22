@@ -80,6 +80,7 @@ type facetScenario struct {
 // TestNativeFacets_LemmyStoresRenderedMarkdown is the real-infrastructure
 // acceptance test for rendering native Coves facets into Lemmy markdown.
 func TestNativeFacets_LemmyStoresRenderedMarkdown(t *testing.T) {
+	parallel(t)
 	h := newHarness(t)
 
 	// A Lemmy community the bridge follows: the acceptance engine admits

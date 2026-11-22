@@ -105,7 +105,7 @@ func TestRunMigrationsRequiresDatabaseURL(t *testing.T) {
 func TestRunDNSBindFailurePrecedesHTTP(t *testing.T) {
 	database := testutil.DB(t)
 	testutil.Truncate(t, database, "service_keys", "bridged_actors", "ap_actors", "inbox_events", "communities")
-	databaseURL := os.Getenv("TIDEPOOL_TEST_DATABASE_URL")
+	databaseURL := testutil.DatabaseURL(t)
 
 	for _, tc := range []struct {
 		name       string
@@ -190,7 +190,7 @@ func TestRunInvalidFollowListStopsBoot(t *testing.T) {
 	require.NoError(t, os.WriteFile(followListPath, []byte("communities:\n"), 0o644))
 
 	t.Setenv("ENVIRONMENT", "development")
-	t.Setenv("DATABASE_URL", os.Getenv("TIDEPOOL_TEST_DATABASE_URL"))
+	t.Setenv("DATABASE_URL", testutil.DatabaseURL(t))
 	t.Setenv("LISTEN_ADDR", httpAddress)
 	t.Setenv("DNS_LISTEN", "")
 	t.Setenv("DNS_PUBLIC_IPV4", "127.0.0.1")
@@ -377,7 +377,7 @@ func TestRunRotateKEKRefusesEqualKeys(t *testing.T) {
 // Only a run against real sealed bytes catches it, which is what this is.
 
 // rotateIntegrationDID owns a DID space of its own so this test never collides
-// with internal/identity's fixtures in the shared test database.
+// with this package's other fixtures.
 const rotateIntegrationDID = "did:plc:cmdrotatekek00000000000000"
 
 // rotateKEKBytes decodes the hex KEK constants above into the raw bytes a
@@ -391,15 +391,13 @@ func rotateKEKBytes(t *testing.T, encoded string) []byte {
 	return raw
 }
 
-// rotateIntegrationDB returns the migrated test database, taking the same
-// cross-package advisory lock every other postgres-backed package takes — this
-// test truncates tables internal/identity's tests also use, so it must not run
-// beside them. It skips when TIDEPOOL_TEST_DATABASE_URL is unset, exactly as
-// testutil.DB does everywhere else.
+// rotateIntegrationDB returns the migrated test database and its URL. It
+// skips when TIDEPOOL_TEST_DATABASE_URL is unset, exactly as testutil.DB does
+// everywhere else.
 func rotateIntegrationDB(t *testing.T) (*sql.DB, string) {
 	t.Helper()
 	database := testutil.DB(t)
-	return database, os.Getenv("TIDEPOOL_TEST_DATABASE_URL")
+	return database, testutil.DatabaseURL(t)
 }
 
 // TestRunRotateKEKResealsARealDatabase is the end-to-end pin.

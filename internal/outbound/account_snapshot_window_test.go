@@ -73,7 +73,8 @@ func TestAccountTakedown_AnObjectEnqueuedAfterTheLabelLocksWaitsForThePause(t *t
 				require.NoError(t, w.conn.QueryRow(`
 					SELECT count(*) FROM pg_locks
 					WHERE locktype = 'advisory' AND NOT granted AND classid = x'7464'::int::oid
-					  AND objid::bigint = (hashtext($1)::bigint & 4294967295)`, tdAuthorDID).Scan(&waiting))
+					  AND objid::bigint = (hashtext($1)::bigint & 4294967295)
+					  AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`, tdAuthorDID).Scan(&waiting))
 				if waiting > 0 {
 					return
 				}

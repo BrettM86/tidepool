@@ -192,6 +192,7 @@ func pauseAppView(t *testing.T) (unpause func()) {
 // gallery image is placed by an #image facet reaches Lemmy with the image's
 // proxy URL at the facet's position, and that URL serves the image.
 func TestNativeImage_InlinePlacementFederatesProxyURL(t *testing.T) {
+	parallel(t)
 	h := newHarness(t)
 
 	owner := h.registerUser(t, h.uniqueName(t, "imgp_own"))

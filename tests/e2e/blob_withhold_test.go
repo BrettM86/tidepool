@@ -21,6 +21,7 @@ import (
 // does not bring the bytes back; the operator's lift serves the original
 // bytes again with no further upstream change.
 func TestBlobWithhold_OperatorWithholdSurvivesEditAndLifts(t *testing.T) {
+	parallel(t)
 	h := newHarness(t)
 	community, _ := setupSubscribedCommunity(t, h, "withhold")
 	user := h.registerUser(t, h.uniqueName(t, "wanda"))

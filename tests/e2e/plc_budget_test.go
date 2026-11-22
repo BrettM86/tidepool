@@ -20,12 +20,14 @@ import (
 const (
 	// plcBudgetRetryAfter is the Retry-After the fixture answers with, and
 	// plcBudgetPause the same value as a duration.
-	plcBudgetRetryAfter = "60"
-	plcBudgetPause      = 60 * time.Second
+	plcBudgetRetryAfter = "20"
+	plcBudgetPause      = 20 * time.Second
 	// plcBudgetTimeout bounds the wait for the renames and the post after the
-	// 429. It must stay at least 4 minutes: chunk 03 moves this inbox retry to
-	// 2 minutes plus jitter.
-	plcBudgetTimeout = 5 * time.Minute
+	// 429. The held post retries every INGEST_PARK_DELAY (10s in
+	// docker-compose.e2e.yml) plus up to a quarter of jitter, so it lands
+	// within about 35s of the 429. A bridge that ignored the setting would park
+	// for the 2m default and miss this deadline.
+	plcBudgetTimeout = 90 * time.Second
 )
 
 // plcFixturePost is one POST the PLC fixture saw, 429s included.

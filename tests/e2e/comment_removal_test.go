@@ -20,6 +20,7 @@ import (
 // PDS and federated to Lemmy by the bridge, and a BRIDGED Lemmy comment. The
 // bridged comment's own record is the author's and stays throughout.
 func TestModeration_CommentRemoveAndRestoreWriteRemovalRecords(t *testing.T) {
+	parallel(t)
 	h := newHarness(t)
 	community, sub := setupSubscribedCommunity(t, h, "cmod")
 

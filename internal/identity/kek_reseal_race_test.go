@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"tidepool/internal/repo"
+	"tidepool/internal/testutil"
 )
 
 // The optimistic guard on the re-seal walk's write-back.
@@ -93,9 +93,7 @@ var racingDriverSeq atomic.Uint64
 // hook exactly once — on the first query carrying marker.
 func racingDB(t *testing.T, marker string, hook func()) *sql.DB {
 	t.Helper()
-	databaseURL := os.Getenv("TIDEPOOL_TEST_DATABASE_URL")
-	require.NotEmpty(t, databaseURL,
-		"the racing pool needs the same database the harness migrated")
+	databaseURL := testutil.DatabaseURL(t)
 
 	var once sync.Once
 	// t.Name() stays in the name for readability in a panic or a pq log line;

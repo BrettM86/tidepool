@@ -11,7 +11,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	gosync "sync"
 	"sync/atomic"
@@ -84,7 +83,7 @@ func newHarnessWithRepoOptions(t *testing.T, pollInterval time.Duration, repoOpt
 	manager, err := repo.NewManager(database, &staticKeys{key: key}, nil, repoOptions...)
 	require.NoError(t, err)
 
-	broadcaster, err := NewBroadcaster(os.Getenv("TIDEPOOL_TEST_DATABASE_URL"), pollInterval, nil)
+	broadcaster, err := NewBroadcaster(testutil.DatabaseURL(t), pollInterval, nil)
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
 	go broadcaster.Run(ctx)

@@ -22,6 +22,7 @@ import (
 // shape Tidepool actually received, because that shape is the assumption the
 // bridge's ban handling rests on.
 func TestUpstreamSiteBan_RemovesBridgedContent(t *testing.T) {
+	parallel(t)
 	h := newHarness(t)
 	community, _ := setupSubscribedCommunity(t, h, "uban")
 
@@ -129,6 +130,7 @@ func awaitInboxBlockOf(t *testing.T, db *sql.DB, subjectActorID string) map[stri
 // AP id serves afterwards, because those are the assumptions purge handling
 // rests on.
 func TestLemmyPostPurge_RemovesBridgedPost(t *testing.T) {
+	parallel(t)
 	h := newHarness(t)
 	community, sub := setupSubscribedCommunity(t, h, "purge")
 

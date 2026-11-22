@@ -469,9 +469,15 @@ unfiltered listener. It re-checks every retained event: collection allowlist,
 lexicon validation, and per-DID rev order. A replay floor (more than 30 commit
 events, at least one post create of either collection, and at least one
 delete) makes a truncated replay fail. A zero or negative cursor live-tails instead of
-replaying; see `newListener` in `helpers.go`. The test runs last only
-because of alphabetical ordering within one `go test` run. Running it alone
-with `-run` checks only what is still in Jetstream's 24-hour store.
+replaying; see `newListener` in `helpers.go`. The test is the last to start
+(alphabetical ordering within one `go test` run), then waits for every
+scenario marked `parallel` to finish, so it needs `-parallel 2` or more and
+fails at `-parallel 1`. Running it alone with `-run` checks only what is still
+in Jetstream's 24-hour store.
+
+Scenarios run 8 at a time (`-parallel 8` in the Makefile) once the serial ones
+finish. The rule for when a new scenario may call `parallel(t)` is on
+`parallel` in `helpers.go`.
 
 ### Not run
 
@@ -519,15 +525,24 @@ native-PDS tests.
 ## Manual Jetstream check
 
 The harness covers Jetstream automatically. For an ad-hoc check against a
-dev bridge, point the bridge at the test database and use the repo tests to
-write commits:
+dev bridge, point the bridge at internal/repo's test database and use the repo
+tests to write commits (run these from the repo root):
 
 ```sh
 make test-db-up      # test postgres on :5443
 TEST_DB='postgres://tidepool_test:tidepool_test@localhost:5443/tidepool_test?sslmode=disable'
 
-# serve the test DB (leave running):
-DATABASE_URL="$TEST_DB" make run
+# the repo tests write to their package's own database (internal/testutil):
+# TEST_DB's name, _p, and the FNV-1a hash of the package directory. The first
+# test run creates it:
+TIDEPOOL_TEST_DATABASE_URL="$TEST_DB" go test -tags nodynamic -run TestPutRecord -count=1 ./internal/repo/
+REPO_DB=tidepool_test_p$(python3 -c 'import sys
+h = 0x811c9dc5
+for b in sys.argv[1].encode(): h = (h ^ b) * 0x01000193 % 2**32
+print(f"{h:08x}")' "$PWD/internal/repo")
+
+# serve the repo tests' database (leave running):
+DATABASE_URL="${TEST_DB%/*}/$REPO_DB?sslmode=disable" make run
 
 make jetstream-up    # Jetstream container → ws://host.docker.internal:8091
 

@@ -24,6 +24,7 @@ import (
 // content first arrived there: nothing is re-resolved, so a refetch from
 // Tidepool cannot stand in for the Announce.
 func TestNativeTakedown_RemovalAndRestoreReachBothLemmyInstances(t *testing.T) {
+	parallel(t)
 	h := newHarness(t)
 	lemmy2 := h.lemmy2Admin(t)
 	community, sub := setupSubscribedCommunity(t, h, "ntkd")

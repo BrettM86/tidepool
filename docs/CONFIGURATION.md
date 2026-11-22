@@ -96,6 +96,7 @@ the whole zone, counted from Cloudflare's `created_on`. A pass also stops at
 | Variable | Default | What it does |
 |---|---|---|
 | `INGEST_WORKERS` | `4` | Inbox queue worker count. |
+| `INGEST_PARK_DELAY` | `2m` | How long an inbox event held back by the mint rate limit, a PLC 429 or a blob store outage waits before its next try, plus up to a quarter more as jitter. Parked events use no retry attempts. |
 | `BACKFILL_MAX_POSTS` | `100` | Posts materialized per community backfill run. |
 | `BACKFILL_DEFERRED_RETRY_INTERVAL` | `1h` | How often backfill retries items it skipped because their host was unreachable, and inbox posts and comments deferred out of the queue. Each item is retried 1h, 6h, 24h, 72h, 1 week, 2 weeks, 30 days and 90 days after its skip, and dropped after the 90-day attempt. A successful fetch from its host that ends the host's host-gone streak makes it due, so it runs at the next sweep. The sweep also runs at startup. |
 | `BACKFILL_DEFERRED_RETRY_BATCH` | `50` | Most deferred items retried per sweep, and at most 20 per host. The rest wait for the next one. |
@@ -118,8 +119,9 @@ the whole zone, counted from Cloudflare's `created_on`. A pass also stops at
 `HANDLE_MIGRATION_RATE`, which are no longer read. Every PLC POST, retries
 included, shares one budget. Any PLC 429 pauses all writes for `Retry-After`,
 or for 1 hour if it is missing or invalid. The pause is not persisted across
-restarts. An inbox event refused a mint, or stopped by a PLC 429, waits about 2
-minutes and retries without using a retry attempt. Every other failing event
+restarts. An inbox event refused a mint, or stopped by a PLC 429, waits
+`INGEST_PARK_DELAY` (default 2 minutes) plus jitter and retries without using a
+retry attempt. Every other failing event
 is retried and, after 3 attempts (down from 5), poisoned, except a community's
 Announce of a post or comment: that content is deferred to the backfill retry
 system, on its first failure when its host looks gone, else after its third. An

@@ -90,7 +90,7 @@ type SigningKeys interface {
 // (PLAN.md: one deployment, full control of emission order). The per-DID
 // mutex and the repo_state row lock are kept as fast-path/backstop.
 //
-// This key MUST stay distinct from internal/testutil's cross-package test
+// This key MUST stay distinct from internal/testutil's per-package test
 // lock key (0x7469646570, session-scoped, held for a whole test binary) —
 // sharing it would deadlock every commit made from tests.
 const commitAdvisoryLockKey int64 = 0x7469646570636d // "tidep"+"cm" (commit)

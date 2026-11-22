@@ -290,7 +290,7 @@ func newHarnessWithRepoOptions(t *testing.T, repoOptions []repo.Option) *harness
 		"ap_objects", "bridged_actors", "communities", "inbox_events",
 		"ap_tombstones", "blocks", "repo_state", "firehose_events", "blobs",
 		// The outbound half (echo acceptance test): a leftover activity or
-		// persona from another package's run would make an echo look like
+		// persona from an earlier test or run would make an echo look like
 		// someone else's.
 		"outbound_deliveries", "outbound_activities", "outbound_objects",
 		"outbound_votes", "ap_actors", "vote_events", "vote_aggregates",

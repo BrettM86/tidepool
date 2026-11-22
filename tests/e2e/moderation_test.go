@@ -29,6 +29,7 @@ import (
 // observations of the same commits, and a bridge that emitted the right
 // events while converging to the wrong repo state would pass only one of them.
 func TestModeration_RemoveRestoreAndSelfDelete(t *testing.T) {
+	parallel(t)
 	h := newHarness(t)
 	community, sub := setupSubscribedCommunity(t, h, "mod")
 
@@ -168,6 +169,7 @@ func TestModeration_RemoveRestoreAndSelfDelete(t *testing.T) {
 // lifted in the commit that deletes it, so each getBlob read follows the
 // firehose event of that commit rather than a poll.
 func TestModeration_RemovalWithholdsTheImageUntilTheRestore(t *testing.T) {
+	parallel(t)
 	h := newHarness(t)
 	community, sub := setupSubscribedCommunity(t, h, "modimg")
 	user := h.registerUser(t, h.uniqueName(t, "rhea"))

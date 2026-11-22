@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"os"
 	"testing"
 	"time"
 
@@ -13,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"tidepool/internal/errors"
+	"tidepool/internal/testutil"
 )
 
 const identityTestHandle = "alice.lemmy.world.ap.tidepool.test"
@@ -21,7 +21,7 @@ func TestAppendIdentityEventTx(t *testing.T) {
 	t.Run("commit persists and notifies", func(t *testing.T) {
 		manager, database, _ := testManager(t)
 		ctx := t.Context()
-		listener := pq.NewListener(os.Getenv("TIDEPOOL_TEST_DATABASE_URL"), 100*time.Millisecond, time.Second, nil)
+		listener := pq.NewListener(testutil.DatabaseURL(t), 100*time.Millisecond, time.Second, nil)
 		t.Cleanup(func() { _ = listener.Close() })
 		require.NoError(t, listener.Listen(FirehoseNotifyChannel))
 
@@ -51,7 +51,7 @@ func TestAppendIdentityEventTx(t *testing.T) {
 	t.Run("rollback hides row and notification", func(t *testing.T) {
 		manager, database, _ := testManager(t)
 		ctx := t.Context()
-		listener := pq.NewListener(os.Getenv("TIDEPOOL_TEST_DATABASE_URL"), 100*time.Millisecond, time.Second, nil)
+		listener := pq.NewListener(testutil.DatabaseURL(t), 100*time.Millisecond, time.Second, nil)
 		t.Cleanup(func() { _ = listener.Close() })
 		require.NoError(t, listener.Listen(FirehoseNotifyChannel))
 

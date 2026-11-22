@@ -251,7 +251,8 @@ func TestAdminMigrate_PersistsRunBeforeAccepted(t *testing.T) {
 		err := h.db.QueryRowContext(t.Context(), `SELECT EXISTS (
 			SELECT 1 FROM pg_locks AS locks JOIN pg_class AS relations ON relations.oid = locks.relation
 			WHERE relations.relname = 'handle_migration_runs' AND locks.mode = 'RowExclusiveLock'
-			AND NOT locks.granted AND locks.pid <> pg_backend_pid())`).Scan(&blocked)
+			AND NOT locks.granted AND locks.pid <> pg_backend_pid()
+			AND locks.database = (SELECT oid FROM pg_database WHERE datname = current_database()))`).Scan(&blocked)
 		return err == nil && blocked
 	}, 5*time.Second, 10*time.Millisecond)
 	select {

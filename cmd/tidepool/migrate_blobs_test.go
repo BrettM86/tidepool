@@ -12,7 +12,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -233,7 +232,7 @@ func summaryFromLog(t *testing.T, log *bytes.Buffer) migrateBlobsSummary {
 // the test database and bucket, and leaves config.Load unable to succeed.
 func migrateBlobsEnv(t *testing.T, bucket *testutil.S3Bucket) {
 	t.Helper()
-	t.Setenv("DATABASE_URL", os.Getenv("TIDEPOOL_TEST_DATABASE_URL"))
+	t.Setenv("DATABASE_URL", testutil.DatabaseURL(t))
 	t.Setenv("ENVIRONMENT", "development")
 	t.Setenv("BLOB_STORE", "s3")
 	t.Setenv("BLOB_S3_ENDPOINT", bucket.Endpoint)

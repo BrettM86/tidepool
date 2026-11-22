@@ -9,6 +9,7 @@ import (
 )
 
 func TestBridgeIdentityPrecedesFirstCommit(t *testing.T) {
+	parallel(t)
 	h := newHarness(t)
 	community, _ := setupSubscribedCommunity(t, h, "ident")
 	username := h.uniqueName(t, "ida")

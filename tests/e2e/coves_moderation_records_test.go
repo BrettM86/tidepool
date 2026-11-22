@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sync"
 	"testing"
 	"time"
 
@@ -33,6 +34,7 @@ const covesSignInTimeout = 60 * time.Second
 // native-alice and the instance admin act through sessions from the AppView's
 // real OAuth web sign-in.
 func TestCovesModeration_RemovalAndBanRecordsReachCovesViews(t *testing.T) {
+	parallel(t)
 	h := newHarness(t)
 	community, sub := setupSubscribedCommunity(t, h, "cvmod")
 	h.awaitAppViewCommunityIndexed(t, sub.DID)
@@ -184,10 +186,30 @@ func TestCovesModeration_RemovalAndBanRecordsReachCovesViews(t *testing.T) {
 	}
 }
 
+// covesSignInSpacing paces sign-ins across parallel scenarios: the AppView
+// allows 10 OAuth login requests per minute per client IP, and one sign-in
+// spends up to three, so three sign-ins a minute stay under the limit.
+const covesSignInSpacing = 20 * time.Second
+
+var (
+	covesSignInMu   sync.Mutex
+	covesLastSignIn time.Time
+)
+
 // covesSignInAs signs handle in through the AppView's OAuth web flow and
 // returns the sealed session token. Fatal on failure.
 func covesSignInAs(t *testing.T, signIn covesSignIn, handle, password string) string {
 	t.Helper()
+	covesSignInMu.Lock()
+	defer covesSignInMu.Unlock()
+	if !covesLastSignIn.IsZero() {
+		select {
+		case <-time.After(time.Until(covesLastSignIn.Add(covesSignInSpacing))):
+		case <-t.Context().Done():
+			t.Fatalf("waiting to sign in as %s: %v", handle, t.Context().Err())
+		}
+	}
+	defer func() { covesLastSignIn = time.Now() }()
 	ctx, cancel := context.WithTimeout(t.Context(), covesSignInTimeout)
 	defer cancel()
 	token, err := signIn.SignIn(ctx, handle, password)

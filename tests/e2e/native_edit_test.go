@@ -22,6 +22,7 @@ import (
 )
 
 func TestNativeEdit_LemmyAppliesPostAndCommentEdits(t *testing.T) {
+	parallel(t)
 	h := newHarness(t)
 
 	owner := h.registerUser(t, h.uniqueName(t, "edit_own"))

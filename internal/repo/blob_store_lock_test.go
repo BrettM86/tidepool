@@ -303,7 +303,8 @@ func waitForBlobStoreWaiter(t *testing.T, database *sql.DB, namespace int) {
 		var waiting int
 		require.NoError(t, database.QueryRowContext(context.Background(),
 			`SELECT count(*) FROM pg_locks
-			 WHERE locktype = 'advisory' AND NOT granted AND objsubid = 2 AND classid = $1`,
+			 WHERE locktype = 'advisory' AND NOT granted AND objsubid = 2 AND classid = $1
+			   AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`,
 			namespace).Scan(&waiting))
 		if waiting > 0 {
 			return
@@ -355,7 +356,8 @@ func waitForStallWaiters(t *testing.T, database *sql.DB, stallKey int64, n int) 
 		require.NoError(t, database.QueryRowContext(context.Background(),
 			`SELECT count(*) FROM pg_locks
 			 WHERE locktype = 'advisory' AND NOT granted AND objsubid = 1
-			 AND classid = ($1::bigint >> 32)::oid AND objid = ($1::bigint & 4294967295)::oid`,
+			 AND classid = ($1::bigint >> 32)::oid AND objid = ($1::bigint & 4294967295)::oid
+			 AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`,
 			stallKey).Scan(&waiting))
 		if waiting >= n {
 			return

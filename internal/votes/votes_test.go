@@ -65,7 +65,7 @@ var voteTablesToTruncate = []string{
 	"blocks", "firehose_events",
 	// The acceptance ledger. 17e's divergence sweep runs here (the re-cast
 	// tests drive the real reconciler), and it READS this table — so a row left
-	// by another package's run would surface as an undelivered-acceptance
+	// by an earlier test or run would surface as an undelivered-acceptance
 	// finding in a vote test. Harmless only by coincidence today: the query
 	// inner-joins through outbound_objects, which IS truncated. That coincidence
 	// is exactly what this list exists to stop depending on.

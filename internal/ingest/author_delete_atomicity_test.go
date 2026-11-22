@@ -172,8 +172,8 @@ func installFaultTrigger(t *testing.T, h *harness, name, table, event, when, act
 }
 
 // waitForAdvisoryWaiters polls until at least count sessions wait on a
-// one-argument advisory lock other than testutil's package lock (other test
-// binaries wait on that one). Past timeout it fails the test when required,
+// one-argument advisory lock other than testutil's package lock (another run
+// of this package waits on that one). Past timeout it fails the test when required,
 // and otherwise returns.
 // testutilPackageLockKey is testutil's advisoryLockKey.
 const testutilPackageLockKey int64 = 0x7469646570
@@ -186,7 +186,8 @@ func waitForAdvisoryWaiters(t *testing.T, h *harness, count int, timeout time.Du
 		require.NoError(t, h.db.QueryRowContext(context.Background(),
 			`SELECT count(*) FROM pg_locks
 			 WHERE locktype = 'advisory' AND NOT granted AND objsubid = 1
-			   AND (classid::bigint << 32 | objid::bigint) <> $1`, testutilPackageLockKey).Scan(&waiting))
+			   AND (classid::bigint << 32 | objid::bigint) <> $1
+			   AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`, testutilPackageLockKey).Scan(&waiting))
 		if waiting >= count {
 			return
 		}

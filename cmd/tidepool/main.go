@@ -720,6 +720,7 @@ func run(logger *slog.Logger) error {
 		Events:    inboxEvents,
 		Processor: handler,
 		Workers:   cfg.IngestWorkers,
+		ParkDelay: cfg.IngestParkDelay,
 		Logger:    logger,
 		// A failing event whose content is on a dead or broken origin moves
 		// to the backfill's deferred items instead of stalling its community.

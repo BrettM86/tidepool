@@ -102,6 +102,7 @@ func numberAt(t *testing.T, root any, path ...string) float64 {
 // extension fallback) is what the materializer classifies on — plus
 // sensitive=true and a top-level thumbnail image.
 func TestImagePost_EmbedImagesAndNSFWLabel(t *testing.T) {
+	parallel(t)
 	h := newHarness(t)
 	community, sub := setupSubscribedCommunity(t, h, "img")
 	user := h.registerUser(t, h.uniqueName(t, "iris"))
@@ -203,6 +204,7 @@ func TestImagePost_EmbedImagesAndNSFWLabel(t *testing.T) {
 // exists and holds NULL bytes, so the bytes went to the bucket. getBlob alone
 // cannot tell, because a row holding its bytes is served from Postgres.
 func TestImagePost_BlobBytesInObjectStore(t *testing.T) {
+	parallel(t)
 	h := newHarness(t)
 	community, _ := setupSubscribedCommunity(t, h, "imgs3")
 	user := h.registerUser(t, h.uniqueName(t, "oscar"))

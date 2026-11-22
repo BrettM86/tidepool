@@ -38,6 +38,7 @@ type covesSubjectState struct {
 // labeler, and Tidepool withholds the bridged post's image until the restore
 // negates the label.
 func TestLabels_InstanceRemovalWithholdsTheBridgedImageUntilTheRestore(t *testing.T) {
+	parallel(t)
 	h := newHarness(t)
 	community, sub := setupSubscribedCommunity(t, h, "lblimg")
 	h.awaitAppViewCommunityIndexed(t, sub.DID)

@@ -5,7 +5,6 @@ import (
 	stderrors "errors"
 	"log/slog"
 	"net"
-	"os"
 	"testing"
 	"time"
 
@@ -38,7 +37,7 @@ func TestRunRefusesPostgresModeWithObjectStoreBytes(t *testing.T) {
 	httpAddress := httpListener.Addr().String()
 
 	t.Setenv("ENVIRONMENT", "development")
-	t.Setenv("DATABASE_URL", os.Getenv("TIDEPOOL_TEST_DATABASE_URL"))
+	t.Setenv("DATABASE_URL", testutil.DatabaseURL(t))
 	t.Setenv("LISTEN_ADDR", httpAddress)
 	t.Setenv("DNS_LISTEN", "")
 	t.Setenv("DNS_PUBLIC_IPV4", "127.0.0.1")

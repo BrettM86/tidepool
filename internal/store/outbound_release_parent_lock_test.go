@@ -33,7 +33,8 @@ func waitingOnSubjectLock(t *testing.T, database *sql.DB, subject string) bool {
 		SELECT EXISTS (SELECT 1 FROM pg_locks
 		               WHERE locktype = 'advisory' AND NOT granted
 		                 AND classid = $1 AND objid = hashtext($2)::oid
-		                 AND objsubid = 2)`,
+		                 AND objsubid = 2
+		                 AND database = (SELECT oid FROM pg_database WHERE datname = current_database()))`,
 		arLockNamespace, subject).Scan(&waiting))
 	return waiting
 }

@@ -13,13 +13,12 @@ import (
 )
 
 // TestMigrations_UpDownUp proves every migration applies cleanly up AND
-// down. Packages sharing the postgres schema are serialized by
-// testutil.DB's advisory lock, so tearing the schema down here cannot race
-// another package's tests.
+// down. Each package has its own test database (testutil.DB), so tearing
+// the schema down here cannot race another package's tests.
 func TestMigrations_UpDownUp(t *testing.T) {
 	database := testDB(t) // already migrated up by the harness
 	ctx := context.Background()
-	// Other packages' tests leave identity events behind, and 035's Down
+	// Earlier tests in this package leave identity events behind, and 035's Down
 	// refuses to drop them; the tables are torn down below anyway.
 	testutil.Truncate(t, database, "firehose_events")
 	// 050's Down refuses while an (actor, subject) pair holds two vote rows.

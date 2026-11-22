@@ -210,6 +210,7 @@ func (c *pdsClient) putRecord(collection, rkey string, record map[string]any) (u
 // is the transit proven at once), carrying the exact CID the PDS assigned;
 // and the relay advanced its own repo state to the commit it emitted.
 func TestNativePDS_RecordTransitsRelayToJetstream(t *testing.T) {
+	parallel(t)
 	h := newHarness(t)
 
 	pds := &pdsClient{http: h.http}

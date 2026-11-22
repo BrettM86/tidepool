@@ -3,6 +3,7 @@
 package e2e
 
 import (
+	"flag"
 	"fmt"
 	"testing"
 	"time"
@@ -20,7 +21,9 @@ const sweepReplayFloor = 30
 
 // Scenario 15: suite-end sweep. `go test` runs tests in source order with
 // files compiled alphabetically, so this file's zz_ name (and the test's ZZ_
-// prefix) makes it run AFTER every other scenario — deliberately: it replays
+// prefix) makes it the last scenario to start; it then marks itself parallel
+// and waits for every other parallel one (see parallel in helpers.go), so it
+// runs AFTER every other scenario — deliberately: it replays
 // the firehose history Jetstream still retains, from cursor 1, on a fresh
 // unfiltered listener and re-vets every replayed event. That closes the one
 // gap the per-scenario listeners leave: events emitted while NO unfiltered
@@ -53,12 +56,22 @@ const sweepReplayFloor = 30
 //     sentinel is only "newest event" in this one connection's ordering,
 //     and the trailing 5s drain is a quiet window, not a proof — an event
 //     the relay reorders past both is vetted by nobody.
-//   - The zz_/ZZ_ "runs last" property is alphabetical file/test ordering
-//     within one `go test` invocation; it does NOT survive -run selection.
+//   - The "runs last" property is alphabetical file/test ordering plus the
+//     wait on parallelScenarios within one `go test` invocation; it does NOT
+//     survive -run selection.
 //     Running this test alone is legal but only vets whatever history
 //     survives in Jetstream's store — it cannot vouch for a suite that
 //     never ran.
 func TestZZ_SuiteEndSweep(t *testing.T) {
+	// Parallel scenarios are released once the serial run reaches the end of
+	// the list, which is this test's t.Parallel call; the sweep then waits for
+	// them to end. It holds a parallel slot while it waits, so it needs a
+	// second one.
+	if parallelism := flag.Lookup("test.parallel"); parallelism != nil && parallelism.Value.String() == "1" {
+		t.Fatal("the suite-end sweep waits for the parallel scenarios and needs -parallel 2 or more")
+	}
+	t.Parallel()
+	parallelScenarios.Wait()
 	h := newHarness(t)
 
 	// Cursor 1 ≈ the beginning of Jetstream's retained history (its cursor

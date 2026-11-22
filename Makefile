@@ -131,13 +131,13 @@ e2e: ## Full e2e run: build + start the stack, run the suite, tear down (-v)
 		echo "$(RED)✗ e2e stack failed to come up (exit $$up_status); recent logs:$(RESET)" >&2; \
 		$(E2E_COMPOSE) logs --tail=100 || true; \
 		echo "$(YELLOW)Tearing down half-started e2e stack...$(RESET)"; \
-		$(E2E_COMPOSE) down -v --remove-orphans || true; \
+		$(E2E_COMPOSE) down -v --remove-orphans --timeout 1 || true; \
 		exit $$up_status; \
 	fi; \
 	echo "$(GREEN)Stack healthy; running e2e suite...$(RESET)"; \
-	status=0; go test -tags e2e,nodynamic -count=1 -timeout 30m ./tests/e2e/... || status=$$?; \
+	status=0; go test -tags e2e,nodynamic -count=1 -parallel 8 -timeout 30m ./tests/e2e/... || status=$$?; \
 	echo "$(YELLOW)Tearing down e2e stack...$(RESET)"; \
-	down_status=0; $(E2E_COMPOSE) down -v --remove-orphans || down_status=$$?; \
+	down_status=0; $(E2E_COMPOSE) down -v --remove-orphans --timeout 1 || down_status=$$?; \
 	if [ $$down_status -ne 0 ]; then \
 		echo "$(RED)✗ WARNING: e2e teardown failed (exit $$down_status) — the stack may still be running; try 'make e2e-down'$(RESET)" >&2; \
 	fi; \
@@ -149,13 +149,13 @@ e2e-up: ## Start the e2e stack and leave it running (for iterating on tests)
 	@echo "$(GREEN)✓ e2e stack up: tidepool 127.0.0.1:8092, DNS 127.0.0.1:$(or $(TIDEPOOL_E2E_DNS_PORT),5380) (UDP/TCP), lemmy 127.0.0.1:8541, lemmy2 127.0.0.1:$(or $(LEMMY2_E2E_PORT),8542), relay 127.0.0.1:2480, reference pds 127.0.0.1:3081, jetstream 127.0.0.1:6028, coves appview 127.0.0.1:$(or $(COVES_APPVIEW_E2E_PORT),8093) (instance admin coves-admin.pds.test)$(RESET)"
 
 e2e-test: ## Run the e2e suite against an already-running stack (make e2e-up)
-	@go test -tags e2e,nodynamic -count=1 -v -timeout 30m ./tests/e2e/...
+	@go test -tags e2e,nodynamic -count=1 -parallel 8 -v -timeout 30m ./tests/e2e/...
 
 e2e-logs: ## Tail all e2e stack logs
 	@$(E2E_COMPOSE) logs -f
 
 e2e-down: ## Tear down the e2e stack and its volumes
-	@$(E2E_COMPOSE) down -v --remove-orphans
+	@$(E2E_COMPOSE) down -v --remove-orphans --timeout 1
 	@echo "$(GREEN)✓ e2e stack removed$(RESET)"
 
 ##@ Code Quality

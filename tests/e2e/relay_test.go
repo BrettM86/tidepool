@@ -39,6 +39,7 @@ import (
 // with a live subscribeRepos connection, is the announcement observed
 // end-to-end rather than eyeballed in logs.
 func TestRelay_BridgeCrawledBySelfAnnouncement(t *testing.T) {
+	parallel(t)
 	h := newHarness(t)
 
 	deadline := time.Now().Add(crawlTimeout)
@@ -82,6 +83,7 @@ func TestRelay_BridgeCrawledBySelfAnnouncement(t *testing.T) {
 // getLatestCommit for it — i.e. the relay didn't just forward frames, it
 // built (and can serve) validated repo state from the bridge's commits.
 func TestRelay_RepoCrawledAndServed(t *testing.T) {
+	parallel(t)
 	h := newHarness(t)
 
 	cursor := cursorNow()

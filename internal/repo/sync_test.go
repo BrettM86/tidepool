@@ -3,7 +3,6 @@ package repo
 import (
 	"bytes"
 	"fmt"
-	"os"
 	"testing"
 	"time"
 
@@ -302,8 +301,7 @@ func TestFirehoseNotify(t *testing.T) {
 	manager, _, _ := testManager(t)
 	ctx := t.Context()
 
-	dsn := os.Getenv("TIDEPOOL_TEST_DATABASE_URL")
-	require.NotEmpty(t, dsn, "testutil.DB already validated this")
+	dsn := testutil.DatabaseURL(t)
 	listener := pq.NewListener(dsn, 100*time.Millisecond, time.Second, nil)
 	defer func() { _ = listener.Close() }()
 	require.NoError(t, listener.Listen(FirehoseNotifyChannel))

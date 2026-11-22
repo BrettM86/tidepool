@@ -19,6 +19,7 @@ import (
 // the outcome for the answer Lemmy gives for it (recorded by this test), and
 // a post the admin labelled `!takedown` stays withheld.
 func TestCommunityRestore_ReconcilesKeptObjectsWithLemmy(t *testing.T) {
+	parallel(t)
 	h := newHarness(t)
 	db := openTidepoolDB(t)
 	community, sub := setupSubscribedCommunity(t, h, "rcrec")

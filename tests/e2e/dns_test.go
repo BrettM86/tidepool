@@ -10,6 +10,7 @@ import (
 )
 
 func TestDNS_BridgedHandleAndTombstone(t *testing.T) {
+	parallel(t)
 	h := newHarness(t)
 	community, _ := setupSubscribedCommunity(t, h, "dns")
 	username := h.uniqueName(t, "dnsuser")

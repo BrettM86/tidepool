@@ -22,6 +22,7 @@ const colBan = "social.coves.moderation.ban"
 // into the community, and a NATIVE Coves persona, known to Lemmy through the
 // post the bridge federated for it.
 func TestModeration_CommunityBanAndUnbanWriteBanRecords(t *testing.T) {
+	parallel(t)
 	h := newHarness(t)
 	community, sub := setupSubscribedCommunity(t, h, "cban")
 

@@ -1,0 +1,170 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.moderation.getCommunityClassificationSummary",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Summarize one community's classification results over the last seven days for one question: per kind, how many posts and comments were scored and how many of them have a most recent probability at or above minProbability, plus the community's NSFW flag changes in the same window. Results under any evaluation count. Probabilities and the share are integer parts per million. Admin identity comes from the authenticated service context, never request fields.",
+      "parameters": {
+        "type": "params",
+        "required": [
+          "community",
+          "question",
+          "minProbability"
+        ],
+        "properties": {
+          "community": {
+            "type": "string",
+            "format": "did",
+            "description": "Community DID"
+          },
+          "question": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "description": "Policy question key of the current policy"
+          },
+          "minProbability": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1000000,
+            "description": "Probability in parts per million at or above which a subject counts as above"
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#output"
+        }
+      },
+      "errors": [
+        {
+          "name": "AuthRequired",
+          "description": "Authentication is required; authenticate with an instance administrator's service account before retrying."
+        },
+        {
+          "name": "Forbidden",
+          "description": "The authenticated actor is not an instance administrator; do not retry."
+        },
+        {
+          "name": "InvalidRequest",
+          "description": "community, question or minProbability is missing or invalid, or question is not in the current policy; correct the request before retrying."
+        },
+        {
+          "name": "CommunityNotFound",
+          "description": "No community has this DID; do not retry."
+        }
+      ]
+    },
+    "output": {
+      "type": "object",
+      "description": "One community's classification summary",
+      "required": [
+        "community",
+        "question",
+        "minProbability",
+        "since",
+        "until",
+        "posts",
+        "comments",
+        "flagEvents"
+      ],
+      "properties": {
+        "community": {
+          "type": "string",
+          "format": "did"
+        },
+        "question": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "minProbability": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000,
+          "description": "minProbability in parts per million"
+        },
+        "since": {
+          "type": "string",
+          "format": "datetime",
+          "description": "Inclusive start of the window on the result's createdAt"
+        },
+        "until": {
+          "type": "string",
+          "format": "datetime",
+          "description": "Exclusive end of the window on the result's createdAt"
+        },
+        "posts": {
+          "type": "ref",
+          "ref": "#kindSummary"
+        },
+        "comments": {
+          "type": "ref",
+          "ref": "#kindSummary"
+        },
+        "share": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000,
+          "description": "(posts.above + comments.above) / (posts.scored + comments.scored) in parts per million; absent when nothing was scored"
+        },
+        "flagEvents": {
+          "type": "array",
+          "items": {
+            "type": "ref",
+            "ref": "#flagEvent"
+          },
+          "description": "The community's NSFW flag changes in the window, newest first"
+        }
+      }
+    },
+    "kindSummary": {
+      "type": "object",
+      "description": "Counts for one kind of subject",
+      "required": [
+        "scored",
+        "above"
+      ],
+      "properties": {
+        "scored": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Distinct subjects with a result in the window"
+        },
+        "above": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Scored subjects whose most recent result in the window is at or above minProbability for the question"
+        }
+      }
+    },
+    "flagEvent": {
+      "type": "object",
+      "description": "One change of the community's NSFW flag",
+      "required": [
+        "oldNsfw",
+        "newNsfw",
+        "occurredAt",
+        "delivered"
+      ],
+      "properties": {
+        "oldNsfw": {
+          "type": "boolean"
+        },
+        "newNsfw": {
+          "type": "boolean"
+        },
+        "occurredAt": {
+          "type": "string",
+          "format": "datetime"
+        },
+        "delivered": {
+          "type": "boolean",
+          "description": "Whether the operator alert for this change has been sent; false while it is pending or after its sends failed at the attempt limit."
+        }
+      }
+    }
+  }
+}

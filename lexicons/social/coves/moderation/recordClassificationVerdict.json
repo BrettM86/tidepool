@@ -1,0 +1,125 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.moderation.recordClassificationVerdict",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Record an instance administrator's verdict on a classification result: for every question the result scored, whether the content is present. A result accepts a verdict only while its subject is not deleted and its current CID is the scored CID. Recording again replaces the same administrator's earlier verdict. Admin identity comes from the authenticated service context, never request fields.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#input"
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#output"
+        }
+      },
+      "errors": [
+        {
+          "name": "AuthRequired",
+          "description": "Authentication is required; authenticate with an instance administrator's service account before retrying."
+        },
+        {
+          "name": "Forbidden",
+          "description": "The authenticated actor is not an instance administrator; do not retry."
+        },
+        {
+          "name": "InvalidRequest",
+          "description": "The body is malformed, or the answers do not name every question the result scored exactly once; correct the request before retrying."
+        },
+        {
+          "name": "ResultNotFound",
+          "description": "No classification result has this id; do not retry."
+        },
+        {
+          "name": "Unreviewable",
+          "description": "The subject was edited or deleted after it was scored; do not retry."
+        }
+      ]
+    },
+    "input": {
+      "type": "object",
+      "description": "Verdict on one classification result",
+      "required": [
+        "resultId",
+        "answers"
+      ],
+      "properties": {
+        "resultId": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Result identifier from listClassificationResults"
+        },
+        "answers": {
+          "type": "array",
+          "maxLength": 64,
+          "items": {
+            "type": "ref",
+            "ref": "#answer"
+          },
+          "description": "One answer for each question the result scored"
+        }
+      }
+    },
+    "answer": {
+      "type": "object",
+      "description": "Whether one question's content is present",
+      "required": [
+        "question",
+        "present"
+      ],
+      "properties": {
+        "question": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Policy question key"
+        },
+        "present": {
+          "type": "boolean",
+          "description": "Whether the content the question asks about is present"
+        }
+      }
+    },
+    "output": {
+      "type": "object",
+      "description": "The stored verdict",
+      "required": [
+        "resultId",
+        "adminDid",
+        "answers",
+        "recordedAt"
+      ],
+      "properties": {
+        "resultId": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "adminDid": {
+          "type": "string",
+          "format": "did",
+          "description": "Administrator who recorded the verdict"
+        },
+        "answers": {
+          "type": "array",
+          "maxLength": 64,
+          "items": {
+            "type": "ref",
+            "ref": "#answer"
+          },
+          "description": "Answers, sorted by question"
+        },
+        "recordedAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "When the verdict was recorded"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,369 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.moderation.listClassificationResults",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "List stored content classification results, newest first, each with the classified subject as the classifier would load it now, for instance administrators reviewing the classifier. Probabilities are integer parts per million. Admin identity comes from the authenticated service context, never request fields.",
+      "parameters": {
+        "type": "params",
+        "properties": {
+          "question": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "description": "Return results that scored this policy question"
+          },
+          "minProbability": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1000000,
+            "description": "Return results whose probability for question is at least this many parts per million; requires question"
+          },
+          "subjectKind": {
+            "type": "string",
+            "maxLength": 32,
+            "knownValues": [
+              "post",
+              "comment",
+              "community"
+            ],
+            "description": "Return results for this kind of subject"
+          },
+          "community": {
+            "type": "string",
+            "format": "did",
+            "description": "Return results for subjects in this community DID"
+          },
+          "modelId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "description": "Return results scored by this model"
+          },
+          "policyVersion": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "description": "Return results scored under this policy version"
+          },
+          "since": {
+            "type": "string",
+            "format": "datetime",
+            "description": "Inclusive lower bound on the result's createdAt"
+          },
+          "until": {
+            "type": "string",
+            "format": "datetime",
+            "description": "Exclusive upper bound on the result's createdAt"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 50,
+            "description": "Maximum number of results to return"
+          },
+          "cursor": {
+            "type": "string",
+            "maxLength": 2048,
+            "description": "Opaque pagination cursor from a previous response"
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#output"
+        }
+      },
+      "errors": [
+        {
+          "name": "AuthRequired",
+          "description": "Authentication is required; authenticate with an instance administrator's service account before retrying."
+        },
+        {
+          "name": "Forbidden",
+          "description": "The authenticated actor is not an instance administrator; do not retry."
+        },
+        {
+          "name": "InvalidRequest",
+          "description": "A filter or limit is invalid, or minProbability was given without question; correct the request before retrying."
+        },
+        {
+          "name": "InvalidCursor",
+          "description": "The cursor is invalid; restart pagination without a cursor."
+        }
+      ]
+    },
+    "output": {
+      "type": "object",
+      "description": "Page of classification results",
+      "required": [
+        "results"
+      ],
+      "properties": {
+        "results": {
+          "type": "array",
+          "maxLength": 100,
+          "items": {
+            "type": "ref",
+            "ref": "#resultView"
+          },
+          "description": "Results, newest first"
+        },
+        "cursor": {
+          "type": "string",
+          "maxLength": 2048,
+          "description": "Opaque cursor for the next page; absent at the end of pagination"
+        }
+      }
+    },
+    "resultView": {
+      "type": "object",
+      "description": "One stored classification result",
+      "required": [
+        "id",
+        "subjectKind",
+        "subjectUri",
+        "scoredCid",
+        "communityDid",
+        "authorDid",
+        "modelId",
+        "policyVersion",
+        "probabilities",
+        "imagesSent",
+        "imagesSkipped",
+        "textTruncated",
+        "partial",
+        "createdAt",
+        "scoredCidIsCurrent",
+        "subject"
+      ],
+      "properties": {
+        "id": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Service-local result identifier, used to record a verdict"
+        },
+        "subjectKind": {
+          "type": "string",
+          "maxLength": 32,
+          "knownValues": [
+            "post",
+            "comment",
+            "community"
+          ],
+          "description": "Kind of the classified subject"
+        },
+        "subjectUri": {
+          "type": "string",
+          "format": "uri",
+          "description": "The classified subject: the AT-URI of a post or comment, or the DID of a community"
+        },
+        "scoredCid": {
+          "type": "string",
+          "format": "cid",
+          "description": "CID of the subject version that was classified"
+        },
+        "communityDid": {
+          "type": "string",
+          "format": "did",
+          "description": "Community the subject belongs to"
+        },
+        "authorDid": {
+          "type": "string",
+          "format": "did",
+          "description": "Author of the subject; the community itself for a community subject"
+        },
+        "modelId": {
+          "type": "string",
+          "maxLength": 256,
+          "description": "Model that scored the subject"
+        },
+        "policyVersion": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "Policy version the subject was scored under"
+        },
+        "probabilities": {
+          "type": "array",
+          "maxLength": 64,
+          "items": {
+            "type": "ref",
+            "ref": "#probabilityView"
+          },
+          "description": "Probability of each scored question, sorted by question"
+        },
+        "imagesSent": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of images sent to the classifier"
+        },
+        "imagesSkipped": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of image slots not sent to the classifier"
+        },
+        "textTruncated": {
+          "type": "boolean",
+          "description": "Whether the classified text was cut to the text limit"
+        },
+        "partial": {
+          "type": "boolean",
+          "description": "Whether the result was stored from the answered image batches of a job that failed at the attempt limit; images never sent count as skipped. A partial result accepts a verdict and counts toward precision like any other"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "When the result was stored, or last replaced: a revived job that completes replaces its partial result in place"
+        },
+        "scoredCidIsCurrent": {
+          "type": "boolean",
+          "description": "Whether the subject is not deleted and its current CID is the scored CID; only such results accept a verdict"
+        },
+        "subject": {
+          "type": "ref",
+          "ref": "#subjectView"
+        }
+      }
+    },
+    "probabilityView": {
+      "type": "object",
+      "description": "One question's probability",
+      "required": [
+        "question",
+        "probability"
+      ],
+      "properties": {
+        "question": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Policy question key"
+        },
+        "probability": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000,
+          "description": "Probability in parts per million"
+        }
+      }
+    },
+    "subjectView": {
+      "type": "object",
+      "description": "The classified subject as the classifier would load it now, including content the public read path hides. Content and images are omitted when the subject is deleted or under an illegal-content or doxing action (for a comment, also when its root post or the post its parent chain reaches is)",
+      "required": [
+        "visibility",
+        "deleted",
+        "images"
+      ],
+      "properties": {
+        "visibility": {
+          "type": "string",
+          "maxLength": 32,
+          "knownValues": [
+            "missing",
+            "hidden",
+            "admissionRefused",
+            "awaitingAdmission",
+            "visible"
+          ],
+          "description": "Whether the subject is shown now"
+        },
+        "deleted": {
+          "type": "boolean",
+          "description": "Whether the subject has been deleted"
+        },
+        "currentCid": {
+          "type": "string",
+          "format": "cid",
+          "description": "The subject's current CID; absent when it is missing or deleted"
+        },
+        "post": {
+          "type": "ref",
+          "ref": "#postFields"
+        },
+        "comment": {
+          "type": "ref",
+          "ref": "#commentFields"
+        },
+        "community": {
+          "type": "ref",
+          "ref": "#communityFields"
+        },
+        "images": {
+          "type": "array",
+          "maxLength": 64,
+          "items": {
+            "type": "ref",
+            "ref": "#imageRef"
+          },
+          "description": "Images the subject shows now"
+        }
+      }
+    },
+    "postFields": {
+      "type": "object",
+      "description": "The classified fields of a post",
+      "properties": {
+        "title": {
+          "type": "string"
+        },
+        "body": {
+          "type": "string"
+        },
+        "externalUri": {
+          "type": "string"
+        },
+        "externalTitle": {
+          "type": "string"
+        }
+      }
+    },
+    "commentFields": {
+      "type": "object",
+      "description": "The classified fields of a comment",
+      "properties": {
+        "body": {
+          "type": "string"
+        }
+      }
+    },
+    "communityFields": {
+      "type": "object",
+      "description": "The classified fields of a community profile",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "displayName": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        }
+      }
+    },
+    "imageRef": {
+      "type": "object",
+      "description": "An image blob a subject shows",
+      "required": [
+        "ownerDid",
+        "cid"
+      ],
+      "properties": {
+        "ownerDid": {
+          "type": "string",
+          "format": "did",
+          "description": "DID whose repository holds the blob"
+        },
+        "cid": {
+          "type": "string",
+          "format": "cid",
+          "description": "CID of the blob"
+        }
+      }
+    }
+  }
+}

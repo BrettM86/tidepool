@@ -1,0 +1,151 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.moderation.getClassificationMetrics",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Report the content classifier's operational metrics, derived from its tables at read time: current job counts by status, every recorded day of model usage, the worker lag, the number of undelivered community NSFW flag events and score alerts, and whether the worker is paused on a refused API token. Admin identity comes from the authenticated service context, never request fields.",
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#output"
+        }
+      },
+      "errors": [
+        {
+          "name": "AuthRequired",
+          "description": "Authentication is required; authenticate with an instance administrator's service account before retrying."
+        },
+        {
+          "name": "Forbidden",
+          "description": "The authenticated actor is not an instance administrator; do not retry."
+        }
+      ]
+    },
+    "output": {
+      "type": "object",
+      "description": "Classifier operational metrics",
+      "required": [
+        "jobs",
+        "usage",
+        "workerLagSeconds",
+        "undeliveredFlagEvents",
+        "undeliveredScoreAlerts"
+      ],
+      "properties": {
+        "jobs": {
+          "type": "ref",
+          "ref": "#jobCounts"
+        },
+        "usage": {
+          "type": "array",
+          "items": {
+            "type": "ref",
+            "ref": "#usageDay"
+          },
+          "description": "Every recorded usage row, newest day first, then by model"
+        },
+        "workerLagSeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Whole seconds since the oldest due pending job became due; 0 when no pending job is due. With the classifier enabled, only jobs under the current policy version and models count; with it disabled, every pending job counts"
+        },
+        "undeliveredFlagEvents": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Community NSFW flag events not yet delivered, including those that exhausted their attempts"
+        },
+        "undeliveredScoreAlerts": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Classifier score alerts not yet delivered, including those that exhausted their attempts"
+        },
+        "authPausedUntil": {
+          "type": "string",
+          "format": "datetime",
+          "description": "Present while the worker is paused because Cloudflare refused the API token (HTTP 401 or 403): when the pause ends. The pause starts at 5 minutes and doubles, up to 1 hour, while the token keeps being refused; jobs wait and spend no attempt"
+        }
+      }
+    },
+    "jobCounts": {
+      "type": "object",
+      "description": "Current classification job counts by status. With the classifier enabled, queued, deferred and retrying count only jobs under the current policy version and models; with it disabled, every pending job. The other counts cover every policy version and model",
+      "required": [
+        "queued",
+        "deferred",
+        "retrying",
+        "sent",
+        "failed",
+        "closedSuperseded",
+        "closedNotVisible"
+      ],
+      "properties": {
+        "queued": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "deferred": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Jobs whose subject awaits community acceptance"
+        },
+        "retrying": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Jobs waiting to retry after a failed attempt"
+        },
+        "sent": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Jobs classified with a stored result"
+        },
+        "failed": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Jobs that exhausted their attempts"
+        },
+        "closedSuperseded": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Jobs closed because a newer version of the subject replaced them"
+        },
+        "closedNotVisible": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Jobs closed because the subject was no longer visible"
+        }
+      }
+    },
+    "usageDay": {
+      "type": "object",
+      "description": "One model's usage on one UTC day",
+      "required": [
+        "modelId",
+        "day",
+        "requests",
+        "inputTokens"
+      ],
+      "properties": {
+        "modelId": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "day": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 10,
+          "description": "UTC day as YYYY-MM-DD"
+        },
+        "requests": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "inputTokens": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}

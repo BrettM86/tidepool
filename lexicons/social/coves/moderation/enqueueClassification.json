@@ -1,0 +1,95 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.moderation.enqueueClassification",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Queue classification jobs under the current evaluation (policy version and models) for existing content: every community, or the posts and comments indexed in a time range. A subject whose identical job (same subject, current CID and evaluation) ended failed has that job queued again with its attempts reset, and is counted as revived; one whose identical job exists in any other status, closed included, is counted as already present and not queued again. Admin identity comes from the authenticated service context, never request fields.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#input"
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#output"
+        }
+      },
+      "errors": [
+        {
+          "name": "AuthRequired",
+          "description": "Authentication is required; authenticate with an instance administrator's service account before retrying."
+        },
+        {
+          "name": "Forbidden",
+          "description": "The authenticated actor is not an instance administrator; do not retry."
+        },
+        {
+          "name": "InvalidRequest",
+          "description": "The body is malformed, the target is unknown, or the range does not match the target; correct the request before retrying."
+        },
+        {
+          "name": "ClassifierNotConfigured",
+          "description": "The content classifier is not configured on this instance; configure it before retrying."
+        }
+      ]
+    },
+    "input": {
+      "type": "object",
+      "description": "What to queue",
+      "required": [
+        "target"
+      ],
+      "properties": {
+        "target": {
+          "type": "string",
+          "knownValues": [
+            "allCommunities",
+            "postsAndComments"
+          ],
+          "description": "allCommunities queues every community and takes no range; postsAndComments queues the posts and comments indexed in [since, until) and requires both"
+        },
+        "since": {
+          "type": "string",
+          "format": "datetime",
+          "description": "Inclusive lower bound on the content's indexedAt; required for postsAndComments"
+        },
+        "until": {
+          "type": "string",
+          "format": "datetime",
+          "description": "Exclusive upper bound on the content's indexedAt; required for postsAndComments"
+        }
+      }
+    },
+    "output": {
+      "type": "object",
+      "description": "Counts of the subjects in scope",
+      "required": [
+        "created",
+        "revived",
+        "alreadyPresent"
+      ],
+      "properties": {
+        "created": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Jobs queued by this call"
+        },
+        "revived": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Failed jobs under the same evaluation queued again by this call, with their attempts reset"
+        },
+        "alreadyPresent": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Subjects whose identical job already existed in a status other than failed"
+        }
+      }
+    }
+  }
+}

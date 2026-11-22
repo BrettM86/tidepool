@@ -1,0 +1,150 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.moderation.getClassificationPrecision",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Report each question's precision and recall at a threshold for one evaluation (model and policy version), over the results administrators verdicted while their scored content is still current, using each result's most recent verdict. Threshold, precision and recall are integer parts per million. Admin identity comes from the authenticated service context, never request fields.",
+      "parameters": {
+        "type": "params",
+        "required": [
+          "modelId",
+          "policyVersion",
+          "threshold"
+        ],
+        "properties": {
+          "modelId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "description": "Model of the evaluation"
+          },
+          "policyVersion": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "description": "Policy version of the evaluation"
+          },
+          "threshold": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1000000,
+            "description": "Probability in parts per million at or above which a result counts as flagged"
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#output"
+        }
+      },
+      "errors": [
+        {
+          "name": "AuthRequired",
+          "description": "Authentication is required; authenticate with an instance administrator's service account before retrying."
+        },
+        {
+          "name": "Forbidden",
+          "description": "The authenticated actor is not an instance administrator; do not retry."
+        },
+        {
+          "name": "InvalidRequest",
+          "description": "modelId, policyVersion or threshold is missing or invalid; correct the request before retrying."
+        }
+      ]
+    },
+    "output": {
+      "type": "object",
+      "description": "Precision report for one evaluation at one threshold",
+      "required": [
+        "modelId",
+        "policyVersion",
+        "threshold",
+        "verdictedCount",
+        "unreviewableCount",
+        "questions"
+      ],
+      "properties": {
+        "modelId": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "policyVersion": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "threshold": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000,
+          "description": "Threshold in parts per million"
+        },
+        "verdictedCount": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of verdicted results whose scored content is still current"
+        },
+        "unreviewableCount": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of the evaluation's results whose subject was edited or deleted after scoring, verdicted or not"
+        },
+        "questions": {
+          "type": "array",
+          "maxLength": 64,
+          "items": {
+            "type": "ref",
+            "ref": "#questionPrecision"
+          },
+          "description": "Per-question counts and ratios, sorted by question"
+        }
+      }
+    },
+    "questionPrecision": {
+      "type": "object",
+      "description": "One question's precision and recall",
+      "required": [
+        "question",
+        "atOrAbove",
+        "present",
+        "truePositive"
+      ],
+      "properties": {
+        "question": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Policy question key"
+        },
+        "atOrAbove": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Verdicted results scored at or above the threshold"
+        },
+        "present": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Verdicted results whose verdict says the content is present"
+        },
+        "truePositive": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Results both at or above the threshold and verdicted present"
+        },
+        "precision": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000,
+          "description": "truePositive / atOrAbove in parts per million; absent when atOrAbove is 0"
+        },
+        "recall": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000,
+          "description": "truePositive / present in parts per million; absent when present is 0"
+        }
+      }
+    }
+  }
+}

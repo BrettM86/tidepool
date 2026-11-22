@@ -1,6 +1,7 @@
 package materialize
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/base32"
@@ -240,6 +241,27 @@ func newHarness(t *testing.T, configure ...func(*Options)) *harness {
 // repo manager both h.manager and h.m use.
 func newHarnessWithRepoOptions(t *testing.T, repoOptions []repo.Option, configure ...func(*Options)) *harness {
 	t.Helper()
+	return newHarnessWithClientMediaCap(t, repoOptions, 0, configure...)
+}
+
+// newHarnessWithMediaBudget is newHarness with Options.MaxMediaDownloadBytes
+// and Options.MaxBlobBytes set (0 leaves either at its default: 25 MiB and
+// 5 MiB) and the AP client's media cap wired as cmd/tidepool does: the larger
+// of the two.
+func newHarnessWithMediaBudget(t *testing.T, downloadBytes, blobBytes int64, configure ...func(*Options)) *harness {
+	t.Helper()
+	clientCap := max(cmp.Or(downloadBytes, 25<<20), cmp.Or(blobBytes, 5<<20))
+	budget := func(o *Options) {
+		o.MaxMediaDownloadBytes = downloadBytes
+		o.MaxBlobBytes = blobBytes
+	}
+	return newHarnessWithClientMediaCap(t, nil, clientCap, append([]func(*Options){budget}, configure...)...)
+}
+
+// newHarnessWithClientMediaCap builds the harness with the AP client's
+// MaxMediaBytes set to clientMediaCap (0 keeps the client default).
+func newHarnessWithClientMediaCap(t *testing.T, repoOptions []repo.Option, clientMediaCap int64, configure ...func(*Options)) *harness {
+	t.Helper()
 	database := testutil.DB(t)
 	testutil.Truncate(t, database,
 		"ap_objects", "bridged_actors", "communities",
@@ -283,6 +305,7 @@ func newHarnessWithRepoOptions(t *testing.T, repoOptions []repo.Option, configur
 		PerHostRPS:            100000, // deep-chain tests fetch dozens of objects from one "host"
 		PerHostBurst:          100000,
 		MaxAttempts:           1, // fixture errors are deterministic; retries just slow tests
+		MaxMediaBytes:         clientMediaCap,
 	})
 
 	scrubbed := &recordingScrubber{actors: actors}

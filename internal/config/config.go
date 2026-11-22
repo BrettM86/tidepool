@@ -102,12 +102,16 @@ type Config struct {
 	// window get an OutdatedCursor #info frame and resume from the oldest
 	// retained event.
 	FirehoseRetention time.Duration
-	// MaxBlobBytes caps how many bytes of remote media (avatars, banners,
-	// post images) the materializer will download and store per blob
-	// (MAX_BLOB_BYTES, default 5 MiB). Individual lexicon slots impose
-	// tighter caps (e.g. avatars max 1 MB); this is the outer transport
-	// budget. Fails closed: oversized media is dropped, never truncated.
+	// MaxBlobBytes caps the size of one stored media blob (avatars,
+	// banners, post images; MAX_BLOB_BYTES, default 5 MiB). Individual
+	// lexicon slots impose tighter caps (e.g. avatars max 1 MB). A still
+	// image over its slot's cap is shrunk to fit; an animated one is
+	// dropped. Never truncated.
 	MaxBlobBytes int64
+	// MaxMediaDownloadBytes caps how many bytes of one remote media file are
+	// downloaded (MAX_MEDIA_DOWNLOAD_BYTES, default 25 MiB). Larger files
+	// are dropped.
+	MaxMediaDownloadBytes int64
 	// ProfileRefreshTTL is how stale a bridged actor's materialized profile
 	// may get before the materializer re-fetches and re-materializes it
 	// (PROFILE_REFRESH_TTL, a Go duration, default 24h). AP Update{Person|
@@ -571,6 +575,17 @@ func Load(logger *slog.Logger) (*Config, error) {
 			return nil, fmt.Errorf("config: MAX_BLOB_BYTES must be a positive integer, got %q", maxBlobRaw)
 		}
 		cfg.MaxBlobBytes = parsed
+	}
+	maxMediaDownloadRaw := os.Getenv("MAX_MEDIA_DOWNLOAD_BYTES")
+	if maxMediaDownloadRaw == "" {
+		cfg.MaxMediaDownloadBytes = 25 << 20 // 25 MiB
+		logger.Info("MAX_MEDIA_DOWNLOAD_BYTES not set, using default", "value", cfg.MaxMediaDownloadBytes)
+	} else {
+		parsed, err := strconv.ParseInt(maxMediaDownloadRaw, 10, 64)
+		if err != nil || parsed <= 0 {
+			return nil, fmt.Errorf("config: MAX_MEDIA_DOWNLOAD_BYTES must be a positive integer, got %q", maxMediaDownloadRaw)
+		}
+		cfg.MaxMediaDownloadBytes = parsed
 	}
 
 	profileTTLRaw := os.Getenv("PROFILE_REFRESH_TTL")

@@ -1,16 +1,20 @@
 // Package media converts remote images into formats the Coves lexicons
 // accept. Coves blob slots take png, jpeg, webp and gif only, while some
 // Lemmy instances (lemmy.zip among them) serve their pictures as AVIF, so a
-// bridged post would otherwise lose its images.
+// bridged post would otherwise lose its images. FitStill shrinks a still
+// JPEG, PNG, GIF or WebP that is over its blob slot's byte cap until it
+// fits, so a large picture is stored smaller rather than dropped.
 //
 // AVIF is decoded by gen2brain/avif, which runs libavif compiled to WASM, so
 // a bug in the decoder stays inside the WASM sandbox instead of the process.
 // The binary must be built with -tags nodynamic: without it the package
 // quietly prefers a system libavif loaded through purego, which runs native
-// code on untrusted bytes. Only one decode runs at a time, because a decode
-// cannot be cancelled once started and can briefly use gigabytes of memory.
+// code on untrusted bytes. The other formats use the standard library's
+// decoders and golang.org/x/image/webp. Only one decode runs at a time, AVIF
+// or FitStill, because a decode cannot be cancelled once started and can
+// briefly use gigabytes of memory.
 //
-// A transcode waits at most decodeSlotWait for that slot and then gives up
+// A transcode or fit waits at most decodeSlotWait for that slot and then gives up
 // with ErrDecoderBusy. Transcodes run inside the ingest workers (four, each
 // on a two-minute lease); a hostile instance posting many large AVIFs must
 // not leave every worker queued on the one slot until its lease expires,
@@ -25,10 +29,14 @@
 //   - gen2brain/avif v0.6.0 ignores a failed frame decode, so a corrupt AV1
 //     payload behind valid headers yields uninitialised output with no error.
 //   - No colour management: ICC profiles and wide-gamut primaries are not
-//     converted to sRGB.
-//   - The transcoded image must fit the slot's byte cap. An AVIF that
-//     re-encodes larger (a big translucent PNG, or a 4096px avatar over
-//     1 MB) is omitted, not retried at a smaller size.
+//     converted to sRGB. This applies to FitStill output too, so a fitted
+//     Display P3 photo loses its profile and shows slightly desaturated.
+//   - A transcoded AVIF must fit the slot's byte cap. One that re-encodes
+//     larger (a big translucent PNG, or a 4096px avatar over 1 MB) is
+//     omitted, not retried at a smaller size as FitStill does.
+//   - FitStill refuses animated GIF, WebP and APNG with ErrAnimated rather
+//     than keep one frame, so animated media over its slot's cap is
+//     omitted. Its output is JPEG or PNG; Go has no WebP encoder.
 //   - The WASM module's stdout and stderr are the process's, so dav1d and
 //     libavif diagnostics may appear in the logs unstructured.
 package media
@@ -78,10 +86,10 @@ var (
 	// ErrImageTooLarge: the declared dimensions exceed the decode caps, so
 	// the image was rejected before any pixel was decoded.
 	ErrImageTooLarge = errors.New("media: image too large")
-	// ErrUndecodable: the bytes are not a decodable AVIF, including a
-	// decoder panic on crafted input.
+	// ErrUndecodable: the bytes are not a decodable image of the expected
+	// type, including a decoder panic on crafted input.
 	ErrUndecodable = errors.New("media: undecodable image")
-	// ErrEncodedTooLarge: the transcoded image exceeds the caller's byte cap.
+	// ErrEncodedTooLarge: the re-encoded image exceeds the caller's byte cap.
 	ErrEncodedTooLarge = errors.New("media: encoded image too large")
 	// ErrDecoderBusy: no decode slot came free within decodeSlotWait.
 	ErrDecoderBusy = errors.New("media: decoder busy")
@@ -234,16 +242,22 @@ func decodeFirstFrame(data []byte) (img image.Image, err error) {
 }
 
 // toEightBit returns img as 8-bit RGBA with its long edge capped at
-// maxOutputLongEdge; the short side is rounded half up and never below 1.
-// Smaller images are never upscaled, and an *image.RGBA that needs no
-// scaling is returned unchanged. Anything else (the decoder's *image.RGBA64
-// for high bit depth) is converted, so the PNG encoder never writes 16 bits
-// per channel.
+// maxOutputLongEdge (see scaleToLongEdge).
 func toEightBit(img image.Image) *image.RGBA {
+	return scaleToLongEdge(img, maxOutputLongEdge)
+}
+
+// scaleToLongEdge returns img as 8-bit RGBA with its long edge capped at
+// longEdge; the short side is rounded half up and never below 1. Smaller
+// images are never upscaled, and an *image.RGBA that needs no scaling is
+// returned unchanged. Anything else (the decoder's *image.RGBA64 for high
+// bit depth) is converted, so the PNG encoder never writes 16 bits per
+// channel.
+func scaleToLongEdge(img image.Image, longEdge int) *image.RGBA {
 	bounds := img.Bounds()
 	width, height := bounds.Dx(), bounds.Dy()
-	longEdge := max(width, height)
-	if longEdge <= maxOutputLongEdge {
+	sourceLongEdge := max(width, height)
+	if sourceLongEdge <= longEdge {
 		if rgba, ok := img.(*image.RGBA); ok {
 			return rgba
 		}
@@ -252,9 +266,9 @@ func toEightBit(img image.Image) *image.RGBA {
 		return converted
 	}
 	shortSide := func(side int) int {
-		return max(1, (2*side*maxOutputLongEdge+longEdge)/(2*longEdge))
+		return max(1, (2*side*longEdge+sourceLongEdge)/(2*sourceLongEdge))
 	}
-	targetWidth, targetHeight := maxOutputLongEdge, maxOutputLongEdge
+	targetWidth, targetHeight := longEdge, longEdge
 	if width > height {
 		targetHeight = shortSide(height)
 	} else {
@@ -275,17 +289,31 @@ func isOpaque(img image.Image) bool {
 
 // encode writes img as JPEG when it is opaque, else as PNG.
 func encode(img image.Image, opaque bool) ([]byte, string, error) {
-	var buffer bytes.Buffer
+	mimeType, encoder := "image/png", encodePNG
 	if opaque {
-		if err := jpeg.Encode(&buffer, img, &jpeg.Options{Quality: jpegQuality}); err != nil {
-			return nil, "", fmt.Errorf("media: encoding JPEG: %w", err)
-		}
-		return buffer.Bytes(), "image/jpeg", nil
+		mimeType, encoder = "image/jpeg", func(img image.Image) ([]byte, error) { return encodeJPEG(img, jpegQuality) }
 	}
+	out, err := encoder(img)
+	if err != nil {
+		return nil, "", err
+	}
+	return out, mimeType, nil
+}
+
+func encodeJPEG(img image.Image, quality int) ([]byte, error) {
+	var buffer bytes.Buffer
+	if err := jpeg.Encode(&buffer, img, &jpeg.Options{Quality: quality}); err != nil {
+		return nil, fmt.Errorf("media: encoding JPEG: %w", err)
+	}
+	return buffer.Bytes(), nil
+}
+
+func encodePNG(img image.Image) ([]byte, error) {
+	var buffer bytes.Buffer
 	if err := png.Encode(&buffer, img); err != nil {
-		return nil, "", fmt.Errorf("media: encoding PNG: %w", err)
+		return nil, fmt.Errorf("media: encoding PNG: %w", err)
 	}
-	return buffer.Bytes(), "image/png", nil
+	return buffer.Bytes(), nil
 }
 
 // IsAVIF reports whether data opens with an ISOBMFF ftyp box whose major

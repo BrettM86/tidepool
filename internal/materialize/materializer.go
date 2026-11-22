@@ -93,8 +93,11 @@ const ProfileRKey = "self"
 // before a content-triggered EnsureActor/EnsureCommunity re-fetches it.
 const defaultProfileRefreshTTL = 24 * time.Hour
 
-// defaultMaxBlobBytes is the outer transport budget for one media download.
+// defaultMaxBlobBytes caps one stored media blob.
 const defaultMaxBlobBytes int64 = 5 << 20
+
+// defaultMaxMediaDownloadBytes is the download budget for one media file.
+const defaultMaxMediaDownloadBytes int64 = 25 << 20
 
 // ErrSkipped marks content the bridge deliberately did not materialize:
 // nobridge/deleted authors, tombstoned ancestors, cycles, unusable inputs.
@@ -255,10 +258,13 @@ type Options struct {
 	// ProfileRefreshTTL bounds profile staleness (config.ProfileRefreshTTL;
 	// defaults to 24h).
 	ProfileRefreshTTL time.Duration
-	// MaxBlobBytes is the outer per-blob download budget
-	// (config.MaxBlobBytes; defaults to 5 MiB). Lexicon slot caps (avatar
-	// 1 MB, banner 2 MB, ...) tighten it further.
+	// MaxBlobBytes caps one stored blob (config.MaxBlobBytes; defaults to
+	// 5 MiB). Lexicon slot caps (avatar 1 MB, banner 2 MB, ...) tighten it
+	// further; a still image over the cap is shrunk to fit.
 	MaxBlobBytes int64
+	// MaxMediaDownloadBytes is the download budget for one media file
+	// (config.MaxMediaDownloadBytes; defaults to 25 MiB).
+	MaxMediaDownloadBytes int64
 	// StrictValidation makes a record that fails lexicon validation an
 	// error (development and tests). When false the record is still
 	// validated, but failures are logged loudly and the record is written
@@ -294,6 +300,7 @@ type Materializer struct {
 	serviceDID  string
 	profileTTL  time.Duration
 	maxBlob     int64
+	maxDownload int64
 	strict      bool
 	catalog     *lexicon.BaseCatalog
 	logger      *slog.Logger
@@ -379,6 +386,7 @@ func New(opts Options) (*Materializer, error) {
 		serviceDID:   opts.ServiceDID,
 		profileTTL:   opts.ProfileRefreshTTL,
 		maxBlob:      opts.MaxBlobBytes,
+		maxDownload:  opts.MaxMediaDownloadBytes,
 		strict:       opts.StrictValidation,
 		catalog:      catalog,
 		logger:       logger,
@@ -393,6 +401,9 @@ func New(opts Options) (*Materializer, error) {
 	}
 	if m.maxBlob <= 0 {
 		m.maxBlob = defaultMaxBlobBytes
+	}
+	if m.maxDownload <= 0 {
+		m.maxDownload = defaultMaxMediaDownloadBytes
 	}
 	return m, nil
 }

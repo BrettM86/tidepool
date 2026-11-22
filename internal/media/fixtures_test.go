@@ -3,11 +3,15 @@ package media
 import (
 	"bytes"
 	"encoding/binary"
+	"hash/crc32"
 	"image"
 	"image/color"
+	"image/gif"
 	"image/jpeg"
 	"image/png"
 	"math/rand/v2"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/gen2brain/avif"
@@ -439,4 +443,193 @@ func withTenBitCodecConfig(t *testing.T, data []byte) []byte {
 		}
 	}
 	return patched
+}
+
+// readTestdata returns a committed fixture from testdata/.
+func readTestdata(t *testing.T, name string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("testdata", name))
+	if err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	return data
+}
+
+// decodeOutputImage decodes out with the decoder for mimeType, which must be
+// image/jpeg or image/png.
+func decodeOutputImage(t *testing.T, out []byte, mimeType string) image.Image {
+	t.Helper()
+	switch mimeType {
+	case "image/jpeg":
+		return decodeJPEGOutput(t, out)
+	case "image/png":
+		return decodePNGOutput(t, out)
+	}
+	t.Fatalf("output mimeType = %q, want image/jpeg or image/png", mimeType)
+	return nil
+}
+
+func assertAlphaNear(t *testing.T, label string, got color.NRGBA, want uint8, tolerance int) {
+	t.Helper()
+	if difference := int(got.A) - int(want); difference < -tolerance || difference > tolerance {
+		t.Errorf("%s: alpha = %d, want %d ±%d (got %v)", label, got.A, want, tolerance, got)
+	}
+}
+
+func encodeGIFFixture(t *testing.T, animation *gif.GIF) []byte {
+	t.Helper()
+	var buffer bytes.Buffer
+	if err := gif.EncodeAll(&buffer, animation); err != nil {
+		t.Fatalf("fixture: gif.EncodeAll: %v", err)
+	}
+	return buffer.Bytes()
+}
+
+// pngChunk returns one PNG chunk: length, type, data, CRC over type and data.
+func pngChunk(chunkType string, data []byte) []byte {
+	chunk := binary.BigEndian.AppendUint32(nil, uint32(len(data)))
+	chunk = append(chunk, chunkType...)
+	chunk = append(chunk, data...)
+	return binary.BigEndian.AppendUint32(chunk, crc32.ChecksumIEEE(chunk[4:]))
+}
+
+var pngSignature = []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}
+
+// pngHeaderOnly is a PNG signature, an IHDR declaring width×height 8-bit
+// RGBA, and IEND: no pixel data at all.
+func pngHeaderOnly(width, height uint32) []byte {
+	header := binary.BigEndian.AppendUint32(nil, width)
+	header = binary.BigEndian.AppendUint32(header, height)
+	header = append(header, 8, 6, 0, 0, 0)
+	data := append(bytes.Clone(pngSignature), pngChunk("IHDR", header)...)
+	return append(data, pngChunk("IEND", nil)...)
+}
+
+// jpegHeaderOnly is SOI, a baseline SOF0 declaring width×height with three
+// components, an SOS header, and EOI: no tables or entropy-coded data.
+func jpegHeaderOnly(width, height uint16) []byte {
+	data := []byte{0xff, 0xd8, 0xff, 0xc0, 0x00, 0x11, 0x08}
+	data = binary.BigEndian.AppendUint16(data, height)
+	data = binary.BigEndian.AppendUint16(data, width)
+	data = append(data, 3, 1, 0x11, 0, 2, 0x11, 1, 3, 0x11, 1)
+	data = append(data, 0xff, 0xda, 0x00, 0x0c, 3, 1, 0x00, 2, 0x11, 3, 0x11, 0, 63, 0)
+	return append(data, 0xff, 0xd9)
+}
+
+// gifHeaderOnly is a GIF89a header declaring a width×height logical screen
+// with a two-colour global table, then the trailer: no image descriptor.
+func gifHeaderOnly(width, height uint16) []byte {
+	data := []byte("GIF89a")
+	data = binary.LittleEndian.AppendUint16(data, width)
+	data = binary.LittleEndian.AppendUint16(data, height)
+	data = append(data, 0x80, 0, 0, 0, 0, 0, 0xff, 0xff, 0xff)
+	return append(data, 0x3b)
+}
+
+// webpVP8XHeaderOnly is a RIFF WEBP container holding only a VP8X chunk
+// (no flags) declaring a width×height canvas.
+func webpVP8XHeaderOnly(width, height uint32) []byte {
+	vp8x := []byte{0, 0, 0, 0}
+	vp8x = append(vp8x, byte(width-1), byte((width-1)>>8), byte((width-1)>>16))
+	vp8x = append(vp8x, byte(height-1), byte((height-1)>>8), byte((height-1)>>16))
+	data := []byte("RIFF")
+	data = binary.LittleEndian.AppendUint32(data, uint32(4+8+len(vp8x)))
+	data = append(data, "WEBPVP8X"...)
+	data = binary.LittleEndian.AppendUint32(data, uint32(len(vp8x)))
+	return append(data, vp8x...)
+}
+
+// withAPNGFrames turns a still PNG into a two-frame APNG: acTL and the first
+// fcTL go before IDAT (so IDAT is frame 0), and after IDAT a second fcTL and
+// an fdAT repeat the same pixels as frame 1. image/png ignores these
+// ancillary chunks and decodes the still frame.
+func withAPNGFrames(t *testing.T, data []byte, width, height uint32) []byte {
+	t.Helper()
+	if !bytes.HasPrefix(data, pngSignature) {
+		t.Fatalf("fixture: not a PNG")
+	}
+	frameControl := func(sequence uint32) []byte {
+		control := binary.BigEndian.AppendUint32(nil, sequence)
+		control = binary.BigEndian.AppendUint32(control, width)
+		control = binary.BigEndian.AppendUint32(control, height)
+		control = binary.BigEndian.AppendUint32(control, 0)  // x offset
+		control = binary.BigEndian.AppendUint32(control, 0)  // y offset
+		control = binary.BigEndian.AppendUint16(control, 1)  // delay numerator
+		control = binary.BigEndian.AppendUint16(control, 10) // delay denominator
+		return append(control, 0, 0)                         // dispose, blend
+	}
+	animationControl := binary.BigEndian.AppendUint32(nil, 2) // frames
+	animationControl = binary.BigEndian.AppendUint32(animationControl, 0)
+
+	out := bytes.Clone(pngSignature)
+	var pixelData []byte
+	insertedBefore := false
+	for offset := len(pngSignature); offset+12 <= len(data); {
+		length := int(binary.BigEndian.Uint32(data[offset:]))
+		chunkType := string(data[offset+4 : offset+8])
+		end := offset + 12 + length
+		if end > len(data) {
+			t.Fatalf("fixture: truncated PNG chunk %s", chunkType)
+		}
+		switch chunkType {
+		case "IDAT":
+			if !insertedBefore {
+				out = append(out, pngChunk("acTL", animationControl)...)
+				out = append(out, pngChunk("fcTL", frameControl(0))...)
+				insertedBefore = true
+			}
+			pixelData = append(pixelData, data[offset+8:offset+8+length]...)
+		case "IEND":
+			out = append(out, pngChunk("fcTL", frameControl(1))...)
+			out = append(out, pngChunk("fdAT", append(binary.BigEndian.AppendUint32(nil, 2), pixelData...))...)
+		}
+		out = append(out, data[offset:end]...)
+		offset = end
+	}
+	if !insertedBefore {
+		t.Fatalf("fixture: PNG has no IDAT")
+	}
+	return out
+}
+
+// withEXIFOrientation inserts, right after SOI, an APP1 Exif segment whose
+// big-endian TIFF IFD0 holds a single Orientation (0x0112) entry.
+func withEXIFOrientation(t *testing.T, data []byte, orientation uint16) []byte {
+	t.Helper()
+	if len(data) < 2 || data[0] != 0xff || data[1] != 0xd8 {
+		t.Fatalf("fixture: not a JPEG")
+	}
+	payload := []byte("Exif\x00\x00MM\x00\x2a")
+	payload = binary.BigEndian.AppendUint32(payload, 8) // IFD0 offset
+	payload = binary.BigEndian.AppendUint16(payload, 1) // entry count
+	payload = binary.BigEndian.AppendUint16(payload, 0x0112)
+	payload = binary.BigEndian.AppendUint16(payload, 3) // SHORT
+	payload = binary.BigEndian.AppendUint32(payload, 1) // count
+	payload = binary.BigEndian.AppendUint16(payload, orientation)
+	payload = append(payload, 0, 0)                     // value padding
+	payload = binary.BigEndian.AppendUint32(payload, 0) // no next IFD
+	segment := []byte{0xff, 0xe1}
+	segment = binary.BigEndian.AppendUint16(segment, uint16(len(payload)+2))
+	segment = append(segment, payload...)
+
+	out := append([]byte{0xff, 0xd8}, segment...)
+	return append(out, data[2:]...)
+}
+
+// withJPEGCommentPadding inserts COM segments totalling at least padding
+// bytes right after SOI, growing the file without changing its pixels.
+func withJPEGCommentPadding(t *testing.T, data []byte, padding int) []byte {
+	t.Helper()
+	if len(data) < 2 || data[0] != 0xff || data[1] != 0xd8 {
+		t.Fatalf("fixture: not a JPEG")
+	}
+	out := []byte{0xff, 0xd8}
+	for written := 0; written < padding; {
+		size := min(padding-written, 60000)
+		out = append(out, 0xff, 0xfe)
+		out = binary.BigEndian.AppendUint16(out, uint16(size+2))
+		out = append(out, bytes.Repeat([]byte{'x'}, size)...)
+		written += size
+	}
+	return append(out, data[2:]...)
 }

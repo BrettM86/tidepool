@@ -340,8 +340,9 @@ type ClientOptions struct {
 	// MaxResponseBytes caps AP object/collection response bodies.
 	MaxResponseBytes int64
 	// MaxMediaBytes caps FetchMedia response bodies (avatars, banners, post
-	// images) independently of MaxResponseBytes, so raising the blob budget
-	// (MAX_BLOB_BYTES) does not also raise the JSON-object cap. Zero falls
+	// images) independently of MaxResponseBytes, so raising the media
+	// budgets (MAX_MEDIA_DOWNLOAD_BYTES, MAX_BLOB_BYTES) does not also raise
+	// the JSON-object cap. Zero falls
 	// back to MaxResponseBytes' effective value — the pre-task-11 behavior,
 	// where the object cap silently clamped media.
 	MaxMediaBytes int64
@@ -753,7 +754,7 @@ func visitItems(page *Object, visit func(*Object) error) error {
 // same SSRF egress guard, per-host rate limiting, retries, redirect handling,
 // and signing as AP object fetches. maxBytes caps the response body for this
 // call (values <= 0 or above the client cap fall back to the client cap) —
-// the materializer passes its blob-size budget so oversized media fails
+// the materializer passes its media download budget so media over it fails
 // closed at read time instead of buffering the client-wide maximum.
 //
 // It returns the body and the response Content-Type (as sent by the server,
@@ -762,8 +763,8 @@ func visitItems(page *Object, visit func(*Object) error) error {
 // → HTTPError. Content-type policy (images only) is the caller's job — the
 // transport layer cannot know which lexicon slot the bytes are for. The
 // outer clamp is the MEDIA cap (ClientOptions.MaxMediaBytes, wired from
-// MAX_BLOB_BYTES), not the JSON-object cap, so blob budgets above 5 MiB
-// actually take effect.
+// the larger of MAX_MEDIA_DOWNLOAD_BYTES and MAX_BLOB_BYTES), not the
+// JSON-object cap, so media budgets above 5 MiB actually take effect.
 func (c *Client) FetchMedia(ctx context.Context, iri string, maxBytes int64) (data []byte, contentType string, err error) {
 	if maxBytes <= 0 || maxBytes > c.maxMediaBytes {
 		maxBytes = c.maxMediaBytes

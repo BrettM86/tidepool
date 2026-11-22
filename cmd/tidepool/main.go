@@ -448,9 +448,10 @@ func run(logger *slog.Logger) error {
 		UserAgent:           cfg.UserAgent,
 		UserOriginUserAgent: cfg.UserOriginUserAgent,
 		Signer:              serviceActor.Signer(),
-		// MAX_BLOB_BYTES governs media downloads only; the JSON-object cap
-		// keeps its own (smaller) default.
-		MaxMediaBytes:         cfg.MaxBlobBytes,
+		// The media cap is the larger of the download budget and the
+		// stored-blob cap, so neither is clamped by the other; the
+		// JSON-object cap keeps its own (smaller) default.
+		MaxMediaBytes:         max(cfg.MaxMediaDownloadBytes, cfg.MaxBlobBytes),
 		AllowPrivateAddresses: cfg.AllowPrivateAddresses,
 	})
 
@@ -549,12 +550,13 @@ func run(logger *slog.Logger) error {
 		OutboundObjects: store.NewOutboundObjects(database),
 		// An inbound moderation decision updates the admissions ledger too, so
 		// the operator surface reflects it when the MODERATOR acts.
-		Ledger:            accept.NewAdmissions(database),
-		ServiceDID:        serviceDID,
-		ProfileRefreshTTL: cfg.ProfileRefreshTTL,
-		MaxBlobBytes:      cfg.MaxBlobBytes,
-		StrictValidation:  cfg.IsDevelopment(),
-		Logger:            logger,
+		Ledger:                accept.NewAdmissions(database),
+		ServiceDID:            serviceDID,
+		ProfileRefreshTTL:     cfg.ProfileRefreshTTL,
+		MaxBlobBytes:          cfg.MaxBlobBytes,
+		MaxMediaDownloadBytes: cfg.MaxMediaDownloadBytes,
+		StrictValidation:      cfg.IsDevelopment(),
+		Logger:                logger,
 		// Nodeinfo discovery for profiles' originSoftware goes through the
 		// SSRF-guarded client like every other fetch of a remote instance.
 		Instances:      instances,

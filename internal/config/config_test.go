@@ -42,7 +42,7 @@ func clearConfigEnv(t *testing.T) {
 		"BRIDGED_VOTE_VERIFY_BATCH",
 		"BLOB_STORE", "BLOB_S3_ENDPOINT", "BLOB_S3_REGION", "BLOB_S3_BUCKET",
 		"BLOB_S3_ACCESS_KEY_ID", "BLOB_S3_SECRET_ACCESS_KEY",
-		"TRUSTED_PROXY_CIDRS",
+		"TRUSTED_PROXY_CIDRS", "MAX_MEDIA_DOWNLOAD_BYTES",
 	} {
 		t.Setenv(name, "")
 	}
@@ -185,6 +185,41 @@ func TestLoad_PLCWritesPerMinute(t *testing.T) {
 			}
 			require.NoError(t, err)
 			require.Equal(t, tc.wantRate, cfg.PLCWritesPerMinute)
+		})
+	}
+}
+
+func TestLoad_MaxMediaDownloadBytes(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		value     string
+		unset     bool
+		wantBytes int64
+		wantError bool
+	}{
+		{name: "unset defaults to 25 MiB", unset: true, wantBytes: 26214400},
+		{name: "empty defaults to 25 MiB", value: "", wantBytes: 26214400},
+		{name: "explicit value", value: "1048576", wantBytes: 1048576},
+		{name: "above the int32 range", value: "8589934592", wantBytes: 8589934592},
+		{name: "zero", value: "0", wantError: true},
+		{name: "negative", value: "-5", wantError: true},
+		{name: "not numeric", value: "25MiB", wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearConfigEnv(t)
+			if tc.unset {
+				require.NoError(t, os.Unsetenv("MAX_MEDIA_DOWNLOAD_BYTES"))
+			} else {
+				t.Setenv("MAX_MEDIA_DOWNLOAD_BYTES", tc.value)
+			}
+			cfg, err := Load(discardLogger())
+			if tc.wantError {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), "MAX_MEDIA_DOWNLOAD_BYTES")
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.wantBytes, cfg.MaxMediaDownloadBytes)
 		})
 	}
 }

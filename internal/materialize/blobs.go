@@ -18,29 +18,35 @@ import (
 
 // blobSlot describes the lexicon slot a fetched image will fill: its
 // size cap and accepted mime types come straight from the vendored lexicon
-// definitions. Everything fails closed — wrong type or oversize means no
-// blob, never a truncated or mislabeled one.
+// definitions. maxLongEdge caps the long edge, in pixels, of a still image
+// re-encoded because it was over the size cap. Everything fails closed — a
+// wrong type, or oversize media that cannot be shrunk to fit, means no blob,
+// never a truncated or mislabeled one.
 type blobSlot struct {
-	name    string
-	maxSize int64
-	accept  []string
+	name        string
+	maxSize     int64
+	accept      []string
+	maxLongEdge int
 }
 
 var (
 	// social.coves.actor.profile / community.profile avatar+banner.
-	slotAvatar = blobSlot{"avatar", 1_000_000, []string{"image/png", "image/jpeg", "image/webp"}}
-	slotBanner = blobSlot{"banner", 2_000_000, []string{"image/png", "image/jpeg", "image/webp"}}
-	// social.coves.embed.images#image (posts allow gif).
-	slotEmbedImage = blobSlot{"embed image", 10_000_000, []string{"image/png", "image/jpeg", "image/webp", "image/gif"}}
+	slotAvatar = blobSlot{"avatar", 1_000_000, []string{"image/png", "image/jpeg", "image/webp"}, 1000}
+	slotBanner = blobSlot{"banner", 2_000_000, []string{"image/png", "image/jpeg", "image/webp"}, 3000}
+	// social.coves.embed.images#image (posts allow gif). 4096 matches the
+	// AVIF transcode's output cap, so tall comics keep a readable width.
+	slotEmbedImage = blobSlot{"embed image", 10_000_000, []string{"image/png", "image/jpeg", "image/webp", "image/gif"}, 4096}
 	// social.coves.embed.external#external thumb.
-	slotExternalThumb = blobSlot{"external thumb", 6_000_000, []string{"image/png", "image/jpeg", "image/webp"}}
+	slotExternalThumb = blobSlot{"external thumb", 6_000_000, []string{"image/png", "image/jpeg", "image/webp"}, 2000}
 )
 
 // fetchBlob downloads remote media through the SSRF-guarded AP client and
 // stores it as a blob in the DID's repo, returning the blob ref for the
 // record. AVIF is transcoded to JPEG, or PNG when it has transparency,
-// because no lexicon slot accepts it. Problems with the media itself
-// (unreachable at origin, oversize, wrong content type, failed transcode)
+// because no lexicon slot accepts it. A still image over the slot's size
+// cap is shrunk and re-encoded until it fits (see media.FitStill). Problems
+// with the media itself (unreachable at origin, over the download budget,
+// animated and oversize, wrong content type, failed transcode or fit)
 // log a reason and return (nil, nil) so the caller omits the image rather
 // than dropping the record. A byte-store failure is not about the media: it
 // returns an error satisfying errors.IsBlobStoreUnavailable, and the caller
@@ -57,8 +63,9 @@ func (m *Materializer) fetchBlob(ctx context.Context, did, url string, slot blob
 // so carry-forward callers can distinguish a permanent removal (IsNotFound
 // for 404/401/403, IsTombstoned for 410 — the image is gone at the source)
 // from a transient failure (timeout/5xx/dial — the image is probably still
-// there). Unusable-media outcomes (wrong content type, oversize, failed AVIF
-// transcode — including a busy decoder) return (nil, nil), meaning no
+// there). Unusable-media outcomes (wrong content type, oversize media that
+// cannot be fitted, failed AVIF transcode — including a busy decoder)
+// return (nil, nil), meaning no
 // removal signal: a post image is omitted this pass, and profile media
 // carries the stored blob forward. A byte-store failure returns an error
 // satisfying errors.IsBlobStoreUnavailable, which callers check before any
@@ -70,7 +77,8 @@ func (m *Materializer) fetchBlobClassified(ctx context.Context, did, url string,
 }
 
 // fetchMedia is fetchBlobClassified that also returns the bytes the blob ref
-// describes (after any transcode), for callers that read the image header.
+// describes (after any transcode or fit), for callers that read the image
+// header.
 // The bytes are non-nil exactly when the blob is, including a withheld blob
 // whose bytes were not stored.
 func (m *Materializer) fetchMedia(ctx context.Context, did, url string, slot blobSlot) (*atdata.Blob, []byte, error) {
@@ -78,18 +86,21 @@ func (m *Materializer) fetchMedia(ctx context.Context, did, url string, slot blo
 }
 
 // fetchAndStoreMedia is fetchMedia with the origin download bounded by
-// fetchCtx and the transcode and byte-store write by storeCtx, so a caller's
-// download deadline never cuts the store and turns a store outage into a
-// missing image.
+// fetchCtx and the transcode, fit and byte-store write by storeCtx, so a
+// caller's download deadline never cuts the store and turns a store outage
+// into a missing image.
+//
+// The download is bounded by the download budget, the stored blob by the
+// slot's cap clamped by MaxBlobBytes. Media between the two is fitted
+// before the slot's type check, so an oversized still GIF reaches a slot
+// that does not take GIF as JPEG or PNG; media under the store cap is
+// stored as served.
 func (m *Materializer) fetchAndStoreMedia(fetchCtx, storeCtx context.Context, did, url string, slot blobSlot) (*atdata.Blob, []byte, error) {
 	if url == "" {
 		return nil, nil, nil
 	}
-	budget := slot.maxSize
-	if m.maxBlob < budget {
-		budget = m.maxBlob
-	}
-	data, contentType, err := m.fetcher.FetchMedia(fetchCtx, url, budget)
+	storeCap := min(slot.maxSize, m.maxBlob)
+	data, contentType, err := m.fetcher.FetchMedia(fetchCtx, url, m.maxDownload)
 	if err != nil {
 		m.logger.Warn("media fetch failed; omitting image",
 			"slot", slot.name, "url", url, "error", err)
@@ -97,9 +108,9 @@ func (m *Materializer) fetchAndStoreMedia(fetchCtx, storeCtx context.Context, di
 	}
 	mimeType := normalizeImageMime(contentType, data)
 	// No slot accepts AVIF, and servers mislabel it, so it is detected from
-	// the header or the bytes and transcoded under the same budget.
+	// the header or the bytes and transcoded under the store cap.
 	if mimeType == "image/avif" || media.IsAVIF(data) {
-		data, mimeType, err = media.TranscodeAVIF(storeCtx, data, budget)
+		data, mimeType, err = media.TranscodeAVIF(storeCtx, data, storeCap)
 		if err != nil {
 			// A busy decoder or a cancelled ingest says nothing about the
 			// media, so it is logged apart from bad media.
@@ -109,6 +120,19 @@ func (m *Materializer) fetchAndStoreMedia(fetchCtx, storeCtx context.Context, di
 				return nil, nil, nil
 			}
 			m.logger.Warn("media transcode failed; omitting image",
+				"slot", slot.name, "url", url, "error", err)
+			return nil, nil, nil
+		}
+	}
+	if int64(len(data)) > storeCap {
+		data, mimeType, err = media.FitStill(storeCtx, data, mimeType, storeCap, slot.maxLongEdge)
+		if err != nil {
+			if reason := transcodeSkipReason(err); reason != "" {
+				m.logger.Warn("media fit skipped; omitting image",
+					"slot", slot.name, "url", url, "reason", reason, "error", err)
+				return nil, nil, nil
+			}
+			m.logger.Warn("media over slot cap could not be fitted; omitting image",
 				"slot", slot.name, "url", url, "error", err)
 			return nil, nil, nil
 		}
@@ -140,9 +164,9 @@ func (m *Materializer) fetchAndStoreMedia(fetchCtx, storeCtx context.Context, di
 	return blob, data, nil
 }
 
-// transcodeSkipReason names why a transcode never looked at the media (the
-// decoder was busy, or the context ended), or returns "" when the error is
-// about the media itself.
+// transcodeSkipReason names why a transcode or fit never finished looking at
+// the media (the decoder was busy, or the context ended), or returns "" when
+// the error is about the media itself.
 func transcodeSkipReason(err error) string {
 	switch {
 	case errors.Is(err, media.ErrDecoderBusy):

@@ -38,6 +38,10 @@
           "type": "ref",
           "ref": "social.coves.actor.defs#accountBanNotice",
           "description": "Present while the viewer's account is banned on this instance."
+        },
+        "hasCommunityRole": {
+          "type": "boolean",
+          "description": "Whether the viewer holds a usable owner or moderator role in any community this instance hosts and has not removed."
         }
       }
     }

@@ -92,6 +92,11 @@
           "format": "at-uri",
           "description": "AT-URI of the community acceptance record that admitted this post. Present only while an acceptance stands. Optional."
         },
+        "communityRemoval": {
+          "type": "ref",
+          "ref": "#communityRemoval",
+          "description": "The community's removal of this post. Present only on the post author's own view while a community removal stands. Optional."
+        },
         "moderation": {
           "type": "ref",
           "ref": "social.coves.moderation.defs#moderationView",
@@ -198,6 +203,34 @@
         }
       }
     },
+    "communityRemoval": {
+      "type": "object",
+      "description": "A community's removal of a post, as its author sees it.",
+      "required": [
+        "code"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "knownValues": [
+            "rule-violation",
+            "spam",
+            "off-topic",
+            "illegal-content",
+            "author-banned",
+            "moderator-discretion"
+          ],
+          "description": "The community's removal decision code. knownValues is an open set.",
+          "maxLength": 64
+        },
+        "reason": {
+          "type": "string",
+          "maxGraphemes": 1000,
+          "maxLength": 10000,
+          "description": "The community's human-readable explanation of the removal. Optional."
+        }
+      }
+    },
     "removedPost": {
       "type": "object",
       "description": "The community's own removal decision. Served as a tombstone carrying the removal code, distinct from notFoundPost (which is indistinguishable from 'never existed'); instance moderation is served as moderatedPost.",
@@ -218,6 +251,28 @@
           "type": "string",
           "description": "The community's removal decision code (e.g. rule-violation, spam, off-topic).",
           "maxLength": 64
+        },
+        "viewer": {
+          "type": "ref",
+          "ref": "#removedPostViewerState",
+          "description": "The viewer's state on the removed post. Present only when the viewer may take a community moderation action on it."
+        }
+      }
+    },
+    "removedPostViewerState": {
+      "type": "object",
+      "description": "Viewer state on a removedPost tombstone. Carries only community moderation actions; the tombstone has no content or author to act on beyond restoring it.",
+      "properties": {
+        "communityModeration": {
+          "type": "array",
+          "description": "Community moderation actions the viewer may take on the community-removed post, using the modlog action tokens. Omitted when there are none.",
+          "items": {
+            "type": "string",
+            "knownValues": [
+              "restore"
+            ],
+            "maxLength": 64
+          }
         }
       }
     },
@@ -402,6 +457,19 @@
             ],
             "maxLength": 64
           }
+        },
+        "communityModeration": {
+          "type": "array",
+          "description": "Community moderation actions the viewer may take on this post in its community, as the viewer's community authority (moderator, owner, or an instance admin acting for the community) allows. remove and restore are the modlog action tokens; ban-author bans the post's author from the community and is omitted when the author holds a role there. Omitted when there are none.",
+          "items": {
+            "type": "string",
+            "knownValues": [
+              "remove",
+              "restore",
+              "ban-author"
+            ],
+            "maxLength": 64
+          }
         }
       }
     },
@@ -419,6 +487,19 @@
               "restore",
               "label",
               "retract-label"
+            ],
+            "maxLength": 64
+          }
+        },
+        "communityModeration": {
+          "type": "array",
+          "description": "Community moderation actions the viewer may take on the post in its community, decided by the post's community admission status and the viewer's community authority. remove and restore are the modlog action tokens; ban-author bans the post's author from the community and is omitted when the author holds a role there. Omitted when there are none.",
+          "items": {
+            "type": "string",
+            "knownValues": [
+              "remove",
+              "restore",
+              "ban-author"
             ],
             "maxLength": 64
           }

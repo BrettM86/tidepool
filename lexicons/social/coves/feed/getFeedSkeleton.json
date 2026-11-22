@@ -1,0 +1,93 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.feed.getFeedSkeleton",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Get an ordered page of post URIs from a feed generator. Served by the generator's service and called by the AppView, which hydrates the posts.",
+      "parameters": {
+        "type": "params",
+        "required": ["feed", "scope"],
+        "properties": {
+          "feed": {
+            "type": "string",
+            "format": "at-uri",
+            "description": "AT-URI of the social.coves.feed.generator record being requested"
+          },
+          "scope": {
+            "type": "string",
+            "knownValues": ["all", "home", "community"],
+            "maxLength": 64,
+            "description": "Which feed surface the request is for: all communities, the viewer's home feed, or one community"
+          },
+          "community": {
+            "type": "string",
+            "format": "did",
+            "description": "DID of the community for scope=community"
+          },
+          "timeframe": {
+            "type": "string",
+            "knownValues": ["hour", "day", "week", "month", "year", "all"],
+            "default": "day",
+            "maxLength": 64,
+            "description": "Timeframe for feeds ranked by top score"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 50
+          },
+          "cursor": {
+            "type": "string",
+            "maxLength": 500
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#output"
+        }
+      },
+      "errors": [
+        {
+          "name": "UnknownFeed",
+          "description": "The generator does not serve the requested feed."
+        },
+        {
+          "name": "UnsupportedFeedScope",
+          "description": "The generator does not support the requested scope."
+        },
+        {
+          "name": "InvalidCursor",
+          "description": "The cursor is malformed or expired."
+        }
+      ]
+    },
+    "output": {
+      "type": "object",
+      "description": "A page of post URIs in the generator's order",
+      "required": ["feed"],
+      "properties": {
+        "feed": {
+          "type": "array",
+          "items": {
+            "type": "ref",
+            "ref": "social.coves.feed.defs#skeletonFeedPost"
+          }
+        },
+        "cursor": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "reqId": {
+          "type": "string",
+          "maxLength": 100,
+          "description": "Request ID assigned by the generator. The AppView returns it on the hydrated response, and clients send it back with interactions."
+        }
+      }
+    }
+  }
+}

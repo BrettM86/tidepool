@@ -1,0 +1,105 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.feed.getFeed",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Get a page of hydrated posts for a feed surface. Without feed, the AppView's default ordering for the scope is used; with feed, the named generator orders the posts.",
+      "parameters": {
+        "type": "params",
+        "required": ["scope"],
+        "properties": {
+          "feed": {
+            "type": "string",
+            "format": "at-uri",
+            "description": "AT-URI of a social.coves.feed.generator record. Omit to use the default ordering for the scope."
+          },
+          "scope": {
+            "type": "string",
+            "knownValues": ["all", "home", "community"],
+            "maxLength": 64,
+            "description": "Which feed surface the request is for: all communities, the viewer's home feed, or one community"
+          },
+          "community": {
+            "type": "string",
+            "maxLength": 320,
+            "description": "Community for scope=community (DID, handle, name@origin, or bare local name)"
+          },
+          "timeframe": {
+            "type": "string",
+            "knownValues": ["hour", "day", "week", "month", "year", "all"],
+            "default": "day",
+            "maxLength": 64,
+            "description": "Timeframe for feeds ranked by top score"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 50,
+            "default": 15
+          },
+          "cursor": {
+            "type": "string",
+            "maxLength": 500
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#output"
+        }
+      },
+      "errors": [
+        {
+          "name": "UnknownFeed",
+          "description": "The feed URI does not name a known feed generator."
+        },
+        {
+          "name": "UnsupportedFeedScope",
+          "description": "The feed generator does not support the requested scope."
+        },
+        {
+          "name": "InvalidCursor",
+          "description": "The cursor is malformed or expired; restart from the first page."
+        },
+        {
+          "name": "CommunityNotFound",
+          "description": "The community for scope=community does not exist."
+        },
+        {
+          "name": "AmbiguousCommunity",
+          "description": "The name@origin community identifier matches more than one community; address it by DID or handle instead."
+        },
+        {
+          "name": "DiscoverUnavailable",
+          "description": "The all-communities feed is temporarily unavailable; retry later."
+        }
+      ]
+    },
+    "output": {
+      "type": "object",
+      "description": "A page of feed posts",
+      "required": ["feed"],
+      "properties": {
+        "feed": {
+          "type": "array",
+          "items": {
+            "type": "ref",
+            "ref": "social.coves.feed.defs#feedViewPost"
+          }
+        },
+        "cursor": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "reqId": {
+          "type": "string",
+          "maxLength": 100,
+          "description": "Request ID for this response, from the feed generator or assigned by the AppView. Clients send it back with interactions on items from this response."
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,200 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.moderation.getCommunityState",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Get a subject's community moderation state and its version, as indexed by this AppView. Requires authentication; the caller must be an owner or moderator of the subject's community, or an instance admin, and the community must be hosted by this instance and not removed. A post or comment subject is read in the community its index names, never the request community. The version starts at 0 and advances on every indexed community record change for the subject (acceptance, removal, ban and role records and their deletes). A post's status can also move through AppView-local states (pending, pending_reacceptance, rejected), and a ban stops being in force at its expiresAt; neither changes the version.",
+      "parameters": {
+        "type": "params",
+        "description": "Subject whose community moderation state is requested",
+        "required": [
+          "subject"
+        ],
+        "properties": {
+          "subject": {
+            "type": "string",
+            "description": "A post or comment AT-URI, or a DID: an account's DID for its community ban, or the community's own DID for its roster"
+          },
+          "community": {
+            "type": "string",
+            "format": "did",
+            "description": "DID of the community; required when the subject is a DID, ignored for a post or comment AT-URI"
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#output"
+        }
+      },
+      "errors": [
+        {
+          "name": "AuthRequired",
+          "description": "Authentication is required; sign in before retrying."
+        },
+        {
+          "name": "Forbidden",
+          "description": "The caller is not a moderator of the subject's community, or the community is not hosted here or is removed; do not retry unless that changes."
+        },
+        {
+          "name": "InvalidRequest",
+          "description": "A DID subject was given without a valid community DID; correct the request before retrying."
+        },
+        {
+          "name": "InvalidSubject",
+          "description": "The subject is malformed, uses an unsupported collection, or is a post or comment this AppView has not indexed in a community."
+        },
+        {
+          "name": "ModerationUnavailable",
+          "description": "The moderation service is temporarily unavailable; retry later."
+        }
+      ]
+    },
+    "output": {
+      "type": "object",
+      "description": "A subject's community moderation state and version; exactly the object for its kind is present, except that an account without an in-force ban has no ban",
+      "required": [
+        "community",
+        "subject",
+        "kind",
+        "version"
+      ],
+      "properties": {
+        "community": {
+          "type": "string",
+          "format": "did",
+          "description": "DID of the community whose state this is"
+        },
+        "subject": {
+          "type": "string",
+          "description": "The requested subject"
+        },
+        "kind": {
+          "type": "string",
+          "knownValues": [
+            "post",
+            "comment",
+            "account",
+            "roster"
+          ],
+          "description": "Kind of the subject"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of indexed community record changes for the subject (acceptance, removal, ban and role records and their deletes); 0 when there have been none. AppView-local post statuses and a ban reaching its expiresAt do not change it"
+        },
+        "post": {
+          "type": "ref",
+          "ref": "#postState"
+        },
+        "comment": {
+          "type": "ref",
+          "ref": "#commentState"
+        },
+        "ban": {
+          "type": "ref",
+          "ref": "#banState"
+        },
+        "roster": {
+          "type": "ref",
+          "ref": "#rosterState"
+        }
+      }
+    },
+    "postState": {
+      "type": "object",
+      "description": "A post's admission in the community",
+      "required": [
+        "status"
+      ],
+      "properties": {
+        "status": {
+          "type": "string",
+          "knownValues": [
+            "none",
+            "pending",
+            "accepted",
+            "pending_reacceptance",
+            "rejected",
+            "removed"
+          ],
+          "description": "Admission status of the post in the community; none when the community has no admission for it"
+        }
+      }
+    },
+    "commentState": {
+      "type": "object",
+      "description": "A comment's community removal state",
+      "required": [
+        "removed"
+      ],
+      "properties": {
+        "removed": {
+          "type": "boolean",
+          "description": "Whether the community has removed the comment"
+        }
+      }
+    },
+    "banState": {
+      "type": "object",
+      "description": "An account's in-force community ban",
+      "required": [
+        "recordUri"
+      ],
+      "properties": {
+        "reason": {
+          "type": "string",
+          "maxGraphemes": 2000,
+          "maxLength": 20000,
+          "description": "Reason given in the ban record"
+        },
+        "expiresAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "When the ban ends; absent for a ban without an end"
+        },
+        "recordUri": {
+          "type": "string",
+          "format": "at-uri",
+          "description": "AT-URI of the community's ban record"
+        }
+      }
+    },
+    "rosterState": {
+      "type": "object",
+      "description": "The community's effective roster",
+      "required": [
+        "moderators"
+      ],
+      "properties": {
+        "owner": {
+          "type": "ref",
+          "ref": "#rosterMember"
+        },
+        "moderators": {
+          "type": "array",
+          "items": {
+            "type": "ref",
+            "ref": "#rosterMember"
+          }
+        }
+      }
+    },
+    "rosterMember": {
+      "type": "object",
+      "required": [
+        "did"
+      ],
+      "properties": {
+        "did": {
+          "type": "string",
+          "format": "did"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,136 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.community.removeComment",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Remove a comment from the community its thread is in, with that community's authority. The comment's community is the community of the post its parent chain reaches. The caller must be a moderator of that community, which this instance must host, or an instance admin; an admin's removal is recorded as an admin acting for the community. The instance writes one commit to the community's repo that writes its social.coves.community.removal record about the comment, and applies the removal to its index before responding; the comment is then served as removed by the community, and its replies stay visible. The actor is the authenticated account, never a request field. Comment and post removals share one rate limit per moderator and per community; instance admins are exempt.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#input"
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#output"
+        }
+      },
+      "errors": [
+        {
+          "name": "AuthRequired",
+          "description": "Authentication is required; sign in before retrying."
+        },
+        {
+          "name": "Forbidden",
+          "description": "The caller is neither a moderator of the comment's community nor an instance admin, or the community is not hosted here or is removed; do not retry."
+        },
+        {
+          "name": "InvalidRequest",
+          "description": "The request is incomplete or malformed: subject is not a social.coves.community.comment AT-URI, code is not a removal code, reason is too long, expectedVersion is negative or idempotencyKey is empty or too long; correct it before retrying."
+        },
+        {
+          "name": "CommentNotFound",
+          "description": "The comment is not indexed, or its parent chain does not reach a post indexed in a community; do not retry."
+        },
+        {
+          "name": "StateConflict",
+          "description": "expectedVersion is not the comment's current community version, the comment's thread moved to another community, or the indexed removal is behind the community's repo; refetch getCommunityState for the comment before retrying."
+        },
+        {
+          "name": "IdempotencyConflict",
+          "description": "The same key was reused with a different request; do not retry with that key."
+        },
+        {
+          "name": "RateLimitExceeded",
+          "description": "The caller or the community has made too many post and comment removals in the last hour; retry later."
+        },
+        {
+          "name": "ModerationUnavailable",
+          "description": "The moderation service or the community's repo is temporarily unavailable; retry later with the same idempotency key."
+        }
+      ]
+    },
+    "input": {
+      "type": "object",
+      "description": "Request to remove a comment from its community",
+      "required": [
+        "subject",
+        "code",
+        "expectedVersion",
+        "idempotencyKey"
+      ],
+      "properties": {
+        "subject": {
+          "type": "string",
+          "format": "at-uri",
+          "description": "AT-URI of the comment to remove"
+        },
+        "code": {
+          "type": "string",
+          "knownValues": [
+            "rule-violation",
+            "spam",
+            "off-topic",
+            "illegal-content",
+            "author-banned",
+            "moderator-discretion",
+            "harassment",
+            "doxing"
+          ],
+          "maxLength": 64,
+          "description": "Machine-readable reason for the removal, written to the removal record as is. The instance accepts only the known values."
+        },
+        "reason": {
+          "type": "string",
+          "maxGraphemes": 1000,
+          "maxLength": 10000,
+          "description": "Human-readable explanation shown to the author and in the moderation log"
+        },
+        "expectedVersion": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The comment's community version (getCommunityState with the comment AT-URI as subject) the caller expects"
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Opaque key that makes a retry of the same request return its first result; scoped to the caller and the community"
+        }
+      }
+    },
+    "output": {
+      "type": "object",
+      "description": "The community decision on the comment, applied before the response returns",
+      "required": [
+        "uri",
+        "version",
+        "alreadyApplied"
+      ],
+      "properties": {
+        "uri": {
+          "type": "string",
+          "format": "at-uri",
+          "description": "AT-URI of the community's removal record about the comment"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The comment's community version after the action"
+        },
+        "actionId": {
+          "type": "string",
+          "description": "ID of the moderation action logged for the change; absent when the decision was already in place"
+        },
+        "alreadyApplied": {
+          "type": "boolean",
+          "description": "True when the decision was already in place, so nothing was written and no action was logged"
+        }
+      }
+    }
+  }
+}

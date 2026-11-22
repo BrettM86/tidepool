@@ -1,0 +1,48 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.feed.sendInteractions",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Report interaction events on items from a feed back to its feed generator. Defined now; not served until a later phase.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#input"
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#output"
+        }
+      }
+    },
+    "input": {
+      "type": "object",
+      "description": "Interactions with items from one feed",
+      "required": ["feed", "interactions"],
+      "properties": {
+        "feed": {
+          "type": "string",
+          "format": "at-uri",
+          "description": "AT-URI of the social.coves.feed.generator record the items came from"
+        },
+        "interactions": {
+          "type": "array",
+          "items": {
+            "type": "ref",
+            "ref": "social.coves.feed.defs#interaction"
+          }
+        }
+      }
+    },
+    "output": {
+      "type": "object",
+      "description": "Empty acknowledgement",
+      "properties": {}
+    }
+  }
+}

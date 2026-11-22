@@ -1,0 +1,48 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.feed.describeFeedGenerator",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Describe the feeds a feed generator service serves. Served by the generator's service.",
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#output"
+        }
+      }
+    },
+    "output": {
+      "type": "object",
+      "description": "The service DID and the feeds it serves",
+      "required": ["did", "feeds"],
+      "properties": {
+        "did": {
+          "type": "string",
+          "format": "did",
+          "description": "DID of the feed generator service"
+        },
+        "feeds": {
+          "type": "array",
+          "items": {
+            "type": "ref",
+            "ref": "#feed"
+          }
+        }
+      }
+    },
+    "feed": {
+      "type": "object",
+      "description": "One feed the service serves",
+      "required": ["uri"],
+      "properties": {
+        "uri": {
+          "type": "string",
+          "format": "at-uri",
+          "description": "AT-URI of the social.coves.feed.generator record"
+        }
+      }
+    }
+  }
+}

@@ -19,6 +19,11 @@
         "reply": {
           "type": "ref",
           "ref": "#replyRef"
+        },
+        "feedContext": {
+          "type": "string",
+          "maxLength": 2000,
+          "description": "Opaque context from the feed generator for this item. Clients pass it back unchanged with interactions."
         }
       }
     },
@@ -77,6 +82,216 @@
           "format": "cid"
         }
       }
+    },
+    "scope": {
+      "type": "string",
+      "description": "Where a feed generator can be used: the all-communities feed, the home feed, a community feed, or a comment thread.",
+      "knownValues": ["all", "home", "community", "thread"],
+      "maxLength": 64
+    },
+    "skeletonFeedPost": {
+      "type": "object",
+      "description": "One post in a feed skeleton returned by a feed generator",
+      "required": ["post"],
+      "properties": {
+        "post": {
+          "type": "string",
+          "format": "at-uri",
+          "description": "AT-URI of the post"
+        },
+        "feedContext": {
+          "type": "string",
+          "maxLength": 2000,
+          "description": "Opaque context the generator attaches to this item; the AppView passes it through to the client unchanged."
+        }
+      }
+    },
+    "skeletonComment": {
+      "type": "object",
+      "description": "One comment in a comment skeleton returned by a feed generator",
+      "required": ["comment"],
+      "properties": {
+        "comment": {
+          "type": "string",
+          "format": "at-uri",
+          "description": "AT-URI of the comment"
+        },
+        "feedContext": {
+          "type": "string",
+          "maxLength": 2000,
+          "description": "Opaque context the generator attaches to this item."
+        }
+      }
+    },
+    "skeletonReplies": {
+      "type": "object",
+      "description": "The ordered direct replies a feed generator returns for one parent post or comment",
+      "required": ["parent", "comments"],
+      "properties": {
+        "parent": {
+          "type": "string",
+          "format": "at-uri",
+          "description": "AT-URI of the parent post or comment"
+        },
+        "comments": {
+          "type": "array",
+          "description": "Direct replies to the parent, in the generator's order",
+          "items": {
+            "type": "ref",
+            "ref": "#skeletonComment"
+          }
+        },
+        "cursor": {
+          "type": "string",
+          "maxLength": 500,
+          "description": "Cursor for the next page of replies to this parent"
+        }
+      }
+    },
+    "generatorView": {
+      "type": "object",
+      "description": "A feed generator as shown in feed pickers",
+      "required": ["uri", "did", "displayName", "kind", "scopes"],
+      "properties": {
+        "uri": {
+          "type": "string",
+          "format": "at-uri",
+          "description": "AT-URI of the social.coves.feed.generator record"
+        },
+        "cid": {
+          "type": "string",
+          "format": "cid",
+          "description": "CID of the generator record"
+        },
+        "did": {
+          "type": "string",
+          "format": "did",
+          "description": "DID of the service that serves the feed"
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Name shown in feed pickers"
+        },
+        "description": {
+          "type": "string",
+          "description": "What the feed shows"
+        },
+        "avatar": {
+          "type": "string",
+          "format": "uri",
+          "description": "URL of the feed's avatar image"
+        },
+        "kind": {
+          "type": "string",
+          "description": "Whether the generator orders posts or comments",
+          "knownValues": ["posts", "comments"]
+        },
+        "scopes": {
+          "type": "array",
+          "description": "Where the feed can be used",
+          "items": {
+            "type": "ref",
+            "ref": "#scope"
+          }
+        },
+        "acceptsInteractions": {
+          "type": "boolean",
+          "description": "Whether the generator accepts interaction events through social.coves.feed.sendInteractions"
+        },
+        "indexedAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "When the AppView indexed the generator record"
+        }
+      }
+    },
+    "interaction": {
+      "type": "object",
+      "description": "One interaction event a client reports to a feed generator",
+      "properties": {
+        "item": {
+          "type": "string",
+          "format": "at-uri",
+          "description": "AT-URI of the post or comment the event is about"
+        },
+        "event": {
+          "type": "string",
+          "description": "The kind of interaction",
+          "knownValues": [
+            "social.coves.feed.defs#requestLess",
+            "social.coves.feed.defs#requestMore",
+            "social.coves.feed.defs#clickthroughItem",
+            "social.coves.feed.defs#clickthroughAuthor",
+            "social.coves.feed.defs#clickthroughReposter",
+            "social.coves.feed.defs#clickthroughEmbed",
+            "social.coves.feed.defs#interactionSeen",
+            "social.coves.feed.defs#interactionLike",
+            "social.coves.feed.defs#interactionRepost",
+            "social.coves.feed.defs#interactionReply",
+            "social.coves.feed.defs#interactionQuote",
+            "social.coves.feed.defs#interactionShare"
+          ],
+          "maxLength": 128
+        },
+        "feedContext": {
+          "type": "string",
+          "maxLength": 2000,
+          "description": "The feedContext the generator attached to the item, passed back unchanged"
+        },
+        "reqId": {
+          "type": "string",
+          "maxLength": 100,
+          "description": "The reqId of the feed response the item came from"
+        }
+      }
+    },
+    "requestLess": {
+      "type": "token",
+      "description": "User asked to see fewer items like this one"
+    },
+    "requestMore": {
+      "type": "token",
+      "description": "User asked to see more items like this one"
+    },
+    "clickthroughItem": {
+      "type": "token",
+      "description": "User opened the item"
+    },
+    "clickthroughAuthor": {
+      "type": "token",
+      "description": "User opened the item's author"
+    },
+    "clickthroughReposter": {
+      "type": "token",
+      "description": "User opened the account that reposted the item"
+    },
+    "clickthroughEmbed": {
+      "type": "token",
+      "description": "User opened the item's embed"
+    },
+    "interactionSeen": {
+      "type": "token",
+      "description": "The item was shown to the user"
+    },
+    "interactionLike": {
+      "type": "token",
+      "description": "User upvoted the item"
+    },
+    "interactionRepost": {
+      "type": "token",
+      "description": "User reposted the item"
+    },
+    "interactionReply": {
+      "type": "token",
+      "description": "User replied to the item"
+    },
+    "interactionQuote": {
+      "type": "token",
+      "description": "User quoted the item"
+    },
+    "interactionShare": {
+      "type": "token",
+      "description": "User shared the item"
     }
   }
 }

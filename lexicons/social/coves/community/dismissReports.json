@@ -1,0 +1,87 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.community.dismissReports",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Dismiss a report queue entry: every open community-visible report on the subject in the community becomes dismissed, recorded as dismissed by the caller. Reports with the reason csam or illegal are left for instance admins. The caller must be the community's owner or a moderator, or an instance admin; the actor is the authenticated account, never a request field. A retry with the same idempotency key returns the first result and changes nothing.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#input"
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#output"
+        }
+      },
+      "errors": [
+        {
+          "name": "AuthRequired",
+          "description": "Authentication is required; sign in before retrying."
+        },
+        {
+          "name": "Forbidden",
+          "description": "The caller is neither a moderator of the community nor an instance admin, or the community is not hosted here or is removed; do not retry."
+        },
+        {
+          "name": "InvalidRequest",
+          "description": "The request is incomplete or malformed: community is not a DID, subject is not an AT-URI or idempotencyKey is empty or too long; correct it before retrying."
+        },
+        {
+          "name": "IdempotencyConflict",
+          "description": "The same key was already used by the caller in this community for a different subject; do not retry with that key."
+        },
+        {
+          "name": "ModerationUnavailable",
+          "description": "The moderation service is temporarily unavailable; retry later with the same idempotency key."
+        }
+      ]
+    },
+    "input": {
+      "type": "object",
+      "description": "Request to dismiss the reports on one subject in a community",
+      "required": [
+        "community",
+        "subject",
+        "idempotencyKey"
+      ],
+      "properties": {
+        "community": {
+          "type": "string",
+          "format": "did",
+          "description": "DID of the community whose queue holds the entry"
+        },
+        "subject": {
+          "type": "string",
+          "format": "at-uri",
+          "description": "AT-URI of the reported post or comment"
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Opaque key that makes a retry of the same request return its first result; scoped to the caller and the community"
+        }
+      }
+    },
+    "output": {
+      "type": "object",
+      "description": "The outcome of the dismissal",
+      "required": [
+        "dismissedCount"
+      ],
+      "properties": {
+        "dismissedCount": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of reports the dismissal changed; zero when the subject had no open community-visible reports"
+        }
+      }
+    }
+  }
+}

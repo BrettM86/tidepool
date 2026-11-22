@@ -4,64 +4,28 @@
   "defs": {
     "main": {
       "type": "record",
-      "description": "A moderator assignment for a community",
-      "key": "tid",
+      "description": "A role a community grants an account. Written to the community's own repository, so only the community can grant or revoke it, and it applies only in the repository of an indexed community. The record key is deterministic: the unpadded lowercase base32 encoding of SHA-256 of the subject DID, the same key as a social.coves.moderation.ban record on that subject, so a community holds at most one role record per account. A record at any other key is ignored.",
+      "key": "any",
       "record": {
         "type": "object",
-        "required": ["user", "community", "role", "createdAt", "createdBy"],
+        "required": ["subject", "role", "createdAt"],
         "properties": {
-          "user": {
+          "subject": {
             "type": "string",
             "format": "did",
-            "description": "DID of the user being assigned as moderator"
-          },
-          "community": {
-            "type": "string",
-            "format": "did",
-            "description": "DID of the community"
+            "description": "DID of the account holding the role"
           },
           "role": {
             "type": "string",
-            "knownValues": ["moderator", "admin"],
+            "knownValues": ["owner", "moderator"],
+            "minLength": 1,
             "maxLength": 64,
-            "description": "Level of moderation privileges"
-          },
-          "permissions": {
-            "type": "array",
-            "description": "Specific permissions granted",
-            "items": {
-              "type": "string",
-              "knownValues": [
-                "remove-posts",
-                "remove-comments",
-                "ban-users",
-                "manage-rules",
-                "manage-wiki",
-                "manage-moderators",
-                "manage-settings"
-              ],
-              "maxLength": 64
-            }
+            "description": "The role granted. When a community holds more than one owner record, the one with the latest createdAt is the owner (ties go to the lexically greatest record key) and the others read as moderator. An unknown value grants nothing."
           },
           "createdAt": {
             "type": "string",
             "format": "datetime",
-            "description": "When the moderator was assigned"
-          },
-          "createdBy": {
-            "type": "string",
-            "format": "did",
-            "description": "DID of the user who assigned this moderator"
-          },
-          "expiresAt": {
-            "type": "string",
-            "format": "datetime",
-            "description": "When the moderator assignment expires (optional)"
-          },
-          "note": {
-            "type": "string",
-            "maxLength": 300,
-            "description": "Note about why this person was made a moderator"
+            "description": "When the role was granted"
           }
         }
       }

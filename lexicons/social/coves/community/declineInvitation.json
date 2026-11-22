@@ -1,0 +1,101 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.community.declineInvitation",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Decline an invitation addressed to the caller. Nothing is written to the community's repo and no moderation action is logged.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#input"
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#output"
+        }
+      },
+      "errors": [
+        {
+          "name": "AuthRequired",
+          "description": "Authentication is required; sign in before retrying."
+        },
+        {
+          "name": "InvalidRequest",
+          "description": "The request is incomplete or malformed: invitation is empty, expectedVersion is negative or idempotencyKey is empty or too long; correct it before retrying."
+        },
+        {
+          "name": "InvitationNotFound",
+          "description": "No invitation with this ID is addressed to the caller."
+        },
+        {
+          "name": "InvitationLapsed",
+          "description": "The invitation lapsed 14 days after it was made."
+        },
+        {
+          "name": "InvitationNotOpen",
+          "description": "The invitation was already accepted, declined, or replaced by a newer invitation."
+        },
+        {
+          "name": "StateConflict",
+          "description": "expectedVersion is not the community's current roster version, or the indexed roster is behind the community's repo; refetch the roster version before retrying."
+        },
+        {
+          "name": "IdempotencyConflict",
+          "description": "The same key was reused with a different request; do not retry with that key."
+        },
+        {
+          "name": "ModerationUnavailable",
+          "description": "The moderation service or the community's repo is temporarily unavailable; retry later with the same idempotency key."
+        }
+      ]
+    },
+    "input": {
+      "type": "object",
+      "description": "Request to decline an invitation",
+      "required": [
+        "invitation",
+        "expectedVersion",
+        "idempotencyKey"
+      ],
+      "properties": {
+        "invitation": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "ID of the invitation"
+        },
+        "expectedVersion": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The community's roster version the caller expects; listViewerInvitations serves it with each invitation"
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Opaque key that makes a retry of the same request return its first result; scoped to the caller and the community"
+        }
+      }
+    },
+    "output": {
+      "type": "object",
+      "description": "The declined invitation",
+      "required": [
+        "invitation"
+      ],
+      "properties": {
+        "invitation": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "ID of the declined invitation"
+        }
+      }
+    }
+  }
+}

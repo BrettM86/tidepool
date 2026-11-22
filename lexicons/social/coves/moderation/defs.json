@@ -151,7 +151,10 @@
             "apply-removal",
             "retract-removal",
             "label",
-            "retract-label"
+            "retract-label",
+            "grant-role",
+            "remove-role",
+            "transfer-ownership"
           ],
           "description": "Moderation transition represented by this action"
         },
@@ -202,6 +205,19 @@
           "type": "ref",
           "ref": "#actorRef",
           "description": "Public actor responsible for the action"
+        },
+        "adminActing": {
+          "type": "boolean",
+          "description": "True when an instance admin took this community-scope action for the community without a usable community role that permits the action; omitted otherwise"
+        },
+        "role": {
+          "type": "string",
+          "maxLength": 64,
+          "knownValues": [
+            "owner",
+            "moderator"
+          ],
+          "description": "Community role granted, removed or transferred; present only on grant-role, remove-role and transfer-ownership actions"
         },
         "reverses": {
           "type": "ref",

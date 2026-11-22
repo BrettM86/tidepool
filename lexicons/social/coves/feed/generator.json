@@ -1,0 +1,64 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.feed.generator",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "Declares a feed generator: a service that orders posts or comments for Coves feeds",
+      "key": "any",
+      "record": {
+        "type": "object",
+        "required": ["did", "displayName", "kind", "scopes", "createdAt"],
+        "properties": {
+          "did": {
+            "type": "string",
+            "format": "did",
+            "description": "DID of the service that serves the feed skeleton"
+          },
+          "displayName": {
+            "type": "string",
+            "maxGraphemes": 24,
+            "maxLength": 240,
+            "description": "Name shown in feed pickers"
+          },
+          "description": {
+            "type": "string",
+            "maxGraphemes": 300,
+            "maxLength": 3000,
+            "description": "What the feed shows"
+          },
+          "avatar": {
+            "type": "blob",
+            "accept": ["image/png", "image/jpeg"],
+            "maxSize": 1000000,
+            "description": "Avatar image shown in feed pickers"
+          },
+          "kind": {
+            "type": "string",
+            "knownValues": ["posts", "comments"],
+            "maxLength": 64,
+            "description": "Whether the generator orders posts (getFeedSkeleton) or comments (getCommentSkeleton)"
+          },
+          "scopes": {
+            "type": "array",
+            "minLength": 1,
+            "description": "Where the feed can be used",
+            "items": {
+              "type": "ref",
+              "ref": "social.coves.feed.defs#scope"
+            }
+          },
+          "acceptsInteractions": {
+            "type": "boolean",
+            "description": "Whether the generator accepts interaction events through social.coves.feed.sendInteractions"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When the record was created"
+          }
+        }
+      }
+    }
+  }
+}

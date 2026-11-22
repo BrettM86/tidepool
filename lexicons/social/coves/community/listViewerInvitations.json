@@ -1,0 +1,62 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.community.listViewerInvitations",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Lists the caller's own pending invitations (open and not lapsed) across communities, newest first. The caller is the authenticated account; no parameter names another account. Each item carries the community's current roster version, which acceptInvitation and declineInvitation take as expectedVersion.",
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#output"
+        }
+      },
+      "errors": [
+        {
+          "name": "AuthRequired",
+          "description": "Authentication is required; sign in before retrying."
+        },
+        {
+          "name": "ModerationUnavailable",
+          "description": "The moderation service is temporarily unavailable; retry later."
+        }
+      ]
+    },
+    "output": {
+      "type": "object",
+      "description": "The caller's pending invitations",
+      "required": [
+        "invitations"
+      ],
+      "properties": {
+        "invitations": {
+          "type": "array",
+          "items": {
+            "type": "ref",
+            "ref": "#viewerInvitation"
+          }
+        }
+      }
+    },
+    "viewerInvitation": {
+      "type": "object",
+      "description": "One of the caller's pending invitations.",
+      "required": [
+        "invitation",
+        "rosterVersion"
+      ],
+      "properties": {
+        "invitation": {
+          "type": "ref",
+          "ref": "social.coves.community.defs#invitationView"
+        },
+        "rosterVersion": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The community's current roster version"
+        }
+      }
+    }
+  }
+}

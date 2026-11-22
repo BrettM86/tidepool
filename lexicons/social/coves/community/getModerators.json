@@ -1,0 +1,73 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.community.getModerators",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Lists a community's owner and every moderator, from the social.coves.community.moderator records in the community's repository. Public; the list is not paginated and has no cap. Roles are served only in communities this instance hosts; for any other indexed community the roster is empty (no owner, no moderators).",
+      "parameters": {
+        "type": "params",
+        "required": ["community"],
+        "properties": {
+          "community": {
+            "type": "string",
+            "description": "The community, identified as social.coves.community.get accepts: DID, canonical handle, or scoped name"
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["community", "moderators"],
+          "properties": {
+            "community": {
+              "type": "string",
+              "format": "did",
+              "description": "DID of the community"
+            },
+            "owner": {
+              "type": "ref",
+              "ref": "#roleView",
+              "description": "The community's owner; absent when it has none"
+            },
+            "moderators": {
+              "type": "array",
+              "items": {
+                "type": "ref",
+                "ref": "#roleView"
+              }
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "NotFound",
+          "description": "No indexed community matches the identifier"
+        }
+      ]
+    },
+    "roleView": {
+      "type": "object",
+      "description": "One account's role in the community.",
+      "required": ["subject", "role", "createdAt"],
+      "properties": {
+        "subject": {
+          "type": "string",
+          "format": "did"
+        },
+        "role": {
+          "type": "string",
+          "knownValues": ["owner", "moderator"],
+          "maxLength": 64
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "createdAt of the role record"
+        }
+      }
+    }
+  }
+}

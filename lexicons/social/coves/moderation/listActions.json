@@ -38,7 +38,10 @@
               "remove",
               "restore",
               "apply-removal",
-              "retract-removal"
+              "retract-removal",
+              "grant-role",
+              "remove-role",
+              "transfer-ownership"
             ],
             "description": "Return actions with this moderation transition"
           },

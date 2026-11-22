@@ -9,13 +9,15 @@
         "postReply",
         "commentReply",
         "mention",
-        "upvote"
+        "upvote",
+        "communityInvitation",
+        "communityReport"
       ]
     },
     "notificationView": {
       "type": "object",
-      "description": "One notification in the authenticated account's list.",
-      "required": ["reason", "sortAt", "isRead", "rootPost"],
+      "description": "One notification in the authenticated account's list. Every reason but communityInvitation and communityReport has rootPost.",
+      "required": ["reason", "sortAt", "isRead"],
       "properties": {
         "reason": {
           "type": "ref",
@@ -83,6 +85,16 @@
           "type": "integer",
           "minimum": 0,
           "description": "Qualifying upvotes from accounts on this network plus the item's bridged upvote total from federated platforms"
+        },
+        "community": {
+          "type": "ref",
+          "ref": "social.coves.community.post.defs#communityRef",
+          "description": "The community a communityInvitation invites the account to a role in, whose author is the inviter, or the community whose report queue a communityReport announces; present only for those reasons."
+        },
+        "reportCount": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Open reports in the community's moderation queue that its moderators can act on; present only for communityReport, which names no reporter."
         },
         "recentUpvoters": {
           "type": "array",

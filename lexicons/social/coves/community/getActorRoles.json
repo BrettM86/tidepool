@@ -1,0 +1,62 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.community.getActorRoles",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Lists the communities in which an account holds a role, with its effective role in each. Public, as the role records are. Only communities this instance hosts are listed; roles in any other indexed community are omitted.",
+      "parameters": {
+        "type": "params",
+        "required": ["actor"],
+        "properties": {
+          "actor": {
+            "type": "string",
+            "format": "did",
+            "description": "DID of the account"
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["actor", "roles"],
+          "properties": {
+            "actor": {
+              "type": "string",
+              "format": "did"
+            },
+            "roles": {
+              "type": "array",
+              "items": {
+                "type": "ref",
+                "ref": "#actorRoleView"
+              }
+            }
+          }
+        }
+      }
+    },
+    "actorRoleView": {
+      "type": "object",
+      "description": "The account's role in one community.",
+      "required": ["community", "role", "createdAt"],
+      "properties": {
+        "community": {
+          "type": "string",
+          "format": "did"
+        },
+        "role": {
+          "type": "string",
+          "knownValues": ["owner", "moderator"],
+          "maxLength": 64
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "createdAt of the role record"
+        }
+      }
+    }
+  }
+}

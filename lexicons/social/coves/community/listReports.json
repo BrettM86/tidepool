@@ -1,0 +1,167 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.community.listReports",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "List a community's report queue: the posts and comments in the community with open reports, one entry per reported subject, most recently reported first. A subject its author deleted or the community has removed is not listed. A report's community is the indexed community of its content, never a request field. Reports with the reason csam or illegal are handled by instance admins only and are never listed. Reporters are never named. Only the community's owner and moderators and instance admins may list it.",
+      "parameters": {
+        "type": "params",
+        "required": [
+          "community"
+        ],
+        "properties": {
+          "community": {
+            "type": "string",
+            "format": "did",
+            "description": "DID of the community"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 50,
+            "description": "Maximum number of entries to return"
+          },
+          "cursor": {
+            "type": "string",
+            "maxLength": 500,
+            "description": "Pagination cursor from the previous page"
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#output"
+        }
+      },
+      "errors": [
+        {
+          "name": "AuthRequired",
+          "description": "Authentication is required; sign in before retrying."
+        },
+        {
+          "name": "Forbidden",
+          "description": "The caller is neither a moderator of the community nor an instance admin, or the community is not hosted here or is removed."
+        },
+        {
+          "name": "InvalidRequest",
+          "description": "community is not a DID, limit is out of range or cursor is malformed."
+        },
+        {
+          "name": "ModerationUnavailable",
+          "description": "The moderation service is temporarily unavailable; retry later."
+        }
+      ]
+    },
+    "output": {
+      "type": "object",
+      "description": "A page of the community's report queue",
+      "required": [
+        "reports"
+      ],
+      "properties": {
+        "reports": {
+          "type": "array",
+          "items": {
+            "type": "ref",
+            "ref": "#reportQueueEntry"
+          }
+        },
+        "cursor": {
+          "type": "string",
+          "maxLength": 500,
+          "description": "Cursor of the next page; absent on the last page"
+        }
+      }
+    },
+    "reportQueueEntry": {
+      "type": "object",
+      "description": "One reported subject in the community's queue, with its open community-visible reports grouped together",
+      "required": [
+        "subject",
+        "subjectType",
+        "reasons",
+        "reportCount",
+        "firstReportedAt",
+        "lastReportedAt"
+      ],
+      "properties": {
+        "subject": {
+          "type": "string",
+          "format": "at-uri",
+          "description": "AT-URI of the reported post or comment"
+        },
+        "subjectType": {
+          "type": "string",
+          "knownValues": [
+            "post",
+            "comment"
+          ],
+          "maxLength": 32,
+          "description": "Whether the subject is a post or a comment"
+        },
+        "post": {
+          "type": "ref",
+          "ref": "social.coves.community.post.defs#postView",
+          "description": "The reported post's current view; absent when the subject is not a post or the caller cannot see it (postState then says why)"
+        },
+        "postState": {
+          "type": "string",
+          "knownValues": [
+            "blocked",
+            "removed",
+            "moderated",
+            "notFound"
+          ],
+          "maxLength": 32,
+          "description": "Why the reported post is served with no view: blocked (the caller blocked its author), removed (removed by the community), moderated (removed by the instance), notFound (not shown to the caller, such as a post still pending acceptance or by a restricted author). Absent when the post view is served or the subject is not a post."
+        },
+        "comment": {
+          "type": "ref",
+          "ref": "social.coves.community.comment.defs#commentView",
+          "description": "The reported comment's current view; absent when the subject is not a comment, cannot be shown, or the caller blocked its author (commentState then says so)"
+        },
+        "commentState": {
+          "type": "string",
+          "knownValues": [
+            "blocked"
+          ],
+          "maxLength": 32,
+          "description": "Why the reported comment is served with no view: blocked (the caller blocked its author). Absent when the comment view is served or the subject is not a comment."
+        },
+        "reasons": {
+          "type": "array",
+          "description": "The distinct reasons of the open reports, in ascending order",
+          "items": {
+            "type": "string",
+            "knownValues": [
+              "doxing",
+              "harassment",
+              "other",
+              "spam"
+            ],
+            "maxLength": 32
+          }
+        },
+        "reportCount": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Number of open reports on the subject"
+        },
+        "firstReportedAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "When the oldest open report was filed"
+        },
+        "lastReportedAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "When the newest open report was filed"
+        }
+      }
+    }
+  }
+}

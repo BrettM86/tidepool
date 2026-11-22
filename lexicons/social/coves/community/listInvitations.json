@@ -1,0 +1,64 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.community.listInvitations",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Lists a community's pending invitations (open and not lapsed), newest first. Only the community's owner and instance admins may list them; moderators and other accounts are refused. Not paginated: each invitee has at most one pending invitation per community.",
+      "parameters": {
+        "type": "params",
+        "required": [
+          "community"
+        ],
+        "properties": {
+          "community": {
+            "type": "string",
+            "format": "did",
+            "description": "DID of the community"
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#output"
+        }
+      },
+      "errors": [
+        {
+          "name": "AuthRequired",
+          "description": "Authentication is required; sign in before retrying."
+        },
+        {
+          "name": "Forbidden",
+          "description": "The caller is neither the community's owner nor an instance admin, or the community is not hosted here or is removed."
+        },
+        {
+          "name": "InvalidRequest",
+          "description": "community is not a DID."
+        },
+        {
+          "name": "ModerationUnavailable",
+          "description": "The moderation service is temporarily unavailable; retry later."
+        }
+      ]
+    },
+    "output": {
+      "type": "object",
+      "description": "The community's pending invitations",
+      "required": [
+        "invitations"
+      ],
+      "properties": {
+        "invitations": {
+          "type": "array",
+          "items": {
+            "type": "ref",
+            "ref": "social.coves.community.defs#invitationView"
+          }
+        }
+      }
+    }
+  }
+}

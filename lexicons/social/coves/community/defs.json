@@ -355,6 +355,94 @@
           "type": "string",
           "format": "datetime",
           "description": "When the viewer's ban ends. Omitted for a permanent ban."
+        },
+        "role": {
+          "type": "string",
+          "knownValues": [
+            "owner",
+            "moderator"
+          ],
+          "description": "The viewer's usable role in this community. Absent when the viewer holds no role, the role is suspended, or this instance does not host the community. Instance admin status is not a role."
+        },
+        "invitation": {
+          "type": "ref",
+          "ref": "#viewerInvitation",
+          "description": "The viewer's pending invitation to a role in this community. Absent when the viewer has none; never served to anyone but the invitee."
+        },
+        "communityModeration": {
+          "type": "array",
+          "description": "Community moderation actions the viewer may take on this community. A moderator may ban-account and unban-account; the owner, or an instance admin acting for the community, may also grant-role, remove-role and transfer-ownership (the modlog action tokens). Omitted when there are none.",
+          "items": {
+            "type": "string",
+            "knownValues": ["ban-account", "unban-account", "grant-role", "remove-role", "transfer-ownership"],
+            "maxLength": 64
+          }
+        }
+      }
+    },
+    "viewerInvitation": {
+      "type": "object",
+      "description": "The viewer's pending invitation to a role in a community.",
+      "required": ["id", "role", "expiresAt"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "ID of the invitation, which acceptInvitation and declineInvitation take"
+        },
+        "role": {
+          "type": "string",
+          "knownValues": ["owner", "moderator"],
+          "maxLength": 64,
+          "description": "The role the invitation offers"
+        },
+        "expiresAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "When the invitation lapses, 14 days after it was made"
+        }
+      }
+    },
+    "invitationView": {
+      "type": "object",
+      "description": "An invitation to a role in a community. Invitations are AppView state, not records; only the community's owner, instance admins and the invitee see them.",
+      "required": ["id", "community", "subject", "role", "inviter", "createdAt", "expiresAt"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "ID of the invitation"
+        },
+        "community": {
+          "type": "string",
+          "format": "did",
+          "description": "DID of the community"
+        },
+        "subject": {
+          "type": "string",
+          "format": "did",
+          "description": "DID of the invited account"
+        },
+        "role": {
+          "type": "string",
+          "knownValues": ["owner", "moderator"],
+          "maxLength": 64,
+          "description": "The role the invitation offers"
+        },
+        "inviter": {
+          "type": "string",
+          "format": "did",
+          "description": "DID of the account that made the invitation: the owner, or an instance admin"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "When the invitation was made"
+        },
+        "expiresAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "When the invitation lapses, 14 days after createdAt"
         }
       }
     }

@@ -4,7 +4,7 @@
   "defs": {
     "main": {
       "type": "query",
-      "description": "Full-text search over visible posts, across every community or restricted to one. Results honour the same admission, deletion and viewer-block rules as social.coves.feed.getDiscover and social.coves.feed.getCommunity.",
+      "description": "Full-text search over visible posts, across every community or restricted to one. Results honour the same admission, deletion and viewer-block rules as social.coves.feed.getDiscover and the community feed.",
       "parameters": {
         "type": "params",
         "required": ["q"],

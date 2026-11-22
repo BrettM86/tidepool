@@ -23,7 +23,9 @@
               "off-topic",
               "illegal-content",
               "author-banned",
-              "moderator-discretion"
+              "moderator-discretion",
+              "harassment",
+              "doxing"
             ],
             "description": "Machine-readable reason for the removal. knownValues is an open set: federated peers may send codes this AppView has not seen yet and their records must still validate, so this MUST NOT become an enum.",
             "maxLength": 64

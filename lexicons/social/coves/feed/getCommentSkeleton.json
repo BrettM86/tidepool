@@ -1,0 +1,85 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.feed.getCommentSkeleton",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Get the ordered direct replies for one or more parent posts or comments from a comment feed generator. Served by the generator's service and called by the AppView, which hydrates the comments.",
+      "parameters": {
+        "type": "params",
+        "required": ["feed", "parents"],
+        "properties": {
+          "feed": {
+            "type": "string",
+            "format": "at-uri",
+            "description": "AT-URI of the social.coves.feed.generator record being requested"
+          },
+          "parents": {
+            "type": "array",
+            "minLength": 1,
+            "maxLength": 25,
+            "description": "AT-URIs of the parent posts or comments whose replies to order",
+            "items": {
+              "type": "string",
+              "format": "at-uri"
+            }
+          },
+          "timeframe": {
+            "type": "string",
+            "knownValues": ["hour", "day", "week", "month", "year", "all"],
+            "maxLength": 64,
+            "description": "Timeframe for generators ranked by top score; ignored by other generators."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 50,
+            "description": "Maximum replies per parent"
+          },
+          "cursor": {
+            "type": "string",
+            "maxLength": 500,
+            "description": "Cursor for the next page of replies. Applies only when exactly one parent is given."
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#output"
+        }
+      },
+      "errors": [
+        {
+          "name": "UnknownFeed",
+          "description": "The generator does not serve the requested feed."
+        },
+        {
+          "name": "InvalidCursor",
+          "description": "The cursor is malformed or expired."
+        }
+      ]
+    },
+    "output": {
+      "type": "object",
+      "description": "Ordered replies for each requested parent",
+      "required": ["replies"],
+      "properties": {
+        "replies": {
+          "type": "array",
+          "items": {
+            "type": "ref",
+            "ref": "social.coves.feed.defs#skeletonReplies"
+          }
+        },
+        "reqId": {
+          "type": "string",
+          "maxLength": 100,
+          "description": "Request ID assigned by the feed generator."
+        }
+      }
+    }
+  }
+}

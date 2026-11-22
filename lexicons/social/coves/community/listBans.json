@@ -1,0 +1,134 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.community.listBans",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "List a community's standing bans, in force and lapsed, newest indexed first. Only the community's owner and moderators and instance admins may list them.",
+      "parameters": {
+        "type": "params",
+        "required": [
+          "community"
+        ],
+        "properties": {
+          "community": {
+            "type": "string",
+            "format": "did",
+            "description": "DID of the community"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 50,
+            "description": "Maximum number of bans to return"
+          },
+          "cursor": {
+            "type": "string",
+            "maxLength": 500,
+            "description": "Pagination cursor from the previous page"
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#output"
+        }
+      },
+      "errors": [
+        {
+          "name": "AuthRequired",
+          "description": "Authentication is required; sign in before retrying."
+        },
+        {
+          "name": "Forbidden",
+          "description": "The caller is neither a moderator of the community nor an instance admin, or the community is not hosted here or is removed."
+        },
+        {
+          "name": "InvalidRequest",
+          "description": "community is not a DID, limit is out of range or cursor is malformed."
+        },
+        {
+          "name": "ModerationUnavailable",
+          "description": "The moderation service is temporarily unavailable; retry later."
+        }
+      ]
+    },
+    "output": {
+      "type": "object",
+      "description": "A page of the community's bans",
+      "required": [
+        "bans"
+      ],
+      "properties": {
+        "bans": {
+          "type": "array",
+          "items": {
+            "type": "ref",
+            "ref": "#ban"
+          }
+        },
+        "cursor": {
+          "type": "string",
+          "maxLength": 500,
+          "description": "Cursor of the next page; absent on the last page"
+        }
+      }
+    },
+    "ban": {
+      "type": "object",
+      "description": "One standing ban record in the community's repo",
+      "required": [
+        "subject",
+        "uri",
+        "cid",
+        "indexedAt",
+        "active"
+      ],
+      "properties": {
+        "subject": {
+          "type": "string",
+          "format": "did",
+          "description": "DID of the banned account"
+        },
+        "uri": {
+          "type": "string",
+          "format": "at-uri",
+          "description": "AT-URI of the ban record"
+        },
+        "cid": {
+          "type": "string",
+          "format": "cid",
+          "description": "CID of the ban record"
+        },
+        "reason": {
+          "type": "string",
+          "maxGraphemes": 2000,
+          "maxLength": 20000,
+          "description": "The ban's reason; absent when it has none"
+        },
+        "expiresAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "When the ban ends; absent for a permanent ban"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "The ban record's createdAt, when known"
+        },
+        "indexedAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "When this instance indexed the ban record"
+        },
+        "active": {
+          "type": "boolean",
+          "description": "True while the ban is in force: it has no expiry or its expiry is in the future"
+        }
+      }
+    }
+  }
+}

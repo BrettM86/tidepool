@@ -285,6 +285,19 @@
             ],
             "maxLength": 64
           }
+        },
+        "communityModeration": {
+          "type": "array",
+          "description": "Community moderation actions the viewer may take on this comment in its community, as the viewer's community authority (moderator, owner, or an instance admin acting for the community) allows. remove and restore are the modlog action tokens; ban-author bans the comment's author from the community and is omitted when the author holds a role there. Omitted when there are none.",
+          "items": {
+            "type": "string",
+            "knownValues": [
+              "remove",
+              "restore",
+              "ban-author"
+            ],
+            "maxLength": 64
+          }
         }
       }
     }

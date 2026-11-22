@@ -1,0 +1,119 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.community.offerOwnership",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Offer ownership of a community this instance hosts to an account. The community's owner may offer it to one of the community's current moderators; an instance admin may offer it to any account, which is how an ownerless community is recovered. Accepting the offer makes the invitee the owner and, when the community has an owner, makes the previous owner a moderator, in one write. The offer is AppView state, not a record; it lapses 14 days after it is made and a newer invitation to the same account in the same community replaces it. The actor is the authenticated account, never a request field.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#input"
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#output"
+        }
+      },
+      "errors": [
+        {
+          "name": "AuthRequired",
+          "description": "Authentication is required; sign in before retrying."
+        },
+        {
+          "name": "Forbidden",
+          "description": "The caller is neither the community's owner nor an instance admin, or the community is not hosted here or is removed; do not retry."
+        },
+        {
+          "name": "InvalidRequest",
+          "description": "The request is incomplete or malformed: community is not a DID, subject is empty, expectedVersion is negative or idempotencyKey is empty or too long; correct it before retrying."
+        },
+        {
+          "name": "AccountNotFound",
+          "description": "The subject handle does not resolve to an account."
+        },
+        {
+          "name": "StateConflict",
+          "description": "expectedVersion is not the community's current roster version, or the indexed roster is behind the community's repo; refetch the roster version before retrying."
+        },
+        {
+          "name": "IdempotencyConflict",
+          "description": "The same key was reused with a different request; do not retry with that key."
+        },
+        {
+          "name": "InviteeHasRole",
+          "description": "The subject is already the community's owner."
+        },
+        {
+          "name": "InviteeNotModerator",
+          "description": "The owner offered ownership to an account that is not a current moderator of the community."
+        },
+        {
+          "name": "InviteeBanned",
+          "description": "The invited account has a community ban in force in this community."
+        },
+        {
+          "name": "ModerationUnavailable",
+          "description": "The moderation service or the community's repo is temporarily unavailable; retry later with the same idempotency key."
+        }
+      ]
+    },
+    "input": {
+      "type": "object",
+      "description": "Request to offer ownership",
+      "required": [
+        "community",
+        "subject",
+        "expectedVersion",
+        "idempotencyKey"
+      ],
+      "properties": {
+        "community": {
+          "type": "string",
+          "format": "did",
+          "description": "DID of the community"
+        },
+        "subject": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048,
+          "description": "Handle or DID of the account offered ownership; a handle is resolved through this instance's identity resolution"
+        },
+        "expectedVersion": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The community's roster version the caller expects"
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Opaque key that makes a retry of the same request return its first result; scoped to the caller and the community"
+        }
+      }
+    },
+    "output": {
+      "type": "object",
+      "description": "The invitation, stored before the response returns. The roster does not change until the invitee accepts.",
+      "required": [
+        "invitation",
+        "version"
+      ],
+      "properties": {
+        "invitation": {
+          "type": "ref",
+          "ref": "social.coves.community.defs#invitationView"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The community's roster version, unchanged by the invitation"
+        }
+      }
+    }
+  }
+}

@@ -21,6 +21,11 @@
             "format": "record-key",
             "description": "Record key of a comment within the post. When provided, the response contains only the subtree rooted at that comment: the comment itself as the sole top-level entry, with its descendants nested beneath it. depth is relative to this comment (0 returns only the comment itself), and limit/cursor paginate its direct replies."
           },
+          "feed": {
+            "type": "string",
+            "format": "at-uri",
+            "description": "AT-URI of the comment feed generator (kind comments, thread scope) that orders the thread, such as the instance's comments-hot, comments-top or comments-new. Takes precedence over sort. When neither is given, the instance's comments-hot is used."
+          },
           "sort": {
             "type": "string",
             "default": "hot",
@@ -29,7 +34,7 @@
               "top",
               "new"
             ],
-            "description": "Sort order: hot (trending), top (highest score), new (most recent)",
+            "description": "Deprecated alias of feed: hot, top and new select the instance's comments-hot, comments-top and comments-new generators. Ignored when feed is given.",
             "maxLength": 64
           },
           "timeframe": {
@@ -42,7 +47,7 @@
               "year",
               "all"
             ],
-            "description": "Timeframe for 'top' sort. Ignored for other sort types.",
+            "description": "Timeframe the top level is ranked within. Accepted only when the resolved feed is comments-top; any other feed rejects it as InvalidRequest. Unset means all time.",
             "maxLength": 64
           },
           "depth": {
@@ -107,7 +112,15 @@
         },
         {
           "name": "InvalidRequest",
-          "description": "Invalid parameters (malformed URI, invalid sort/timeframe combination, etc.)"
+          "description": "Invalid parameters (malformed URI, invalid sort, a timeframe on a feed other than comments-top, etc.)"
+        },
+        {
+          "name": "UnknownFeed",
+          "description": "The feed is not a registered feed generator"
+        },
+        {
+          "name": "UnsupportedFeedScope",
+          "description": "The feed is not a comment feed for threads"
         }
       ]
     }

@@ -40,7 +40,10 @@
               "apply-removal",
               "retract-removal",
               "label",
-              "retract-label"
+              "retract-label",
+              "grant-role",
+              "remove-role",
+              "transfer-ownership"
             ],
             "description": "Return actions with this moderation transition"
           },

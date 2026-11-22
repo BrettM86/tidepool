@@ -1,0 +1,110 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.community.restoreComment",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Restore a comment its community removed, with that community's authority. The caller must be a moderator of the comment's community, which this instance must host, or an instance admin; an admin's restore is recorded as an admin acting for the community. The instance writes one commit to the community's repo that deletes the community's removal record about the comment, whoever wrote it, and applies the restore to its index before responding. With no removal standing the restore is already applied. An instance removal of the comment is independent and stays in force. The actor is the authenticated account, never a request field.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#input"
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#output"
+        }
+      },
+      "errors": [
+        {
+          "name": "AuthRequired",
+          "description": "Authentication is required; sign in before retrying."
+        },
+        {
+          "name": "Forbidden",
+          "description": "The caller is neither a moderator of the comment's community nor an instance admin, or the community is not hosted here or is removed; do not retry."
+        },
+        {
+          "name": "InvalidRequest",
+          "description": "The request is incomplete or malformed: subject is not a social.coves.community.comment AT-URI, expectedVersion is negative or idempotencyKey is empty or too long; correct it before retrying."
+        },
+        {
+          "name": "CommentNotFound",
+          "description": "The comment is not indexed, or its parent chain does not reach a post indexed in a community; do not retry."
+        },
+        {
+          "name": "StateConflict",
+          "description": "expectedVersion is not the comment's current community version, the comment's thread moved to another community, or the indexed removal is behind the community's repo; refetch getCommunityState for the comment before retrying."
+        },
+        {
+          "name": "IdempotencyConflict",
+          "description": "The same key was reused with a different request; do not retry with that key."
+        },
+        {
+          "name": "ModerationUnavailable",
+          "description": "The moderation service or the community's repo is temporarily unavailable; retry later with the same idempotency key."
+        }
+      ]
+    },
+    "input": {
+      "type": "object",
+      "description": "Request to restore a comment its community removed",
+      "required": [
+        "subject",
+        "expectedVersion",
+        "idempotencyKey"
+      ],
+      "properties": {
+        "subject": {
+          "type": "string",
+          "format": "at-uri",
+          "description": "AT-URI of the comment to restore"
+        },
+        "expectedVersion": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The comment's community version (getCommunityState with the comment AT-URI as subject) the caller expects"
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Opaque key that makes a retry of the same request return its first result; scoped to the caller and the community"
+        }
+      }
+    },
+    "output": {
+      "type": "object",
+      "description": "The community decision on the comment, applied before the response returns",
+      "required": [
+        "uri",
+        "version",
+        "alreadyApplied"
+      ],
+      "properties": {
+        "uri": {
+          "type": "string",
+          "format": "at-uri",
+          "description": "AT-URI of the community's removal record about the comment, which no longer stands"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The comment's community version after the action"
+        },
+        "actionId": {
+          "type": "string",
+          "description": "ID of the moderation action logged for the change; absent when the decision was already in place"
+        },
+        "alreadyApplied": {
+          "type": "boolean",
+          "description": "True when the decision was already in place, so nothing was written and no action was logged"
+        }
+      }
+    }
+  }
+}

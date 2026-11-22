@@ -1,0 +1,46 @@
+{
+  "lexicon": 1,
+  "id": "social.coves.feed.getFeedGenerators",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Get views of feed generators for feed pickers",
+      "parameters": {
+        "type": "params",
+        "required": ["feeds"],
+        "properties": {
+          "feeds": {
+            "type": "array",
+            "maxLength": 25,
+            "description": "AT-URIs of social.coves.feed.generator records",
+            "items": {
+              "type": "string",
+              "format": "at-uri"
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "#output"
+        }
+      }
+    },
+    "output": {
+      "type": "object",
+      "description": "Views of the requested feed generators that the AppView knows",
+      "required": ["feeds"],
+      "properties": {
+        "feeds": {
+          "type": "array",
+          "items": {
+            "type": "ref",
+            "ref": "social.coves.feed.defs#generatorView"
+          }
+        }
+      }
+    }
+  }
+}
